@@ -1,0 +1,5 @@
+model: "whisper_large"
+max_seq_len: 448
+node_groups:
+  - node_names: [audio_encoder, decoder]
+    ranks: [0]

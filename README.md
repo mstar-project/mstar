@@ -45,6 +45,7 @@ LLM serving stacks assume inference is a single autoregressive loop. Composite m
 - Paged attention (FlashInfer) and continuous batching for autoregressive backbones
 - CUDA-graph capture for encoders and decode
 - Classifier-free-guidance parallelism for diffusion / flow
+- Tensor parallelism and Ulysses sequence parallelism, composable as a TP × SP mesh per component
 - Sliding-window chunk streaming for audio codecs
 - Component-level disaggregation with pluggable tensor transport (shared memory, TCP, RDMA)
 
@@ -76,7 +77,7 @@ uv pip install \
   "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
-Other models: `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
+Other models: `mstar serve cosmos3` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
 
 **Python SDK** — works for every model (text, image, audio, video):
 
@@ -85,14 +86,14 @@ from mstar import MStarClient
 client = MStarClient("http://localhost:8000")
 
 client.chat("What is the capital of France?").text          # text
-client.generate_image("a cat in a hat")                     # → PNG bytes   (BAGEL)
+client.generate_image("a cat in a hat")                     # → PNG bytes   (BAGEL, Cosmos3)
 client.tts("Hello there", voice="tara").to_wav("out.wav")   # → speech      (Orpheus)
 
 for event in client.chat("Tell me a story", stream=True):   # streaming
     print(getattr(event, "text", ""), end="", flush=True)
 ```
 
-**OpenAI-compatible API** — drop-in for `bagel`, `qwen3_omni`, and `orpheus`:
+**OpenAI-compatible API** — drop-in for `bagel`, `cosmos3`, `qwen3_omni`, and `orpheus`:
 
 ```python
 from openai import OpenAI
@@ -115,11 +116,12 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
+| [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
 | [Pi0.5](https://huggingface.co/lerobot/pi05_base) | Vision-language-action | text, image, state → robot actions | `/generate` |
 | [V-JEPA 2 / 2-AC](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | World model | video (+ actions) → latents, rollouts | `/generate` |
 
 Every model is reachable through the SDK and the native `/generate` endpoint; the OpenAI-compatible
-routes cover the chat, speech, and image models.
+routes cover the chat, speech, image, and video models.
 
 ## How it works
 
@@ -138,10 +140,21 @@ single-GPU or fully disaggregated by changing only the YAML `node_groups`. Four 
 primitives — `Sequential`, `Parallel`, `Loop`, and a cross-partition
 `StreamingGraphEdge` — express every model family above. See the [paper](https://arxiv.org/abs/2606.12688) for the full design.
 
+### Optional: Rust ZMQ transport
+
+The ZeroMQ control mesh can run over a Rust transport (vendored in [`rust/`](rust/)) instead of
+pyzmq — wire-compatible, selectable per process with `MSTAR_RUST_ZMQ` (default `AUTO`).
+Note what AUTO-by-default means: on any machine where the extension is built, the whole
+mesh switches to the Rust transport with no configuration change — each process logs its
+choice at startup (`control mesh transport: ...`), and `MSTAR_RUST_ZMQ=0` pins pyzmq. Build it with
+[maturin](https://www.maturin.rs): `uv pip install maturin && maturin develop --release -m rust/Cargo.toml`.
+See the [installation docs](https://m-star.org/mstar/installation.html) and
+[environment variables](https://m-star.org/mstar/environment_variables.html).
+
 ## Performance
 
 Across every model we benchmark, M\* matches or beats the system specialized for that family — unified
-models (BAGEL), omni and speech models (Qwen3-Omni, Orpheus), and world models (V-JEPA 2) — by executing
+models (BAGEL), omni and speech models (Qwen3-Omni, Orpheus), and world models (Cosmos3, V-JEPA 2) — by executing
 only the components each request needs and giving each its own fast path: paged attention and continuous
 batching for autoregressive backbones, classifier-free-guidance parallelism for diffusion, chunk streaming
 for audio codecs, and persistent-cache loops for world-model rollouts.

@@ -1,0 +1,5 @@
+model: "higgs_audio"
+max_seq_len: 32768
+node_groups:
+  - node_names: [audio_encoder, LLM]
+    ranks: [0]

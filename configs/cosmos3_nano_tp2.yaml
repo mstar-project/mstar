@@ -1,0 +1,18 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool. Under tensor parallelism the KV heads shard across ranks, so
+# each rank's pages hold half the heads — 1024 pages leave ample headroom.
+kv_cache:
+  max_num_pages: 1024
+# The DiT runs tensor-parallel across two ranks (attention heads + MLP
+# intermediate shard; the residual stream stays full and the out/down
+# projections all-reduce). The VAE decoder is small and runs un-sharded on
+# rank 0; the DiT's final latents are replicated, so the decoder reads them
+# directly.
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1]
+    tp_size: 2
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
+    ranks: [0]

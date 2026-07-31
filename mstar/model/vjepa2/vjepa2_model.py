@@ -783,7 +783,7 @@ class VJepa2Model(Model):
 
         return out
 
-    def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
+    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "video":
             # Predicted hidden tensor is emitted as raw float32 bytes.
             # Clients can reshape via (B, N, hidden_size) — shape is

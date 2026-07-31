@@ -195,6 +195,114 @@ def test_ingest_input_rejects_unknown_input_name():
     assert io.nodes["x"].ready_signals.ready_names == set()
 
 
+def test_parallel_preserves_outside_fed_member_inputs():
+    """Parallel members fed from OUTSIDE the Parallel keep their inputs in
+    ext_inputs. The prior implementation classified every member input as
+    internal (its destination is always a member node), which emptied the
+    IO of a decoder fan-out fed by an upstream loop."""
+    from mstar.graph.base import Parallel
+
+    par = Parallel([
+        GraphNode(
+            name="vae_decoder",
+            input_names={"latents"},
+            outputs=[GraphEdge(name="video_output", next_node="EMIT_TO_CLIENT")],
+        ),
+        GraphNode(
+            name="audio_decoder",
+            input_names={"sound_latents"},
+            outputs=[GraphEdge(name="audio_output", next_node="EMIT_TO_CLIENT")],
+        ),
+    ])
+    io = par.get_inputs_outputs()
+    assert io.ext_inputs == {
+        ("latents", "vae_decoder"), ("sound_latents", "audio_decoder")
+    }
+    assert {(e.name, e.next_node) for e in io.ext_outputs} == {
+        ("video_output", "EMIT_TO_CLIENT"), ("audio_output", "EMIT_TO_CLIENT"),
+    }
+    assert io.loop_back == set()
+
+
+def test_parallel_sibling_produced_edge_is_internal():
+    """An edge produced by one member and consumed by another is internal:
+    absent from both ext_inputs and ext_outputs. Inputs no sibling produces
+    stay external."""
+    from mstar.graph.base import Parallel
+
+    par = Parallel([
+        GraphNode(
+            name="producer",
+            input_names={"seed"},
+            outputs=[GraphEdge(name="feat", next_node="consumer")],
+        ),
+        GraphNode(
+            name="consumer",
+            input_names={"feat", "cond"},
+            outputs=[GraphEdge(name="out", next_node="EMIT_TO_CLIENT")],
+        ),
+    ])
+    io = par.get_inputs_outputs()
+    assert io.ext_inputs == {("seed", "producer"), ("cond", "consumer")}
+    assert {(e.name, e.next_node) for e in io.ext_outputs} == {
+        ("out", "EMIT_TO_CLIENT")
+    }
+    assert io.loop_back == set()
+
+
+def test_cfg_branch_loop_io_artifacts():
+    """A CFG-style loop — parallel denoise branches plus a combine node that
+    feeds them back — derives no external inputs, classifies every branch
+    feed as loop-back, and keeps the loop's declared output. This is BAGEL's
+    image_gen_cfg shape; these artifacts are identical before and after the
+    Parallel member-input fix (the branch feeds are produced by combine_cfg,
+    so the enclosing Sequential reclassifies them as loop-back either way)."""
+    from mstar.graph.base import Parallel
+
+    branches = [
+        GraphNode(
+            name=n,
+            input_names={"latents", "time_index"},
+            outputs=[GraphEdge(name=v, next_node="combine_cfg")],
+        )
+        for n, v in [
+            ("LLM", "v_main"),
+            ("LLM_cfg_text", "v_cfg_text"),
+            ("LLM_cfg_img", "v_cfg_img"),
+        ]
+    ]
+    combine = GraphNode(
+        name="combine_cfg",
+        input_names={"v_main", "v_cfg_text", "v_cfg_img", "latents", "time_index"},
+        outputs=[
+            GraphEdge(name="latents", next_node="LLM"),
+            GraphEdge(name="time_index", next_node="LLM"),
+            GraphEdge(name="latents", next_node="LLM_cfg_text"),
+            GraphEdge(name="time_index", next_node="LLM_cfg_text"),
+            GraphEdge(name="latents", next_node="LLM_cfg_img"),
+            GraphEdge(name="time_index", next_node="LLM_cfg_img"),
+            GraphEdge(name="latents", next_node="combine_cfg"),
+            GraphEdge(name="time_index", next_node="combine_cfg"),
+        ],
+    )
+    loop = Loop(
+        name="cfg_loop",
+        section=Sequential([Parallel(branches), combine]),
+        max_iters=10,
+        outputs=[GraphEdge(name="latents", next_node="vae_decoder")],
+    )
+    assert loop._external_inputs == set()
+    assert loop._loop_back_inputs == {
+        ("latents", "LLM"), ("time_index", "LLM"),
+        ("latents", "LLM_cfg_text"), ("time_index", "LLM_cfg_text"),
+        ("latents", "LLM_cfg_img"), ("time_index", "LLM_cfg_img"),
+        ("latents", "combine_cfg"), ("time_index", "combine_cfg"),
+    }
+    assert [(e.name, e.next_node) for e in loop.outputs] == [
+        ("latents", "vae_decoder")
+    ]
+
+
 def test_streaming_inputs_propagate_to_ready_signals():
     """When _register_streaming is called on a GraphNode, the existing
     ReadySignals instances must see the new streaming names. Regression

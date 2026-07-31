@@ -1,0 +1,21 @@
+model: "cosmos3_super"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool. Super is 64 layers and ~64 GB of weights/rank already sit on
+# each 80 GB card at TP=2, so the KV pool must stay small or init OOMs (1024
+# pages = 16 GB/rank here, which OOMs). 384 pages (~6 GB/rank) covers t2i plus
+# 256p/480p video (480p needs ~300 pages) and leaves room for activations; 720p
+# video (~692 pages + large replicated activations) does not fit at TP=2 and is
+# deferred to sequence-parallelism.
+kv_cache:
+  max_num_pages: 384
+# Super (64B, ~128 GB bf16) is unviable on one 80 GB GPU, so the DiT runs
+# tensor-parallel across 2 ranks (~64 GB weights/rank). The VAE decoder is small
+# and runs un-sharded on rank 0 (the DiT's final latents are replicated, so it
+# reads them directly).
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1]
+    tp_size: 2
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
+    ranks: [0]

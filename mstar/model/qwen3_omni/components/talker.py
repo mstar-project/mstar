@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
@@ -65,7 +65,7 @@ class Qwen3OmniTalkerLayer(nn.Module):
 
     def __init__(
         self, config: TalkerTextConfig, layer_idx: int,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -133,7 +133,7 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
     This corresponds to the ``talker.model.*`` weight namespace.
     """
 
-    def __init__(self, config: TalkerTextConfig, comm_group: TPCommGroup | None = None):
+    def __init__(self, config: TalkerTextConfig, comm_group: CommGroup | None = None):
         super().__init__()
         # NOTE: No embed_tokens here -- the HF Talker text model does not
         # have a text embedding table.  The Talker receives pre-computed
@@ -193,7 +193,7 @@ class Qwen3OmniTalkerModel(nn.Module):
 
     def __init__(
         self, config: Qwen3OmniModelConfig,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
     ):
         super().__init__()
         talker_text = config.talker_text

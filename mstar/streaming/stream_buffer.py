@@ -40,6 +40,10 @@ class StreamBuffer:
     _consumed: int = 0
     _chunks_popped: int = 0
     producer_done: bool = False
+    # Set once a chunk has been popped with ``is_final=True`` (the terminal
+    # flush). Guards the empty-buffer final flush below so it fires exactly
+    # once and ``has_chunk_ready`` doesn't spin returning True forever.
+    _final_chunk_emitted: bool = False
 
     _num_tensors_registered = 0
     _num_buffer_writes = 0
@@ -76,17 +80,23 @@ class StreamBuffer:
     def has_chunk_ready(self) -> bool:
         self._update_buffer()
         buf_len = len(self._buffer)
-        if self._producer_done_and_all_read() and buf_len > 0:
-            return True
+
+        if not self._producer_done_and_all_read():
+            return self.policy.is_ready(buf_len)
+
         # When continue_after_producer_done is set, keep producing empty
         # chunks after the producer finishes and all items are consumed.
         # This allows the consumer to keep running (e.g., Talker continues
         # generating codec tokens after the Thinker hits text EOS).
-        if (self._producer_done_and_all_read()
-                and buf_len == 0
-                and self.policy.continue_after_producer_done()):
-            return True
-        return self.policy.is_ready(buf_len)
+        # Producer done and the buffer already drained to empty (all items
+        # were consumed in earlier chunks. Emit exactly one final
+        # (empty) chunk so ``is_final`` propagates and the stream closes.
+
+        return (
+            buf_len > 0
+            or self.policy.continue_after_producer_done()
+            or not self._final_chunk_emitted
+        )
 
     def pop_chunk(self) -> StreamChunk:
         """Pop the next chunk. Only call when has_chunk_ready() is True.
@@ -120,6 +130,8 @@ class StreamBuffer:
         # consumer decides when it's done via its own model logic.
         if self.policy.continue_after_producer_done():
             is_final = False
+        if is_final:
+            self._final_chunk_emitted = True
 
         chunk = StreamChunk(
             data=self._collate(items),

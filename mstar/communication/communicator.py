@@ -9,6 +9,19 @@ from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
 
+#: The ``mstar_rust`` extension version this tree expects (the vendored
+#: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching
+#: install - e.g. a stale wheel after an upgrade - takes over the mesh
+#: silently, so the factory warns when the imported version differs.
+EXPECTED_MSTAR_RUST_VERSION = "0.1.0"
+
+
+class CommProtocol(Enum):
+    IPC = "IPC"
+    TCP = "TCP"
+    RDMA = "RDMA"
+    SHM = "SHM"
+
 
 class BaseCommunicator(ABC):
     @abstractmethod
@@ -22,16 +35,35 @@ class BaseCommunicator(ABC):
     def get_all_new_messages(self) -> list:
         pass
 
+    # -- endpoint scheme (shared by every ZMQ-based communicator) ------------
+    # Subclasses set ``self.protocol`` and ``self.ipc_socket_path_prefix``.
+
+    def _endpoint(self, entity_id: str) -> str:
+        if self.protocol == CommProtocol.IPC:
+            return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
+        if self.protocol == CommProtocol.TCP:
+            host = os.getenv("MSTAR_ZMQ_TCP_HOST", "127.0.0.1")
+            return f"tcp://{host}:{self._tcp_port(entity_id)}"
+        raise NotImplementedError(f"Protocol {self.protocol} not yet supported yet")
+
+    @staticmethod
+    def _tcp_port(entity_id: str) -> int:
+        base_port = int(os.getenv("MSTAR_ZMQ_TCP_BASE_PORT", "19000"))
+        if entity_id == "api_server":
+            return base_port
+        if entity_id == "conductor":
+            return base_port + 1
+        if entity_id == "api_server_preprocess_worker":
+            return base_port + 2
+        if entity_id.startswith("worker_"):
+            rank = entity_id.removeprefix("worker_")
+            if rank.isdigit():
+                return base_port + 100 + int(rank)
+        return base_port + 1000 + (sum(entity_id.encode("utf-8")) % 1000)
+
     # @abstractmethod
     # def get_session_id(self) -> str:
     #     pass
-
-
-class CommProtocol(Enum):
-    IPC = "IPC"
-    TCP = "TCP"
-    RDMA = "RDMA"
-    SHM = "SHM"
 
 
 class ZMQCommunicator(BaseCommunicator):
@@ -84,28 +116,17 @@ class ZMQCommunicator(BaseCommunicator):
         if self.event.fd in events:
             self.event.drain()
 
-    def _endpoint(self, entity_id: str) -> str:
-        if self.protocol == CommProtocol.IPC:
-            return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
-        if self.protocol == CommProtocol.TCP:
-            host = os.getenv("MSTAR_ZMQ_TCP_HOST", "127.0.0.1")
-            return f"tcp://{host}:{self._tcp_port(entity_id)}"
-        raise NotImplementedError(f"Protocol {self.protocol} not yet supported yet")
-
-    @staticmethod
-    def _tcp_port(entity_id: str) -> int:
-        base_port = int(os.getenv("MSTAR_ZMQ_TCP_BASE_PORT", "19000"))
-        if entity_id == "api_server":
-            return base_port
-        if entity_id == "conductor":
-            return base_port + 1
-        if entity_id == "api_server_preprocess_worker":
-            return base_port + 2
-        if entity_id.startswith("worker_"):
-            rank = entity_id.removeprefix("worker_")
-            if rank.isdigit():
-                return base_port + 100 + int(rank)
-        return base_port + 1000 + (sum(entity_id.encode("utf-8")) % 1000)
+    def poll_for_messages(self, timeout_ms=20):
+        """Block until a message is readable, a registered wakeup event
+        fires, or ``timeout_ms`` elapses — whichever comes first. True when
+        a message is available (left queued for ``get_all_new_messages``);
+        a wakeup ends the poll early with False (the event is drained,
+        exactly as in ``wait_for_work``). Mirrors the Rust communicator's
+        method so call sites work against either transport."""
+        events = dict(self.poller.poll(timeout=timeout_ms))
+        if self.event is not None and self.event.fd in events:
+            self.event.drain()
+        return self.pull_socket in events
 
     # def get_session_id(self) -> str:
     #     return self.session_id
@@ -123,8 +144,18 @@ class ZMQCommunicator(BaseCommunicator):
             self.push_sockets[entity_id] = sock
         self.push_sockets[entity_id].send_pyobj(msg)
 
-    def get_all_new_messages(self, blocking=False) -> list:
+    def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
         messages = []
+        if blocking:
+            # Wait until the pull socket is readable before draining. A
+            # registered wakeup event also ends the wait (and is drained
+            # here, exactly as in wait_for_work), so a completed compute
+            # future can interrupt a blocking receive. `timeout_s` bounds
+            # the wait (None = indefinitely); on expiry, drain what's there.
+            timeout_ms = None if timeout_s is None else int(timeout_s * 1000)
+            events = dict(self.poller.poll(timeout=timeout_ms))
+            if self.event is not None and self.event.fd in events:
+                self.event.drain()
         while True:
             try:
                 # zmq.NOBLOCK means zmq doesn't wait for a new message to be
@@ -141,3 +172,49 @@ class ZMQCommunicator(BaseCommunicator):
                 # zmq.Again actually means no messages left to read
                 break
         return messages
+
+
+def make_communicator(*args, **kwargs) -> BaseCommunicator:
+    """Construct the process's communicator, selecting the transport.
+
+    ``MSTAR_RUST_ZMQ`` selects it (see ``docs/environment_variables.rst``):
+
+    * ``AUTO`` (default) — the Rust-backed ``RustZMQCommunicator`` (vendored
+      ``rust/`` extension; see ``communication/rust_communicator.py``) when
+      the extension imports successfully, pyzmq otherwise.
+    * ``1`` — the Rust communicator; raises if the extension is missing.
+    * ``0`` — always the pyzmq ``ZMQCommunicator``.
+
+    The two are wire-compatible (same endpoints, same pickle frames), so the
+    flag can be set per-process — one entity at a time — while the rest of
+    the mesh stays on pyzmq.
+    """
+    choice = os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper()
+    if choice not in ("0", "1", "AUTO"):
+        raise ValueError(f"MSTAR_RUST_ZMQ must be 0, 1, or AUTO; got {choice!r}")
+    if choice != "0":
+        try:
+            import mstar_rust
+
+            from mstar.communication.rust_communicator import RustZMQCommunicator
+        except ImportError:
+            if choice == "1":
+                raise
+            logger.debug("MSTAR_RUST_ZMQ=AUTO: mstar_rust not installed, using pyzmq")
+        else:
+            # A support bundle must be able to tell what a mesh was running,
+            # and an old wheel left in an env must not silently take over
+            # the whole mesh under AUTO after an upgrade.
+            version = getattr(mstar_rust, "__version__", "<pre-versioning>")
+            logger.info(
+                "control mesh transport: rust %s (MSTAR_RUST_ZMQ=%s)",
+                version, choice)
+            if version != EXPECTED_MSTAR_RUST_VERSION:
+                logger.warning(
+                    "mstar_rust version %s does not match this tree's "
+                    "expected %s — a stale wheel may be shadowing the "
+                    "vendored rust/ build (rebuild with `maturin develop "
+                    "--release`)", version, EXPECTED_MSTAR_RUST_VERSION)
+            return RustZMQCommunicator(*args, **kwargs)
+    logger.info("control mesh transport: pyzmq (MSTAR_RUST_ZMQ=%s)", choice)
+    return ZMQCommunicator(*args, **kwargs)

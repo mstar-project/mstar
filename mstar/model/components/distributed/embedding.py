@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 
 
@@ -37,13 +37,13 @@ class VocabParallelEmbedding(nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
-        comm_group: TPCommGroup | None = None,
+        comm_group: CommGroup | None = None,
         padding_idx: int | None = None,
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.comm_group = comm_group
         self.tp_rank = comm_group.rank
         self.tp_size = comm_group.world_size

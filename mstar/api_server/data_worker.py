@@ -22,7 +22,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
-from mstar.communication.communicator import CommProtocol, ZMQCommunicator
+from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.model.base import Model
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
@@ -74,7 +74,7 @@ class PreprocessWorker:
         # The socket is only *used* from the worker thread, but owning the
         # tensor manager here lets the main thread read its tx/rx profiling
         # directly once a request is done (no cross-thread queue / race).
-        self.communicator = ZMQCommunicator(
+        self.communicator = make_communicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
@@ -152,6 +152,12 @@ class PreprocessWorker:
         self, request_id: str,
         final_outputs: dict[str, NestedLoopIndices],
     ):
+        # Every serving walk reports at least one client-facing output, so an
+        # empty dict means the walk emitted nothing (or completion raced ahead
+        # of every result). Report not-done and let the TTL backstop close the
+        # request rather than completing it instantly with zero chunks.
+        if not final_outputs:
+            return False
         return all(
             not loop_iters.label_context_gt( # recv'd loop iters is not less than the final_fwd
                 self.output_loop_idxs[request_id].get(name, None)
@@ -162,6 +168,17 @@ class PreprocessWorker:
         results = []
         while not self.output_queue.empty():
             result: ResultChunk = self.output_queue.get()
+            # A request can be cleaned up (its result already returned) while a
+            # late chunk is still in the queue -- common when several requests
+            # complete in the same step. Mirror new_result_tensors' guard and
+            # drop the straggler rather than KeyError, which would otherwise
+            # abort the whole drain and lose the other requests' chunks.
+            if result.request_id not in self.per_request_reading_tensors:
+                logger.warning(
+                    "Late result chunk for cleaned-up request %s, ignoring",
+                    result.request_id,
+                )
+                continue
             self.per_request_reading_tensors[result.request_id] -= 1
             logger.debug(
                 "Data worker reading queue for request %s decreased to length %d",
@@ -216,7 +233,7 @@ class PreprocessWorkerThread:
         abort_request_queue: queue.Queue,
         discard_tensor_queue: queue.Queue,
         stop_event: threading.Event,
-        communicator: ZMQCommunicator,
+        communicator: BaseCommunicator,
         tensor_manager,
         device: str = "cpu",
         model: Model | None = None,
@@ -236,6 +253,9 @@ class PreprocessWorkerThread:
         self.enable_prof = enable_prof
 
         self.tensor_uuid_to_metadata_per_request = {}
+        # The request's model_kwargs, kept so output postprocessing can
+        # honor per-request parameters (e.g. the video container fps).
+        self.request_model_kwargs: dict[str, dict] = {}
 
         # Owned by PreprocessWorker (main thread); used only from this thread.
         self.communicator = communicator
@@ -303,19 +323,20 @@ class PreprocessWorkerThread:
             request_id=input.request_id,
             tensors=tensors # dict(modality_input: list[tensors])
         )
-        all_uuids = sum([
-            [info.uuid for info in infos] for infos in initial_signals.values()
-        ], start=[])
+        all_infos = sum(
+            [infos for infos in initial_signals.values()], start=[]
+        )
         self.tensor_manager.register_for_send(
             request_id=input.request_id,
-            uuids=all_uuids
+            tensor_infos=all_infos,
         )
         # also persist all of the input signals
-        for uuid in all_uuids:
+        for info in all_infos:
             self.tensor_manager.set_persist(
-                input.request_id, uuid, persist=True
+                input.request_id, info.uuid, persist=True
             )
 
+        self.request_model_kwargs[input.request_id] = input.model_kwargs or {}
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -409,17 +430,20 @@ class PreprocessWorkerThread:
                         uuid=tensor_info.uuid
                     )
                     postprocessed = self.model.postprocess(
-                        tensor, modality
+                        tensor, modality,
+                        request_kwargs=self.request_model_kwargs.get(request_id),
                     )
 
                     chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                         tensor_info.uuid] or {}
                     # Audio is emitted as headerless 16-bit PCM; surface the
-                    # model's output sample rate so clients can wrap it.
+                    # model's output sample rate + channel count so clients can
+                    # wrap it.
                     if modality == "audio" and self.model is not None:
                         chunk_metadata = {
                             **chunk_metadata,
                             "sample_rate": self.model.get_output_sample_rate("audio"),
+                            "num_channels": self.model.get_output_audio_channels("audio"),
                         }
 
                     self.out_queue.put(ResultChunk(
@@ -462,13 +486,15 @@ class PreprocessWorkerThread:
             did_work = False
             try:
                 did_work = self._process_messages()
-                if not self.in_queue.empty():
-                    did_work = True
-                    self._process_input(self.in_queue.get())
-                if not self.result_tensor_queue.empty():
+                # Output delivery is latency-sensitive: the API server holds a
+                # finished request open for its final chunks only briefly, so
+                # queued read-starts / acks / cleanups must never wait behind a
+                # multi-second media preprocess. Drain them fully every pass
+                # and take at most one preprocess item afterwards.
+                while not self.result_tensor_queue.empty():
                     did_work = True
                     self._read_result_tensor(self.result_tensor_queue.get())
-                if not self.abort_request_queue.empty():
+                while not self.abort_request_queue.empty():
                     did_work = True
                     self.communicator.send(
                         "conductor",
@@ -477,16 +503,40 @@ class PreprocessWorkerThread:
                             body=AbortRequest(request_id=self.abort_request_queue.get()),
                         ),
                     )
-                if not self.discard_tensor_queue.empty():
+                while not self.discard_tensor_queue.empty():
                     did_work = True
                     self._discard_result_tensor(self.discard_tensor_queue.get())
-                if not self.cleanup_request_queue.empty():
+                while not self.cleanup_request_queue.empty():
                     did_work = True
                     req_id = self.cleanup_request_queue.get()
                     self.tensor_manager.cleanup_request(req_id)
                     if req_id in self.tensor_uuid_to_metadata_per_request:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
-                did_work = did_work or self._process_read_tensors()
+                    self.request_model_kwargs.pop(req_id, None)
+                did_work = self._process_read_tensors() or did_work
+                if not self.in_queue.empty():
+                    did_work = True
+                    pre_input = self.in_queue.get()
+                    try:
+                        self._process_input(pre_input)
+                    except Exception as exc:  # noqa: BLE001 — any failure must reach the client
+                        # A request whose media load or prompt processing fails
+                        # never reaches the conductor, so nothing downstream
+                        # would ever complete it; surface the failure as an
+                        # error chunk instead of leaving the client to hit the
+                        # server timeout.
+                        logger.exception(
+                            "Preprocessing failed for request %s", pre_input.request_id
+                        )
+                        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
+                        self.out_queue.put(ResultChunk(
+                            request_id=pre_input.request_id,
+                            modality="error",
+                            data=str(exc).encode("utf-8"),
+                            metadata={"status": status},
+                        ))
+                        self.tensor_manager.cleanup_request(pre_input.request_id)
+                        self.request_model_kwargs.pop(pre_input.request_id, None)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 

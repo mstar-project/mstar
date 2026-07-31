@@ -3,6 +3,7 @@ import hashlib
 import logging
 import multiprocessing as mp
 import os
+import signal
 import socket
 import time
 from collections import defaultdict
@@ -13,7 +14,7 @@ import torch
 import yaml
 
 from mstar.api_server.request_types import APIServerMessage, RequestComplete
-from mstar.communication.communicator import CommProtocol, ZMQCommunicator
+from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -22,7 +23,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.distributed.communication import GlobalTPConfig, WorkerTPGroups
+from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
@@ -87,7 +88,7 @@ def _worker_process_target(
     all_worker_graph_ids_to_nodes: dict[str, set[str]],
     all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
     sharding_config: ShardingConfig,
-    tp_groups: WorkerTPGroups,
+    parallel_groups: WorkerParallelGroups,
     hostname: str,
     socket_path_prefix: str,
     dist_init_method: str,
@@ -100,6 +101,17 @@ def _worker_process_target(
     tcp_transfer_device="",
 ):
     """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
+    # no unwinding, no atexit, no finalizers — so a worker's shared-memory
+    # segments were never unlinked and leaked into /dev/shm for the life of
+    # the box. Turning it into SystemExit unwinds the interpreter normally,
+    # which runs the transport's cleanup. The main process gets this for
+    # free from SIGINT -> KeyboardInterrupt, which is why only the workers
+    # leaked.
+    def _graceful_exit(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _graceful_exit)
     logging.basicConfig(
         level=getattr(logging, log_level),
         format=f"%(asctime)s %(levelname)s [{worker_id}] %(name)s: %(message)s",
@@ -123,7 +135,7 @@ def _worker_process_target(
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
             sharding_config=sharding_config,
-            tp_groups=tp_groups,
+            parallel_groups=parallel_groups,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
             dist_init_method=dist_init_method,
@@ -237,8 +249,8 @@ class Conductor:
         self.streaming_consumers = set()
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
 
-        # (worker idx) -> {tp_group_str: tp_rank}
-        self.worker_tp_group_to_tp_rank: dict[int, dict[str, int]] = {}
+        # (worker idx) -> {sharding group key: rank within the lockstep instance}
+        self.worker_group_to_instance_rank: dict[int, dict[str, int]] = {}
 
         graph_walks = set()
         for wg in self.worker_graphs.values():
@@ -287,9 +299,13 @@ class Conductor:
                         f"but its sharding group has tp_size {group.tp_size}. "
                         f"node_groups and sharding_config disagree."
                     )
-                    for ranks in wg._tp_ranks:
+                    # The instance rank is the worker's index within the
+                    # lockstep instance (0..tp*sp-1), used by the
+                    # replicated-signal fanout (so exactly one rank — index 0
+                    # — forwards a replicated tensor to a downstream node).
+                    for ranks in wg._instance_ranks:
                         for i, r in enumerate(ranks):
-                            self.worker_tp_group_to_tp_rank.setdefault(r, {})[group_key] = i
+                            self.worker_group_to_instance_rank.setdefault(r, {})[group_key] = i
 
         # Pick a free TCP port for the NCCL init store. Done once on the
         # conductor and shared with every spawned worker via
@@ -302,7 +318,7 @@ class Conductor:
         self._derive_worker_info()
         self._launch_workers()
 
-        self.communicator = ZMQCommunicator(
+        self.communicator = make_communicator(
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
@@ -313,11 +329,25 @@ class Conductor:
         # Apply any KV cache overrides from the YAML config
         yaml_kv_overrides = self.model_config.get("kv_cache", {})
         if yaml_kv_overrides:
-            from dataclasses import fields
+            from dataclasses import fields, replace
+            # cross_attn is a nested {source: CrossAttnKVConfig}; the YAML gives
+            # {source: {field: value}} and we patch each pool's fields (frozen
+            # dataclass -> dataclasses.replace). Everything else is a flat setattr.
+            cross_overrides = yaml_kv_overrides.get("cross_attn", {})
             for kv_cfg in kv_cache_config:
                 for f in fields(kv_cfg):
+                    if f.name == "cross_attn":
+                        continue
                     if f.name in yaml_kv_overrides:
                         setattr(kv_cfg, f.name, yaml_kv_overrides[f.name])
+                if cross_overrides and kv_cfg.cross_attn:
+                    kv_cfg.cross_attn = {
+                        source: (
+                            replace(pool, **cross_overrides[source])
+                            if source in cross_overrides else pool
+                        )
+                        for source, pool in kv_cfg.cross_attn.items()
+                    }
                 logger.info("KV cache config after YAML overrides: %s", kv_cfg)
         return kv_cache_config
 
@@ -370,17 +400,17 @@ class Conductor:
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
 
-        # set the _tp_rank properly for each worker
+        # set each group's _tp_rank (the worker's instance rank) per worker
         self.per_worker_sharding_config: dict[str, ShardingConfig] = {}
         for i, worker_id in enumerate(self.worker_ids):
             sharding_cfg = self.default_sharding_config.clone_empty()
             for group in sharding_cfg.groups:
                 group_key = group.key_str()
-                if group_key in self.worker_tp_group_to_tp_rank.get(i, {}):
-                    group._tp_rank = self.worker_tp_group_to_tp_rank[i][group_key]
+                if group_key in self.worker_group_to_instance_rank.get(i, {}):
+                    group._tp_rank = self.worker_group_to_instance_rank[i][group_key]
             self.per_worker_sharding_config[worker_id] = sharding_cfg
 
-        self.tp_config = GlobalTPConfig(
+        self.parallel_config = GlobalParallelConfig(
             worker_graphs=self.worker_graphs,
             worker_ids=self.worker_ids,
         )
@@ -401,7 +431,7 @@ class Conductor:
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
                     "all_worker_graph_ids_to_dyn_loops": self._all_worker_graph_ids_to_dyn_loops,
                     "sharding_config": self.per_worker_sharding_config[worker_id],
-                    "tp_groups": self.tp_config.per_worker_config[worker_id],
+                    "parallel_groups": self.parallel_config.per_worker_config[worker_id],
                     "hostname": self.hostname,
                     "socket_path_prefix": self.socket_path_prefix,
                     "dist_init_method": self._dist_init_method,
@@ -421,13 +451,24 @@ class Conductor:
         atexit.register(self.shutdown)
 
     def shutdown(self):
-        logger.info("Shutting down conductor...")
         """Terminate and join all worker processes."""
+        logger.info("Shutting down conductor...")
+        # SIGTERM is handled in _worker_process_target as a graceful exit so
+        # the transports' cleanup runs (shm segments unlinked). A worker
+        # blocked in a C call cannot service it in time, so escalate to
+        # SIGKILL after the join window rather than hang the shutdown —
+        # the leftover segments are then reclaimed by the next arena
+        # start's orphan sweep.
         for p in self._worker_processes:
             if p.is_alive():
                 p.terminate()
         for p in self._worker_processes:
             p.join(timeout=5)
+            if p.is_alive():
+                logger.warning(
+                    "Worker pid %s did not exit on SIGTERM; killing", p.pid)
+                p.kill()
+                p.join(timeout=5)
         self._worker_processes.clear()
 
     def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
@@ -446,11 +487,15 @@ class Conductor:
         group_id_to_replica_idx: dict[int, int] = {}
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            if wg._tp_ranks:
+            if wg._instance_ranks:
+                # Route to a whole instance (the lockstep unit): every rank of a
+                # tp*sp instance runs the request together, so its TP all-reduce
+                # and SP all-to-all collectives stay in sync. Picking a single TP
+                # row here would desync the SP all-to-all across rows.
                 replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg._tp_ranks)),
+                    wg._group_id, np.random.randint(len(wg._instance_ranks)),
                 )
-                ranks = wg._tp_ranks[replica_idx]
+                ranks = wg._instance_ranks[replica_idx]
                 result[wg_id] = [f"worker_{r}" for r in ranks]
             else:
                 replica_idx = group_id_to_replica_idx.setdefault(

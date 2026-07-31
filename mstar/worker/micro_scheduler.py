@@ -55,15 +55,15 @@ class MicroScheduler:
     def __init__(
         self, engine_manager: EngineManager,
         sched_type=SchedulingType.ROUND_ROBIN,
-        tp_rank_zero_nodes: set[str] | None = None,
+        parallel_leader_nodes: set[str] | None = None,
         max_consec_tp_follower_batches: int = 1,
     ):
         self.engine_manager = engine_manager
         self.batch_number = 0
         self.sched_type = sched_type
 
-        # tensor parallel
-        self.tp_rank_zero_nodes = tp_rank_zero_nodes
+        # lockstep-parallel (TP / SP instance) scheduling
+        self.parallel_leader_nodes = parallel_leader_nodes
         self.tp_batches_pending_schedule = deque()
         self.num_consec_tp_follower_batches = 0
         self.max_consec_tp_follower_batches = max_consec_tp_follower_batches
@@ -135,10 +135,24 @@ class MicroScheduler:
 
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
+        target_node_name: str | None = None,
+        target_graph_walk: str | None = None,
+        exclude_target: tuple[str, str] | None = None,
     ) -> ScheduledBatch | None:
         if len(self.tp_batches_pending_schedule) == 0:
             return
         first_tp_node: ScheduleTPNode = self.tp_batches_pending_schedule[0]
+        # Respect the caller's filters: a targeted call (e.g. the speculation
+        # path asking for one specific node/walk) must not be handed a TP
+        # follower batch for some other node, or the caller will merge those
+        # node objects into a batch labeled with the target's name.
+        if target_node_name is not None and first_tp_node.node_name != target_node_name:
+            return
+        if target_graph_walk is not None and first_tp_node.graph_walk != target_graph_walk:
+            return
+        if exclude_target is not None and \
+                (first_tp_node.node_name, first_tp_node.graph_walk) == exclude_target:
+            return
         if self.num_consec_tp_follower_batches >= self.max_consec_tp_follower_batches and \
                 self.has_ready_excluding(
                     worker_graphs_manager,
@@ -147,8 +161,11 @@ class MicroScheduler:
             return
         # check if batch is ready
         node_partition = worker_graphs_manager.get_partition_for_node(first_tp_node.node_name)
+        # Use the leader's graph walk, not this worker's current one: the
+        # follower may lag or lead the leader's partition state.
         wgid = worker_graphs_manager.get_worker_graph_id_for_node(
-            first_tp_node.request_ids[0], first_tp_node.node_name
+            first_tp_node.request_ids[0], first_tp_node.node_name,
+            graph_walk=first_tp_node.graph_walk,
         )
         queue = worker_graphs_manager.queues[wgid]
         for rid in first_tp_node.request_ids:
@@ -217,7 +234,12 @@ class MicroScheduler:
             rid: t for rid, t in self.held_until.items() if t > now
         }
 
-        tp_follow_batch = self._try_schedule_tp_follow(worker_graphs_manager)
+        tp_follow_batch = self._try_schedule_tp_follow(
+            worker_graphs_manager,
+            target_node_name=target_node_name,
+            target_graph_walk=target_graph_walk,
+            exclude_target=exclude_target,
+        )
         if tp_follow_batch is None:
             self.num_consec_tp_follower_batches = 0
         else:
@@ -235,7 +257,7 @@ class MicroScheduler:
                 if request_id in self.held_until:
                     continue
                 for sname in node_names:
-                    if sname not in self.tp_rank_zero_nodes:
+                    if sname not in self.parallel_leader_nodes:
                         continue # only rank 0 can initiate scheduling!
                     if target_node_name is not None and sname != target_node_name:
                         continue

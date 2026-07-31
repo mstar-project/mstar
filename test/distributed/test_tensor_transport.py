@@ -110,7 +110,7 @@ def _send(
         info.source_tp_rank = source_tp_rank
         info.source_tp_size = source_tp_size
     manager.register_for_send(
-        request_id, [info.uuid for info in edge.tensor_info],
+        request_id, edge.tensor_info,
     )
     return edge
 

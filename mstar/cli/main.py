@@ -25,11 +25,16 @@ import mstar
 DEFAULT_CONFIGS: dict[str, str] = {
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
+    "cosmos3": "cosmos3_nano.yaml",
+    "cosmos3_super": "cosmos3_super_tp2.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
+    # ASR (Beta, un-optimized) — audio in, transcript out.
+    "whisper_large": "whisper_large.yaml",
+    "higgs_audio": "higgs_audio.yaml",
 }
 
 
@@ -77,6 +82,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
+    if model in ("cosmos3", "cosmos3_super"):
+        lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
+        lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
     if model in ("orpheus", "qwen3_omni"):
@@ -85,9 +93,13 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
+    if model in ("whisper_large", "higgs_audio"):
+        lines.append("    res = client.generate(text=\"\", audio=\"speech.wav\", "
+                     "input_modalities=(\"audio\",\"text\"))")
+        lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
-    if model in ("bagel", "qwen3_omni", "orpheus"):
+    if model in ("bagel", "qwen3_omni", "orpheus", "cosmos3", "cosmos3_super"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
@@ -99,6 +111,8 @@ def _next_steps(model: str, host: str, port: int) -> str:
             lines.append(f"    oai.audio.speech.create(model=\"{model}\", input=\"hi\", voice=\"{voice}\")")
         if model == "bagel":
             lines.append("    oai.images.generate(model=\"bagel\", prompt=\"a cat\")")
+        if model in ("cosmos3", "cosmos3_super"):
+            lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
     lines.append("")
     return "\n".join(lines)
 

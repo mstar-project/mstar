@@ -122,8 +122,9 @@ def test_store_and_register_creates_file():
         mgr = _make_manager(tmpdir, request_id="req1")
         tensor = torch.randn(4, 8)
         info = mgr.store_and_return_tensor_info("req1", {"out": [tensor]})
-        uuid = info["out"][0].uuid
-        mgr.register_for_send("req1", [uuid])
+        tensor_info = info["out"][0]
+        uuid = tensor_info.uuid
+        mgr.register_for_send("req1", [tensor_info])
 
         expected_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
         assert os.path.isfile(expected_path)
@@ -141,7 +142,7 @@ def test_full_sender_receiver_cycle():
         edges = [GraphEdge(next_node="LLM", name="image_embs")]
         sender.store_and_populate_graph_edges("req1", {"image_embs": [original]}, edges)
         uuids = [info.uuid for info in edges[0].tensor_info]
-        sender.register_for_send("req1", uuids)
+        sender.register_for_send("req1", edges[0].tensor_info)
 
         # Receiver: start read
         receiver.start_read_tensors("req1", edges, graph_walk="decode")
@@ -167,7 +168,7 @@ def test_full_cycle_bfloat16():
         edges = [GraphEdge(next_node="LLM", name="embs")]
         sender.store_and_populate_graph_edges("req1", {"embs": [original]}, edges)
         uuids = [info.uuid for info in edges[0].tensor_info]
-        sender.register_for_send("req1", uuids)
+        sender.register_for_send("req1", edges[0].tensor_info)
 
         receiver.start_read_tensors("req1", edges, graph_walk="decode")
         receiver.get_ready_tensors(graph_walk="decode")
@@ -180,8 +181,9 @@ def test_cleanup_unlinks_file():
         mgr = _make_manager(tmpdir, request_id="req1")
         tensor = torch.randn(4, 8)
         info = mgr.store_and_return_tensor_info("req1", {"out": [tensor]})
-        uuid = info["out"][0].uuid
-        mgr.register_for_send("req1", [uuid])
+        tensor_info = info["out"][0]
+        uuid = tensor_info.uuid
+        mgr.register_for_send("req1", [tensor_info])
 
         path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
         assert os.path.isfile(path)
@@ -201,7 +203,7 @@ def test_local_tensor_skips_shm():
         edges = [GraphEdge(next_node="LLM", name="data")]
         mgr.store_and_populate_graph_edges("req1", {"data": [tensor]}, edges)
         uuids = [info.uuid for info in edges[0].tensor_info]
-        mgr.register_for_send("req1", uuids)
+        mgr.register_for_send("req1", edges[0].tensor_info)
 
         # Reading from self — should NOT open an SHM file, just increment ref
         mgr.start_read_tensors("req1", edges, graph_walk="decode")
@@ -222,7 +224,7 @@ def test_ack_sent_on_remote_read():
         edges = [GraphEdge(next_node="node", name="t")]
         sender.store_and_populate_graph_edges("req1", {"t": [original]}, edges)
         uuids = [info.uuid for info in edges[0].tensor_info]
-        sender.register_for_send("req1", uuids)
+        sender.register_for_send("req1", edges[0].tensor_info)
 
         receiver.start_read_tensors("req1", edges, graph_walk="decode")
         receiver.get_ready_tensors(graph_walk="decode")
@@ -240,7 +242,7 @@ def _produce_registered_output(mgr, request_id, name="audio_output"):
     edges = [GraphEdge(next_node="api_server", name=name)]
     mgr.store_and_populate_graph_edges(request_id, {name: [torch.randn(8, 16)]}, edges)
     uuid = edges[0].tensor_info[0].uuid
-    mgr.register_for_send(request_id, [uuid])
+    mgr.register_for_send(request_id, edges[0].tensor_info)
     return edges, uuid
 
 

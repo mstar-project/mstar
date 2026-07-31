@@ -9,7 +9,7 @@ The TP-aware versions of these blocks (parallel linears, etc.) will
 land here too in a follow-up; the current shapes intentionally leave
 room for that.
 """
-from mstar.model.components.attention import Attention
+from mstar.model.components.attention import Attention, CrossAttention
 from mstar.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
@@ -25,6 +25,7 @@ from mstar.model.components.norm import AdaRMSNorm, RMSNorm
 
 __all__ = [
         "Attention",
+        "CrossAttention",
     "DecoderLayer",
     "GatedDecoderLayer",
     "FusedColumnLinear",

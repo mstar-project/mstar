@@ -194,6 +194,55 @@ def pcm16_to_container(pcm: bytes, sample_rate: int, fmt: str = "wav") -> tuple[
         return pcm16_to_wav_bytes(pcm, sample_rate), AUDIO_FORMAT_MIME["wav"]
 
 
+def mux_mp4_with_pcm16(
+    video_mp4: bytes, pcm: bytes, sample_rate: int, num_channels: int = 2,
+    video_fps: float | None = None,
+) -> bytes:
+    """Mux an H.264 mp4 and raw interleaved 16-bit PCM into one mp4 with an AAC
+    audio track (stream-copies the video). ``video_fps`` is the true frame rate
+    of the content: when it differs from the container's rate the video
+    timestamps are rescaled (no re-encode) so playback runs at the real rate
+    and stays in sync with the audio track. Requires the ``ffmpeg`` binary;
+    raises on failure — callers fall back to the video-only mp4."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        vpath = Path(tmp) / "v.mp4"
+        apath = Path(tmp) / "a.pcm"
+        opath = Path(tmp) / "out.mp4"
+        vpath.write_bytes(video_mp4)
+        apath.write_bytes(pcm)
+        itsscale = None
+        if video_fps:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", str(vpath)],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            try:
+                num, den = probe.stdout.strip().split("/")
+                container_fps = float(num) / float(den)
+                if container_fps > 0 and abs(container_fps - video_fps) > 1e-3:
+                    itsscale = container_fps / float(video_fps)
+            except (ValueError, ZeroDivisionError):
+                pass
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        if itsscale is not None:
+            cmd += ["-itsscale", f"{itsscale:.6f}"]
+        cmd += [
+            "-i", str(vpath),
+            "-f", "s16le", "-ar", str(int(sample_rate)), "-ac", str(int(num_channels)), "-i", str(apath),
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(opath),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg mux failed: {proc.stderr.strip()[:500]}")
+        return opath.read_bytes()
+
+
 def wav_stream_header(sample_rate: int, num_channels: int = 1, bits: int = 16) -> bytes:
     """A 44-byte WAV header with streaming (unknown-length) size fields.
 

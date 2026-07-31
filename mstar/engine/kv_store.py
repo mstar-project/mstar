@@ -67,6 +67,38 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
+@dataclass(frozen=True)
+class CrossAttnKVConfig:
+    """Config for one cross-attention context KV pool.
+
+    Cross-attention K/V come from an encoder context: written once at
+    encode time, reused (read-only) by every decoder step, and possibly
+    shaped differently from the decoder's self-attention KV.
+
+    Only the fields that genuinely differ from the decoder's self-attention
+    are declared here; everything else is inherited from the parent
+    ``KVCacheConfig`` (``page_size``, ``num_layers`` — one cross-attention
+    block per decoder layer, and ``num_qo_heads`` — the decoder queries the
+    context with its own heads).
+
+    Pool sharing: sources whose configs match on everything *except*
+    ``max_num_pages`` (see ``pool_key``) share one physical pool, and that
+    pool's page budget is the **sum** of the sharing sources' ``max_num_pages``.
+    So two sources with identical head geometry asking for 256 pages each
+    get a 512-page shared pool. ``CrossAttnKVConfig`` is frozen/hashable so
+    it can key the dedup map.
+    """
+    num_kv_heads: int
+    head_dim: int
+    max_context_len: int  # per-request context capacity (tokens)
+    max_num_pages: int = 256
+
+    def pool_key(self) -> tuple:
+        """Identity for pool sharing: everything except the page budget
+        (pages accumulate across sources that share a pool)."""
+        return (self.num_kv_heads, self.head_dim, self.max_context_len)
+
+
 @dataclass
 class KVCacheConfig:
     num_layers: int
@@ -78,6 +110,14 @@ class KVCacheConfig:
     num_qo_heads: int | None = None  # Optional, defaults to num_kv_heads
     cpu_offload_pages: int = 0  # >0 enables CPU offloading with this many CPU pages
     nodes: list[str] = None # defaults to all AR nodes
+    # Cross-attention context pools, keyed by source name (e.g. "default",
+    # "audio_encoder"). See CrossAttnKVConfig.
+    cross_attn: dict[str, CrossAttnKVConfig] = None
+    # Which cache-manager backend serves this cache's attention — a key in
+    # cache_manager.ATTENTION_BACKENDS: "flashinfer" (paged, the default) or
+    # "dense_gen" (adds the dense FA3 generation-attention fast path). The
+    # model's get_kv_cache_config sets it; model yaml config may override.
+    attention_backend: str = "flashinfer"
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -92,12 +132,12 @@ class KVCacheConfig:
             return "ALL_NODES"
         return "///".join(self.nodes)
 
-    def shard(self, tp_size: int):
-        if tp_size >= self.original_num_kv_heads:
+    def shard(self, num_shards: int):
+        if num_shards >= self.original_num_kv_heads:
             self.num_kv_heads = 1
         else:
-            self.num_kv_heads = divide(self.original_num_kv_heads, tp_size)
-        self.num_qo_heads = divide(self.original_num_qo_heads, tp_size)
+            self.num_kv_heads = divide(self.original_num_kv_heads, num_shards)
+        self.num_qo_heads = divide(self.original_num_qo_heads, num_shards)
         self._sharded = True
 
 
@@ -119,6 +159,16 @@ class KVRequestState:
 
     # sequence length of the in-distributed-store KV cache
     is_paused: bool = False
+
+    # Lazily-filled {layer_idx: (k_pref, v_pref)} contiguous copies of the frozen
+    # text-prefix K/V, used by the dense generation-attention path. The prefix is
+    # written once at prefill and immutable through denoise (text tokens get no
+    # timestep embedding; the dense path never writes generation K/V to pages), so
+    # it is gathered once and reused across steps rather than re-gathered from the
+    # paged cache every step. Reset to None by _new_state()
+    # (add_request/reset_label/remove_request) — exactly when the prefix pages are
+    # (re)allocated — so it needs no manual invalidation.
+    dense_prefix_kv: dict | None = None
 
     def get_pos_info(self):
         return PositionInfo(
@@ -390,6 +440,23 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         for fut in self._pending:
             fut.result()
         self._executor.shutdown(wait=True)
+
+
+@dataclass
+class CrossAttnPool:
+    """One physical cross-attention KV pool (possibly shared by several
+    sources whose ``CrossAttnKVConfig`` compare equal).
+
+    ``alloc_config`` is a synthesized ``KVCacheConfig`` carrying the
+    pool's page geometry so ``PagedAllocationManager`` and the FlashInfer
+    wrapper construction can reuse the self-attention code paths
+    unchanged.
+    """
+    config: CrossAttnKVConfig
+    alloc_config: "KVCacheConfig"
+    kv_cache: torch.Tensor
+    alloc_manager: "PagedAllocationManager"
+
 
 class PagedAllocationManager:
     def __init__(

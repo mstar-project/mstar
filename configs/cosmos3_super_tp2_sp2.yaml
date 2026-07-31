@@ -1,0 +1,22 @@
+model: "cosmos3_super"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool. With 2D tp*sp = 4 each rank holds num_kv_heads / 4 heads, so
+# the cache is half the per-page memory of the TP=2 config; 384 pages cover t2i
+# plus 256p/480p video with headroom for activations.
+kv_cache:
+  max_num_pages: 384
+# Super (64B, ~128 GB bf16) needs tensor parallelism just to fit its weights
+# (~64 GB/rank at tp_size=2). Ulysses sequence parallelism is layered on top to
+# shard the replicated diffusion activations that TP alone leaves full — the
+# lever for the 480p-video cells (free memory so the denoise can graph) and for
+# 720p-video denoise. The 4 ranks form a [sp_size, tp_size] grid: TP groups
+# {0,1},{2,3}; SP groups {0,2},{1,3}. The VAE decoder runs un-sharded on rank 0.
+# Serve eager (DISABLE_GRAPH=1) for v1.
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1, 2, 3]
+    tp_size: 2
+    sp_size: 2
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
+    ranks: [0]

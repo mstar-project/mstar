@@ -507,7 +507,7 @@ class Pi05Model(Model):
         text_ids = self.tokenizer.encode_prompt(full_prompt)
         return {"text_inputs": [text_ids]}
 
-    def postprocess(self, output: torch.Tensor, modality: str) -> bytes:
+    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "action":
             return output.detach().to(torch.float32).cpu().numpy().tobytes()
         raise ValueError(f"Unsupported modality for Pi0.5: {modality!r}")

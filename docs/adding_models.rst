@@ -110,6 +110,29 @@ The abstract methods you **must** implement:
    ``num_kv_heads``, ``head_dim``, ``max_seq_len``, ``num_qo_heads``). Return a single
    config if all AR nodes share one. Models with no AR node may return an empty list.
 
+   **Cross-attention (encoder-decoder models).** For a decoder that attends to a
+   fixed encoder context (Whisper, etc.), declare one or more context pools via
+   ``KVCacheConfig.cross_attn``, a ``{source_name: CrossAttnKVConfig}`` map.
+   ``CrossAttnKVConfig`` carries only what differs from the decoder's
+   self-attention — ``num_kv_heads``, ``head_dim``, ``max_context_len`` (per-request
+   context capacity in tokens) and ``max_num_pages`` (page budget); ``page_size``,
+   ``num_layers`` and ``num_qo_heads`` are inherited from the parent config. The
+   submodule then writes the context K/V once at prefill with
+   ``cache_handle.add_cross_attn_kv(...)`` and, every step, calls
+   ``cache_handle.plan_cross_attention(...)`` (in ``preprocess``) and
+   ``cache_handle.run_cross_attn(q, source=...)`` (in the layer forward). A
+   single-source model uses ``source="default"`` and can omit the argument.
+
+   *Pool sharing.* Sources whose ``num_kv_heads`` / ``head_dim`` / ``max_context_len``
+   match share **one physical pool**, and that pool's page budget is the **sum** of
+   the sharing sources' ``max_num_pages`` — so two same-geometry sources ("audio",
+   "image") asking for 256 pages each get a 512-page shared pool. Sources with
+   differing geometry get separate pools.
+
+   *YAML override.* Like the flat KV fields, cross-attention pools are overridable
+   from the model config's ``kv_cache:`` block via a nested ``cross_attn:`` map,
+   e.g. ``kv_cache: {cross_attn: {default: {max_num_pages: 384}}}``.
+
 ``get_node_engine_types(self) -> dict[str, EngineType]``
    Maps each graph-node name to an :class:`mstar.engine.base.EngineType`
    (``KV_CACHE`` or ``STATELESS``). See `Step 6 — Choose engine types`_ below.
