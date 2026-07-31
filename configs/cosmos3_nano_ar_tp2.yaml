@@ -1,0 +1,18 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool (see cosmos3_nano_tp2.yaml).
+kv_cache:
+  max_num_pages: 1024
+# cosmos3_nano_tp2.yaml plus the opt-in windowed video walk: the DiT (and its
+# windowed commit pass) runs tensor-parallel across two ranks; the streaming
+# window decoder is small and runs un-sharded on rank 0, consuming the
+# window-latents stream the multi-rank producer dedups to rank 0.
+model_kwargs:
+  enable_windowed_video: true
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1]
+    tp_size: 2
+  - node_names: ["vae_encoder", "vae_decoder", "vae_decoder_ar", "audio_decoder"]
+    ranks: [0]

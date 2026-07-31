@@ -1432,6 +1432,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # sequential path.
             if not all(st["uncond"] is not None for st in sts):
                 return False
+            if batch.graph_walk not in GEN_WALKS:
+                # Windowed requests join only generation-loop batches; their
+                # prefill stays sequential (these passes carry no time_index,
+                # and the committed kv text prefix must not depend on which
+                # requests happened to arrive together).
+                return all("ar_schedule" not in st for st in sts)
             for st, inp in zip(sts, model_inputs, strict=True):
                 if "ar_schedule" not in st:
                     continue

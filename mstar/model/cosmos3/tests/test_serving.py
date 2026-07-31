@@ -1179,6 +1179,17 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
     assert sub.can_batch(batch_kv, [inp(1), inp(1)])
     assert not sub.can_batch(batch_kv, [inp(1), inp(4)])  # local 4 == steps
 
+    # A prefill batch carries no time_index; with a windowed request in it the
+    # batch must fall to the sequential path (not raise), while plain-only
+    # prefill batches still batch.
+    noti = SimpleNamespace(tensor_inputs={})
+    batch_pre = SimpleNamespace(graph_walk=C.PREFILL_WALK, request_ids=["a", "p"])
+    sub.request_state("p").add_all(cond={}, uncond={})
+    assert not sub.can_batch(batch_pre, [noti, noti])
+    batch_pp = SimpleNamespace(graph_walk=C.PREFILL_WALK, request_ids=["p", "q"])
+    sub.request_state("q").add_all(cond={}, uncond={})
+    assert sub.can_batch(batch_pp, [noti, noti])
+
     # Batched forward: request "a" at its window-0 boundary (local 3),
     # request "b" mid-window. The boundary request emits + stages.
     sub.transformer = SimpleNamespace(
@@ -1206,7 +1217,7 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
     assert out["a"]["latents"][0].shape == latent_shape  # staged next window
     assert "window_latents" not in out["b"]
     assert torch.equal(out["b"]["latents"][0], lat["b"] * 0.5)
-    for rid in ("a", "b", "c"):
+    for rid in ("a", "b", "c", "p", "q"):
         sub.cleanup_request(rid)
 
 
