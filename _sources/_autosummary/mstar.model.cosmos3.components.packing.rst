@@ -25,6 +25,7 @@ mstar.model.cosmos3.components.packing
       get_3d_mrope_ids_text_tokens
       get_3d_mrope_ids_vae_tokens
       normalize_condition_frame_indexes
+      resolve_action_domain_id
       tokenize_prompt
       vision_condition_frame_indexes
    

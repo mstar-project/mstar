@@ -29,6 +29,7 @@ mstar.model.cosmos3.tests
 
    pipeline
    test_action
+   test_droid
    test_engine_cache
    test_loader
    test_serving

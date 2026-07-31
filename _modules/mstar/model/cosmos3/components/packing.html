@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 30, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 31, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -1010,6 +1010,57 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># The published Cosmos3 embodiment-domain table: requests may name their</span>
+<span class="c1"># embodiment instead of sending the numeric domain id. droid_lerobot and</span>
+<span class="c1"># robomind-franka share a domain (both are a Franka arm with a Robotiq</span>
+<span class="c1"># gripper); the agibot names are aliases of one domain likewise.</span>
+<span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;no_action&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="s2">&quot;av&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="s2">&quot;camera_pose&quot;</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span>
+    <span class="s2">&quot;hand_pose&quot;</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span>
+    <span class="s2">&quot;pusht&quot;</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span>
+    <span class="s2">&quot;libero&quot;</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span>
+    <span class="s2">&quot;umi&quot;</span><span class="p">:</span> <span class="mi">6</span><span class="p">,</span>
+    <span class="s2">&quot;bridge_orig_lerobot&quot;</span><span class="p">:</span> <span class="mi">7</span><span class="p">,</span>
+    <span class="s2">&quot;droid_lerobot&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+    <span class="s2">&quot;robomind-franka&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+    <span class="s2">&quot;galbot&quot;</span><span class="p">:</span> <span class="mi">9</span><span class="p">,</span>
+    <span class="s2">&quot;robomind-franka-dual&quot;</span><span class="p">:</span> <span class="mi">12</span><span class="p">,</span>
+    <span class="s2">&quot;robomind-ur&quot;</span><span class="p">:</span> <span class="mi">13</span><span class="p">,</span>
+    <span class="s2">&quot;agibotworld&quot;</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
+    <span class="s2">&quot;agibot_gear_gripper&quot;</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
+    <span class="s2">&quot;agibot_gear_gripper_ext&quot;</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
+    <span class="s2">&quot;fractal&quot;</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
+<span class="p">}</span>
+
+
+<div class="viewcode-block" id="resolve_action_domain_id">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.resolve_action_domain_id">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">resolve_action_domain_id</span><span class="p">(</span><span class="n">domain_id</span><span class="p">,</span> <span class="n">domain_name</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Resolve an action request&#39;s embodiment domain. A numeric ``domain_id``</span>
+<span class="sd">    wins; otherwise ``domain_name`` looks up the published table. One of the</span>
+<span class="sd">    two is required — the domain conditions the action pathway, and a silent</span>
+<span class="sd">    default would predict actions for the wrong embodiment.&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">domain_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">resolved</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">domain_id</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">resolved</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cosmos3 domain_id must be non-negative, got </span><span class="si">{</span><span class="n">resolved</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">resolved</span>
+    <span class="k">if</span> <span class="n">domain_name</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">str</span><span class="p">(</span><span class="n">domain_name</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">():</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="s2">&quot;Cosmos3 action requests require &#39;domain_id&#39; or a non-empty &#39;domain_name&#39;.&quot;</span>
+        <span class="p">)</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">domain_name</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Unknown Cosmos3 action domain_name=</span><span class="si">{</span><span class="n">domain_name</span><span class="si">!r}</span><span class="s2">; expected one of &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">)</span><span class="si">}</span><span class="s2"> or a numeric domain_id.&quot;</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">[</span><span class="n">key</span><span class="p">]</span></div>
+
+
+
 <span class="c1"># ---------------------------------------------------------------------------</span>
 <span class="c1"># Prompt tokenization — ported from pipeline.tokenize_prompt. Image mode</span>
 <span class="c1"># (num_frames == 1) and video mode differ only in the system prompt and the</span>
@@ -1422,7 +1473,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 30, 2026.
+  Last updated on Jul 31, 2026.
   <br/>
 </p>
   </div>

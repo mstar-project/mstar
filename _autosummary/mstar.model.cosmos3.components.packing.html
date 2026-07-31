@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 30, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 31, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -522,6 +522,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_text_tokens"><code class="docutils literal notranslate"><span class="pre">get_3d_mrope_ids_text_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_vae_tokens"><code class="docutils literal notranslate"><span class="pre">get_3d_mrope_ids_vae_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes"><code class="docutils literal notranslate"><span class="pre">normalize_condition_frame_indexes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id"><code class="docutils literal notranslate"><span class="pre">resolve_action_domain_id()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.tokenize_prompt"><code class="docutils literal notranslate"><span class="pre">tokenize_prompt()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.vision_condition_frame_indexes"><code class="docutils literal notranslate"><span class="pre">vision_condition_frame_indexes()</span></code></a></li>
 </ul>
@@ -583,10 +584,13 @@ diffusers pipeline’s packed t2i inputs byte-for-byte.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes" title="mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">normalize_condition_frame_indexes</span></code></a>(value, default)</p></td>
 <td><p>Normalize a request's video-conditioning latent-frame indexes.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.tokenize_prompt" title="mstar.model.cosmos3.components.packing.tokenize_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tokenize_prompt</span></code></a>(tokenizer, prompt, ...[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id" title="mstar.model.cosmos3.components.packing.resolve_action_domain_id"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_action_domain_id</span></code></a>(domain_id, domain_name)</p></td>
+<td><p>Resolve an action request's embodiment domain.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.tokenize_prompt" title="mstar.model.cosmos3.components.packing.tokenize_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tokenize_prompt</span></code></a>(tokenizer, prompt, ...[, ...])</p></td>
 <td><p>Return <code class="docutils literal notranslate"><span class="pre">(cond_input_ids,</span> <span class="pre">uncond_input_ids)</span></code> for image/video generation.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.vision_condition_frame_indexes" title="mstar.model.cosmos3.components.packing.vision_condition_frame_indexes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vision_condition_frame_indexes</span></code></a>(mode, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.vision_condition_frame_indexes" title="mstar.model.cosmos3.components.packing.vision_condition_frame_indexes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vision_condition_frame_indexes</span></code></a>(mode, ...)</p></td>
 <td><p>Clean (conditioning) latent video frames for <code class="docutils literal notranslate"><span class="pre">mode</span></code>.</p></td>
 </tr>
 </tbody>
@@ -855,6 +859,20 @@ sorted, de-duplicated tuple. <code class="docutils literal notranslate"><span cl
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.components.packing.resolve_action_domain_id">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">resolve_action_domain_id</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">domain_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">domain_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#resolve_action_domain_id"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id" title="Link to this definition">#</a></dt>
+<dd><p>Resolve an action request’s embodiment domain. A numeric <code class="docutils literal notranslate"><span class="pre">domain_id</span></code>
+wins; otherwise <code class="docutils literal notranslate"><span class="pre">domain_name</span></code> looks up the published table. One of the
+two is required — the domain conditions the action pathway, and a silent
+default would predict actions for the wrong embodiment.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.components.packing.tokenize_prompt">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">tokenize_prompt</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prompt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">negative_prompt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_frames</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">height</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">24.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_system_prompt</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">add_resolution_template</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">add_duration_template</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_sequence_length</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#tokenize_prompt"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.tokenize_prompt" title="Link to this definition">#</a></dt>
 <dd><p>Return <code class="docutils literal notranslate"><span class="pre">(cond_input_ids,</span> <span class="pre">uncond_input_ids)</span></code> for image/video generation.</p>
@@ -964,6 +982,7 @@ truncation contract); <code class="docutils literal notranslate"><span class="pr
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_text_tokens"><code class="docutils literal notranslate"><span class="pre">get_3d_mrope_ids_text_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.get_3d_mrope_ids_vae_tokens"><code class="docutils literal notranslate"><span class="pre">get_3d_mrope_ids_vae_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes"><code class="docutils literal notranslate"><span class="pre">normalize_condition_frame_indexes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id"><code class="docutils literal notranslate"><span class="pre">resolve_action_domain_id()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.tokenize_prompt"><code class="docutils literal notranslate"><span class="pre">tokenize_prompt()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.components.packing.vision_condition_frame_indexes"><code class="docutils literal notranslate"><span class="pre">vision_condition_frame_indexes()</span></code></a></li>
 </ul>
@@ -999,7 +1018,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 30, 2026.
+  Last updated on Jul 31, 2026.
   <br/>
 </p>
   </div>

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 30, 2026"/>
+    <meta name="docbuild:last-update" content="Jul 31, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -551,35 +551,41 @@ representative Hugging Face identifier.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano</span></code></p></td>
 <td><p>Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cosmos3_super</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">cosmos3_droid</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano-Policy-DROID</span></code></p></td>
+<td><p>Cosmos3 action-policy fine-tune for the DROID platform (<code class="docutils literal notranslate"><span class="pre">domain_name</span></code>
+<code class="docutils literal notranslate"><span class="pre">droid_lerobot</span></code>, 10-dim raw actions); no sound pathway. The config
+serves the released policy sampling defaults (4 steps, guidance 3.0).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">cosmos3_super</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super</span></code></p></td>
 <td><p>Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">orpheus</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">orpheus</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">canopylabs/orpheus-3b-0.1-ft</span></code></p></td>
 <td><p>TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">pi05</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">pi05</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">lerobot/pi05_base</span></code></p></td>
 <td><p>Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Omni-30B-A3B-Instruct</span></code></p></td>
 <td><p>Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/vjepa2-vitl-fpc64-256</span></code></p></td>
 <td><p>V-JEPA 2 video encoder + masked predictor.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">vjepa2-ac-vitg</span></code></p></td>
 <td><p>V-JEPA 2-AC encoder + action-conditioned predictor.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
 <td><p>Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bosonai/higgs-audio-v3-stt</span></code></p></td>
 <td><p>Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.</p></td>
 </tr>
@@ -710,7 +716,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 30, 2026.
+  Last updated on Jul 31, 2026.
   <br/>
 </p>
   </div>
