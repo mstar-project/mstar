@@ -1005,11 +1005,18 @@ class Cosmos3Model(Model):
             params["context_latent_units"] = context_units
             params["total_latent_units"] = total_units
             params["num_windows"] = schedule.num_windows
+            params["stream_video"] = bool(mk.get("stream_video"))
             # Every window after the first is conditioned generation, which
             # the reference recipe runs at the V2V flow shift; one shift for
             # all windows keeps the per-window schedules consistent. Request
             # flow_shift overrides.
             params.setdefault("flow_shift", constants.V2V_DEFAULT_FLOW_SHIFT)
+        elif mk.get("stream_video"):
+            # The non-windowed walks emit one video at the very end; there is
+            # nothing to deliver incrementally.
+            raise ValueError(
+                "Cosmos3 stream_video requires a windowed request (set window_mode)."
+            )
         return params
 
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:

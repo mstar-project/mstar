@@ -1210,23 +1210,16 @@ def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
         sub.cleanup_request(rid)
 
 
-def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
-    """The AR decoder's context-re-decode + trim reproduces the whole-clip
-    decode of the same latent stream, chunk counts drive completion, and the
-    stream's empty terminal flush is skipped."""
+def _tracing_vae():
+    """Stub VAE for the AR-decoder tests: decodes latent value v at latent
+    index i to pixel frames of value v — frame 0 from latent 0, then 4 frames
+    per later latent, the Wan VAE's temporal contract — so every output frame
+    identifies its source latent."""
     from types import SimpleNamespace
 
     import torch
 
-    from mstar.model.cosmos3.config import Cosmos3Config
-    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderARSubmodule
-
     class _TracingVAE(torch.nn.Module):
-        """Decodes latent value v at latent index i to pixel frames of value
-        v: frame 0 from latent 0, then 4 frames per later latent — the same
-        temporal contract as the Wan VAE, with content that identifies its
-        source latent."""
-
         def __init__(self):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
@@ -1242,10 +1235,24 @@ def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
             # forward maps [-1, 1] -> uint8; keep values identity-recoverable.
             return SimpleNamespace(sample=sample / 127.5 - 1.0)
 
+    return _TracingVAE()
+
+
+def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
+    """The AR decoder's context-re-decode + trim reproduces the whole-clip
+    decode of the same latent stream, chunk counts drive completion, and the
+    stream's empty terminal flush is skipped."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderARSubmodule
+
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Config()
     cfg.windowed_decode_context_latents = 3
-    sub = Cosmos3VAEDecoderARSubmodule(_TracingVAE(), cfg)
+    sub = Cosmos3VAEDecoderARSubmodule(_tracing_vae(), cfg)
     sub._decode_dtype_cached = torch.float32
 
     # Latent stream of 12 units, value = absolute unit index; windows of 8
@@ -1268,6 +1275,136 @@ def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     expected = sub._decode_pixels(stream)
     assert video.shape == expected.shape  # 1 + 11*4 = 45 frames
     assert torch.equal(video, expected)
+
+
+def test_windowed_decoder_streams_chunks(monkeypatch) -> None:
+    """stream_video emits each window's pixels as its own chunk with nothing
+    accumulated, the tail chunk is capped at the requested frame count, and
+    the chunks concatenate to the non-streaming assembly."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.submodules import Cosmos3VAEDecoderARSubmodule
+
+    monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
+    cfg = Cosmos3Config()
+    cfg.windowed_decode_context_latents = 3
+    sub = Cosmos3VAEDecoderARSubmodule(_tracing_vae(), cfg)
+    sub._decode_dtype_cached = torch.float32
+
+    stream = torch.arange(12, dtype=torch.float32).view(1, 1, 12, 1, 1).expand(1, 16, 12, 4, 4).contiguous()
+    # 43 requested frames inside the 45-frame padded schedule: the trim lands
+    # in the tail chunk.
+    md = {
+        "num_windows": 2, "overlap_latent_units": 1, "num_frames": 43,
+        "stream_video": True,
+    }
+    engine_inputs = SimpleNamespace(
+        request_ids=["r"],
+        per_request_info={"r": SimpleNamespace(step_metadata=md)},
+    )
+
+    out0 = sub.forward("video_decode_ar", engine_inputs, stream[:, :, 0:8])
+    out1 = sub.forward("video_decode_ar", engine_inputs, stream[:, :, 7:12])
+    c0 = out0["video_output"][0]
+    c1 = out1["video_output"][0]
+    assert c0.shape[2] == 29 and c1.shape[2] == 14
+    expected = sub._decode_pixels(stream)
+    assert torch.equal(torch.cat([c0, c1], dim=2), expected[:, :, :43])
+    assert sub.request_state("r")["ar_pixels"] == []
+    # The stream's empty terminal flush stays a no-op.
+    assert sub.forward("video_decode_ar", engine_inputs, torch.empty(0)) == {}
+
+
+def test_windowed_stream_video_gen_params() -> None:
+    """stream_video resolves only alongside a windowed mode."""
+    import pytest as _pytest
+
+    model = Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True,
+    )
+    p = model._resolve_gen_params(
+        {"window_mode": "chained", "num_frames": 189, "stream_video": True}, [], ["video"],
+    )
+    assert p["stream_video"] is True
+    q = model._resolve_gen_params({"window_mode": "kv", "num_frames": 189}, [], ["video"])
+    assert q["stream_video"] is False
+    with _pytest.raises(ValueError):
+        model._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
+
+
+def test_video_streaming_ndjson_lines() -> None:
+    """stream_video turns the video handler into an NDJSON generator: indexed
+    video lines closed by a done line, an in-band error line terminal instead
+    on failure, and the non-streaming path collecting as before."""
+    import asyncio
+    import base64
+    import json
+
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.api_server.openai.protocol import VideoGenerationRequest
+    from mstar.api_server.openai.serving_videos import create_videos
+    from mstar.api_server.request_types import ResultChunk
+
+    class _Api:
+        upload_dir = "/tmp"
+
+        def __init__(self, chunks):
+            self._chunks = chunks
+            self.submits = []
+
+        def submit_request(self, **kw):
+            self.submits.append(kw)
+            return kw["request_id"]
+
+        async def iter_result_chunks(self, request_id):  # noqa: ARG002
+            for c in self._chunks:
+                yield c
+
+        async def collect_results(self, request_id, raw_request=None):  # noqa: ARG002
+            return list(self._chunks)
+
+    adapter = get_adapter("cosmos3")
+    streaming_req = VideoGenerationRequest(
+        prompt="x", num_frames=57, window_mode="chained", stream_video=True,
+    )
+
+    async def _lines(api):
+        gen = await create_videos(api, "cosmos3", adapter, streaming_req)
+        return [json.loads(line) async for line in gen]
+
+    api = _Api([
+        ResultChunk(request_id="r", modality="video", data=b"w0"),
+        ResultChunk(request_id="r", modality="video", data=b"w1"),
+    ])
+    lines = asyncio.run(_lines(api))
+    assert api.submits[0]["streaming"] is True
+    assert api.submits[0]["model_kwargs"]["stream_video"] is True
+    assert [ln["modality"] for ln in lines] == ["video", "video", "done"]
+    assert [ln["metadata"]["index"] for ln in lines[:2]] == [0, 1]
+    assert base64.b64decode(lines[0]["data"]) == b"w0"
+    assert base64.b64decode(lines[1]["data"]) == b"w1"
+    assert lines[2]["metadata"]["chunks"] == 2
+
+    api = _Api([
+        ResultChunk(request_id="r", modality="video", data=b"w0"),
+        ResultChunk(
+            request_id="r", modality="error", data=b"boom", metadata={"status": 500},
+        ),
+    ])
+    lines = asyncio.run(_lines(api))
+    assert [ln["modality"] for ln in lines] == ["video", "error"]
+    assert base64.b64decode(lines[1]["data"]) == b"boom"
+
+    api = _Api([ResultChunk(request_id="r", modality="video", data=b"v")])
+    out = asyncio.run(create_videos(
+        api, "cosmos3", adapter, VideoGenerationRequest(prompt="x", num_frames=57),
+    ))
+    assert api.submits[0]["streaming"] is False
+    assert "stream_video" not in api.submits[0]["model_kwargs"]
+    assert base64.b64decode(out["data"][0]["b64_json"]) == b"v"
 
 
 if __name__ == "__main__":

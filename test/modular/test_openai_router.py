@@ -170,6 +170,36 @@ def test_chat_stream(client_and_stub):
     assert lines[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_videos_stream_ndjson(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "cosmos3"
+    stub.next_chunks = [_Chunk("video", b"mp4-w0"), _Chunk("video", b"mp4-w1")]
+    r = client.post(
+        "/v1/videos/generations",
+        json={
+            "model": "cosmos3", "prompt": "a road", "num_frames": 57,
+            "window_mode": "chained", "stream_video": True,
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    assert stub.last_submit["streaming"] is True
+    assert stub.last_submit["model_kwargs"]["stream_video"] is True
+    lines = [json.loads(l) for l in r.text.splitlines() if l.strip()]
+    assert [ln["modality"] for ln in lines] == ["video", "video", "done"]
+    assert [base64.b64decode(ln["data"]) for ln in lines[:2]] == [b"mp4-w0", b"mp4-w1"]
+    assert lines[2]["metadata"]["chunks"] == 2
+
+    # Without the flag the endpoint returns the grouped JSON body as before.
+    stub.next_chunks = [_Chunk("video", b"mp4-full")]
+    body = client.post(
+        "/v1/videos/generations",
+        json={"model": "cosmos3", "prompt": "a road", "num_frames": 57},
+    ).json()
+    assert stub.last_submit["streaming"] is False
+    assert base64.b64decode(body["data"][0]["b64_json"]) == b"mp4-full"
+
+
 def test_unsupported_model_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "pi05"

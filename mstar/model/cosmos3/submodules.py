@@ -2243,6 +2243,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
                 # The schedule may be padded up to whole windows; the request's
                 # frame count is what the assembled video is trimmed to.
                 ar_out_frames=int(md["num_frames"]),
+                ar_stream=bool(md.get("stream_video")),
+                ar_emitted=0,
                 ar_pixels=[],
             )
         index = st["ar_chunks"]
@@ -2259,10 +2261,17 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             # inside it) is exactly the part being trimmed.
             keep = new.shape[2] * self.config.vae.scale_factor_temporal
             pixels = pixels[:, :, -keep:]
-        st["ar_pixels"].append(pixels)
         stream_tail = new if tail is None else torch.cat([tail, new.to(tail.dtype)], dim=2)
         st.add("ar_tail", stream_tail[:, :, -st["ar_ctx"]:])
         st.add("ar_chunks", index + 1)
+        if st["ar_stream"]:
+            # Deliver each window as its own chunk, capped at the frames still
+            # owed (the padded final window can outrun the requested count);
+            # nothing is retained across windows.
+            chunk = pixels[:, :, : st["ar_out_frames"] - st["ar_emitted"]]
+            st.add("ar_emitted", st["ar_emitted"] + chunk.shape[2])
+            return {"video_output": [chunk]} if chunk.shape[2] else {}
+        st["ar_pixels"].append(pixels)
         if index + 1 < st["ar_windows"]:
             return {}
         video = torch.cat(st["ar_pixels"], dim=2)[:, :, : st["ar_out_frames"]]
