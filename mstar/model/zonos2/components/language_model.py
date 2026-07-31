@@ -19,7 +19,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.cache_manager import BatchedCacheManager
-from mstar.model.components import RMSNorm
+from mstar.model.components import RMSNorm, SparseMoeBlock
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -27,7 +27,6 @@ from mstar.model.components.distributed import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from mstar.model.components.moe import dispatch_experts
 from mstar.model.zonos2.config import Zonos2Config
 
 # The reference attention hardcodes the QK-norm epsilon (F.rms_norm(..., eps=1e-6)).
@@ -204,13 +203,19 @@ class Zonos2Attention(nn.Module):
 class Zonos2Router(nn.Module):
     """MoE router with Expert-Dropout-Augmentation (EDA) state threading.
 
+    This is a *stateful* router in the sense of the router contract in
+    :mod:`mstar.model.components.moe`: it is plugged into a stock
+    :class:`~mstar.model.components.SparseMoeBlock` via that block's ``router``
+    argument, and the block threads its state with ``return_router_states=True``.
+
     The router down-projects the hidden state to ``router_dim``. It optionally
     blends in the previous MoE layer's router state (EDA). It RMS-normalizes,
     runs a 3-layer GELU MLP to per-expert logits, applies softmax, and selects
     a bias-aware top-k. It returns the routing weights, the expert indices, and
     the *pre-norm* router state for the next MoE layer's EDA.
 
-    Checkpoint layout:
+    Checkpoint layout (the reference names it ``router``; the block holds it as
+    ``gate``, so ``Zonos2ForCausalLM.load_weights`` remaps the prefix):
         router.down_proj.{weight,bias}
         router.router_mlp.{0,2,4}.{weight,bias}   # GELU sits at indices 1, 3
         router.rmsnorm_eda.weight
@@ -269,50 +274,27 @@ class Zonos2Router(nn.Module):
         return route_prob, expert_choice.to(torch.int64), router_states_next
 
 
-class Zonos2MoEFeedForward(nn.Module):
-    """Sparse MoE feed-forward: EDA router + fused SwiGLU experts.
+def build_zonos2_moe(config: Zonos2Config, layer_id: int) -> SparseMoeBlock:
+    """The MoE feed-forward for one layer: stock block + Zonos2's EDA router.
 
-    The expert weights use the fused checkpoint layout shared with
-    :class:`SparseMoeBlock`:
+    This is a plain :class:`~mstar.model.components.SparseMoeBlock` with
+    :class:`Zonos2Router` injected, so Zonos2 inherits the shared expert
+    dispatch (fused Triton grouped-GEMM when available, naive per-expert SwiGLU
+    loop otherwise) and the fused expert-weight layout:
       - ``experts.gate_up_proj``: (num_experts, 2 * inter, hidden)  # w1 || w3
       - ``experts.down_proj``:    (num_experts, hidden, inter)      # w2
-    Dispatch reuses :func:`dispatch_experts`. That function prefers the fused
-    Triton grouped-GEMM kernel when available. Else it falls back to the naive
-    per-expert SwiGLU loop.
+
+    ``norm_topk_prob`` is not passed: it only configures the block's default
+    :class:`TopKRouter`, and Zonos2's router does its own (non-renormalized)
+    top-k selection.
     """
-
-    def __init__(self, config: Zonos2Config, layer_id: int):
-        super().__init__()
-        self.num_experts = config.moe_n_experts
-        hidden = config.hidden_size
-        inter = config.moe_inter
-
-        self.router = Zonos2Router(config, layer_id)
-        # A bare Module holds these. So the params get the names
-        # ``experts.gate_up_proj`` and ``experts.down_proj``.
-        self.experts = nn.Module()
-        self.experts.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * inter, hidden)
-        )
-        self.experts.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, hidden, inter)
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        router_states: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        route_prob, expert_choice, router_states_next = self.router(x, router_states)
-        out = dispatch_experts(
-            x,
-            self.experts.gate_up_proj,
-            self.experts.down_proj,
-            self.num_experts,
-            expert_choice,
-            route_prob,
-        )
-        return out, router_states_next
+    return SparseMoeBlock(
+        hidden_size=config.hidden_size,
+        num_experts=config.moe_n_experts,
+        num_experts_per_tok=config.get_num_experts_per_tok(layer_id),
+        moe_intermediate_size=config.moe_inter,
+        router=Zonos2Router(config, layer_id),
+    )
 
 
 class Zonos2DecoderLayer(nn.Module):
@@ -333,7 +315,7 @@ class Zonos2DecoderLayer(nn.Module):
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         if self.is_moe:
-            self.feed_forward = Zonos2MoEFeedForward(config, layer_id)
+            self.feed_forward = build_zonos2_moe(config, layer_id)
         else:
             self.feed_forward = ParallelGatedMLP(
                 hidden_size=config.hidden_size,
@@ -356,7 +338,9 @@ class Zonos2DecoderLayer(nn.Module):
         residual = x
         x = self.ffn_norm(x)
         if self.is_moe:
-            x, router_states = self.feed_forward(x, router_states)
+            x, router_states = self.feed_forward(
+                x, router_states, return_router_states=True,
+            )
         else:
             x = self.feed_forward(x)
             router_states = None
@@ -498,9 +482,12 @@ class Zonos2ForCausalLM(nn.Module):
           half, ``w3`` up half) and ``experts.down_proj`` (``w2``). The
           already-fused ``experts.gate_up_proj`` and ``experts.down_proj``
           load directly.
+        * ``feed_forward.router.*`` -> ``feed_forward.gate.*``. The MoE layers
+          are stock :class:`SparseMoeBlock`s holding a :class:`Zonos2Router`,
+          and that block names its router ``gate``.
 
-        All other keys (embedders, norms, router, wq/wo/gater/temp,
-        out_norm, multi_output) already line up by name.
+        All other keys (embedders, norms, wq/wo/gater/temp, out_norm,
+        multi_output) already line up by name.
         """
         import re
 
@@ -570,6 +557,15 @@ class Zonos2ForCausalLM(nn.Module):
                 elif which == "w2" and (base + ".down_proj") in params:
                     params[base + ".down_proj"].data.copy_(tensor)
                     loaded.add(base + ".down_proj")
+                continue
+
+            # SparseMoeBlock holds its router as ``gate``; the reference
+            # checkpoint calls it ``router``. Everything under it (down_proj,
+            # router_mlp, rmsnorm_eda, router_states_scale, balancing_biases)
+            # lines up once the prefix is rewritten.
+            m = re.match(r"(layers\.\d+\.feed_forward)\.router\.(.+)$", name)
+            if m:
+                _copy(f"{m.group(1)}.gate.{m.group(2)}", tensor)
                 continue
 
             _copy(name, tensor)

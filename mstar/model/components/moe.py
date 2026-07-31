@@ -210,28 +210,6 @@ def _dispatch(
     )
 
 
-# Public alias for the fused-preferring dispatch. External blocks (the Zonos2
-# MoE) call this entry point. They then get the Triton kernel when it is
-# available, and fall back to the naive loop only if it is not. This is an
-# alias of the module-internal ``_dispatch`` that the blocks below use.
-#
-# Zonos2 needs this one function, but it cannot reuse a whole block such as
-# :class:`SparseMoeBlock`. Its MoE uses a stateful EDA router
-# (``Zonos2Router``) that threads ``router_states`` from one layer to the next.
-# The blocks here own a stateless :class:`TopKRouter` and a fixed forward
-# signature, so they do not fit. Zonos2 keeps its own router and block, and
-# reuses only the expert dispatch (the fused kernel plus the fallback loop).
-# The alias gives that reuse a public, correctly named handle: ``_dispatch`` is
-# private, and the obvious public name ``dispatch_experts_fused`` is already
-# the naive fallback loop, not this fused-preferring path.
-#
-# The fused kernel autotunes the first time it sees a new key
-# ``(M, E, N, K, top_k)``. This step also syncs on the host. It runs during the
-# CUDA-graph runner's eager warmup forwards, before capture. So it needs no
-# dedicated warmup hook.
-dispatch_experts = _dispatch
-
-
 class SparseMoeBlock(nn.Module):
     """Top-K sparse MoE with fused expert weights, no shared expert.
 

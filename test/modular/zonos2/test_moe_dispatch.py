@@ -1,9 +1,10 @@
 """MoE dispatch graph-safety tests for Zonos2 (Phase 1).
 
-Zonos2's MoE now dispatches through :func:`dispatch_experts` (fused-Triton
-preferring) instead of the naive per-expert loop, so a CUDA-graph capture can
-run the grouped-GEMM kernel instead of a data-dependent Python loop. These
-tests pin the two invariants that swap relies on:
+Zonos2's MoE layers are stock :class:`SparseMoeBlock`s with
+:class:`Zonos2Router` plugged in, so they dispatch through the block's shared
+fused-Triton-preferring path instead of a naive per-expert loop, and a
+CUDA-graph capture can run the grouped-GEMM kernel instead of a data-dependent
+Python loop. These tests pin the two invariants that swap relies on:
 
   * the fused grouped-GEMM matches the naive per-expert loop within bf16
     tolerance (grouped reduction order is not bit-identical, and this is a
@@ -23,10 +24,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.model.components import moe as moe_mod
-from mstar.model.components.moe import (
-    dispatch_experts,
-    dispatch_experts_fused,
-)
+from mstar.model.components.moe import dispatch_experts_fused
+
+# The block-internal dispatch selector (fused kernel when available, else the
+# naive loop). Reached privately on purpose: these tests pin which path a
+# SparseMoeBlock takes, which is exactly that internal choice.
+dispatch_experts = moe_mod._dispatch
 
 fused_required = pytest.mark.skipif(
     not (torch.cuda.is_available() and moe_mod._HAS_FUSED),
@@ -89,14 +92,14 @@ def test_dispatch_fused_matches_naive_seeds():
 
 @fused_required
 def test_moe_feedforward_forward_parity(monkeypatch):
-    """``Zonos2MoEFeedForward.forward`` parity: naive vs fused dispatch.
+    """Zonos2 MoE block forward parity: naive vs fused dispatch.
 
     Same module, same routing (the router is deterministic given weights +
     input); only the dispatch path differs. Toggled via the module-global
-    ``_HAS_FUSED`` that ``dispatch_experts`` reads at call time.
+    ``_HAS_FUSED`` that the block's dispatch reads at call time.
     """
+    from mstar.model.zonos2.components.language_model import build_zonos2_moe
     from mstar.model.zonos2.config import Zonos2Config
-    from mstar.model.zonos2.components.language_model import Zonos2MoEFeedForward
 
     cfg = Zonos2Config(
         hidden_size=64, intermediate_size=128, moe_intermediate_size=128,
@@ -105,7 +108,7 @@ def test_moe_feedforward_forward_parity(monkeypatch):
     )
     torch.manual_seed(0)
     # layer_id == moe_start_from_layer -> no EDA state threading (self-contained).
-    ff = Zonos2MoEFeedForward(cfg, layer_id=0).to("cuda", torch.bfloat16).eval()
+    ff = build_zonos2_moe(cfg, layer_id=0).to("cuda", torch.bfloat16).eval()
     for p in ff.parameters():
         torch.nn.init.normal_(p, std=0.05)
 
@@ -113,10 +116,10 @@ def test_moe_feedforward_forward_parity(monkeypatch):
 
     monkeypatch.setattr(moe_mod, "_HAS_FUSED", False)
     with torch.no_grad():
-        naive, _ = ff(x)
+        naive, _ = ff(x, return_router_states=True)
     monkeypatch.setattr(moe_mod, "_HAS_FUSED", True)
     with torch.no_grad():
-        fused, _ = ff(x)
+        fused, _ = ff(x, return_router_states=True)
 
     a, b = fused.float(), naive.float()
     scale = b.abs().max().clamp(min=1e-3)

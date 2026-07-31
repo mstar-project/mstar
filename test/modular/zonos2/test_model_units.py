@@ -20,12 +20,15 @@ import pytest
 torch = pytest.importorskip("torch")
 from torch import nn
 
-from mstar.model.zonos2.config import Zonos2Config
+from mstar.distributed.communication import CommGroup
 from mstar.model.zonos2.components.language_model import (
+    Zonos2DecoderLayer,
     Zonos2ForCausalLM,
     Zonos2Router,
+    build_zonos2_moe,
     softcap,
 )
+from mstar.model.zonos2.config import Zonos2Config
 
 
 # -- softcap ----------------------------------------------------------------
@@ -72,6 +75,117 @@ def test_router_topk_is_static_int():
     router = Zonos2Router(_moe_cfg(num_experts_per_tok=2), layer_id=0)
     assert isinstance(router.top_k, int)
     assert router.top_k == 2
+
+
+# -- MoE block wiring + checkpoint name remap -------------------------------
+def _moe_model_cfg() -> Zonos2Config:
+    return Zonos2Config(
+        hidden_size=64, intermediate_size=128, moe_intermediate_size=128,
+        moe_n_experts=8, num_experts_per_tok=2, moe_router_dim=32,
+        moe_start_from_layer=1, moe_end_from_layer=0, num_layers=4,
+        num_qo_heads=4, num_kv_heads=4, head_dim=16,
+        n_codebooks=2, text_vocab=32,
+    )
+
+
+def test_moe_layer_is_sparse_moe_block_with_zonos2_router():
+    # The MoE feed-forward is the shared block with Zonos2's router injected
+    # (not a Zonos2-private copy), so Zonos2 rides the common expert dispatch.
+    from mstar.model.components import SparseMoeBlock
+
+    cfg = _moe_model_cfg()
+    layer = Zonos2DecoderLayer(cfg, layer_id=2, comm_group=CommGroup.trivial())
+    assert isinstance(layer.feed_forward, SparseMoeBlock)
+    assert isinstance(layer.feed_forward.gate, Zonos2Router)
+
+
+def test_moe_block_threads_router_states():
+    # The block must return the router's next state when asked, and pass an
+    # incoming state through to the router (the EDA chain depends on both).
+    cfg = _moe_model_cfg()
+    block = build_zonos2_moe(cfg, layer_id=2)
+
+    seen = {}
+    incoming = torch.randn(4, cfg.moe_router_dim)
+
+    # Stub the router so this stays CPU-only (the real one uses CUDA RMSNorm)
+    # and returns a recognizable next-state.
+    def stub(x, router_states=None):
+        seen["router_states"] = router_states
+        return (
+            torch.ones(x.shape[0], 2),
+            torch.zeros(x.shape[0], 2, dtype=torch.int64),
+            torch.full((x.shape[0], cfg.moe_router_dim), 7.0),
+        )
+
+    block.gate.forward = stub
+
+    out, next_states = block(
+        torch.randn(4, cfg.hidden_size), incoming, return_router_states=True,
+    )
+    assert out.shape == (4, cfg.hidden_size)
+    assert seen["router_states"] is incoming              # state passed in
+    assert torch.equal(next_states, torch.full((4, cfg.moe_router_dim), 7.0))
+
+    # Default (no flag) stays a bare tensor, matching the block's contract.
+    bare = block(torch.randn(4, cfg.hidden_size), incoming)
+    assert isinstance(bare, torch.Tensor)
+
+
+def test_load_weights_remaps_reference_router_prefix_to_gate():
+    # The reference checkpoint names the router ``router``; SparseMoeBlock
+    # holds it as ``gate``. If this remap regressed, every router tensor would
+    # silently stay at its init value instead of erroring — hence this test.
+    cfg = _moe_model_cfg()
+    model = Zonos2ForCausalLM(cfg)
+    moe_layers = [i for i in range(cfg.num_layers) if cfg.is_moe_layer(i)]
+    assert moe_layers, "config must have MoE layers for this test to mean anything"
+
+    tensors = dict(model.named_parameters()) | dict(model.named_buffers())
+    moe_names = {
+        n for n in tensors
+        if any(n.startswith(f"layers.{i}.feed_forward") for i in moe_layers)
+    }
+    assert any(".gate." in n for n in moe_names)
+
+    # Synthetic checkpoint in the *reference* naming.
+    ckpt = {}
+    for n in moe_names:
+        ref = n.replace(".feed_forward.gate.", ".feed_forward.router.")
+        if ref.endswith(".experts.gate_up_proj"):
+            base = ref[: -len(".gate_up_proj")]
+            for w in ("w1", "w3"):
+                ckpt[f"{base}.{w}"] = torch.randn(
+                    cfg.moe_n_experts, cfg.moe_inter, cfg.hidden_size,
+                )
+        elif ref.endswith(".experts.down_proj"):
+            base = ref[: -len(".down_proj")]
+            ckpt[f"{base}.w2"] = torch.randn(
+                cfg.moe_n_experts, cfg.hidden_size, cfg.moe_inter,
+            )
+        else:
+            ckpt[ref] = torch.randn_like(tensors[n].data.float()).to(tensors[n].dtype)
+
+    loaded = model.load_weights(ckpt.items())
+    assert not (moe_names - loaded), f"unloaded MoE tensors: {sorted(moe_names - loaded)}"
+
+    # Values really landed (a no-op remap would leave the init values).
+    last = moe_layers[-1]
+    for suffix in ("down_proj.weight", "rmsnorm_eda.weight", "balancing_biases"):
+        assert torch.equal(
+            tensors[f"layers.{last}.feed_forward.gate.{suffix}"].data,
+            ckpt[f"layers.{last}.feed_forward.router.{suffix}"],
+        ), suffix
+    # And the expert w1/w3 -> gate_up_proj fusion still works through the block.
+    gate_up = tensors[f"layers.{last}.feed_forward.experts.gate_up_proj"].data
+    assert torch.equal(
+        gate_up[:, : cfg.moe_inter, :],
+        ckpt[f"layers.{last}.feed_forward.experts.w1"],
+    )
+    assert torch.equal(
+        gate_up[:, cfg.moe_inter :, :],
+        ckpt[f"layers.{last}.feed_forward.experts.w3"],
+    )
 
 
 # -- speaker conditioning injection ----------------------------------------

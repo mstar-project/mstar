@@ -4,8 +4,8 @@ from mstar.model.zonos2.components.language_model import (
     Zonos2Attention,
     Zonos2DecoderLayer,
     Zonos2ForCausalLM,
-    Zonos2MoEFeedForward,
     Zonos2Router,
+    build_zonos2_moe,
     softcap,
 )
 
@@ -14,7 +14,7 @@ __all__ = [
     "Zonos2Attention",
     "Zonos2DecoderLayer",
     "Zonos2ForCausalLM",
-    "Zonos2MoEFeedForward",
     "Zonos2Router",
+    "build_zonos2_moe",
     "softcap",
 ]
