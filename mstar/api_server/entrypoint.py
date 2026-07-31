@@ -486,6 +486,7 @@ class APIServer:
         """
         start = time.time()
         finished = False
+        error_delivered = False
         try:
             while True:
                 if time.time() - start > self.timeout_seconds:
@@ -505,6 +506,7 @@ class APIServer:
                         done = True
 
                 for chunk in new_chunks:
+                    error_delivered |= chunk.modality == "error"
                     yield chunk
 
                 if done:
@@ -522,12 +524,20 @@ class APIServer:
                     if finished_req is not None:
                         self._finalize_profile(finished_req)
                     for chunk in remaining:
+                        error_delivered |= chunk.modality == "error"
                         yield chunk
                     # A request can fail after the stream is already open
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
-                    # in-band as the final chunk.
-                    if finished_req is not None and finished_req.error is not None:
+                    # in-band as the final chunk. A preprocess failure is
+                    # already delivered as an in-band error chunk above — only
+                    # synthesize one for errors that never produced a chunk
+                    # (e.g. result-delivery timeout), not a duplicate.
+                    if (
+                        finished_req is not None
+                        and finished_req.error is not None
+                        and not error_delivered
+                    ):
                         yield ResultChunk(
                             request_id=request_id,
                             modality="error",

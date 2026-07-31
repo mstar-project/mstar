@@ -208,3 +208,28 @@ def test_stream_carries_error_as_final_chunk():
     chunks = asyncio.run(_collect())
     assert [c.modality for c in chunks] == ["text", "error"]
     assert chunks[-1].metadata["status"] == 500
+
+
+def test_stream_does_not_duplicate_delivered_error_chunk():
+    """A preprocess failure arrives as an in-band error chunk AND sets
+    req.error; the stream must deliver that error exactly once, not append a
+    second synthesized copy."""
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    req = _pending_request()
+    req.chunks.append(ResultChunk(
+        request_id="r4", modality="error", data=b"bad knob",
+        metadata={"status": 400},
+    ))
+    req.error = "bad knob"
+    req.error_status = 400
+    req.event.set()
+    server.pending_requests["r4"] = req
+
+    async def _collect():
+        return [chunk async for chunk in server.iter_result_chunks("r4")]
+
+    chunks = asyncio.run(_collect())
+    assert [c.modality for c in chunks] == ["error"]
+    assert chunks[0].data == b"bad knob"
+    assert chunks[0].metadata["status"] == 400
