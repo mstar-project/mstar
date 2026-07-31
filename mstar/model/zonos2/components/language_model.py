@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.distributed.communication import TPCommGroup
+from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import RMSNorm
@@ -47,7 +47,7 @@ class MultiEmbedding(nn.Module):
     ``multi_embedder.embedders.{i}.weight`` (audio columns first, text last).
     """
 
-    def __init__(self, config: Zonos2Config, comm_group: TPCommGroup):
+    def __init__(self, config: Zonos2Config, comm_group: CommGroup):
         super().__init__()
         self.n_codebooks = config.n_codebooks
 
@@ -99,7 +99,7 @@ class Zonos2Attention(nn.Module):
     ``wq`` and ``gater`` (column), ``wkv`` (merged K||V column), ``wo`` (row).
     """
 
-    def __init__(self, config: Zonos2Config, comm_group: TPCommGroup):
+    def __init__(self, config: Zonos2Config, comm_group: CommGroup):
         super().__init__()
         self.comm_group = comm_group
         tp_size = comm_group.world_size
@@ -323,7 +323,7 @@ class Zonos2DecoderLayer(nn.Module):
     :class:`RMSNorm`. Dense layers use :class:`ParallelGatedMLP`.
     """
 
-    def __init__(self, config: Zonos2Config, layer_id: int, comm_group: TPCommGroup):
+    def __init__(self, config: Zonos2Config, layer_id: int, comm_group: CommGroup):
         super().__init__()
         self.layer_id = layer_id
         self.is_moe = config.is_moe_layer(layer_id)
@@ -375,10 +375,10 @@ class Zonos2ForCausalLM(nn.Module):
     ``out_norm.weight``, ``multi_output.weight``.
     """
 
-    def __init__(self, config: Zonos2Config, comm_group: TPCommGroup | None = None):
+    def __init__(self, config: Zonos2Config, comm_group: CommGroup | None = None):
         super().__init__()
         if comm_group is None:
-            comm_group = TPCommGroup.trivial()
+            comm_group = CommGroup.trivial()
         self.config = config
         self.n_codebooks = config.n_codebooks
         self.audio_vocab = config.audio_vocab
