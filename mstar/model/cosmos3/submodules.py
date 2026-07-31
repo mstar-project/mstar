@@ -734,35 +734,33 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # preprocess: plan paged attention for the labels this walk touches.
     # ------------------------------------------------------------------
 
-    def _plan_gen(
-        self, cm, st, num_gen: int, cfg_active: bool = True, dense_gen: bool = True,
-    ) -> None:
+    def _plan_gen(self, cm, st, num_gen: int, cfg_active: bool = True) -> None:
         """Plan a denoise step's non-causal attention: one batched plan covering
         both guidance branches when they run together, else a plan per label.
         ``cfg_active`` False (a guidance_interval out-of-interval step, or
         gs==1) plans the conditional branch alone — matching the cond-only
         forward — so an interval step costs no wasted uncond/batched plan.
-        ``dense_gen`` False keeps the label on the paged path — kv-windowed
-        requests mutate their committed prefix per window (commit + release),
-        which breaks the dense fast path's frozen-prefix gather."""
+        kv-windowed requests stay dense-eligible: their committed prefix
+        mutates per window, which the dense path detects via prefix_epoch and
+        answers with a per-window re-gather."""
         if st["uncond"] is None or not cfg_active:
             cm.plan_attention(
                 seq_lens=[num_gen], is_causal=False, label=COND_LABEL,
-                write_store=False, dense_gen=dense_gen,
+                write_store=False, dense_gen=True,
             )
         elif self.batched_cfg:
             cm.plan_attention_batched_cfg(
                 labels=[COND_LABEL, UNCOND_LABEL], seq_lens=[num_gen],
-                is_causal=False, write_store=False, dense_gen=dense_gen,
+                is_causal=False, write_store=False, dense_gen=True,
             )
         else:
             cm.plan_attention(
                 seq_lens=[num_gen], is_causal=False, label=COND_LABEL,
-                write_store=False, dense_gen=dense_gen,
+                write_store=False, dense_gen=True,
             )
             cm.plan_attention(
                 seq_lens=[num_gen], is_causal=False, label=UNCOND_LABEL,
-                write_store=False, dense_gen=dense_gen,
+                write_store=False, dense_gen=True,
             )
 
     def _plan_commit(self, cm, st, window_index: int) -> None:
@@ -879,7 +877,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 }
             ti = inputs[0].tensor_inputs["time_index"]
             step_index = int(ti.reshape(-1)[0].item())
-            dense_gen = True
             if "ar_schedule" in st:
                 # Windowed: the loop counter is global; guidance is decided on
                 # the within-window step, matching the forward. In kv mode the
@@ -894,10 +891,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                         "time_index": ti,
                     }
                 step_index = local
-                dense_gen = not st.get("ar_kv_mode")
             self._plan_gen(
                 cm, st, st["cond"]["num_vision_tokens"],
-                cfg_active=self._cfg_active(st, step_index), dense_gen=dense_gen,
+                cfg_active=self._cfg_active(st, step_index),
             )
             return {
                 "latents": inputs[0].tensor_inputs["latents"],
@@ -1429,12 +1425,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # Image/video batch only in the two-branch guidance regime, so one
             # batched-CFG plan covers them. (Batches are per graph walk, so
             # sound requests only ever batch with sound requests.) Windowed
-            # requests keep the single-request path: their window boundaries
-            # swap per-request statics/scheduler mid-walk, which the packed
-            # batched forward doesn't model.
-            return all(
-                st["uncond"] is not None and "ar_schedule" not in st for st in sts
-            )
+            # requests join denoise batches — the batched forward maps their
+            # loop counter to the within-window step and handles chained
+            # window boundaries — but a kv commit iteration is a different
+            # computation (an append pass) and drops the batch to the
+            # sequential path.
+            if not all(st["uncond"] is not None for st in sts):
+                return False
+            for st, inp in zip(sts, model_inputs, strict=True):
+                if "ar_schedule" not in st:
+                    continue
+                ti = inp.tensor_inputs["time_index"]
+                local = int(ti.reshape(-1)[0].item()) % st["ar_iters_per_window"]
+                if local == st["ar_steps"]:
+                    return False
+            return True
         if batch.graph_walk in ACTION_WALKS:
             # Action batches when all requests share the guidance regime (all
             # single-branch -- guidance-scale-1 inverse/forward-dynamics and base
@@ -1479,6 +1484,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             st = states[rid]
             lat, ti = latents[rid], time_index[rid]
             step_index = int(ti.reshape(-1)[0].item())
+            if "ar_schedule" in st:
+                # Windowed: the loop counter is global; the schedule index is
+                # the within-window step (commit iterations never batch).
+                step_index %= st["ar_iters_per_window"]
             n_steps = len(st["scheduler"].timesteps)
             # A request may be one step past its denoise count (a discarded extra
             # step) while others in the batch are still running; clamp its
@@ -1494,12 +1503,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 "vision_noisy_frame_indexes": st["cond"]["vision_noisy_frame_indexes"],
                 "vision_mse_loss_indexes": st["cond"]["mse_gen_indexes"],
             })
-            meta.append((rid, st, lat, ti, t))
+            meta.append((rid, st, lat, ti, t, step_index))
 
         results = self.transformer.denoise_step_batched(reqs, cm)
 
         out = {}
-        for (rid, st, lat, ti, t), (cond_v, uncond_v) in zip(meta, results, strict=True):
+        for (rid, st, lat, ti, t, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
             new_latents = st["scheduler"].step(
                 velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
@@ -1508,7 +1517,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # Video-to-video: re-inject the clean conditioning frames, as in
                 # the single-request path.
                 new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * st["cond_video_latents"]
-            out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
+            if (
+                "ar_schedule" in st
+                and local + 1 == st["ar_steps"]
+                and not st.get("ar_kv_mode")
+            ):
+                # Chained window boundary inside a batch: emit + stage, as in
+                # the single-request path.
+                window_index = int(ti.reshape(-1)[0].item()) // st["ar_iters_per_window"]
+                out[rid] = self._finish_window(st, new_latents, ti, window_index)
+            else:
+                out[rid] = {"latents": [new_latents], "time_index": [ti + 1]}
         return out
 
     def _forward_batched_sound(self, engine_inputs, latents, sound_latents, time_index):

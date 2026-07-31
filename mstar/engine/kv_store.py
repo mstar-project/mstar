@@ -164,16 +164,16 @@ class KVRequestState:
     # sequence length of the in-distributed-store KV cache
     is_paused: bool = False
 
-    # Lazily-filled {layer_idx: (k_pref, v_pref)} contiguous copies of the frozen
-    # text-prefix K/V, used by the dense generation-attention path. The prefix is
-    # written once at prefill and immutable through denoise (text tokens get no
-    # timestep embedding; the dense path never writes generation K/V to pages), so
-    # it is gathered once and reused across steps rather than re-gathered from the
-    # paged cache every step. Reset to None by _new_state()
-    # (add_request/reset_label/remove_request) — exactly when the prefix pages are
-    # (re)allocated — so it needs no manual invalidation. Labels whose committed
-    # content mutates mid-request (windowed generation) additionally reset it in
-    # release_oldest and carry prefix_epoch for consumers to detect growth.
+    # Lazily-filled {"epoch": int, "layers": {layer_idx: (k_pref, v_pref)}}
+    # contiguous copies of the committed-prefix K/V, used by the dense
+    # generation-attention path. For a static prefix (text written once at
+    # prefill, immutable through denoise) it is gathered once and reused
+    # across steps; when the committed content mutates mid-request (windowed
+    # generation appends/evicts per window) the recorded epoch falls behind
+    # prefix_epoch and the dense path re-gathers from the live pages — once
+    # per mutation, amortized over the steps between them. Reset to None by
+    # _new_state() (add_request/reset_label/remove_request) and by
+    # release_oldest (freed pages may be reused before the next gather).
     dense_prefix_kv: dict | None = None
 
     # Windowed-generation bookkeeping (PagedAllocationManager.protect_prefix /

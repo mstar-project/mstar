@@ -1069,8 +1069,9 @@ def test_windowed_kv_commit_and_lifecycle(monkeypatch) -> None:
     )
 
     # Preprocess maps the loop counter: a commit iteration plans the append
-    # (both labels, the window's 4 new units), a denoise iteration plans
-    # paged with the dense fast path off.
+    # (both labels, the window's 4 new units); a denoise iteration plans the
+    # step with the dense fast path eligible (staleness handled by the
+    # dense manager's prefix_epoch re-gather).
     ei = SimpleNamespace(cache_manager=cm, request_ids=["r"], per_request_states=None)
     inp = SimpleNamespace(tensor_inputs={
         "latents": torch.zeros(1), "time_index": torch.tensor([4]),
@@ -1078,10 +1079,11 @@ def test_windowed_kv_commit_and_lifecycle(monkeypatch) -> None:
     sub.preprocess("video_gen_ar", ei, [inp])
     kind, kw = cm.plans[-1]
     assert kind == "cfg" and kw["seq_lens"] == [4 * stride] and not kw["is_causal"]
+    assert "dense_gen" not in kw
     inp.tensor_inputs["time_index"] = torch.tensor([2])
     sub.preprocess("video_gen_ar", ei, [inp])
     kind, kw = cm.plans[-1]
-    assert kind == "cfg" and kw["dense_gen"] is False
+    assert kind == "cfg" and kw["dense_gen"] is True
 
     # Window 0 commit: full window appended, prefixes protected per label,
     # nothing released yet (the horizon still covers everything committed).
@@ -1116,6 +1118,96 @@ def test_windowed_kv_commit_and_lifecycle(monkeypatch) -> None:
     ]
     assert torch.equal(out["window_latents"][0], x0)
     assert torch.equal(out["latents"][0], x0)
+
+
+def test_windowed_can_batch_and_batched_boundary(monkeypatch) -> None:
+    """Windowed denoise steps batch across requests (loop counters mapped to
+    within-window steps per request); any request at a kv commit iteration
+    drops the batch to the sequential path; and a chained window boundary
+    inside the batched forward emits the window and stages the next one like
+    the single-request path."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from mstar.engine.windowing import WindowSchedule
+    from mstar.model.cosmos3 import constants as C
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+
+    cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    sub = Cosmos3DiTSubmodule(transformer=None, config=cfg, scheduler=None)
+
+    schedule = WindowSchedule(total_units=14, window_units=8, overlap_units=2)
+    latent_shape = sub._window_latent_shape(64, 64, 8)
+    sched = SimpleNamespace(
+        timesteps=torch.arange(4, 0, -1),
+        step=lambda v, t, lat, return_dict=False: (lat * 0.5,),
+    )
+
+    def add_windowed(rid):
+        st = sub.request_state(rid)
+        n = 8 * 4
+        ids = torch.arange(n).view(1, -1).expand(3, -1).contiguous()
+        static = {
+            "num_vision_tokens": n, "num_noisy_vision_tokens": n,
+            "vision_mrope_ids": ids, "und_len": 7,
+            "vision_token_shapes": [(8, 2, 2)],
+            "vision_noisy_frame_indexes": [torch.arange(8)],
+            "mse_gen_indexes": torch.arange(n),
+        }
+        st.add_all(
+            ar_schedule=schedule, ar_steps=4, ar_iters_per_window=4,
+            ar_kv_mode=False, ar_size=(64, 64), gs=6.0,
+            ar_generator=torch.Generator().manual_seed(0),
+            cond=static, uncond=dict(static), scheduler=sched,
+            latent_shape=latent_shape,
+        )
+        return st
+
+    add_windowed("a")
+    add_windowed("b")
+    batch = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=["a", "b"])
+    inp = lambda t: SimpleNamespace(tensor_inputs={"time_index": torch.tensor([t])})  # noqa: E731
+    assert sub.can_batch(batch, [inp(1), inp(1)])
+    assert sub.can_batch(batch, [inp(3), inp(5)])  # different windows, both denoise
+
+    # A kv request at its commit iteration vetoes the batch.
+    st_kv = add_windowed("c")
+    st_kv.add("ar_kv_mode", True)
+    st_kv.add("ar_iters_per_window", 5)
+    batch_kv = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=["a", "c"])
+    assert sub.can_batch(batch_kv, [inp(1), inp(1)])
+    assert not sub.can_batch(batch_kv, [inp(1), inp(4)])  # local 4 == steps
+
+    # Batched forward: request "a" at its window-0 boundary (local 3),
+    # request "b" mid-window. The boundary request emits + stages.
+    sub.transformer = SimpleNamespace(
+        proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
+        denoise_step_batched=lambda reqs, cm: [
+            (torch.zeros(latent_shape), torch.zeros(latent_shape)) for _ in reqs
+        ],
+    )
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: sched)
+    monkeypatch.setattr(
+        sub, "_window_statics_for",
+        lambda st, plan, dev: (dict(sub.request_states["a"]["cond"]), None),
+    )
+    cm = SimpleNamespace(set_active_label=lambda label: None)
+    ei = SimpleNamespace(
+        cache_manager=cm, request_ids=["a", "b"], per_request_states=None,
+        per_request_info={},
+    )
+    lat = {r: torch.full(latent_shape, 2.0) for r in ("a", "b")}
+    ti = {"a": torch.tensor([3]), "b": torch.tensor([1])}
+    out = sub.forward_batched("video_gen_ar", ei, latents=lat, time_index=ti)
+    assert "window_latents" in out["a"] and torch.equal(
+        out["a"]["window_latents"][0], lat["a"] * 0.5
+    )
+    assert out["a"]["latents"][0].shape == latent_shape  # staged next window
+    assert "window_latents" not in out["b"]
+    assert torch.equal(out["b"]["latents"][0], lat["b"] * 0.5)
+    for rid in ("a", "b", "c"):
+        sub.cleanup_request(rid)
 
 
 def test_windowed_decoder_assembles_stream(monkeypatch) -> None:

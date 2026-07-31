@@ -829,6 +829,42 @@ def test_windowed_kv_engine_release_and_psnr() -> None:
           + " dB; released 384 tokens/label on the live request")
 
 
+def test_windowed_kv_dense_matches_paged() -> None:
+    """kv-mode denoise on the dense FA3 fast path — whose committed prefix
+    mutates every window and is re-gathered via prefix_epoch — against the
+    pure paged FlashInfer backend. Same machinery, different attention
+    kernel: window 0 must agree at the usual kernel-precision bar; later
+    windows compound the kernels' rounding through the committed context
+    (same autoregressive-feedback regime as the reference comparison) and
+    get the corruption floor."""
+    ctx = _windowed_scenario()
+    if ctx is None:
+        print("  (skipped windowed-kv dense-vs-paged: needs COSMOS3_NANO_DIR + CUDA)")
+        return
+    try:
+        outs = {}
+        for backend in ("flashinfer", "dense_gen"):
+            cm = _flashinfer_cache(ctx["model"], "r0", ctx["device"], ctx["dtype"], backend=backend)
+            outs[backend] = _run_windowed_kv_served(
+                ctx["model"], ctx["dit"], cm, ctx["md"], ctx["cond"], ctx["uncond"],
+                ctx["device"],
+            )
+            cm.alloc_manager.remove_request("r0")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skipped windowed-kv dense-vs-paged: FA3/FlashInfer unavailable: {exc})")
+        return
+    psnrs = []
+    for paged, dense in zip(outs["flashinfer"], outs["dense_gen"], strict=True):
+        img_p = ctx["mpipe"]._decode(paged).squeeze().float().cpu()
+        img_d = ctx["mpipe"]._decode(dense).squeeze().float().cpu()
+        mse = (img_p - img_d).pow(2).mean().item()
+        psnrs.append(float("inf") if mse == 0 else -10 * math.log10(mse))
+    assert psnrs[0] >= 30, f"windowed-kv dense vs paged window-0 PSNR {psnrs[0]:.2f} < 30"
+    assert min(psnrs) >= 12, f"windowed-kv dense vs paged per-window PSNRs {psnrs}"
+    print("  windowed-kv dense-FA3 vs paged per-window PSNR = "
+          + ", ".join(f"{p:.2f}" for p in psnrs) + " dB")
+
+
 @torch.no_grad()
 def _run_cuda_graph_denoise(ctx):
     """Capture the image denoise step and run the whole loop through the real
@@ -924,6 +960,7 @@ def _main() -> None:
         ("dense_fa3_video_psnr", test_dense_fa3_video_psnr),
         ("windowed_kv_matches_reference", test_windowed_kv_matches_reference),
         ("windowed_kv_engine_release_and_psnr", test_windowed_kv_engine_release_and_psnr),
+        ("windowed_kv_dense_matches_paged", test_windowed_kv_dense_matches_paged),
         ("anchor_encode_matches_full", test_anchor_encode_matches_full),
         ("compile_vae_matches_eager", test_compile_vae_matches_eager),
         ("compile_vae_matches_eager_t2v", test_compile_vae_matches_eager_t2v),

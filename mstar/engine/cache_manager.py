@@ -1488,14 +1488,22 @@ class DenseGenCacheManager(FlashInferCacheManager):
         offset = 0
         for idx, prefix_len, gen_len, state in dg["segs"]:
             prefix_cache = state.dense_prefix_kv
-            if prefix_cache is None:
-                prefix_cache = state.dense_prefix_kv = {}
-            cached = prefix_cache.get(layer_idx)
+            if prefix_cache is None or prefix_cache.get("epoch") != state.prefix_epoch:
+                # First gather, or the committed content mutated since the
+                # last one (windowed generation appends/evicts per window —
+                # prefix_epoch moves with every such mutation): drop the stale
+                # clones and re-gather from the live pages. Static-prefix
+                # requests keep the single-gather behavior (their epoch never
+                # moves after prefill).
+                prefix_cache = state.dense_prefix_kv = {
+                    "epoch": state.prefix_epoch, "layers": {},
+                }
+            cached = prefix_cache["layers"].get(layer_idx)
             if cached is None:
                 sub = kv_layer[idx]  # [n_pages, 2, page_size, num_kv_heads, head_dim]
                 k_pref = sub[:, 0].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
                 v_pref = sub[:, 1].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
-                prefix_cache[layer_idx] = (k_pref, v_pref)
+                prefix_cache["layers"][layer_idx] = (k_pref, v_pref)
             else:
                 k_pref, v_pref = cached
             k_parts.append(k_pref)
