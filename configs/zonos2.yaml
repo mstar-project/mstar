@@ -1,10 +1,19 @@
 model: "zonos2"
 max_seq_len: 8192
-# Two-GPU: GPU 0 runs the LLM (prefill + decode), GPU 1 runs the DAC vocoder.
+# Two-GPU: GPU 0 runs the LLM (prefill + decode) and the voice-clone speaker
+# encoder, GPU 1 runs the DAC vocoder.
+#
+# speaker_encoder shares rank 0 with the LLM because it feeds prefill directly
+# (an in-partition sequence, no cross-GPU transfer). Despite the "1.7B" in its
+# HF repo id it is only ~12M params (~48 MB in fp32), so it barely competes
+# with the LLM for memory. Drop its node group to serve text-only.
 node_groups:
   - node_names: [LLM]
     ranks: [0]
-    graph_walks: [prefill, decode]
+    graph_walks: [prefill, prefill_clone, decode]
+  - node_names: [speaker_encoder]
+    ranks: [0]
+    graph_walks: [prefill_clone]
   - node_names: [dac_decoder]
     ranks: [1]
     graph_walks: [dac_chunk]
