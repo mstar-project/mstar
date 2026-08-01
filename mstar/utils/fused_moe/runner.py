@@ -55,13 +55,11 @@ def fused_experts(
         ``(num_experts, 2 * moe_intermediate_size, hidden)``.  Matches the
         ``experts.gate_up_proj`` parameter the WeightConverter already
         produces in :mod:`mstar.model.qwen3_omni.qwen3_omni_model`.
-        On the W4A16 path (``w1_scale`` set) this is instead the PACKED int32
-        tensor ``(num_experts, 2 * moe_intermediate_size, hidden // pack_factor)``.
+        Packed int32 on the W4A16 path.
     w2 : torch.Tensor
         Down projection weights, shape
         ``(num_experts, hidden, moe_intermediate_size)``.  Matches
-        ``experts.down_proj``.  On the W4A16 path this is the packed int32 tensor
-        ``(num_experts, hidden, moe_intermediate_size // pack_factor)``.
+        ``experts.down_proj``. Packed int32 on the W4A16 path.
     topk_weights : torch.Tensor
         ``(tokens, top_k)``, routing probabilities (possibly
         renormalized).  Dtype matches ``hidden_states``.
@@ -75,14 +73,11 @@ def fused_experts(
         ``(tokens, top_k, hidden)`` — the caller is responsible for the
         reduce (e.g. after an all-reduce for TP).
     w1_scale, w2_scale : torch.Tensor | None
-        W4A16 group scales, shapes ``(E, 2*inter, hidden//group_size)``
-        and ``(E, hidden, inter//group_size)``.  When BOTH are ``None`` (default)
-        the bf16 path runs byte-for-byte as before; when set, ``w1``/``w2`` are
-        packed int32 and the in-kernel dequant path runs.
+        W4A16 group scales; both ``None`` keeps the historical bf16 path.
     w1_zp, w2_zp : torch.Tensor | None
         Optional asymmetric zero points (unused for Kimi's symmetric INT4).
     group_size, pack_factor : int | None
-        Group granularity and INT4 pack factor (8); required on the W4A16 path.
+        Required on the W4A16 path.
 
     Returns
     -------
@@ -93,7 +88,7 @@ def fused_experts(
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert hidden_states.dim() == 2
     assert topk_weights.shape == topk_ids.shape
-    # Activations stay bf16/fp16 on both paths — only the WEIGHTS are quantized.
+    # Only weights are quantized; activations stay bf16/fp16.
     assert hidden_states.dtype in (torch.bfloat16, torch.float16)
 
     quantized = w1_scale is not None
@@ -159,7 +154,6 @@ def fused_experts(
     )
 
     # 3. Gate+up GEMM: cache1[slot] = hidden[slot // top_k] @ w1[expert].T
-    # (W4A16: w1 packed int32, dequantized in-kernel; GEMM-1 contracts over hidden.)
     if quantized:
         invoke_fused_moe_kernel_w4a16(
             A=hidden_states,
@@ -202,7 +196,6 @@ def fused_experts(
     # 5. Down GEMM (weighted): cache3[slot] = topk_weight[slot] * (cache2[slot] @ w2[expert].T)
     # top_k=1 for this GEMM so the kernel's offs_token // top_k is identity
     # -- it reads cache2 rows directly instead of the (slot // top_k)-th source row.
-    # (W4A16: w2 packed int32; GEMM-2 contracts over the intermediate dim.)
     if quantized:
         invoke_fused_moe_kernel_w4a16(
             A=cache2,

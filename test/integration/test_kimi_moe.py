@@ -1,19 +1,3 @@
-"""M2 golden tests for Kimi-K2.7 fine-grained MoE.
-
-Verifies the new DeepSeek-V3 MoE math against independent references:
-  - the group-limited sigmoid ``noaux_tc`` router (KimiMoEGate),
-  - the fused expert dispatch (reused fused-expert GEMM), and
-  - the full MoE block (routed + ungated shared expert).
-
-References are inlined (self-contained; no dependency on the local golden
-harness) and cited to vLLM ``fused_moe/cpu_fused_moe.py::grouped_topk`` and
-``models/deepseek_v2.py::DeepseekV2MoE``.
-
-GPU test: the fused expert GEMM (``fused_experts``) is CUDA/bf16-only, so the
-block/dispatch tests run on ``cuda``; the suite skips without a GPU.
-
-Run:  pytest test/integration/test_kimi_moe.py -v
-"""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -30,16 +14,10 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda"
 
-
-# --------------------------------------------------------------------------
-# Independent references (cited to vLLM cpu_fused_moe.py / deepseek_v2.py)
-# --------------------------------------------------------------------------
-
 def _ref_grouped_topk(
     logits: torch.Tensor, bias: torch.Tensor, n_group, topk_group, top_k,
     norm_topk_prob, routed_scaling_factor,
 ):
-    """vLLM ``grouped_topk`` (sigmoid + noaux_tc) -> (weights, ids)."""
     scores = logits.float().sigmoid()
     T = scores.shape[0]
     original = scores
@@ -63,7 +41,6 @@ def _ref_grouped_topk(
 
 
 def _ref_routed_experts(h, gate_up, down, weights, ids):
-    """Naive per-token top-k expert loop matching ``fused_experts`` semantics."""
     T, H = h.shape
     inter = down.shape[-1]
     out = torch.zeros(T, H, dtype=h.dtype, device=h.device)
@@ -82,16 +59,9 @@ def _ref_swiglu(x, gate_w, up_w, down_w):
 
 
 def _dense_combine(ids, weights, num_experts):
-    """Scatter (ids, weights) into a dense (T, E) vector for order-insensitive
-    comparison (topk with sorted=False returns experts in arbitrary order)."""
     dense = torch.zeros(ids.shape[0], num_experts, device=ids.device)
     dense.scatter_(1, ids, weights.float())
     return dense
-
-
-# --------------------------------------------------------------------------
-# Router
-# --------------------------------------------------------------------------
 
 def test_moe_gate_matches_reference():
     torch.manual_seed(0)
@@ -122,8 +92,6 @@ def test_moe_gate_matches_reference():
 
 
 def test_moe_gate_group_limited_routing():
-    """With n_group=2/topk_group=1, every selected expert must come from the
-    single kept group — the crux of group-limited routing."""
     torch.manual_seed(1)
     n_experts, n_group, topk_group, top_k = 8, 2, 1, 2
     experts_per_group = n_experts // n_group
@@ -141,11 +109,6 @@ def test_moe_gate_group_limited_routing():
     groups = ids // experts_per_group
     assert (groups == groups[:, :1]).all(), "experts crossed group boundary"
 
-
-# --------------------------------------------------------------------------
-# Fused expert dispatch (trivial fixed router)
-# --------------------------------------------------------------------------
-
 def test_expert_dispatch_matches_naive():
     torch.manual_seed(2)
     cfg = KimiK2Config.reduced()
@@ -155,18 +118,12 @@ def test_expert_dispatch_matches_naive():
     h = torch.randn(T, H, device=DEVICE, dtype=dtype) * 0.1
     gate_up = torch.randn(E, 2 * I, H, device=DEVICE, dtype=dtype) * 0.05
     down = torch.randn(E, H, I, device=DEVICE, dtype=dtype) * 0.05
-    # Trivial fixed router: every token -> experts {0, 1}, fixed weights.
     ids = torch.tensor([[0, 1]] * T, device=DEVICE)
     weights = torch.full((T, 2), 0.5, device=DEVICE, dtype=dtype)
 
     got = _dispatch(h, gate_up, down, E, ids, weights)
     expected = _ref_routed_experts(h, gate_up, down, weights, ids)
     torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
-
-
-# --------------------------------------------------------------------------
-# Full MoE block (routed + ungated shared)
-# --------------------------------------------------------------------------
 
 def test_moe_block_matches_reference():
     torch.manual_seed(3)
@@ -185,8 +142,7 @@ def test_moe_block_matches_reference():
     sh_up = torch.randn(shared_inter, H, device=DEVICE, dtype=dtype) * 0.05
     sh_down = torch.randn(H, shared_inter, device=DEVICE, dtype=dtype) * 0.05
 
-    # Keep the router in fp32 (deterministic selection); load fused expert +
-    # shared weights.
+    # Keep the router fp32 for deterministic selection.
     block.gate.weight.data = gate_w
     block.gate.e_score_correction_bias.data = bias
     block.experts.gate_up_proj.data.copy_(expert_gate_up)

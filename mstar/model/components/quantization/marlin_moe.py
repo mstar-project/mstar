@@ -1,14 +1,4 @@
-"""Marlin W4A16 backend for the routed-expert (fused-MoE) GEMM.
-
-Implements :class:`~mstar.model.components.quantization.base.FusedMoEQuantizeMethod`
-for symmetric INT4 (compressed-tensors ``pack-quantized``, group-wise). It consumes
-the packed params an MoE block already loaded (the "Hook B" layout Kimi uses —
-``(E, N, K // pack_factor)`` int32 weights + ``(E, N, K // group_size)`` bf16 group
-scales), repacks them once into Marlin's tiled layout, and thereafter runs the
-vendored Marlin kernels (:mod:`mstar.utils.marlin`).
-
-Model-agnostic: any MoE block with the same packed-param convention can hold one.
-"""
+"""Marlin W4A16 backend for routed-expert MoE GEMMs."""
 from __future__ import annotations
 
 import torch
@@ -46,15 +36,6 @@ class MarlinMoEMethod:
         w2_scale: torch.Tensor,
         device: torch.device,
     ) -> None:
-        """Repack Hook-B packed experts into Marlin layout.
-
-        mstar packs experts along the input axis as ``(E, N_out, K_in // pack)``
-        (compressed-tensors), whereas Marlin's ``gptq_marlin_moe_repack`` wants
-        GPTQ-style ``(E, K_in // pack, N_out)`` — hence the transpose before each
-        repack. Scales are permuted the same way. ``w13`` is the fused gate+up
-        (``N_out = 2 * shard_inter``, ``K_in = hidden``); ``w2`` is the down
-        projection (``N_out = hidden``, ``K_in = shard_inter``).
-        """
         pf, gs = self.pack_factor, self.group_size
         E, two_inter, hidden_over_pack = w13_packed.shape
         hidden = hidden_over_pack * pf
@@ -109,12 +90,7 @@ class MarlinMoEMethod:
 
     @staticmethod
     def shapes_are_legal(hidden: int, shard_inter: int, group_size: int) -> bool:
-        """Whether the per-rank expert GEMM shapes satisfy Marlin's tile rules.
-
-        Marlin needs ``n % 64 == 0`` and ``k % 128 == 0`` on each GEMM, plus
-        ``k % group_size == 0``. gate_up: k=hidden, n=2*shard_inter; down:
-        k=shard_inter, n=hidden.
-        """
+        """Marlin needs n%64 and k%128 for both expert GEMMs."""
         if group_size not in (-1, 32, 64, 128):
             return False
         checks = [

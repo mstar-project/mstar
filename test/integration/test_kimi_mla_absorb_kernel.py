@@ -1,23 +1,3 @@
-"""Phase-B follow-up GPU check: the FlashInfer MLA **kernel** fast path.
-
-``MlaAbsorbCacheManager`` uses ``flashinfer.mla.BatchMLAPagedAttentionWrapper``
-(the dedicated ckv=512/kpe=64 kernel) instead of the SDPA gather loop whenever
-``_mla_kernel_available`` says the dims + GPU support it (real Kimi dims on sm90).
-This drives the manager at real dims so the kernel activates and asserts:
-
-    kernel path  ==  SDPA path  ==  independent accumulate-everything reference
-
-across a multi-page prefill, a decode step, and a batched (multi-request) decode.
-The kernel manager (``mla_ckv_dim=512``) and the SDPA manager (``mla_ckv_dim=None``,
-which forces the fallback at the SAME dims) share identical random inputs, so any
-divergence is the kernel's. It also asserts the probe declines reduced dims (the
-kernel is dim-locked and crashes off-dim, so reduced configs MUST use SDPA).
-
-Requires a Hopper (sm90) GPU — off sm90 the probe declines and the "kernel"
-manager silently uses SDPA, making the comparison a tautology, so we skip.
-
-Run:  pytest test/integration/test_kimi_mla_absorb_kernel.py -v
-"""
 import pytest
 import torch
 
@@ -41,13 +21,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEVICE = torch.device("cuda")
-# Real Kimi latent dims — the only dims the MLA kernel supports.
 L, DROPE = 512, 64
 
-
-# --------------------------------------------------------------------------
-# Real paged latent cache manager. ``ckv_dim=512`` -> kernel; None -> SDPA.
-# --------------------------------------------------------------------------
 
 def _make_cm(softmax_scale, ckv_dim, request_ids, page_size=4, max_num_pages=64):
     latent_width = L + DROPE
@@ -87,30 +62,22 @@ def _make_cm(softmax_scale, ckv_dim, request_ids, page_size=4, max_num_pages=64)
     cm.set_layer_idx(0)
     return cm, alloc
 
-
-# --------------------------------------------------------------------------
-# Independent reference: accumulate every (kv_c, k_pe), causal SDPA (no paging).
-# --------------------------------------------------------------------------
-
 def _ref_mla_step(q_nope_new, q_pe_new, kv_c_all, k_pe_all, scale):
-    """Intended MLA output for the NEW query tokens. ``kv_c_all``/``k_pe_all`` are
-    EVERY latent cached so far (including this step's); query j sits at absolute
-    position old_len+j and attends cached 0..old_len+j; value = the kv_c part."""
     sl, _H, _L = q_nope_new.shape
     total = kv_c_all.shape[0]
     old_len = total - sl
-    query = torch.cat([q_nope_new, q_pe_new], dim=-1)         # [sl,H,L+Drope]
+    query = torch.cat([q_nope_new, q_pe_new], dim=-1)
     key = torch.cat([kv_c_all.squeeze(1), k_pe_all.squeeze(1)], dim=-1)  # [total,L+Drope]
-    value = kv_c_all.squeeze(1)                               # [total,L]
-    qt = query.transpose(0, 1).float()                        # [H,sl,L+Drope]
+    value = kv_c_all.squeeze(1)
+    qt = query.transpose(0, 1).float()
     scores = torch.einsum("hqd,kd->hqk", qt, key.float()) * scale
     q_pos = old_len + torch.arange(sl, device=DEVICE)
     k_pos = torch.arange(total, device=DEVICE)
     mask = torch.where(k_pos[None, :] <= q_pos[:, None], 0.0,
                        torch.tensor(float("-inf"), device=DEVICE))
     attn = (scores + mask).softmax(-1)
-    out = torch.einsum("hqk,kd->hqd", attn, value.float())    # [H,sl,L]
-    return out.transpose(0, 1).to(q_nope_new.dtype)           # [sl,H,L]
+    out = torch.einsum("hqk,kd->hqd", attn, value.float())
+    return out.transpose(0, 1).to(q_nope_new.dtype)
 
 
 def _rand_step(sl, H, dtype=torch.bfloat16):
@@ -123,8 +90,6 @@ def _rand_step(sl, H, dtype=torch.bfloat16):
 
 
 def _run_single_req(cm, alloc, T, H, scale):
-    """Prefill T tokens (multi-page) + one decode step through ``cm``; return the
-    two outputs and the reference for each."""
     q_nope, q_pe, kv_c, k_pe = _rand_step(T, H)
     cm.plan_attention(seq_lens=[T], is_causal=True, dtype=torch.bfloat16)
     with torch.no_grad():
@@ -146,12 +111,7 @@ def _run_single_req(cm, alloc, T, H, scale):
 
 
 def test_kernel_matches_sdpa_and_reference():
-    """Real dims (L=512, Drope=64, H=2): kernel == SDPA == reference, prefill+decode.
-
-    Same seed/inputs into a kernel manager (``mla_ckv_dim=512``) and an SDPA
-    manager (``mla_ckv_dim=None``) at identical dims — both must match the
-    independent reference and each other."""
-    H, T, ps = 2, 6, 4  # T=6 over page_size-4 = 2 pages
+    H, T, ps = 2, 6, 4
     scale = (L + DROPE) ** -0.5 * 1.3
     assert _mla_kernel_available(L, DROPE, 9) is True
 
@@ -162,45 +122,34 @@ def test_kernel_matches_sdpa_and_reference():
     finally:
         alloc_k.cleanup()
 
-    torch.manual_seed(0)  # identical inputs
+    torch.manual_seed(0)
     cm_s, alloc_s = _make_cm(scale, ckv_dim=None, request_ids=["r0"], page_size=ps)
     try:
         (sp, _refp), (sd, _refd) = _run_single_req(cm_s, alloc_s, T, H, scale)
     finally:
         alloc_s.cleanup()
 
-    # Sanity: the kernel manager actually took the kernel path (ps.wrapper set),
-    # the SDPA manager did not.
     assert cm_k._plan_states["main"].wrapper is not None
     assert cm_s._plan_states["main"].wrapper is None
 
     assert kp.shape == (T, H, L) and kd.shape == (1, H, L)
-    # kernel == reference
     torch.testing.assert_close(kp, refp, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(kd, refd, rtol=2e-2, atol=2e-2)
-    # SDPA == reference
     torch.testing.assert_close(sp, refp, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(sd, refd, rtol=2e-2, atol=2e-2)
-    # kernel == SDPA
     torch.testing.assert_close(kp, sp, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(kd, sd, rtol=2e-2, atol=2e-2)
 
 
 def test_kernel_batched_decode():
-    """Batched (multi-request, varying lengths) decode through the kernel path.
-
-    Two requests are prefilled to different lengths, then a single decode step
-    runs both together; each request's decode output must match its own
-    accumulate-everything reference."""
     H, ps = 2, 4
     scale = (L + DROPE) ** -0.5
-    lens = [5, 9]  # req0 prefill 5 tokens, req1 prefill 9 (spans >1 page)
+    lens = [5, 9]
     rids = ["r0", "r1"]
 
     torch.manual_seed(1)
     cm, alloc = _make_cm(scale, ckv_dim=L, request_ids=rids, page_size=ps)
     try:
-        # ---- prefill both requests (concatenated queries) ----
         pref = [_rand_step(sl, H) for sl in lens]
         q_nope = torch.cat([p[0] for p in pref], 0)
         q_pe = torch.cat([p[1] for p in pref], 0)
@@ -213,7 +162,6 @@ def test_kernel_batched_decode():
         cm.advance_seq_lens()
         assert cm._plan_states["main"].wrapper is not None
 
-        # ---- one decode step for both requests ----
         dec = [_rand_step(1, H) for _ in lens]
         dq_nope = torch.cat([d[0] for d in dec], 0)
         dq_pe = torch.cat([d[1] for d in dec], 0)
@@ -225,9 +173,8 @@ def test_kernel_batched_decode():
         torch.cuda.synchronize()
         assert got.shape == (2, H, L)
 
-        # ---- per-request reference (its prefill latents + its decode latent) ----
         for i in range(2):
-            kv_c_all = torch.cat([pref[i][2], dec[i][2]], 0)   # [len_i+1,1,L]
+            kv_c_all = torch.cat([pref[i][2], dec[i][2]], 0)
             k_pe_all = torch.cat([pref[i][3], dec[i][3]], 0)
             ref = _ref_mla_step(dec[i][0], dec[i][1], kv_c_all, k_pe_all, scale)
             torch.testing.assert_close(got[i:i + 1], ref, rtol=2e-2, atol=2e-2)
@@ -236,17 +183,6 @@ def test_kernel_batched_decode():
 
 
 def test_mla_wrapper_cuda_graph_capture_replay():
-    """The MLA kernel wrapper + latent scatter are CUDA-graph capturable.
-
-    Captures ONE decode graph (``set_latent`` + ``run`` over static buffers) then
-    replays it across two decode steps — re-planning each step (which updates the
-    wrapper's static index/scatter buffers via ``.copy_()``, advancing kv_len +
-    scatter offset) and copying fresh queries/latents into the static input
-    buffers before replay. Each replay's output must match the independent
-    accumulate-everything reference for that step. This mirrors exactly what
-    ``CudaGraphRunner`` does across decode steps, proving the absorbed-decode
-    primitive captures + replays correctly with a moving page table.
-    """
     from mstar.utils.flashinfer_utils import FlashInferMLAWrapper
 
     bs, H, ps, max_pages = 2, 2, 4, 64
@@ -262,9 +198,7 @@ def test_mla_wrapper_cuda_graph_capture_replay():
         max_total_tokens=bs, device=DEVICE, use_cuda_graph=True,
     )
 
-    # Per-request fixed page ranges + prefill lengths. prefill=6/9 with ps=4 keep
-    # the two following decode steps within the same 2/3 pages (kv_indices stable;
-    # only kv_len + the scatter offset advance) — the common decode case.
+    # Decode steps stay within fixed pages; only kv_len and scatter offsets advance.
     req_pages = [[0, 1], [2, 3, 4]]
     prefill = [6, 9]
     torch.manual_seed(7)
@@ -282,7 +216,6 @@ def test_mla_wrapper_cuda_graph_capture_replay():
     kv_indices = torch.tensor(req_pages[0] + req_pages[1], device=DEVICE, dtype=torch.int32)
     qo_indptr = torch.tensor([0, 1, 2], device=DEVICE, dtype=torch.int32)
 
-    # Static input buffers replay reads from.
     q_nope_s = torch.zeros(bs, H, L, device=DEVICE, dtype=dtype)
     q_pe_s = torch.zeros(bs, H, DROPE, device=DEVICE, dtype=dtype)
     latent_s = torch.zeros(bs, latent_w, device=DEVICE, dtype=dtype)
@@ -299,7 +232,6 @@ def test_mla_wrapper_cuda_graph_capture_replay():
         q_pe_s.copy_(torch.randn(bs, H, DROPE, device=DEVICE, dtype=dtype) * 0.1)
         latent_s.copy_(torch.randn(bs, latent_w, device=DEVICE, dtype=dtype) * 0.1)
 
-    # ---- warmup (side stream) then capture ONE decode graph ----
     plan_step(1)
     fill_inputs(100)
     s = torch.cuda.Stream()
@@ -315,19 +247,17 @@ def test_mla_wrapper_cuda_graph_capture_replay():
         wrapper.set_latent(cache, latent_s)
         out_static = wrapper.run(q_nope_s, q_pe_s, cache[..., :L], cache[..., L:])
 
-    # ---- replay two decode steps; each must match its accumulate reference ----
     decode_hist = [[] for _ in range(bs)]  # decode latents scattered so far, per req
     prev = None
     for step in (1, 2):
-        fill_inputs(step)          # fresh queries + decode latents into static bufs
-        plan_step(step)            # re-plan: advance kv_len + scatter offset
+        fill_inputs(step)
+        plan_step(step)
         g.replay()
         torch.cuda.synchronize()
         for r in range(bs):
             decode_hist[r].append(latent_s[r:r + 1].clone())
         got = out_static.clone()
 
-        # reference: query attends [prefix_r ; all decode latents so far]
         ref = torch.empty(bs, H, L, device=DEVICE, dtype=dtype)
         for r in range(bs):
             all_lat = torch.cat([prefix[r]] + decode_hist[r], dim=0)  # [prefill+step, w]
@@ -337,15 +267,12 @@ def test_mla_wrapper_cuda_graph_capture_replay():
             )
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
         if prev is not None:
-            # Sanity: distinct inputs -> distinct outputs (values really flow
-            # through the static buffers, not baked into the captured graph).
+            # Distinct inputs prove replay reads static buffers, not baked values.
             assert not torch.allclose(got, prev, atol=1e-3)
         prev = got
 
 
 def test_probe_declines_reduced_dims():
-    """The kernel is dim-locked (ckv=512/kpe=64) and crashes off-dim, so the probe
-    must decline reduced dims / pre-sm90 (→ SDPA), and accept only real dims on sm90."""
     assert _mla_kernel_available(L, DROPE, 9) is True     # real dims, Hopper
     assert _mla_kernel_available(32, 8, 9) is False        # reduced dims
     assert _mla_kernel_available(L, DROPE, 8) is False     # pre-sm90

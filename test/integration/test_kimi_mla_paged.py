@@ -1,32 +1,3 @@
-"""M6 step 1: the real paged MLA path, end-to-end, at the DeepSeek scale.
-
-This is the test that finally validates ``KimiMLAAttention`` over mstar's REAL
-paged ``FlashInferCacheManager`` (genuine ``PagedAllocationManager`` + KV cache),
-not the MockCacheHandle SDPA stand-in the M3/M4/M5 goldens use.
-
-It closes the M4 FlashInfer-192 blocker. The naive MLA pads q/k (from
-``qk_head_dim``) and v (from ``v_head_dim``) up to ``padded_head_dim`` — the
-smallest FlashInfer-SM90-supported head_dim {64,128,256} >= ``qk_head_dim`` — so
-the reduced ``qk_head_dim=24`` becomes 64 (real Kimi 192 -> 256). The Hopper
-prefill kernel ``static_assert``s ``head_dim_vo in {64,128,256}``, so the raw 24
-(and 192) fail to JIT-build; 64 builds and runs.
-
-The correctness crux is the **softmax-scale compensation**. run_attention applies
-a fixed ``1/sqrt(padded_head_dim)`` scale, but DeepSeek's intended softmax scale
-is ``qk_head_dim**-0.5 * mscale**2``. The zero-pad dims contribute 0 to q·k, so
-we fold ``boost = mscale**2 * sqrt(padded_head_dim / qk_head_dim)`` into q:
-
-    scores = (q*boost)·k * padded_head_dim**-0.5
-           = q·k * mscale**2 * sqrt(padded/qk) * padded**-0.5
-           = q·k * mscale**2 * qk**-0.5            (the DeepSeek scale).
-
-The reference below is the **independent DeepSeek computation** — projections +
-YARN RoPE + causal SDPA at ``qk_head_dim**-0.5 * mscale**2`` over the UNPADDED q/k
-(Dqk) and v (Dv), then output slice + o_proj. Matching it proves the padded paged
-run + scale compensation reproduce the intended result exactly.
-
-Run:  pytest test/integration/test_kimi_mla_paged.py -v
-"""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -54,10 +25,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = torch.device("cuda")
 
-
-# --------------------------------------------------------------------------
-# Real paged cache manager (mirrors test_kimi_flashinfer_attention.py).
-# --------------------------------------------------------------------------
 
 def _make_real_cache_manager(num_heads, head_dim, dtype, page_size=128, max_num_pages=8):
     kv_cache = torch.zeros(
@@ -91,10 +58,6 @@ def _make_real_cache_manager(num_heads, head_dim, dtype, page_size=128, max_num_
     return cm, alloc
 
 
-# --------------------------------------------------------------------------
-# Independent DeepSeek reference (no pad; scale = qk_head_dim**-0.5 * mscale**2).
-# --------------------------------------------------------------------------
-
 def _ref_rmsnorm(x, weight, eps):
     x32 = x.float()
     x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
@@ -127,7 +90,6 @@ def _sdpa_causal(q, k, v, scale):
 
 
 def _ref_deepseek_mla(attn: KimiMLAAttention, cfg, h, pos):
-    """The intended DeepSeek MLA output: NO padding, scale = qk**-0.5 * mscale**2."""
     T, H = h.shape[0], attn.num_heads
     Dnope, Drope, Dv, L = (
         cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank)
@@ -166,13 +128,6 @@ def _build_attention(cfg, dtype):
 
 
 def test_paged_mla_matches_deepseek_sdpa():
-    """KimiMLAAttention through the REAL paged FlashInferCacheManager (head_dim =
-    padded_head_dim = 64) == the independent DeepSeek MLA at qk**-0.5 * mscale**2.
-
-    This validates both (a) the real paged path builds+runs at the padded head_dim
-    (the M4 FlashInfer-192 blocker mitigation), and (b) the scale compensation is
-    exactly right — the padded run reproduces the unpadded DeepSeek scale.
-    """
     torch.manual_seed(0)
     cfg = KimiK2Config.reduced()
     assert cfg.qk_head_dim == 24 and cfg.padded_head_dim == 64  # the mitigation
@@ -196,6 +151,5 @@ def test_paged_mla_matches_deepseek_sdpa():
 
     expected = _ref_deepseek_mla(attn, cfg, h, pos)
     assert got.shape == (T, cfg.hidden_size)
-    # bf16 through the real FlashInfer kernel; the scale compensation is exact in
-    # exact arithmetic, so any residual is pure bf16 rounding.
+    # Any residual after exact scale compensation is bf16 FlashInfer rounding.
     torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)

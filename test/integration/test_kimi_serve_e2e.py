@@ -1,37 +1,3 @@
-"""Phase 2 (gap 4): drive the Kimi-K2.7 SERVING path as deep as possible
-in-process, beyond the submodule-level gate.
-
-``mstar-serve`` is a multi-process stack (API server -> conductor -> N worker
-processes -> KV_CACHE engine -> decode Loop -> tokens over ZMQ). A live serve is
-the ultimate proof; see ``tools/kimi_goldens/repro/RUNBOOK.md`` for the exact
-launch + request commands. This test is the committed, deterministic gate that
-exercises the same *model* serve surface a live serve hits, minus the inter-
-process transport, so it runs in CI-style isolation on one GPU with synthetic
-weights:
-
-  1. **The real serve entry points via the real __init__.** We build the model
-     through ``KimiK2Model(config_variant="reduced", checkpoint_path=...,
-     tokenizer_mode="byte")`` — the exact path ``api_server/entrypoint.py`` takes
-     from a serving YAML's ``model_kwargs`` — then use ``process_prompt`` (byte
-     tokenizer), ``get_submodule`` (meta -> to_empty -> M5 load), and
-     ``postprocess``. None of these are touched by ``test_kimi_submodule.py``,
-     which bypasses ``__init__`` via ``object.__new__``.
-
-  2. **prefill + the decode Loop with the real Sampler and check_stop.** Over a
-     genuine ``FlashInferCacheManager`` we run prefill (``forward`` -> logits ->
-     ``Sampler.sample``) then several decode steps through ``forward_batched``
-     (the engine's batched decode path, which samples inside the pass and returns
-     per-request ``new_token``), calling the submodule's ``check_stop`` each step
-     — the Loop's real stop mechanism. This produces actual generated token ids
-     and proves the decode loop terminates on ``max_tokens`` (the reduced model's
-     EOS id 163586 is unreachable in ``vocab_size=256``, so ``max_tokens`` is the
-     only stop — exactly what a live reduced serve relies on).
-
-Deterministic by construction (greedy / ``temperature=0``): the sequence is
-asserted stable across two fresh-cache runs so the golden never flakes.
-
-Run:  pytest test/integration/test_kimi_serve_e2e.py -v
-"""
 import pytest
 import torch
 
@@ -58,11 +24,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = torch.device("cuda")
 
-
-# --------------------------------------------------------------------------
-# Synthetic HF DeepSeek-V3 reduced checkpoint (un-fuse every fused param back
-# to HF keys — identical serialization to test_kimi_submodule / M5 loader).
-# --------------------------------------------------------------------------
 
 def _fill_layer(layer, cfg):
     a = layer.self_attn
@@ -146,10 +107,6 @@ def _write_checkpoint(tmp_path, seed=0):
     return cfg
 
 
-# --------------------------------------------------------------------------
-# Real paged FlashInfer cache (head_dim = padded_head_dim = 64 for reduced).
-# --------------------------------------------------------------------------
-
 def _make_real_cache_manager(cfg, dtype, page_size=128, max_num_pages=8):
     num_heads = cfg.num_attention_heads
     head_dim = cfg.padded_head_dim
@@ -179,7 +136,6 @@ def _make_real_cache_manager(cfg, dtype, page_size=128, max_num_pages=8):
 
 
 def _greedy_sampler(cfg):
-    """A real Sampler configured for deterministic greedy decode of r0."""
     sampler = Sampler(device=DEVICE)
     sampler.add_request("r0")
     sampler.set_config("r0", vocab_size=cfg.vocab_size, temperature=0.0,
@@ -188,8 +144,6 @@ def _greedy_sampler(cfg):
 
 
 def _fwd_info(max_tokens, cfg):
-    """CurrentForwardPassInfo the submodule's check_stop reads (sampling_config /
-    max_tokens / dynamic_loop_iter_counts)."""
     return CurrentForwardPassInfo(
         request_id="r0", graph_walk="decode", requires_cfg=False, fwd_index=0,
         random_seed=0, max_tokens=max_tokens,
@@ -199,13 +153,7 @@ def _fwd_info(max_tokens, cfg):
     )
 
 
-# --------------------------------------------------------------------------
-# The serve drive.
-# --------------------------------------------------------------------------
-
 def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
-    """prefill (forward+Sampler) then the decode Loop (forward_batched + check_stop)
-    over a fresh paged cache. Returns (generated_token_ids, stopped_by_check_stop)."""
     cm, alloc = _make_real_cache_manager(cfg, torch.bfloat16)
     sampler = _greedy_sampler(cfg)
     engine_inputs = ModelInputsFromEngine(
@@ -215,7 +163,6 @@ def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
     generated: list[int] = []
     stopped = False
     try:
-        # --- prefill: forward -> last-token logits -> Sampler (first token) ---
         ar = submodule.prepare_inputs("prefill", None, {"text_inputs": [prompt_ids]})
         packed = submodule.preprocess("prefill", engine_inputs, [ar])
         with torch.no_grad():
@@ -225,7 +172,6 @@ def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
         next_token = sampler.sample(["r0"], logits).clone()  # (1,)
         generated.append(int(next_token.item()))
 
-        # --- decode Loop: forward_batched samples inside the pass; check_stop ---
         for step in range(max_tokens + 4):  # +slack; check_stop must break first
             ar = submodule.prepare_inputs("decode", None, {"text_inputs": [next_token]})
             packed = submodule.preprocess("decode", engine_inputs, [ar])
@@ -248,25 +194,15 @@ def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
     return generated, stopped
 
 
-# --------------------------------------------------------------------------
-# Tests
-# --------------------------------------------------------------------------
-
 def test_serve_path_prefill_decode_loop(tmp_path):
-    """Full model serve surface: real __init__ (reduced/local/byte) -> process_prompt
-    -> get_submodule -> prefill + decode Loop (Sampler + check_stop) -> postprocess.
-    Proves the decode loop generates real tokens and terminates on max_tokens."""
     cfg = _write_checkpoint(tmp_path, seed=0)
 
-    # The exact construction api_server/entrypoint.py performs from a serving
-    # YAML's model_kwargs (no HF tokenizer, no 1T weights).
     model = KimiK2Model(
         model_path_hf="", config_variant="reduced",
         checkpoint_path=str(tmp_path), tokenizer_mode="byte",
     )
     assert model.config.vocab_size == 256
 
-    # Byte tokenizer: prompt text -> token ids in [0, 256).
     prompt_tensors = model.process_prompt("hello kimi", ["text"], ["text"])
     prompt_ids = prompt_tensors["text_inputs"][0].to(DEVICE)
     assert prompt_ids.tolist() == list("hello kimi".encode("utf-8"))
@@ -274,29 +210,22 @@ def test_serve_path_prefill_decode_loop(tmp_path):
 
     submodule = model.get_submodule("LLM", device="cuda", autocast_dtype=torch.bfloat16)
     assert isinstance(submodule, KimiLLMSubmodule)
-    # M6 buffer audit still holds through the serve build path.
     assert list(submodule.language_model.named_buffers()) == []
 
     MAX_TOKENS = 6
     generated, stopped = _run_generation(model, submodule, cfg, prompt_ids, MAX_TOKENS)
 
-    # The decode loop stopped via check_stop (max_tokens), NOT the safety slack.
     assert stopped, "decode loop did not terminate via check_stop"
-    # 1 prefill token + exactly MAX_TOKENS decode tokens (check_stop fires when
-    # decode_loop count+1 >= max_tokens, i.e. after the MAX_TOKENS-th decode step).
+    # check_stop fires after exactly MAX_TOKENS decode steps.
     assert len(generated) == 1 + MAX_TOKENS, generated
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
-    # postprocess decodes the generated ids back to bytes (client-facing output).
     out_bytes = model.postprocess(torch.tensor(generated), "text")
     assert isinstance(out_bytes, bytes)
     assert len(out_bytes) == len(generated)
 
 
 def test_serve_path_is_deterministic(tmp_path):
-    """Greedy decode over a fresh cache is bit-stable: two runs of the whole
-    prefill+decode serve drive yield identical token sequences. Guards the golden
-    against the flakiness that has bitten this project before."""
     cfg = _write_checkpoint(tmp_path, seed=1)
     model = KimiK2Model(
         model_path_hf="", config_variant="reduced",

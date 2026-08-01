@@ -1,10 +1,5 @@
 model: "kimi_k2_7"
-# Attempt-3 variant of kimi_k2_7_code_tp8.yaml: identical EXCEPT the checkpoint is
-# loaded from /dev/shm (RAM-backed tmpfs) instead of shared ZFS. Attempt 2 loaded
-# from ZFS over ~59 min and a rank was silently SIGKILL'd (likely a shared-FS mmap
-# SIGBUS / contention reaper during the long load). Staging the 595GB checkpoint
-# into /dev/shm makes the load RAM-speed (minutes) and immune to mmap I/O faults.
-# Stage first with tools: /m-coriander/coriander/garv901/stage_to_shm.sh
+# TP8 Kimi-K2.7-Code config using a RAM-backed /dev/shm checkpoint copy.
 max_seq_len: 8192
 model_kwargs:
   config_variant: k27_code

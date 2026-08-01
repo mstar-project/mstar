@@ -1,32 +1,3 @@
-"""M6 step 6: submodule-level end-to-end through the REAL paged cache.
-
-This is the M6 correctness gate for serving: it exercises the whole
-``KimiK2Model.get_submodule`` -> ``KimiLLMSubmodule`` -> real
-``FlashInferCacheManager`` path on the reduced config with synthetic weights.
-
-Two things are validated:
-
-1. **The real build path.** ``get_submodule`` constructs ``KimiForCausalLM`` on
-   the meta device, casts to bf16 on meta, ``to_empty(cuda)``, and runs the M5 HF
-   loader — the production ``meta -> to_empty -> load_weights`` path (where the M5
-   rope-buffer bug would have bitten). We assert the loaded model carries ZERO
-   buffers (M6 buffer audit) so no derived tensor survives as garbage.
-
-2. **Serving lifecycle over the paged MLA.** We drive
-   ``prepare_inputs -> preprocess -> forward`` through a genuine
-   ``FlashInferCacheManager`` (head_dim = padded_head_dim = 64) for a prefill plus
-   several decode steps, asserting sane token generation. The prefill logits are
-   checked against a mock-cache forward of the SAME loaded model at the
-   DeepSeek-correct scale, tying the paged serving path to the validated
-   MockCacheHandle goldens.
-
-``mstar-serve`` full-stack e2e (conductor + worker processes + SHM ports + CUDA
-graph capture) is NOT run here — that infra isn't stood up in this environment.
-This submodule-level test is the required correctness gate; see the M6 notes in
-kimi-port-plan for the serve status.
-
-Run:  pytest test/integration/test_kimi_submodule.py -v
-"""
 import pytest
 import torch
 
@@ -50,12 +21,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEVICE = torch.device("cuda")
-
-
-# --------------------------------------------------------------------------
-# Synthetic HF DeepSeek-V3 checkpoint (same serialization as
-# test_kimi_weight_loading — un-fuse every fused param back to HF keys).
-# --------------------------------------------------------------------------
 
 def _fill_layer(layer, cfg):
     a = layer.self_attn
@@ -128,11 +93,6 @@ def _hf_checkpoint(model, cfg):
     sd["lm_head.weight"] = model.lm_head.weight
     return {k: v.detach().cpu().clone().contiguous() for k, v in sd.items()}
 
-
-# --------------------------------------------------------------------------
-# Real paged cache + mock cache (DeepSeek-correct scale via padded_head_dim).
-# --------------------------------------------------------------------------
-
 def _make_real_cache_manager(cfg, dtype, page_size=128, max_num_pages=8):
     num_heads = cfg.num_attention_heads
     head_dim = cfg.padded_head_dim
@@ -184,22 +144,12 @@ class _MockMLACache:
 
 
 def _make_model(cfg, checkpoint_dir) -> KimiK2Model:
-    """A KimiK2Model wired to the synthetic checkpoint without a tokenizer.
-
-    object.__new__ skips __init__ (which would pull a tokenizer / the full config),
-    so we set only what get_submodule needs — mirroring the modular test builder.
-    """
     model = object.__new__(KimiK2Model)
     model.config = cfg
     model.model_path_hf = str(checkpoint_dir)
     model.cache_dir = None
     model._submodule_cache = {}
     return model
-
-
-# --------------------------------------------------------------------------
-# Minimal engine-inputs + lifecycle driver.
-# --------------------------------------------------------------------------
 
 def _engine_inputs(cm):
     return ModelInputsFromEngine(
@@ -208,7 +158,6 @@ def _engine_inputs(cm):
 
 
 def _step(submodule, cm, graph_walk, token_ids):
-    """Drive prepare_inputs -> preprocess -> forward for one packed request."""
     engine_inputs = _engine_inputs(cm)
     ar_in = submodule.prepare_inputs(
         graph_walk=graph_walk, fwd_info=None,
@@ -220,10 +169,6 @@ def _step(submodule, cm, graph_walk, token_ids):
     return out["logits"][0], packed  # (1, vocab), packed dict
 
 
-# --------------------------------------------------------------------------
-# Test
-# --------------------------------------------------------------------------
-
 def test_submodule_prefill_decode_over_real_paged_cache(tmp_path):
     from safetensors.torch import save_file
 
@@ -232,18 +177,15 @@ def test_submodule_prefill_decode_over_real_paged_cache(tmp_path):
     ref = _build_reference(cfg)
     save_file(_hf_checkpoint(ref, cfg), str(tmp_path / "model.safetensors"))
 
-    # --- the real build path: meta -> to(bf16) -> to_empty(cuda) -> load ---
     model = _make_model(cfg, tmp_path)
     submodule = model.get_submodule("LLM", device="cuda", autocast_dtype=torch.bfloat16)
     assert isinstance(submodule, KimiLLMSubmodule)
-    # get_submodule caches the built submodule.
     assert model.get_submodule("LLM") is submodule
-    # M6 buffer audit: no derived tensor buffer survived the load path as garbage.
+    # Derived buffers must not survive meta -> to_empty as garbage.
     assert list(submodule.language_model.named_buffers()) == []
     p = next(submodule.language_model.parameters())
     assert p.device.type == "cuda" and p.dtype == torch.bfloat16
 
-    # --- prefill over the real paged FlashInfer cache (head_dim = 64) ---
     T = 6
     prompt = torch.randint(0, cfg.vocab_size, (T,), device=DEVICE)
     cm, alloc = _make_real_cache_manager(cfg, torch.bfloat16)
@@ -252,10 +194,7 @@ def test_submodule_prefill_decode_over_real_paged_cache(tmp_path):
         assert prefill_logits.shape == (1, cfg.vocab_size)
         assert torch.isfinite(prefill_logits).all()
 
-        # Reference: the SAME loaded model through the mock cache at the
-        # DeepSeek-correct scale (padded_head_dim). Ties the paged serving path to
-        # the validated MockCacheHandle goldens. Loose bf16 tolerance (2-layer stack
-        # through the real FlashInfer kernel).
+        # Same loaded weights through the mock cache at the DeepSeek-correct scale.
         pos = torch.arange(T, device=DEVICE)
         with torch.no_grad():
             ref_hidden = submodule.language_model.model(
@@ -263,7 +202,6 @@ def test_submodule_prefill_decode_over_real_paged_cache(tmp_path):
         ref_logits = submodule.lm_head(ref_hidden[-1:])
         torch.testing.assert_close(prefill_logits, ref_logits, rtol=5e-2, atol=5e-2)
 
-        # --- a few decode steps over the accumulating paged KV cache ---
         next_token = prefill_logits.argmax(-1)  # (1,)
         generated = [int(next_token.item())]
         assert 0 <= generated[-1] < cfg.vocab_size
@@ -278,14 +216,11 @@ def test_submodule_prefill_decode_over_real_paged_cache(tmp_path):
     finally:
         alloc.cleanup()
 
-    # Sane generation: right length, all valid ids.
     assert len(generated) == 5
     assert all(0 <= t < cfg.vocab_size for t in generated)
 
 
 def test_submodule_paged_decode_is_deterministic(tmp_path):
-    """Same prompt + fresh cache -> identical first token (paged path is stable and
-    the load is reproducible). Cheap guard against nondeterministic KV writes."""
     from safetensors.torch import save_file
 
     torch.manual_seed(1)

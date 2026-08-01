@@ -140,7 +140,6 @@ def fused_moe_kernel(
 
 @triton.jit
 def fused_moe_kernel_w4a16(
-    # Pointers
     a_ptr,
     b_ptr,
     c_ptr,
@@ -155,7 +154,6 @@ def fused_moe_kernel_w4a16(
     K,
     EM,
     num_valid_tokens,
-    # Strides
     stride_am,
     stride_ak,
     stride_be,
@@ -169,7 +167,6 @@ def fused_moe_kernel_w4a16(
     stride_bze,
     stride_bzk,
     stride_bzn,
-    # Block sizes (compile-time)
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -182,19 +179,10 @@ def fused_moe_kernel_w4a16(
     HAS_ZP: tl.constexpr,
     even_Ks: tl.constexpr,
 ):
-    """Compute one ``[BLOCK_SIZE_M, BLOCK_SIZE_N]`` output tile from PACKED weights.
+    """Fused MoE tile for packed W4A16 weights.
 
-    Identical control flow to :func:`fused_moe_kernel`; the only change is the
-    B load in the K-loop. ``b_ptr`` addresses an int32 tensor of shape
-    ``(E, N, K // PACK_FACTOR)`` where ``PACK_FACTOR`` INT4 nibbles are packed
-    low-order-first along the (logical) K axis into each int32. For each K tile we
-    read the containing int32s, shift out the right nibble, offset-binary subtract
-    (symmetric: ``- 8``; asymmetric: ``- b_zp``), and scale by the per-``group_size``
-    ``b_scale``, all in fp32, then cast to ``compute_type`` for the ``tl.dot``.
-
-    Requires ``BLOCK_SIZE_K % PACK_FACTOR == 0`` and ``BLOCK_SIZE_K % group_size
-    == 0`` (enforced by :func:`get_default_config`) so a K tile spans a whole
-    number of int32s and never straddles a group boundary mid-int32.
+    ``K`` is logical; weights are int32-packed low-order-first along K. K tiles
+    must span whole int32s and whole quant groups.
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -219,8 +207,7 @@ def fused_moe_kernel_w4a16(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
-    # Packed B: the int32 holding logical-K index ``kk`` is at ``kk // PACK_FACTOR``
-    # along the last (packed) axis; the nibble sits at ``(kk % PACK_FACTOR) * 4``.
+    # Packed B is indexed by logical K, then shifted to the right INT4 nibble.
     b_ptrs = (
         b_ptr + off_experts * stride_be
         + (offs_k[:, None] // PACK_FACTOR) * stride_bk
@@ -231,8 +218,7 @@ def fused_moe_kernel_w4a16(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k_start in range(0, K, BLOCK_SIZE_K):
-        # Per-group scale index along the logical K axis (same for every int32 in
-        # a group). Recomputed each tile from the global-K position.
+        # Group scales are indexed by logical K, not packed K.
         offs_ks = (offs_k[:, None] + k_start) // group_size
         b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn + offs_ks * stride_bsk
         if even_Ks:
@@ -248,13 +234,10 @@ def fused_moe_kernel_w4a16(
             )
             b_packed = tl.load(b_ptrs, mask=k_mask, other=0)
             b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=1.0).to(tl.float32)
-        # Extract the nibble. ``>>`` on int32 is arithmetic, but ``& 0xF`` masks
-        # the sign-extended high bits, so the top nibble (container bit 31 set) is
-        # exact for all PACK_FACTOR positions.
+        # Mask after arithmetic shift so the top nibble is exact when bit 31 is set.
         b_nib = ((b_packed >> b_shifter) & 0xF).to(tl.float32)
         if HAS_ZP:
-            # Asymmetric extension (never exercised by Kimi — symmetric only). The
-            # zero point is stored one-per-group, unpacked, mirroring ``b_scale``.
+            # Optional asymmetric zero point; Kimi uses symmetric INT4.
             b_zp_ptrs = b_zp_ptr + off_experts * stride_bze + offs_bn[None, :] * stride_bzn + offs_ks * stride_bzk
             if even_Ks:
                 b_zp = tl.load(b_zp_ptrs).to(tl.float32)
@@ -378,20 +361,10 @@ def invoke_fused_moe_kernel_w4a16(
     pack_factor: int,
     group_size: int,
 ) -> None:
-    """Launch :func:`fused_moe_kernel_w4a16` (packed-INT4 grouped GEMM).
+    """Launch the packed-W4A16 MoE kernel.
 
-    Mirrors :func:`invoke_fused_moe_kernel` with two differences that the packed
-    layout forces:
-
-    * ``K`` is the LOGICAL contraction dim and is passed explicitly — it CANNOT be
-      derived from ``B_packed.shape[2]`` (that is ``K // pack_factor``).
-    * ``B_scale`` (shape ``(E, N, K // group_size)``) rides alongside; its strides
-      are passed ``stride(0), stride(2), stride(1)`` to match the kernel's
-      ``(bse, bsk, bsn)`` order, exactly like the weight strides.
-
-    ``B_zp`` is optional (symmetric INT4 has no zero point). When ``None`` the
-    kernel's ``HAS_ZP`` is off and a stand-in tensor (``B_scale``) is passed so the
-    dead zp-stride args stay valid; nothing is dereferenced.
+    ``K`` is logical, while ``B_packed.shape[2]`` is ``K // pack_factor``. When
+    ``B_zp`` is absent, ``HAS_ZP`` gates all loads from the stand-in tensor.
     """
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -635,12 +608,9 @@ def get_default_config(
     For decode batch sizes (``M`` on the order of 1--64) we always fall
     into the ``M <= E`` branch since Qwen3-Omni has ``E == 128``.
 
-    ``group_size`` (set only on the W4A16 path) does NOT change the bf16 result:
-    when ``None`` the returned config is byte-for-byte the historical one. When
-    set, ``BLOCK_SIZE_K`` is clamped down (halving) until it is a multiple of both
-    ``pack_factor`` (8 for INT4) and ``group_size`` — the divisibility the packed
-    kernel needs so a K tile spans whole int32s and whole groups. Kimi
-    (``group_size=32``; configs 64/32) already complies, so the clamp is a no-op.
+    When ``group_size`` is set for W4A16, ``BLOCK_SIZE_K`` is clamped until it is
+    divisible by both INT4 pack factor and group size. ``None`` preserves the
+    historical config.
     """
     if M <= E:
         config = {

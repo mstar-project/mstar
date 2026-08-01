@@ -1,22 +1,4 @@
-"""GPU golden for the vendored Marlin W4A16 kernels (utils/marlin).
-
-Validates the kernel layer in isolation, below any model wiring:
-
-  1. the JIT extension builds and registers ``_mstar_marlin_C`` ops;
-  2. ``gptq_marlin_repack`` runs and is deterministic (repack layout is stable);
-  3. the full routed-expert path (``MarlinMoEMethod`` = per-expert Marlin repack +
-     ``fused_marlin_moe``) matches the bf16 fused-expert GEMM on the *same*
-     dequantized weights, AND the existing Triton W4A16 path on the *same* packed
-     weights.
-
-Marlin dequantizes the identical INT4 nibbles as the Triton path but accumulates
-in a different tile/reduce order (and folds fp32 combine weights), so agreement is
-close-but-not-bit-exact. The meaningful gate is a cosine-similarity floor plus a
-relative-L2 bound — an elementwise ``atol`` would flag the handful of bf16-accumulate
-outliers on large down-projection sums, not a kernel bug.
-
-Run:  pytest test/integration/test_marlin_kernels.py -v
-"""
+"""GPU golden tests for the vendored Marlin W4A16 kernels."""
 import pytest
 import torch
 
@@ -33,7 +15,6 @@ PACK_FACTOR = 8
 
 
 def _quantize_stack(weight):
-    """Fake-quantize a stacked ``(E, N, K)`` weight -> packed/scale/deq (bf16 scale)."""
     E, N, K = weight.shape
     packed = torch.empty((E, N, K // PACK_FACTOR), dtype=torch.int32, device=DEVICE)
     scale = torch.empty((E, N, K // GROUP_SIZE), dtype=torch.bfloat16, device=DEVICE)
@@ -115,8 +96,6 @@ def test_marlin_moe_matches_bf16_and_triton(num_tokens):
 
 
 def test_marlin_moe_reduce_results_false_shape():
-    """``reduce_results=False`` returns the per-slot (tokens, top_k, hidden) tensor
-    the TP path all-reduces before folding — exercise it on the Marlin path."""
     from mstar.model.components.quantization import MarlinMoEMethod
 
     torch.manual_seed(1)

@@ -1,21 +1,3 @@
-"""Phase-B GPU check: the REAL paged compressed-latent MLA backend.
-
-Drives ``MlaAbsorbCacheManager.run_attention_mla`` over a genuine 4D latent
-paged cache (real ``PagedAllocationManager`` + ``create_cache_manager``), with
-SYNTHETIC random ``q_nope/q_pe/kv_c/k_pe`` — no ``KimiMLAAttention`` needed. The
-manager writes ``cat([kv_c, k_pe])`` as one latent vector per token into the
-paged cache at its (page, offset), then per request gathers its full cached
-latent and runs a causal SDPA (query = ``cat([q_nope, q_pe])``, key = the full
-latent, value = its first ``L`` dims) at ``kv_cache_config.softmax_scale``.
-
-The reference is INDEPENDENT of the paging machinery: it accumulates every
-``(kv_c, k_pe)`` seen so far into contiguous tensors and runs the same causal
-SDPA (no pages, no scatter/gather). Matching it across a multi-page prefill and a
-following decode step proves the paged scatter/gather + causal mask + scale are
-correct — at real Kimi latent dims (L=512, Drope=64) and reduced dims.
-
-Run:  pytest test/integration/test_kimi_mla_absorb_paged.py -v
-"""
 import pytest
 import torch
 
@@ -39,16 +21,10 @@ pytestmark = pytest.mark.skipif(
 DEVICE = torch.device("cuda")
 
 
-# --------------------------------------------------------------------------
-# Real paged latent cache manager (mirrors test_kimi_mla_paged.py, but 4D).
-# --------------------------------------------------------------------------
-
 def _make_latent_cache_manager(
     latent_width, dtype, softmax_scale, page_size=4, max_num_pages=64
 ):
-    # 4D latent cache: [num_layers, max_pages, page_size, latent_width]
-    # (the shape KVCacheEngine.load_model allocates for attention_backend
-    # "mla_absorb"). Small page_size so a handful of tokens spans >1 page.
+    # 4D mla_absorb cache; small page_size forces multi-page coverage.
     kv_cache = torch.zeros(
         2, max_num_pages, page_size, latent_width,
         dtype=dtype, device=DEVICE,
@@ -82,18 +58,7 @@ def _make_latent_cache_manager(
     return cm, alloc
 
 
-# --------------------------------------------------------------------------
-# Independent reference: accumulate all (kv_c, k_pe), causal SDPA (no paging).
-# --------------------------------------------------------------------------
-
 def _ref_mla_step(q_nope_new, q_pe_new, kv_c_all, k_pe_all, scale):
-    """The intended MLA output for the NEW query tokens.
-
-    q_nope_new [sl,H,L], q_pe_new [sl,H,Drope] are just this step's queries;
-    kv_c_all [total,1,L], k_pe_all [total,1,Drope] are EVERY latent cached so far
-    (including this step's). Query j sits at absolute position old_len+j and
-    attends to cached 0..old_len+j; value is the kv_c (first L) part.
-    """
     sl, _H, L = q_nope_new.shape
     total = kv_c_all.shape[0]
     old_len = total - sl
@@ -128,8 +93,6 @@ def _rand_step(sl, H, L, Drope, dtype):
 
 
 def _run_prefill_then_decode(L, Drope, H, T, page_size):
-    """Drive a multi-page prefill + a decode step through the real paged backend
-    and compare each to the independent accumulate-everything reference."""
     torch.manual_seed(0)
     dtype = torch.bfloat16
     # Arbitrary MLA-style scale (the backend must apply exactly this value).
@@ -140,7 +103,6 @@ def _run_prefill_then_decode(L, Drope, H, T, page_size):
         cm.set_active_label("main")
         cm.set_layer_idx(0)
 
-        # ---- prefill: T tokens spanning more than one page ----
         assert T > page_size, "T must span >1 page to exercise page boundaries"
         q_nope, q_pe, kv_c, k_pe = _rand_step(T, H, L, Drope, dtype)
         cm.plan_attention(seq_lens=[T], is_causal=True, dtype=dtype)
@@ -152,10 +114,8 @@ def _run_prefill_then_decode(L, Drope, H, T, page_size):
         assert got_prefill.shape == (T, H, L)
         torch.testing.assert_close(got_prefill, ref_prefill, rtol=2e-2, atol=2e-2)
 
-        # Advance seq_len so the decode step sees the T cached tokens.
         cm.advance_seq_lens()
 
-        # ---- decode: 1 new token attends over all T+1 cached ----
         q_nope1, q_pe1, kv_c1, k_pe1 = _rand_step(1, H, L, Drope, dtype)
         cm.plan_attention(seq_lens=[1], is_causal=True, dtype=dtype)
         with torch.no_grad():
@@ -172,11 +132,8 @@ def _run_prefill_then_decode(L, Drope, H, T, page_size):
 
 
 def test_paged_latent_mla_real_dims():
-    """Real Kimi MLA latent dims: L=512, Drope=64, H=2. Prefill (6 tokens over a
-    page_size-4 cache = 2 pages) + a decode step."""
     _run_prefill_then_decode(L=512, Drope=64, H=2, T=6, page_size=4)
 
 
 def test_paged_latent_mla_reduced_dims():
-    """Reduced dims: L=32, Drope=8, H=4. Same multi-page prefill + decode step."""
     _run_prefill_then_decode(L=32, Drope=8, H=4, T=6, page_size=4)

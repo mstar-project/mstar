@@ -1,22 +1,3 @@
-"""M4 golden tests for the Kimi-K2.7 / DeepSeek-V3 decoder layer.
-
-One golden per feed-forward variant — a dense layer (``layer_idx=0``, below
-``first_k_dense_replace``) and a MoE layer (``layer_idx=1``) — each compared to a
-self-contained inline reference that re-derives the whole block:
-pre-norm → naive-MLA self-attention → residual → pre-norm → (dense-or-MoE) FFN →
-residual. The inner attention and FFN references are the same ones the M2/M3
-goldens use, cited to vLLM; what this test adds is the residual/norm *wiring*,
-matching vLLM ``models/deepseek_v2.py::DeepseekV2DecoderLayer.forward``.
-
-A ``_MockMLACache`` stands in for the paged cache (causal SDPA at the fixed
-``1/sqrt(qk_head_dim)`` scale FlashInfer uses); the real paged ``run_attention``
-is exercised separately in ``test_kimi_flashinfer_attention.py``.
-
-GPU test (mstar RMSNorm + the fused expert GEMM are CUDA/half-precision only);
-skips without a GPU.
-
-Run:  pytest test/integration/test_kimi_decoder_layer.py -v
-"""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -38,11 +19,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda"
 
-
-# --------------------------------------------------------------------------
-# Inline references (cited to vLLM deepseek_v2.py / deepseek_scaling_rope.py /
-# cpu_fused_moe.py) — self-contained, no dependency on the golden harness.
-# --------------------------------------------------------------------------
 
 def _ref_rmsnorm(x, weight, eps):
     x32 = x.float()
@@ -67,7 +43,6 @@ def _ref_yarn_rope(pos, q_pe, k_pe, rotary_dim, base, factor, max_pos,
 
 
 def _sdpa_causal(q, k, v, scale):
-    """Causal SDPA at a fixed scale (mirrors _MockMLACache / FlashInfer)."""
     qt, kt, vt = (t.transpose(0, 1).float() for t in (q, k, v))  # (H,T,D)
     T = q.shape[0]
     causal = torch.triu(
@@ -77,7 +52,6 @@ def _sdpa_causal(q, k, v, scale):
 
 
 def _ref_attn_forward(attn, cfg, h_normed, pos):
-    """Independent naive-MLA forward matching KimiMLAAttention.forward."""
     T, H = h_normed.shape[0], attn.num_heads
     Dnope, Drope, Dv, L = (
         cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank)
@@ -146,7 +120,6 @@ def _ref_swiglu(x, gate_w, up_w, down_w):
 
 
 def _ref_mlp_forward(mlp, cfg, h_normed):
-    """Dense SwiGLU or MoE (routed + ungated shared), matching the module."""
     if isinstance(mlp, KimiSparseMoeBlock):
         I = cfg.moe_intermediate_size
         si = cfg.moe_intermediate_size * cfg.n_shared_experts
@@ -176,11 +149,6 @@ def _ref_decoder_layer(layer, cfg, h, pos):
     return h1 + _ref_mlp_forward(layer.mlp, cfg, mlp_in)
 
 
-# --------------------------------------------------------------------------
-# Mock paged cache: causal SDPA at 1/sqrt(head_dim), no cross-layer history
-# (a single prefill forward; each layer attends its own q/k/v).
-# --------------------------------------------------------------------------
-
 class _MockMLACache:
     def __init__(self, head_dim):
         self.scale = head_dim ** -0.5
@@ -206,7 +174,7 @@ def _build_layer(cfg, layer_idx, dtype):
     layer.post_attention_layernorm.weight.data.normal_(1.0, 0.02)
     mlp = layer.mlp
     if isinstance(mlp, KimiSparseMoeBlock):
-        # Keep the router fp32 (deterministic selection); experts/shared bf16.
+        # Keep the router fp32 for deterministic selection.
         mlp.gate.weight.data = torch.randn(
             cfg.n_routed_experts, cfg.hidden_size, device=DEVICE)
         mlp.gate.e_score_correction_bias.data = torch.randn(
@@ -220,10 +188,6 @@ def _build_layer(cfg, layer_idx, dtype):
         mlp.down_proj.weight.data.normal_(0, 0.05)
     return layer
 
-
-# --------------------------------------------------------------------------
-# Tests
-# --------------------------------------------------------------------------
 
 def test_dense_decoder_layer_matches_reference():
     torch.manual_seed(0)
