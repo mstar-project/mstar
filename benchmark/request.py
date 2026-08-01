@@ -418,6 +418,15 @@ class AggregateMetrics:
     rtf: Optional[LatencyStats] = None  # per-request E2E / audio_duration
     audio_duration_mean_s: Optional[float] = None  # mean synthesized audio duration
 
+    # SLO attainment. A percentile threshold ("is RTF p99 < 1.0?") is a single
+    # order statistic and swings 1.4x on average between repetitions of the
+    # same cell; the fraction of requests meeting the SLO is a mean over every
+    # request and is far steadier. slo_goodput is that fraction expressed as a
+    # rate, i.e. the throughput counting only requests that were real-time.
+    slo_rtf_threshold: Optional[float] = None  # RTF below this counts as met
+    slo_attainment: Optional[float] = None  # fraction of audio requests meeting it
+    slo_goodput: Optional[float] = None  # SLO-meeting req / wall_time
+
     def __str__(self) -> str:
         if not self.ttft:
             return "ERROR: benchmark produced no results."
@@ -466,6 +475,13 @@ class AggregateMetrics:
                 f"RTF      {' ' * max_len}: "
                 f"mean={_fmt(self.rtf.mean)}  p50={_fmt(self.rtf.p50)}  "
                 f"p95={_fmt(self.rtf.p95)}  p99={_fmt(self.rtf.p99)}  (lower is better; <1.0 = real-time)\n"
+            )
+        if self.slo_attainment is not None:
+            audio_lines += (
+                f"SLO      {' ' * max_len}: "
+                f"attainment={self.slo_attainment * 100:.1f}%  "
+                f"goodput={self.slo_goodput:.3f} req/s  "
+                f"(RTF < {self.slo_rtf_threshold:g})\n"
             )
         if self.audio_duration_mean_s is not None:
             audio_lines += f"Audio dur{' ' * (max_len - 1)}: mean={self.audio_duration_mean_s:.3f}s\n"
@@ -589,6 +605,18 @@ def aggregate_metrics(
     rtf_vals = [r.e2e_latency / dur for r, dur in audio_pairs if r.e2e_latency is not None]
     rtf_stats = _latency_stats(rtf_vals) if rtf_vals else None
 
+    # SLO attainment: what fraction of requests were actually real-time, and
+    # what rate does that correspond to. Both are averages over all requests
+    # rather than a single order statistic, so they reproduce across runs where
+    # RTF p99 does not.
+    slo_threshold = float(os.environ.get("MSTAR_BENCH_SLO_RTF", "1.0"))
+    slo_attainment = slo_goodput = None
+    if rtf_vals:
+        n_met = sum(1 for v in rtf_vals if v < slo_threshold)
+        slo_attainment = n_met / len(rtf_vals)
+        if wall_time > 0:
+            slo_goodput = n_met / wall_time
+
     request_throughput = n_success / wall_time if wall_time > 0 else None
     text_token_throughput = total_text_tokens / wall_time if wall_time > 0 and total_text_tokens > 0 else None
 
@@ -620,6 +648,9 @@ def aggregate_metrics(
         audio_seconds_throughput=audio_seconds_throughput,
         rtf=rtf_stats,
         audio_duration_mean_s=audio_duration_mean_s,
+        slo_rtf_threshold=slo_threshold,
+        slo_attainment=slo_attainment,
+        slo_goodput=slo_goodput,
     )
 
 
