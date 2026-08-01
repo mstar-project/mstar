@@ -596,11 +596,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             audio_embeds = inputs["audio_embeds"][0].to(device)  # (audio_tokens, hidden)
             audio_len = audio_embeds.shape[0]
 
-            # Env-gated dump of the audio-encoder last_hidden_state for the
-            # cross-system tensor comparison (no-op unless MSTAR_DUMP_DIR set).
-            from mstar.model.qwen3_omni.qwen3_omni_model import _dump_obj
-            _dump_obj("mstar_audio_encoder_last_hidden_state.pt", audio_embeds)
-
             mm_mask = torch.ones(audio_len + 2, dtype=torch.bool, device=device)
             mm_mask[[0, -1]] = 0
             masks_for_talker = torch.stack([

@@ -126,35 +126,6 @@ def batch_vision_prefill_enabled() -> bool:
     return _envflag("MSTAR_BATCH_VISION_PREFILL")
 
 
-def _tensor_dump_dir() -> str | None:
-    """Directory for env-gated intermediate-tensor / token dumps, or None."""
-    import os as _os
-
-    return _os.environ.get("MSTAR_DUMP_DIR") or None
-
-
-def _dump_obj(name: str, obj) -> None:
-    """Best-effort dump of a tensor / python object to MSTAR_DUMP_DIR."""
-    d = _tensor_dump_dir()
-    if not d:
-        return
-    try:
-        import os as _os
-
-        _os.makedirs(d, exist_ok=True)
-        path = _os.path.join(d, name)
-        if isinstance(obj, torch.Tensor):
-            torch.save(obj.detach().cpu(), path)
-        else:
-            import json as _json
-
-            with open(path, "w") as f:
-                _json.dump(obj, f, indent=2)
-        logger.info("MSTAR_DUMP: wrote %s", path)
-    except Exception as e:  # never let instrumentation break a run
-        logger.warning("MSTAR_DUMP failed for %s: %s", name, e)
-
-
 def _hf_encoder_attn_impl() -> str:
     """Pick the attention implementation for the HF-wrapper encoder fallback.
 
@@ -1516,25 +1487,6 @@ class Qwen3OmniModel(Model):
                 prefix_ids = input_ids[:split]
                 suffix_ids = input_ids[split:]
                 result["text_inputs"] = [prefix_ids, suffix_ids]
-                _dump_obj("mstar_thinker_prefix_ids.pt", prefix_ids)
-                _dump_obj("mstar_thinker_suffix_ids.pt", suffix_ids)
-                _dump_obj(
-                    "mstar_thinker_layout.json",
-                    {
-                        "layout": "vllm_user_turn_audio_before_instruction",
-                        "prefix_ids": prefix_ids.tolist(),
-                        "suffix_ids": suffix_ids.tolist(),
-                        "split_index": int(split),
-                        "audio_sentinels": (
-                            [151669, 151670]
-                            if vllm_audio_sentinels_enabled()
-                            else [
-                                self.config.thinker.audio_start_token_id,
-                                self.config.thinker.audio_end_token_id,
-                            ]
-                        ),
-                    },
-                )
             else:
                 logger.warning(
                     "MSTAR_VLLM_PROMPT_LAYOUT=1 but could not locate the user "
