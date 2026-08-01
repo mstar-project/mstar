@@ -18,8 +18,17 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     get_vision_position_ids,
 )
 
-from mstar.model.qwen3_omni.components import audio_encoder as AE
-from mstar.model.qwen3_omni.components.audio_encoder import varlen_attention
+from mstar.model.components.encoder_telemetry import (
+    note_encoder_layout,
+    note_encoder_path,
+)
+from mstar.model.components.varlen_attention import (
+    capture_legal_backend,
+    make_fi_graph_state,
+    plan_fi_graph_state,
+    set_fi_override,
+    varlen_attention,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -190,9 +199,8 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         MUST be divisible by ``spatial_merge_size**2`` (the merger reshapes
         ``[total_tokens, H] -> [total_tokens/merge_sq, H*merge_sq]``); a bucket
         that isn't simply fails capture and falls back to eager."""
-        import mstar.model.qwen3_omni.components.audio_encoder as AE
         from mstar.engine.cuda_graph_config import PiecewisePackedConfig
-        if not (AE._FLASHINFER_AVAILABLE and AE._VARLEN_BACKEND == "flashinfer"):
+        if not capture_legal_backend():
             return None
 
         hidden_size = self.config.hidden_size
@@ -217,22 +225,22 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
             }
 
         def make_attn_state(shape):
-            return AE.make_fi_graph_state(device, shape.bs)
+            return make_fi_graph_state(device, shape.bs)
 
         def plan_attn_fn(state, shape, seq_lens):
-            AE.plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale,
+            plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale,
                                    autocast_dtype)
 
         def capture_fn(static_inputs, static_cm=None, attn_state=None, **kw):
             # max_seqlen unused (FI-external path ignores it; capture never takes
             # the flash-attn branch). Route attention through the runner wrapper.
             pos = (static_inputs["pos_cos"], static_inputs["pos_sin"])
-            AE.set_fi_override(attn_state)
+            set_fi_override(attn_state)
             try:
                 merged, deepstack = self._block_loop_tail(
                     static_inputs["x"], static_inputs["cu_seqlens"], 0, pos)
             finally:
-                AE.set_fi_override(None)
+                set_fi_override(None)
             out = {"merged": merged}
             for i, d in enumerate(deepstack):
                 out[f"deepstack_{i}"] = d
@@ -280,7 +288,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         total_tokens = hidden_states.shape[0]
         if runner is not None:
             fitted = runner.can_run(n_seg, total_tokens)
-            AE.note_encoder_layout("vision", n_seg, total_tokens, fitted)
+            note_encoder_layout("vision", n_seg, total_tokens, fitted)
             if fitted:
                 seg_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
                 cos, sin = position_embeddings
@@ -305,8 +313,8 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
                     out.get_view(f"deepstack_{i}")[:merged_len].clone()
                     for i in range(n_deepstack)
                 ]
-                AE.note_encoder_path("vision.piecewise")
+                note_encoder_path("vision.piecewise")
                 return merged, deepstack
 
-        AE.note_encoder_path("vision.eager")
+        note_encoder_path("vision.eager")
         return self._block_loop_tail(hidden_states, cu_seqlens, max_seqlen, position_embeddings)

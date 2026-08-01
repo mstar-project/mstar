@@ -1,27 +1,21 @@
 """Parity for the encoder CUDA-graph path (the production default).
 
-The eager parity tests in ``test_qwen3_omni_native_encoders.py`` exercise only the
-eager forward.  The shipping default runs the transformer block loop through a
-``PiecewiseCudaGraphRunner`` with the FlashInfer varlen backend.  That path had
-ZERO coverage, and it was in fact silently broken once: ``varlen_attention``
-preferred flash-attn even while a capture override was live, so capture threw and
-the encoder fell back to eager on every request.
+The shipping default runs the block loop through a ``PiecewiseCudaGraphRunner``
+with the FlashInfer varlen backend. This pins that a graph is captured AND that
+the encoder actually replays it -- asserted via ``encoder_path_counts()``, since
+"a graph exists" and "the forward used it" differ exactly in the failure mode
+that matters (a layout fitting no bucket silently falls back to eager) -- plus
+graph == eager and graph == HF.
 
-This test pins the contract for the graph path:
-  1. a graph is ACTUALLY captured AND the encoder actually replays it -- asserted
-     via ``encoder_path_counts()``, not just by counting captured graphs, because
-     "a graph exists" and "the forward used it" are different claims and only the
-     second one is what production depends on,
-  2. graph replay == eager (same kernels, same inputs -> essentially exact),
-  3. graph replay == HF reference (still correct through capture).
-
-Small random-weight encoders => no checkpoint, runs on one GPU in seconds.
-Requires CUDA + flashinfer (the only capture-legal varlen backend).
+Small random-weight encoders, so no checkpoint. Needs CUDA + flashinfer.
 """
 from __future__ import annotations
 
 import pytest
 import torch
+
+import mstar.model.components.encoder_telemetry as TEL
+import mstar.model.components.varlen_attention as VA
 
 transformers = pytest.importorskip("transformers")
 
@@ -69,13 +63,11 @@ def _small_audio_cfg():
 
 
 def _require_flashinfer():
-    """flashinfer must be importable *inside the encoder module* -- the encoder
-    caches its own availability flag at import time."""
+    """flashinfer must be importable *inside the varlen module* -- it caches its
+    own availability flag at import time."""
     pytest.importorskip("flashinfer")
-    import mstar.model.qwen3_omni.components.audio_encoder as AE
-    if not AE._FLASHINFER_AVAILABLE:
-        pytest.skip("flashinfer not importable inside encoder module")
-    return AE
+    if not VA._FLASHINFER_AVAILABLE:
+        pytest.skip("flashinfer not importable inside the varlen module")
 
 
 def _build_runner(encoder):
@@ -98,8 +90,8 @@ def _build_runner(encoder):
     return runner
 
 
-def _paths_delta(AE, before):
-    after = AE.encoder_path_counts()
+def _paths_delta(before):
+    after = TEL.encoder_path_counts()
     return {k: after.get(k, 0) - before.get(k, 0) for k in set(after) | set(before)}
 
 
@@ -112,7 +104,7 @@ def test_vision_encoder_graph_eager_hf_parity():
     from mstar.model.qwen3_omni.components.vision_encoder import (
         NativeQwen3OmniVisionEncoder,
     )
-    AE = _require_flashinfer()
+    _require_flashinfer()
     torch.manual_seed(0)
     cfg = _small_vision_cfg()
     hf = Qwen3OmniMoeVisionEncoder._from_config(cfg, attn_implementation="sdpa").to(DEVICE, DTYPE).eval()
@@ -127,11 +119,11 @@ def test_vision_encoder_graph_eager_hf_parity():
     with torch.no_grad():
         emb_eager, _ds_e = nat(pv, g)                      # piecewise_runner=None
     runner = _build_runner(nat)
-    before = AE.encoder_path_counts()
+    before = TEL.encoder_path_counts()
     with torch.no_grad():
         emb_graph, _ds_g = nat(pv, g, piecewise_runner=runner)
     torch.cuda.synchronize()
-    delta = _paths_delta(AE, before)
+    delta = _paths_delta(before)
     with torch.no_grad():
         o = hf(pv, grid_thw=g)
 
@@ -154,7 +146,7 @@ def test_audio_encoder_graph_eager_hf_parity():
     from mstar.model.qwen3_omni.components.audio_encoder import (
         NativeQwen3OmniAudioEncoder,
     )
-    AE = _require_flashinfer()
+    _require_flashinfer()
     torch.manual_seed(0)
     cfg = _small_audio_cfg()
     hf = Qwen3OmniMoeAudioEncoder._from_config(cfg, attn_implementation="sdpa").to(DEVICE, DTYPE).eval()
@@ -168,11 +160,11 @@ def test_audio_encoder_graph_eager_hf_parity():
     with torch.no_grad():
         out_eager = nat(feat, lens)                        # piecewise_runner=None
     runner = _build_runner(nat)
-    before = AE.encoder_path_counts()
+    before = TEL.encoder_path_counts()
     with torch.no_grad():
         out_graph = nat(feat, lens, piecewise_runner=runner)
     torch.cuda.synchronize()
-    delta = _paths_delta(AE, before)
+    delta = _paths_delta(before)
     with torch.no_grad():
         ref = hf(feat, feature_lens=lens).last_hidden_state
 
@@ -200,17 +192,17 @@ def test_varlen_attention_uses_flashinfer_under_capture_override():
     GPU nor flashinfer -- deliberately NOT under ``requires_cuda``, since this is
     the only standing guard for the regression and it must run in CI.
     """
-    import mstar.model.qwen3_omni.components.audio_encoder as AE
+    import mstar.model.components.varlen_attention as VA
 
     called = {"flash": False, "flashinfer": False}
     # Every global this test mutates must be restored: leaking
     # ``flash_attn_varlen_func``/``_FLASH_ATTN_AVAILABLE`` makes every later
     # varlen test in the same session dispatch into the stub below and fail.
     saved = (
-        AE._flashinfer_varlen,
-        AE._fi_override,
-        AE.flash_attn_varlen_func,
-        AE._FLASH_ATTN_AVAILABLE,
+        VA._flashinfer_varlen,
+        VA._fi_override,
+        VA.flash_attn_varlen_func,
+        VA._FLASH_ATTN_AVAILABLE,
     )
 
     def fake_flash(*a, **k):
@@ -221,19 +213,19 @@ def test_varlen_attention_uses_flashinfer_under_capture_override():
         called["flashinfer"] = True
         return q  # shape-compatible dummy
 
-    AE.flash_attn_varlen_func = fake_flash  # type: ignore[attr-defined]
-    AE._flashinfer_varlen = fake_fi
-    AE._FLASH_ATTN_AVAILABLE = True
-    AE.set_fi_override({"sentinel": True})
+    VA.flash_attn_varlen_func = fake_flash  # type: ignore[attr-defined]
+    VA._flashinfer_varlen = fake_fi
+    VA._FLASH_ATTN_AVAILABLE = True
+    VA.set_fi_override({"sentinel": True})
     try:
         q = torch.zeros(4, 2, 16)
-        AE.varlen_attention(q, q, q, torch.tensor([0, 4]), 4, 0.1)
+        VA.varlen_attention(q, q, q, torch.tensor([0, 4]), 4, 0.1)
     finally:
         (
-            AE._flashinfer_varlen,
+            VA._flashinfer_varlen,
             _restore_override,
-            AE.flash_attn_varlen_func,
-            AE._FLASH_ATTN_AVAILABLE,
+            VA.flash_attn_varlen_func,
+            VA._FLASH_ATTN_AVAILABLE,
         ) = saved
-        AE.set_fi_override(_restore_override)
+        VA.set_fi_override(_restore_override)
     assert called["flashinfer"] and not called["flash"]

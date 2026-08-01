@@ -1,7 +1,7 @@
 """Backend-equivalence parity for the Qwen3-Omni native encoder's varlen attention.
 
-Issue #131 ships several interchangeable varlen-attention backends (selectable via
-``MSTAR_VARLEN_BACKEND``) plus a flash-attn fast path and a FlashInfer path. They
+Issue #131 ships several interchangeable varlen-attention backends (``_VARLEN_FALLBACKS`` in
+mstar/model/components/varlen_attention.py) plus a flash-attn fast path and a FlashInfer path. They
 are only *correct* if they all compute the SAME block-diagonal (within-segment)
 attention. This test pins that: for synthetic packed q/k/v segmented by
 ``cu_seqlens``, every available backend must match the dense block-diagonal
@@ -17,7 +17,7 @@ fallbacks, the FlashInfer head-dim padding, or the adaptive heuristic. Complemen
 import pytest
 import torch
 
-from mstar.model.qwen3_omni.components import audio_encoder as AE
+import mstar.model.components.varlen_attention as VA
 
 DEVICE = "cuda:0"
 
@@ -61,19 +61,19 @@ def test_varlen_backends_match_dense(layout, H, D, dtype):
     scale = D ** -0.5
 
     # Reference: dense (total x total) block-diagonal mask SDPA — exact within-segment attention.
-    ref = AE._sdpa_varlen_dense(q, k, v, cu, scale)
+    ref = VA._sdpa_varlen_dense(q, k, v, cu, scale)
 
     # SDPA-family backends (mathematically identical to the dense reference).
     backends = {
-        "per_segment": lambda: AE._sdpa_varlen_per_segment(q, k, v, cu, scale),
-        "padded": lambda: AE._sdpa_varlen_padded(q, k, v, cu, scale),
-        "adaptive": lambda: AE._sdpa_varlen_adaptive(q, k, v, cu, scale),
+        "per_segment": lambda: VA._sdpa_varlen_per_segment(q, k, v, cu, scale),
+        "padded": lambda: VA._sdpa_varlen_padded(q, k, v, cu, scale),
+        "adaptive": lambda: VA._sdpa_varlen_adaptive(q, k, v, cu, scale),
     }
     # Kernel backends are fp16/bf16 only — skip them in fp32.
     if dtype != torch.float32:
-        if AE._FLASHINFER_AVAILABLE:
-            backends["flashinfer"] = lambda: AE._flashinfer_varlen(q, k, v, cu, scale)
-        if AE._FLASH_ATTN_AVAILABLE:
+        if VA._FLASHINFER_AVAILABLE:
+            backends["flashinfer"] = lambda: VA._flashinfer_varlen(q, k, v, cu, scale)
+        if VA._FLASH_ATTN_AVAILABLE:
             from flash_attn import flash_attn_varlen_func
             backends["flash_attn"] = lambda: flash_attn_varlen_func(
                 q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
@@ -91,7 +91,7 @@ def test_varlen_backends_match_dense(layout, H, D, dtype):
             f"backend={name} layout={layout} {H}x{D} {dtype}: cos={cos:.6f} relL2={rel:.4f}")
 
 
-@pytest.mark.skipif(not (torch.cuda.is_available() and AE._FLASHINFER_AVAILABLE),
+@pytest.mark.skipif(not (torch.cuda.is_available() and VA._FLASHINFER_AVAILABLE),
                     reason="flashinfer required")
 @pytest.mark.parametrize("D", [64, 72], ids=["d64", "d72"])
 def test_flashinfer_headdim_padding_is_exact(D):
@@ -99,8 +99,8 @@ def test_flashinfer_headdim_padding_is_exact(D):
     (the encoder relies on this for the graph-capturable path, esp. vision D=72)."""
     q, k, v, cu, _ = _make([64, 64], 16, D, torch.bfloat16)
     scale = D ** -0.5
-    ref = AE._sdpa_varlen_dense(q, k, v, cu, scale)
-    out = AE._flashinfer_varlen(q, k, v, cu, scale)
+    ref = VA._sdpa_varlen_dense(q, k, v, cu, scale)
+    out = VA._flashinfer_varlen(q, k, v, cu, scale)
     assert out.shape[-1] == D, f"output head_dim {out.shape[-1]} != {D} (padding not sliced back)"
     rel, cos = _rel_cos(out, ref)
     assert cos > 0.999 and rel < 5e-2, f"flashinfer D={D}: cos={cos:.6f} relL2={rel:.4f}"
