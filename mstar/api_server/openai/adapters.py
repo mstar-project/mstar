@@ -234,10 +234,12 @@ class BagelAdapter(OpenAIAdapter):
 class Qwen3OmniAdapter(OpenAIAdapter):
     """Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.
 
-    Sampling is split across two stages: the Thinker (text) takes
-    ``thinker_*`` keys, the Talker (speech) ``talker_*``. The other Talker knobs
-    (``talker_top_k``, ``talker_repetition_penalty``) aren't OpenAI fields — pass
-    them via ``extra_body``.
+    Sampling is split across three stages: the Thinker (text) takes
+    ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker's
+    CodePredictor (residual codec groups) ``code_predictor_*``. Everything
+    except temperature/top_p is not an OpenAI field (``talker_top_k``,
+    ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those
+    via ``extra_body``.
     """
 
     supports_chat = True

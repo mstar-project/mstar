@@ -251,6 +251,12 @@ class MultiSamplingConfig:
     def seed(self):
         return self.main.seed if self.main is not None else 0
 
+    @property
+    def ignore_eos(self) -> bool:
+        # Stop conditions are a main-config concern; submodules' ``check_stop``
+        # reads this straight off the node's config.
+        return self.main.ignore_eos if self.main is not None else False
+
 
 @dataclass
 class BaseSampler(ABC):
@@ -278,6 +284,13 @@ class BaseSampler(ABC):
 class BaseMultiSampler(BaseSampler):
     main: BaseSampler
     aux: dict[str, BaseSampler] = field(default_factory=dict)
+
+    @property
+    def tp_group(self):
+        # Every label shares the submodule's communicator; expose main's so
+        # ``_broadcast_tokens`` called on the multi-sampler still broadcasts
+        # (without this it reads no tp_group and silently no-ops).
+        return getattr(self.main, "tp_group", None)
 
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
