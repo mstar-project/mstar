@@ -38,7 +38,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Qwen/Qwen3-Omni-30B-A3B-Instruct``
      - Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.
    * - ``zonos2``
-     - ``Zyphra/ZONOS2`` (override with ``$ZONOS2_MODEL_PATH``)
+     - ``Zyphra/ZONOS2``
      - Multi-codebook TTS: autoregressive LLM emitting audio codes + DAC 44.1 kHz decoder.
        Needs the DAC vocoder (``pip install descript-audio-codec``; see :doc:`installation`).
    * - ``vjepa2``

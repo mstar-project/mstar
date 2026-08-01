@@ -51,13 +51,15 @@ class Zonos2Model(Model):
 
     def __init__(
         self,
-        model_path_hf: str | None = None,
+        model_path_hf: str,
         cache_dir: str | None = None,
         config: Zonos2Config | None = None,
+        skip_weight_loading: bool = False,
         **kwargs,
     ):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        self.skip_weight_loading = skip_weight_loading
         # Extra kwargs come from the serving YAML's ``model_kwargs``. They win
         # over the checkpoint config. This matches the pi05 pattern.
         self._yaml_overrides = dict(kwargs)
@@ -72,32 +74,32 @@ class Zonos2Model(Model):
 
     def _load_config(self) -> Zonos2Config:
         """Build the config from the checkpoint's ``params.json``, with YAML
-        ``model_kwargs`` overrides. Fall back to defaults if unavailable."""
-        if self.model_path_hf:
-            try:
-                from mstar.model.zonos2.weight_loader import (
-                    load_zonos2_config_from_checkpoint,
-                    resolve_zonos2_checkpoint,
-                )
+        ``model_kwargs`` overrides.
 
-                ckpt = resolve_zonos2_checkpoint(self.model_path_hf, self.cache_dir)
-                cfg = load_zonos2_config_from_checkpoint(ckpt, **self._yaml_overrides)
-                if cfg.text_vocab is None:
-                    cfg.text_vocab = BYTE_TEXT_VOCAB_SIZE
-                logger.info(
-                    "Zonos2: config from checkpoint (%d layers, dim %d, %d experts)",
-                    cfg.num_layers, cfg.hidden_size, cfg.moe_n_experts,
-                )
-                return cfg
-            except Exception as e:
-                logger.warning(
-                    "Zonos2: could not load config from %s (%s); using defaults.",
-                    self.model_path_hf, e,
-                )
-        cfg = Zonos2Config()
-        for key, value in self._yaml_overrides.items():
-            if hasattr(cfg, key):
-                setattr(cfg, key, value)
+        Only ``skip_weight_loading`` (tests) falls back to defaults — a serving
+        run that cannot read its own ``params.json`` would otherwise build the
+        wrong architecture and then quietly serve noise.
+        """
+        if self.skip_weight_loading:
+            cfg = Zonos2Config()
+            for key, value in self._yaml_overrides.items():
+                if hasattr(cfg, key):
+                    setattr(cfg, key, value)
+            return cfg
+
+        from mstar.model.zonos2.weight_loader import (
+            load_zonos2_config_from_checkpoint,
+            resolve_zonos2_checkpoint,
+        )
+
+        ckpt = resolve_zonos2_checkpoint(self.model_path_hf, self.cache_dir)
+        cfg = load_zonos2_config_from_checkpoint(ckpt, **self._yaml_overrides)
+        if cfg.text_vocab is None:
+            cfg.text_vocab = BYTE_TEXT_VOCAB_SIZE
+        logger.info(
+            "Zonos2: config from checkpoint (%d layers, dim %d, %d experts)",
+            cfg.num_layers, cfg.hidden_size, cfg.moe_n_experts,
+        )
         return cfg
 
     # ------------------------------------------------------------------
@@ -362,18 +364,11 @@ class Zonos2Model(Model):
             model = model.to(autocast_dtype)
         model.to_empty(device=device)
 
-        if self.model_path_hf:
-            try:
-                ckpt = resolve_zonos2_checkpoint(self.model_path_hf, self.cache_dir)
-                load_zonos2_weights(model, ckpt, device=device)
-            except Exception as e:
-                logger.warning(
-                    "Zonos2: weight loading failed (%s); LLM weights are uninitialized.", e,
-                )
+        if self.skip_weight_loading:
+            logger.warning("Zonos2: skip_weight_loading set; LLM weights are uninitialized.")
         else:
-            logger.warning(
-                "Zonos2: no model_path_hf given; LLM weights are uninitialized."
-            )
+            ckpt = resolve_zonos2_checkpoint(self.model_path_hf, self.cache_dir)
+            load_zonos2_weights(model, ckpt, device=device)
         model.eval()
 
         return Zonos2LLMSubmodule(
