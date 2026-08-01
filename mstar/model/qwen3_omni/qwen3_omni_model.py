@@ -75,16 +75,6 @@ def gpu_log_mel(waveform, mel_filters, window, n_fft, hop):
     return log.to(torch.float32)
 
 
-def _envflag(name: str, default: bool = False) -> bool:
-    """Read a boolean env flag. Accepts 1/true/yes/on; returns ``default`` if unset."""
-    import os as _os
-
-    raw = _os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
 def _hf_encoder_attn_impl() -> str:
     """Pick the attention implementation for the HF-wrapper encoder fallback.
 
