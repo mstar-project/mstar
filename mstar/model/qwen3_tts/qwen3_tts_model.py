@@ -22,7 +22,12 @@ and partition declarations, state-machine transitions, sampling defaults, and
 lazy worker-side construction. Heavy weights are not loaded in ``__init__``.
 """
 
+import importlib
+import importlib.metadata
+import sys
+from importlib.machinery import ModuleSpec
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import torch
@@ -82,6 +87,57 @@ def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
             "merges.txt",
             "speech_tokenizer/config.json",
         ],
+    )
+
+
+def _load_qwen3_tts_decoder_classes() -> tuple[type, type]:
+    """Load only qwen-tts' 12 Hz decoder modules.
+
+    ``qwen_tts.__init__`` eagerly imports its high-level inference package,
+    which in turn imports the unrelated 25 Hz tokenizer and pysox.  Pysox
+    probes for a system ``sox`` executable at import time and emits a warning
+    even though the 12 Hz decoder used here never calls it.  Registering the
+    installed package directories as namespace packages lets Python import the
+    two exact upstream modules without executing those broad ``__init__``
+    files.  If another caller already imported qwen_tts, preserve that module
+    and use normal imports.
+    """
+    if "qwen_tts" not in sys.modules:
+        try:
+            distribution = importlib.metadata.distribution("qwen-tts")
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise ImportError(
+                "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
+                "M* with the qwen3_tts optional dependency"
+            ) from exc
+
+        package_root = Path(distribution.locate_file("qwen_tts"))
+        package_paths = (
+            ("qwen_tts", package_root),
+            ("qwen_tts.core", package_root / "core"),
+            (
+                "qwen_tts.core.tokenizer_12hz",
+                package_root / "core" / "tokenizer_12hz",
+            ),
+        )
+        for name, path in package_paths:
+            module = ModuleType(name)
+            module.__package__ = name
+            module.__path__ = [str(path)]
+            spec = ModuleSpec(name, loader=None, is_package=True)
+            spec.submodule_search_locations = module.__path__
+            module.__spec__ = spec
+            sys.modules[name] = module
+
+    config_module = importlib.import_module(
+        "qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2"
+    )
+    model_module = importlib.import_module(
+        "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2"
+    )
+    return (
+        config_module.Qwen3TTSTokenizerV2DecoderConfig,
+        model_module.Qwen3TTSTokenizerV2Decoder,
     )
 
 
@@ -660,12 +716,10 @@ class Qwen3TTSModel(Model):
     def _create_codec_submodule(self, device: str) -> NodeSubmodule:
         """Build the official speech-tokenizer decoder from its sub-checkpoint."""
         try:
-            from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+            (
                 Qwen3TTSTokenizerV2DecoderConfig,
-            )
-            from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
                 Qwen3TTSTokenizerV2Decoder,
-            )
+            ) = _load_qwen3_tts_decoder_classes()
         except ImportError as exc:
             raise ImportError(
                 "Qwen3-TTS Codec requires the 'qwen-tts' package; install "

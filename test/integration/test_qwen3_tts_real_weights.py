@@ -159,4 +159,3 @@ def test_real_codec_decodes_expected_number_of_pcm_samples(codec, model):
 
     assert pcm.shape == (1, frames * model.config.codec.decode_upsample_rate)
     assert pcm.dtype == torch.int16
-

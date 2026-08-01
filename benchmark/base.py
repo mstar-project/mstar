@@ -232,6 +232,16 @@ class Qwen3Omni(Model):
         }
 
 
+class Qwen3TTS(Model):
+    """Qwen3-TTS CustomVoice benchmark metadata for native M* requests."""
+
+    def get_hf_url(self):
+        return "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2S}
+
+
 class Pi05(Model):
     """Physical Intelligence Pi0.5 VLA model.
 
@@ -317,6 +327,7 @@ class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     QWEN3OMNI = "qwen3omni"
+    QWEN3TTS = "qwen3_tts"
     PI05 = "pi05"
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
@@ -329,6 +340,8 @@ class ModelType(Enum):
             return Orpheus(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
+        if self == ModelType.QWEN3TTS:
+            return Qwen3TTS(**kwargs)
         if self == ModelType.PI05:
             return Pi05(**kwargs)
         if self == ModelType.VJEPA2AC:

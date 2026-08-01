@@ -155,6 +155,11 @@ class Qwen3TTSTalkerModel(nn.Module):
 # ---------------------------------------------------------------------------
 # CodePredictor: autoregression across codec groups within one frame
 # ---------------------------------------------------------------------------
+# Qwen3-Omni has the same high-level residual-code loop, but currently uses a
+# different attention primitive, checkpoint/config namespace, sampling policy,
+# and CUDA-graph capture path.  Sharing the loop before the auxiliary-sampler
+# work tracked in #199 would couple two independently validated model ports;
+# factor the common implementation after that engine interface is available.
 
 
 class Qwen3TTSCodePredictorLayer(nn.Module):

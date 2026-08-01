@@ -1,4 +1,6 @@
+import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -157,6 +159,46 @@ def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     }
     assert all(worker_graph.ranks == [0] for worker_graph in worker_graphs)
     assert by_walk["codec_chunk"].consumes_stream is True
+
+
+def test_qwen3_tts_cli_and_benchmark_entries_are_registered():
+    repo_root = str(Path(__file__).resolve().parents[2])
+    sys.path.insert(0, repo_root)
+    from benchmark.base import ModelType, Qwen3TTS, RequestType
+    from mstar.cli.main import DEFAULT_CONFIGS, _next_steps
+
+    assert DEFAULT_CONFIGS["qwen3_tts"] == "qwen3tts.yaml"
+    benchmark_model = ModelType.QWEN3TTS.inst()
+    assert isinstance(benchmark_model, Qwen3TTS)
+    assert benchmark_model.get_hf_url() == (
+        "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    )
+    assert benchmark_model.get_supported_modalities() == {RequestType.T2S}
+    assert 'voice="Vivian"' in _next_steps("qwen3_tts", "0.0.0.0", 8000)
+    sys.path.remove(repo_root)
+
+
+def test_qwen3_tts_decoder_import_does_not_probe_sox():
+    if importlib.util.find_spec("qwen_tts") is None:
+        pytest.skip("qwen-tts optional dependency is not installed")
+    script = """
+import sys
+from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_decoder_classes
+config_cls, decoder_cls = _load_qwen3_tts_decoder_classes()
+print(config_cls.__name__, decoder_cls.__name__)
+print('sox_loaded=' + str('sox' in sys.modules))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Qwen3TTSTokenizerV2DecoderConfig Qwen3TTSTokenizerV2Decoder" in (
+        result.stdout
+    )
+    assert "sox_loaded=False" in result.stdout
+    assert "SoX could not be found" not in result.stderr
 
 
 def test_flashinfer_wrappers_forward_explicit_kernel_backend(monkeypatch):
@@ -423,6 +465,57 @@ def test_qwen3_tts_prefill_frame_counts_toward_generation_limit():
     }
 
 
+def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config),
+        Qwen3TTSCodePredictor(config),
+        config,
+    )
+    submodule.request_state("request").add("generated_frames", 0)
+    outputs = {"codec_tokens": [torch.tensor([
+        config.talker.codec_eos_token_id, 1, 2, 3
+    ])]}
+    request_info = SimpleNamespace(
+        step_metadata={"talker_max_tokens": 100},
+        sampling_config={
+            "Talker": SimpleNamespace(ignore_eos=False),
+        },
+        max_tokens=8192,
+    )
+
+    submodule.postprocess("request", request_info, outputs)
+
+    assert outputs["layer0_codes"][0].item() == config.talker.codec_eos_token_id
+    assert submodule.check_stop("request", request_info, outputs) == {
+        "talker_decode_loop"
+    }
+
+
+def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config),
+        Qwen3TTSCodePredictor(config),
+        config,
+    )
+    submodule.request_state("request").add("generated_frames", 0)
+    outputs = {"new_token": [torch.tensor(
+        config.talker.codec_eos_token_id
+    )]}
+    request_info = SimpleNamespace(
+        step_metadata={"talker_max_tokens": 100},
+        sampling_config={
+            "Talker": SimpleNamespace(ignore_eos=True),
+        },
+        max_tokens=8192,
+    )
+
+    submodule.postprocess("request", request_info, outputs)
+
+    assert submodule.check_stop("request", request_info, outputs) == set()
+
+
 def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
@@ -443,7 +536,7 @@ def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
     assert mask[1, eos].item() is False
 
 
-def test_qwen3_tts_talker_batches_and_captures_decode():
+def test_qwen3_tts_talker_batches_and_keeps_recurrent_decode_eager():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config),
@@ -474,8 +567,9 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
         for _ in range(2)
     ]
 
+    assert submodule.disable_torch_compile is True
     assert submodule.can_batch(batch, model_inputs)
-    assert submodule.can_use_cuda_graphs(batch, model_inputs)
+    assert not submodule.can_use_cuda_graphs(batch, model_inputs)
     cache_manager = SimpleNamespace(
         set_active_label=lambda label: None,
         plan_attention=lambda **kwargs: None,
@@ -492,9 +586,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     )
     assert packed["input_embeds"].shape == (2, 16)
     assert packed["last_token_indices"].tolist() == [0, 1]
-    graph_config = submodule.get_cuda_graph_configs(torch.device("cpu"))[0]
-    assert graph_config.capture_graph_walk == "talker_decode"
-    assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
+    assert submodule.get_cuda_graph_configs(torch.device("cpu")) == []
     piecewise = submodule.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.float32
     )["code_predictor_loop"]
@@ -687,7 +779,12 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     assert packed["codec_tokens"].shape == (2, 4, 5)
     graph_config = submodule.get_cuda_graph_configs(torch.device("cpu"))[0]
     assert graph_config.capture_graph_walk == "codec_chunk"
-    assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16]
+    assert submodule.max_batch_size("codec_chunk") == 8
+    assert graph_config.capture_batch_sizes == [1, 2, 4, 8]
     assert graph_config.single_request_inputs.tensor_inputs[
         "codec_tokens"
     ].shape == (4, 5)
+
+    oversized = model_inputs * 5
+    assert len(oversized) == 10
+    assert not submodule.can_batch(batch, oversized)

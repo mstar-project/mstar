@@ -67,6 +67,12 @@ class TalkerSubmodule(ARNodeSubmodule):
     the complete code vector is streamed independently to ``CodecSubmodule``.
     """
 
+    # Compiling the entire engine-facing forward traces request sampling,
+    # residual-code control flow, and recurrent routing in addition to the
+    # transformer. It introduces graph breaks and showed no steady-state win
+    # for this path. The CodePredictor hot loop remains CUDA-graph captured
+    # independently below.
+    disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
@@ -343,7 +349,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         top_p: torch.Tensor,
         do_sample: torch.Tensor,
     ) -> torch.Tensor:
-        """Graph-safe batched top-k/top-p sampling from supplied uniforms."""
+        """Graph-safe batched top-k/top-p sampling from supplied uniforms.
+
+        TODO(#199): replace this model-local path with the engine's auxiliary
+        sampler once it supports independent per-request CUDA-graph buffers.
+        """
         vocab_size = logits.shape[-1]
         greedy = logits.argmax(dim=-1)
         safe_temperature = torch.where(
@@ -660,10 +670,20 @@ class TalkerSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs: Any,
     ) -> None:
-        """Rename the stop token output and advance metadata without GPU sync."""
+        """Expose the stop token and advance metadata without a GPU sync.
+
+        Whole-graph replay and eager execution normally retain ``new_token``.
+        ``codec_tokens`` is the routed output, though, so use its first codebook
+        as a fallback.  This keeps EOS detection correct even if an execution
+        path filters the sampler-only output before slow-path ``check_stop``.
+        """
         del request_info, kwargs
         if "new_token" in outputs:
             outputs["layer0_codes"] = outputs.pop("new_token")
+        elif "layer0_codes" not in outputs and "codec_tokens" in outputs:
+            codec_tokens = outputs["codec_tokens"][0]
+            outputs["layer0_codes"] = [codec_tokens.reshape(-1)[0]]
+        if "layer0_codes" in outputs:
             state = self.request_state(request_id)
             state.add(
                 "generated_frames", int(state.get("generated_frames", 0)) + 1
@@ -689,7 +709,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         max_tokens = request_info.step_metadata.get(
             "talker_max_tokens", request_info.max_tokens
         )
-        if token == self.talker_config.codec_eos_token_id or generated >= max_tokens:
+        sampling_config = getattr(request_info, "sampling_config", {}).get(
+            "Talker"
+        )
+        ignore_eos = bool(getattr(sampling_config, "ignore_eos", False))
+        reached_eos = (
+            not ignore_eos and token == self.talker_config.codec_eos_token_id
+        )
+        if reached_eos or generated >= max_tokens:
             return {"talker_decode_loop"}
         return set()
 
@@ -719,25 +746,22 @@ class TalkerSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[BasicBatchedCudaGraphConfig]:
-        """Capture fixed one-token Talker decode batches, including sampling."""
-        del tp_world_size
-        dtype = self.model.model.codec_embedding.weight.dtype
-        return [BasicBatchedCudaGraphConfig(
-            capture_graph_walk="talker_decode",
-            labels=["main"],
-            requires_cfg=False,
-            single_request_inputs=ARNodeInputs(
-                input_embeds=torch.zeros(
-                    1,
-                    self.talker_config.hidden_size,
-                    dtype=dtype,
-                    device=device,
-                ),
-                input_seq_len=1,
-            ),
-            capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            compile=True,
-        )]
+        """Keep the recurrent Talker path outside a whole CUDA Graph.
+
+        A whole-walk capture also captures the main sampler, the mutable
+        15-position CodePredictor cache, and the recurrent codec-embedding
+        output. Real-checkpoint tests showed that this combined graph can
+        replay stale residual state after the text condition is exhausted: it
+        then emits silent frames until ``max_output_tokens`` instead of codec
+        EOS. The hot CodePredictor depth loop is still captured independently
+        by :meth:`get_piecewise_cuda_graph_configs`; the outer Talker
+        transformer and its request state remain eager.
+
+        Prefill also stays eager because it is variable-length, runs only once
+        per request, and is not on the 12 Hz recurrent hot path.
+        """
+        del device, tp_world_size
+        return []
 
     def get_piecewise_cuda_graph_configs(
         self,
@@ -747,10 +771,9 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """Capture CodePredictor's 15-step depth loop as an inner CUDA Graph.
 
-        This runner is also useful when the whole Talker graph is ineligible,
-        for example after a request overrides ``subtalker_*`` sampling values.
-        It has no engine KV cache: its small frame-local cache is a static
-        tensor owned by this submodule.
+        The outer Talker walk intentionally remains eager so EOS and recurrent
+        state stay request-owned. This inner graph has no engine KV cache: its
+        small frame-local cache is a static tensor owned by this submodule.
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
@@ -815,21 +838,9 @@ class TalkerSubmodule(ARNodeSubmodule):
     def can_use_cuda_graphs(
         self, batch: NodeBatch, model_inputs: list[NodeInputs]
     ) -> bool:
-        """Use the whole decode graph only for its captured sampling constants."""
-        if batch.graph_walk != "talker_decode" or not self.can_batch(
-            batch, model_inputs
-        ):
-            return False
-        expected = {
-            "do_sample": self.config.generation.subtalker_dosample,
-            "temperature": self.config.generation.subtalker_temperature,
-            "top_k": self.config.generation.subtalker_top_k,
-            "top_p": self.config.generation.subtalker_top_p,
-        }
-        for info in batch.per_request_info.values():
-            if info.step_metadata.get("subtalker_sampling", expected) != expected:
-                return False
-        return super().can_use_cuda_graphs(batch, model_inputs)
+        """Reject whole-walk capture; only the inner CodePredictor is graphed."""
+        del batch, model_inputs
+        return False
 
     def get_needed_cache_labels(
         self,
@@ -855,8 +866,13 @@ class CodecSubmodule(ARNodeSubmodule):
     """
 
     disable_torch_compile = True
-    MAX_BATCH_SIZE = 16
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # The official 114M-parameter decoder materializes large fixed-shape
+    # activations while CUDA graphs are captured.  Capturing bs=16 exhausts an
+    # H100 once Talker weights and the CodePredictor graphs are resident, so
+    # keep the safe ceiling at 8 until the decoder is ported to M*'s
+    # lighter-weight codec components.
+    MAX_BATCH_SIZE = 8
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def __init__(self, decoder: torch.nn.Module, config: Qwen3TTSModelConfig):
         super().__init__()
