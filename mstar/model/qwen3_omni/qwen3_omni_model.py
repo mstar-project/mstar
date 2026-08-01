@@ -29,7 +29,6 @@ Text-only mode:
 """
 
 import logging
-import os
 from pathlib import Path
 
 import torch
@@ -54,13 +53,6 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
-
-# Performance defaults (ON), validated vs HF to cos>=0.9999. Opt out for the
-# HF-identical baseline: MSTAR_GPU_MEL=0 / MSTAR_GPU_IMAGE_PREPROCESS=0 /
-# MSTAR_VLLM_PROMPT_LAYOUT=0 / MSTAR_QWEN3_NATIVE_{AUDIO,VISION}_ENCODER=0.
-# (MSTAR_VLLM_AUDIO_SENTINELS, MSTAR_BATCH_VISION_PREFILL stay opt-in.)
-# GPU log-mel: mel spectrograms on GPU instead of HF's CPU WhisperFeatureExtractor.
-_GPU_MEL = os.environ.get("MSTAR_GPU_MEL", "1") in ("1", "true", "True")
 
 
 def gpu_log_mel(waveform, mel_filters, window, n_fft, hop):
@@ -165,18 +157,10 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
-# GPU image preprocessing: the CPU round-trip to HF's Qwen2VLImageProcessor is the
-# biggest I2T TTFT cost (~175 ms). MSTAR_GPU_IMAGE_PREPROCESS=1 runs the identical
-# algorithm on-GPU (torchvision bicubic resize, same kernel HF calls); grid_thw is
-# bit-exact, pixel_values cos>0.9999. =0 restores the byte-identical HF CPU path.
-
-
-def _gpu_image_preprocess_enabled() -> bool:
-    import os
-
-    # ON by default (benchmarked canonical config); MSTAR_GPU_IMAGE_PREPROCESS=0
-    # falls back to the byte-identical HF CPU image processor.
-    return os.environ.get("MSTAR_GPU_IMAGE_PREPROCESS", "1") != "0"
+# GPU image preprocessing: the CPU round-trip to HF's Qwen2VLImageProcessor was the
+# biggest I2T TTFT cost (~175 ms). We run the identical algorithm on the image's own
+# device (torchvision bicubic resize, the same kernel HF calls); grid_thw is
+# bit-exact and pixel_values match HF to cos>0.9999 (test_qwen3_omni_gpu_image_parity).
 
 
 def _smart_resize(
@@ -361,8 +345,8 @@ class Qwen3OmniModel(Model):
         # Lazy submodule cache -- each worker only loads what it needs
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-        # GPU log-mel state (MSTAR_GPU_MEL=1): cached filterbank + window per
-        # device, built lazily on first audio request. Default OFF -> HF path.
+        # GPU log-mel state: cached filterbank + window per device, built lazily
+        # on the first audio request (None until then, and on CPU-only workers).
         self._gpu_mel_state: dict | None = None
 
     # -----------------------------------------------------------------------
@@ -1267,7 +1251,7 @@ class Qwen3OmniModel(Model):
         return None
 
     def _audio_mel_gpu(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """GPU log-mel matching HF ``WhisperFeatureExtractor`` (MSTAR_GPU_MEL=1).
+        """GPU log-mel matching HF ``WhisperFeatureExtractor``.
 
         The HF feature_extractor runs the STFT + mel filterbank + log on the CPU
         (numpy); for a 30 s clip that is ~tens of ms on the TTFT critical path and
@@ -1342,32 +1326,15 @@ class Qwen3OmniModel(Model):
         raw_audio_inputs = tensors.get("audio_inputs", [])
         raw_video_inputs = tensors.get("video_inputs", [])
 
-        # When GPU image preprocessing is enabled we keep the raw GPU tensors
-        # and never round-trip through CPU/numpy (see _gpu_image_preprocess).
-        gpu_img_preprocess = _gpu_image_preprocess_enabled()
+        # Image preprocessing runs on the image's own device, so the raw tensors
+        # are kept as-is and never round-trip through CPU/numpy
+        # (see _gpu_image_preprocess).
 
-        pil_images: list = []
-        if not gpu_img_preprocess:
-            for img in raw_image_inputs:
-                # data_worker.py provides images as (C, H, W) float32 in [0, 1]
-                # on the GPU.  HF processors expect PIL/numpy uint8 (H, W, C)
-                # in [0, 255] -- otherwise the default do_rescale=True double-
-                # rescales and the model sees a near-zero (essentially black)
-                # tensor regardless of the actual image content.
-                if img.dtype.is_floating_point:
-                    img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
-                else:
-                    img_u8 = img
-                if img_u8.dim() == 3 and img_u8.shape[0] in (1, 3):
-                    img_u8 = img_u8.permute(1, 2, 0)  # CHW -> HWC
-                pil_images.append(img_u8.cpu().contiguous().numpy())
-
-        # GPU log-mel is opt-in (MSTAR_GPU_MEL=1) and only when CUDA is present in
-        # this worker; otherwise the raw audio is converted to numpy for the HF
-        # (CPU) feature_extractor exactly as before. Default OFF = byte-identical.
-        _use_gpu_mel = (
-            _GPU_MEL and self._processor is not None and torch.cuda.is_available()
-        )
+        # GPU log-mel needs CUDA in this worker; without it the raw audio is
+        # converted to numpy for the HF (CPU) feature_extractor instead. This is
+        # a capability fallback, not a toggle -- both paths match to cos>=0.9999
+        # (test_qwen3_omni_gpu_mel_parity).
+        _use_gpu_mel = self._processor is not None and torch.cuda.is_available()
         np_audios: list = []
         if not _use_gpu_mel:
             for waveform in raw_audio_inputs:
@@ -1408,10 +1375,9 @@ class Qwen3OmniModel(Model):
                 "chat-template prompt. Check the checkpoint/processor files."
             )
 
-        # Modality presence is measured from the RAW inputs, not pil_images /
-        # np_audios: under MSTAR_GPU_IMAGE_PREPROCESS / MSTAR_GPU_MEL (both ON by
-        # default) those derived lists stay empty even when modality inputs are
-        # present, so counting them would skip the #196 split entirely.
+        # Modality presence is measured from the RAW inputs, not the derived
+        # np_audios list: on the GPU log-mel path that list stays empty even when
+        # audio is present, so counting it would skip the #196 split entirely.
         num_mm_inputs = (
             len(raw_image_inputs) + len(raw_audio_inputs) + len(raw_video_inputs)
         )
@@ -1512,28 +1478,21 @@ class Qwen3OmniModel(Model):
 
         # Run image_processor / feature_extractor SEPARATELY for the
         # modality outputs.  These don't touch text_inputs.
-        if gpu_img_preprocess:
-            # GPU path: process each image fully on-device (no CPU round-trip).
-            img_proc = self._processor.image_processor
-            for img in raw_image_inputs:
-                pv, grid_thw = _gpu_image_preprocess(
-                    img,
-                    patch_size=img_proc.patch_size,
-                    temporal_patch_size=img_proc.temporal_patch_size,
-                    merge_size=img_proc.merge_size,
-                    min_pixels=img_proc.size["shortest_edge"],
-                    max_pixels=img_proc.size["longest_edge"],
-                    image_mean=img_proc.image_mean,
-                    image_std=img_proc.image_std,
-                )
-                result["pixel_values"].append(pv)
-                result["image_grid_thw"] += list(grid_thw)
-        else:
-            for img in pil_images:
-                img_proc = self._processor.image_processor
-                img_out = img_proc(images=[img], return_tensors="pt")
-                result["pixel_values"].append(img_out["pixel_values"])
-                result["image_grid_thw"] += img_out["image_grid_thw"]
+        # Each image is processed fully on its own device (no CPU round-trip).
+        img_proc = self._processor.image_processor
+        for img in raw_image_inputs:
+            pv, grid_thw = _gpu_image_preprocess(
+                img,
+                patch_size=img_proc.patch_size,
+                temporal_patch_size=img_proc.temporal_patch_size,
+                merge_size=img_proc.merge_size,
+                min_pixels=img_proc.size["shortest_edge"],
+                max_pixels=img_proc.size["longest_edge"],
+                image_mean=img_proc.image_mean,
+                image_std=img_proc.image_std,
+            )
+            result["pixel_values"].append(pv)
+            result["image_grid_thw"] += list(grid_thw)
 
         if _use_gpu_mel:
             for waveform in raw_audio_inputs:

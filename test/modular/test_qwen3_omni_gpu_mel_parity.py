@@ -1,5 +1,4 @@
-"""Parity for the opt-in GPU log-mel (MSTAR_GPU_MEL=1) vs HF's CPU
-``WhisperFeatureExtractor``.
+"""Parity for the GPU log-mel vs HF's CPU ``WhisperFeatureExtractor``.
 
 The native audio encoder is numerically parity-tested against HF, so the audio
 features fed to it must match HF regardless of where the mel spectrogram is
