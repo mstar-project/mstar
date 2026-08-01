@@ -30,6 +30,7 @@ from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
+    FailRequest,
     InputSignals,
     MessageSource,
     NewRequest,
@@ -473,7 +474,7 @@ class Worker:
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
         # the run loop).
-        if body.request_id in getattr(self, "_in_flight_rids", set()):
+        if body.request_id in self._in_flight_rids:
             self._pending_removes.add(body.request_id)
             return
 
@@ -505,6 +506,7 @@ class Worker:
         self.tensor_manager.cleanup_request(body.request_id)
         self.profile_info.pop_request(body.request_id)
         self.streaming_buffers.pop(body.request_id, None)
+        self.scheduler.clear_rid(body.request_id)
 
         for node_name in self.engine_manager.lru_tracked_nodes():
             self._last_active.pop((body.request_id, node_name), None)
@@ -1957,6 +1959,22 @@ class Worker:
             self._pending_removes.discard(rid)
             self._remove_request(RemoveRequest(request_id=rid, source=MessageSource.SELF))
 
+    def _fail_requests(
+        self, rids: set[str], error_message: str):
+        self.scheduler.fail_rids(rids)
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.FAIL_REQUESTS,
+                body=FailRequest(
+                    rids=rids,
+                    error_message=error_message
+                ),
+            ),
+        )
+        # Note: we do not cleanup the request right now; we wait for the conductor
+        # to officially send a removal message
+
     def run(self) -> None:
         switch_interval = os.environ.get("MSTAR_PY_SWITCH_INTERVAL_SEC", "")
         if switch_interval:
@@ -2243,15 +2261,7 @@ class Worker:
                     for node in pending.batch.node_objects.values():
                         node._speculatively_scheduled = False
 
-                    if output.allocation_failed:
-                        # KV-cache OOM on pending. ``_handle_allocation_failure``
-                        # offloads or holds the failed rids and pushes their
-                        # GraphNodes back to the scheduler queue.
-                        self._handle_allocation_failure(
-                            pending.batch, pending.node_batch
-                        )
-                        for node in pending.batch.node_objects.values():
-                            node._speculatively_scheduled = False
+                    def _maybe_clear_spec():
                         # Speculation cleanup splits by kind:
                         #
                         # * Non-yield-away spec depended on pending's outputs
@@ -2275,6 +2285,22 @@ class Worker:
                                     for edge in edges:
                                         self._return_speculative_streaming_edge(rid, edge)
                                 speculation = None
+
+                    if output.allocation_failed:
+                        # KV-cache OOM on pending. ``_handle_allocation_failure``
+                        # offloads or holds the failed rids and pushes their
+                        # GraphNodes back to the scheduler queue.
+                        self._handle_allocation_failure(
+                            pending.batch, pending.node_batch
+                        )
+                        for node in pending.batch.node_objects.values():
+                            node._speculatively_scheduled = False
+                        _maybe_clear_spec()
+
+                    if output.failed_requests:
+                        _maybe_clear_spec()
+                        for rid, message in output.failed_requests.items():
+                            self._fail_requests({rid}, message)
 
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
@@ -2442,6 +2468,21 @@ class Worker:
                     graph_walk=batch.graph_walk,
                     future=future
                 ))
-            except Exception:
-                logger.exception("Worker %s error in main loop", self.worker_id)
-                sleep(0.01)
+            except Exception as e:
+                logger.exception("Worker %s error in main loop: %s", self.worker_id, str(e))
+
+                # fail requests in this batch
+                if batch is not None:
+                    # TODO @claude: differentiate between failed in model execution and failed in postprocess?
+                    self._fail_requests(
+                        self._in_flight_rids | set(batch.request_to_worker_graph.keys()),
+                        f"Error in worker: {str(e)}"
+                    )
+
+                # clean up worker state for the next loop
+                batch = None
+                spec_pending = None
+                consecutive_spec_steps = 0
+                self._in_flight_rids = set()
+                
+                

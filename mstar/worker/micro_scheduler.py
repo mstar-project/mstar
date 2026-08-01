@@ -62,6 +62,10 @@ class MicroScheduler:
         self.batch_number = 0
         self.sched_type = sched_type
 
+        # RIDs that have failed but have not gone through the cleanup procedure;
+        # these cannot be scheduled (unless this is a TP follower node)
+        self.failed_rids = set()
+
         # lockstep-parallel (TP / SP instance) scheduling
         self.parallel_leader_nodes = parallel_leader_nodes
         self.tp_batches_pending_schedule = deque()
@@ -234,6 +238,8 @@ class MicroScheduler:
             rid: t for rid, t in self.held_until.items() if t > now
         }
 
+        # Note: batch has to be scheduled irrespective of failure, otherwise
+        # rank 0 will wait forever
         tp_follow_batch = self._try_schedule_tp_follow(
             worker_graphs_manager,
             target_node_name=target_node_name,
@@ -249,12 +255,14 @@ class MicroScheduler:
         for worker_graph_id, queue in worker_graphs_manager.queues.items():
             ready_map = queue.get_ready_node_names()
             for request_id, node_names in ready_map.items():
-                if request_id not in worker_graphs_manager.per_request_info:
-                    continue  # request was removed between scheduling cycles
-                if request_id in self.pending_removes:
-                    continue  # remove deferred for in-flight safety; don't start new work
-                # Skip requests in OOM backoff
-                if request_id in self.held_until:
+                if (
+                    request_id not in worker_graphs_manager.per_request_info
+                ) or request_id in self.pending_removes or (
+                    request_id in self.held_until
+                ) or request_id in self.failed_rids:
+                    # Do not want to schedule if: request was removed between
+                    # scheduling cycles, remove deferred for in-flight safety,
+                    # request in OOM backoff, or request recently failed
                     continue
                 for sname in node_names:
                     if sname not in self.parallel_leader_nodes:
@@ -342,6 +350,14 @@ class MicroScheduler:
         Does NOT pop or modify queue state. Mirrors the ready-scan in
         get_next_batch but stops at the first match.
         """
+
+        tp_pend_node = None
+        tp_pend_rids = set()
+        if len(self.tp_batches_pending_schedule) > 0:
+            pend: ScheduleTPNode = self.tp_batches_pending_schedule[0]
+            if (pend.node_name, pend.graph_walk) != exclude_target:
+                tp_pend_node = pend.node_name
+                tp_pend_rids = set(pend.request_ids)
         now = time.monotonic()
         # Don't bother expiring held_until here — we only read it; the next
         # get_next_batch call will refresh.
@@ -352,7 +368,17 @@ class MicroScheduler:
                     continue
                 if request_id in self.held_until and self.held_until[request_id] > now:
                     continue
+
+                rid_tp_follow = request_id in tp_pend_rids
                 for sname in node_names:
+                    if request_id in self.failed_rids and (
+                        not rid_tp_follow or sname != tp_pend_node 
+                    ):
+                        # If this request ID is going to be TP scheduled, we have to run it
+                        # even if it has failed... otherwise rank 0 will be stuck waiting for
+                        # its followers.
+                        continue
+                    
                     node_partition = worker_graphs_manager.get_partition_for_node(sname)
                     graph_walk = worker_graphs_manager.get_graph_walk(
                         request_id, node_partition,
@@ -365,3 +391,11 @@ class MicroScheduler:
                         continue
                     return True
         return False
+
+    def fail_rids(self, rids: set[str]):
+        self.failed_rids.update(rids)
+    
+    def clear_rid(self, rid: str):
+        self.failed_rids.discard(rid)
+        self.held_until.pop(rid, None)
+

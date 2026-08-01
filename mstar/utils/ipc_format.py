@@ -108,6 +108,7 @@ class ConductorMessageType(Enum):
     WORKER_GRAPHS_DONE = "worker_graphs_done"
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
+    FAIL_REQUESTS = "fail"
 
 
 @dataclass
@@ -146,6 +147,12 @@ class SetupDone(MessageBody):
 @dataclass
 class AbortRequest(MessageBody):
     request_id: str
+
+
+@dataclass
+class FailRequest(MessageBody):
+    rids: set[str]
+    error_message: str
 
 
 @dataclass

@@ -67,3 +67,9 @@ class PreprocessInput:
     input_modalities: list[str]
     output_modalities: list[str]
     model_kwargs: dict
+
+
+@dataclass
+class APIServerFailRequests:
+    request_ids: set[str]
+    error_message: str

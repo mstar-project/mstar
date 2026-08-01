@@ -381,6 +381,9 @@ class APIServer:
                                 self.preprocess_worker.new_result_tensors(
                                     message.body
                                 )
+                            elif message.message_type == "fail_requests":
+                                # TODO @claude: send a 500 to the client and do all necessary cleanup
+                                pass
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()

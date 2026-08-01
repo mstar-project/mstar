@@ -938,27 +938,37 @@ class KVCacheEngine(BaseEngine):
 
         node_inputs: list[ARNodeInputs] = []
         skipped_rids: set[str] = set()
+
+        # TODO @claude: do all of this "failed_requests" logic for
+        # mstar/engine/stateless_engine.py as well
+        failed: dict[str, str] = {}
         if self.enable_nvtx:
             range_push("kv_cache.prepare_inputs")
         for rid in batch.request_ids:
-            labels = cache_mgmt.alloc_manager.get_labels(rid)
-            pos_info = {
-                label: cache_mgmt.alloc_manager.get_state(
-                    rid, label
-                ).get_pos_info() for label in labels
-            }
-            req_inputs = submodule.prepare_inputs(
-                graph_walk=batch.graph_walk,
-                fwd_info=batch.per_request_info[rid],
-                inputs=batch.per_request_input_tensors[rid],
-                pos_info=pos_info,
-                seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
-            )
-            if req_inputs is None:
-                skipped_rids.add(rid)
-            else:
-                node_inputs.append(req_inputs)
+            try:
+                labels = cache_mgmt.alloc_manager.get_labels(rid)
+                pos_info = {
+                    label: cache_mgmt.alloc_manager.get_state(
+                        rid, label
+                    ).get_pos_info() for label in labels
+                }
+                req_inputs = submodule.prepare_inputs(
+                    graph_walk=batch.graph_walk,
+                    fwd_info=batch.per_request_info[rid],
+                    inputs=batch.per_request_input_tensors[rid],
+                    pos_info=pos_info,
+                    seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
+                )
+                if req_inputs is None:
+                    skipped_rids.add(rid)
+                else:
+                    node_inputs.append(req_inputs)
+            except AllocationFailedError as e:
+                raise e # allocation errors handled separately
+            except BaseException as e:
+                failed[rid] = str(e)
 
+        skipped_rids.update(failed.keys())
         if skipped_rids:
             batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
             batch.per_request_info = {
@@ -975,6 +985,7 @@ class KVCacheEngine(BaseEngine):
             submodule=submodule,
             node_inputs=node_inputs,
             metadata={"submod_mgmt": submod_mgmt},
+            failed_requests=failed
         )
 
     def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
@@ -1022,18 +1033,22 @@ class KVCacheEngine(BaseEngine):
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+        output.failed_requests.update(planned.prepared.failed_requests)
         return output
 
     def postprocess_batch(self, planned: PlannedBatch, output: NodeOutput) -> None:
         batch = planned.batch
         submodule = planned.submodule
         for rid, node_inputs in zip(batch.request_ids, planned.node_inputs, strict=True):
-            submodule.postprocess(
-                request_id=rid,
-                request_info=batch.per_request_info[rid],
-                outputs=output.per_request_output_tensors.get(rid, {}),
-                inputs=node_inputs,
-            )
+            try:
+                submodule.postprocess(
+                    request_id=rid,
+                    request_info=batch.per_request_info[rid],
+                    outputs=output.per_request_output_tensors.get(rid, {}),
+                    inputs=node_inputs,
+                )
+            except BaseException as e:
+                output.failed_requests[rid] = str(e)
 
     def _get_needed_labels(
         self, node_name: str, graph_walk: str,

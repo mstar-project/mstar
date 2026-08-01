@@ -68,6 +68,7 @@ class PreparedBatch:
     submodule: Any | None = None
     node_inputs: list = field(default_factory=list)
     skipped_rids: set[str] = field(default_factory=set)
+    failed_requests: dict[str, str] = field(default_factory=dict) # rid -> error message
     metadata: dict = field(default_factory=dict)
 
     @property
@@ -126,6 +127,7 @@ class NodeOutput:
     # side-stream D→H copy of the produced tokens. Set by the worker in
     # _execute_on_gpu_thread; engines don't populate it themselves.
     completion_event: "torch.cuda.Event | None" = None
+    failed_requests: dict[str, str] # rid -> error message
 
 
 class BaseEngine(ABC):

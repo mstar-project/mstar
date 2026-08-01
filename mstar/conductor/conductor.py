@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 
-from mstar.api_server.request_types import APIServerMessage, RequestComplete
+from mstar.api_server.request_types import APIServerFailRequests, APIServerMessage, RequestComplete
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -33,6 +33,7 @@ from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.ipc_format import (
     ConductorMessageType,
+    FailRequest,
     InputSignals,
     NewRequest,
     NewRequestConductor,
@@ -806,6 +807,26 @@ class Conductor:
             if graph_walk in self.worker_graphs[wg_id].graph_walks
         }
 
+    def _fail_request(self, message: FailRequest):
+        for rid in message.rids:
+            request_data = self.requests.get(rid)
+            if request_data is None:
+                logger.info(
+                    "Request %s was failed from multiple different workers; ignoring all but the first.", rid
+                )
+                return
+            self._remove_request(rid, request_data)
+        self.communicator.send(
+            APIServerMessage(
+                message_type="fail_requests",
+                body=APIServerFailRequests(
+                    request_ids=message.rids,
+                    error_message=message.error_message
+                )
+            )
+        )
+
+
     def _abort_request(self, request_id: str):
         """Tear down a request the client abandoned, freeing its worker GPU state."""
         for i, body in enumerate(self.waiting_queue):
@@ -818,7 +839,9 @@ class Conductor:
         if request_data is None:
             logger.info("Abort for request %s ignored; already finished or unknown", request_id)
             return
-
+        self._remove_request(request_id, request_data)
+    
+    def _remove_request(self, request_id: str, request_data: RequestData):
         workers = {
             worker_id
             for worker_ids in request_data.worker_graph_to_workers.values()
@@ -1144,6 +1167,8 @@ class Conductor:
                         self._ingest_request(message.body)
                     elif message.message_type == ConductorMessageType.ABORT_REQUEST:
                         self._abort_request(message.body.request_id)
+                    elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
+                        self._fail_request(message)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
                         rid = message.body.request_id
                         if rid not in self.requests:
