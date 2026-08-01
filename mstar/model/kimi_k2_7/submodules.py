@@ -1,21 +1,4 @@
-"""Submodules for Kimi-K2.7 (text backbone).
-
-The :class:`KimiLLMSubmodule` ``ARNodeSubmodule`` drives the DeepSeek-V3 text
-backbone (MLA attention over the paged cache + fine-grained sigmoid-routed MoE)
-through the engine's ``prepare_inputs -> preprocess ->
-forward/forward_batched -> postprocess -> check_stop`` lifecycle for the
-``prefill`` and ``decode`` Loop walks.
-
-Structurally this mirrors ``OrpheusLLMSubmodule`` (the smallest complete LLM in
-the tree) with one addition: the naive MLA applies YARN RoPE itself over the
-decoupled ``qk_rope`` slice, so ``preprocess`` builds per-token ``position_ids``
-(the same positions ``plan_rope`` uses) and threads them into the forward —
-analogous to how Qwen3-Omni threads its 3D-MRoPE cos/sin through preprocess. The
-sampling/EOS/logits contract is identical to Orpheus: the non-batched ``forward``
-returns last-token ``logits`` (the KV-cache engine samples them into
-``new_token``); ``forward_batched`` samples inside the forward and returns
-``new_token`` per request.
-"""
+"""AR submodule for the Kimi-K2.7 text backbone."""
 from __future__ import annotations
 
 from typing import Any
@@ -43,39 +26,18 @@ _MAIN = "main"
 
 
 class KimiLLMSubmodule(ARNodeSubmodule):
-    """Autoregressive Kimi/DeepSeek-V3 text backbone (prefill + decode).
-
-    Dispatches on ``graph_walk``:
-      - ``prefill``: embed the prompt, fill the KV cache, sample the first token;
-      - ``decode``: embed the previous token, generate the next token.
-    """
-
     def __init__(self, language_model: nn.Module, config: KimiK2Config):
         super().__init__()
         self.language_model = language_model  # KimiForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
 
-    # -- CUDA-graph prefill capture grid (full-size defaults) --------------
-    # Overridable per-config via ``config.prefill_token_buckets`` /
-    # ``config.prefill_capture_batch_sizes``: ``KimiK2Config.reduced()`` sets a
-    # tiny grid for a reduced-size serve, while the full model leaves them
-    # ``None`` and uses these defaults. Capturing the full 6x5 compiled grid is
-    # slow, and buckets above a small model's ``max_position_embeddings`` do not
-    # fit — hence the reduced config trims it.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def _build_prefill_packed(
         self, num_tokens: int, device: torch.device,
     ) -> dict[str, torch.Tensor]:
-        """Tensor-only post-``preprocess`` packed dict for prefill capture.
-
-        Mirrors ``preprocess``'s tensor outputs: the packed ``(num_tokens,)`` long
-        ``input_ids`` and the ``(num_tokens,)`` long ``position_ids`` the MLA YARN
-        RoPE reads. Both are interned as static buffers; at replay the runner
-        copies the real ``preprocess`` output into them.
-        """
         return {
             "input_ids": torch.zeros((num_tokens,), dtype=torch.long, device=device),
             "position_ids": torch.arange(num_tokens, dtype=torch.long, device=device),
@@ -84,16 +46,6 @@ class KimiLLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
-        """Decode (per-bs) + prefill (per-token-bucket) captures.
-
-        The YARN-rope path the MLA runs is pure tensor compute (``outer`` + cos/sin
-        + interleaved rotate) reading ``position_ids`` from a static buffer, so it
-        captures like Qwen3-Omni's cos/sin-threaded prefill: decode re-runs
-        ``preprocess`` at replay and copies the packed ``input_ids`` /
-        ``position_ids`` into the interned buffers; prefill uses the packed dict
-        above. ``inv_freq`` is lazily cached on first (warmup) forward, so its
-        address is stable across replay.
-        """
         prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
         prefill_batch_sizes = (
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
@@ -124,8 +76,6 @@ class KimiLLMSubmodule(ARNodeSubmodule):
             ),
         ]
 
-    # -- lifecycle ---------------------------------------------------------
-
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -134,8 +84,6 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         pos_info: dict[str, PositionInfo] = {},
         **kwargs,
     ) -> ARNodeInputs:
-        # Cheap host-side: the prompt ids (prefill) or the previous token (decode)
-        # arrive under the "text_inputs" edge (see KimiK2Model.get_graph_walk_graphs).
         text_inputs = inputs["text_inputs"][0]
         return ARNodeInputs(
             input_ids=text_inputs,
@@ -151,17 +99,10 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         cache_manager = engine_inputs.cache_manager
         seq_lens = [inp.input_seq_len for inp in inputs]
 
-        # Plan attention + rope for the main cache label (CUDA-graph incompatible,
-        # so it happens here in preprocess, not in forward).
         cache_manager.set_active_label(_MAIN)
         cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label=_MAIN)
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label=_MAIN)
 
-        # Build the per-token YARN position_ids for the MLA rope. These are exactly
-        # the positions plan_rope uses: each request's position_id_start (advanced
-        # once per forward by KimiLanguageModel's advance_seq_lens) plus its span.
-        # request_ids order matches the inputs order (both are batch order), so the
-        # concatenated input_ids and position_ids stay token-aligned.
         device = self.get_device()
         pos_ids_list: list[int] = []
         for rid, sl in zip(cache_manager.request_ids, seq_lens, strict=True):
@@ -180,12 +121,6 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         cache_handle: BatchedCacheManager,
     ) -> torch.Tensor:
-        """Token ids -> final hidden states (embed -> layers -> norm).
-
-        ``KimiLanguageModel.forward`` embeds ``input_ids``, runs the decoder stack
-        (per-layer ``set_layer_idx``, MLA YARN rope from ``position_ids``), calls
-        ``advance_seq_lens`` once, and returns the normed hidden states.
-        """
         return self.language_model.model(input_ids, cache_handle, position_ids)
 
     def forward(
@@ -196,8 +131,6 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        """Non-batched forward: return the last token's logits for the engine to
-        sample (prefill: last prompt token; decode: the single token)."""
         cache_handle = engine_inputs.cache_manager
         hidden = self._hidden(input_ids, position_ids, cache_handle)
         logits = self.lm_head(hidden[-1:])
@@ -214,10 +147,6 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        """Batched forward: sample inside the pass (CUDA-graphable sampler) and
-        return per-request ``new_token``. Prefill packs all requests' tokens, so the
-        last-token-per-request indices come from the FlashInfer prefill wrapper's
-        persistent ``qo_indptr`` buffer; decode is one token per request."""
         cache_handle = engine_inputs.cache_manager
         sampler = engine_inputs.sampler
         cache_handle.set_active_label(_MAIN)
@@ -255,8 +184,6 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        # Metadata-only: rebind the new token as the next step's text_inputs.
-        # EOS is checked in check_stop so the GPU thread doesn't sync on .item().
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]

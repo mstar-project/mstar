@@ -1,16 +1,4 @@
-"""Python launchers over the vendored ``torch.ops._mstar_marlin_C`` Marlin ops.
-
-Mirrors vLLM's ``_custom_ops`` + ``marlin_utils`` helpers (same transformation
-sequence: checkpoint INT4 → Marlin-repacked → GEMM), so the port is auditable
-against the reference. Callers must gate on
-:func:`mstar.utils.marlin.is_marlin_available` first — these dereference the JIT
-op namespace directly.
-
-The routed-expert GEMM (:func:`fused_marlin_moe`) reuses mstar's existing MoE
-plumbing — ``moe_align_block_size`` (token→expert sort), ``act_and_mul_triton``
-(SwiGLU), and ``moe_sum_reduce_triton`` (top-k fold) — so only the two INT4
-matmuls are Marlin; everything around them is shared with the bf16/Triton paths.
-"""
+"""Python launchers over the vendored Marlin torch ops."""
 from __future__ import annotations
 
 import torch
@@ -19,23 +7,12 @@ from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import act_and_mul_triton, moe_sum_reduce_triton
 from mstar.utils.marlin.scalar_type import UINT4B8_ID
 
-# Marlin repacked-weight tile (from the vendored marlin.cuh ``tile_size``).
 _MARLIN_TILE = 16
 
-
-# ---------------------------------------------------------------------------
-# Load-time repack (checkpoint GPTQ-packed INT4 → Marlin tiled layout)
-# ---------------------------------------------------------------------------
 
 def gptq_marlin_repack(
     b_q_weight: torch.Tensor, size_k: int, size_n: int, num_bits: int = 4
 ) -> torch.Tensor:
-    """Repack a GPTQ-layout packed INT4 weight into Marlin tiled layout.
-
-    ``b_q_weight`` is int32 ``(size_k // pack_factor, size_n)`` (K-major packed,
-    the layout Marlin's repack expects). Returns the Marlin-tiled int32 weight
-    ``(size_k // 16, size_n * 16 // pack_factor)``.
-    """
     perm = torch.empty(0, dtype=torch.int32, device=b_q_weight.device)
     return torch.ops._mstar_marlin_C.gptq_marlin_repack(
         b_q_weight, perm, size_k, size_n, num_bits
@@ -45,11 +22,6 @@ def gptq_marlin_repack(
 def gptq_marlin_moe_repack(
     b_q_weight: torch.Tensor, size_k: int, size_n: int, num_bits: int = 4
 ) -> torch.Tensor:
-    """Per-expert :func:`gptq_marlin_repack` (mirrors vLLM's pure-Python loop).
-
-    ``b_q_weight`` is int32 ``(E, size_k // pack_factor, size_n)``; returns
-    ``(E, size_k // 16, size_n * num_bits // 8)``.
-    """
     num_experts = b_q_weight.shape[0]
     perm = torch.empty(0, dtype=torch.int32, device=b_q_weight.device)
     output = torch.empty(
@@ -65,7 +37,6 @@ def gptq_marlin_moe_repack(
 
 
 def _get_scale_perms() -> tuple[list[int], list[int]]:
-    """Marlin scale-permutation index tables (verbatim from vLLM marlin_utils)."""
     scale_perm: list[int] = []
     for i in range(8):
         scale_perm.extend([i + 8 * j for j in range(8)])
@@ -78,7 +49,6 @@ def _get_scale_perms() -> tuple[list[int], list[int]]:
 def marlin_permute_scales(
     s: torch.Tensor, size_k: int, size_n: int, group_size: int
 ) -> torch.Tensor:
-    """Permute a single expert's group scales into Marlin layout (vLLM parity)."""
     scale_perm, scale_perm_single = _get_scale_perms()
     if group_size < size_k and group_size != -1:
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
@@ -90,7 +60,6 @@ def marlin_permute_scales(
 def marlin_moe_permute_scales(
     s: torch.Tensor, size_k: int, size_n: int, group_size: int
 ) -> torch.Tensor:
-    """Per-expert :func:`marlin_permute_scales`. ``s`` is ``(E, num_groups, size_n)``."""
     num_experts = s.shape[0]
     output = torch.empty_like(s)
     for e in range(num_experts):
@@ -99,14 +68,9 @@ def marlin_moe_permute_scales(
 
 
 def marlin_make_workspace(device: torch.device, max_blocks_per_sm: int = 4) -> torch.Tensor:
-    """Marlin reduce/lock workspace: one int per (SM × max_blocks_per_sm)."""
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
 
-
-# ---------------------------------------------------------------------------
-# Runtime: fused routed-expert Marlin GEMM
-# ---------------------------------------------------------------------------
 
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -121,15 +85,6 @@ def fused_marlin_moe(
     activation: str = "silu",
     reduce_results: bool = True,
 ) -> torch.Tensor:
-    """Marlin W4A16 routed-expert dispatch (gate_up GEMM → SwiGLU → down GEMM).
-
-    Layout mirrors :func:`mstar.utils.fused_moe.fused_experts` but with Marlin
-    kernels: ``w1_marlin``/``w2_marlin`` are the Marlin-repacked int32 experts
-    (from :func:`gptq_marlin_moe_repack`), ``w1_scale``/``w2_scale`` the permuted
-    group scales (from :func:`marlin_moe_permute_scales`). Returns
-    ``(tokens, hidden)`` when ``reduce_results`` else the per-slot
-    ``(tokens, top_k, hidden)`` tensor the TP path all-reduces before folding.
-    """
     assert hidden_states.is_contiguous() and hidden_states.dim() == 2
     assert hidden_states.dtype in (torch.bfloat16, torch.float16)
     M, K = hidden_states.shape

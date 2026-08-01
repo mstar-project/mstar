@@ -1,16 +1,3 @@
-"""GPU golden for the Marlin backend wired into ``KimiSparseMoeBlock``.
-
-Where ``test_marlin_kernels.py`` exercises the kernels in isolation, this drives
-the *block* wiring: ``process_weights_after_loading`` resolving the backend +
-repacking the packed experts (and freeing the source packed params), the
-``_use_marlin`` branch in ``forward`` passing fp32 combine weights, and the shared
-expert / router riding alongside. The reference is the same block's bf16 path:
-router + bf16 fused-expert GEMM on the dequantized experts + the (bf16) shared
-expert. Only the routed-expert kernel differs, so a cosine floor + relative-L2
-bound is the correct gate (see ``test_marlin_kernels.py`` for why).
-
-Run:  pytest test/integration/test_kimi_moe_marlin.py -v
-"""
 import pytest
 import torch
 
@@ -41,8 +28,6 @@ def _quantize_stack(weight):
 
 
 def _build_block():
-    """A tp=1 Marlin-legal KimiSparseMoeBlock, materialized on CUDA with random
-    router/shared weights and synthetic quantized routed experts loaded packed."""
     from mstar.model.kimi_k2_7.components.moe import KimiSparseMoeBlock
     from mstar.model.kimi_k2_7.config import KimiK2Config
 
@@ -53,13 +38,11 @@ def _build_block():
     block = block.to(torch.bfloat16)
     block.to_empty(device=DEVICE)
 
-    # Random router + shared-expert weights (float params only).
     for p in block.parameters():
         if p.dtype.is_floating_point:
             with torch.no_grad():
                 p.copy_(torch.randn_like(p) * 0.1)
 
-    # Synthetic quantized routed experts; keep the bf16 dequant for the reference.
     E, H, I = cfg.n_routed_experts, cfg.hidden_size, cfg.moe_intermediate_size
     w1 = (torch.randn(E, 2 * I, H, device=DEVICE) * 0.3).to(torch.bfloat16)
     w2 = (torch.randn(E, H, I, device=DEVICE) * 0.3).to(torch.bfloat16)
@@ -80,17 +63,14 @@ def test_marlin_block_matches_bf16_reference():
     H = cfg.hidden_size
     x = (torch.randn(5, H, device=DEVICE) * 0.5).to(torch.bfloat16)
 
-    # bf16 reference (before the Marlin repack frees the packed params): router +
-    # bf16 fused experts on the dequant + the shared expert.
+    # Build the bf16 reference before Marlin repack frees packed params.
     with torch.no_grad():
         topk_w, topk_ids = block.gate(x)
         routed_ref = fused_experts(x, w1_deq, w2_deq, topk_w.to(x.dtype), topk_ids)
         ref = (routed_ref + block.shared_expert(x)).view(x.shape)
 
-    # Resolve backend + repack to Marlin, then run the block forward.
     block.process_weights_after_loading(torch.device(DEVICE))
     assert block._use_marlin, "reduced_marlin config should select the Marlin backend"
-    # Source packed params are freed after the repack.
     assert block.experts.gate_up_proj_packed.numel() == 0
 
     with torch.no_grad():
@@ -106,9 +86,6 @@ def test_marlin_block_matches_bf16_reference():
 
 
 def test_forced_marlin_raises_on_illegal_shapes():
-    """``quant_kernel='marlin'`` must fail loudly when the shapes are Marlin-illegal
-    (rather than silently downgrading) — reduced_quantized_inkernel has
-    moe_intermediate_size=64, which violates Marlin's k%128 on the down GEMM."""
     from mstar.model.kimi_k2_7.components.moe import KimiSparseMoeBlock
     from mstar.model.kimi_k2_7.config import KimiK2Config
 
@@ -123,7 +100,6 @@ def test_forced_marlin_raises_on_illegal_shapes():
 
 
 def test_triton_backend_still_selected_when_forced():
-    """``quant_kernel='triton'`` keeps the packed Triton path (no Marlin repack)."""
     from mstar.model.kimi_k2_7.components.moe import KimiSparseMoeBlock
     from mstar.model.kimi_k2_7.config import KimiK2Config
 

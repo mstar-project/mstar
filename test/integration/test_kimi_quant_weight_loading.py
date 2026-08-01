@@ -1,31 +1,3 @@
-"""Golden: compressed-tensors dequant-on-load for Kimi-K2.7.
-
-The real 1T INT4 checkpoint is absent and a bf16 dequant of it would not fit, so
-this validates the *parser + numerics* on a SYNTHETIC ``reduced_quantized()``
-model, exactly mirroring the bf16 ``test_kimi_weight_loading.py`` but with a
-compressed-tensors quantized checkpoint:
-
-  1. build a ``KimiForCausalLM`` reference with random bf16 weights;
-  2. **fake-quantize in place** every eligible weight (2-D, input dim divisible by
-     ``group_size``, and not a norm / router / embedding / lm_head) — writing the
-     dequantized bf16 back into the reference, so the reference now holds exactly
-     what a correct loader must reproduce — and serialize it as an HF
-     compressed-tensors checkpoint: ``<name>.weight_packed`` (int32) +
-     ``<name>.weight_scale`` (bf16) for quantized weights, plain ``<name>.weight``
-     for the rest (the ``ignore`` set + weights whose dim doesn't divide the
-     group). MLA / dense-FFN / shared-expert / routed-expert weights are all
-     quantized here — proving dequant-on-load covers plain linears *and* the fused experts;
-  3. build a fresh model on ``meta`` -> ``to(bf16)`` -> ``to_empty(cuda)`` and load
-     the checkpoint via the standard driver. Because the config carries a
-     ``quantization_config``, ``load_kimi_hf_weights`` wraps the stream with the
-     dequant-on-load dequantizer *before* the remap + stacked rules (which are unchanged);
-  4. assert (a) completeness, (b) every loaded param equals the fake-quantized
-     reference bit-for-bit (the loader reproduces the dequant exactly), (c) the
-     router bias stays fp32 and no stray buffers survive, and (d) a full forward on
-     the loaded model matches a forward on the reference model.
-
-Run:  pytest test/integration/test_kimi_quant_weight_loading.py -v
-"""
 import pytest
 import torch
 
@@ -42,10 +14,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda"
 
-
-# --------------------------------------------------------------------------
-# Mock paged cache (causal SDPA at 1/sqrt(head_dim)) — same as test_kimi_forward.
-# --------------------------------------------------------------------------
 
 def _sdpa_causal(q, k, v, scale):
     qt, kt, vt = (t.transpose(0, 1).float() for t in (q, k, v))
@@ -68,11 +36,6 @@ class _MockMLACache:
 
     def run_attention(self, q, k, v):
         return _sdpa_causal(q, k, v, self.scale)
-
-
-# --------------------------------------------------------------------------
-# Random weight init (router bias kept fp32) — same as test_kimi_weight_loading.
-# --------------------------------------------------------------------------
 
 def _fill_layer(layer, cfg):
     a = layer.self_attn
@@ -103,19 +66,11 @@ def _build_reference(cfg):
     model.lm_head.weight.data.normal_(0, 0.02)
     for layer in model.model.layers:
         _fill_layer(layer, cfg)
-    # Eval-only fixture; disable grad so the in-place dequant write-back in _emit
-    # (copying into leaf params) is allowed.
+    # Disable grad so in-place dequant write-back into leaf params is allowed.
     model.requires_grad_(False)
     return model.eval()
 
-
-# --------------------------------------------------------------------------
-# Fake-quant serialization: compressed-tensors keys for eligible weights, plain
-# bf16 for the rest. Mutates the reference in place to hold the dequant.
-# --------------------------------------------------------------------------
-
 def _keep_bf16(key):
-    """Weights a real compressed-tensors Kimi checkpoint leaves in bf16."""
     if key == "lm_head.weight":
         return True
     return (
@@ -127,12 +82,6 @@ def _keep_bf16(key):
 
 
 def _emit(sd, key, view, quant_cfg):
-    """Add checkpoint entries for reference param ``view`` at ``key``.
-
-    Quantizes (and writes the dequant back into ``view``) when eligible, else
-    stores the plain bf16 tensor. Eligibility mirrors a real checkpoint: 2-D,
-    input dim divisible by the group size, and not in the bf16-keep set.
-    """
     eligible = (
         not _keep_bf16(key)
         and view.dim() == 2
@@ -141,9 +90,7 @@ def _emit(sd, key, view, quant_cfg):
     if not eligible:
         sd[key] = view
         return
-    # Store the scale in bf16 (as a real compressed-tensors checkpoint does) and
-    # take the dequant from that same bf16 scale, so the reference holds exactly
-    # what the loader's bf16-scale dequant reconstructs.
+    # Match compressed-tensors checkpoints: bf16 scale drives the reference dequant.
     packed, scale, deq = fake_quantize_weight(
         view, num_bits=quant_cfg.num_bits, group_size=quant_cfg.group_size,
         symmetric=quant_cfg.symmetric, scale_dtype=torch.bfloat16,
@@ -204,7 +151,6 @@ def _hf_quant_checkpoint(model, cfg, quant_cfg):
 
 
 def _build_loaded(cfg, checkpoint_dir):
-    """Production path: meta -> to(bf16) -> to_empty(cuda) -> load_weights."""
     with torch.device("meta"):
         model = KimiForCausalLM(cfg)
     model = model.to(torch.bfloat16)
@@ -213,52 +159,38 @@ def _build_loaded(cfg, checkpoint_dir):
     return model.eval(), loaded
 
 
-# --------------------------------------------------------------------------
-# Test
-# --------------------------------------------------------------------------
-
 def test_quant_weight_loading_roundtrip_and_forward(tmp_path):
     from safetensors.torch import save_file
 
     torch.manual_seed(0)
-    cfg = KimiK2Config.reduced_quantized()  # group_size=32, INT4 symmetric
+    cfg = KimiK2Config.reduced_quantized()
     assert cfg.quantization_config is not None
     ref = _build_reference(cfg)
-    # The stack spans the dense->MoE transition (first_k_dense_replace=1).
     assert not isinstance(ref.model.layers[0].mlp, KimiSparseMoeBlock)
     assert isinstance(ref.model.layers[1].mlp, KimiSparseMoeBlock)
 
     sd = _hf_quant_checkpoint(ref, cfg, cfg.quantization_config)
 
-    # Guard: the checkpoint really is quantized (else this silently degrades to
-    # the bf16 test) — routed experts AND plain linears carry packed weights.
     assert any(k.endswith("mlp.experts.0.gate_proj.weight_packed") for k in sd)
     assert any(k.endswith("self_attn.o_proj.weight_packed") for k in sd)
-    # ... and the ignore-set weights stayed bf16 (plain .weight, no packed).
     assert "lm_head.weight" in sd and "lm_head.weight_packed" not in sd
     assert "model.embed_tokens.weight" in sd
 
     save_file(sd, str(tmp_path / "model.safetensors"))
     model, loaded = _build_loaded(cfg, tmp_path)
 
-    # (a) completeness: every param received exactly one tensor, and no quant
-    # sub-key leaked through as a spurious param.
     all_params = set(dict(model.named_parameters()).keys())
     assert loaded == all_params, (
         f"unloaded: {all_params - loaded}; spurious: {loaded - all_params}")
 
-    # (b) every loaded param equals the fake-quantized reference, bit for bit
-    # (dequant-on-load reproduces the same fp32 (q-bias)*scale -> bf16 dequant).
     ref_sd = dict(ref.named_parameters())
     for name, param in model.named_parameters():
         assert torch.equal(param, ref_sd[name]), f"mismatch at {name}"
 
-    # (c) router bias preserved fp32; no derived buffers survived the load path.
     bias = model.model.layers[1].mlp.gate.e_score_correction_bias
     assert bias.dtype == torch.float32
     assert {n for n, _ in model.named_buffers()} == set()
 
-    # (d) full forward on the loaded model matches the reference model's forward.
     T = 8
     ids = torch.randint(0, cfg.vocab_size, (T,), device=DEVICE)
     pos = torch.arange(T, device=DEVICE)

@@ -1,27 +1,3 @@
-"""GPU kernel golden: W4A16 in-kernel INT4 dequant vs the bf16 fused-expert GEMM.
-
-The in-kernel dequant path ships a SEPARATE ``fused_moe_kernel_w4a16`` that keeps the routed
-experts packed in VRAM and dequantizes each K tile in registers before the dot.
-Its correctness invariant is exact: the nibble ``(q - 8) * scale`` cast to bf16 is
-*the same value* the bf16 path feeds to ``tl.dot`` after a pre-dequant, and with
-the same tile config the two accumulate in the same order — so the packed path
-must match the bf16 path on the SAME dequantized weights to a tight tolerance.
-
-This is the cheapest level that catches a kernel bug (packed-K stride, nibble
-shifter, group-scale index, the top-nibble sign case) without a full model:
-
-  1. random bf16 experts ``w1 (E, 2I, H)`` / ``w2 (E, H, I)``;
-  2. ``fake_quantize_weight`` each expert to ``(packed, bf16 scale, deq_bf16)``,
-     with ``scale_dtype=bfloat16`` so the packed-param scale and the bf16-path
-     weight dequantize from the identical scale;
-  3. assert ``fused_experts(x, w1_packed, w2_packed, w1_scale=, w2_scale=, ...)``
-     == ``fused_experts(x, w1_deq, w2_deq)`` (the bf16 path).
-
-Includes an expert whose packing sets container bit 31 (top nibble >= 8), proving
-the arithmetic-shift + ``& 0xF`` mask recovers it.
-
-Run:  pytest test/integration/test_kimi_moe_inkernel_dequant.py -v
-"""
 import pytest
 import torch
 
@@ -39,12 +15,6 @@ PACK_FACTOR = 8
 
 
 def _quantize_stack(weight):
-    """Fake-quantize a stacked ``(E, N, K)`` weight, returning packed/scale/deq.
-
-    Each expert is quantized independently (matching a per-Linear checkpoint);
-    the bf16 scale is what a real compressed-tensors checkpoint stores, so the
-    returned ``deq`` is bit-for-bit what the packed param dequantizes to.
-    """
     E, N, K = weight.shape
     packed = torch.empty((E, N, K // PACK_FACTOR), dtype=torch.int32, device=DEVICE)
     scale = torch.empty((E, N, K // GROUP_SIZE), dtype=torch.bfloat16, device=DEVICE)
@@ -71,16 +41,14 @@ def test_w4a16_matches_bf16_on_same_dequant(num_tokens):
 
     torch.manual_seed(0)
     E, H, I, top_k = 4, 128, 64, 2
-    # Slightly wide init so per-group amax spans the full nibble range and some
-    # top nibbles land >= 8 (container bit 31 set) — the sign-mask path.
+    # Wide init exercises top-nibble sign masking.
     w1 = (torch.randn(E, 2 * I, H, device=DEVICE) * 0.3).to(torch.bfloat16)
     w2 = (torch.randn(E, H, I, device=DEVICE) * 0.3).to(torch.bfloat16)
 
     w1_packed, w1_scale, w1_deq = _quantize_stack(w1)
     w2_packed, w2_scale, w2_deq = _quantize_stack(w2)
 
-    # Guard: the packing really exercises the negative-container / top-nibble>=8
-    # case (else the sign-extension mask would be untested).
+    # Guard that the negative-container path is actually covered.
     assert (w1_packed < 0).any(), "no int32 with bit 31 set — top-nibble path untested"
     top_nibbles = unpack_int32(w1_packed.cpu(), num_bits=4)[..., PACK_FACTOR - 1 :: PACK_FACTOR]
     assert (top_nibbles >= 8).any()
@@ -100,8 +68,6 @@ def test_w4a16_matches_bf16_on_same_dequant(num_tokens):
 
 
 def test_w4a16_reduce_results_false_shape():
-    """``reduce_results=False`` returns the per-slot (tokens, top_k, hidden) tensor
-    the TP path all-reduces before the top-k sum — exercise it on the packed path."""
     from mstar.utils.fused_moe.runner import fused_experts
 
     torch.manual_seed(1)

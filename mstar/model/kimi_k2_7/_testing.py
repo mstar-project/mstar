@@ -26,20 +26,7 @@ def fake_quantize_weight(
     symmetric: bool = True,
     scale_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize ``weight`` group-wise and return ``(packed, scale, dequant)``.
-
-    A test/harness helper (not used at serve time): produces the on-disk
-    compressed-tensors tensors *and* the exact bf16 result they dequantize back
-    to, so a golden can assert the loader reproduces ``dequant`` bit-for-bit. Only
-    symmetric INT-style quantization is implemented (Kimi's scheme).
-
-    ``dequant`` is derived from the *returned* ``scale`` via :func:`dequantize_weight`,
-    so it stays consistent with whatever ``scale_dtype`` the scale is stored at.
-    Pass ``scale_dtype=torch.bfloat16`` to match a real compressed-tensors
-    checkpoint (whose ``weight_scale`` is stored in the model dtype) — otherwise
-    the loader's bf16-scale dequant would differ from an fp32-scale reference in
-    the low bits.
-    """
+    """Return packed weights, stored scales, and the exact dequantized reference."""
     if not symmetric:
         raise NotImplementedError("fake_quantize_weight: only symmetric is implemented")
     out_f, in_f = weight.shape

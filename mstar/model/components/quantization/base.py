@@ -1,23 +1,4 @@
-"""Model-agnostic quantization seams for mstar.
-
-mstar has no vLLM-style quant-method abstraction. This module introduces the
-minimal seam needed to bolt a kernel backend (currently Marlin W4A16 for the
-routed experts) onto a model without the model code knowing which kernel runs:
-
-* :class:`FusedMoEQuantizeMethod` — the interface an MoE block delegates its
-  quantized routed-expert GEMM to. A block holds one instance, calls
-  :meth:`~FusedMoEQuantizeMethod.prepare` once post-load to transform its loaded
-  packed params into the backend's kernel layout, then calls
-  :meth:`~FusedMoEQuantizeMethod.apply` each forward. Kimi's
-  :class:`~mstar.model.components.quantization.marlin_moe.MarlinMoEMethod` is the
-  first implementation; another MoE model can reuse it verbatim.
-
-* :func:`process_weights_after_loading` — a generic post-load pass. mstar builds
-  a module on ``meta``, ``to_empty``\\s it, and loads weights, but has no hook to
-  finalize a kernel layout on the real device afterwards (Marlin needs a one-time
-  repack + workspace alloc). This walker calls a ``process_weights_after_loading``
-  method on every submodule that exposes one; it is a no-op for a plain bf16 model.
-"""
+"""Model-agnostic quantization hooks for post-load kernel layout fixes."""
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
@@ -45,10 +26,6 @@ class FusedMoEQuantizeMethod(Protocol):
     ) -> None:
         """Transform the loaded compressed-tensors packed expert weights into the
         backend's runtime layout (e.g. Marlin repack), storing them internally.
-
-        ``w13_packed``/``w2_packed`` are int32 ``(E, N, K // pack_factor)`` and
-        ``w13_scale``/``w2_scale`` are ``(E, N, K // group_size)`` — the layout
-        Kimi's Hook B packed params already carry.
         """
         ...
 
@@ -76,8 +53,7 @@ def process_weights_after_loading(root: nn.Module, device: torch.device) -> None
     Call once after ``load_weights`` and before ``eval()``/CUDA-graph capture. Any
     submodule exposing a ``process_weights_after_loading(device)`` method gets it
     invoked (e.g. a Marlin MoE block repacks its packed experts + allocates a
-    workspace). Modules without the method are skipped, so this is a no-op for a
-    plain bf16 model.
+    workspace).
     """
     for module in root.modules():
         hook = getattr(module, "process_weights_after_loading", None)

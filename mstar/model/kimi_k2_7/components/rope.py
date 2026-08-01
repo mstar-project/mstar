@@ -1,18 +1,4 @@
-"""deepseek_yarn RoPE for Kimi-K2.7 / DeepSeek-V3 MLA.
-
-MLA rotates only the decoupled ``qk_rope_head_dim`` slice of q/k, with YARN
-(NTK-by-parts) frequency scaling and an ``mscale`` amplitude on cos/sin. mstar's
-``cache_manager.apply_rope`` (FlashInfer) does not implement YARN, so this is a
-standalone rotary module the MLA attention applies itself.
-
-Style is **interleaved / GPT-J** (``is_neox_style=False`` in DeepSeek): cos/sin
-are ``repeat_interleave(2)`` and adjacent even/odd pairs are rotated. Mirrors
-vLLM ``DeepseekScalingRotaryEmbedding`` and the YARN helpers in ``common.py``.
-
-Two ``mscale`` values (both use the 2-arg ``yarn_get_mscale``):
-  - **amplitude** on cos/sin (here): ``get_mscale(f, mscale) / get_mscale(f, mscale_all_dim) * attn_factor``.
-  - **softmax-scale boost** (in the attention, not here): ``get_mscale(f, mscale_all_dim) ** 2``.
-"""
+"""DeepSeek YARN RoPE for Kimi-K2.7 MLA."""
 from __future__ import annotations
 
 import math
@@ -72,22 +58,14 @@ class KimiYarnRotaryEmbedding(nn.Module):
         super().__init__()
         self.rotary_dim = rotary_dim
 
-        # ``inv_freq`` is NOT a registered buffer. Buffers computed in ``__init__``
-        # do not survive the production ``meta`` build -> ``to_empty(device)`` ->
-        # ``load_weights`` path: ``to_empty`` allocates uninitialized memory and
-        # never re-runs ``__init__``, and ``inv_freq`` is not in the checkpoint
-        # (it's derived, skipped by the loader) — so a buffer would be left as
-        # garbage after loading, silently corrupting YARN RoPE. Instead keep the
-        # scalar recipe and compute ``inv_freq`` lazily in fp32 on the target
-        # device (also keeps it fp32 under a bf16 model, matching DeepSeek, rather
-        # than being downcast by ``model.to(bf16)``).
+        # Do not register inv_freq: meta->to_empty leaves derived buffers
+        # uninitialized, and model.to(bf16) would downcast it. Recompute fp32 lazily.
         self._inv_freq_args = (
             rotary_dim, base, factor, original_max_position_embeddings,
             beta_fast, beta_slow, extrapolation_factor,
         )
         self._inv_freq_cache: torch.Tensor | None = None
 
-        # cos/sin amplitude (deepseek_scaling_rope.py:56-60).
         self.mscale = float(
             yarn_get_mscale(factor, mscale)
             / yarn_get_mscale(factor, mscale_all_dim)

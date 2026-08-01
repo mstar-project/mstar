@@ -1,23 +1,4 @@
-"""Kimi-K2.7 / DeepSeek-V3 decoder layer.
-
-One pre-norm transformer block: MLA self-attention then a feed-forward that is
-either the dense SwiGLU MLP (the ``first_k_dense_replace`` early layers) or the
-fine-grained sigmoid-routed MoE block. Both feed-forwards expose the same
-``(x) -> x`` interface, so the residual wiring here is agnostic to which it holds
-(``build_mlp_for_layer`` picks per ``layer_idx``).
-
-This is a Kimi-specific decoder layer rather than the shared
-``mstar.model.components.DecoderLayer`` because MLA attention needs
-``position_ids`` threaded through its forward (the shared layer's
-``self_attn(x, cache_handle=...)`` signature has no position channel — YARN RoPE
-is applied inside the attention over the decoupled ``qk_rope`` slice).
-
-Residual structure mirrors vLLM ``DeepseekV2DecoderLayer.forward``:
-    residual = h
-    h = input_layernorm(h); h = self_attn(h, cache, pos); h = residual + h
-    residual = h
-    h = post_attention_layernorm(h); h = mlp(h); h = residual + h
-"""
+"""Kimi-K2.7 decoder layer with MLA position ids threaded through attention."""
 from __future__ import annotations
 
 import torch
@@ -34,15 +15,6 @@ from mstar.model.kimi_k2_7.config import KimiK2Config
 
 
 class KimiDecoderLayer(nn.Module):
-    """Pre-norm MLA + (dense-or-MoE) feed-forward block.
-
-    Args:
-        config: model config.
-        layer_idx: index into the stack; selects the dense MLP (``layer_idx <
-            first_k_dense_replace``) or the MoE block (``build_mlp_for_layer``).
-        comm_group: TP comm group (trivial single-rank if ``None``).
-    """
-
     def __init__(
         self,
         config: KimiK2Config,

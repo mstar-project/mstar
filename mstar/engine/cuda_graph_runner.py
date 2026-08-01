@@ -337,12 +337,7 @@ class CudaGraphRunner:
 
         cfg = self.kv_cache_config
 
-        # Compressed-latent MLA fast path: when the backend is "mla_absorb" and the
-        # FlashInfer MLA kernel is available at these dims (real Kimi dims on sm90),
-        # capture uses a persistent FlashInferMLAWrapper for BOTH decode and prefill
-        # (its run() serves both). This is the only capturable absorbed path — the
-        # SDPA fallback is eager-only, so reduced-dims / non-kernel absorbed serving
-        # runs eager (no capture). See MlaAbsorbCacheManager.
+        # Only the FlashInfer MLA path is capturable; absorbed SDPA stays eager.
         use_mla_kernel = (
             cfg.attention_backend == "mla_absorb"
             and cfg.mla_ckv_dim is not None

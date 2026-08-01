@@ -1,22 +1,3 @@
-"""M3 golden tests for Kimi-K2.7 MLA attention (naive/materialized path).
-
-Three goldens against independent references cited to vLLM:
-  - YARN RoPE (KimiYarnRotaryEmbedding) vs a DeepseekScalingRotaryEmbedding-style
-    forward_static,
-  - the q/k/v assembly (projections + rope-on-slice + k_pe broadcast + v-pad +
-    mscale^2 q-prescale) captured at ``run_attention`` via a mock cache handle, and
-  - the full attention forward (+ causal attention + output slice + o_proj).
-
-A ``_MockMLACache`` stands in for the paged cache: its ``run_attention`` does a
-causal SDPA at the fixed ``1/sqrt(qk_head_dim)`` scale (what FlashInfer uses),
-which is what lets us golden the MLA math without the paged engine. The real
-FlashInfer path over a 192-dim cache is exercised at M4/M6.
-
-Refs: vLLM ``models/deepseek_v2.py::DeepseekV2Attention`` (naive path) and
-``rotary_embedding/deepseek_scaling_rope.py``.
-
-Run:  pytest test/integration/test_kimi_mla.py -v
-"""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -38,10 +19,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda"
 
-
-# --------------------------------------------------------------------------
-# References
-# --------------------------------------------------------------------------
 
 def _ref_rmsnorm(x, weight, eps):
     x32 = x.float()
@@ -66,7 +43,6 @@ def _ref_yarn_rope(pos, q_pe, k_pe, rotary_dim, base, factor, max_pos,
 
 
 class _MockMLACache:
-    """Paged-cache stand-in: causal SDPA at 1/sqrt(head_dim)."""
 
     def __init__(self, head_dim: int):
         self.scale = head_dim ** -0.5
@@ -103,7 +79,6 @@ def _rope_kwargs(cfg):
 
 
 def _ref_mla(attn: KimiMLAAttention, cfg, h, pos, scale, boost):
-    """Independent MLA forward using weights extracted from ``attn``."""
     T, H = h.shape[0], attn.num_heads
     Dnope, Drope, Dv, L = (
         cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank)
@@ -120,18 +95,13 @@ def _ref_mla(attn: KimiMLAAttention, cfg, h, pos, scale, boost):
     k_pe = k_pe.view(T, 1, Drope)
     rk = _rope_kwargs(cfg)
     q_pe, k_pe = _ref_yarn_rope(pos, q_pe, k_pe, **rk)
-    # M6 mitigation: q/k assembled at Dqk then zero-padded to padded_head_dim, v
-    # padded from Dv to padded_head_dim (see KimiMLAAttention.forward).
+    # Reference mirrors q/k/v zero-padding to padded_head_dim.
     pad = cfg.padded_head_dim
     q = F.pad(torch.cat([q_nope, q_pe], dim=-1), [0, pad - cfg.qk_head_dim]) * boost
     k = F.pad(torch.cat([k_nope, k_pe.expand(T, H, Drope)], dim=-1), [0, pad - cfg.qk_head_dim])
     v = F.pad(v, [0, pad - Dv])
     return q, k, v
 
-
-# --------------------------------------------------------------------------
-# Tests
-# --------------------------------------------------------------------------
 
 def test_yarn_rope_matches_reference():
     torch.manual_seed(0)

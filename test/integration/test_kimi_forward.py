@@ -1,27 +1,3 @@
-"""M4 full-forward golden test for Kimi-K2.7 / DeepSeek-V3 (assembled backbone).
-
-Runs ``KimiForCausalLM`` end to end on the reduced config — token ids →
-embedding → stacked ``KimiDecoderLayer`` blocks (including the dense→MoE
-transition at ``first_k_dense_replace=1``) → final RMSNorm → untied LM head →
-logits — and compares against a self-contained inline reference that re-derives
-every step. The inner attention / FFN / router references are the same ones the
-M2/M3 goldens use (cited to vLLM); this test verifies the *assembly*: embedding,
-the per-layer cache-handle contract (``set_layer_idx`` each layer,
-``advance_seq_lens`` once after), the layer stack, and the LM head.
-
-A ``_MockMLACache`` stands in for the paged cache (causal SDPA at the fixed
-``1/sqrt(qk_head_dim)`` scale). Because a single prefill forward re-attends the
-same tokens each layer with no cross-layer history, the mock — which attends the
-q/k/v of each ``run_attention`` call independently — reproduces the paged
-prefill exactly. The real FlashInfer paged path is validated separately in
-``test_kimi_flashinfer_attention.py``.
-
-Refs: vLLM ``models/deepseek_v2.py`` (``DeepseekV2Model`` / ``DecoderLayer`` /
-``DeepseekV2MoE``), ``rotary_embedding/deepseek_scaling_rope.py``,
-``fused_moe/cpu_fused_moe.py::grouped_topk``.
-
-Run:  pytest test/integration/test_kimi_forward.py -v
-"""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -43,11 +19,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda"
 
-
-# --------------------------------------------------------------------------
-# Inline references (self-contained; cited to vLLM). Same math as the M2/M3
-# component goldens, assembled here into a whole-model forward.
-# --------------------------------------------------------------------------
 
 def _ref_rmsnorm(x, weight, eps):
     x32 = x.float()
@@ -99,9 +70,7 @@ def _ref_attn_forward(attn, cfg, h_normed, pos):
         pos, q_pe, k_pe, Drope, cfg.rope_theta, r["factor"],
         r["original_max_position_embeddings"], r.get("beta_fast", 32),
         r.get("beta_slow", 1), r.get("mscale", 1.0), r.get("mscale_all_dim", 0.0))
-    # M6 mitigation: q/k padded from Dqk and v from Dv up to padded_head_dim; the
-    # softmax_scale_boost compensates so run_attention's padded_head_dim**-0.5
-    # scale reproduces the DeepSeek qk_head_dim**-0.5 * mscale**2 scale.
+    # softmax_scale_boost restores DeepSeek's scale after padded-head attention.
     pad = cfg.padded_head_dim
     q = F.pad(torch.cat([q_nope, q_pe], dim=-1), [0, pad - cfg.qk_head_dim]) * attn.softmax_scale_boost
     k = F.pad(torch.cat([k_nope, k_pe.expand(T, H, Drope)], dim=-1), [0, pad - cfg.qk_head_dim])
@@ -189,10 +158,6 @@ def _ref_forward(model, cfg, ids, pos):
     return F.linear(h, model.lm_head.weight)
 
 
-# --------------------------------------------------------------------------
-# Mock paged cache (causal SDPA at 1/sqrt(head_dim)) + weight init
-# --------------------------------------------------------------------------
-
 class _MockMLACache:
     def __init__(self, head_dim):
         self.scale = head_dim ** -0.5
@@ -242,16 +207,11 @@ def _build_model(cfg, dtype):
     return model.eval()
 
 
-# --------------------------------------------------------------------------
-# Test
-# --------------------------------------------------------------------------
-
 def test_full_forward_logits_match_reference():
     torch.manual_seed(0)
     cfg = KimiK2Config.reduced()
     dtype = torch.bfloat16
     model = _build_model(cfg, dtype)
-    # The stack spans the dense->MoE transition (first_k_dense_replace=1).
     assert not isinstance(model.model.layers[0].mlp, KimiSparseMoeBlock)
     assert isinstance(model.model.layers[1].mlp, KimiSparseMoeBlock)
 
@@ -264,8 +224,7 @@ def test_full_forward_logits_match_reference():
         got = model(ids, cache, pos)
     expected = _ref_forward(model, cfg, ids, pos)
 
-    # advance_seq_lens is called exactly once per forward (after the layer loop),
-    # not once per layer — the cache-handle contract mirrored from Orpheus.
+    # advance_seq_lens belongs after the layer loop, not once per layer.
     assert cache.advance_calls == 1
     assert got.shape == (T, cfg.vocab_size)
     torch.testing.assert_close(got, expected, rtol=3e-2, atol=3e-2)

@@ -1,27 +1,3 @@
-"""Phase-A confirmation gate for weight-absorbed MLA (``config.mla_absorb``).
-
-These are CPU-only, GPU-free tests that prove the absorption *math* on the reduced
-config, behind the default-off flag. They deliberately do NOT call
-``KimiMLAAttention.forward`` (its RMSNorm uses a FlashInfer GPU kernel); instead
-they use pure-torch references (mirroring ``test/integration/test_kimi_mla*.py``)
-and exercise the real load-time build (``process_weights_after_loading``) + the
-absorption algebra + the latent KV-cache config.
-
-What the absorbed path must satisfy:
-  * ``w_kc``/``w_vc`` split out of ``kv_b_proj`` reconstruct the naive per-head
-    ``k_nope``/``v`` from the latent (``test_absorb_reconstructs_kv_b_proj``);
-  * the absorbed forward math equals the canonical DeepSeek MLA output — the same
-    thing the naive path reproduces (``test_absorbed_math_matches_deepseek``);
-  * ``get_kv_cache_config`` reports the shrunk latent cache when the flag is on,
-    and is byte-identical to naive when off (``test_kv_cache_config_*``).
-
-The real FlashInfer MLA kernel / paged latent cache (Phase B) is out of scope here
-(it is hard-locked to ckv=512/kpe=64, so it cannot run at the reduced dims); the
-wired ``forward`` absorbed branch is exercised on GPU in
-``test/integration/test_kimi_mla_absorb_forward.py``.
-
-Run:  pytest test/modular/test_kimi_mla_absorb.py -v
-"""
 import torch
 import torch.nn.functional as F
 
@@ -35,10 +11,6 @@ from mstar.model.kimi_k2_7.components.rope import (
 from mstar.model.kimi_k2_7.config import KimiK2Config
 from mstar.model.kimi_k2_7.kimi_model import KimiK2Model
 
-# --------------------------------------------------------------------------
-# Pure-torch references (CPU; copied from test_kimi_mla_paged.py so this stays
-# self-contained and GPU-free).
-# --------------------------------------------------------------------------
 
 def _ref_rmsnorm(x, weight, eps):
     x32 = x.float()
@@ -75,7 +47,6 @@ def _sdpa_causal(q, k, v, scale):
 
 
 def _q_and_latent(attn, cfg, h, pos):
-    """Shared Q + normed-latent + roped pe slices (the piece both refs need)."""
     t, heads = h.shape[0], attn.num_heads
     d_nope, d_rope, latent = cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.kv_lora_rank
     eps = cfg.rms_norm_eps
@@ -97,7 +68,6 @@ def _deepseek_scale(cfg):
 
 
 def _ref_deepseek_mla(attn, cfg, h, pos):
-    """Canonical (naive) DeepSeek MLA: materialize k_nope/v, SDPA at Dqk, o_proj."""
     t, heads = h.shape[0], attn.num_heads
     d_nope, d_rope, d_v = cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim
     q_nope, q_pe, kv_c, k_pe = _q_and_latent(attn, cfg, h, pos)
@@ -110,7 +80,6 @@ def _ref_deepseek_mla(attn, cfg, h, pos):
 
 
 def _absorbed_mla(attn, cfg, h, pos):
-    """Weight-absorbed MLA: fold w_kc into q, MQA over the latent, fold w_vc into o."""
     t, heads = h.shape[0], attn.num_heads
     d_rope, d_v, latent = cfg.qk_rope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank
     q_nope, q_pe, kv_c, k_pe = _q_and_latent(attn, cfg, h, pos)
@@ -124,7 +93,6 @@ def _absorbed_mla(attn, cfg, h, pos):
 
 
 def _build_attention_cpu(seed=0):
-    """Reduced-config KimiMLAAttention on CPU (fp32), absorbed weights built."""
     torch.manual_seed(seed)
     cfg = KimiK2Config.reduced()
     cfg.mla_absorb = True
@@ -138,12 +106,7 @@ def _build_attention_cpu(seed=0):
     return attn, cfg
 
 
-# --------------------------------------------------------------------------
-# Tests
-# --------------------------------------------------------------------------
-
 def test_absorb_reconstructs_kv_b_proj():
-    """w_kc/w_vc built from kv_b_proj reproduce naive per-head k_nope / v."""
     attn, cfg = _build_attention_cpu(seed=1)
     heads, d_nope, d_v, latent = (
         attn.num_heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank)
@@ -161,21 +124,16 @@ def test_absorb_reconstructs_kv_b_proj():
 
 
 def test_fused_qkv_a_proj():
-    """The fused latent down-projection buffer == cat(q_a_proj, kv_a_proj_with_mqa)
-    exactly (it is the one GEMM the absorbed forward runs before splitting)."""
     attn, cfg = _build_attention_cpu(seed=3)
     expected = torch.cat(
         [attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight], dim=0)
     assert tuple(attn.fused_qkv_a_proj_weight.shape) == (
         cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.hidden_size)
-    # Byte-for-byte concat; no arithmetic, so exact equality (rtol/atol 0).
     torch.testing.assert_close(
         attn.fused_qkv_a_proj_weight, expected, rtol=0, atol=0)
 
 
 def test_absorbed_math_matches_deepseek():
-    """The absorbed forward math == the canonical DeepSeek MLA output (the naive
-    invariant). This is the Phase-A algorithm gate."""
     attn, cfg = _build_attention_cpu(seed=2)
     t = 7
     h = torch.randn(t, cfg.hidden_size) * 0.1
@@ -185,8 +143,7 @@ def test_absorbed_math_matches_deepseek():
     reference = _ref_deepseek_mla(attn, cfg, h, pos)
 
     assert absorbed.shape == (t, cfg.hidden_size)
-    # Pure fp32 algebra; the only difference is float op ordering (two bmms +
-    # latent SDPA vs materialized SDPA), so the residual is tiny.
+    # Pure fp32 algebra; residual comes only from op ordering.
     torch.testing.assert_close(absorbed, reference, rtol=1e-4, atol=1e-4)
 
 
@@ -204,7 +161,6 @@ def test_kv_cache_config_absorbed_shrinks_latent():
     assert kv.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim  # 32 + 8 = 40
     assert kv.num_qo_heads == cfg.num_attention_heads              # 4 (q still sharded)
     assert kv.attention_backend == "mla_absorb"
-    # per-token cache shrink vs naive padded MHA: 2 * 4 * 64 = 512 -> 1 * 40 = 40
     naive_elems = 2 * cfg.num_attention_heads * cfg.padded_head_dim
     absorbed_elems = kv.num_kv_heads * kv.head_dim
     assert naive_elems == 512 and absorbed_elems == 40

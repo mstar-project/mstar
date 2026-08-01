@@ -1,20 +1,3 @@
-"""Phase-A GPU check: the REAL ``KimiMLAAttention.forward`` absorbed branch.
-
-The CPU gate (``test/modular/test_kimi_mla_absorb.py``) proves the absorption
-algebra with pure-torch references. This test drives the actual wired forward —
-``config.mla_absorb=True`` -> ``_forward_absorbed`` -> ``run_attention_mla`` — so
-it needs a GPU (MLA RMSNorm uses a FlashInfer kernel). A ``_MockMLALatentCache``
-stands in for the Phase-B paged latent backend: its ``run_attention_mla`` does a
-causal SDPA over ``[kv_c | k_pe]`` (value = ``kv_c``) at the DeepSeek scale, which
-is exactly what the FlashInfer MLA kernel will compute. The real kernel is locked
-to ckv=512/kpe=64 so it can't run at the reduced dims — that path is validated in
-Phase B on real dims.
-
-Matching the independent DeepSeek MLA (materialized k_nope/v, no absorption) proves
-the wired absorbed forward is numerically the naive path.
-
-Run:  pytest test/integration/test_kimi_mla_absorb_forward.py -v
-"""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -35,10 +18,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda"
 
-
-# --------------------------------------------------------------------------
-# References (device-aware; mirror test_kimi_mla_paged.py).
-# --------------------------------------------------------------------------
 
 def _ref_rmsnorm(x, weight, eps):
     x32 = x.float()
@@ -81,7 +60,6 @@ def _deepseek_scale(cfg):
 
 
 def _ref_deepseek_mla(attn, cfg, h, pos):
-    """Naive DeepSeek MLA (materialized k_nope/v; no absorption) — ground truth."""
     t, heads = h.shape[0], attn.num_heads
     d_nope, d_rope, d_v, latent = (
         cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank)
@@ -103,7 +81,6 @@ def _ref_deepseek_mla(attn, cfg, h, pos):
 
 
 class _MockMLALatentCache:
-    """Phase-B latent-backend stand-in: causal SDPA over [kv_c|k_pe], value=kv_c."""
 
     def __init__(self, sm_scale):
         self.sm_scale = sm_scale

@@ -1,22 +1,3 @@
-"""Absorbed-MLA serve smoke: the FULL model through the real mla_absorb backend.
-
-This is the end-to-end gate for the (now-default) weight-absorbed path. The
-absorbed *math* is validated by ``test_kimi_mla_absorb.py`` (CPU) and the wired
-attention forward by ``test_kimi_mla_absorb_forward.py``; the SDPA-over-latent
-backend by ``test_kimi_mla_absorb_paged.py``. This test closes the loop: a whole
-reduced ``KimiForCausalLM`` (all layers) built via the real
-``get_submodule`` (meta -> to_empty -> load_weights -> post-load walker that builds
-w_kc/w_vc + fused_qkv_a_proj) is driven for a prefill + several decode steps over a
-genuine ``MlaAbsorbCacheManager`` + engine-shaped 4D latent cache.
-
-Correctness tie: the SAME synthetic checkpoint is loaded into a NAIVE reference
-model (``mla_absorb=False``) and run through the mock cache at the DeepSeek scale;
-the absorbed serve's prefill logits must match it (weight absorption is numerically
-identical to naive up to fp rounding). This pins the absorbed serve path to the
-M4-golden naive reference at full-model scale.
-
-Run:  pytest test/integration/test_kimi_mla_absorb_serve.py -v
-"""
 import pytest
 import torch
 
@@ -42,11 +23,6 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = torch.device("cuda")
 
-
-# --------------------------------------------------------------------------
-# Synthetic checkpoint (same serialization as test_kimi_submodule.py).
-# --------------------------------------------------------------------------
-
 def _fill_layer(layer, cfg):
     a = layer.self_attn
     for lin in (a.q_a_proj, a.q_b_proj, a.kv_a_proj_with_mqa, a.kv_b_proj, a.o_proj):
@@ -70,7 +46,6 @@ def _fill_layer(layer, cfg):
 
 
 def _build_reference(cfg):
-    """A naive-path (mla_absorb=False) model with random weights = the ground truth."""
     model = KimiForCausalLM(cfg).to(device=DEVICE, dtype=torch.bfloat16)
     model.model.embed_tokens.weight.data.normal_(0, 0.05)
     model.model.norm.weight.data.normal_(1.0, 0.02)
@@ -119,11 +94,6 @@ def _hf_checkpoint(model, cfg):
     sd["lm_head.weight"] = model.lm_head.weight
     return {k: v.detach().cpu().clone().contiguous() for k, v in sd.items()}
 
-
-# --------------------------------------------------------------------------
-# Naive mock cache (DeepSeek-correct scale) for the reference logits.
-# --------------------------------------------------------------------------
-
 def _sdpa_causal(q, k, v, scale):
     qt, kt, vt = (t.transpose(0, 1).float() for t in (q, k, v))
     t = q.shape[0]
@@ -144,11 +114,6 @@ class _MockMLACache:
 
     def run_attention(self, q, k, v):
         return _sdpa_causal(q, k, v, self.scale)
-
-
-# --------------------------------------------------------------------------
-# Real mla_absorb backend (4D latent cache), engine-shaped.
-# --------------------------------------------------------------------------
 
 def _absorbed_softmax_scale(cfg):
     r = cfg.rope_scaling
@@ -204,21 +169,15 @@ def _step(submodule, cm, graph_walk, token_ids):
     return out["logits"][0]
 
 
-# --------------------------------------------------------------------------
-# Test
-# --------------------------------------------------------------------------
-
 def test_absorbed_serve_matches_naive_reference(tmp_path):
     from safetensors.torch import save_file
 
     torch.manual_seed(0)
-    # One synthetic checkpoint, built from a naive reference model.
     cfg_naive = KimiK2Config.reduced()            # mla_absorb=False (reduced default)
     assert cfg_naive.mla_absorb is False
     ref = _build_reference(cfg_naive)
     save_file(_hf_checkpoint(ref, cfg_naive), str(tmp_path / "model.safetensors"))
 
-    # Reference logits: the naive model through the mock cache at the DeepSeek scale.
     T = 6
     prompt = torch.randint(0, cfg_naive.vocab_size, (T,), device=DEVICE)
     pos = torch.arange(T, device=DEVICE)
@@ -226,14 +185,11 @@ def test_absorbed_serve_matches_naive_reference(tmp_path):
         ref_hidden = ref.model(prompt, _MockMLACache(cfg_naive.padded_head_dim), pos)
         ref_logits = ref.lm_head(ref_hidden[-1:])  # (1, vocab)
 
-    # Absorbed serve: load the SAME checkpoint into an mla_absorb model via the real
-    # build path; the post-load walker builds w_kc/w_vc + fused_qkv_a_proj.
     cfg_absorb = KimiK2Config.reduced()
     cfg_absorb.mla_absorb = True
     model = _make_model(cfg_absorb, tmp_path)
     submodule = model.get_submodule("LLM", device="cuda", autocast_dtype=torch.bfloat16)
     assert isinstance(submodule, KimiLLMSubmodule)
-    # Absorbed models DO carry derived buffers (w_kc/w_vc/fused, persistent=False).
     buf_names = {n for n, _ in submodule.language_model.named_buffers()}
     assert any("w_kc" in n for n in buf_names) and any("fused_qkv_a_proj" in n for n in buf_names)
 
@@ -242,10 +198,8 @@ def test_absorbed_serve_matches_naive_reference(tmp_path):
         prefill_logits = _step(submodule, cm, "prefill", prompt)
         assert prefill_logits.shape == (1, cfg_absorb.vocab_size)
         assert torch.isfinite(prefill_logits).all()
-        # Absorbed == naive up to bf16 rounding through a 2-layer stack + real backend.
         torch.testing.assert_close(prefill_logits, ref_logits, rtol=5e-2, atol=5e-2)
 
-        # A few decode steps over the accumulating paged LATENT cache.
         next_token = prefill_logits.argmax(-1)
         generated = [int(next_token.item())]
         for _ in range(4):

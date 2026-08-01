@@ -1,24 +1,4 @@
-"""Kimi-K2.7 / DeepSeek-V3 fine-grained MoE.
-
-mstar's ``model.components.moe`` router is softmax-only and its shared-expert
-block gates the shared expert (Qwen-style). Kimi/DeepSeek-V3 needs a different
-router and an *ungated* shared expert, so these live here (append, don't modify
-the shared abstraction). The expert dispatch itself is reused verbatim — the
-fused-expert GEMM (``fused_experts`` via ``model.components.moe._dispatch``) and
-the ``(E, 2*moe_inter, hidden)`` / ``(E, hidden, moe_inter)`` fused param layout.
-
-Two pieces:
-
-* :class:`KimiMoEGate` — the router. sigmoid scoring + group-limited top-k
-  (``n_group`` / ``topk_group``) + ``noaux_tc`` per-expert
-  ``e_score_correction_bias`` (affects *selection* only; the combine weights come
-  from the raw sigmoid scores) + optional ``norm_topk_prob`` + a
-  ``routed_scaling_factor`` folded into the returned weights. Computed in fp32.
-  Exactly mirrors vLLM ``fused_moe/cpu_fused_moe.py::grouped_topk``.
-* :class:`KimiSparseMoeBlock` — router + fused routed experts + ungated shared
-  expert. ``out = routed(scaled weights) + shared`` (the shared expert does *not*
-  get ``routed_scaling_factor``). Mirrors vLLM ``deepseek_v2.py::DeepseekV2MoE``.
-"""
+"""Kimi-K2.7 fine-grained MoE: sigmoid router plus ungated shared expert."""
 from __future__ import annotations
 
 import logging
@@ -39,20 +19,7 @@ from mstar.model.kimi_k2_7.config import KimiK2Config
 
 logger = logging.getLogger(__name__)
 
-# Log the resolved routed-expert backend once per process (the block is
-# instantiated per MoE layer, so a per-block log would repeat ~60x).
 _BACKEND_LOGGED = False
-
-# ---------------------------------------------------------------------------
-# Packed-expert weight loaders (int32 weights + bf16 group scales).
-#
-# The packed analogs of ``model.components.moe._gate_up_weight_loader`` /
-# ``_down_proj_weight_loader`` (which serve the bf16 fused params shared with
-# Qwen3-Omni). The TP shard geometry is identical to the bf16 loaders; only the
-# last (input/K) axis differs: it is pre-divided by ``pack_factor`` (packed int32)
-# or ``group_size`` (bf16 scale). One function serves both the packed and the
-# scale tensor for a projection — the divisor is the only difference.
-# ---------------------------------------------------------------------------
 
 
 def _gate_up_packed_loader(
@@ -60,17 +27,6 @@ def _gate_up_packed_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: str | int | None = None,
 ):
-    """Load one expert's gate_proj/up_proj packed-or-scale tensor into the fused
-    ``gate_up_proj_packed`` / ``gate_up_proj_scale`` param.
-
-    ``loaded_shard_id`` is ``"gate:N"`` / ``"up:N"``. ``loaded_weight`` is a single
-    expert's 2-D tensor ``(full_inter, hidden // divisor)`` (divisor = pack_factor
-    for the int32 packed tensor, group_size for the bf16 scale). The N/out axis
-    (dim 0) is the TP-sharded one: this rank takes rows
-    ``[tp_rank*shard_inter : +shard_inter]`` and writes them into the gate half
-    ``[:shard_inter]`` or up half ``[shard_inter:]`` of ``param[expert]``. The last
-    axis (the un-sharded input dim) is copied whole.
-    """
     assert loaded_shard_id is not None
     kind, expert_str = loaded_shard_id.split(":")
     expert_idx = int(expert_str)
@@ -88,17 +44,6 @@ def _down_packed_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: str | int | None = None,
 ):
-    """Load one expert's down_proj packed-or-scale tensor into ``down_proj_packed``
-    / ``down_proj_scale``.
-
-    ``loaded_shard_id`` is ``"down:N"``. ``loaded_weight`` is ``(hidden, moe_inter
-    // divisor)``; the intermediate dim is the LAST (input) axis and is the
-    TP-sharded one, already divided by ``divisor`` (pack_factor for packed,
-    group_size for scale). This rank takes the column stripe
-    ``[tp_rank*(shard_inter//divisor) : +(shard_inter//divisor)]``. Requires
-    ``shard_inter % divisor == 0`` (asserted at block build) so the stripe lands on
-    an int32 / group boundary.
-    """
     assert loaded_shard_id is not None
     expert_idx = int(str(loaded_shard_id).split(":")[1])
     shard_inter = divide(full_inter, tp_size)
@@ -108,21 +53,7 @@ def _down_packed_loader(
 
 
 class KimiMoEGate(nn.Module):
-    """DeepSeek-V3 group-limited sigmoid router with ``noaux_tc`` bias.
-
-    Args:
-        hidden_size: input hidden dim.
-        n_routed_experts: number of routed experts (``E``).
-        num_experts_per_tok: top-k experts per token.
-        n_group: number of expert groups (``E`` split into ``n_group`` contiguous
-            groups for group-limited routing).
-        topk_group: number of groups kept per token.
-        routed_scaling_factor: scale folded into the returned combine weights.
-        scoring_func: ``"sigmoid"`` (Kimi/DeepSeek-V3) or ``"softmax"``.
-        topk_method: ``"noaux_tc"`` enables the per-expert
-            ``e_score_correction_bias`` (selection-only). Anything else disables it.
-        norm_topk_prob: renormalize the top-k combine weights to sum to 1.
-    """
+    """DeepSeek-V3 group-limited sigmoid router with selection-only bias."""
 
     def __init__(
         self,
@@ -147,7 +78,6 @@ class KimiMoEGate(nn.Module):
         self.topk_method = topk_method
         self.norm_topk_prob = norm_topk_prob
 
-        # Router projection ``[E, hidden]`` (no bias), like DeepSeek ``MoEGate``.
         self.weight = nn.Parameter(torch.zeros(n_routed_experts, hidden_size))
         if topk_method == "noaux_tc":
             # Per-expert selection bias; fp32, added to scores for group/top-k
@@ -161,14 +91,6 @@ class KimiMoEGate(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route tokens to experts.
-
-        Returns:
-            topk_weights: ``(tokens, top_k)`` fp32 combine weights (renormalized
-                and scaled by ``routed_scaling_factor``).
-            topk_ids: ``(tokens, top_k)`` int64 expert indices.
-        """
-        # Route in fp32 (DeepSeek runs the router in fp32 for stability).
         h = hidden_states.reshape(-1, self.hidden_size).float()
         gating = F.linear(h, self.weight.float())  # (T, E)
 
@@ -223,33 +145,7 @@ class KimiMoEGate(nn.Module):
 
 
 class KimiSparseMoeBlock(nn.Module):
-    """DeepSeek-V3 MoE block: routed experts + ungated shared expert.
-
-    ``out = routed(x) + shared(x)`` where ``routed`` dispatches the top-k experts
-    through the fused-expert GEMM with the router's (scaled) combine weights, and
-    ``shared`` is a plain dense SwiGLU MLP added ungated (no sigmoid gate, no
-    ``routed_scaling_factor``).
-
-    **TP sharding (intermediate-parallel).** Under tensor parallelism the router
-    (:class:`KimiMoEGate`) stays REPLICATED — every rank computes the full
-    ``(top_k_ids, weights)`` — and only the expert GEMMs shard, exactly like
-    mstar's own ``ParallelSparseMoeBlock``: each rank holds every expert but only
-    a ``moe_intermediate_size // tp_size`` slice of its SwiGLU intermediate
-    (``gate_up_proj`` column-parallel, ``down_proj`` row-parallel). The per-rank
-    partial hidden contributions are summed with a single all-reduce before the
-    top-k sum-reduce. The shared expert is a ``ParallelGatedMLP`` on the same comm
-    group, so it shards its intermediate and all-reduces internally. This reuses
-    the existing fused-expert machinery verbatim and is trivially goldenable
-    (tp>1 == tp=1). Its tradeoff: every rank still stores ALL experts' weights, so
-    it does NOT reduce per-rank expert memory — the 1T fit needs true token-dispatch
-    expert parallelism (all-to-all), which is deliberately not built here.
-
-    Expert weights use the fused layout reused from ``model.components.moe``,
-    sharded to this rank (``full == moe_intermediate_size``,
-    ``shard == full // tp_size``):
-      - ``experts.gate_up_proj``: ``(E, 2 * shard, hidden)``
-      - ``experts.down_proj``:   ``(E, hidden, shard)``
-    """
+    """DeepSeek-V3 MoE block: routed experts + ungated shared expert."""
 
     def __init__(
         self, config: KimiK2Config, comm_group: CommGroup | None = None
@@ -263,19 +159,11 @@ class KimiSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.n_routed_experts
         self.moe_intermediate_size = config.moe_intermediate_size
-        # Per-rank slice of each expert's SwiGLU intermediate (== full at tp=1).
         shard_inter = divide(config.moe_intermediate_size, self.tp_size)
 
-        # Packed experts (in-kernel W4A16 dequant) are used iff the checkpoint is
-        # quantized AND the config opts in. When off, the experts use the bf16 fused
-        # params (dequantized on load, or a native-bf16 checkpoint loaded directly).
         self.packed_experts = (
             config.quantization_config is not None and config.moe_in_kernel_dequant
         )
-        # Routed-expert W4A16 kernel backend for the packed experts. Marlin layers
-        # on top of the same packed params; the marlin-vs-triton choice is resolved
-        # post-load in :meth:`process_weights_after_loading` (a real device is needed
-        # to probe GPU capability + JIT-build the kernel — ``__init__`` runs on meta).
         self.quant_kernel = getattr(config, "quant_kernel", "auto")
         self._marlin_method = None
         self._use_marlin = False
@@ -294,20 +182,11 @@ class KimiSparseMoeBlock(nn.Module):
 
         self.experts = nn.Module()
         if self.packed_experts:
-            # PACKED expert params (int32 weights + bf16 group scales) INSTEAD of the
-            # bf16 fused params. Layout mirrors the fused bf16 shapes with the K
-            # (input) axis compressed: gate_up packs K=hidden, down packs K=inter.
-            #   gate_up_proj_packed: int32 (E, 2*shard_inter, hidden // pack_factor)
-            #   gate_up_proj_scale:  bf16  (E, 2*shard_inter, hidden // group_size)
-            #   down_proj_packed:    int32 (E, hidden, shard_inter // pack_factor)
-            #   down_proj_scale:     bf16  (E, hidden, shard_inter // group_size)
             qc = config.quantization_config
             self.group_size = qc.group_size
             self.pack_factor = qc.pack_factor  # 8 for INT4
             self.symmetric = qc.symmetric
             hidden, gs, pf = config.hidden_size, self.group_size, self.pack_factor
-            # The packed/group axes must divide evenly on BOTH the hidden (gate_up K)
-            # and the per-rank intermediate stripe (down K, TP-sharded).
             assert hidden % pf == 0 and hidden % gs == 0, (
                 f"hidden {hidden} must divide pack_factor {pf} and group_size {gs}"
             )
@@ -346,18 +225,8 @@ class KimiSparseMoeBlock(nn.Module):
                     shard_inter,
                 )
             )
-        # The fused expert params are plain nn.Parameters, so they carry no
-        # per-shard ``weight_loader`` by default. The stacked-param rules route each
-        # checkpoint expert via a ``"gate:N"/"up:N"/"down:N"`` shard id, so we attach
-        # the same fused-expert loaders ``ParallelSparseMoeBlock`` uses (or, when
-        # packed, the packed analogs). The loaders take
-        # ``(tp_rank, tp_size, full_inter)`` and slice this rank's intermediate
-        # stripe out of the full-size checkpoint expert — so a single weight path
-        # serves tp=1 (full) and tp>1 (sharded).
         self._attach_expert_weight_loaders()
 
-        # Ungated shared expert: a dense SwiGLU MLP with the shared intermediate
-        # size (``moe_intermediate_size * n_shared_experts``).
         self.shared_expert = ParallelGatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
@@ -367,15 +236,7 @@ class KimiSparseMoeBlock(nn.Module):
         )
 
     def _attach_expert_weight_loaders(self) -> None:
-        """Give the fused expert params their per-shard ``weight_loader``.
-
-        Mirrors ``ParallelSparseMoeBlock._attach_weight_loaders``. Re-run after
-        every ``_apply`` (``.to(dtype)`` / ``to_empty(device)`` rebuild the
-        Parameter objects and drop the attribute), so weights load correctly
-        through the meta -> to_empty -> load path. When packed, the four packed /
-        scale params get the Kimi-local packed loaders; otherwise the two bf16
-        fused params get the shared loaders.
-        """
+        """Reattach per-shard loaders after ``_apply`` rebuilds parameters."""
         from functools import partial
 
         full_inter = self.moe_intermediate_size
@@ -410,7 +271,6 @@ class KimiSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden_size).contiguous()
 
-        # Router is replicated: every rank computes the full top-k selection.
         topk_weights, topk_ids = self.gate(flat)
         if self._use_marlin:
             # Marlin's GEMM takes fp32 combine weights — pass them BEFORE the bf16
@@ -419,8 +279,6 @@ class KimiSparseMoeBlock(nn.Module):
         else:
             topk_weights = topk_weights.to(flat.dtype)
             if self.packed_experts:
-                # Packed experts: bypass the shared bf16 ``_dispatch`` and run the
-                # W4A16 in-kernel dequant GEMM directly (handles tp=1 and tp>1).
                 routed = self._dispatch_packed_experts(flat, topk_weights, topk_ids)
             elif self.tp_size == 1:
                 routed = _dispatch(
@@ -433,8 +291,6 @@ class KimiSparseMoeBlock(nn.Module):
                 )
             else:
                 routed = self._dispatch_tp(flat, topk_weights, topk_ids)
-        # Shared expert is a ParallelGatedMLP on the same comm group: at tp>1 it
-        # holds its own intermediate stripe and all-reduces inside its down_proj.
         shared = self.shared_expert(flat)
         return (routed + shared).view(input_shape)
 
@@ -444,17 +300,6 @@ class KimiSparseMoeBlock(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Packed (W4A16) routed dispatch — the memory-lean packed-expert path.
-
-        Feeds the packed int32 weights + bf16 group scales to ``fused_experts``,
-        which launches ``fused_moe_kernel_w4a16`` (dequant in registers). The TP
-        story is identical to :meth:`_dispatch_tp`: at tp=1 the kernel sum-reduces
-        the top-k dim itself; at tp>1 we keep the per-slot partials
-        (``reduce_results=False``), all-reduce the intermediate-parallel partials,
-        then fold the top-k dim. Combine weights already carry
-        ``routed_scaling_factor`` (folded by :class:`KimiMoEGate`), so the
-        sum-reduce passes ``routed_scaling_factor=1.0``.
-        """
         from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
 
         reduce = self.tp_size == 1
@@ -478,16 +323,7 @@ class KimiSparseMoeBlock(nn.Module):
         return output
 
     def process_weights_after_loading(self, device) -> None:
-        """Resolve the routed-expert kernel backend and, for Marlin, repack the
-        loaded packed experts into Marlin layout (freeing the source packed params).
-
-        Invoked by the generic post-load walker
-        (:func:`mstar.model.components.quantization.process_weights_after_loading`)
-        on a real device — a no-op unless the experts are packed and Marlin is both
-        selected (``quant_kernel != "triton"``) and eligible (sm80+, symmetric INT4,
-        Marlin-legal shapes). ``quant_kernel="marlin"`` raises if ineligible so an
-        explicit request never silently downgrades to Triton.
-        """
+        """Resolve Triton-vs-Marlin after weights land on the real device."""
         if not self.packed_experts:
             return
         from mstar.model.components.quantization import MarlinMoEMethod
@@ -541,7 +377,6 @@ class KimiSparseMoeBlock(nn.Module):
             self.experts.down_proj_scale.data,
             dev,
         )
-        # Free the source packed params — Marlin holds the repacked copies now.
         for name in (
             "gate_up_proj_packed", "gate_up_proj_scale",
             "down_proj_packed", "down_proj_scale",
@@ -557,12 +392,6 @@ class KimiSparseMoeBlock(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Marlin W4A16 routed dispatch. TP story is identical to
-        :meth:`_dispatch_packed_experts`: tp=1 sum-reduces inside the kernel; tp>1
-        keeps per-slot partials (``reduce_results=False``), all-reduces the
-        intermediate-parallel partials, then folds the top-k dim. ``topk_weights``
-        is fp32 (Marlin requirement) and already carries ``routed_scaling_factor``.
-        """
         from mstar.utils.fused_moe import moe_sum_reduce_triton
 
         reduce = self.tp_size == 1
@@ -582,19 +411,8 @@ class KimiSparseMoeBlock(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Intermediate-sharded routed dispatch (mirrors
-        ``ParallelSparseMoeBlock._dispatch_tp``).
-
-        Each rank's ``fused_experts`` produces its partial hidden contribution per
-        (token, top-k slot); an all-reduce sums the intermediate-dim partials
-        across ranks, then ``moe_sum_reduce_triton`` folds the top-k dim. The
-        combine weights already carry ``routed_scaling_factor`` (folded in by
-        :class:`KimiMoEGate`), so the sum-reduce passes ``routed_scaling_factor=1.0``.
-        """
         from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
 
-        # (tokens, top_k, hidden) partials — reduce_results=False keeps the
-        # per-slot rows so we can all-reduce the intermediate-parallel partials.
         cache3 = fused_experts(
             flat,
             self.experts.gate_up_proj,
