@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -46,7 +47,11 @@ def _clone_tensor_input(value):
         return value.clone()
     if isinstance(value, (list, tuple)):
         return type(value)(_clone_tensor_input(v) for v in value)
-    return value
+    if isinstance(value, dict):
+        return {k: _clone_tensor_input(v) for k, v in value.items()}
+    # Scalars / immutables pass through; anything else mutable would alias the
+    # original, so copy it defensively rather than sharing state across a clone.
+    return copy.copy(value)
 
 
 class StackingMethod(Enum):
