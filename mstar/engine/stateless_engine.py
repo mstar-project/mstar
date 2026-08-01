@@ -543,17 +543,24 @@ class StatelessEngine(BaseEngine):
                 self.config.name, node_name,
             )
             return
+        # ``dynamic`` defaults to None (Inductor decides). A submodule whose
+        # forward only ever sees a fixed set of shapes -- e.g. one driven by
+        # piecewise capture buckets -- can set ``torch_compile_dynamic = False``
+        # to force static specialization. Leaving the default is important for
+        # variable-shape submodules, which would otherwise recompile per shape.
+        dynamic = getattr(submodule, "torch_compile_dynamic", None)
         try:
             if hasattr(submodule, "forward"):
                 submodule.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
-                    dynamic=False,
+                    dynamic=dynamic,
                 )
                 logger.info(
-                    "StatelessEngine[%s]: torch.compile applied to %s.forward",
+                    "StatelessEngine[%s]: torch.compile applied to %s.forward (dynamic=%s)",
                     self.config.name,
                     node_name,
+                    dynamic,
                 )
             # forward_batched is intentionally left eager — Inductor would pay
             # a ~30s one-shot trace cost for dynamic varlen shapes on the

@@ -126,6 +126,11 @@ class NativeAudioEncoderSubmodule(NodeSubmodule):
     it is still correct, just not batched with its peers.
     """
 
+    # The layer loop runs on piecewise capture buckets, so forward only ever
+    # sees a fixed set of shapes; static specialization is safe and avoids
+    # Inductor's dynamic-shape guards.
+    torch_compile_dynamic = False
+
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
         self.audio_encoder = audio_encoder
@@ -301,6 +306,10 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
     (``vision_embeds`` + positionally-spliced ``deepstack``) so nothing upstream
     of ``vision_encoder.forward`` changes.
     """
+
+    # Same rationale as NativeAudioEncoderSubmodule: the block loop runs on
+    # piecewise capture buckets, so forward sees a fixed set of shapes.
+    torch_compile_dynamic = False
 
     def __init__(self, vision_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
