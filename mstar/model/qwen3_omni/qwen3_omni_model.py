@@ -93,16 +93,6 @@ def _envflag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def vllm_prompt_layout_enabled() -> bool:
-    """Replicate vLLM-Omni's prompt layout: position the audio block INSIDE the
-    user turn BEFORE the instruction text, so the effective Thinker sequence is
-    system-turn, then user-turn = [audio][instruction], then assistant. ON by
-    default (the benchmarked config; also gives audio M-RoPE h/w parity vs vLLM).
-    Set MSTAR_VLLM_PROMPT_LAYOUT=0 for the legacy bare-block layout.
-    """
-    return _envflag("MSTAR_VLLM_PROMPT_LAYOUT", default=True)
-
-
 def vllm_audio_sentinels_enabled() -> bool:
     """When ON, wrap the audio span with the real Qwen3-Omni audio marker token
     IDs (151669 ``<|audio_start|>`` / 151670 ``<|audio_end|>``, what vLLM uses)
@@ -913,8 +903,7 @@ class Qwen3OmniModel(Model):
         # and SILENTLY LOSE its vision walk.  Any image/video falls through to
         # the #196 layout below.
         if (
-            vllm_prompt_layout_enabled()
-            and len(texts) >= 2
+            len(texts) >= 2
             and len(audio_features) >= 1
             and not pixel_values
             and not pixel_values_videos
@@ -1390,11 +1379,11 @@ class Qwen3OmniModel(Model):
         #
         # We reproduce that layout with sequential walks.  Two mechanisms,
         # selected by ``use_vllm_audio_layout`` below:
-        #   * AUDIO-ONLY + MSTAR_VLLM_PROMPT_LAYOUT -> token-slice path (ours):
-        #     tokenize the whole templated prompt once, then slice the ids at
-        #     the user-turn boundary.  Slicing already-tokenized ids preserves
-        #     BPE merges across the split, which re-tokenizing each half cannot.
-        #   * everything else (any vision, mixed audio+image, or layout off) ->
+        #   * AUDIO-ONLY -> token-slice path (ours): tokenize the whole templated
+        #     prompt once, then slice the ids at the user-turn boundary.  Slicing
+        #     already-tokenized ids preserves BPE merges across the split, which
+        #     re-tokenizing each half cannot.
+        #   * everything else (any vision, or mixed audio+image) ->
         #     the #196 sentinel path: the templated prompt is split at
         #     ``_MM_SPLIT_SENTINEL`` into text-before / text-after and each half
         #     is tokenized separately.  Placeholders stay out of both halves:
@@ -1431,8 +1420,7 @@ class Qwen3OmniModel(Model):
         # the #196 sentinel path below so its vision walk survives (a mixed
         # audio+image request would otherwise slice and silently lose vision).
         use_vllm_audio_layout = (
-            vllm_prompt_layout_enabled()
-            and len(raw_audio_inputs) > 0
+            len(raw_audio_inputs) > 0
             and not raw_image_inputs
             and not raw_video_inputs
             and prompt is not None
@@ -1489,9 +1477,9 @@ class Qwen3OmniModel(Model):
                 result["text_inputs"] = [prefix_ids, suffix_ids]
             else:
                 logger.warning(
-                    "MSTAR_VLLM_PROMPT_LAYOUT=1 but could not locate the user "
-                    "turn in the tokenized prompt; falling back to legacy "
-                    "layout for this request."
+                    "Could not locate the user turn in the tokenized prompt; "
+                    "falling back to a single bare-block text span for this "
+                    "request."
                 )
                 result["text_inputs"] = [input_ids]
         else:

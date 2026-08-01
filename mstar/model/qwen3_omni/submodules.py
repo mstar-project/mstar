@@ -617,16 +617,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 device,
                 self.config.thinker.position_id_per_seconds,
             )
-            # M-RoPE parity: M* pins audio h/w to a constant, HF ramps them with
-            # temporal. Under MSTAR_VLLM_PROMPT_LAYOUT, set h/w == temporal so the
-            # 3D position_ids are byte-identical to HF get_rope_index.
-            from mstar.model.qwen3_omni.qwen3_omni_model import (
-                vllm_prompt_layout_enabled,
-            )
-            if vllm_prompt_layout_enabled():
-                audio_pos_ids = audio_pos_ids.clone()
-                audio_pos_ids[1] = audio_pos_ids[0]
-                audio_pos_ids[2] = audio_pos_ids[0]
+            # M-RoPE parity: the legacy M* layout pinned audio h/w to a constant
+            # while HF ramps them with temporal, so h/w is set to temporal here
+            # to make the 3D position_ids byte-identical to HF get_rope_index.
+            audio_pos_ids = audio_pos_ids.clone()
+            audio_pos_ids[1] = audio_pos_ids[0]
+            audio_pos_ids[2] = audio_pos_ids[0]
             end_pos_ids = get_rope_index_text(
                 1, start_pos + 1 + audio_len, device
             )
