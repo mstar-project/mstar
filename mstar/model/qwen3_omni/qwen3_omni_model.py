@@ -85,29 +85,6 @@ def _envflag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def vllm_audio_sentinels_enabled() -> bool:
-    """When ON, wrap the audio span with the real Qwen3-Omni audio marker token
-    IDs (151669 ``<|audio_start|>`` / 151670 ``<|audio_end|>``, what vLLM uses)
-    instead of the legacy 151647/151648 (mislabeled ``<|audio_bos|>``/
-    ``<|audio_eos|>``). Default OFF. Independent of MSTAR_VLLM_PROMPT_LAYOUT so
-    both can be tested separately."""
-    return _envflag("MSTAR_VLLM_AUDIO_SENTINELS")
-
-
-def batch_vision_prefill_enabled() -> bool:
-    """When ON, allow the Thinker ``prefill_vision`` walk to batch more than
-    one request per step (like ``prefill_audio`` / ``prefill_text`` already
-    do): the vision tower runs once over the concatenated multi-image batch
-    and all requests are prefilled together, cutting Image-to-Text TTFT.
-
-    Default OFF -> ``preprocess`` keeps the single-request assert and the
-    eager single-request side-channels, so behavior is byte-identical to the
-    pre-batching path. See ``ThinkerSubmodule.preprocess`` /
-    ``get_cuda_graph_configs`` in ``submodules.py``.
-    """
-    return _envflag("MSTAR_BATCH_VISION_PREFILL")
-
-
 def _hf_encoder_attn_impl() -> str:
     """Pick the attention implementation for the HF-wrapper encoder fallback.
 

@@ -474,22 +474,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         # Wrap the audio span in ``<|audio_bos|>`` / ``<|audio_eos|>``
         # sentinel token embeddings so the Thinker sees the same
         # prompt layout the HF processor produces.
-        #
-        # When MSTAR_VLLM_AUDIO_SENTINELS=1, use the real Qwen3-Omni audio
-        # marker IDs (151669/151670, what vLLM uses) instead of the legacy
-        # 151647/151648 (mislabeled <|audio_bos|>/<|audio_eos|> in config.py).
-        from mstar.model.qwen3_omni.qwen3_omni_model import (
-            vllm_audio_sentinels_enabled,
-        )
-
         device = self.get_device()
         if self._audio_bos_embed is None or self._audio_eos_embed is None:
-            if vllm_audio_sentinels_enabled():
-                audio_start_id = 151669
-                audio_end_id = 151670
-            else:
-                audio_start_id = self.config.thinker.audio_start_token_id
-                audio_end_id = self.config.thinker.audio_end_token_id
+            audio_start_id = self.config.thinker.audio_start_token_id
+            audio_end_id = self.config.thinker.audio_end_token_id
             start_tok = torch.tensor(
                 [audio_start_id], dtype=torch.long, device=device
             )
@@ -759,12 +747,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         extra_inputs = {}
         if graph_walk == "prefill_vision":
-            from mstar.model.qwen3_omni.qwen3_omni_model import (
-                batch_vision_prefill_enabled,
-            )
-            if not batch_vision_prefill_enabled():
-                assert len(inputs) == 1, \
-                    "Batching not implemented for Thinker vision prefill"
+            assert len(inputs) == 1, \
+                "Batching not implemented for Thinker vision prefill"
             num_deepstack = len(self.config.vision.deepstack_visual_indexes)
             for i in range(num_deepstack):
                 layer_tensors: list[torch.Tensor] = []
@@ -923,7 +907,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         128, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384,
     ]
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
-    PREFILL_VISION_BATCH_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     @property
     def PREFILL_VISION_TOKEN_BUCKETS(self) -> list[int]:
@@ -1046,14 +1029,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             num_tokens: self._build_prefill_vision_packed(num_tokens, device)
             for num_tokens in self.PREFILL_VISION_TOKEN_BUCKETS
         }
-        from mstar.model.qwen3_omni.qwen3_omni_model import (
-            batch_vision_prefill_enabled,
-        )
-        prefill_vision_capture_bs = (
-            self.PREFILL_VISION_BATCH_CAPTURE_BATCH_SIZES
-            if batch_vision_prefill_enabled()
-            else self.PREFILL_VISION_CAPTURE_BATCH_SIZES
-        )
+        prefill_vision_capture_bs = self.PREFILL_VISION_CAPTURE_BATCH_SIZES
         num_deepstack = len(self.config.vision.deepstack_visual_indexes)
 
         prefill_vision_zero_padding_tensor_inputs = {
