@@ -9,7 +9,6 @@ SDPA fallback). Frontend helpers replicate HF bit-for-bit (parity-tested).
 from __future__ import annotations
 
 import logging
-import os
 from collections import namedtuple
 
 import numpy as np
@@ -169,26 +168,18 @@ def plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale, q_dtype):
                           causal=False, sm_scale=float(scale), q_data_type=q_dtype)
 
 
-def _encoder_int_list(name, default):
-    """Parse a sorted, de-duplicated int bucket list from an env var."""
-    spec = os.environ.get(name, default)
-    return sorted({int(x) for x in spec.split(",") if x.strip()})
-
-
-def _encoder_probe() -> bool:
-    """Log every distinct layout and force eager, to harvest the real
-    (num_segments, total_tokens) distribution before sizing buckets. Guessed
-    buckets fall back to eager silently, which reads as a regression."""
-    return os.environ.get("MSTAR_ENCODER_CG_PROBE", "0").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
 # Capture-path accounting: one dict increment, always on, because "ran and did
 # not regress" and "never ran" look identical in results.json.
 _ENCODER_PATH_COUNTS: dict[str, int] = {}
 _SEEN_LAYOUTS: set[tuple] = set()
 _SEEN_LAYOUTS_CAP = 512          # bounded: a long run must not leak keys
 _WARNED_NO_BUCKET: set[str] = set()
+
+# Measured buckets: s2t (1..7 segments, 36..426 tokens) and s2s (1..16, ~1057).
+CAPTURE_TOKENS_AUDIO = (48, 64, 96, 128, 192, 256, 384, 512, 704, 896, 1088)
+# One bs value: crossed with total_tokens, so extras multiply graphs and 128 MiB
+# workspaces, while padding bs up is free.
+CAPTURE_BATCH_SIZES_AUDIO = (32,)
 
 
 def note_encoder_path(path: str) -> None:
@@ -203,13 +194,13 @@ def encoder_path_counts() -> dict[str, int]:
 def note_encoder_layout(kind: str, n_seg: int, total_tokens: int, fitted: bool) -> None:
     """Log once per distinct layout; WARN the first time one fits no bucket —
     the only visible signal that buckets are mis-sized, since the fallback is
-    otherwise silent. Probe mode has no buckets, so it skips the warning."""
-    if not fitted and not _encoder_probe() and kind not in _WARNED_NO_BUCKET:
+    otherwise silent."""
+    if not fitted and kind not in _WARNED_NO_BUCKET:
         _WARNED_NO_BUCKET.add(kind)
         logger.warning(
             "%s encoder: NO capture bucket fits segments=%d total_tokens=%d — "
-            "falling back to eager. Widen MSTAR_ENCODER_CG_BS_%s / "
-            "MSTAR_ENCODER_CG_TOKENS_%s; piecewise numbers from this run are "
+            "falling back to eager. Widen CAPTURE_BATCH_SIZES_%s / "
+            "CAPTURE_TOKENS_%s; piecewise numbers from this run are "
             "NOT measuring the captured path.",
             kind, n_seg, total_tokens, kind.upper(), kind.upper(),
         )
@@ -218,11 +209,8 @@ def note_encoder_layout(kind: str, n_seg: int, total_tokens: int, fitted: bool) 
         return
     if len(_SEEN_LAYOUTS) < _SEEN_LAYOUTS_CAP:
         _SEEN_LAYOUTS.add(key)
-    # Probe logs at WARNING: harvesting is the point, and the harness may boot
-    # at --log-level WARNING.
-    emit = logger.warning if _encoder_probe() else logger.info
-    emit("%s encoder layout: segments=%d total_tokens=%d bucket=%s",
-         kind, n_seg, total_tokens, "HIT" if fitted else "MISS")
+    logger.info("%s encoder layout: segments=%d total_tokens=%d bucket=%s",
+                kind, n_seg, total_tokens, "HIT" if fitted else "MISS")
 
 
 # During CUDA-graph capture, routes _flashinfer_varlen through a dedicated state
@@ -266,9 +254,8 @@ def _flashinfer_varlen(q, k, v, cu_seqlens, scale):
     return out[..., :D].contiguous()
 
 
-# Default=flashinfer: the only capture-legal varlen backend (SDPA mask builds are not graph-safe).
-# MSTAR_VARLEN_BACKEND in {adaptive, per_segment, dense, padded, flashinfer}.
-_VARLEN_BACKEND = os.environ.get("MSTAR_VARLEN_BACKEND", "flashinfer")
+# The only capture-legal backend; SDPA variants remain as fallback + test reference.
+_VARLEN_BACKEND = "flashinfer"
 _VARLEN_FALLBACKS = {"adaptive": _sdpa_varlen_adaptive,
                      "per_segment": _sdpa_varlen_per_segment, "dense": _sdpa_varlen_dense,
                      "padded": _sdpa_varlen_padded, "flashinfer": _flashinfer_varlen}
@@ -459,10 +446,9 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         which is what lets one captured bucket serve many audio layouts.
 
         Returns None (eager path) when FlashInfer isn't the active varlen backend.
-        Bucket lists are env-overridable
-        (``MSTAR_ENCODER_CG_BS_AUDIO`` segment counts,
-        ``MSTAR_ENCODER_CG_TOKENS_AUDIO`` token counts); each ``(bs, tokens)``
-        bucket owns a persistent 128 MiB workspace, so keep the product modest."""
+        Buckets come from ``CAPTURE_BATCH_SIZES_AUDIO`` (segment counts) and
+        ``CAPTURE_TOKENS_AUDIO`` (token counts); each ``(bs, tokens)`` bucket owns
+        a persistent 128 MiB workspace, so keep the product modest."""
         from mstar.engine.cuda_graph_config import PiecewisePackedConfig
         if not (_FLASHINFER_AVAILABLE and _VARLEN_BACKEND == "flashinfer"):
             return None
@@ -502,24 +488,14 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
                 set_fi_override(None)
             return {"x": x}
 
-        # Buckets are measured (MSTAR_ENCODER_CG_PROBE=1), covering s2t
-        # (segments 1..7, tokens 36..426) AND s2s (1..16, up to ~1057) — sizing
-        # from s2t alone left long audio with no bucket. Token values are
-        # near-continuous, so the ladder is deliberately coarse.
-        # ONE bs value: it is crossed with total_tokens, so each extra multiplies
-        # graphs and 128 MiB workspaces, while padding bs up is free (trailing
-        # segments are zero-length). bs carries headroom, tokens carry resolution.
         return PiecewisePackedConfig(
             capture_fn=capture_fn,
             make_static_inputs=make_static_inputs,
             make_attn_state=make_attn_state,
             plan_attn_fn=plan_attn_fn,
             uses_kv_cache=False,
-            total_tokens=_encoder_int_list(
-                "MSTAR_ENCODER_CG_TOKENS_AUDIO",
-                "48,64,96,128,192,256,384,512,704,896,1088"),
-            capture_batch_sizes=_encoder_int_list("MSTAR_ENCODER_CG_BS_AUDIO",
-                                                  "32"),
+            total_tokens=list(CAPTURE_TOKENS_AUDIO),
+            capture_batch_sizes=list(CAPTURE_BATCH_SIZES_AUDIO),
         )
 
     @torch.no_grad()
@@ -558,13 +534,6 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         runner = getattr(self, "_piecewise_runner", None)
         n_seg = cu_seqlens.shape[0] - 1
         total_tokens = hidden_states.shape[0]
-        if _encoder_probe():
-            # Harvest the layout, capture nothing, run eager.
-            note_encoder_layout("audio", n_seg, total_tokens, fitted=False)
-            note_encoder_path("audio.probe")
-            return AudioEncoderOutput(
-                last_hidden_state=self._layer_loop_tail(
-                    hidden_states, cu_seqlens, max_seqlen))
         if runner is not None:
             fitted = runner.can_run(n_seg, total_tokens)
             note_encoder_layout("audio", n_seg, total_tokens, fitted)

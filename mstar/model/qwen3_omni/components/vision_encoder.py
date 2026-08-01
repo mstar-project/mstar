@@ -23,6 +23,12 @@ from mstar.model.qwen3_omni.components.audio_encoder import varlen_attention
 
 logger = logging.getLogger(__name__)
 
+# Measured buckets: i2t (1 segment, 576..1024 tokens) and i2s (4 images, ~4096).
+# MUST stay divisible by spatial_merge_size**2 (=4).
+CAPTURE_TOKENS_VISION = (576, 704, 768, 896, 1024, 1280, 1536, 2048, 3072, 4096)
+# One bs value above the observed max of 4; padding bs up is free.
+CAPTURE_BATCH_SIZES_VISION = (8,)
+
 
 def _rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
@@ -178,9 +184,8 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         replay with the real per-segment lengths.
 
         Returns None (eager path) when FlashInfer isn't the active varlen backend.
-        Bucket lists are env-overridable
-        (``MSTAR_ENCODER_CG_BS_VISION`` segment counts,
-        ``MSTAR_ENCODER_CG_TOKENS_VISION`` token counts); each bucket owns a
+        Buckets come from ``CAPTURE_BATCH_SIZES_VISION`` (segment counts) and
+        ``CAPTURE_TOKENS_VISION`` (token counts); each bucket owns a
         persistent 128 MiB workspace, so keep the product modest. Token buckets
         MUST be divisible by ``spatial_merge_size**2`` (the merger reshapes
         ``[total_tokens, H] -> [total_tokens/merge_sq, H*merge_sq]``); a bucket
@@ -233,26 +238,14 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
                 out[f"deepstack_{i}"] = d
             return out
 
-        # Buckets are measured (MSTAR_ENCODER_CG_PROBE=1), covering i2t (one image
-        # per request: segments=1, tokens {576,704,768,896,1024}) AND i2s (up to
-        # four images: segments=4, ~4096 tokens) — sizing from i2t alone left
-        # multi-image requests with no bucket. Low rungs match the single-image
-        # layouts exactly; upper rungs cover multi-image.
-        # ONE bs value above the observed max of 4: bs is crossed with
-        # total_tokens, so extra values multiply graphs and 128 MiB workspaces,
-        # while padding bs up is free (trailing segments are zero-length).
-        # Token buckets MUST stay divisible by spatial_merge_size**2 (=4).
         return PiecewisePackedConfig(
             capture_fn=capture_fn,
             make_static_inputs=make_static_inputs,
             make_attn_state=make_attn_state,
             plan_attn_fn=plan_attn_fn,
             uses_kv_cache=False,
-            total_tokens=AE._encoder_int_list(
-                "MSTAR_ENCODER_CG_TOKENS_VISION",
-                "576,704,768,896,1024,1280,1536,2048,3072,4096"),
-            capture_batch_sizes=AE._encoder_int_list("MSTAR_ENCODER_CG_BS_VISION",
-                                                     "8"),
+            total_tokens=list(CAPTURE_TOKENS_VISION),
+            capture_batch_sizes=list(CAPTURE_BATCH_SIZES_VISION),
         )
 
     @torch.no_grad()
@@ -285,12 +278,6 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         runner = getattr(self, "_piecewise_runner", None)
         n_seg = cu_seqlens.shape[0] - 1
         total_tokens = hidden_states.shape[0]
-        if AE._encoder_probe():
-            # Harvest the layout, capture nothing, run eager.
-            AE.note_encoder_layout("vision", n_seg, total_tokens, fitted=False)
-            AE.note_encoder_path("vision.probe")
-            return self._block_loop_tail(
-                hidden_states, cu_seqlens, max_seqlen, position_embeddings)
         if runner is not None:
             fitted = runner.can_run(n_seg, total_tokens)
             AE.note_encoder_layout("vision", n_seg, total_tokens, fitted)

@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 
 import torch
@@ -899,20 +898,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
     # (``preprocess`` line in this file), and V2T runs at concurrency 1
     # today. Costs ~4 captures × persistent FlashInfer wrappers + static
     # buffers for the 30B Thinker; revisit if memory becomes a constraint.
-    _PREFILL_VISION_TOKEN_BUCKETS_BASE = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-    # Vision-token counts pad up to the smallest captured bucket. MSTAR_VISION_GRAPH_ALIGN=1
-    # adds intermediate low-range buckets so a 258-token image pads to 320 (~24% slack)
-    # instead of 512 (~99%), at the cost of a few extra bs=1 captures.
-    _PREFILL_VISION_TOKEN_BUCKETS_ALIGNED = [
-        128, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384,
-    ]
+    PREFILL_VISION_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
-
-    @property
-    def PREFILL_VISION_TOKEN_BUCKETS(self) -> list[int]:
-        if os.environ.get("MSTAR_VISION_GRAPH_ALIGN", "0") in ("1", "true", "True"):
-            return self._PREFILL_VISION_TOKEN_BUCKETS_ALIGNED
-        return self._PREFILL_VISION_TOKEN_BUCKETS_BASE
 
     def _build_prefill_text_packed(
         self, num_tokens: int, device: torch.device,
