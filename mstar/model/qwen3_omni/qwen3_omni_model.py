@@ -131,6 +131,15 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 # an H200. data_worker loads images on CPU, so only the CPU column applies today.
 
 
+def _image_preprocess_gpu(img: "torch.Tensor", **kwargs):
+    """``_image_preprocess`` on CUDA, wherever the input happens to live.
+
+    The core runs on the input's own device; data_worker loads on CPU, so callers
+    that want the GPU say so explicitly here rather than the core guessing.
+    """
+    return _image_preprocess(img.to("cuda"), **kwargs)
+
+
 def _smart_resize(
     height: int,
     width: int,
@@ -1235,6 +1244,10 @@ class Qwen3OmniModel(Model):
         return None
 
     def _audio_mel_gpu(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``_audio_mel`` on CUDA, wherever the input happens to live."""
+        return self._audio_mel(waveform.to("cuda"))
+
+    def _audio_mel(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Log-mel matching HF ``WhisperFeatureExtractor``, on the input's device.
 
         The HF feature_extractor runs the STFT + mel filterbank + log on the CPU
@@ -1465,7 +1478,7 @@ class Qwen3OmniModel(Model):
         # Each image is processed fully on its own device (no CPU round-trip).
         img_proc = self._processor.image_processor
         for img in raw_image_inputs:
-            pv, grid_thw = _image_preprocess(
+            pv, grid_thw = _image_preprocess_gpu(
                 img,
                 patch_size=img_proc.patch_size,
                 temporal_patch_size=img_proc.temporal_patch_size,
