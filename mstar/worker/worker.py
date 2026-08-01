@@ -1983,6 +1983,59 @@ class Worker:
             if rid not in output.failed_requests
         ]
 
+    def _handle_main_loop_error(
+        self,
+        exc: Exception,
+        in_flight: "tuple[PendingBatch | None, ...]",
+        batch: ScheduledBatch | None,
+    ) -> None:
+        """Fail everything the crashed iteration touched and drain its futures.
+
+        Attribution is batch-granular here: a raise out of the forward, the
+        batch build, or output routing can't be pinned on one request (the
+        stages that *can* attribute report through
+        ``NodeOutput.failed_requests`` instead), so every rid this iteration
+        touched fails together. Sequential retry of the batch — see the design
+        discussion on #123 — would go here; today a batch-level crash is
+        terminal for its rids.
+
+        The caller still has to clear its own in-flight state; see the main
+        loop's handler.
+        """
+        # The exception is usually surfacing out of ``pending.future.result()``,
+        # where the concurrent.futures machinery has already wrapped the
+        # engine's traceback. Report the leaf exception to the client and keep
+        # the full chain in the log.
+        err = f"{type(exc).__name__}: {exc}"
+        logger.exception("Worker %s error in main loop: %s", self.worker_id, err)
+
+        failed_rids: set[str] = set(self._in_flight_rids)
+        for stale in in_flight:
+            if stale is None:
+                continue
+            failed_rids.update(stale.batch.node_objects)
+            for node in stale.batch.node_objects.values():
+                node._speculatively_scheduled = False
+            # Drain before dropping the reference: the future owns engine state
+            # on the GPU thread, and an abandoned one leaves that thread writing
+            # into a batch nobody will collect. Already-finished futures (the
+            # common case — one of them is what just raised) return at once.
+            if stale.future is None:
+                continue
+            try:
+                stale.future.result()
+            except Exception:
+                logger.debug(
+                    "Worker %s discarding failed batch for node %s",
+                    self.worker_id, stale.node_name,
+                )
+        if batch is not None:
+            failed_rids.update(batch.node_objects)
+            for node in batch.node_objects.values():
+                node._speculatively_scheduled = False
+
+        self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
+
     def _fail_requests(self, errors: dict[str, str]) -> None:
         """Report requests this worker can no longer serve to the conductor.
 
@@ -2523,47 +2576,7 @@ class Worker:
                     future=future
                 ))
             except Exception as e:
-                # The exception is usually surfacing out of
-                # ``pending.future.result()``, where the concurrent.futures
-                # machinery has already wrapped the engine's traceback. Report
-                # the leaf exception to the client and keep the full chain in
-                # the log.
-                err = f"{type(e).__name__}: {e}"
-                logger.exception(
-                    "Worker %s error in main loop: %s", self.worker_id, err
-                )
-
-                # Attribution here is batch-granular: a raise out of the
-                # forward, the batch build, or output routing can't be pinned
-                # on one request (the stages that *can* attribute report
-                # through NodeOutput.failed_requests instead), so every rid
-                # this iteration touched fails together. Sequential retry of
-                # the batch — see the design discussion on #123 — would go
-                # here; today a batch-level crash is terminal for its rids.
-                failed_rids: set[str] = set(self._in_flight_rids)
-                for stale in (pending, spec_pending):
-                    if stale is None:
-                        continue
-                    failed_rids.update(stale.batch.node_objects)
-                    for node in stale.batch.node_objects.values():
-                        node._speculatively_scheduled = False
-                    # Drain before dropping the reference: the future owns
-                    # engine state on the GPU thread, and an abandoned one
-                    # leaves that thread writing into a batch nobody collects.
-                    # Already-finished futures return immediately.
-                    try:
-                        stale.future.result()
-                    except Exception:
-                        logger.debug(
-                            "Worker %s discarding failed batch for node %s",
-                            self.worker_id, stale.node_name,
-                        )
-                if batch is not None:
-                    failed_rids.update(batch.node_objects)
-                    for node in batch.node_objects.values():
-                        node._speculatively_scheduled = False
-                self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
-
+                self._handle_main_loop_error(e, (pending, spec_pending), batch)
                 # Clear the in-flight step. Without this the next iteration
                 # calls .result() on the same completed-with-exception future
                 # and re-raises forever, wedging the worker on one bad batch.
