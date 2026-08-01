@@ -499,7 +499,8 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         )
 
     @torch.no_grad()
-    def forward(self, input_features, feature_lens=None, return_dict=True, **kwargs):
+    def forward(self, input_features, feature_lens=None, return_dict=True,
+                piecewise_runner=None, **kwargs):
         # return_dict/**kwargs accepted for HF signature compatibility; always returns AudioEncoderOutput.
         assert feature_lens is not None, "native AuT requires feature_lens"
         param_dtype = self.conv2d1.weight.dtype
@@ -529,9 +530,9 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
 
         # Piecewise path (default): replay the layer loop on a bucketed graph,
         # re-planning ragged attention with the real per-segment lengths. The
-        # runner is threaded on by the submodule from engine_inputs; absent it
-        # (or if no bucket fits this layout) we fall through to eager.
-        runner = getattr(self, "_piecewise_runner", None)
+        # submodule passes the runner in from engine_inputs; without one (or if
+        # no bucket fits this layout) we fall through to eager.
+        runner = piecewise_runner
         n_seg = cu_seqlens.shape[0] - 1
         total_tokens = hidden_states.shape[0]
         if runner is not None:

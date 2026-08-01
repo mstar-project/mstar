@@ -249,7 +249,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         )
 
     @torch.no_grad()
-    def forward(self, pixel_values, grid_thw):
+    def forward(self, pixel_values, grid_thw, piecewise_runner=None):
         dtype = self.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.to(dtype)
 
@@ -273,9 +273,9 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         # Piecewise path (default): replay the block loop on a bucketed graph,
         # re-planning ragged attention with the real per-segment lengths and
         # copying cos/sin + hidden state into the runner-owned static buffers. The
-        # runner is threaded on by the submodule; absent it (or no fitting bucket)
-        # we fall through to eager.
-        runner = getattr(self, "_piecewise_runner", None)
+        # submodule passes the runner in; without one (or no fitting bucket) we
+        # fall through to eager.
+        runner = piecewise_runner
         n_seg = cu_seqlens.shape[0] - 1
         total_tokens = hidden_states.shape[0]
         if runner is not None:

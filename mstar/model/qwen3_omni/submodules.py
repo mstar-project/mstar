@@ -163,10 +163,10 @@ class NativeAudioEncoderSubmodule(NodeSubmodule):
 
     def forward_batched(self, graph_walk, engine_inputs, audio_features,
                         audio_seqlens, req_token_counts=None, **kwargs):
-        # Thread the (possibly absent) piecewise runner onto the encoder for this
-        # forward; the encoder's forward reads it via ``_piecewise_runner``.
-        self.audio_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("layer_loop")
-        embeds = self.audio_encoder(audio_features, audio_seqlens).last_hidden_state
+        embeds = self.audio_encoder(
+            audio_features, audio_seqlens,
+            piecewise_runner=engine_inputs.piecewise_runners.get("layer_loop"),
+        ).last_hidden_state
         if embeds.dim() == 3:
             embeds = embeds.squeeze(0)
         request_ids = engine_inputs.request_ids
@@ -181,8 +181,10 @@ class NativeAudioEncoderSubmodule(NodeSubmodule):
         return results
 
     def forward(self, graph_walk, engine_inputs, audio_features, audio_seqlens, **kwargs):
-        self.audio_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("layer_loop")
-        embeds = self.audio_encoder(audio_features, audio_seqlens).last_hidden_state
+        embeds = self.audio_encoder(
+            audio_features, audio_seqlens,
+            piecewise_runner=engine_inputs.piecewise_runners.get("layer_loop"),
+        ).last_hidden_state
         if embeds.dim() == 3:
             embeds = embeds.squeeze(0)
         return {"audio_embeds": [embeds]}
@@ -343,8 +345,10 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
             "req_token_counts": counts,
         }
 
-    def _run(self, pixel_values, grid_thw):
-        out = self.vision_encoder(pixel_values, grid_thw=grid_thw)
+    def _run(self, pixel_values, grid_thw, piecewise_runner=None):
+        out = self.vision_encoder(
+            pixel_values, grid_thw=grid_thw, piecewise_runner=piecewise_runner,
+        )
         if isinstance(out, tuple):
             embeds, deepstack = out
         else:
@@ -359,10 +363,10 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
 
     def forward_batched(self, graph_walk, engine_inputs, pixel_values, grid_thw,
                         req_token_counts=None, **kwargs):
-        # Thread the (possibly absent) piecewise runner onto the encoder; its
-        # forward reads it via ``_piecewise_runner`` (``_run`` calls that forward).
-        self.vision_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("block_loop")
-        embeds, deepstack = self._run(pixel_values, grid_thw)
+        embeds, deepstack = self._run(
+            pixel_values, grid_thw,
+            piecewise_runner=engine_inputs.piecewise_runners.get("block_loop"),
+        )
         request_ids = engine_inputs.request_ids
         if req_token_counts is None:  # one-image-per-request fallback
             g = grid_thw if grid_thw.dim() == 2 else grid_thw.unsqueeze(0)
@@ -378,8 +382,10 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
         return results
 
     def forward(self, graph_walk, engine_inputs, pixel_values, grid_thw, **kwargs):
-        self.vision_encoder._piecewise_runner = engine_inputs.piecewise_runners.get("block_loop")
-        embeds, deepstack = self._run(pixel_values, grid_thw)
+        embeds, deepstack = self._run(
+            pixel_values, grid_thw,
+            piecewise_runner=engine_inputs.piecewise_runners.get("block_loop"),
+        )
         return {
             "vision_embeds": [embeds],
             "deepstack": deepstack if deepstack else [torch.tensor([])],
