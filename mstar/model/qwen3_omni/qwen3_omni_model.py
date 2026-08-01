@@ -124,10 +124,11 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
-# GPU image preprocessing: the CPU round-trip to HF's Qwen2VLImageProcessor was the
-# biggest I2T TTFT cost (~175 ms). We run the identical algorithm on the image's own
-# device (torchvision bicubic resize, the same kernel HF calls); grid_thw is
-# bit-exact and pixel_values match HF to cos>0.9999 (test_qwen3_omni_gpu_image_parity).
+# Device-agnostic port of HF's Qwen2VLImageProcessor: same torchvision bicubic
+# resize in the same order, so grid_thw is bit-exact and pixel_values match HF to
+# cos>0.9999 (test_qwen3_omni_image_parity). Measured against the HF processor:
+# 6.9 -> 1.3 ms at 512x512 and 16.7 -> 6.0 ms at 1024x768 on CPU, 0.26 / 0.27 ms on
+# an H200. data_worker loads images on CPU, so only the CPU column applies today.
 
 
 def _smart_resize(
@@ -158,7 +159,7 @@ def _smart_resize(
     return h_bar, w_bar
 
 
-def _gpu_image_preprocess(
+def _image_preprocess(
     img: "torch.Tensor",
     *,
     patch_size: int,
@@ -171,8 +172,10 @@ def _gpu_image_preprocess(
 ) -> tuple["torch.Tensor", "torch.Tensor"]:
     """Resize + rescale + normalize + patchify a single image on its device.
 
-    ``img`` is a (C, H, W) tensor on the GPU, float in [0, 1] (as produced by
-    data_worker) or uint8 in [0, 255].  Returns ``(pixel_values, grid_thw)``
+    ``img`` is a (C, H, W) tensor, float in [0, 1] (as produced by data_worker,
+    which loads on CPU) or uint8 in [0, 255]. Every op runs on the input's own
+    device, so this is CPU today and needs no change to run on an accelerator
+    once one hands it a device tensor.  Returns ``(pixel_values, grid_thw)``
     matching HF's ``Qwen2VLImageProcessor`` output for one image:
     ``pixel_values`` is 2-D ``(grid_h*grid_w, C*temporal*patch*patch)`` and
     ``grid_thw`` is ``(1, 3)`` long ``[[1, grid_h, grid_w]]``.
@@ -1295,7 +1298,7 @@ class Qwen3OmniModel(Model):
 
         # Image preprocessing runs on the image's own device, so the raw tensors
         # are kept as-is and never round-trip through CPU/numpy
-        # (see _gpu_image_preprocess).
+        # (see _image_preprocess).
 
         # GPU log-mel needs CUDA in this worker; without it the raw audio is
         # converted to numpy for the HF (CPU) feature_extractor instead. This is
@@ -1448,7 +1451,7 @@ class Qwen3OmniModel(Model):
         # Each image is processed fully on its own device (no CPU round-trip).
         img_proc = self._processor.image_processor
         for img in raw_image_inputs:
-            pv, grid_thw = _gpu_image_preprocess(
+            pv, grid_thw = _image_preprocess(
                 img,
                 patch_size=img_proc.patch_size,
                 temporal_patch_size=img_proc.temporal_patch_size,

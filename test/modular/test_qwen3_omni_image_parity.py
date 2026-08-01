@@ -1,6 +1,6 @@
 """Parity for the GPU image preprocess vs HF's ``Qwen2VLImageProcessor``.
 
-``_gpu_image_preprocess`` (qwen3_omni_model.py) does resize + rescale +
+``_image_preprocess`` (qwen3_omni_model.py) does resize + rescale +
 normalize + patchify entirely on-device, replacing the CPU round-trip
 through HF's image processor. The native vision encoder is parity-tested against
 HF, so the ``pixel_values`` / ``image_grid_thw`` it consumes must match HF's. This
@@ -111,8 +111,8 @@ def _make_image(H, W, content):
 
 @pytest.mark.parametrize("content", ["noise", "smooth"])
 @pytest.mark.parametrize("H,W", SIZES, ids=[f"{h}x{w}" for h, w in SIZES])
-def test_gpu_image_preprocess_matches_hf(H, W, content):
-    from mstar.model.qwen3_omni.qwen3_omni_model import _gpu_image_preprocess
+def test_image_preprocess_matches_hf(H, W, content):
+    from mstar.model.qwen3_omni.qwen3_omni_model import _image_preprocess
 
     # Identical pixel data fed to both paths: uint8 HWC for HF, uint8 CHW on GPU.
     img_hwc = _make_image(H, W, content)
@@ -130,7 +130,7 @@ def test_gpu_image_preprocess_matches_hf(H, W, content):
 
     # GPU path under test (CHW uint8 on cuda).
     img_chw = torch.from_numpy(img_hwc).permute(2, 0, 1).contiguous().to("cuda")
-    pv, grid = _gpu_image_preprocess(img_chw, **params)
+    pv, grid = _image_preprocess(img_chw, **params)
     pv = pv.float().cpu()
     grid = grid.cpu().to(torch.long)
 
