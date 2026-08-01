@@ -98,9 +98,12 @@ def _next_steps(model: str, host: str, port: int) -> str:
         voice = "tara" if model == "orpheus" else "Ethan"
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
     if model == "zonos2":
-        # Zonos2 has no built-in voices yet. It disables speaker conditioning.
-        # So the hint shows no voice argument.
+        # Zonos2 has no named voices: it clones from a reference clip instead,
+        # so the hint shows both the default voice and the clone form.
         lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
+        lines.append("    res = client.generate(text=\"Hello there\", audio=\"voice.wav\",")
+        lines.append("                           input_modalities=(\"audio\",\"text\"),")
+        lines.append("                           output_modalities=(\"audio\",))")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")

@@ -1,4 +1,4 @@
-"""Zonos2 model components (built on ``mstar.model.components``)."""
+"""Zonos2 model components. They build on ``mstar.model.components``."""
 from mstar.model.zonos2.components.language_model import (
     MultiEmbedding,
     Zonos2Attention,
