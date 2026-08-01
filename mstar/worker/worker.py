@@ -1715,14 +1715,26 @@ class Worker:
         # Check for stops
         engine = self.engine_manager.get_engine(batch_N.node_name)
         cpu_output = self._prematerialize_for_check_stop(output)
-        new_stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_output)
+        stop_result = engine.check_stop_for_batch(batch_N.node_batch, cpu_output)
+        if stop_result.failed_requests:
+            # A rid whose stop check raised has no trustworthy stop decision:
+            # routing it would either run its loop forever or end it early.
+            # Fail it here and take it out of the batch before the routing
+            # loops below touch it.
+            output.failed_requests.update(stop_result.failed_requests)
+            self._drop_failed_rids(batch_N, output)
+            self._fail_requests(stop_result.failed_requests)
+            if not batch_N.node_batch.request_ids:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
+                return
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
         # Stop loops, if applicable
-        for rid, loop_names in new_stops.items():
+        for rid, loop_names in stop_result.stops.items():
             loop_names = set([
                 ln for ln in loop_names if \
                     self.worker_graphs_manager.check_dyn_loop(rid, batch_N.partition, ln)

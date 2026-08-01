@@ -130,6 +130,21 @@ class NodeOutput:
     failed_requests: dict[str, str] = field(default_factory=dict) # rid -> error message
 
 
+@dataclass
+class StopCheckResult:
+    """Outcome of ``check_stop_for_batch``.
+
+    ``stops`` maps request_id -> loop names whose loops should stop.
+    ``failed_requests`` maps request_id -> error message, for rids whose
+    stop check raised: the check is per-rid and reads tensor values, so a
+    raise is attributable to one request and shouldn't take down the batch.
+    Mirrors ``NodeOutput.failed_requests``; the worker funnels both into the
+    same per-request failure path.
+    """
+    stops: dict[str, set[str]] = field(default_factory=dict)
+    failed_requests: dict[str, str] = field(default_factory=dict)
+
+
 class BaseEngine(ABC):
     def __init__(
         self, enable_nvtx: bool = False,
@@ -410,18 +425,19 @@ class BaseEngine(ABC):
 
     def check_stop_for_batch(
         self, batch: NodeBatch, output: NodeOutput
-    ) -> dict[str, set[str]]:
+    ) -> StopCheckResult:
         """
         Per-rid stop-condition check for a finished batch.
 
         Called by the worker on its slow-postprocess path *after*
-        ``execute_batch`` returns. May read tensor values. Returns
-        ``{request_id: {loop_name, ...}}`` for rids whose loops should stop.
+        ``execute_batch`` returns. May read tensor values. Returns a
+        :class:`StopCheckResult` carrying the rids whose loops should stop and
+        the rids whose check raised.
 
         Default: no stops. Stateless engines override this to delegate the
         check to the submodule; the AR engine has its own value-driven logic.
         """
-        return {}
+        return StopCheckResult()
 
     def warmup(self) -> None:
         """Optional CUDA graph capture. Override in subclasses."""

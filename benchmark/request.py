@@ -135,6 +135,7 @@ class RequestMetrics:
         data_b64: str,
         n_tokens: int = 1,
         arrival_time: Optional[float] = None,
+        metadata: Optional[dict] = None,
     ):
         """
         Decode a base64 chunk, record timing/byte metrics, and buffer content
@@ -142,6 +143,20 @@ class RequestMetrics:
         """
         data = base64.b64decode(data_b64)
         if not data:
+            return
+
+        if modality == "error":
+            # A request that fails after the response has opened can't be given
+            # an HTTP error status — the 200 was committed with the first byte
+            # of the stream — so the server reports it in-band as a final
+            # "error" chunk. Surface it as the request's failure rather than
+            # counting it as an output modality, which would report the real
+            # message as an unhelpful "expected ['audio'], received ['error']".
+            status = (metadata or {}).get("status")
+            message = data.decode("utf-8", errors="replace")
+            self.record_error(
+                f"HTTP {status}: {message}" if status else message
+            )
             return
 
         self._output_modalities_recvd.append(modality)
@@ -212,6 +227,12 @@ class RequestMetrics:
             self.e2e_latency = 0.0
             self.status = Status.FAILED
             self.error = self.error or "start_time was never set (no HTTP send)"
+            return
+        if self.error is not None:
+            # Already failed in-band (an "error" chunk mid-stream). Keep that
+            # message and its latency; the modality check below would only
+            # replace a real diagnosis with "expected X, received ['error']".
+            self.status = Status.FAILED
             return
         self.e2e_latency = time.monotonic() - self.start_time
 
@@ -764,6 +785,7 @@ class OurSystem(InferenceSystem):
                         data_b64=data_b64,
                         arrival_time=arrival_time,
                         n_tokens=1,  # mstar server emits one token per chunk
+                        metadata=msg.get("metadata"),
                     )
 
         except Exception as e:

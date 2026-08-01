@@ -15,6 +15,7 @@ from mstar.engine.base import (
     NodeOutput,
     PlannedBatch,
     PreparedBatch,
+    StopCheckResult,
 )
 from mstar.engine.cache_manager import (
     BatchedCacheManager,
@@ -1125,14 +1126,14 @@ class KVCacheEngine(BaseEngine):
 
     def check_stop_for_batch(
         self, batch: NodeBatch, output: NodeOutput
-    ) -> dict[str, set[str]]:
+    ) -> StopCheckResult:
         """Delegate to each rid's submodule.check_stop. Worker calls this on
         the slow-postprocess path so the .item() / .cpu() reads no longer
         block ``execute_batch`` on the GPU thread."""
+        result = StopCheckResult()
         if batch.node_name not in self.submodule_management:
-            return {}
+            return result
         submodule = self.submodule_management[batch.node_name].submodule
-        result: dict[str, set[str]] = {}
         for rid in batch.request_ids:
             req_outputs = output.per_request_output_tensors.get(rid, {})
             if not req_outputs:
@@ -1140,9 +1141,20 @@ class KVCacheEngine(BaseEngine):
             req_info = batch.per_request_info.get(rid)
             if req_info is None:
                 continue
-            stops = submodule.check_stop(rid, req_info, req_outputs)
+            try:
+                stops = submodule.check_stop(rid, req_info, req_outputs)
+            except Exception as e:
+                # Per-rid stage: fail only this request. Letting it escape
+                # would abort the stop check for the rest of the batch too,
+                # leaving their loops running past their stop condition.
+                logger.exception(
+                    "check_stop failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.graph_walk,
+                )
+                result.failed_requests[rid] = f"{type(e).__name__}: {e}"
+                continue
             if stops:
-                result[rid] = stops
+                result.stops[rid] = stops
         return result
 
     def reserve_replay_slot(self, batch: NodeBatch) -> int | None:

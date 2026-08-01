@@ -21,7 +21,14 @@ from mstar.api_server.request_types import (
     ResultTensors,
 )
 from mstar.conductor.conductor import Conductor
-from mstar.engine.base import BaseEngine, EngineType, NodeBatch, NodeOutput, PreparedBatch
+from mstar.engine.base import (
+    BaseEngine,
+    EngineType,
+    NodeBatch,
+    NodeOutput,
+    PreparedBatch,
+    StopCheckResult,
+)
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -90,6 +97,35 @@ def test_minibatch_split_keeps_failures_from_every_chunk():
     engine.get_max_batch_size = lambda node_name, graph_walk: 2
     out = engine.execute_with_max_batch_size(_node_batch(["r0", "r1", "r2", "r3"]))
     assert out.failed_requests == {"r0": "boom", "r3": "bang"}
+
+
+def test_check_stop_failure_is_attributed_to_one_rid():
+    """check_stop reads tensor values per rid, so a raise there names its
+    culprit — the rest of the batch must still get its stop decisions."""
+    from mstar.engine.stateless_engine import StatelessEngine
+
+    class _Submodule:
+        def check_stop(self, rid, req_info, outputs):
+            if rid == "bad":
+                raise RuntimeError("nan in logits")
+            return {"decode"}
+
+    engine = StatelessEngine.__new__(StatelessEngine)
+    engine.submodules = {"node": _Submodule()}
+    batch = _node_batch(["good", "bad"])
+    output = NodeOutput(
+        per_request_output_tensors={"good": {"o": []}, "bad": {"o": []}},
+    )
+    result = engine.check_stop_for_batch(batch, output)
+
+    assert result.stops == {"good": {"decode"}}
+    assert "nan in logits" in result.failed_requests["bad"]
+
+
+def test_check_stop_default_reports_nothing():
+    assert _Engine({}).check_stop_for_batch(_node_batch(["r1"]), NodeOutput(
+        per_request_output_tensors={},
+    )) == StopCheckResult()
 
 
 def test_stateless_engine_attributes_prepare_inputs_raise():
