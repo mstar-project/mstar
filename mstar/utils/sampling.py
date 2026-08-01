@@ -16,6 +16,7 @@ Usage:
 """
 
 import logging
+import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
@@ -227,6 +228,31 @@ class SamplingConfig:
 
 
 @dataclass
+class MultiSamplingConfig:
+    """A node's sampling configs: the main one plus any labelled aux samplers.
+
+    Aux samplers exist for submodules that sample more than once per step with
+    different params — e.g. the Qwen3-Omni Talker samples codec group 0 from the
+    Talker LLM and groups 1..N-1 from the CodePredictor.
+    """
+    main: SamplingConfig | None = field(default_factory=SamplingConfig)
+    aux: dict[str, SamplingConfig] = field(default_factory=dict)
+
+    def set_seed(self, seed: int):
+        if self.main is not None:
+            self.main.set_seed(seed)
+        for label, cfg in self.aux.items():
+            # Derive aux seeds from the request seed so aux draws don't replay
+            # the main sampler's philox stream. crc32 (unlike hash()) is stable
+            # across processes, so TP ranks derive the same seed.
+            cfg.set_seed(seed ^ (zlib.crc32(label.encode()) & 0x7FFFFFFF))
+
+    @property
+    def seed(self):
+        return self.main.seed if self.main is not None else 0
+
+
+@dataclass
 class BaseSampler(ABC):
     def _broadcast_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """In-place broadcast of ``tokens`` from rank 0 to all TP ranks.
@@ -247,20 +273,27 @@ class BaseSampler(ABC):
     ) -> torch.Tensor:
         pass
 
-    @torch.compiler.disable
-    def sample_with_config(
-        self, logits: torch.Tensor,
-        temperature: float,
-        top_k: int,
-        top_p: float = 1.0,
-    ):
-        import flashinfer
-        scaled = logits / temperature
-        probs = torch.softmax(scaled, dim=-1)
-        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p, deterministic=True,
+
+@dataclass
+class BaseMultiSampler(BaseSampler):
+    main: BaseSampler
+    aux: dict[str, BaseSampler] = field(default_factory=dict)
+
+    def sample(
+        self, request_ids: list[str], logits: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
+        return self.main.sample(request_ids, logits, **kwargs)
+
+    def sample_aux(
+        self, label: str,
+        request_ids: list[str],
+        logits: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
+        assert label in self.aux, (
+            f"No aux sampler {label!r} (have {sorted(self.aux)}). The node's "
+            "``get_aux_sampling_configs`` must declare it."
         )
-        return samples.to(torch.int64)
+        return self.aux[label].sample(request_ids, logits, **kwargs)
 
 
 @dataclass
@@ -294,7 +327,6 @@ class SeenTokenMask:
 
 @dataclass
 class Sampler(BaseSampler):
-    # per request
     device: torch.device
     _sampling_config: dict[str, SamplingConfig] = field(default_factory=dict)
     _seen_token_mask: dict[str, SeenTokenMask]= field(default_factory=dict)
@@ -416,6 +448,52 @@ class Sampler(BaseSampler):
             self._step_offset[rid] = self._step_offset.get(rid, 0) + 1
 
         return tokens
+
+
+@dataclass
+class MultiSampler(BaseMultiSampler):
+    """Eager ``Sampler`` per label. Each owns its own per-request state."""
+    main: Sampler
+    aux: dict[str, Sampler] = field(default_factory=dict)
+
+    @classmethod
+    def new(
+        cls, aux_labels: list[str],
+        device: torch.device,
+        **sampler_kwargs
+    ) -> "MultiSampler":
+        return cls(
+            main=Sampler(device, **sampler_kwargs),
+            aux={
+                label: Sampler(device, **sampler_kwargs) \
+                    for label in aux_labels
+            }
+        )
+
+    def add_request(self, request_id: str):
+        self.main.add_request(request_id)
+        for aux in self.aux.values():
+            aux.add_request(request_id)
+
+    def get_token_mask(self, request_id: str):
+        return self.main.get_token_mask(request_id)
+
+    def get_aux_token_masks(self, request_id: str):
+        return {
+            label: sampler.get_token_mask(request_id) \
+                for label, sampler in self.aux.items()
+        }
+
+    def remove_request(self, request_id: str):
+        self.main.remove_request(request_id)
+        for aux in self.aux.values():
+            aux.remove_request(request_id)
+
+    def set_config(self, request_id: str, config: MultiSamplingConfig):
+        if config.main is not None:
+            self.main.set_config(request_id, **asdict(config.main))
+        for label in config.aux.keys() & self.aux.keys():
+            self.aux[label].set_config(request_id, **asdict(config.aux[label]))
 
 
 @torch.compiler.disable
@@ -625,31 +703,6 @@ class CudaGraphableSampler(BaseSampler):
         return codes
 
     @torch.compiler.disable
-    def sample_with_config(
-        self, logits: torch.Tensor,
-        temperature: float,
-        top_k: int,
-        top_p: float = 1.0,
-    ):
-        import flashinfer
-        scaled = logits / temperature
-        samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-            scaled, top_k, top_p, deterministic=True,
-            seed=self.seed_buf, offset=self.offset_buf
-        )
-        self.offset_buf += 1
-        tokens = samples.to(torch.int64)
-        # Defensive broadcast for callers that run this sampler on every TP
-        # rank with replicated logits (Qwen3-Omni CodePredictor's unrolled
-        # depth loop). ``deterministic=True`` should already produce
-        # bit-equal output, but tied-probability sorts can still resolve
-        # differently across GPUs in edge cases — one diverging code
-        # cascades into garbled audio with no recovery, so we pay the
-        # ~5µs in-place broadcast (no-op for trivial groups) to guarantee
-        # agreement. Mirrors ``CudaGraphableSampler.sample``.
-        return self._broadcast_tokens(tokens)
-
-    @torch.compiler.disable
     def sync_seen_token_masks(
         self, seen_masks: "Iterable[SeenTokenMask]",
     ) -> None:
@@ -666,6 +719,45 @@ class CudaGraphableSampler(BaseSampler):
             mask = m._seen_token_mask
             if mask is not None:
                 mask.copy_(self.seen_tokens_buf[i])
+
+
+@dataclass
+class MultiCudaGraphableSampler(BaseMultiSampler):
+    """Graph-safe counterpart of ``MultiSampler``, built by ``MultiSamplerBuffers``.
+
+    Submodules sample the main stream with ``sample`` and each aux stream with
+    ``sample_aux(label, ...)``; every param comes from the label's own static
+    device buffers, so replay honours per-request configs without recapture.
+    """
+    main: CudaGraphableSampler
+    aux: dict[str, CudaGraphableSampler] = field(default_factory=dict)
+
+    def _samplers(self) -> "Iterable[CudaGraphableSampler]":
+        return [self.main, *self.aux.values()]
+
+    @property
+    def applied_penalty_in_graph(self) -> bool:
+        return any(s.applied_penalty_in_graph for s in self._samplers())
+
+    @applied_penalty_in_graph.setter
+    def applied_penalty_in_graph(self, value: bool) -> None:
+        for s in self._samplers():
+            s.applied_penalty_in_graph = value
+
+    @torch.compiler.disable
+    def sync_seen_token_masks(
+        self, request_ids: list[str], sampler: MultiSampler,
+    ) -> None:
+        """Sync each label's in-graph rows back to its eager ``SeenTokenMask``s."""
+        self.main.sync_seen_token_masks(
+            [sampler.main.get_token_mask(rid) for rid in request_ids]
+        )
+        for label, aux in self.aux.items():
+            eager = sampler.aux.get(label)
+            if eager is not None:
+                aux.sync_seen_token_masks(
+                    [eager.get_token_mask(rid) for rid in request_ids]
+                )
 
 
 @dataclass
@@ -775,7 +867,7 @@ class SamplerBuffers:
     # TP communicator for the submodule that owns these buffers. Passed
     # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
     # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
-    # Without this, ``sample`` / ``sample_with_config`` would build a
+    # Without this, ``sample`` would build a
     # sampler with ``tp_group=None``, the broadcast would silently no-op,
     # and TP ranks would drift apart on the first tied-logit sample —
     # garbled audio for Talker, premature EOS for Thinker. Defaults to
@@ -1030,12 +1122,98 @@ class SamplerBuffers:
         return CudaGraphableSampler(**slices)
 
 
+@dataclass
+class MultiSamplerBuffers:
+    """One ``SamplerBuffers`` per label — the graph-side owner of a node's configs.
+
+    Each label gets independent scalar/seed/offset buffers (and its own optional
+    seen-token mask, sized by that label's ``vocab_size``), so the aux samplers
+    neither share the main sampler's RNG stream nor its penalty state.
+    """
+    main: SamplerBuffers
+    aux: dict[str, SamplerBuffers] = field(default_factory=dict)
+
+    @classmethod
+    def allocate(
+        cls,
+        max_batch_size: int,
+        device: torch.device,
+        config: MultiSamplingConfig | None = None,
+        tp_group: "CommGroup | None" = None,  # noqa: F821
+    ) -> "MultiSamplerBuffers":
+        config = config or MultiSamplingConfig()
+        main_cfg = config.main if config.main is not None else SamplingConfig()
+
+        def mk(cfg: SamplingConfig) -> SamplerBuffers:
+            return SamplerBuffers.allocate(
+                max_batch_size=max_batch_size, device=device,
+                tp_group=tp_group, vocab_size=cfg.vocab_size,
+            )
+
+        return cls(
+            main=mk(main_cfg),
+            aux={label: mk(cfg) for label, cfg in config.aux.items()},
+        )
+
+    def register_request(
+        self, rid: str, config: MultiSamplingConfig | None = None,
+    ) -> None:
+        self.main.register_request(rid, config.main if config else None)
+        for label, bufs in self.aux.items():
+            bufs.register_request(rid, config.aux.get(label) if config else None)
+
+    def unregister_request(self, rid: str) -> None:
+        self.main.unregister_request(rid)
+        for bufs in self.aux.values():
+            bufs.unregister_request(rid)
+
+    def update_request_config(
+        self, rid: str, config: MultiSamplingConfig,
+    ) -> None:
+        if config.main is not None:
+            self.main.update_request_config(rid, config.main)
+        for label, cfg in config.aux.items():
+            bufs = self.aux.get(label)
+            if bufs is not None:
+                bufs.update_request_config(rid, cfg)
+
+    def stage_seen_token_masks(
+        self, request_ids: list[str], sampler: MultiSampler,
+    ) -> None:
+        """Stage every label's live eager masks into its master rows."""
+        self.main.stage_seen_token_masks(
+            request_ids, [sampler.main.get_token_mask(rid) for rid in request_ids]
+        )
+        for label, bufs in self.aux.items():
+            eager = sampler.aux.get(label)
+            if eager is not None:
+                bufs.stage_seen_token_masks(
+                    request_ids,
+                    [eager.get_token_mask(rid) for rid in request_ids],
+                )
+
+    def gather_for_request_ids(
+        self, request_ids: list[str], padded_bs: int,
+        gather_seen_tokens: bool = True,
+    ) -> MultiCudaGraphableSampler:
+        return MultiCudaGraphableSampler(
+            main=self.main.gather_for_request_ids(
+                request_ids, padded_bs, gather_seen_tokens,
+            ),
+            aux={
+                label: bufs.gather_for_request_ids(
+                    request_ids, padded_bs, gather_seen_tokens,
+                ) for label, bufs in self.aux.items()
+            },
+        )
+
+
 def make_sampler_from_buffers(
-    bufs: SamplerBuffers,
+    bufs: MultiSamplerBuffers,
     request_ids: list[str],
     sampling_configs: dict[str, SamplingConfig],
     padded_bs: int,
-) -> CudaGraphableSampler:
+) -> MultiCudaGraphableSampler:
     """Compatibility shim. Prefer ``bufs.gather_for_request_ids`` directly.
 
     ``sampling_configs`` is no longer consulted — per-request configs live

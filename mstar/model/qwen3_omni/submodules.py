@@ -36,7 +36,7 @@ from mstar.model.qwen3_omni.components.rope import (
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
 from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.utils.sampling import CudaGraphableSampler, SeenTokenMask
+from mstar.utils.sampling import MultiCudaGraphableSampler, SeenTokenMask
 
 logger = logging.getLogger(__name__)
 
@@ -1482,7 +1482,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _forward_decode_like(
         self, request_ids: list[str],
         cache_handle: BatchedCacheManager,
-        injected_sampler: CudaGraphableSampler,
+        injected_sampler: MultiCudaGraphableSampler,
         suppress_mask: torch.Tensor,
         all_codes: torch.Tensor,
         codec_emb_sum: torch.Tensor,
@@ -1516,8 +1516,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         logits = self.model.codec_head(last_hidden)
         logits = logits.masked_fill(suppress_mask.unsqueeze(0), float("-inf"))
         # Apply the repetition penalty to the Talker's layer-0 codes (the code
-        # predictor depth loop below uses sample_with_config and stays penalty-free
-        # for now). The penalty is baked into the captured graph.
+        # predictor depth loop below samples through its own aux config and
+        # stays penalty-free). The penalty is baked into the captured graph.
         layer0_codes = injected_sampler.sample(
             request_ids, logits, apply_penalty=True
         )
@@ -1550,10 +1550,10 @@ class TalkerSubmodule(ARNodeSubmodule):
                 hidden, cp.lm_head_weight[group_idx - 1].t()
             )
 
-            # TODO: allow setting the code predictor temperature
-            tokens = injected_sampler.sample_with_config(
-                logits=logits, temperature=1.0,
-                top_k=50, top_p=0.8
+            # Params come from the "code_predictor" aux sampler's static
+            # buffers, so per-request values survive graph replay.
+            tokens = injected_sampler.sample_aux(
+                "code_predictor", request_ids, logits,
             )
             all_codes[:, group_idx] = tokens
             embed = codec_embedding[group_idx - 1](tokens)

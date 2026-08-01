@@ -24,7 +24,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.utils.sampling import SamplingConfig
+from mstar.utils.sampling import MultiSamplingConfig, SamplingConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -368,6 +368,35 @@ class Model(ABC):
             ignore_eos=(model_kwargs or {}).get("ignore_eos", False)
         )
 
+    def get_aux_sampling_configs(
+        self, node_name: str,
+        model_kwargs: dict | None = None,
+    ) -> dict[str, SamplingConfig]:
+        """
+        For a node that needs to perform sampling with multiple configs, for
+        instance the talker and code predictor in Qwen3-Omni / TTS. Returns
+        label -> SamplingConfig, e.g., {"code_predictor": ...}
+
+        The submodule samples these via ``sampler.sample_aux(label, ...)``; each
+        label gets its own sampler buffers, so the params are per-request and
+        CUDA-graph safe.
+        """
+        return {}
+
+    def resolve_sampling_configs(
+        self, node_name: str,
+        model_kwargs: dict | None = None,
+    ) -> MultiSamplingConfig:
+        """Bundle a node's main + aux configs. The engines consume this, not
+        ``get_sampling_config`` directly."""
+        return MultiSamplingConfig(
+            main=self.get_sampling_config(
+                node_name=node_name, model_kwargs=model_kwargs
+            ),
+            aux=self.get_aux_sampling_configs(
+                node_name=node_name, model_kwargs=model_kwargs
+            )
+        )
 
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

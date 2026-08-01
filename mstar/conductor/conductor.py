@@ -44,7 +44,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.profiler import range_pop, range_push
-from mstar.utils.sampling import SamplingConfig
+from mstar.utils.sampling import MultiSamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class RequestData:
     all_worker_graph_ids: set[str]
     max_output_tokens: int
     random_seed: int
-    sampling_config: dict[str, SamplingConfig | None]
+    sampling_config: dict[str, MultiSamplingConfig | None]
     sharding_config: ShardingConfig | None = None
 
     # Partition state (always populated — single-partition models use a "default" partition)
@@ -351,14 +351,14 @@ class Conductor:
                 logger.info("KV cache config after YAML overrides: %s", kv_cfg)
         return kv_cache_config
 
-    def _get_sampling_configs(self, model_kwargs: dict):
+    def _get_sampling_configs(self, model_kwargs: dict) -> dict[str, MultiSamplingConfig]:
         ar_nodes = [
             node for (node, engine) in self.model.get_node_engine_types().items() \
                 if engine == EngineType.KV_CACHE
         ]
         return {
-            node: self.model.get_sampling_config(
-                node_name=node, model_kwargs=model_kwargs
+            node: self.model.resolve_sampling_configs(
+                node, model_kwargs
             ) for node in ar_nodes
         }
 
