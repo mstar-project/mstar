@@ -77,4 +77,4 @@ def test_base_class_is_abstract():
 
 
 def test_registry_names():
-    assert set(ATTENTION_BACKENDS) == {"flashinfer", "dense_gen"}
+    assert set(ATTENTION_BACKENDS) == {"flashinfer", "dense_gen", "mla_absorb"}
