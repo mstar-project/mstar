@@ -381,9 +381,28 @@ class APIServer:
                                 self.preprocess_worker.new_result_tensors(
                                     message.body
                                 )
-                            elif message.message_type == "fail_requests":
-                                # TODO @claude: send a 500 to the client and do all necessary cleanup
-                                pass
+                            elif message.message_type == "request_failed":
+                                logger.error(
+                                    "Request %s failed in the engine: %s",
+                                    rid, message.body.error_message,
+                                )
+                                req = self.pending_requests[rid]
+                                # Don't clobber an earlier, more specific
+                                # error (e.g. a preprocess failure) with a
+                                # downstream one.
+                                if req.error is None:
+                                    req.error = message.body.error_message
+                                    req.error_status = message.body.status
+                                # Release the waiting client immediately: no
+                                # result is coming, so the alternative is the
+                                # blanket request timeout.
+                                req.event.set()
+                                # The conductor has already dropped this rid,
+                                # so no abort is needed — but the data worker
+                                # still holds its transport state. Parking the
+                                # rid here makes _prune_recently_completed
+                                # release it once the client lets go.
+                                self.recently_completed[rid] = time.time()
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
@@ -459,14 +478,20 @@ class APIServer:
                         req.chunks.append(result_chunk)
 
                         if result_chunk.modality == "error":
-                            # Preprocessing failed before the request reached
-                            # the conductor; release the waiting client with
-                            # the error instead of letting it time out.
-                            req.error = result_chunk.data.decode("utf-8", "replace")
-                            req.error_status = int(
-                                (result_chunk.metadata or {}).get("status", 500)
-                            )
+                            # The data worker failed this request (preprocess,
+                            # or postprocess of a result tensor); release the
+                            # waiting client with the error instead of letting
+                            # it time out.
+                            if req.error is None:
+                                req.error = result_chunk.data.decode("utf-8", "replace")
+                                req.error_status = int(
+                                    (result_chunk.metadata or {}).get("status", 500)
+                                )
                             req.event.set()
+                            # Park the rid so _prune_recently_completed reclaims
+                            # the data worker's per-request state once the
+                            # client lets go of the request.
+                            self.recently_completed[rid] = time.time()
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")

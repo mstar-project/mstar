@@ -30,7 +30,7 @@ from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
-    FailRequest,
+    FailRequests,
     InputSignals,
     MessageSource,
     NewRequest,
@@ -1959,17 +1959,55 @@ class Worker:
             self._pending_removes.discard(rid)
             self._remove_request(RemoveRequest(request_id=rid, source=MessageSource.SELF))
 
-    def _fail_requests(
-        self, rids: set[str], error_message: str):
-        self.scheduler.fail_rids(rids)
+    def _drop_failed_rids(
+        self, pending: PendingBatch, output: NodeOutput
+    ) -> None:
+        """Excise ``output.failed_requests`` from a finished batch.
+
+        A rid that raised in ``postprocess`` is still carried in the batch (the
+        engine only recorded the error), and one that raised in
+        ``prepare_inputs`` is already out of ``node_batch.request_ids`` but not
+        out of the worker-side ``ScheduledBatch``. Either way we must not route
+        its outputs or mark its node complete — that's how a request that blew
+        up mid-walk ends up reported to the client as a successful empty
+        response. ``_postprocess_batch`` reconciles the remaining structures
+        from ``node_batch.request_ids``.
+        """
+        for rid in output.failed_requests:
+            output.per_request_output_tensors.pop(rid, None)
+            pending.batch.node_objects.pop(rid, None)
+            pending.batch.request_to_worker_graph.pop(rid, None)
+            pending.node_batch.per_request_info.pop(rid, None)
+        pending.node_batch.request_ids = [
+            rid for rid in pending.node_batch.request_ids
+            if rid not in output.failed_requests
+        ]
+
+    def _fail_requests(self, errors: dict[str, str]) -> None:
+        """Report requests this worker can no longer serve to the conductor.
+
+        ``errors`` maps request_id -> message. Rids the worker has already
+        torn down are dropped: reporting them would leave a permanent entry
+        in ``scheduler.failed_rids`` (the conductor answers a failure with a
+        REMOVE_REQUEST, and it won't send one for a request it no longer
+        knows about).
+        """
+        errors = {
+            rid: msg for rid, msg in errors.items()
+            if rid in self.worker_graphs_manager.per_request_info
+        }
+        if not errors:
+            return
+        for rid, msg in errors.items():
+            logger.error("Worker %s failing request %s: %s", self.worker_id, rid, msg)
+        # Stop scheduling new work for these rids while the teardown is in
+        # flight; the conductor's REMOVE_REQUEST clears the entry.
+        self.scheduler.fail_rids(set(errors))
         self.communicator.send(
             "conductor",
             ConductorMessage(
                 message_type=ConductorMessageType.FAIL_REQUESTS,
-                body=FailRequest(
-                    rids=rids,
-                    error_message=error_message
-                ),
+                body=FailRequests(errors=errors),
             ),
         )
         # Note: we do not cleanup the request right now; we wait for the conductor
@@ -2118,9 +2156,19 @@ class Worker:
             )
             phase_buf.clear()
 
+        # Reset per iteration (not just where they're first used) so the
+        # error handler below sees only this iteration's work — a stale
+        # ``batch`` from a previous pass would otherwise be failed twice, and
+        # a raise before the first assignment would hit UnboundLocalError
+        # inside the handler itself.
+        batch: ScheduledBatch | None = None
+        spec_pending: PendingBatch | None = None
+
         while True:
             from mstar.utils.profiler import range_pop, range_push
             try:
+                batch = None
+                spec_pending = None
                 _iter_start = _time.perf_counter() if phase_period else 0.0
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
@@ -2262,6 +2310,7 @@ class Worker:
                         node._speculatively_scheduled = False
 
                     def _maybe_clear_spec():
+                        nonlocal speculation
                         # Speculation cleanup splits by kind:
                         #
                         # * Non-yield-away spec depended on pending's outputs
@@ -2298,9 +2347,14 @@ class Worker:
                         _maybe_clear_spec()
 
                     if output.failed_requests:
+                        # A per-rid stage (prepare_inputs / postprocess) blamed
+                        # specific requests. Drop the speculation: it was built
+                        # from pending's rids and may thread outputs that the
+                        # failed rids never produced. The rest of the batch
+                        # still post-processes and routes normally below.
                         _maybe_clear_spec()
-                        for rid, message in output.failed_requests.items():
-                            self._fail_requests({rid}, message)
+                        self._drop_failed_rids(pending, output)
+                        self._fail_requests(output.failed_requests)
 
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
@@ -2469,20 +2523,51 @@ class Worker:
                     future=future
                 ))
             except Exception as e:
-                logger.exception("Worker %s error in main loop: %s", self.worker_id, str(e))
+                # The exception is usually surfacing out of
+                # ``pending.future.result()``, where the concurrent.futures
+                # machinery has already wrapped the engine's traceback. Report
+                # the leaf exception to the client and keep the full chain in
+                # the log.
+                err = f"{type(e).__name__}: {e}"
+                logger.exception(
+                    "Worker %s error in main loop: %s", self.worker_id, err
+                )
 
-                # fail requests in this batch
+                # Attribution here is batch-granular: a raise out of the
+                # forward, the batch build, or output routing can't be pinned
+                # on one request (the stages that *can* attribute report
+                # through NodeOutput.failed_requests instead), so every rid
+                # this iteration touched fails together. Sequential retry of
+                # the batch — see the design discussion on #123 — would go
+                # here; today a batch-level crash is terminal for its rids.
+                failed_rids: set[str] = set(self._in_flight_rids)
+                for stale in (pending, spec_pending):
+                    if stale is None:
+                        continue
+                    failed_rids.update(stale.batch.node_objects)
+                    for node in stale.batch.node_objects.values():
+                        node._speculatively_scheduled = False
+                    # Drain before dropping the reference: the future owns
+                    # engine state on the GPU thread, and an abandoned one
+                    # leaves that thread writing into a batch nobody collects.
+                    # Already-finished futures return immediately.
+                    try:
+                        stale.future.result()
+                    except Exception:
+                        logger.debug(
+                            "Worker %s discarding failed batch for node %s",
+                            self.worker_id, stale.node_name,
+                        )
                 if batch is not None:
-                    # TODO @claude: differentiate between failed in model execution and failed in postprocess?
-                    self._fail_requests(
-                        self._in_flight_rids | set(batch.request_to_worker_graph.keys()),
-                        f"Error in worker: {str(e)}"
-                    )
+                    failed_rids.update(batch.node_objects)
+                    for node in batch.node_objects.values():
+                        node._speculatively_scheduled = False
+                self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
 
-                # clean up worker state for the next loop
-                batch = None
-                spec_pending = None
+                # Clear the in-flight step. Without this the next iteration
+                # calls .result() on the same completed-with-exception future
+                # and re-raises forever, wedging the worker on one bad batch.
+                _set_pending(None)
                 consecutive_spec_steps = 0
-                self._in_flight_rids = set()
-                
-                
+                sleep(0.01)
+

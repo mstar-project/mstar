@@ -108,7 +108,7 @@ class ConductorMessageType(Enum):
     WORKER_GRAPHS_DONE = "worker_graphs_done"
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
-    FAIL_REQUESTS = "fail"
+    FAIL_REQUESTS = "fail_requests"
 
 
 @dataclass
@@ -150,9 +150,15 @@ class AbortRequest(MessageBody):
 
 
 @dataclass
-class FailRequest(MessageBody):
-    rids: set[str]
-    error_message: str
+class FailRequests(MessageBody):
+    """A worker reporting requests it can no longer serve.
+
+    ``errors`` maps request_id -> message. It's a dict rather than a
+    (rids, message) pair because per-rid stages (prepare_inputs,
+    postprocess) attribute a distinct error to each request, and one
+    step can fail several of them for different reasons.
+    """
+    errors: dict[str, str]
 
 
 @dataclass

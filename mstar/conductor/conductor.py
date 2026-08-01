@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 
-from mstar.api_server.request_types import APIServerFailRequests, APIServerMessage, RequestComplete
+from mstar.api_server.request_types import APIServerMessage, RequestComplete, RequestFailed
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -33,7 +33,7 @@ from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.ipc_format import (
     ConductorMessageType,
-    FailRequest,
+    FailRequests,
     InputSignals,
     NewRequest,
     NewRequestConductor,
@@ -807,25 +807,34 @@ class Conductor:
             if graph_walk in self.worker_graphs[wg_id].graph_walks
         }
 
-    def _fail_request(self, message: FailRequest):
-        for rid in message.rids:
+    def _fail_requests(self, body: FailRequests):
+        """Tear down requests a worker reported as unservable and tell the
+        client. Mirrors ``_process_request_done``, but the api-server side
+        turns the message into an HTTP error / stream error event.
+        """
+        for rid, error_message in body.errors.items():
             request_data = self.requests.get(rid)
             if request_data is None:
+                # Expected under TP: every rank raises symmetrically and each
+                # reports the failure, so only the first report finds the
+                # request. Also covers a client abort racing the failure.
                 logger.info(
-                    "Request %s was failed from multiple different workers; ignoring all but the first.", rid
+                    "Failure for request %s ignored; already finished, aborted, "
+                    "or failed by another worker (%s)", rid, error_message,
                 )
-                return
+                continue
+            logger.error("Request %s failed on a worker: %s", rid, error_message)
             self._remove_request(rid, request_data)
-        self.communicator.send(
-            APIServerMessage(
-                message_type="fail_requests",
-                body=APIServerFailRequests(
-                    request_ids=message.rids,
-                    error_message=message.error_message
-                )
+            self.communicator.send(
+                "api_server",
+                APIServerMessage(
+                    message_type="request_failed",
+                    body=RequestFailed(
+                        request_id=rid,
+                        error_message=error_message,
+                    ),
+                ),
             )
-        )
-
 
     def _abort_request(self, request_id: str):
         """Tear down a request the client abandoned, freeing its worker GPU state."""
@@ -840,8 +849,13 @@ class Conductor:
             logger.info("Abort for request %s ignored; already finished or unknown", request_id)
             return
         self._remove_request(request_id, request_data)
-    
+
     def _remove_request(self, request_id: str, request_data: RequestData):
+        """Drop conductor state for a request and free its worker GPU state.
+
+        Shared by the abort (client went away) and fail (worker can't serve
+        it) paths; neither notifies the api server from here.
+        """
         workers = {
             worker_id
             for worker_ids in request_data.worker_graph_to_workers.values()
@@ -856,7 +870,7 @@ class Conductor:
                 ),
             )
         del self.requests[request_id]
-        logger.info("Aborted request %s; freed worker resources", request_id)
+        logger.info("Tore down request %s; freed worker resources", request_id)
         self._try_admit_waiting()
 
     def _process_request_done(
@@ -1168,7 +1182,7 @@ class Conductor:
                     elif message.message_type == ConductorMessageType.ABORT_REQUEST:
                         self._abort_request(message.body.request_id)
                     elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
-                        self._fail_request(message)
+                        self._fail_requests(message.body)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
                         rid = message.body.request_id
                         if rid not in self.requests:

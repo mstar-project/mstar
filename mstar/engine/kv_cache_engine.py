@@ -938,9 +938,6 @@ class KVCacheEngine(BaseEngine):
 
         node_inputs: list[ARNodeInputs] = []
         skipped_rids: set[str] = set()
-
-        # TODO @claude: do all of this "failed_requests" logic for
-        # mstar/engine/stateless_engine.py as well
         failed: dict[str, str] = {}
         if self.enable_nvtx:
             range_push("kv_cache.prepare_inputs")
@@ -963,18 +960,25 @@ class KVCacheEngine(BaseEngine):
                     skipped_rids.add(rid)
                 else:
                     node_inputs.append(req_inputs)
-            except AllocationFailedError as e:
-                raise e # allocation errors handled separately
-            except BaseException as e:
-                failed[rid] = str(e)
+            except AllocationFailedError:
+                raise  # allocation errors handled separately
+            except Exception as e:
+                # prepare_inputs is per-rid, so we know exactly who is at
+                # fault: record the error and drop the rid instead of taking
+                # the whole batch down with it.
+                logger.exception(
+                    "prepare_inputs failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.graph_walk,
+                )
+                failed[rid] = f"{type(e).__name__}: {e}"
 
-        skipped_rids.update(failed.keys())
-        if skipped_rids:
-            batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
+        dropped_rids = skipped_rids | failed.keys()
+        if dropped_rids:
+            batch.request_ids = [rid for rid in batch.request_ids if rid not in dropped_rids]
             batch.per_request_info = {
                 rid: info
                 for rid, info in batch.per_request_info.items()
-                if rid not in skipped_rids
+                if rid not in dropped_rids
             }
 
         if self.enable_nvtx:
@@ -1033,7 +1037,6 @@ class KVCacheEngine(BaseEngine):
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
-        output.failed_requests.update(planned.prepared.failed_requests)
         return output
 
     def postprocess_batch(self, planned: PlannedBatch, output: NodeOutput) -> None:
@@ -1047,8 +1050,16 @@ class KVCacheEngine(BaseEngine):
                     outputs=output.per_request_output_tensors.get(rid, {}),
                     inputs=node_inputs,
                 )
-            except BaseException as e:
-                output.failed_requests[rid] = str(e)
+            except AllocationFailedError:
+                raise  # allocation errors handled separately
+            except Exception as e:
+                # Per-rid stage: fail only this request, let the rest of the
+                # batch finish routing normally.
+                logger.exception(
+                    "postprocess failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.graph_walk,
+                )
+                output.failed_requests[rid] = f"{type(e).__name__}: {e}"
 
     def _get_needed_labels(
         self, node_name: str, graph_walk: str,

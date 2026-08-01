@@ -40,10 +40,23 @@ class RequestComplete:
 
 
 @dataclass
+class RequestFailed:
+    """Signals that a request died in the engine and will produce no result.
+
+    One message per request, so it routes through the API server's result
+    loop exactly like ``RequestComplete`` does.
+    """
+    request_id: str
+    error_message: str
+    status: int = 500
+
+
+@dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    message_type: str  # "result_tensors" | "request_complete" | "setup_done"
-    body: ResultTensors | RequestComplete | None = None  # None for setup_done message
+    # "result_tensors" | "request_complete" | "request_failed" | "setup_done"
+    message_type: str
+    body: ResultTensors | RequestComplete | RequestFailed | None = None  # None for setup_done
 
 
 @dataclass
@@ -67,9 +80,3 @@ class PreprocessInput:
     input_modalities: list[str]
     output_modalities: list[str]
     model_kwargs: dict
-
-
-@dataclass
-class APIServerFailRequests:
-    request_ids: set[str]
-    error_message: str

@@ -127,7 +127,7 @@ class NodeOutput:
     # side-stream D→H copy of the produced tokens. Set by the worker in
     # _execute_on_gpu_thread; engines don't populate it themselves.
     completion_event: "torch.cuda.Event | None" = None
-    failed_requests: dict[str, str] # rid -> error message
+    failed_requests: dict[str, str] = field(default_factory=dict) # rid -> error message
 
 
 class BaseEngine(ABC):
@@ -231,7 +231,8 @@ class BaseEngine(ABC):
         prepared = self.prepare_batch(batch)
         if not prepared.active_request_ids:
             return NodeOutput(
-                per_request_output_tensors={rid: {} for rid in batch.request_ids}
+                per_request_output_tensors={rid: {} for rid in batch.request_ids},
+                failed_requests=dict(prepared.failed_requests),
             )
         planned = self.plan_batch(prepared)
         output = self.execute_forward(planned)
@@ -240,6 +241,11 @@ class BaseEngine(ABC):
         output.per_request_output_tensors.update(
             {rid: {} for rid in prepared.skipped_rids}
         )
+        # Requests that blew up in prepare_inputs are already out of the batch;
+        # carry their errors out so the worker can fail just those rids. Done
+        # here rather than in each engine so every prepare_batch override gets
+        # it — including the early return above.
+        output.failed_requests.update(prepared.failed_requests)
         return output
 
     # ── Async pre-execution hooks ────────────────────────────────────────
@@ -377,6 +383,7 @@ class BaseEngine(ABC):
             output.per_request_output_tensors.update(
                 minibatch_out.per_request_output_tensors
             )
+            output.failed_requests.update(minibatch_out.failed_requests)
             if minibatch_out.allocation_failed:
                 output.allocation_failed = True
                 output.alloc_pages_short = minibatch_out.alloc_pages_short
