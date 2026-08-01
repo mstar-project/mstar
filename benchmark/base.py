@@ -213,10 +213,27 @@ class Qwen3Omni(Model):
         # collapsing the Talker to a degenerate "mee mee mee" repetition attractor.
         # Letting mstar use its own model default (talker_temperature=0.9) restores
         # apples-to-apples behavior with vllm-omni's effective Talker sampling.
+        #
+        # Pin the speaker. Qwen3-Omni ships three voices and the systems pick
+        # different defaults when the request omits one: mstar hardcodes
+        # "Ethan" (qwen3_omni_model.py:546), while vllm-omni takes
+        # ``list(talker_config.speaker_id.keys())[0]`` — which is "chelsie",
+        # first only by dict order. So the same prompt was being spoken by a
+        # male voice on mstar/sglang-omni and a female voice on vllm-omni.
+        #
+        # That is not cosmetic: chelsie's audio ran ~15% longer for identical
+        # prompts (51.0s vs 44.4s mean), and RTF = E2E / audio_duration, so a
+        # longer denominator flattered vllm-omni's RTF. Same parity argument as
+        # max_tokens and thinker_temperature above -- the comparison has to hold
+        # the output fixed and vary only the serving system.
+        #
+        # vllm-omni reads it off the top-level request (serving_chat.py:713
+        # checks `voice` then `speaker`); mstar reads model_kwargs["voice"].
         return {
             "max_tokens": 256,
             "max_output_tokens": 256,
             "thinker_temperature": 0.0,
+            "voice": "Ethan",
         }
 
     def get_supported_modalities(self):
