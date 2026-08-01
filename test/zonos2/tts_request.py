@@ -5,10 +5,12 @@ Usage:
     python test/zonos2/tts_request.py
     python test/zonos2/tts_request.py --text "Good morning!" --output speech.wav
     python test/zonos2/tts_request.py --url http://127.0.0.1:20002/generate
+    python test/zonos2/tts_request.py --ref-audio voice.wav   # clone that voice
 """
 import argparse
 import base64
 import json
+import os
 import struct
 import sys
 
@@ -43,23 +45,39 @@ def main() -> int:
     # this. Raise it if you feed very long text; it is not a target length.
     ap.add_argument("--max-tokens", type=int, default=4096,
                     help="generous upper bound on frames; natural EOS stops first")
+    ap.add_argument("--ref-audio", default=None,
+                    help="reference clip to clone the voice from; needs a "
+                         "speaker-conditioned checkpoint")
+    ap.add_argument("--accurate-mode", action="store_true",
+                    help="favour a closer clone over expressiveness")
+    ap.add_argument("--noisy-background", action="store_true",
+                    help="tell the model the reference clip has background noise")
     args = ap.parse_args()
+
+    data = {
+        "text": args.text,
+        "output_modalities": "audio",
+        # ignore_eos=False => natural EOS (not forced-length). max_output_tokens
+        # is only a generous cap.
+        "model_kwargs": json.dumps({
+            "max_output_tokens": args.max_tokens,
+            "ignore_eos": False,
+            "accurate_mode": args.accurate_mode,
+            "clean_speaker_background": not args.noisy_background,
+        }),
+    }
+    files = None
+    if args.ref_audio:
+        # The server infers the modality from the filename extension, so the
+        # clip arrives as tensors["audio_inputs"] in process_prompt.
+        data["input_modalities"] = "audio,text"
+        with open(args.ref_audio, "rb") as f:
+            files = {"files": (os.path.basename(args.ref_audio), f.read(),
+                               "application/octet-stream")}
 
     pcm = b""
     chunks = 0
-    with requests.post(
-        args.url,
-        data={
-            "text": args.text,
-            "output_modalities": "audio",
-            # ignore_eos=False => natural EOS (not forced-length). max_output_tokens
-            # is only a generous cap.
-            "model_kwargs": json.dumps(
-                {"max_output_tokens": args.max_tokens, "ignore_eos": False}
-            ),
-        },
-        stream=True,
-    ) as resp:
+    with requests.post(args.url, data=data, files=files, stream=True) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
             if not line:

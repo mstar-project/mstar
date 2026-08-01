@@ -255,3 +255,183 @@ def test_speaker_disabled_ignores_values():
             speaker_token_positions=torch.tensor([0]),
         )
     assert torch.allclose(base, out)
+
+
+# -- conditioning token ids -------------------------------------------------
+# Conditioning tokens sit in the tail of the text vocab, in a fixed order:
+# rate, then quality (per feature), then the clean/noisy background pair, then
+# accurate-mode. Every count shifts everything after it, so these pin the exact
+# arithmetic rather than just relative ordering.
+_TEXT_VOCAB = 469          # 448 byte vocab + 21 rate buckets, the shipped shape
+_RATE_BUCKETS = 21
+_QUALITY_COUNTS = (3, 4)   # two features, 3 and 4 buckets
+_BG = 2
+_ACC = 1
+# base = 469 - 21 - 7 - 2 - 1 = 438
+_BASE = _TEXT_VOCAB - _RATE_BUCKETS - sum(_QUALITY_COUNTS) - _BG - _ACC
+
+
+def test_conditioning_token_ids_are_contiguous_blocks():
+    from mstar.model.zonos2.prompt import (
+        accurate_mode_token_id,
+        quality_token_id,
+        speaker_background_token_id,
+        speaking_rate_token_id,
+    )
+
+    args = (_TEXT_VOCAB, _RATE_BUCKETS, _QUALITY_COUNTS, _BG, _ACC)
+
+    # Rate occupies [base, base + 21).
+    assert speaking_rate_token_id(_TEXT_VOCAB, _RATE_BUCKETS, 0, _QUALITY_COUNTS, _BG, _ACC) == _BASE
+    assert speaking_rate_token_id(_TEXT_VOCAB, _RATE_BUCKETS, 20, _QUALITY_COUNTS, _BG, _ACC) == _BASE + 20
+
+    # Quality feature 0 follows rate; feature 1 follows feature 0's 3 buckets.
+    assert quality_token_id(_TEXT_VOCAB, _RATE_BUCKETS, _QUALITY_COUNTS, 0, 0, _BG, _ACC) == _BASE + 21
+    assert quality_token_id(_TEXT_VOCAB, _RATE_BUCKETS, _QUALITY_COUNTS, 1, 0, _BG, _ACC) == _BASE + 21 + 3
+    assert quality_token_id(_TEXT_VOCAB, _RATE_BUCKETS, _QUALITY_COUNTS, 1, 3, _BG, _ACC) == _BASE + 21 + 6
+
+    # Background pair (clean first), then the single accurate-mode marker.
+    assert speaker_background_token_id(*args[:3], True, _BG, _ACC) == _BASE + 28
+    assert speaker_background_token_id(*args[:3], False, _BG, _ACC) == _BASE + 29
+    assert accurate_mode_token_id(_TEXT_VOCAB, _RATE_BUCKETS, _QUALITY_COUNTS, _BG, _ACC) == _BASE + 30
+    # The whole conditioning tail ends exactly at text_vocab (the padding id).
+    assert _BASE + 31 == _TEXT_VOCAB
+
+
+def test_conditioning_token_ids_reject_out_of_range():
+    from mstar.model.zonos2.prompt import quality_token_id, speaking_rate_token_id
+
+    with pytest.raises(ValueError):
+        speaking_rate_token_id(_TEXT_VOCAB, _RATE_BUCKETS, _RATE_BUCKETS, _QUALITY_COUNTS, _BG, _ACC)
+    with pytest.raises(ValueError):
+        quality_token_id(_TEXT_VOCAB, _RATE_BUCKETS, _QUALITY_COUNTS, 0, 3, _BG, _ACC)
+    with pytest.raises(ValueError):
+        # text_vocab too small to hold the declared buckets.
+        speaking_rate_token_id(10, _RATE_BUCKETS, 0, _QUALITY_COUNTS, _BG, _ACC)
+
+
+# -- prompt frame layout ----------------------------------------------------
+def _builder(**kw):
+    from mstar.model.zonos2.prompt import TTSPromptBuilder
+
+    base = dict(
+        n_codebooks=9, audio_pad_id=1025, text_vocab=_TEXT_VOCAB,
+        prepend_silence=False, speaking_rate_num_buckets=_RATE_BUCKETS,
+        quality_bucket_counts=_QUALITY_COUNTS,
+        speaker_background_num_buckets=_BG, accurate_mode_num_buckets=_ACC,
+    )
+    base.update(kw)
+    return TTSPromptBuilder(**base)
+
+
+def test_prompt_without_speaker_is_unchanged():
+    from mstar.model.zonos2.prompt import text_to_byte_ids
+
+    frames = _builder().build("hi")
+    assert frames.shape == (len(text_to_byte_ids("hi")), 10)
+    assert frames[:, -1].tolist() == text_to_byte_ids("hi")
+    assert (frames[:, :9] == 1025).all()        # audio columns are all padding
+
+
+def test_prompt_speaker_slot_and_marker_order():
+    from mstar.model.zonos2.prompt import text_to_byte_ids
+
+    frames = _builder().build(
+        "hi", speaker=True, clean_speaker_background=True, accurate_mode=True,
+    )
+    # slot, background, accurate, then the byte tokens.
+    assert frames.shape[0] == 3 + len(text_to_byte_ids("hi"))
+    assert frames[0, -1].item() == _TEXT_VOCAB       # slot carries the padding id
+    assert frames[1, -1].item() == _BASE + 28        # clean background
+    assert frames[2, -1].item() == _BASE + 30        # accurate mode
+    assert frames[3, -1].item() == text_to_byte_ids("hi")[0]
+    # Audio columns stay padding throughout the conditioning prefix, so the
+    # slot is indistinguishable from padding until the model overwrites it.
+    assert (frames[:3, :9] == 1025).all()
+
+
+def test_prompt_speaker_markers_respond_to_flags():
+    clean = _builder().build("hi", speaker=True, clean_speaker_background=True)
+    noisy = _builder().build("hi", speaker=True, clean_speaker_background=False)
+    assert clean[1, -1].item() == _BASE + 28
+    assert noisy[1, -1].item() == _BASE + 29
+    # accurate_mode=False omits the marker entirely (absent == expressive).
+    assert clean.shape[0] == noisy.shape[0]
+    assert clean.shape[0] == 2 + 4                    # slot + background + BOS/h/i/EOS
+
+    # A checkpoint without the background token emits the slot alone.
+    bare = _builder(speaker_background_num_buckets=0, accurate_mode_num_buckets=0)
+    frames = bare.build("hi", speaker=True, accurate_mode=True)
+    assert frames.shape[0] == 1 + 4
+    assert frames[0, -1].item() == _TEXT_VOCAB
+
+
+def test_prompt_speaker_slot_matches_make_speaker_slot():
+    builder = _builder()
+    frames = builder.build("hi", speaker=True)
+    assert torch.equal(frames[:1], builder.speaker_slot())
+
+
+def test_prompt_rate_and_quality_follow_speaker_markers():
+    frames = _builder().build(
+        "hi", speaker=True, accurate_mode=True,
+        speaking_rate_bucket=5, quality_buckets=[2, None],
+    )
+    # slot, background, accurate, rate, quality(feature 0) — feature 1 is None
+    # so it emits nothing.
+    assert frames[3, -1].item() == _BASE + 5
+    assert frames[4, -1].item() == _BASE + 21 + 2
+    assert frames.shape[0] == 5 + 4
+
+
+# -- packed-batch speaker positions ----------------------------------------
+def test_speaker_token_positions_are_absolute_in_packed_batch():
+    """The model index_copy's over the concatenated batch, so a request's slot
+    position is its exclusive prefix sum of sequence lengths, not 0."""
+    from mstar.model.submodule_base import ARNodeInputs
+    from mstar.model.zonos2.submodules import Zonos2LLMSubmodule
+
+    sub = Zonos2LLMSubmodule(
+        model=nn.Linear(1, 1), n_codebooks=9, text_vocab=_TEXT_VOCAB,
+        eoa_id=1024, params=SimpleNamespace(),
+    )
+    seq_lens = [7, 5, 3]
+    inputs = []
+    for i, n in enumerate(seq_lens):
+        inp = ARNodeInputs(input_ids=torch.zeros(n, 10, dtype=torch.long), input_seq_len=n)
+        if i != 1:                                    # middle request has no clone
+            inp.tensor_inputs["speaker_embedding"] = torch.full((1, 5), float(i))
+        inputs.append(inp)
+
+    values, positions = sub._collect_speaker_inputs(inputs, seq_lens)
+    assert positions.tolist() == [0, 12]              # 0, then 7 + 5
+    assert values.shape == (2, 5)
+    assert values[:, 0].tolist() == [0.0, 2.0]        # order follows the batch
+
+    # No cloning requests at all (every decode step) yields nothing to inject.
+    plain = [ARNodeInputs(input_ids=torch.zeros(n, 10, dtype=torch.long), input_seq_len=n)
+             for n in seq_lens]
+    assert sub._collect_speaker_inputs(plain, seq_lens) == (None, None)
+
+
+# -- speaker encoder output selection ---------------------------------------
+def test_speaker_encoder_selects_and_pools_matching_output():
+    """The backbone returns a (T, D) hidden-state sequence; the encoder must
+    mean-pool it to one vector of exactly speaker_embedding_dim."""
+    from mstar.model.zonos2.speaker_encoder import Qwen3SpeakerEncoder
+
+    enc = Qwen3SpeakerEncoder.__new__(Qwen3SpeakerEncoder)   # skip the HF download
+    enc.model_id = "test"
+    enc.embedding_dim = 4
+
+    seq = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+    out = enc._select_embedding(seq)
+    assert out.shape == (4,)
+    assert torch.allclose(out, seq[0].mean(0))
+
+    # Several candidates: the one with the expected width wins.
+    wrong = torch.zeros(1, 3, 7)
+    assert enc._select_embedding((wrong, seq)).shape == (4,)
+
+    with pytest.raises(ValueError, match="expects a 4-dim speaker embedding"):
+        enc._select_embedding(wrong)
