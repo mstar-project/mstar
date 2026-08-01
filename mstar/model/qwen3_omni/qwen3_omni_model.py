@@ -315,8 +315,8 @@ class Qwen3OmniModel(Model):
         # Lazy submodule cache -- each worker only loads what it needs
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-        # GPU log-mel state: cached filterbank + window per device, built lazily
-        # on the first audio request (None until then, and on CPU-only workers).
+        # log-mel state: cached filterbank + window per device, built lazily on
+        # the first audio request.
         self._gpu_mel_state: dict | None = None
 
     # -----------------------------------------------------------------------
@@ -1221,7 +1221,7 @@ class Qwen3OmniModel(Model):
         return None
 
     def _audio_mel_gpu(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """GPU log-mel matching HF ``WhisperFeatureExtractor``.
+        """Log-mel matching HF ``WhisperFeatureExtractor``, on the input's device.
 
         The HF feature_extractor runs the STFT + mel filterbank + log on the CPU
         (numpy); for a 30 s clip that is ~tens of ms on the TTFT critical path and
@@ -1236,7 +1236,7 @@ class Qwen3OmniModel(Model):
         (x+4)/4. ``T = floor(len/hop)`` == HF's valid (un-padded) frame count.
         """
         fe = self._processor.feature_extractor
-        dev = waveform.device if waveform.is_cuda else torch.device("cuda")
+        dev = waveform.device
         st = self._gpu_mel_state
         if st is None or st["dev"] != dev:
             import numpy as np
@@ -1300,13 +1300,13 @@ class Qwen3OmniModel(Model):
         # are kept as-is and never round-trip through CPU/numpy
         # (see _image_preprocess).
 
-        # GPU log-mel needs CUDA in this worker; without it the raw audio is
-        # converted to numpy for the HF (CPU) feature_extractor instead. This is
-        # a capability fallback, not a toggle -- both paths match to cos>=0.9999
-        # (test_qwen3_omni_gpu_mel_parity).
-        _use_gpu_mel = self._processor is not None and torch.cuda.is_available()
+        # Our log-mel runs on the waveform's own device and beats the HF CPU
+        # feature extractor on either (2.1 vs 3.5 ms for a 5 s clip on CPU,
+        # 0.39 ms on an H200), matching it to cos>=0.9999
+        # (test_qwen3_omni_gpu_mel_parity), so it is the only path.
+        _use_mel = self._processor is not None
         np_audios: list = []
-        if not _use_gpu_mel:
+        if not _use_mel:
             for waveform in raw_audio_inputs:
                 np_audios.append(waveform.cpu().numpy())
 
@@ -1464,7 +1464,7 @@ class Qwen3OmniModel(Model):
             result["pixel_values"].append(pv)
             result["image_grid_thw"] += list(grid_thw)
 
-        if _use_gpu_mel:
+        if _use_mel:
             for waveform in raw_audio_inputs:
                 feat, seqlen = self._audio_mel_gpu(waveform)   # (n_mel, T), (1,)
                 result["audio_seqlens"].append(seqlen)
