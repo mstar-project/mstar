@@ -87,6 +87,7 @@ class BenchmarkConfig:
 
     batch_size: Optional[int] = 1
     rate: Optional[float] = 1
+    arrival_cv: float = 1.0  # 1.0 = Poisson; >1 = bursty gamma at the same mean rate
     # Max in-flight requests for CLOSED_LOOP mode (semaphore cap). Ignored for
     # OFFLINE / ONLINE. Default 1 = sequential, matching sglang-omni's default.
     max_concurrency: Optional[int] = 1
@@ -342,8 +343,17 @@ class Benchmark:
             )
             tasks.append(task)
             if i < len(requests) - 1:
-                # Poisson inter-request times
-                interval = random.expovariate(self.config.rate)
+                # Inter-arrival times. cv=1 is exponential (Poisson) and is the
+                # default, so existing results are unchanged. cv>1 uses a gamma
+                # with shape k=1/cv^2 and scale 1/(rate*k): the mean stays 1/rate
+                # while the coefficient of variation becomes cv -- i.e. burstier
+                # arrivals at the same average load.
+                cv = self.config.arrival_cv or 1.0
+                if cv == 1.0:
+                    interval = random.expovariate(self.config.rate)
+                else:
+                    k = 1.0 / (cv * cv)
+                    interval = random.gammavariate(k, 1.0 / (self.config.rate * k))
                 await asyncio.sleep(interval)
         return list(await asyncio.gather(*tasks))
 
@@ -511,6 +521,11 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument("--dataset", default=None, choices=[d.value for d in DatasetType])
     parser.add_argument("--rate", type=float, default=1.0, help="Requests/sec (default: 1.0)")
     parser.add_argument(
+        "--arrival-cv", type=float, default=1.0,
+        help="Coefficient of variation of inter-arrival times for --profiling-type online. "
+             "1.0 = Poisson (default); 2 or 4 = bursty gamma at the same mean rate.",
+    )
+    parser.add_argument(
         "--output-dir", default=None, help="Directory to save outputs (text files / images). Omit to skip."
     )
     parser.add_argument("--verbose", action="store_true")
@@ -667,6 +682,7 @@ def parse_args() -> BenchmarkConfig:
         batch_size=args.batch_size,
         max_concurrency=args.max_concurrency,
         rate=args.rate,
+        arrival_cv=args.arrival_cv,
         verbose=args.verbose,
         output_dir=args.output_dir,
         vbench_cache_dir=args.vbench_cache_dir,
