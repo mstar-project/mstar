@@ -21,10 +21,10 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from mstar.model.components import moe as moe_mod
 from mstar.model.components.moe import dispatch_experts_fused
+
+torch = pytest.importorskip("torch")
 
 # The block-internal dispatch selector (fused kernel when available, else the
 # naive loop). Reached privately on purpose: these tests pin which path a

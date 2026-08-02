@@ -14,12 +14,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
-torch = pytest.importorskip("torch")
 from torch import nn
 
 from mstar.model.zonos2.submodules import Zonos2LLMSubmodule
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams
+
+torch = pytest.importorskip("torch")
 
 C, EOA = 9, 1024
 

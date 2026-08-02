@@ -39,8 +39,8 @@ from types import SimpleNamespace
 
 import torch
 
-from mstar.model.zonos2.config import load_zonos2_config
 from mstar.model.zonos2.components.language_model import Zonos2ForCausalLM
+from mstar.model.zonos2.config import load_zonos2_config
 from mstar.model.zonos2.submodules import Zonos2LLMSubmodule
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams
 

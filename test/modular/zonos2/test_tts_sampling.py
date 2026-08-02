@@ -10,7 +10,6 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-import torch.nn.functional as F
 
 from mstar.model.zonos2.tts_sampling import (
     TTSSamplingParams,

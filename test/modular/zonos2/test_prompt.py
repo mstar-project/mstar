@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from mstar.model.zonos2.prompt import (
     BOS_ID,
     BYTE_TEXT_VOCAB_SIZE,
@@ -22,6 +20,8 @@ from mstar.model.zonos2.prompt import (
     text_to_byte_ids,
 )
 from mstar.model.zonos2.vocoder import shear_up
+
+torch = pytest.importorskip("torch")
 
 
 # -- byte tokenization ------------------------------------------------------

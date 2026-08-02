@@ -16,8 +16,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
-torch = pytest.importorskip("torch")
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
@@ -30,6 +28,7 @@ from mstar.model.zonos2.components.language_model import (
 )
 from mstar.model.zonos2.config import Zonos2Config
 
+torch = pytest.importorskip("torch")
 
 # -- softcap ----------------------------------------------------------------
 def test_softcap_bounds_and_monotonic():
