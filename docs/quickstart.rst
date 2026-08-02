@@ -61,6 +61,16 @@ that supports it, so run the matching server first:
    client.tts("Hello there", voice="tara").to_wav("out.wav")             # speech (Orpheus)
    client.tts("Hello there").to_wav("out.wav")                          # speech (Zonos2; no voice arg)
 
+Zonos2 has no named voices — it clones one from a reference clip, which needs the Qwen speech
+encoder set up in :doc:`installation`:
+
+.. code-block:: python
+
+   res = client.generate(text="Hello there", audio="voice.wav",
+                         input_modalities=("audio", "text"),
+                         output_modalities=("audio",))
+   res.audio.to_wav("cloned.wav")
+
 Streaming yields typed chunks (``TextChunk`` / ``ImageChunk`` / ``AudioChunk``):
 
 .. code-block:: python

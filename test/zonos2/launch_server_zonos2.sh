@@ -8,10 +8,13 @@ else
 fi
 
 # Launch the Zonos2 TTS server.
-# Colocated: the LLM (prefill + decode) and the DAC vocoder share GPU 0.
-# For two GPUs (LLM on rank 0, DAC on rank 1) use configs/zonos2.yaml below.
+# Colocated: the LLM (prefill + decode), the DAC vocoder, and the voice-clone
+# speaker encoder share GPU 0. For two GPUs (LLM + encoder on rank 0, DAC on
+# rank 1) use configs/zonos2.yaml below.
 #
-# Requires: pip install descript-audio-codec   (for the DAC vocoder)
+# Requires: pip install descript-audio-codec    (the DAC vocoder)
+#           pip install transformers torchcodec (the Qwen speech encoder that
+#                                                voice cloning needs)
 
 # coriander may need:
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH

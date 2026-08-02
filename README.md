@@ -80,6 +80,9 @@ uv pip install \
 Zonos2 (multi-codebook TTS) additionally needs the DAC vocoder — `pip install descript-audio-codec`
 (kept out of the extras; see [docs/installation.rst](docs/installation.rst)).
 
+Zonos2 voice cloning also downloads a Qwen speech encoder (not part of the checkpoint) at server
+start — `pip install transformers torchcodec` and set a writable `HF_MODULES_CACHE`.
+
 Other models: `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve zonos2` · `mstar serve pi05` · `mstar serve vjepa2`
 
 **Python SDK** — works for every model (text, image, audio, video):
@@ -119,7 +122,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
-| [Zonos2](https://huggingface.co/Zyphra/ZONOS2) | Speech LM (multi-codebook TTS) | text → speech | `/generate`, SDK `client.tts(...)` |
+| [Zonos2](https://huggingface.co/Zyphra/ZONOS2) | Speech LM (multi-codebook TTS) | text (+ reference audio for voice cloning) → speech | `/generate`, SDK `client.tts(...)` |
 | [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3 Policy DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | Robot policy | text, image, video → robot actions, video | `/generate`, `/v1/images/generations`, `/v1/videos/generations` |
 | [Pi0.5](https://huggingface.co/lerobot/pi05_base) | Vision-language-action | text, image, state → robot actions | `/generate` |

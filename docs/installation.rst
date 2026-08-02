@@ -71,6 +71,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - Zonos2 TTS runtime: ``flashinfer-python``, ``safetensors``, ``huggingface-hub``,
        ``mooncake-transfer-engine``. **Also needs** ``descript-audio-codec`` (the DAC
        vocoder), which is installed separately — see `descript-audio-codec (Zonos2)`_.
+       **Voice cloning additionally needs** ``transformers`` and ``torchcodec``, which the
+       extra does not pull in — see `Qwen speech encoder (Zonos2 voice cloning)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -246,6 +248,23 @@ Verify:
 .. code-block:: bash
 
    python -c "import dac; print('dac ok')"
+
+Qwen speech encoder (Zonos2 voice cloning)
+------------------------------------------
+
+Zonos2 has no named voices: it clones one from a reference clip, using a Qwen speech encoder
+(~48 MB) that is not part of the checkpoint. A speaker-conditioned checkpoint downloads it
+from the hub at server start, which needs two packages ``.[zonos2]`` doesn't install and a
+**writable** ``HF_MODULES_CACHE`` (the encoder is remote code, so ``transformers`` writes its
+module files at load time; the shared ``HF_HOME`` default is often read-only):
+
+.. code-block:: bash
+
+   pip install transformers torchcodec
+   export HF_MODULES_CACHE=/path/you/can/write/hf_modules
+
+``test/zonos2/launch_server_zonos2.sh`` sets ``HF_MODULES_CACHE`` for you. Text-only serving
+needs none of this — drop the ``speaker_encoder`` node group from the config YAML.
 
 Matching your CUDA toolkit
 --------------------------
