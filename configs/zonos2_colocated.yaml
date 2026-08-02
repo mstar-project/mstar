@@ -1,0 +1,19 @@
+model: "zonos2"
+max_seq_len: 8192
+# Single-GPU: the LLM (prefill + decode), the DAC vocoder and the voice-clone
+# speaker encoder all share rank 0.
+#
+# speaker_encoder holds the voice-clone ECAPA-TDNN resident. Despite the "1.7B"
+# in its HF repo id it is only ~12M params (~48 MB in fp32), so colocating it
+# costs almost nothing. Drop its node group to serve text-only; voice-clone
+# requests then fail rather than silently ignoring the reference audio.
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    graph_walks: [prefill, prefill_clone, decode]
+  - node_names: [speaker_encoder]
+    ranks: [0]
+    graph_walks: [prefill_clone]
+  - node_names: [dac_decoder]
+    ranks: [0]
+    graph_walks: [dac_chunk]

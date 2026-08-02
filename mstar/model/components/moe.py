@@ -193,7 +193,12 @@ def _dispatch(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Pick fused-Triton if available, otherwise the naive loop."""
+    """Use the fused Triton kernel if it is available, or the naive loop.
+
+    The fused kernel needs a bf16 or fp16 ``hidden_states`` on CUDA (see
+    :func:`mstar.utils.fused_moe.fused_experts`). The ``is_cuda`` guard here
+    checks the device. The caller must run in an autocast dtype.
+    """
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(
             hidden_states, gate_up_proj, down_proj,

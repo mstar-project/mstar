@@ -37,6 +37,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_omni``
      - ``Qwen/Qwen3-Omni-30B-A3B-Instruct``
      - Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.
+   * - ``zonos2``
+     - ``Zyphra/ZONOS2``
+     - Multi-codebook TTS: autoregressive LLM emitting audio codes + DAC 44.1 kHz decoder.
+       No named voices — it clones from a reference clip with a separate Qwen speech encoder.
+       See `Zonos2 environment requirements`_.
    * - ``vjepa2``
      - ``facebook/vjepa2-vitl-fpc64-256``
      - V-JEPA 2 video encoder + masked predictor.
@@ -87,3 +92,17 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
+
+Zonos2 environment requirements
+-------------------------------
+
+- The **DAC vocoder** (``pip install descript-audio-codec``) is required and is kept out of
+  every extra — see :doc:`installation`.
+- **Voice cloning** embeds the reference clip with a Qwen speech encoder that is not part of
+  the checkpoint, downloaded from the hub at server start. It needs ``transformers`` and
+  ``torchcodec`` (neither is in ``.[zonos2]``) and a writable ``HF_MODULES_CACHE`` — see
+  :doc:`installation`. Drop the ``speaker_encoder`` node group from the config YAML to serve
+  text-only; clone requests then fail instead of ignoring the reference audio.
+- Clone requests send reference audio (``audio=...`` with ``"audio"`` in
+  ``input_modalities``). A client that caches the returned embedding can pass it back as the
+  ``speaker_embedding`` model kwarg to skip the encoder.

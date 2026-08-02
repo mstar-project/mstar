@@ -7,6 +7,7 @@ from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
 from mstar.model.whisper.whisper_model import WhisperModel
+from mstar.model.zonos2.zonos2_model import Zonos2Model
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "bagel": BagelModel,
@@ -20,6 +21,7 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
     "vjepa2": VJepa2Model,
     "vjepa2_ac": VJepa2ACModel,
     "whisper_large": WhisperModel,
+    "zonos2": Zonos2Model,
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -57,6 +59,11 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    # Zonos2 multi-codebook TTS. The checkpoint is the reference layout — a
+    # directory with ``params.json`` and ``model.pth``, not HF safetensors — so
+    # ``mstar/model/zonos2/weight_loader.py`` snapshots and reads it directly.
+    # The DAC vocoder also needs ``descript-audio-codec`` installed.
+    "zonos2": {"model_path_hf": "Zyphra/ZONOS2"},
 }
 
 

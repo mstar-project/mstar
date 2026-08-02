@@ -33,6 +33,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
+    "zonos2": "zonos2_colocated.yaml",
     # ASR (Beta, un-optimized) — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
@@ -96,6 +97,13 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model in ("orpheus", "qwen3_omni"):
         voice = "tara" if model == "orpheus" else "Ethan"
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
+    if model == "zonos2":
+        # Zonos2 has no named voices: it clones from a reference clip instead,
+        # so the hint shows both the default voice and the clone form.
+        lines.append("    client.tts(\"Hello there\").to_wav(\"out.wav\")")
+        lines.append("    res = client.generate(text=\"Hello there\", audio=\"voice.wav\",")
+        lines.append("                           input_modalities=(\"audio\",\"text\"),")
+        lines.append("                           output_modalities=(\"audio\",))")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
