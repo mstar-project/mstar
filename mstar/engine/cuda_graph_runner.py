@@ -2831,6 +2831,7 @@ def build_piecewise_runners(
     kv_cache_config: KVCacheConfig | None = None,
     alloc_manager: PagedAllocationManager | None = None,
     buffer_manager: WorkspaceBufferManager | None = None,
+    sampler_buffers: MultiSamplerBuffers | None = None,
 ) -> dict[str, PiecewiseCudaGraphRunner]:
     """Build + warm up one ``PiecewiseCudaGraphRunner`` per label a submodule
     declares via ``get_piecewise_cuda_graph_configs``.
@@ -2842,7 +2843,7 @@ def build_piecewise_runners(
     opts into none, or whose capture fails, yields an empty dict (eager path).
     """
     configs = submodule.get_piecewise_cuda_graph_configs(
-        device, autocast_dtype, tp_world_size
+        device, autocast_dtype, tp_world_size, sampler_buffers=sampler_buffers,
     )
     runners: dict[str, PiecewiseCudaGraphRunner] = {}
     for label, config in configs.items():

@@ -13,7 +13,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.engine.kv_store import PositionInfo
-from mstar.utils.sampling import BaseSampler, SeenTokenMask
+from mstar.utils.sampling import BaseSampler, MultiSamplerBuffers, SeenTokenMask
 
 if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
@@ -338,13 +338,19 @@ class NodeSubmodule(torch.nn.Module):
         return []
 
     def get_piecewise_cuda_graph_configs(
-        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+        sampler_buffers: "MultiSamplerBuffers | None" = None,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is the engine's autocast dtype — passed so a config's
         ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
         the captured region runs under (avoids a copy-time upcast at replay).
+
+        ``sampler_buffers`` are the node's engine-owned sampler buffers. A
+        captured region that samples reads its params straight out of them
+        (their addresses are stable across replays), so sampling can live
+        INSIDE the capture instead of being hoisted out as static inputs.
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

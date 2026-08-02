@@ -744,6 +744,87 @@ def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
     assert kwargs["enable_gqa"] is True
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="piecewise capture requires CUDA"
+)
+def test_qwen3_tts_depth_loop_piecewise_captures_its_own_sampling():
+    """The depth loop is captured *including* sampling, off the engine's aux
+    buffers — so eager paths (above all prefill) still replay it, and per-request
+    params stay live after capture.
+    """
+    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.utils.sampling import (
+        MultiSamplerBuffers,
+        MultiSamplingConfig,
+        SamplingConfig,
+    )
+
+    # Indexed device: the capture path pins kernels with torch.cuda.device(...),
+    # which rejects a bare "cuda".
+    dev = torch.device("cuda:0")
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config,
+    ).to(device=dev, dtype=torch.bfloat16).eval()
+    submodule.code_predictor.consolidate_stacked_weights()
+    submodule.DECODE_CAPTURE_BATCH_SIZES = [1, 2]
+
+    rids = ["a", "b"]
+    multi = MultiSamplingConfig(
+        main=SamplingConfig(vocab_size=config.talker.vocab_size),
+        aux={"code_predictor": SamplingConfig(temperature=0.9, top_k=8)},
+    )
+    multi.set_seed(11)
+    bufs = MultiSamplerBuffers.allocate(max_batch_size=2, device=dev, config=multi)
+    for rid in rids:
+        bufs.register_request(rid, multi)
+
+    configs = submodule.get_piecewise_cuda_graph_configs(
+        dev, torch.bfloat16, sampler_buffers=bufs,
+    )
+    runner = PiecewiseCudaGraphRunner(
+        config=configs["code_predictor_loop"], device=dev,
+        autocast_dtype=torch.bfloat16,
+    )
+    runner.warmup_and_capture()
+    assert runner.graphs, "depth-loop capture produced no graphs"
+
+    hidden = config.talker.hidden_size
+    engine_inputs = SimpleNamespace(
+        piecewise_runners={"code_predictor_loop": runner}, request_ids=rids,
+    )
+    last_hidden = torch.randn(2, hidden, device=dev, dtype=torch.bfloat16)
+    layer0 = torch.tensor([1, 2], device=dev)
+    codes, embed_sum = submodule._run_depth_loop_piecewise(
+        engine_inputs, last_hidden, layer0
+    )
+    assert codes.shape == (2, config.talker.num_code_groups)
+    assert embed_sum.shape == (2, hidden)
+    assert codes[:, 0].tolist() == [1, 2]
+
+    # A sub-bucket batch replays in the bs=2 graph, sliced back to its real size.
+    single = SimpleNamespace(
+        piecewise_runners={"code_predictor_loop": runner}, request_ids=["a"],
+    )
+    solo_codes, _ = submodule._run_depth_loop_piecewise(
+        single, last_hidden[:1], layer0[:1]
+    )
+    assert solo_codes.shape == (1, config.talker.num_code_groups)
+
+    # Switch request "a" to greedy AFTER capture; its row must go deterministic
+    # while the graph is untouched. (A capture-time constant could not.)
+    greedy = MultiSamplingConfig(
+        main=multi.main, aux={"code_predictor": SamplingConfig(temperature=0.0)},
+    )
+    greedy.set_seed(11)
+    bufs.update_request_config("a", greedy)
+    first, _ = submodule._run_depth_loop_piecewise(engine_inputs, last_hidden, layer0)
+    first = first.clone()
+    second, _ = submodule._run_depth_loop_piecewise(engine_inputs, last_hidden, layer0)
+    torch.cuda.synchronize()
+    assert first[0].tolist() == second[0].tolist()
+
+
 def test_qwen3_tts_aux_sampling_config_drives_code_predictor():
     """Residual groups are configured through the ``code_predictor`` aux config,
     which the engine turns into its own per-request sampler buffers."""

@@ -394,6 +394,9 @@ class KVCacheEngine(BaseEngine):
                 kv_cache_config=kv_mgmt.kv_cache_config,
                 alloc_manager=kv_mgmt.alloc_manager,
                 buffer_manager=kv_mgmt.buffer_manager,
+                # Lets a captured region sample in-graph off the node's static
+                # sampler buffers (e.g. the Qwen3-TTS CodePredictor depth loop).
+                sampler_buffers=runner.sampler_buffer,
             )
 
         # torch.compile applied after CUDA graph capture so compiled kernels
