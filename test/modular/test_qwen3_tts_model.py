@@ -855,7 +855,7 @@ def test_qwen3_tts_aux_sampling_config_drives_code_predictor():
 
     # The bundle the engines actually consume.
     multi = model.resolve_sampling_configs("Talker", {})
-    assert multi.main is not None and multi.main.vocab_size is not None
+    assert multi.main.vocab_size is not None
     assert set(multi.aux) == {"code_predictor"}
     multi.set_seed(99)
     assert multi.main.seed == 99

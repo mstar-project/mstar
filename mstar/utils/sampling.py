@@ -235,12 +235,19 @@ class MultiSamplingConfig:
     different params — e.g. the Qwen3-Omni Talker samples codec group 0 from the
     Talker LLM and groups 1..N-1 from the CodePredictor.
     """
-    main: SamplingConfig | None = field(default_factory=SamplingConfig)
+    # Never None after construction — see ``__post_init__``. Callers of a node's
+    # config can read ``.main`` unguarded.
+    main: SamplingConfig = field(default_factory=SamplingConfig)
     aux: dict[str, SamplingConfig] = field(default_factory=dict)
 
+    def __post_init__(self):
+        if self.main is None:
+            # Allow the upstream (e.g., a model implementation) to return None
+            # for its base config, but set it to the default sampling config here.
+            self.main = SamplingConfig()
+
     def set_seed(self, seed: int):
-        if self.main is not None:
-            self.main.set_seed(seed)
+        self.main.set_seed(seed)
         for label, cfg in self.aux.items():
             # Derive aux seeds from the request seed so aux draws don't replay
             # the main sampler's philox stream. crc32 (unlike hash()) is stable
@@ -249,13 +256,13 @@ class MultiSamplingConfig:
 
     @property
     def seed(self):
-        return self.main.seed if self.main is not None else 0
+        return self.main.seed
 
     @property
     def ignore_eos(self) -> bool:
         # Stop conditions are a main-config concern; submodules' ``check_stop``
         # reads this straight off the node's config.
-        return self.main.ignore_eos if self.main is not None else False
+        return self.main.ignore_eos
 
 
 @dataclass
@@ -503,8 +510,7 @@ class MultiSampler(BaseMultiSampler):
             aux.remove_request(request_id)
 
     def set_config(self, request_id: str, config: MultiSamplingConfig):
-        if config.main is not None:
-            self.main.set_config(request_id, **asdict(config.main))
+        self.main.set_config(request_id, **asdict(config.main))
         for label in config.aux.keys() & self.aux.keys():
             self.aux[label].set_config(request_id, **asdict(config.aux[label]))
 
@@ -1155,7 +1161,7 @@ class MultiSamplerBuffers:
         tp_group: "CommGroup | None" = None,  # noqa: F821
     ) -> "MultiSamplerBuffers":
         config = config or MultiSamplingConfig()
-        main_cfg = config.main if config.main is not None else SamplingConfig()
+        main_cfg = config.main
 
         def mk(cfg: SamplingConfig) -> SamplerBuffers:
             return SamplerBuffers.allocate(
@@ -1183,8 +1189,7 @@ class MultiSamplerBuffers:
     def update_request_config(
         self, rid: str, config: MultiSamplingConfig,
     ) -> None:
-        if config.main is not None:
-            self.main.update_request_config(rid, config.main)
+        self.main.update_request_config(rid, config.main)
         for label, cfg in config.aux.items():
             bufs = self.aux.get(label)
             if bufs is not None:
