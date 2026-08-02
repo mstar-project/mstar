@@ -118,6 +118,10 @@ class KVCacheConfig:
     # "dense_gen" (adds the dense FA3 generation-attention fast path). The
     # model's get_kv_cache_config sets it; model yaml config may override.
     attention_backend: str = "flashinfer"
+    # Kernel selected inside FlashInfer's paged wrappers. ``auto`` may choose
+    # FA3 on Hopper; models can pin ``fa2`` when their deployment toolchain
+    # cannot compile the Hopper JIT kernels.
+    flashinfer_backend: str = "auto"
 
     def __post_init__(self):
         if self.num_qo_heads is None:

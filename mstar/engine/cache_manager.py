@@ -844,6 +844,7 @@ class FlashInferCacheManager(BatchedCacheManager):
                 page_size=page_size,
                 device=self.device,
                 enable_nvtx=self.enable_nvtx,
+                backend=cfg.flashinfer_backend,
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
@@ -856,6 +857,7 @@ class FlashInferCacheManager(BatchedCacheManager):
                 page_size=page_size,
                 device=self.device,
                 enable_nvtx=self.enable_nvtx,
+                backend=cfg.flashinfer_backend,
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[effective_label] = ps
@@ -982,6 +984,7 @@ class FlashInferCacheManager(BatchedCacheManager):
                 device=self.device,
                 use_cuda_graph=True,
                 enable_nvtx=self.enable_nvtx,
+                backend=cfg.flashinfer_backend,
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[combined_label] = ps
@@ -995,6 +998,7 @@ class FlashInferCacheManager(BatchedCacheManager):
                 head_dim=head_dim,
                 page_size=page_size,
                 enable_nvtx=self.enable_nvtx,
+                backend=cfg.flashinfer_backend,
             )
             ps = _PlanState(wrapper=wrapper)
             self._plan_states[combined_label] = ps

@@ -37,6 +37,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_omni``
      - ``Qwen/Qwen3-Omni-30B-A3B-Instruct``
      - Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.
+   * - ``qwen3_tts``
+     - ``Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice``
+     - Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.
    * - ``vjepa2``
      - ``facebook/vjepa2-vitl-fpc64-256``
      - V-JEPA 2 video encoder + masked predictor.
@@ -59,6 +62,50 @@ Notes
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
+
+Qwen3-TTS notes
+---------------
+
+- Install the model-specific dependencies with ``pip install -e '.[qwen3_tts]'``
+  and launch the default single-GPU deployment with
+  ``mstar serve qwen3_tts --gpus 0``.
+- The first integration supports the CustomVoice checkpoint and text-to-audio
+  requests. ``voice`` selects one of the checkpoint's built-in speakers and
+  ``language`` defaults to automatic detection.
+- Codec CUDA graphs are captured through batch size 8. The upstream decoder's
+  batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
+  graphs are resident; larger Codec batches therefore use the scheduler's safe
+  ceiling.
+- Talker prefill remains eager because it runs once with variable sequence
+  lengths. Decode uses a whole-walk CUDA Graph when residual sampling matches
+  the captured defaults; request-local EOS suppression is carried as a graph
+  tensor input so replay does not consult capture-slot dummy request state.
+  Requests with custom ``subtalker_*`` sampling fall back to eager Talker
+  execution while retaining the piecewise-captured 15-step CodePredictor loop.
+- The 12 Hz decoder does not require the system SoX executable. M* imports only
+  the exact upstream decoder modules, avoiding qwen-tts's unrelated 25 Hz SoX
+  probe during worker startup.
+
+For throughput/latency validation, run the native serving benchmark with the
+Qwen3-TTS model metadata rather than the Orpheus compatibility entry::
+
+   python -m benchmark.runner \
+       --url localhost:8000 \
+       --model qwen3_tts \
+       --profiling-type closed_loop \
+       --request-type text_to_speech \
+       --num-requests 20 \
+       --inference-system ours \
+       --num-warmup 2 \
+       --max-concurrency 4 \
+       --dataset seed_tts \
+       --output-dir .bench_outs
+
+The benchmark stops on the model's natural codec EOS by default. Use
+``--ignore-eos --output-len-min N --output-len-max N`` only when measuring
+fixed-length decode throughput rather than end-user latency.
+The first process-local request can include eager FlashInfer kernel JIT, so
+keep the warmup requests enabled when reporting steady-state latency.
 
 Cosmos3 environment requirements
 --------------------------------

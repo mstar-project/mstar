@@ -30,6 +30,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3_super": "cosmos3_super_tp2.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
+    "qwen3_tts": "qwen3tts.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -93,8 +94,12 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("                           raw_action_dim=10, action_chunk_size=16)")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
-    if model in ("orpheus", "qwen3_omni"):
-        voice = "tara" if model == "orpheus" else "Ethan"
+    if model in ("orpheus", "qwen3_omni", "qwen3_tts"):
+        voice = {
+            "orpheus": "tara",
+            "qwen3_omni": "Ethan",
+            "qwen3_tts": "Vivian",
+        }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
