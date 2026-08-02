@@ -71,10 +71,12 @@ Qwen3-TTS notes
   batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
   graphs are resident; larger Codec batches therefore use the scheduler's safe
   ceiling.
-- Talker prefill and the outer recurrent walk remain eager. The 15-step inner
-  CodePredictor loop is CUDA-graph captured; capturing the complete recurrent
-  walk can replay stale residual state, miss codec EOS, and append silent
-  frames.
+- Talker prefill remains eager because it runs once with variable sequence
+  lengths. Decode uses a whole-walk CUDA Graph when residual sampling matches
+  the captured defaults; request-local EOS suppression is carried as a graph
+  tensor input so replay does not consult capture-slot dummy request state.
+  Requests with custom ``subtalker_*`` sampling fall back to eager Talker
+  execution while retaining the piecewise-captured 15-step CodePredictor loop.
 - The 12 Hz decoder does not require the system SoX executable. M* imports only
   the exact upstream decoder modules, avoiding qwen-tts's unrelated 25 Hz SoX
   probe during worker startup.

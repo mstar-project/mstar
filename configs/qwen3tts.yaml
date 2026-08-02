@@ -1,5 +1,9 @@
 model: "qwen3_tts"
 max_seq_len: 32768
+# The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
+# kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
+kv_cache:
+  flashinfer_backend: fa2
 node_groups:
   - node_names: [Talker]
     ranks: [0]

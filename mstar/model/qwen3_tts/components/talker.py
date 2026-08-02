@@ -312,14 +312,15 @@ class Qwen3TTSCodePredictor(nn.Module):
             end = cache_pos + seq_len
             kv_cache[layer_idx, :, 0, cache_pos:end].copy_(k)
             kv_cache[layer_idx, :, 1, cache_pos:end].copy_(v)
-            keys = kv_cache[layer_idx, :, 0, :end]
-            values = kv_cache[layer_idx, :, 1, :end]
-            repeats = attn.num_heads // attn.num_kv_heads
-            keys = keys.repeat_interleave(repeats, dim=2).transpose(1, 2)
-            values = values.repeat_interleave(repeats, dim=2).transpose(1, 2)
+            keys = kv_cache[layer_idx, :, 0, :end].transpose(1, 2)
+            values = kv_cache[layer_idx, :, 1, :end].transpose(1, 2)
             queries = q.transpose(1, 2)
             attn_output = F.scaled_dot_product_attention(
-                queries, keys, values, is_causal=False
+                queries,
+                keys,
+                values,
+                is_causal=False,
+                enable_gqa=True,
             ).transpose(1, 2)
             attn_output = attn_output.reshape(batch_size, seq_len, -1)
             hidden_states = residual + attn.o_proj(attn_output)

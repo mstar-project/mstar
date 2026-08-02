@@ -75,6 +75,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (151644, 77091, 198)
+    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (151645, 198, 151644, 77091, 198)
 
     def __init__(
         self,
@@ -107,23 +109,23 @@ class TalkerSubmodule(ARNodeSubmodule):
         return self._suppress_mask
 
     def _get_batch_suppress_mask(
-        self, request_ids: list[str]
+        self, inputs: list[ARNodeInputs]
     ) -> torch.Tensor:
-        """Apply request-local minimum-length EOS suppression to the base mask."""
+        """Apply input-carried minimum-length EOS suppression to the base mask.
+
+        CUDA Graph replay calls ``preprocess`` with capture-slot dummy request
+        ids, so looking up request state here would permanently observe a new
+        request at frame zero. ``prepare_inputs`` runs with the real request and
+        carries the dynamic flag as a tensor instead.
+        """
         mask = self._get_suppress_mask().unsqueeze(0).expand(
-            len(request_ids), -1
+            len(inputs), -1
         ).clone()
         eos = self.talker_config.codec_eos_token_id
         if 0 <= eos < mask.shape[1]:
-            mask[:, eos] = torch.tensor(
-                [
-                    int(self.request_state(request_id).get("generated_frames", 0))
-                    < self.config.generation.min_new_tokens
-                    for request_id in request_ids
-                ],
-                dtype=torch.bool,
-                device=mask.device,
-            )
+            mask[:, eos] = torch.cat([
+                item.tensor_inputs["suppress_eos"] for item in inputs
+            ]).to(device=mask.device, dtype=torch.bool)
         return mask
 
     def _get_cp_kv_cache(self, batch_size: int) -> torch.Tensor:
@@ -187,9 +189,30 @@ class TalkerSubmodule(ARNodeSubmodule):
         This aligns text progress with the 12 Hz acoustic generation steps.
         """
         text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
-        if text_ids.shape[1] < 9:
+        expected_prefix = text_ids.new_tensor(
+            self.CHATML_ASSISTANT_PREFIX_TOKEN_IDS
+        )
+        expected_suffix = text_ids.new_tensor(
+            self.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
+        )
+        prefix_len = expected_prefix.numel()
+        suffix_len = expected_suffix.numel()
+        if text_ids.shape[1] < prefix_len + 1 + suffix_len:
             raise ValueError(
-                "Qwen3-TTS formatted prompt is shorter than its fixed chat suffix"
+                "Qwen3-TTS formatted prompt is shorter than its fixed ChatML "
+                "prefix, text token, and suffix"
+            )
+        if not torch.equal(text_ids[0, :prefix_len], expected_prefix):
+            raise ValueError(
+                "Qwen3-TTS ChatML assistant prefix changed; expected token IDs "
+                f"{expected_prefix.tolist()}, got "
+                f"{text_ids[0, :prefix_len].tolist()}"
+            )
+        if not torch.equal(text_ids[0, -suffix_len:], expected_suffix):
+            raise ValueError(
+                "Qwen3-TTS ChatML assistant suffix changed; expected token IDs "
+                f"{expected_suffix.tolist()}, got "
+                f"{text_ids[0, -suffix_len:].tolist()}"
             )
 
         codec = self.talker_config
@@ -215,14 +238,18 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         # Prefix layout mirrors the official CustomVoice generation helper:
         # assistant role, language/voice codec tags, then first text token.
-        role_embed = self._project_text(text_ids[:, :3]).to(codec_embeds.dtype)
+        role_embed = self._project_text(
+            text_ids[:, :prefix_len]
+        ).to(codec_embeds.dtype)
         tag_text = torch.cat([
             pad_embed.expand(-1, codec_embeds.shape[1] - 2, -1),
             bos_embed,
         ], dim=1)
         tag_embed = tag_text + codec_embeds[:, :-1]
         first_text = (
-            self._project_text(text_ids[:, 3:4]).to(codec_embeds.dtype)
+            self._project_text(
+                text_ids[:, prefix_len:prefix_len + 1]
+            ).to(codec_embeds.dtype)
             + codec_embeds[:, -1:]
         )
         prefill = torch.cat([role_embed, tag_embed, first_text], dim=1)
@@ -231,7 +258,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Decode consumes this tensor by ``generation_step`` and uses PAD once
         # the text condition has been exhausted.
         trailing = torch.cat([
-            self._project_text(text_ids[:, 4:-5]).to(codec_embeds.dtype),
+            self._project_text(
+                text_ids[:, prefix_len + 1:-suffix_len]
+            ).to(codec_embeds.dtype),
             eos_embed,
         ], dim=1)
         self.request_state(request_id).add_all(
@@ -266,6 +295,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 int(inputs["speaker_id"][0].item()),
                 int(inputs["language_id"][0].item()),
             )
+            state = self.request_state(fwd_info.request_id)
         elif graph_walk == "talker_decode":
             state = self.request_state(fwd_info.request_id)
             step = int(state["generation_step"])
@@ -286,9 +316,18 @@ class TalkerSubmodule(ARNodeSubmodule):
         else:
             raise ValueError(f"Unknown Qwen3-TTS Talker walk: {graph_walk!r}")
 
+        suppress_eos = (
+            int(state.get("generated_frames", 0))
+            < self.config.generation.min_new_tokens
+        )
         return ARNodeInputs(
             input_embeds=input_embeds,
             input_seq_len=input_embeds.shape[0],
+            tensor_inputs={
+                "suppress_eos": torch.tensor(
+                    [suppress_eos], dtype=torch.bool, device=self.get_device()
+                )
+            },
         )
 
     def preprocess(
@@ -318,9 +357,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             "last_token_indices": (
                 torch.tensor(seq_lens, device=self.get_device()).cumsum(0) - 1
             ),
-            "suppress_mask": self._get_batch_suppress_mask(
-                engine_inputs.request_ids
-            ),
+            "suppress_mask": self._get_batch_suppress_mask(inputs),
         }
 
     @staticmethod
@@ -746,22 +783,38 @@ class TalkerSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[BasicBatchedCudaGraphConfig]:
-        """Keep the recurrent Talker path outside a whole CUDA Graph.
+        """Capture fixed one-token Talker decode batches, including sampling.
 
-        A whole-walk capture also captures the main sampler, the mutable
-        15-position CodePredictor cache, and the recurrent codec-embedding
-        output. Real-checkpoint tests showed that this combined graph can
-        replay stale residual state after the text condition is exhausted: it
-        then emits silent frames until ``max_output_tokens`` instead of codec
-        EOS. The hot CodePredictor depth loop is still captured independently
-        by :meth:`get_piecewise_cuda_graph_configs`; the outer Talker
-        transformer and its request state remain eager.
-
-        Prefill also stays eager because it is variable-length, runs only once
-        per request, and is not on the 12 Hz recurrent hot path.
+        Dynamic EOS suppression is carried by ``ARNodeInputs`` and packed into
+        a graph input, so replay never consults capture-slot dummy request state.
+        Prefill remains eager because it is variable-length and runs once per
+        request.
         """
-        del device, tp_world_size
-        return []
+        del tp_world_size
+        dtype = self.model.model.codec_embedding.weight.dtype
+        return [BasicBatchedCudaGraphConfig(
+            capture_graph_walk="talker_decode",
+            labels=["main"],
+            requires_cfg=False,
+            single_request_inputs=ARNodeInputs(
+                input_embeds=torch.zeros(
+                    1,
+                    self.talker_config.hidden_size,
+                    dtype=dtype,
+                    device=device,
+                ),
+                input_seq_len=1,
+                # Padding slots clone this template, so every replay input must
+                # declare the same dynamic key as a real prepared request.
+                tensor_inputs={
+                    "suppress_eos": torch.ones(
+                        1, dtype=torch.bool, device=device
+                    )
+                },
+            ),
+            capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            compile=True,
+        )]
 
     def get_piecewise_cuda_graph_configs(
         self,
@@ -771,9 +824,10 @@ class TalkerSubmodule(ARNodeSubmodule):
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """Capture CodePredictor's 15-step depth loop as an inner CUDA Graph.
 
-        The outer Talker walk intentionally remains eager so EOS and recurrent
-        state stay request-owned. This inner graph has no engine KV cache: its
-        small frame-local cache is a static tensor owned by this submodule.
+        This runner is also useful when the whole Talker graph is ineligible,
+        for example after a request overrides ``subtalker_*`` sampling values.
+        It has no engine KV cache: its small frame-local cache is a static
+        tensor owned by this submodule.
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
@@ -838,9 +892,21 @@ class TalkerSubmodule(ARNodeSubmodule):
     def can_use_cuda_graphs(
         self, batch: NodeBatch, model_inputs: list[NodeInputs]
     ) -> bool:
-        """Reject whole-walk capture; only the inner CodePredictor is graphed."""
-        del batch, model_inputs
-        return False
+        """Use the whole decode graph only for its captured sampling constants."""
+        if batch.graph_walk != "talker_decode" or not self.can_batch(
+            batch, model_inputs
+        ):
+            return False
+        expected = {
+            "do_sample": self.config.generation.subtalker_dosample,
+            "temperature": self.config.generation.subtalker_temperature,
+            "top_k": self.config.generation.subtalker_top_k,
+            "top_p": self.config.generation.subtalker_top_p,
+        }
+        for info in batch.per_request_info.values():
+            if info.step_metadata.get("subtalker_sampling", expected) != expected:
+                return False
+        return super().can_use_cuda_graphs(batch, model_inputs)
 
     def get_needed_cache_labels(
         self,

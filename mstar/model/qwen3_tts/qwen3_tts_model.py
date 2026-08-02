@@ -22,12 +22,11 @@ and partition declarations, state-machine transitions, sampling defaults, and
 lazy worker-side construction. Heavy weights are not loaded in ``__init__``.
 """
 
-import importlib
 import importlib.metadata
+import importlib.util
 import sys
-from importlib.machinery import ModuleSpec
+from functools import lru_cache
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import torch
@@ -90,51 +89,68 @@ def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
     )
 
 
+@lru_cache(maxsize=1)
 def _load_qwen3_tts_decoder_classes() -> tuple[type, type]:
     """Load only qwen-tts' 12 Hz decoder modules.
 
     ``qwen_tts.__init__`` eagerly imports its high-level inference package,
     which in turn imports the unrelated 25 Hz tokenizer and pysox.  Pysox
     probes for a system ``sox`` executable at import time and emits a warning
-    even though the 12 Hz decoder used here never calls it.  Registering the
-    installed package directories as namespace packages lets Python import the
-    two exact upstream modules without executing those broad ``__init__``
-    files.  If another caller already imported qwen_tts, preserve that module
-    and use normal imports.
+    even though the 12 Hz decoder used here never calls it. Load the two exact
+    source files under an M*-private package name so their relative import
+    works without executing those broad ``__init__`` files or claiming the
+    public ``qwen_tts`` names in ``sys.modules``.
     """
-    if "qwen_tts" not in sys.modules:
-        try:
-            distribution = importlib.metadata.distribution("qwen-tts")
-        except importlib.metadata.PackageNotFoundError as exc:
-            raise ImportError(
-                "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
-                "M* with the qwen3_tts optional dependency"
-            ) from exc
+    try:
+        distribution = importlib.metadata.distribution("qwen-tts")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ImportError(
+            "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
+            "M* with the qwen3_tts optional dependency"
+        ) from exc
 
-        package_root = Path(distribution.locate_file("qwen_tts"))
-        package_paths = (
-            ("qwen_tts", package_root),
-            ("qwen_tts.core", package_root / "core"),
-            (
-                "qwen_tts.core.tokenizer_12hz",
-                package_root / "core" / "tokenizer_12hz",
-            ),
+    source_root = Path(distribution.locate_file(
+        "qwen_tts/core/tokenizer_12hz"
+    ))
+    private_package = "_mstar_qwen3_tts_tokenizer_12hz"
+    config_name = (
+        f"{private_package}.configuration_qwen3_tts_tokenizer_v2"
+    )
+    model_name = f"{private_package}.modeling_qwen3_tts_tokenizer_v2"
+    loaded_names = [private_package, config_name, model_name]
+
+    package_spec = importlib.util.spec_from_file_location(
+        private_package,
+        source_root / "__init__.py",
+        submodule_search_locations=[str(source_root)],
+    )
+    if package_spec is None:
+        raise ImportError(f"Cannot load qwen-tts package from {source_root}")
+    sys.modules[private_package] = importlib.util.module_from_spec(package_spec)
+
+    def load_private_module(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load qwen-tts module from {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    try:
+        config_module = load_private_module(
+            config_name,
+            source_root / "configuration_qwen3_tts_tokenizer_v2.py",
         )
-        for name, path in package_paths:
-            module = ModuleType(name)
-            module.__package__ = name
-            module.__path__ = [str(path)]
-            spec = ModuleSpec(name, loader=None, is_package=True)
-            spec.submodule_search_locations = module.__path__
-            module.__spec__ = spec
-            sys.modules[name] = module
+        model_module = load_private_module(
+            model_name,
+            source_root / "modeling_qwen3_tts_tokenizer_v2.py",
+        )
+    except Exception:
+        for name in loaded_names:
+            sys.modules.pop(name, None)
+        raise
 
-    config_module = importlib.import_module(
-        "qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2"
-    )
-    model_module = importlib.import_module(
-        "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2"
-    )
     return (
         config_module.Qwen3TTSTokenizerV2DecoderConfig,
         model_module.Qwen3TTSTokenizerV2Decoder,
@@ -212,9 +228,9 @@ class Qwen3TTSModel(Model):
             max_seq_len=talker.max_position_embeddings,
             num_qo_heads=talker.num_attention_heads,
             nodes=["Talker"],
-            # FlashInfer 0.6.x auto-selects an FA3 JIT kernel on Hopper. The
-            # supported deployment toolchain uses the compatible FA2 kernel.
-            flashinfer_backend="fa2",
+            # Keep the model portable: deployment YAML may pin FA2 when its
+            # toolchain cannot build the Hopper FA3 JIT kernels.
+            flashinfer_backend="auto",
         )]
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
@@ -384,6 +400,13 @@ class Qwen3TTSModel(Model):
             )
 
         language = str(kwargs.get("language", self.config.default_language)).lower()
+        dialect = self.config.talker.spk_is_dialect.get(speaker, False)
+        if dialect and language in {"auto", "chinese"}:
+            language = str(dialect).lower()
+
+        # Validate after applying the speaker's dialect. Otherwise a malformed
+        # dialect mapping falls through ``dict.get(..., -1)`` below and silently
+        # degrades to automatic language selection.
         if language != "auto" and language not in self.config.talker.codec_language_id:
             supported = ", ".join(
                 ["auto", *sorted(self.config.talker.codec_language_id)]
@@ -391,10 +414,6 @@ class Qwen3TTSModel(Model):
             raise ValueError(
                 f"Unsupported Qwen3-TTS language {language!r}; supported: {supported}"
             )
-
-        dialect = self.config.talker.spk_is_dialect.get(speaker, False)
-        if dialect and language in {"auto", "chinese"}:
-            language = str(dialect)
 
         # Match the official processor template exactly. `_build_prefill`
         # relies on the fixed assistant suffix when separating prompt tokens

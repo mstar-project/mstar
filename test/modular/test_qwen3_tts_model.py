@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.base import EngineType, NodeBatch
@@ -145,7 +146,9 @@ def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     assert kv.num_kv_heads == model.config.talker.num_key_value_heads
     assert kv.num_qo_heads == model.config.talker.num_attention_heads
     assert kv.head_dim == model.config.talker.head_dim
-    assert kv.flashinfer_backend == "fa2"
+    assert kv.flashinfer_backend == "auto"
+    serving_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    assert serving_config["kv_cache"]["flashinfer_backend"] == "fa2"
 
     worker_graphs = model.get_worker_graphs(str(CONFIG_PATH))
     by_walk = {
@@ -183,10 +186,16 @@ def test_qwen3_tts_decoder_import_does_not_probe_sox():
         pytest.skip("qwen-tts optional dependency is not installed")
     script = """
 import sys
+import importlib.util
 from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_decoder_classes
 config_cls, decoder_cls = _load_qwen3_tts_decoder_classes()
 print(config_cls.__name__, decoder_cls.__name__)
 print('sox_loaded=' + str('sox' in sys.modules))
+print('public_qwen_tts_loaded=' + str(any(
+    name == 'qwen_tts' or name.startswith('qwen_tts.') for name in sys.modules
+)))
+public_spec = importlib.util.find_spec('qwen_tts')
+print('public_qwen_tts_origin=' + str(public_spec.origin))
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -198,6 +207,8 @@ print('sox_loaded=' + str('sox' in sys.modules))
         result.stdout
     )
     assert "sox_loaded=False" in result.stdout
+    assert "public_qwen_tts_loaded=False" in result.stdout
+    assert "qwen_tts/__init__.py" in result.stdout
     assert "SoX could not be found" not in result.stderr
 
 
@@ -254,6 +265,29 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     assert tensors["text_inputs"][0].tolist() == [1, 2, 3]
     assert tensors["speaker_id"][0].item() == 3065
     assert tensors["language_id"][0].item() == 2055
+
+
+def test_qwen3_tts_validates_speaker_dialect_after_language_override():
+    model = _make_model()
+
+    tensors = model.process_prompt(
+        "你好",
+        input_modalities=["text"],
+        output_modalities=["audio"],
+        voice="Eric",
+        language="auto",
+    )
+    assert tensors["language_id"][0].item() == 2062
+
+    model.config.talker.spk_is_dialect["vivian"] = "missing_dialect"
+    with pytest.raises(ValueError, match="missing_dialect"):
+        model.process_prompt(
+            "你好",
+            input_modalities=["text"],
+            output_modalities=["audio"],
+            voice="Vivian",
+            language="auto",
+        )
 
 
 @pytest.mark.parametrize(
@@ -429,6 +463,8 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
     talker = Qwen3TTSTalkerModel(config)
     predictor = Qwen3TTSCodePredictor(config)
     submodule = TalkerSubmodule(talker, predictor, config)
+    submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
+    submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
 
     embeds = submodule._build_prefill(
         request_id="request",
@@ -442,6 +478,27 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
     assert state["trailing_text_hidden"].shape == (4, 16)
     assert state["tts_pad_embed"].shape == (16,)
     assert state["generation_step"] == 0
+
+
+def test_qwen3_tts_talker_rejects_changed_chatml_layout():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config),
+        Qwen3TTSCodePredictor(config),
+        config,
+    )
+    submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
+    submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
+    text_ids = torch.arange(1, 13)
+    text_ids[-1] = 7
+
+    with pytest.raises(ValueError, match="ChatML assistant suffix changed"):
+        submodule._build_prefill(
+            request_id="request",
+            text_ids=text_ids,
+            speaker_id=40,
+            language_id=-1,
+        )
 
 
 def test_qwen3_tts_prefill_frame_counts_toward_generation_limit():
@@ -523,12 +580,15 @@ def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
         Qwen3TTSCodePredictor(config),
         config,
     )
-    submodule.request_state("new").add("generated_frames", 0)
-    submodule.request_state("ready").add(
-        "generated_frames", config.generation.min_new_tokens
-    )
-
-    mask = submodule._get_batch_suppress_mask(["new", "ready"])
+    inputs = [
+        ARNodeInputs(tensor_inputs={
+            "suppress_eos": torch.tensor([True]),
+        }),
+        ARNodeInputs(tensor_inputs={
+            "suppress_eos": torch.tensor([False]),
+        }),
+    ]
+    mask = submodule._get_batch_suppress_mask(inputs)
     eos = config.talker.codec_eos_token_id
 
     assert mask.shape == (2, config.talker.vocab_size)
@@ -536,7 +596,48 @@ def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
     assert mask[1, eos].item() is False
 
 
-def test_qwen3_tts_talker_batches_and_keeps_recurrent_decode_eager():
+def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config),
+        Qwen3TTSCodePredictor(config),
+        config,
+    )
+    real_state = submodule.request_state("real")
+    real_state.add_all(
+        generation_step=0,
+        generated_frames=config.generation.min_new_tokens,
+        trailing_text_hidden=torch.zeros(1, config.talker.hidden_size),
+        tts_pad_embed=torch.zeros(config.talker.hidden_size),
+    )
+    prepared = submodule.prepare_inputs(
+        "talker_decode",
+        SimpleNamespace(request_id="real"),
+        {"talker_input_embeds": [torch.zeros(1, config.talker.hidden_size)]},
+    )
+    cache_manager = SimpleNamespace(
+        set_active_label=lambda label: None,
+        plan_attention=lambda **kwargs: None,
+        plan_rope=lambda **kwargs: None,
+    )
+
+    packed = submodule.preprocess(
+        "talker_decode",
+        ModelInputsFromEngine(
+            request_ids=["__graph_dummy__"],
+            per_request_info={},
+            cache_manager=cache_manager,
+        ),
+        [prepared],
+    )
+
+    eos = config.talker.codec_eos_token_id
+    assert prepared.tensor_inputs["suppress_eos"].item() is False
+    assert packed["suppress_mask"][0, eos].item() is False
+    assert "__graph_dummy__" not in submodule.request_states
+
+
+def test_qwen3_tts_talker_batches_and_captures_decode():
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config),
@@ -563,13 +664,17 @@ def test_qwen3_tts_talker_batches_and_keeps_recurrent_decode_eager():
         per_request_info=info,
     )
     model_inputs = [
-        ARNodeInputs(input_embeds=torch.zeros(1, 16), input_seq_len=1)
+        ARNodeInputs(
+            input_embeds=torch.zeros(1, 16),
+            input_seq_len=1,
+            tensor_inputs={"suppress_eos": torch.tensor([True])},
+        )
         for _ in range(2)
     ]
 
     assert submodule.disable_torch_compile is True
     assert submodule.can_batch(batch, model_inputs)
-    assert not submodule.can_use_cuda_graphs(batch, model_inputs)
+    assert submodule.can_use_cuda_graphs(batch, model_inputs)
     cache_manager = SimpleNamespace(
         set_active_label=lambda label: None,
         plan_attention=lambda **kwargs: None,
@@ -586,7 +691,12 @@ def test_qwen3_tts_talker_batches_and_keeps_recurrent_decode_eager():
     )
     assert packed["input_embeds"].shape == (2, 16)
     assert packed["last_token_indices"].tolist() == [0, 1]
-    assert submodule.get_cuda_graph_configs(torch.device("cpu")) == []
+    graph_config = submodule.get_cuda_graph_configs(torch.device("cpu"))[0]
+    assert graph_config.capture_graph_walk == "talker_decode"
+    assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
+    assert graph_config.single_request_inputs.tensor_inputs[
+        "suppress_eos"
+    ].item() is True
     piecewise = submodule.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.float32
     )["code_predictor_loop"]
@@ -601,6 +711,51 @@ def test_qwen3_tts_talker_batches_and_keeps_recurrent_decode_eager():
     info["b"].step_metadata["subtalker_sampling"]["temperature"] = 0.7
     assert not submodule.can_batch(batch, model_inputs)
     assert not submodule.can_use_cuda_graphs(batch, model_inputs)
+
+
+def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
+    config = _tiny_model_config()
+    predictor = Qwen3TTSCodePredictor(config)
+    # This CPU-only contract test targets the SDPA call. FlashInfer RMSNorm is
+    # CUDA-only, so replace normalization without changing attention geometry.
+    for layer in predictor.model.layers:
+        layer.input_layernorm = torch.nn.Identity()
+        layer.post_attention_layernorm = torch.nn.Identity()
+        layer.self_attn.q_norm = torch.nn.Identity()
+        layer.self_attn.k_norm = torch.nn.Identity()
+    predictor.model.norm = torch.nn.Identity()
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+    calls = []
+
+    def capture_sdpa(query, key, value, **kwargs):
+        calls.append((query.shape, key.shape, value.shape, kwargs))
+        return original_sdpa(query, key, value, **kwargs)
+
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "scaled_dot_product_attention",
+        capture_sdpa,
+    )
+    output = predictor.forward_depth_unrolled(
+        inputs_embeds=torch.randn(1, 1, config.talker.hidden_size),
+        position_ids=torch.zeros(1, 1, dtype=torch.long),
+        kv_cache=torch.empty(
+            config.talker.code_predictor.num_hidden_layers,
+            1,
+            2,
+            config.talker.num_code_groups,
+            config.talker.code_predictor.num_key_value_heads,
+            config.talker.code_predictor.head_dim,
+        ),
+        cache_pos=0,
+    )
+
+    query_shape, key_shape, value_shape, kwargs = calls[0]
+    assert output.shape == (1, 1, config.talker.hidden_size)
+    assert query_shape[1] == config.talker.code_predictor.num_attention_heads
+    assert key_shape[1] == config.talker.code_predictor.num_key_value_heads
+    assert value_shape[1] == config.talker.code_predictor.num_key_value_heads
+    assert kwargs["enable_gqa"] is True
 
 
 def test_qwen3_tts_piecewise_sampling_is_tensor_only():
