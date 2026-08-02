@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 31, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 02, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -511,6 +511,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
 </ul>
             </nav>
@@ -573,19 +574,23 @@ serves the released policy sampling defaults (4 steps, guidance 3.0).</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-Omni-30B-A3B-Instruct</span></code></p></td>
 <td><p>Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice</span></code></p></td>
+<td><p>Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/vjepa2-vitl-fpc64-256</span></code></p></td>
 <td><p>V-JEPA 2 video encoder + masked predictor.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">vjepa2-ac-vitg</span></code></p></td>
 <td><p>V-JEPA 2-AC encoder + action-conditioned predictor.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
 <td><p>Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bosonai/higgs-audio-v3-stt</span></code></p></td>
 <td><p>Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.</p></td>
 </tr>
@@ -602,6 +607,50 @@ performance-optimized; treat their throughput/latency as provisional.</p></li>
 <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> for the inputs it expects.</p></li>
 <li><p>To add a new family, see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></li>
 </ul>
+</section>
+<section id="qwen3-tts-notes">
+<h2>Qwen3-TTS notes<a class="headerlink" href="#qwen3-tts-notes" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Install the model-specific dependencies with <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[qwen3_tts]'</span></code>
+and launch the default single-GPU deployment with
+<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">qwen3_tts</span> <span class="pre">--gpus</span> <span class="pre">0</span></code>.</p></li>
+<li><p>The first integration supports the CustomVoice checkpoint and text-to-audio
+requests. <code class="docutils literal notranslate"><span class="pre">voice</span></code> selects one of the checkpoint’s built-in speakers and
+<code class="docutils literal notranslate"><span class="pre">language</span></code> defaults to automatic detection.</p></li>
+<li><p>Codec CUDA graphs are captured through batch size 8. The upstream decoder’s
+batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
+graphs are resident; larger Codec batches therefore use the scheduler’s safe
+ceiling.</p></li>
+<li><p>Talker prefill remains eager because it runs once with variable sequence
+lengths. Decode uses a whole-walk CUDA Graph when residual sampling matches
+the captured defaults; request-local EOS suppression is carried as a graph
+tensor input so replay does not consult capture-slot dummy request state.
+Requests with custom <code class="docutils literal notranslate"><span class="pre">subtalker_*</span></code> sampling fall back to eager Talker
+execution while retaining the piecewise-captured 15-step CodePredictor loop.</p></li>
+<li><p>The 12 Hz decoder does not require the system SoX executable. M* imports only
+the exact upstream decoder modules, avoiding qwen-tts’s unrelated 25 Hz SoX
+probe during worker startup.</p></li>
+</ul>
+<p>For throughput/latency validation, run the native serving benchmark with the
+Qwen3-TTS model metadata rather than the Orpheus compatibility entry:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">runner</span> \
+    <span class="o">--</span><span class="n">url</span> <span class="n">localhost</span><span class="p">:</span><span class="mi">8000</span> \
+    <span class="o">--</span><span class="n">model</span> <span class="n">qwen3_tts</span> \
+    <span class="o">--</span><span class="n">profiling</span><span class="o">-</span><span class="nb">type</span> <span class="n">closed_loop</span> \
+    <span class="o">--</span><span class="n">request</span><span class="o">-</span><span class="nb">type</span> <span class="n">text_to_speech</span> \
+    <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">requests</span> <span class="mi">20</span> \
+    <span class="o">--</span><span class="n">inference</span><span class="o">-</span><span class="n">system</span> <span class="n">ours</span> \
+    <span class="o">--</span><span class="n">num</span><span class="o">-</span><span class="n">warmup</span> <span class="mi">2</span> \
+    <span class="o">--</span><span class="nb">max</span><span class="o">-</span><span class="n">concurrency</span> <span class="mi">4</span> \
+    <span class="o">--</span><span class="n">dataset</span> <span class="n">seed_tts</span> \
+    <span class="o">--</span><span class="n">output</span><span class="o">-</span><span class="nb">dir</span> <span class="o">.</span><span class="n">bench_outs</span>
+</pre></div>
+</div>
+<p>The benchmark stops on the model’s natural codec EOS by default. Use
+<code class="docutils literal notranslate"><span class="pre">--ignore-eos</span> <span class="pre">--output-len-min</span> <span class="pre">N</span> <span class="pre">--output-len-max</span> <span class="pre">N</span></code> only when measuring
+fixed-length decode throughput rather than end-user latency.
+The first process-local request can include eager FlashInfer kernel JIT, so
+keep the warmup requests enabled when reporting steady-state latency.</p>
 </section>
 <section id="cosmos3-environment-requirements">
 <h2>Cosmos3 environment requirements<a class="headerlink" href="#cosmos3-environment-requirements" title="Link to this heading">#</a></h2>
@@ -682,6 +731,7 @@ automatically.</p></li>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
 </ul>
   </nav></div>
@@ -716,7 +766,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 31, 2026.
+  Last updated on Aug 02, 2026.
   <br/>
 </p>
   </div>

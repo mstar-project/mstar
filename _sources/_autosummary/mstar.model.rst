@@ -35,6 +35,7 @@
    orpheus
    pi05
    qwen3_omni
+   qwen3_tts
    registry
    submodule_base
    utils

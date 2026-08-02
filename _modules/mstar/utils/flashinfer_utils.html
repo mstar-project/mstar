@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Jul 31, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 02, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -836,7 +836,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="n">rms_norm_dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="nb">input</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">rms_norm_dtype</span><span class="p">)</span>
     <span class="k">elif</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_autocast_enabled</span><span class="p">():</span>
-        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">get_autocast_gpu_dtype</span><span class="p">()</span>
+        <span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">get_autocast_dtype</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
         <span class="nb">input</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
     <span class="k">elif</span> <span class="nb">input</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">:</span>
         <span class="c1"># Unsupported dtype; must recast</span>
@@ -909,6 +909,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">),</span>
         <span class="n">use_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
@@ -950,6 +951,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">paged_kv_indptr_buf</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indptr_buf</span><span class="p">,</span>
                 <span class="n">paged_kv_indices_buf</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">,</span>
                 <span class="n">paged_kv_last_page_len_buf</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_last_page_len_buf</span><span class="p">,</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
             <span class="p">)</span>
 
             <span class="c1"># Static buffers for vectorized KV cache writes</span>
@@ -961,7 +963,7 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span> <span class="o">=</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">BatchPrefillWithPagedKVCacheWrapper</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="p">,</span> <span class="s2">&quot;NHD&quot;</span>
+                <span class="n">workspace_buffer</span><span class="p">,</span> <span class="s2">&quot;NHD&quot;</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
             <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">token_to_page</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">token_to_cache</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1139,6 +1141,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">),</span>
         <span class="n">use_cuda_graph</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
@@ -1174,6 +1177,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">paged_kv_indptr_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indptr_buf</span><span class="p">,</span>
                 <span class="n">paged_kv_indices_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_indices_buf</span><span class="p">,</span>
                 <span class="n">paged_kv_last_page_len_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_paged_kv_last_page_len_buf</span><span class="p">,</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
             <span class="p">)</span>
 
             <span class="c1"># Static buffer for KV write locations: [batch_size, 2] = (page_idx, pos_idx)</span>
@@ -1184,6 +1188,7 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">attn_wrapper</span> <span class="o">=</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">BatchDecodeWithPagedKVCacheWrapper</span><span class="p">(</span>
                 <span class="n">workspace_buffer</span><span class="p">,</span> <span class="s2">&quot;NHD&quot;</span><span class="p">,</span>
                 <span class="n">use_tensor_cores</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_locations</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -1360,7 +1365,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Jul 31, 2026.
+  Last updated on Aug 02, 2026.
   <br/>
 </p>
   </div>
