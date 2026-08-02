@@ -343,7 +343,10 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     assert talker.full_metadata.graph_walk == "talker_prefill"
     assert [edge.name for edge in talker.inputs] == list(pointers)
     assert talker.full_metadata.kwargs["talker_max_tokens"] == 12
-    assert talker.step_metadata["subtalker_sampling"]["top_k"] == 7
+    # Residual-group sampling rides the aux sampling config, not step metadata.
+    assert "subtalker_sampling" not in talker.step_metadata
+    aux = model.get_aux_sampling_configs("Talker", {"subtalker_top_k": 7})
+    assert aux["code_predictor"].top_k == 7
 
     codec = model.get_initial_forward_pass_args(
         "Codec",
@@ -365,7 +368,6 @@ def test_qwen3_tts_talker_prefill_transitions_to_decode():
         is_prefill=True,
         kwargs={
             "talker_max_tokens": 100,
-            "subtalker_sampling": {},
         },
     )
 
@@ -644,16 +646,8 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
         Qwen3TTSCodePredictor(config),
         config,
     )
-    expected_sampling = {
-        "do_sample": config.generation.subtalker_dosample,
-        "temperature": config.generation.subtalker_temperature,
-        "top_k": config.generation.subtalker_top_k,
-        "top_p": config.generation.subtalker_top_p,
-    }
     info = {
-        request_id: SimpleNamespace(
-            step_metadata={"subtalker_sampling": expected_sampling.copy()}
-        )
+        request_id: SimpleNamespace(step_metadata={})
         for request_id in ("a", "b")
     }
     batch = NodeBatch(
@@ -697,20 +691,12 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert graph_config.single_request_inputs.tensor_inputs[
         "suppress_eos"
     ].item() is True
-    piecewise = submodule.get_piecewise_cuda_graph_configs(
-        torch.device("cpu"), torch.float32
-    )["code_predictor_loop"]
-    assert piecewise.seq_len == 1
-    assert piecewise.uses_kv_cache is False
-    assert piecewise.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
-    capture_shape = piecewise.get_capture_shapes([2])[0]
-    static_inputs = piecewise.make_static_inputs(capture_shape)
-    assert static_inputs["last_hidden"].shape == (2, 16)
-    assert static_inputs["uniforms"].shape == (2, 3)
-
-    info["b"].step_metadata["subtalker_sampling"]["temperature"] = 0.7
-    assert not submodule.can_batch(batch, model_inputs)
-    assert not submodule.can_use_cuda_graphs(batch, model_inputs)
+    # Residual sampling params live in per-request sampler buffers, so requests
+    # that disagree about them still batch AND still replay the decode graph.
+    # (They used to fall out of both.)
+    info["b"].step_metadata["subtalker_sampling"] = {"temperature": 0.7}
+    assert submodule.can_batch(batch, model_inputs)
+    assert submodule.can_use_cuda_graphs(batch, model_inputs)
 
 
 def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
@@ -758,72 +744,42 @@ def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
     assert kwargs["enable_gqa"] is True
 
 
-def test_qwen3_tts_piecewise_sampling_is_tensor_only():
-    logits = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
-    tokens = TalkerSubmodule._sample_from_uniform(
-        logits=logits,
-        uniform=torch.tensor([0.3, 0.7]),
-        temperature=torch.ones(2),
-        top_k=torch.tensor([1, 1]),
-        top_p=torch.ones(2),
-        do_sample=torch.tensor([True, False]),
-    )
-    assert tokens.tolist() == [2, 0]
+def test_qwen3_tts_aux_sampling_config_drives_code_predictor():
+    """Residual groups are configured through the ``code_predictor`` aux config,
+    which the engine turns into its own per-request sampler buffers."""
+    model = _make_model()
+    generation = model.config.generation
 
+    default = model.get_aux_sampling_configs("Talker")["code_predictor"]
+    assert default.temperature == generation.subtalker_temperature
+    assert default.top_k == generation.subtalker_top_k
+    assert default.top_p == generation.subtalker_top_p
+    # No penalty on the depth loop => no seen-token mask buffers for this label.
+    assert default.vocab_size is None
 
-def test_qwen3_tts_uses_piecewise_runner_when_available():
-    config = _tiny_model_config()
-    submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
-        config,
-    )
+    overridden = model.get_aux_sampling_configs(
+        "Talker",
+        {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
+    )["code_predictor"]
+    assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
 
-    class _Sampler:
-        @staticmethod
-        def _broadcast_tokens(tensor):
-            return tensor
+    # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
+    greedy = model.get_aux_sampling_configs(
+        "Talker", {"subtalker_dosample": False}
+    )["code_predictor"]
+    assert greedy.temperature == 0.0
 
-    class _Runner:
-        called = False
+    # Only the Talker owns an aux sampler.
+    assert model.get_aux_sampling_configs("Codec") == {}
 
-        @staticmethod
-        def can_run(batch_size):
-            return batch_size == 1
-
-        def run(self, static_inputs, real_bs):
-            self.called = True
-            assert real_bs == 1
-            assert static_inputs["uniforms"].shape == (1, 3)
-            return {
-                "all_codes": torch.tensor([[1, 2, 3, 4]]),
-                "codec_embed_sum": torch.zeros(1, 16),
-            }
-
-    runner = _Runner()
-    result = submodule._run_code_predictor_piecewise(
-        engine_inputs=ModelInputsFromEngine(
-            request_ids=["request"],
-            per_request_info={
-                "request": SimpleNamespace(random_seed=123)
-            },
-            sampler=_Sampler(),
-            piecewise_runners={"code_predictor_loop": runner},
-        ),
-        last_hidden=torch.zeros(1, 16),
-        layer0_codes=torch.tensor([1]),
-        sampling={
-            "do_sample": True,
-            "temperature": 0.9,
-            "top_k": 10,
-            "top_p": 0.8,
-        },
-    )
-
-    assert runner.called
-    assert result is not None
-    assert result[0].tolist() == [[1, 2, 3, 4]]
-    assert result[1].shape == (1, 16)
+    # The bundle the engines actually consume.
+    multi = model.resolve_sampling_configs("Talker", {})
+    assert multi.main is not None and multi.main.vocab_size is not None
+    assert set(multi.aux) == {"code_predictor"}
+    multi.set_seed(99)
+    assert multi.main.seed == 99
+    # Aux stream is seeded independently of the Talker's.
+    assert multi.aux["code_predictor"].seed != 99
 
 
 class _FakeCodecDecoder(torch.nn.Module):

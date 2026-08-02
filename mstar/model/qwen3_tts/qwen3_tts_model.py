@@ -467,7 +467,6 @@ class Qwen3TTSModel(Model):
                 is_prefill=True,
                 kwargs={
                     "talker_max_tokens": self.get_max_output_tokens(**model_kwargs),
-                    "subtalker_sampling": self._get_subtalker_sampling(model_kwargs),
                 },
             )
             inputs = []
@@ -565,8 +564,8 @@ class Qwen3TTSModel(Model):
     ) -> SamplingConfig | None:
         """Configure sampling for codec group 0 predicted by the Talker.
 
-        Residual groups 1-15 use the independent ``subtalker_*`` settings
-        carried in step metadata and consumed by ``TalkerSubmodule``.
+        Residual groups 1-15 use the independent ``subtalker_*`` settings,
+        returned separately by ``get_aux_sampling_configs``.
         """
         if node_name != "Talker":
             return None
@@ -589,6 +588,43 @@ class Qwen3TTSModel(Model):
             ),
             ignore_eos=model_kwargs.get("ignore_eos", False),
         )
+
+    def get_aux_sampling_configs(
+        self,
+        node_name: str,
+        model_kwargs: dict | None = None,
+    ) -> dict[str, SamplingConfig]:
+        """Sampling for residual codec groups 1-15, predicted by the CodePredictor.
+
+        Driven by the ``subtalker_*`` knobs. ``subtalker_dosample=False`` maps to
+        temperature 0, which the sampler buffers encode as greedy.
+        """
+        if node_name != "Talker":
+            return {}
+        model_kwargs = model_kwargs or {}
+        generation = self.config.generation
+        do_sample = model_kwargs.get(
+            "subtalker_dosample", generation.subtalker_dosample
+        )
+        # No vocab_size: the depth loop applies no repetition penalty, so this
+        # label allocates no seen-token mask buffers.
+        return {
+            "code_predictor": SamplingConfig(
+                temperature=(
+                    model_kwargs.get(
+                        "subtalker_temperature", generation.subtalker_temperature
+                    )
+                    if do_sample
+                    else 0.0
+                ),
+                top_k=model_kwargs.get(
+                    "subtalker_top_k", generation.subtalker_top_k
+                ),
+                top_p=model_kwargs.get(
+                    "subtalker_top_p", generation.subtalker_top_p
+                ),
+            )
+        }
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
         return model_kwargs.get(
@@ -726,8 +762,8 @@ class Qwen3TTSModel(Model):
         self._verify_loaded(
             code_predictor, loaded, "Qwen3-TTS CodePredictor"
         )
-        # Piecewise CUDA Graph execution indexes all residual LM heads as one
-        # tensor; consolidate after the individual checkpoint heads are loaded.
+        # The captured depth loop indexes all residual LM heads as one tensor;
+        # consolidate after the individual checkpoint heads are loaded.
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
         return TalkerSubmodule(talker, code_predictor, self.config)
@@ -771,25 +807,6 @@ class Qwen3TTSModel(Model):
         decoder.eval()
         return CodecSubmodule(decoder, self.config)
 
-    def _get_subtalker_sampling(self, model_kwargs: dict[str, Any]) -> dict[str, Any]:
-        """Resolve sampling controls for residual codec groups 1 through 15."""
-        generation = self.config.generation
-        do_sample = model_kwargs.get(
-            "subtalker_dosample", generation.subtalker_dosample
-        )
-        return {
-            "do_sample": do_sample,
-            "temperature": (
-                model_kwargs.get(
-                    "subtalker_temperature", generation.subtalker_temperature
-                )
-                if do_sample
-                else 0.0
-            ),
-            "top_k": model_kwargs.get("subtalker_top_k", generation.subtalker_top_k),
-            "top_p": model_kwargs.get("subtalker_top_p", generation.subtalker_top_p),
-        }
-
     @staticmethod
     def _talker_step_metadata(
         metadata: CurrentForwardConductorMetadata,
@@ -798,5 +815,4 @@ class Qwen3TTSModel(Model):
         return {
             "is_prefill": metadata.is_prefill,
             "talker_max_tokens": metadata.kwargs["talker_max_tokens"],
-            "subtalker_sampling": metadata.kwargs["subtalker_sampling"],
         }

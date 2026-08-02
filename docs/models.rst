@@ -77,11 +77,12 @@ Qwen3-TTS notes
   graphs are resident; larger Codec batches therefore use the scheduler's safe
   ceiling.
 - Talker prefill remains eager because it runs once with variable sequence
-  lengths. Decode uses a whole-walk CUDA Graph when residual sampling matches
-  the captured defaults; request-local EOS suppression is carried as a graph
-  tensor input so replay does not consult capture-slot dummy request state.
-  Requests with custom ``subtalker_*`` sampling fall back to eager Talker
-  execution while retaining the piecewise-captured 15-step CodePredictor loop.
+  lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
+  CodePredictor loop captured inside it; request-local EOS suppression is
+  carried as a graph tensor input so replay does not consult capture-slot dummy
+  request state. Residual ``subtalker_*`` sampling is per-request through the
+  ``code_predictor`` aux sampler, so custom values neither block batching nor
+  fall off the graph.
 - The 12 Hz decoder does not require the system SoX executable. M* imports only
   the exact upstream decoder modules, avoiding qwen-tts's unrelated 25 Hz SoX
   probe during worker startup.
