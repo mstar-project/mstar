@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from mstar.model.zonos2 import vocoder as V
+
+torch = pytest.importorskip("torch")
 
 # Small geometry so windows/overlap are easy to reason about.
 NC = 3            # n_codebooks
@@ -64,9 +64,12 @@ class _LegacyDecoder:
 
     def reset(self, rid=None):
         if rid is None:
-            self._buffers.clear(); self._decoded.clear(); self._overlap_tails.clear()
+            self._buffers.clear()
+            self._decoded.clear()
+            self._overlap_tails.clear()
         else:
-            self._buffers.pop(rid, None); self._decoded.pop(rid, None)
+            self._buffers.pop(rid, None)
+            self._decoded.pop(rid, None)
             self._overlap_tails.pop(rid, None)
 
     def _fade_in(self, length):
@@ -152,7 +155,8 @@ def _drive(dec, frames, splits, trailing_final_flush=False):
     """
     outs, idx = [], 0
     for i, n in enumerate(splits):
-        chunk = frames[idx:idx + n]; idx += n
+        chunk = frames[idx:idx + n]
+        idx += n
         final = (i == len(splits) - 1) and not trailing_final_flush
         outs.append(dec.add_frames("r", chunk, is_final=final).cpu())
     if trailing_final_flush:
@@ -185,7 +189,9 @@ def test_rewrite_matches_legacy_bytes(seed, chunking):
         splits, rem = [], T
         while rem > 0:
             n = int(torch.randint(1, 7, (1,), generator=g).item())
-            n = min(n, rem); splits.append(n); rem -= n
+            n = min(n, rem)
+            splits.append(n)
+            rem -= n
 
     legacy = _drive(_LegacyDecoder(), frames, splits, trailing_final_flush=trailing)
     new = _drive(_new_decoder(), frames, splits, trailing_final_flush=trailing)
@@ -232,7 +238,8 @@ def test_batched_matches_per_request(seed):
     for r in rids:
         idx = 0
         for i, n in enumerate(schedules[r]):
-            chunk = streams[r][idx:idx + n]; idx += n
+            chunk = streams[r][idx:idx + n]
+            idx += n
             final = i == len(schedules[r]) - 1
             ref_out[r].append(ref[r].add_frames(r, chunk, is_final=final).cpu())
 
@@ -247,8 +254,10 @@ def test_batched_matches_per_request(seed):
             if step >= len(schedules[r]):
                 continue
             n = schedules[r][step]
-            chunk = streams[r][cursors[r]:cursors[r] + n]; cursors[r] += n
-            active.append(r); frames_list.append(chunk)
+            chunk = streams[r][cursors[r]:cursors[r] + n]
+            cursors[r] += n
+            active.append(r)
+            frames_list.append(chunk)
             finals.append(step == len(schedules[r]) - 1)
         res = dec.add_frames_batched(active, frames_list, finals)
         for r in active:

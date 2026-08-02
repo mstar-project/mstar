@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from mstar.model.zonos2.tts_sampling import (
     TTSSamplingParams,
     apply_min_p,
@@ -18,6 +16,8 @@ from mstar.model.zonos2.tts_sampling import (
     apply_top_p,
     sample_frame,
 )
+
+torch = pytest.importorskip("torch")
 
 C, V = 3, 8  # codebooks, per-codebook vocab
 

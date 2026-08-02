@@ -26,13 +26,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
-torch = pytest.importorskip("torch")
 from torch import nn
 
 from mstar.model.zonos2.sampler_buffers import Zonos2SamplerBuffers
 from mstar.model.zonos2.submodules import Zonos2LLMSubmodule
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams, sample_frame
+
+torch = pytest.importorskip("torch")
 
 C = 4              # n_codebooks (small for the test)
 V = 32             # audio vocab
@@ -305,7 +305,8 @@ def test_captured_sampler_matches_eager_token_for_token(reals, padded_bs):
     # Prime buf with a valid gather, then warm up on a side stream before capture.
     ei0 = _engine_inputs(request_ids=dummy, real_request_ids=rids)
     cap._prepare_sampler_step(ei0, padded_bs=padded_bs)
-    s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
             cap._sample_in_graph(static_logits)

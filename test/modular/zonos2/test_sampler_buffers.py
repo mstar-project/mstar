@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from mstar.model.zonos2.sampler_buffers import Zonos2SamplerBuffers
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams, apply_repetition_penalty
+
+torch = pytest.importorskip("torch")
 
 C = 4              # n_codebooks (small for the test)
 V = 32             # audio vocab
@@ -216,7 +216,8 @@ def test_in_graph_ops_are_capture_safe():
 
     # Warm up (allocations, autotune) on a side stream before capture.
     ring.gather_for_request_ids(["r0", "r1"], padded_bs=pb)
-    s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
             ring.repetition_ids(pb)

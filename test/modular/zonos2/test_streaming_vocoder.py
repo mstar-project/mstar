@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 import mstar.model.zonos2.vocoder as V
 from mstar.model.zonos2.vocoder import StreamingDacDecoder
+
+torch = pytest.importorskip("torch")
 
 HOP = 8            # tiny hop for a fast test
 C = 9              # n_codebooks

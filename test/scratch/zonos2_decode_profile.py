@@ -250,7 +250,8 @@ def main():
 
     hdr = (f"{'B':>3} | {'eager':>8} {'captured':>9} {'speedup':>8} | "
            f"{'_sample':>8} {'samp/captured':>14}")
-    print(hdr); print("-" * len(hdr))
+    print(hdr)
+    print("-" * len(hdr))
     for B in BATCH_SIZES:
         f = profile_forward(model, cfg, B)
         s = profile_sample(model, cfg, B)
