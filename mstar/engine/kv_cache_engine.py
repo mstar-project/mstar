@@ -513,6 +513,13 @@ class KVCacheEngine(BaseEngine):
         inputs: list[ARNodeInputs], sampler: Sampler,
     ) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
+        # GAP: this engine does not populate ``ragged_attention_state`` — KV-cached
+        # nodes attend through ``cache_manager``, and a second live attention
+        # channel here with no consumer would mean two ways to do one thing. A
+        # node that genuinely needs cacheless attention (a cross-attention encoder
+        # inside an AR node) should build one via ``get_ragged_attention_config``
+        # and set the field, the way ``StatelessEngine`` does, rather than adding a
+        # third mechanism. See ``mstar/engine/attention_state.py``.
         cache_manager = self._create_cache_manager(
             batch.request_ids, batch.node_name
         )

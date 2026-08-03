@@ -620,7 +620,8 @@ class StatelessEngine(BaseEngine):
                 submodule_name=node_name,
                 submodule=submodule,
                 device=self.device,
-                tp_group=self.parallel_groups.get_tp_config_for_node(node_name)
+                tp_group=self.parallel_groups.get_tp_config_for_node(node_name),
+                autocast_dtype=self.config.autocast_dtype or torch.bfloat16,
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()

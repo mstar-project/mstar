@@ -26,6 +26,11 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.attention_state import (
+    AttentionState,
+    RaggedAttention,
+    RaggedAttentionConfig,
+)
 from mstar.engine.cache_manager import (
     BatchedCacheManager,
     WorkspaceBufferManager,
@@ -93,6 +98,9 @@ class PiecewiseGraphData:
     static_cache_manager: BatchedCacheManager | None
     dummy_rids: list[str]
     shape: PiecewiseCaptureShape
+    # The bucket's cacheless attention state, when the submodule declared one.
+    # Replay must re-plan THIS object: the graph recorded its static buffers.
+    ragged_state: "AttentionState | None" = None
 
 @dataclass
 class CudaGraphData:
@@ -2069,6 +2077,7 @@ class StatelessCudaGraphRunner:
         submodule: nn.Module,
         device: torch.device,
         tp_group=None,
+        autocast_dtype: torch.dtype = torch.bfloat16,
     ):
 
         self.submodule_name = submodule_name
@@ -2078,6 +2087,16 @@ class StatelessCudaGraphRunner:
         self.capture_configs: list[CudaGraphConfig] = (
             submodule.get_cuda_graph_configs(device, tp_world_size) if submodule is not None else []
         )
+        # Ragged attention is gated purely on the submodule declaring it — no
+        # opt-in on CudaGraphConfig. Each capture bucket needs its OWN state:
+        # the graph records that state's static buffers, so sharing one across
+        # buckets would corrupt whichever graph was captured first.
+        self.ragged_config = (
+            submodule.get_ragged_attention_config(tp_world_size)
+            if submodule is not None else None
+        )
+        self.autocast_dtype = autocast_dtype
+        self._ragged = RaggedAttention(device=device)
 
         # Keyed by (graph_walk, padded_bs)
         self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
@@ -2086,6 +2105,38 @@ class StatelessCudaGraphRunner:
         self.dummy_rids: dict[tuple[str, int], list[str]] = {}
         self.memory_pool = None
         self.enable_nvtx = False
+
+    @staticmethod
+    def _ragged_key(graph_walk: str, bs: int) -> str:
+        return f"{graph_walk}_bs{bs}"
+
+    def _build_ragged_state(self, graph_walk: str, bs: int):
+        """One graph-mode AttentionState for this capture bucket, or None.
+
+        None when the submodule declared no ragged attention, or declared it
+        without the per-request bounds a fixed-size bucket needs — in that case
+        it keeps using the engine's eager state and this walk stays uncaptured
+        for attention purposes.
+        """
+        if self.ragged_config is None:
+            return None
+        max_num_segments = self.ragged_config.max_segments_for(bs)
+        max_total_tokens = self.ragged_config.max_tokens_for(bs)
+        if max_num_segments is None or max_total_tokens is None:
+            logger.warning(
+                "%s: ragged attention declared without max_segments_per_request / "
+                "max_tokens_per_request; cannot size a capture bucket for walk=%s bs=%d",
+                self.submodule_name, graph_walk, bs,
+            )
+            return None
+        return self._ragged.build(
+            self._ragged_key(graph_walk, bs),
+            self.ragged_config,
+            q_data_type=self.autocast_dtype,
+            use_cuda_graph=True,
+            max_num_segments=max_num_segments,
+            max_total_tokens=max_total_tokens,
+        )
 
     def warmup_and_capture(self) -> None:
         if not torch.cuda.is_available() or self.device is None:
@@ -2160,8 +2211,15 @@ class StatelessCudaGraphRunner:
         engine_inputs = ModelInputsFromEngine(
             request_ids=dummy_rids,
             per_request_info=dummy_info,
+            ragged_attention_state=self._build_ragged_state(
+                config.capture_graph_walk, bs
+            ),
         )
 
+        # preprocess runs OUTSIDE the captured region here and at replay, so a
+        # submodule plans its ragged layout there and only runs attention inside
+        # the graph — plan() does host work and writes the static indptr buffers,
+        # neither of which is capture-legal.
         packed = submodule.preprocess(
             graph_walk=config.capture_graph_walk,
             engine_inputs=engine_inputs,
@@ -2277,6 +2335,11 @@ class StatelessCudaGraphRunner:
         engine_inputs = ModelInputsFromEngine(
             request_ids=request_ids,
             per_request_info=per_request_info,
+            # The state this bucket was captured with — replay must re-plan the
+            # same object, since the graph recorded its static buffers.
+            ragged_attention_state=self._ragged.get(
+                self._ragged_key(graph_walk, padded_bs)
+            ),
         )
 
         if self.enable_nvtx:
@@ -2436,6 +2499,7 @@ class PiecewiseCudaGraphRunner:
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
         tp_group=None,
+        ragged_config: "RaggedAttentionConfig | None" = None,
     ):
         from mstar.distributed.communication import CommGroup
 
@@ -2445,6 +2509,11 @@ class PiecewiseCudaGraphRunner:
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.buffer_manager = buffer_manager
+        # Gated on the submodule declaring ragged attention, not on a flag on
+        # the piecewise config. Each bucket gets its own state — the graph
+        # records that state's static buffers.
+        self.ragged_config = ragged_config
+        self._ragged = RaggedAttention(device=device)
         # ``tp_group`` is the per-node TP comm group. Defaults to the trivial
         # single-rank group so the runner behaves identically for non-TP
         # submodules. When ``world_size > 1`` the captured region may include
@@ -2508,6 +2577,7 @@ class PiecewiseCudaGraphRunner:
     def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
         static_inputs = self.config.make_static_inputs(shape)
         static_cm, dummy_rids = self._setup_cache_manager(shape)
+        ragged_state, ragged_segments = self._setup_ragged_state(shape)
 
         fn = self.config.capture_fn
         if self.config.compile:
@@ -2518,16 +2588,27 @@ class PiecewiseCudaGraphRunner:
                 dynamic=False,
             )
 
+        # ``static_attn`` is passed only when the submodule declared ragged
+        # attention, so capture_fns that predate it keep their exact signature.
+        extra = {} if ragged_state is None else {"static_attn": ragged_state}
+
         def run_fn():
             return fn(
                 static_inputs=static_inputs,
                 static_cm=static_cm,
+                **extra,
                 **self.config.forward_kwargs,
             )
 
         def plan():
             if static_cm is not None:
                 self._plan(static_cm, shape)
+            if ragged_state is not None:
+                # Capture-time layout: the bucket's full token count spread over
+                # its segments. Replay re-plans the real cu_seqlens.
+                ragged_state.plan(
+                    self._capture_cu_seqlens(shape.total_tokens, ragged_segments)
+                )
 
         plan()
 
@@ -2559,7 +2640,48 @@ class PiecewiseCudaGraphRunner:
             static_cache_manager=static_cm,
             dummy_rids=dummy_rids,
             shape=shape,
+            ragged_state=ragged_state,
         )
+
+    def _setup_ragged_state(
+        self, shape: PiecewiseCaptureShape
+    ) -> tuple[AttentionState | None, int]:
+        """Build this bucket's cacheless attention state and its segment ceiling.
+
+        The token ceiling is the bucket's own ``total_tokens`` — this runner
+        already buckets by token count, so only the segment ceiling has to come
+        from the submodule's per-request bound.
+        """
+        if self.ragged_config is None:
+            return None, 0
+        max_num_segments = self.ragged_config.max_segments_for(shape.bs)
+        if max_num_segments is None:
+            logger.warning(
+                "PiecewiseCudaGraphRunner: ragged attention declared without "
+                "max_segments_per_request; cannot size a bucket for bs=%d",
+                shape.bs,
+            )
+            return None, 0
+        state = self._ragged.build(
+            f"bs{shape.bs}_tok{shape.total_tokens}",
+            self.ragged_config,
+            q_data_type=self.autocast_dtype,
+            use_cuda_graph=True,
+            max_num_segments=max_num_segments,
+            max_total_tokens=shape.total_tokens,
+        )
+        return state, max_num_segments
+
+    @staticmethod
+    def _capture_cu_seqlens(total_tokens: int, n_seg: int) -> torch.Tensor:
+        """Largest legal layout for the bucket: every segment used, tokens spread
+        evenly (remainder on the first)."""
+        lens = [total_tokens // n_seg] * n_seg
+        lens[0] += total_tokens % n_seg
+        cu = [0]
+        for seg_len in lens:
+            cu.append(cu[-1] + seg_len)
+        return torch.tensor(cu, dtype=torch.int32)
 
     def _setup_cache_manager(
         self, shape: PiecewiseCaptureShape,
@@ -2727,13 +2849,15 @@ class PiecewiseCudaGraphRunner:
         request_ids: list[str] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> PiecewiseOutput:
         """Replay the captured graph for the given real inputs.
 
         Steps (mirroring CudaGraphRunner._run_basic_batched):
           1. Copy each real input tensor into the runner-owned static buffer of
              the same name (zeroing any padded tail).
-          2. Swap real KV states onto dummy slots + plan_attention (if KV).
+          2. Swap real KV states onto dummy slots + plan_attention (if KV), and
+             re-plan the bucket's ragged attention state (if cacheless).
           3. graph.replay().
           4. advance_seq_lens (Python-only, outside graph).
           5. Restore dummy states.
@@ -2742,6 +2866,10 @@ class PiecewiseCudaGraphRunner:
         ``real_bs`` is inferred from ``request_ids`` or ``seq_lens`` when not
         given. PACKED configs require ``seq_lens`` (used for both the token
         bucket lookup and attention planning).
+
+        ``cu_seqlens`` is the varlen segment layout for submodules using ragged
+        attention — segments, not requests, so it is independent of ``seq_lens``.
+        The runner plans it outside the graph; the captured region only runs.
         """
         if real_bs is None:
             if request_ids is not None:
@@ -2790,6 +2918,16 @@ class PiecewiseCudaGraphRunner:
                 data.shape,
                 seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
             )
+
+        # --- 2b: re-plan cacheless attention for the real segment layout ---
+        if data.ragged_state is not None:
+            if cu_seqlens is None:
+                raise ValueError(
+                    "PiecewiseCudaGraphRunner.run: this bucket captured ragged "
+                    "attention; pass cu_seqlens so it can be re-planned before "
+                    "replay"
+                )
+            data.ragged_state.plan(cu_seqlens)
 
         # --- 3: replay ---
         data.graph.replay()
@@ -2840,6 +2978,10 @@ def build_piecewise_runners(
     configs = submodule.get_piecewise_cuda_graph_configs(
         device, autocast_dtype, tp_world_size
     )
+    # Ragged attention is a property of the submodule, so every label it
+    # declares captures against the same shape (each bucket still gets its own
+    # state).
+    ragged_config = submodule.get_ragged_attention_config(tp_world_size)
     runners: dict[str, PiecewiseCudaGraphRunner] = {}
     for label, config in configs.items():
         try:
@@ -2851,6 +2993,7 @@ def build_piecewise_runners(
                 alloc_manager=alloc_manager if config.uses_kv_cache else None,
                 buffer_manager=buffer_manager if config.uses_kv_cache else None,
                 tp_group=tp_group,
+                ragged_config=ragged_config,
             )
             runner.warmup_and_capture()
             if runner.graphs:

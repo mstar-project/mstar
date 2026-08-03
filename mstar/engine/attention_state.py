@@ -63,6 +63,29 @@ class RaggedAttentionConfig:
     sm_scale: float | None = None
     workspace_bytes: int = DEFAULT_WORKSPACE_BYTES
     make_attn_state: Callable[..., AttentionState] | None = None
+    # Per-request upper bounds used to size a CUDA-graph bucket: a capture at
+    # batch size ``bs`` gets ``bs *`` these. A "segment" is an independently-
+    # attending span, not a request — one audio clip window-chunks into several,
+    # and a multi-image request contributes one per image, so the segment count
+    # a graph must fix does NOT equal the batch size.
+    #
+    # ``max_segments_per_request`` is required to capture ragged attention at
+    # all. ``max_tokens_per_request`` is only needed by runners that don't
+    # already bucket by token count (the piecewise runner takes the bucket's
+    # ``total_tokens`` instead). Leave both None to opt out of captured ragged
+    # attention — the eager state is still built.
+    max_segments_per_request: int | None = None
+    max_tokens_per_request: int | None = None
+
+    def max_segments_for(self, bs: int) -> int | None:
+        if self.max_segments_per_request is None:
+            return None
+        return bs * self.max_segments_per_request
+
+    def max_tokens_for(self, bs: int) -> int | None:
+        if self.max_tokens_per_request is None:
+            return None
+        return bs * self.max_tokens_per_request
 
 
 def build_ragged_attention_state(
@@ -120,19 +143,30 @@ class RaggedAttention:
 
     def build(
         self,
-        node_name: str,
+        key: str,
         config: RaggedAttentionConfig,
         q_data_type: torch.dtype = torch.bfloat16,
+        use_cuda_graph: bool = False,
+        max_num_segments: int | None = None,
+        max_total_tokens: int | None = None,
     ) -> AttentionState:
+        """Build and retain one state. ``key`` is a node name for the engine's
+        eager states, or a capture-bucket id for a graph runner's."""
         workspace = torch.empty(
             config.workspace_bytes, dtype=torch.uint8, device=self.device
         )
         state = build_ragged_attention_state(
-            config, workspace, self.device, q_data_type=q_data_type
+            config,
+            workspace,
+            self.device,
+            q_data_type=q_data_type,
+            use_cuda_graph=use_cuda_graph,
+            max_num_segments=max_num_segments,
+            max_total_tokens=max_total_tokens,
         )
-        self.workspaces[node_name] = workspace
-        self.states[node_name] = state
+        self.workspaces[key] = workspace
+        self.states[key] = state
         return state
 
-    def get(self, node_name: str) -> AttentionState | None:
-        return self.states.get(node_name)
+    def get(self, key: str) -> AttentionState | None:
+        return self.states.get(key)
