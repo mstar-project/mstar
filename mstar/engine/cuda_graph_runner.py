@@ -2117,6 +2117,15 @@ class StatelessCudaGraphRunner:
         without the per-request bounds a fixed-size bucket needs — in that case
         it keeps using the engine's eager state and this walk stays uncaptured
         for attention purposes.
+
+        TODO: bucket on token count here too. This runner buckets on batch size
+        alone — ``CudaGraphConfig`` fixes one per-request ``seq_len``, so a
+        bucket's token ceiling is just ``bs * max_tokens_per_request``. A
+        submodule whose token count varies independently of ``bs`` therefore
+        either overflows the ceiling (``plan`` rejects it) or wastes the padding,
+        and today has to move to ``PiecewiseCudaGraphRunner`` — which already
+        buckets by token count — to be captured at all (see BAGEL's ViT). Token
+        buckets here are the same mechanism, planned for a future release.
         """
         if self.ragged_config is None or not self.ragged_config.cuda_graph_enabled:
             return None

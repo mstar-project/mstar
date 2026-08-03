@@ -128,9 +128,11 @@ def test_ragged_config_shards_heads_for_tp(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    # Buckets are 256/512: exact fit, padded into the small one, padded into the
+    # large one (so bucket selection has to skip past 256), and two segments.
     "seg_lens",
-    [[256], [200], [128, 100]],
-    ids=["exact_bucket", "under_bucket", "two_images"],
+    [[256], [200], [300], [128, 100]],
+    ids=["exact_bucket", "under_small", "under_large", "two_images"],
 )
 def test_captured_matches_eager(monkeypatch, seg_lens):
     sub = submodule(monkeypatch)

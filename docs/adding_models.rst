@@ -619,6 +619,14 @@ zero-length segments, so one graph serves any layout that fits its ceilings.
 
 .. note::
 
+   Only ``PiecewiseCudaGraphRunner`` buckets by *token count* today.
+   ``StatelessCudaGraphRunner`` buckets on batch size alone, so an encoder whose token
+   count varies independently of the batch size has to capture its inner loop
+   piecewise (as BAGEL's ViT does) rather than its whole forward. Token bucketing on
+   the whole-forward runner will be added in a future release.
+
+.. note::
+
    Only ``StatelessEngine`` populates ``ragged_attention_state`` today; on a
    ``KV_CACHE`` node it is ``None``. The field is engine-agnostic on purpose — a
    KV-cached node that needs ragged attention (a cross-attention encoder inside an AR
