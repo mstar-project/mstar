@@ -467,6 +467,7 @@ argument and returns a dict::
 
    capture_fn(static_inputs: dict[str, Tensor],
               static_cm: BatchedCacheManager | None = None,
+              static_attn: AttentionState | None = None,   # only if ragged attention
               **forward_kwargs) -> dict[str, Tensor]
 
 The one rule that makes it CUDA-graph-safe: **read tensors out of** ``static_inputs``
@@ -606,6 +607,43 @@ and run against it:
 - ``workspace_bytes`` — FlashInfer workspace for this node (default 128 MB).
 - ``make_attn_state`` — escape hatch: a factory returning your own ``AttentionState``
   instead of the default wrapper. Leave ``None`` unless you need a different backend.
+- ``max_segments_per_request`` / ``max_tokens_per_request`` — per-request upper bounds
+  that size a CUDA-graph bucket (a capture at batch size ``bs`` gets ``bs *`` these).
+  Required to capture ragged attention at all; leave them ``None`` and the eager state
+  is still built, but captured buckets skip attention and log a warning.
+
+.. warning::
+
+   A **segment** is an independently-attending span, not a request. An audio clip
+   window-chunks into several; a multi-image request contributes one per image. So the
+   segment count a graph must fix is *not* the batch size, and
+   ``max_segments_per_request`` is what lets the engine size it.
+
+Under CUDA graphs
+^^^^^^^^^^^^^^^^^
+
+Capture is gated purely on your submodule returning a config — there is no opt-in on
+``CudaGraphConfig`` or ``PiecewiseCudaGraphConfig``. Each capture bucket gets its **own**
+state, because the graph records that state's static buffers; re-planning a state some
+other graph captured would corrupt that graph.
+
+The one rule for your code: **plan outside the graph, run inside it.** ``plan()`` does
+host-side work and writes the static indptr buffers, neither of which is capture-legal.
+Both stateless runners give you a seam that already sits outside the captured region:
+
+- **Whole-forward** (``StatelessCudaGraphRunner``): ``preprocess`` runs outside the graph
+  at capture *and* at replay, so plan there and only call ``run`` from
+  ``forward_batched``.
+- **Piecewise** (``PiecewiseCudaGraphRunner``): the runner plans for you. Pass the layout
+  to ``runner.run(..., cu_seqlens=...)`` and it re-plans the bucket's state before
+  replay. Your ``capture_fn`` receives the state as a ``static_attn`` keyword — passed
+  only when a ragged config exists, so capture-fns that predate this keep their exact
+  signature. Omitting ``cu_seqlens`` on a bucket that captured ragged attention raises,
+  rather than silently replaying a stale plan.
+
+Layouts shorter than the bucket are padded with **zero-length segments**, so a captured
+graph serves any layout that fits its ceilings — you do not capture one graph per exact
+``cu_seqlens``.
 
 ``AttentionState`` is a two-method protocol — ``plan(cu_seqlens)`` and
 ``run(q, k, v)`` — deliberately narrow so that everything kernel-selecting (``causal``,

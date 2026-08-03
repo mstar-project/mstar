@@ -116,6 +116,30 @@ def test_config_defaults():
     assert config.causal is False           # encoders are bidirectional
     assert config.sm_scale is None          # derived from the TRUE head dim
     assert config.make_attn_state is None   # default state
+    # No per-request bounds → opts out of captured ragged attention.
+    assert config.max_segments_for(4) is None
+    assert config.max_tokens_for(4) is None
+
+
+def test_capture_bounds_scale_with_batch_size():
+    """Segments are spans, not requests — one clip window-chunks into several."""
+    config = RaggedAttentionConfig(
+        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM,
+        max_segments_per_request=3, max_tokens_per_request=256,
+    )
+    assert config.max_segments_for(1) == 3
+    assert config.max_segments_for(8) == 24
+    assert config.max_tokens_for(8) == 2048
+
+
+def test_capture_bounds_are_independent():
+    """The piecewise runner needs only the segment bound; it buckets tokens itself."""
+    config = RaggedAttentionConfig(
+        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM,
+        max_segments_per_request=3,
+    )
+    assert config.max_segments_for(4) == 12
+    assert config.max_tokens_for(4) is None
 
 
 # --------------------------------------------------------------------------- #
