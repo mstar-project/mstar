@@ -73,20 +73,22 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.transform = ImageTransform(980, 224, 14)
         self.vae_transform = ImageTransform(1024, 512, 16)
 
+        self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") != "1"
         # CUDA-graph capture of the ViT block loop. Opt-in (like MSTAR_VIT_BATCHING)
         # because capture costs one graph per (bs, token bucket) and the eager
         # flash-attn path is already fast; the win is removing per-layer launch
         # overhead on small images.
-        self._cuda_graph_enabled = os.environ.get("MSTAR_VIT_CUDA_GRAPH", "0") == "1"
+        self._cuda_graph_enabled = os.environ.get("MSTAR_VIT_CUDA_GRAPH", "1") == "1"
         self._cg_token_buckets = [
             int(t) for t in
             os.environ.get("MSTAR_VIT_CG_TOKEN_BUCKETS", "512,1024,2048,4096,4900").split(",")
             if t.strip()
-        ]
+        ] # NOTE: 4900 is the exact sequence length from the "vllm" preprocess option, which is
+          # why it is included
         self._cg_batch_sizes = [
             int(b) for b in
             os.environ.get("MSTAR_VIT_CG_BATCH_SIZES", "1,2,4").split(",") if b.strip()
-        ]
+        ] if self._vit_batching else [1]
         # prepare_inputs emits exactly one varlen segment (one image) per request,
         # so the segment ceiling is the batch size. Raise only if that changes.
         self._images_per_request = 1
@@ -285,12 +287,12 @@ class ViTEncoderSubmodule(NodeSubmodule):
         # Opt-in via MSTAR_VIT_BATCHING=1. Off by default because flashattn
         # varlen reductions across packed images produce small bf16 drift,
         # which at greedy temperature=0 can flip downstream LLM argmax.
-        if os.environ.get("MSTAR_VIT_BATCHING", "0") != "1":
+        if not self._vit_batching:
             return False
         return batch.graph_walk == "prefill_vit" and len(model_inputs) > 1
 
     def max_batch_size(self, graph_walk: str):
-        if os.environ.get("MSTAR_VIT_BATCHING", "0") != "1":
+        if not self._vit_batching:
             return 1
         if graph_walk == "prefill_vit":
             return 32

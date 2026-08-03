@@ -560,20 +560,11 @@ For a real, KV-cached instance see the V-JEPA2 AC predictor
 Attention without a KV cache (ragged attention)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``KV_CACHE`` nodes attend through ``engine_inputs.cache_manager``, which owns paged
-KV storage, RoPE planning, and sequence-length stepping. Encoder towers need none of
-that: an audio or vision tower attends *within* variable-length segments of a single
-packed forward — no cache, no cross-step state, and normally no causal mask. What it
-does need is a planned FlashInfer wrapper, and building one per model leads to
-module-global attention state that two components end up sharing.
-
-A submodule opts into an engine-owned one by returning a config from::
-
-   get_ragged_attention_config(self, tp_world_size=1) -> RaggedAttentionConfig | None
-
-The engine builds an ``AttentionState`` for the node and injects it as
-``engine_inputs.ragged_attention_state``. Your attention layers plan a layout on it
-and run against it:
+``KV_CACHE`` nodes attend through ``engine_inputs.cache_manager``. Encoder towers need
+none of what it owns — an audio or vision tower attends *within* variable-length
+segments of one packed forward, with no cache and no cross-step state. Return a config
+from ``get_ragged_attention_config(self, tp_world_size=1)`` and the engine builds an
+``AttentionState`` for the node, injected as ``engine_inputs.ragged_attention_state``:
 
 .. code-block:: python
 
@@ -584,7 +575,7 @@ and run against it:
            return RaggedAttentionConfig(
                num_qo_heads=self.num_heads // tp_world_size,   # POST-sharding
                num_kv_heads=self.num_heads // tp_world_size,
-               head_dim=self.head_dim,
+               head_dim=self.head_dim,                         # TRUE dim; padded internally
            )
 
        def forward(self, graph_walk, engine_inputs, hidden, cu_seqlens, **kwargs):
@@ -594,76 +585,44 @@ and run against it:
                hidden = block(hidden, attn)    # block calls attn.run(q, k, v)
            return {"embeds": [hidden]}
 
-``RaggedAttentionConfig`` fields:
+``AttentionState`` is just ``plan(cu_seqlens)`` and ``run(q, k, v)``. Everything
+kernel-selecting is fixed at build time, which is what lets a captured graph re-plan
+between replays. See ``mstar/engine/attention_state.py`` for the full field list;
+the ones with non-obvious contracts:
 
-- ``num_qo_heads`` / ``num_kv_heads`` / ``head_dim`` — the tower's attention shape.
-  Report **post-sharding** head counts; you already know how you built your layers
-  for ``tp_world_size``. ``head_dim`` is the TRUE one — FlashInfer only instantiates
-  kernels for head dims 64 / 128 / 256, so anything else (SigLIP2-style towers use 72)
-  is zero-padded internally and sliced back on the way out.
-- ``causal`` — default ``False``; encoders are bidirectional.
-- ``sm_scale`` — defaults to ``head_dim ** -0.5`` on the true head dim. Override only
-  for models that scale attention non-standardly. Do not derive it from a padded dim.
-- ``workspace_bytes`` — FlashInfer workspace for this node (default 128 MB).
-- ``make_attn_state`` — escape hatch: a factory returning your own ``AttentionState``
-  instead of the default wrapper. Leave ``None`` unless you need a different backend.
-- ``max_segments_per_request`` / ``max_tokens_per_request`` — per-request upper bounds
-  that size a CUDA-graph bucket (a capture at batch size ``bs`` gets ``bs *`` these).
-  Required to capture ragged attention at all; leave them ``None`` and the eager state
-  is still built, but captured buckets skip attention and log a warning.
-- ``enabled_for`` — an ``AttentionMode``: ``BOTH`` (default), ``EAGER``, or
-  ``CUDA_GRAPH``. States are not interchangeable across paths (a captured bucket owns
-  buffers its graph recorded), so each path you use costs its own state and workspace.
-  Narrow this when your submodule keeps a *different* backend on one path. BAGEL's ViT
-  declares ``CUDA_GRAPH``: eager runs flash-attn, which needs no head-dim padding, so
-  an eager state would be an unread ``workspace_bytes``. ``EAGER`` also silences the
-  missing-bucket-bounds warning, since capture was never intended.
+- ``head_dim`` — the TRUE dim. FlashInfer only has kernels for 64 / 128 / 256, so
+  anything else (SigLIP2-style towers use 72) is zero-padded internally.
+- ``max_segments_per_request`` / ``max_tokens_per_request`` — per-request bounds sizing
+  a CUDA-graph bucket (a capture at ``bs`` gets ``bs *`` these). Required to capture at
+  all.
+- ``enabled_for`` — ``AttentionMode.BOTH`` (default) / ``EAGER`` / ``CUDA_GRAPH``. Each
+  path costs its own state and workspace, so narrow it when your submodule keeps a
+  different backend on one path (BAGEL's ViT declares ``CUDA_GRAPH``; eager stays on
+  flash-attn, which needs no padding).
+- ``make_attn_state`` — escape hatch for a non-default backend.
 
 .. warning::
 
-   A **segment** is an independently-attending span, not a request. An audio clip
-   window-chunks into several; a multi-image request contributes one per image. So the
-   segment count a graph must fix is *not* the batch size, and
-   ``max_segments_per_request`` is what lets the engine size it.
+   A **segment** is an independently-attending span, not a request: an audio clip
+   window-chunks into several, and a multi-image request contributes one per image. The
+   segment count a graph fixes is *not* the batch size.
 
-Under CUDA graphs
-^^^^^^^^^^^^^^^^^
-
-Capture is gated purely on your submodule returning a config — there is no opt-in on
-``CudaGraphConfig`` or ``PiecewiseCudaGraphConfig``. Each capture bucket gets its **own**
-state, because the graph records that state's static buffers; re-planning a state some
-other graph captured would corrupt that graph.
-
-The one rule for your code: **plan outside the graph, run inside it.** ``plan()`` does
-host-side work and writes the static indptr buffers, neither of which is capture-legal.
-Both stateless runners give you a seam that already sits outside the captured region:
-
-- **Whole-forward** (``StatelessCudaGraphRunner``): ``preprocess`` runs outside the graph
-  at capture *and* at replay, so plan there and only call ``run`` from
-  ``forward_batched``.
-- **Piecewise** (``PiecewiseCudaGraphRunner``): the runner plans for you. Pass the layout
-  to ``runner.run(..., cu_seqlens=...)`` and it re-plans the bucket's state before
-  replay. Your ``capture_fn`` receives the state as a ``static_attn`` keyword — passed
-  only when a ragged config exists, so capture-fns that predate this keep their exact
-  signature. Omitting ``cu_seqlens`` on a bucket that captured ragged attention raises,
-  rather than silently replaying a stale plan.
-
-Layouts shorter than the bucket are padded with **zero-length segments**, so a captured
-graph serves any layout that fits its ceilings — you do not capture one graph per exact
-``cu_seqlens``.
-
-``AttentionState`` is a two-method protocol — ``plan(cu_seqlens)`` and
-``run(q, k, v)`` — deliberately narrow so that everything kernel-selecting (``causal``,
-``sm_scale``, dtype, head counts) is fixed when the state is built. That is what lets a
-CUDA-graph capture re-plan between replays without changing the kernel it recorded.
+**Under CUDA graphs**, capture is gated purely on your submodule returning a config —
+there is no opt-in on ``CudaGraphConfig``. Each bucket gets its own state, since the
+graph records that state's buffers. The one rule: **plan outside the graph, run inside
+it** (``plan()`` does host work and writes static buffers; neither is capture-legal).
+Both stateless runners give you a seam outside the captured region — ``preprocess`` for
+``StatelessCudaGraphRunner``, and for ``PiecewiseCudaGraphRunner`` the runner itself
+plans, taking the layout via ``runner.run(..., cu_seqlens=...)`` and handing your
+``capture_fn`` a ``static_attn`` keyword. Layouts shorter than a bucket are padded with
+zero-length segments, so one graph serves any layout that fits its ceilings.
 
 .. note::
 
    Only ``StatelessEngine`` populates ``ragged_attention_state`` today; on a
-   ``KV_CACHE`` node it is ``None`` and you attend through ``cache_manager`` instead.
-   The field is engine-agnostic on purpose — a KV-cached node that genuinely needs
-   ragged attention (a cross-attention encoder inside an AR node) should populate
-   this rather than add a third mechanism.
+   ``KV_CACHE`` node it is ``None``. The field is engine-agnostic on purpose — a
+   KV-cached node that needs ragged attention (a cross-attention encoder inside an AR
+   node) should populate this rather than add a third mechanism.
 
 Step 6 — Choose engine types
 ----------------------------

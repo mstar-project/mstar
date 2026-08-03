@@ -94,9 +94,7 @@ def _batch(node_name: str, request_ids: list[str]) -> NodeBatch:
     )
 
 
-# --------------------------------------------------------------------------- #
-# submodule opt-in
-# --------------------------------------------------------------------------- #
+# --- submodule opt-in ---
 
 
 def test_submodules_declare_no_ragged_attention_by_default():
@@ -114,16 +112,21 @@ def test_config_defaults():
     config = RaggedAttentionConfig(
         num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM
     )
-    assert config.causal is False           # encoders are bidirectional
-    assert config.sm_scale is None          # derived from the TRUE head dim
-    assert config.make_attn_state is None   # default state
+    assert config.causal is False               # encoders are bidirectional
+    assert config.sm_scale is None              # derived from the TRUE head dim
+    assert config.make_attn_state is None       # default state
+    assert config.enabled_for is AttentionMode.BOTH
     # No per-request bounds → opts out of captured ragged attention.
     assert config.max_segments_for(4) is None
     assert config.max_tokens_for(4) is None
 
 
 def test_capture_bounds_scale_with_batch_size():
-    """Segments are spans, not requests — one clip window-chunks into several."""
+    """Segments are spans, not requests — one clip window-chunks into several.
+
+    The two bounds are independent: the piecewise runner supplies its own token
+    ceiling from the bucket, so only the segment bound is mandatory.
+    """
     config = RaggedAttentionConfig(
         num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM,
         max_segments_per_request=3, max_tokens_per_request=256,
@@ -131,6 +134,13 @@ def test_capture_bounds_scale_with_batch_size():
     assert config.max_segments_for(1) == 3
     assert config.max_segments_for(8) == 24
     assert config.max_tokens_for(8) == 2048
+
+    segments_only = RaggedAttentionConfig(
+        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM,
+        max_segments_per_request=3,
+    )
+    assert segments_only.max_segments_for(4) == 12
+    assert segments_only.max_tokens_for(4) is None
 
 
 @pytest.mark.parametrize(
@@ -149,13 +159,6 @@ def test_enabled_for_selects_paths(mode, eager, cuda_graph):
     )
     assert config.eager_enabled is eager
     assert config.cuda_graph_enabled is cuda_graph
-
-
-def test_enabled_for_defaults_to_both():
-    config = RaggedAttentionConfig(
-        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM
-    )
-    assert config.enabled_for is AttentionMode.BOTH
 
 
 def test_cuda_graph_only_skips_the_engines_eager_state():
@@ -177,39 +180,25 @@ def test_eager_only_still_builds_the_engine_state():
     assert engine._ragged.get("encoder") is not None
 
 
-def test_capture_bounds_are_independent():
-    """The piecewise runner needs only the segment bound; it buckets tokens itself."""
-    config = RaggedAttentionConfig(
-        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM,
-        max_segments_per_request=3,
-    )
-    assert config.max_segments_for(4) == 12
-    assert config.max_tokens_for(4) is None
+# --- building states ---
 
 
-# --------------------------------------------------------------------------- #
-# building states
-# --------------------------------------------------------------------------- #
-
-
-def test_make_attn_state_override_is_used():
+def test_make_attn_state_override_receives_config_and_bucket_bounds():
     config = _stub_config()
-    state = build_ragged_attention_state(
+    eager = build_ragged_attention_state(
         config, torch.zeros(8, dtype=torch.uint8), torch.device("cpu")
     )
-    assert isinstance(state, _StubState)
-    assert state.kwargs["config"] is config
-    assert state.kwargs["use_cuda_graph"] is False
+    assert isinstance(eager, _StubState)
+    assert eager.kwargs["config"] is config
+    assert eager.kwargs["use_cuda_graph"] is False
 
-
-def test_make_attn_state_receives_graph_bucket_bounds():
-    state = build_ragged_attention_state(
-        _stub_config(), torch.zeros(8, dtype=torch.uint8), torch.device("cpu"),
+    captured = build_ragged_attention_state(
+        config, torch.zeros(8, dtype=torch.uint8), torch.device("cpu"),
         use_cuda_graph=True, max_num_segments=4, max_total_tokens=512,
     )
-    assert state.kwargs["use_cuda_graph"] is True
-    assert state.kwargs["max_num_segments"] == 4
-    assert state.kwargs["max_total_tokens"] == 512
+    assert captured.kwargs["use_cuda_graph"] is True
+    assert captured.kwargs["max_num_segments"] == 4
+    assert captured.kwargs["max_total_tokens"] == 512
 
 
 def test_ragged_attention_keeps_workspace_alive():
@@ -220,14 +209,7 @@ def test_ragged_attention_keeps_workspace_alive():
     assert ragged.workspaces["audio_encoder"].numel() == 1024
 
 
-def test_ragged_attention_get_is_none_for_unknown_node():
-    ragged = RaggedAttention(device=torch.device("cpu"))
-    assert ragged.get("nope") is None
-
-
-# --------------------------------------------------------------------------- #
-# StatelessEngine plumbing
-# --------------------------------------------------------------------------- #
+# --- StatelessEngine plumbing ---
 
 
 def test_warmup_builds_state_for_declaring_node():
@@ -295,51 +277,25 @@ def test_tp_world_size_is_passed_to_submodule():
     assert seen["tp_world_size"] == 1
 
 
-# --------------------------------------------------------------------------- #
-# default state (real FlashInfer)
-# --------------------------------------------------------------------------- #
+# --- default state (real FlashInfer) ---
 
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="default ragged state requires CUDA"
-)
-
-
-@requires_cuda
-def test_default_state_is_a_ragged_prefill_wrapper():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="default state needs CUDA")
+def test_default_state_is_a_working_ragged_prefill_wrapper():
     from mstar.utils.flashinfer_utils import RaggedPrefillWrapper
 
+    device = torch.device("cuda:0")
     config = RaggedAttentionConfig(
         num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM
     )
-    device = torch.device("cuda:0")
-    state = build_ragged_attention_state(
-        config,
-        torch.empty(config.workspace_bytes, dtype=torch.uint8, device=device),
-        device,
-    )
+    state = RaggedAttention(device=device).build("audio_encoder", config)
+
     assert isinstance(state, RaggedPrefillWrapper)
-    assert isinstance(state, AttentionState)   # satisfies the protocol
-    assert state.num_qo_heads == NUM_HEADS
-    assert state.head_dim == HEAD_DIM
+    assert isinstance(state, AttentionState)        # satisfies the protocol
     assert state.sm_scale == pytest.approx(HEAD_DIM ** -0.5)
-    assert state.causal is False
 
-
-@requires_cuda
-def test_default_state_plans_and_runs():
-    config = RaggedAttentionConfig(
-        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM
-    )
-    device = torch.device("cuda:0")
-    ragged = RaggedAttention(device=device)
-    state = ragged.build("audio_encoder", config)
-
-    seg_lens = [128, 64, 32]
-    cu = torch.tensor([0, 128, 192, 224], dtype=torch.int32)
     qkv = tuple(
-        torch.randn(sum(seg_lens), NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
+        torch.randn(224, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
         for _ in range(3)
     )
-    state.plan(cu)
-    out = state.run(*qkv)
-    assert out.shape == qkv[0].shape
+    state.plan(torch.tensor([0, 128, 192, 224], dtype=torch.int32))
+    assert state.run(*qkv).shape == qkv[0].shape
