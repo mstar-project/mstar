@@ -10,6 +10,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.attention_state import AttentionState, RaggedAttentionConfig
 from mstar.engine.base import NodeBatch
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.engine.kv_store import PositionInfo
@@ -199,6 +200,13 @@ class ModelInputsFromEngine:
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
     per_request_states: dict[str, PerRequestState] | None = None
+    # Cacheless (encoder-style) attention for nodes that declared a
+    # ``RaggedAttentionConfig``; None when they didn't. GAP: only
+    # ``StatelessEngine`` populates this today — KV_CACHE nodes attend through
+    # ``cache_manager``. The field is engine-agnostic on purpose, so a KV_CACHE
+    # node that needs ragged attention populates this rather than adding a third
+    # mechanism.
+    ragged_attention_state: AttentionState | None = None
 
     @property
     @torch.compiler.disable
@@ -330,6 +338,25 @@ class NodeSubmodule(torch.nn.Module):
         it enabled, wrap the submodule's forward with
         ``torch.amp.autocast(enabled=False)`` — that path is engine-agnostic
         and doesn't need this surface.
+        """
+        return None
+
+    def get_ragged_attention_config(
+        self, tp_world_size: int = 1
+    ) -> RaggedAttentionConfig | None:
+        """Declare cacheless, encoder-style attention for this submodule.
+
+        Return a config and the engine builds an ``AttentionState`` for the
+        node and injects it as ``ModelInputsFromEngine.ragged_attention_state``;
+        your attention layers plan a ``cu_seqlens`` layout on it and run against
+        it, instead of reaching for a module-global FlashInfer wrapper.
+
+        Report **post-sharding** head counts — you already know how you built
+        your layers for ``tp_world_size``. No ``device`` argument: the config is
+        pure metadata, and the engine supplies the device when it builds.
+
+        Default: ``None`` (no ragged attention). KV-cached nodes leave this
+        alone and attend through ``cache_manager``.
         """
         return None
 
