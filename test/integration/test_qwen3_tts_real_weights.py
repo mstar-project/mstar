@@ -16,6 +16,7 @@ import torch
 
 from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+from mstar.utils.attention import apply_rope_pos_ids
 
 HF_REPO = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
@@ -84,6 +85,40 @@ def test_real_checkpoint_loads_all_components(model, talker, codec):
     assert sum(p.numel() for p in codec.decoder.parameters()) == 114_323_137
     assert next(talker.model.parameters()).dtype == torch.bfloat16
     assert next(codec.decoder.parameters()).dtype == torch.float32
+
+
+def test_fused_code_predictor_rope_matches_checkpoint_formula():
+    device = torch.device("cuda:0")
+    dtype = torch.bfloat16
+    head_dim = 128
+    rope_theta = 1_000_000.0
+    position_ids = torch.tensor([7], dtype=torch.int32, device=device)
+    q = torch.randn(1, 16, head_dim, dtype=dtype, device=device)
+    k = torch.randn(1, 8, head_dim, dtype=dtype, device=device)
+
+    inv_freq = 1.0 / (
+        rope_theta ** (
+            torch.arange(
+                0, head_dim, 2, dtype=torch.float32, device=device
+            ) / head_dim
+        )
+    )
+    angles = position_ids.to(torch.float32).unsqueeze(1) * inv_freq
+    cos = torch.cat([angles.cos(), angles.cos()], dim=-1).to(dtype).unsqueeze(1)
+    sin = torch.cat([angles.sin(), angles.sin()], dim=-1).to(dtype).unsqueeze(1)
+
+    def reference(tensor: torch.Tensor) -> torch.Tensor:
+        first, second = tensor.chunk(2, dim=-1)
+        return tensor * cos + torch.cat([-second, first], dim=-1) * sin
+
+    expected_q = reference(q)
+    expected_k = reference(k)
+    actual_q, actual_k = apply_rope_pos_ids(
+        q.clone(), k.clone(), position_ids, rope_theta
+    )
+
+    torch.testing.assert_close(actual_q, expected_q, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(actual_k, expected_k, rtol=1e-2, atol=2e-2)
 
 
 def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
