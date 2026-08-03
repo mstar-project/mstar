@@ -611,6 +611,13 @@ and run against it:
   that size a CUDA-graph bucket (a capture at batch size ``bs`` gets ``bs *`` these).
   Required to capture ragged attention at all; leave them ``None`` and the eager state
   is still built, but captured buckets skip attention and log a warning.
+- ``enabled_for`` — an ``AttentionMode``: ``BOTH`` (default), ``EAGER``, or
+  ``CUDA_GRAPH``. States are not interchangeable across paths (a captured bucket owns
+  buffers its graph recorded), so each path you use costs its own state and workspace.
+  Narrow this when your submodule keeps a *different* backend on one path. BAGEL's ViT
+  declares ``CUDA_GRAPH``: eager runs flash-attn, which needs no head-dim padding, so
+  an eager state would be an unread ``workspace_bytes``. ``EAGER`` also silences the
+  missing-bucket-bounds warning, since capture was never intended.
 
 .. warning::
 

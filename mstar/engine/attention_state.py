@@ -11,6 +11,7 @@ a ``RaggedAttentionConfig`` and the engine builds and owns the state.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 import torch
@@ -19,6 +20,25 @@ if TYPE_CHECKING:
     from mstar.utils.flashinfer_utils import RaggedPrefillWrapper  # noqa: F401
 
 DEFAULT_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+class AttentionMode(Enum):
+    """Which execution paths a node's ragged attention is built for.
+
+    States are not interchangeable across paths — a captured bucket owns static
+    buffers the graph recorded — so each path a node uses costs its own state
+    and workspace. Declaring the paths you actually use avoids paying for the
+    ones you don't.
+    """
+
+    #: Eager only. No capture-bucket states, and missing bucket bounds are not
+    #: a misconfiguration.
+    EAGER = "eager"
+    #: Capture buckets only; ``ragged_attention_state`` stays None outside
+    #: captured regions. For submodules keeping a different eager backend.
+    CUDA_GRAPH = "cuda_graph"
+    #: Both, the default.
+    BOTH = "both"
 
 
 @runtime_checkable
@@ -64,18 +84,30 @@ class RaggedAttentionConfig:
     workspace_bytes: int = DEFAULT_WORKSPACE_BYTES
     make_attn_state: Callable[..., AttentionState] | None = None
     # Per-request upper bounds used to size a CUDA-graph bucket: a capture at
-    # batch size ``bs`` gets ``bs *`` these. A "segment" is an independently-
-    # attending span, not a request — one audio clip window-chunks into several,
-    # and a multi-image request contributes one per image, so the segment count
-    # a graph must fix does NOT equal the batch size.
+    # batch size ``bs`` gets ``bs`` times this upper bound segment. A "segment"
+    # is an independently-attending span, not a request, useful for requests with
+    # multiple images/audio/etc.
     #
     # ``max_segments_per_request`` is required to capture ragged attention at
     # all. ``max_tokens_per_request`` is only needed by runners that don't
     # already bucket by token count (the piecewise runner takes the bucket's
     # ``total_tokens`` instead). Leave both None to opt out of captured ragged
-    # attention — the eager state is still built.
+    # attention; the eager state is still built.
     max_segments_per_request: int | None = None
     max_tokens_per_request: int | None = None
+    # Which execution paths to build states for. Narrow it when a submodule
+    # keeps a different backend on one of them — BAGEL's ViT declares
+    # ``CUDA_GRAPH`` because eager runs flash-attn, which needs no head-dim
+    # padding, so an eager state would be an unread ``workspace_bytes``.
+    enabled_for: AttentionMode = AttentionMode.BOTH
+
+    @property
+    def eager_enabled(self) -> bool:
+        return self.enabled_for in (AttentionMode.EAGER, AttentionMode.BOTH)
+
+    @property
+    def cuda_graph_enabled(self) -> bool:
+        return self.enabled_for in (AttentionMode.CUDA_GRAPH, AttentionMode.BOTH)
 
     def max_segments_for(self, bs: int) -> int | None:
         if self.max_segments_per_request is None:

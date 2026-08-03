@@ -12,6 +12,7 @@ import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.attention_state import (
+    AttentionMode,
     AttentionState,
     RaggedAttention,
     RaggedAttentionConfig,
@@ -130,6 +131,50 @@ def test_capture_bounds_scale_with_batch_size():
     assert config.max_segments_for(1) == 3
     assert config.max_segments_for(8) == 24
     assert config.max_tokens_for(8) == 2048
+
+
+@pytest.mark.parametrize(
+    ("mode", "eager", "cuda_graph"),
+    [
+        (AttentionMode.BOTH, True, True),
+        (AttentionMode.EAGER, True, False),
+        (AttentionMode.CUDA_GRAPH, False, True),
+    ],
+    ids=["both", "eager_only", "cuda_graph_only"],
+)
+def test_enabled_for_selects_paths(mode, eager, cuda_graph):
+    config = RaggedAttentionConfig(
+        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM,
+        enabled_for=mode,
+    )
+    assert config.eager_enabled is eager
+    assert config.cuda_graph_enabled is cuda_graph
+
+
+def test_enabled_for_defaults_to_both():
+    config = RaggedAttentionConfig(
+        num_qo_heads=NUM_HEADS, num_kv_heads=NUM_HEADS, head_dim=HEAD_DIM
+    )
+    assert config.enabled_for is AttentionMode.BOTH
+
+
+def test_cuda_graph_only_skips_the_engines_eager_state():
+    """The node keeps another backend eagerly, so it shouldn't pay a workspace."""
+    submodule = _Submodule(_stub_config(enabled_for=AttentionMode.CUDA_GRAPH))
+    engine = _engine({"vit": submodule})
+    engine.warmup()
+    assert engine._ragged.get("vit") is None
+    assert "vit" not in engine._ragged.workspaces
+
+    engine.execute_batch(_batch("vit", ["r0"]))
+    assert submodule.seen[0].ragged_attention_state is None
+
+
+def test_eager_only_still_builds_the_engine_state():
+    submodule = _Submodule(_stub_config(enabled_for=AttentionMode.EAGER))
+    engine = _engine({"encoder": submodule})
+    engine.warmup()
+    assert engine._ragged.get("encoder") is not None
 
 
 def test_capture_bounds_are_independent():

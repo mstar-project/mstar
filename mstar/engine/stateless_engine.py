@@ -563,6 +563,15 @@ class StatelessEngine(BaseEngine):
         )
         if config is None:
             return
+        if not config.eager_enabled:
+            # Capture buckets still build their own states; this node just keeps
+            # a different backend outside captured regions.
+            logger.info(
+                "StatelessEngine[%s]: %s declared ragged attention as %s; "
+                "skipping its eager state",
+                self.config.name, node_name, config.enabled_for.value,
+            )
+            return
         try:
             self._ragged.build(
                 node_name, config, q_data_type=self.config.autocast_dtype or torch.bfloat16

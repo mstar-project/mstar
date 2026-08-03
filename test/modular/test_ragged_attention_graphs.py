@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.attention_state import RaggedAttentionConfig
+from mstar.engine.attention_state import AttentionMode, RaggedAttentionConfig
 from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
     PiecewisePackedConfig,
@@ -179,6 +179,14 @@ def test_piecewise_without_ragged_config_passes_no_static_attn():
     assert runner.graphs[(PW_BS, PW_TOKENS)].ragged_state is None
 
 
+def test_piecewise_skips_ragged_state_when_eager_only():
+    runner = _piecewise_runner(
+        _ragged_config(enabled_for=AttentionMode.EAGER),
+        capture_fn=lambda static_inputs, static_cm=None, **kw: {"x": static_inputs["x"] * 2},
+    )
+    assert runner.graphs[(PW_BS, PW_TOKENS)].ragged_state is None
+
+
 def test_piecewise_without_segment_bound_skips_ragged_state():
     runner = _piecewise_runner(
         _ragged_config(max_segments_per_request=None),
@@ -236,7 +244,16 @@ class _EncoderSubmodule(NodeSubmodule):
     def forward_batched(self, graph_walk, engine_inputs, x, **kwargs):
         attn = engine_inputs.ragged_attention_state
         qkv = x.reshape(-1, NUM_HEADS, HEAD_DIM)
-        out = attn.run(qkv, qkv, qkv).reshape(x.shape[0], SL_SEQ, WIDTH)
+        if attn is not None:
+            flat = attn.run(qkv, qkv, qkv)
+        else:
+            # Second backend, as a real two-mode submodule would have. Keeps
+            # EAGER-mode capture a genuine capture rather than a crash.
+            s = qkv.reshape(x.shape[0], SL_SEQ, NUM_HEADS, HEAD_DIM).transpose(1, 2)
+            flat = F.scaled_dot_product_attention(
+                s, s, s, scale=HEAD_DIM ** -0.5
+            ).transpose(1, 2).reshape(-1, NUM_HEADS, HEAD_DIM)
+        out = flat.reshape(x.shape[0], SL_SEQ, WIDTH)
         return {
             rid: {"y": [out[i]]}
             for i, rid in enumerate(engine_inputs.request_ids)
@@ -276,6 +293,15 @@ def test_stateless_captures_with_ragged_state():
 def test_stateless_gated_on_submodule_declaring_config():
     runner, _ = _stateless_runner(None)
     assert runner.ragged_config is None
+    assert runner._ragged.get(runner._ragged_key("encode", SL_BS)) is None
+
+
+def test_stateless_skips_ragged_state_when_eager_only():
+    runner, _ = _stateless_runner(
+        _ragged_config(max_segments_per_request=1, enabled_for=AttentionMode.EAGER)
+    )
+    # Still captures — just against the submodule's other backend.
+    assert runner.graphs
     assert runner._ragged.get(runner._ragged_key("encode", SL_BS)) is None
 
 

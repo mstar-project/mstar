@@ -2118,7 +2118,7 @@ class StatelessCudaGraphRunner:
         it keeps using the engine's eager state and this walk stays uncaptured
         for attention purposes.
         """
-        if self.ragged_config is None:
+        if self.ragged_config is None or not self.ragged_config.cuda_graph_enabled:
             return None
         max_num_segments = self.ragged_config.max_segments_for(bs)
         max_total_tokens = self.ragged_config.max_tokens_for(bs)
@@ -2652,7 +2652,7 @@ class PiecewiseCudaGraphRunner:
         already buckets by token count, so only the segment ceiling has to come
         from the submodule's per-request bound.
         """
-        if self.ragged_config is None:
+        if self.ragged_config is None or not self.ragged_config.cuda_graph_enabled:
             return None, 0
         max_num_segments = self.ragged_config.max_segments_for(shape.bs)
         if max_num_segments is None:
