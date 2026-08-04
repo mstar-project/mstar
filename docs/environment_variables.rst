@@ -141,3 +141,20 @@ Read by the ``mstar-server`` binary and its bridge
        tokenization. Leave unset with the Python backend — its preprocess
        worker owns tokenization, and the bridge rejects pre-tokenized
        ingest.
+
+Rust frontend limitations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Rust frontend carries no audio encoder or media muxer (the Python frontend
+uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
+
+* ``/v1/audio/speech`` produces only ``wav`` and ``pcm``. Any other
+  ``response_format`` (``mp3``, ``opus``, ``flac``, …) is rejected with a 400
+  rather than silently returned as WAV. Run the Python frontend for compressed
+  containers.
+* ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
+  request sets ``generate_sound``, Cosmos3 generates a separate audio track that
+  mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
+  the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
+  the Rust frontend (it spends compute on a track the client won't receive), or
+  run the Python frontend for sound video.

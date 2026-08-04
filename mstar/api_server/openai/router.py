@@ -88,7 +88,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     try:
         result = await serving_chat.create_chat_completion(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        # A bad request (adapter translation raises ValueError/TypeError) is a
+        # 400, not a 500, matching the videos handler and the Rust frontend.
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
     if request.stream:
         return StreamingResponse(
             result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
@@ -104,7 +107,8 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
     try:
         return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
 
 
 @router.post("/v1/images/generations")
@@ -115,7 +119,8 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
     try:
         result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
     return JSONResponse(result)
 
 

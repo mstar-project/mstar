@@ -39,6 +39,7 @@ fn ext_for(mime: &str) -> &'static str {
         "video/webm" => ".webm",
         "video/quicktime" => ".mov",
         "video/x-matroska" => ".mkv",
+        "video/x-msvideo" | "video/avi" => ".avi",
         other => match other.split('/').next().unwrap_or("") {
             "image" => ".png",
             "audio" => ".wav",
@@ -53,7 +54,7 @@ fn modality_from_ext(suffix: &str) -> &'static str {
     match suffix.to_ascii_lowercase().as_str() {
         ".png" | ".jpg" | ".jpeg" | ".webp" | ".gif" | ".bmp" | ".tiff" => "image",
         ".wav" | ".mp3" | ".flac" | ".ogg" | ".opus" | ".aac" | ".m4a" => "audio",
-        ".mp4" | ".webm" | ".mov" | ".mkv" => "video",
+        ".mp4" | ".webm" | ".mov" | ".mkv" | ".avi" => "video",
         _ => "unknown",
     }
 }
@@ -82,6 +83,16 @@ pub fn modality_from_mime(mime: &str) -> &'static str {
 // Inbound: persist request media into upload_dir, return (modality, path)
 // ---------------------------------------------------------------------------
 
+/// Decode base64 the way Python's `base64.b64decode(..., validate=False)` does:
+/// non-alphabet bytes are discarded rather than erroring. In practice the only
+/// such bytes are the interior newlines of line-wrapped payloads (what the
+/// `base64` CLI and `base64.encodebytes` emit by default), so stripping ASCII
+/// whitespace before a strict decode matches Python without accepting garbage.
+fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(compact.as_bytes())
+}
+
 fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
     std::fs::create_dir_all(upload_dir)?;
     let path = upload_dir.join(format!("{}{}", Uuid::new_v4(), ext_for(mime)));
@@ -105,8 +116,7 @@ fn save_data_url(data_url: &str, upload_dir: &Path) -> Result<(String, String), 
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or("application/octet-stream");
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(payload.trim())
+    let raw = decode_b64_lenient(payload)
         .map_err(|e| format!("data URL base64 decode failed: {e}"))?;
     save_bytes(&raw, mime, upload_dir).map_err(|e| e.to_string())
 }
@@ -120,8 +130,7 @@ pub fn save_base64(
     upload_dir: &Path,
 ) -> Result<(String, String), String> {
     std::fs::create_dir_all(upload_dir).map_err(|e| e.to_string())?;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
+    let raw = decode_b64_lenient(b64)
         .map_err(|e| format!("input_audio base64 decode failed: {e}"))?;
     // Sanitize the client-controlled `format`: keep only alphanumerics, so
     // a value like `../../etc/x` cannot inject path separators into the

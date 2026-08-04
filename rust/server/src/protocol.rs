@@ -57,8 +57,10 @@ pub struct ChatCompletionRequest {
     pub stop: Option<Value>, // str | [str]
     #[serde(default)]
     pub seed: Option<i64>,
+    /// `bool | None` in Python (default False); accept an explicit `null`
+    /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default)]
-    pub stream: bool,
+    pub stream: Option<bool>,
 
     // Multimodal output (vllm-omni / sglang-omni style).
     #[serde(default)]
@@ -87,8 +89,10 @@ pub struct SpeechRequest {
     #[allow(dead_code)]
     #[serde(default)]
     pub speed: Option<f64>,
+    /// `bool | None` in Python (default False); accept an explicit `null`
+    /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default)]
-    pub stream: bool,
+    pub stream: Option<bool>,
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
@@ -107,8 +111,7 @@ pub struct ImageGenerationRequest {
     #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
     #[serde(default)]
     pub model: Option<String>,
-    /// Accepted for OpenAI compatibility (kept out of `extra`), as in mstar.
-    #[allow(dead_code)]
+    /// OpenAI `n`: number of images to generate (submitted as n engine requests).
     #[serde(default)]
     pub n: Option<i64>,
     #[allow(dead_code)]

@@ -241,6 +241,28 @@ fn error(status: u16, message: &str, type_: &str) -> Response {
         .into_response()
 }
 
+/// FastAPI-`HTTPException`-shaped error (`{"detail": "..."}`). The native
+/// `/generate` endpoint (entrypoint.py) raises `HTTPException`, so its errors
+/// carry `detail`, not the OpenAI `{"error": {...}}` envelope the /v1 endpoints
+/// use — keep the two interfaces byte-consistent with Python.
+fn detail_error(status: u16, message: &str) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (code, Json(json!({"detail": message}))).into_response()
+}
+
+/// Parse a form-field boolean the way FastAPI's `bool = Form(...)` does (pydantic
+/// v2 lax coercion): a fixed truthy/falsy set, case-insensitive, and a hard
+/// error on anything else. The naive `== "true"` accepted a subset and silently
+/// turned `TRUE` / `yes` / invalid values into `false` — e.g. `streaming=TRUE`
+/// would quietly return a non-streaming body.
+fn parse_form_bool(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
+        "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
+        other => Err(format!("value is not a valid boolean: {other:?}")),
+    }
+}
+
 /// Resolve the loaded model's adapter and check it serves `surface`; otherwise
 /// an OpenAI-shaped error response (404), matching router.py `_resolve`.
 fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
@@ -346,7 +368,7 @@ async fn chat_completions(
     schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("chatcmpl");
 
-    if req.stream {
+    if req.stream.unwrap_or(false) {
         return chat_sse(st, args, request_id).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
@@ -372,9 +394,14 @@ fn chat_sse(
         let s = chunk_json(&request_id, created, &model, json!({"role": "assistant"}), None);
         futures::stream::once(async move { Ok(Event::default().data(s)) })
     };
+    // Set if a terminal error is emitted mid-stream, so the tail below does NOT
+    // append a clean `finish_reason:"stop"` + `[DONE]` — a failed request must
+    // not look cleanly completed to the client.
+    let errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let body = {
         let model = model.clone();
         let id = request_id.clone();
+        let errored = errored.clone();
         base.map(move |item| match item {
             Out::Chunk(c) => Ok(Event::default().data(chunk_json(
                 &id,
@@ -383,19 +410,27 @@ fn chat_sse(
                 chat_delta(&c),
                 None,
             ))),
-            // Terminal mid-stream failure: an OpenAI error event (the stream
-            // ends right after — mstar's generator exception drops the
-            // connection; this is strictly more informative).
-            Out::Error(e) => Ok(sse_error_event(&e)),
+            // Terminal mid-stream failure: an OpenAI error event, and suppress
+            // the normal stop/[DONE] tail (mstar's generator exception drops the
+            // connection; the explicit error event is strictly more informative).
+            Out::Error(e) => {
+                errored.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(sse_error_event(&e))
+            }
         })
     };
-    let tail = {
-        let finish = chunk_json(&request_id, created, &model, json!({}), Some("stop"));
-        futures::stream::iter(vec![
-            Ok(Event::default().data(finish)),
-            Ok(Event::default().data("[DONE]")),
-        ])
-    };
+    let tail = futures::stream::once(async move {
+        if errored.load(std::sync::atomic::Ordering::SeqCst) {
+            futures::stream::iter(Vec::new())
+        } else {
+            let finish = chunk_json(&request_id, created, &model, json!({}), Some("stop"));
+            futures::stream::iter(vec![
+                Ok(Event::default().data(finish)),
+                Ok(Event::default().data("[DONE]")),
+            ])
+        }
+    })
+    .flatten();
     Sse::new(head.chain(body).chain(tail)).keep_alive(KeepAlive::default())
 }
 
@@ -486,8 +521,23 @@ async fn audio_speech(State(st): State<AppState>, Json(req): Json<SpeechRequest>
     };
     let request_id = rid("speech");
     let fmt = req.response_format.to_ascii_lowercase();
+    // Only wav / pcm are produced natively; unlike Python (soundfile encodes
+    // the real container), the Rust frontend has no compressed-audio encoder,
+    // so reject an unsupported format instead of silently returning WAV bytes
+    // under the requested container's name.
+    if !matches!(fmt.as_str(), "wav" | "pcm") {
+        return error(
+            400,
+            &format!(
+                "response_format {fmt:?} is not supported by the Rust frontend \
+                 (only 'wav' and 'pcm'); run the Python frontend for compressed \
+                 containers"
+            ),
+            "invalid_request_error",
+        );
+    }
 
-    if req.stream {
+    if req.stream.unwrap_or(false) {
         // Open-ended WAV: streaming header, then PCM16 frames as they arrive.
         // A backend error ends the byte stream (the connection closes
         // mid-WAV, matching mstar's generator exception).
@@ -537,15 +587,35 @@ async fn images_generations(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let args = match adapter.image_to_request(&req) {
+    let base = match adapter.image_to_request(&req) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    let request_id = rid("img");
-    match collect(result_stream(&st, &args, &request_id, false)).await {
-        Ok(chunks) => Json(images_response(chunks)).into_response(),
-        Err(e) => error(500, &e, "server_error"),
+    // OpenAI `n`: submit n engine requests up front and aggregate their images,
+    // matching serving_images.create_images. Seeded requests follow the seed
+    // contract — image i uses seed + i (i > 0), so image 0 is bit-identical to
+    // the same request with n=1; unseeded requests draw independent seeds.
+    let n = req.n.unwrap_or(1).max(1);
+    let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
+    let futs = (0..n).map(|i| {
+        let mut args = base.clone();
+        if let (Some(s), true) = (seed, i > 0) {
+            args.model_kwargs.insert("seed".to_string(), Value::from(s + i));
+        }
+        let st = st.clone();
+        async move {
+            let request_id = rid("img");
+            collect(result_stream(&st, &args, &request_id, false)).await
+        }
+    });
+    let mut all: Vec<ResultChunk> = Vec::new();
+    for r in futures::future::join_all(futs).await {
+        match r {
+            Ok(chunks) => all.extend(chunks),
+            Err(e) => return error(500, &e, "server_error"),
+        }
     }
+    Json(images_response(all)).into_response()
 }
 
 // ---- POST /v1/videos/generations (Cosmos3) -------------------------------
@@ -593,15 +663,29 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         };
         let name = field.name().unwrap_or("").to_string();
         let has_file = field.file_name().is_some();
+        // A field read failure (body-limit overrun, mid-upload disconnect,
+        // non-UTF-8 text) must surface as a 400, not be flattened to an empty
+        // value — otherwise a truncated upload becomes a misleading error.
         if name == "image" {
             image_filename = field.file_name().map(str::to_string);
-            image_bytes = field.bytes().await.ok().map(|b| b.to_vec());
+            match field.bytes().await {
+                Ok(b) => image_bytes = Some(b.to_vec()),
+                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+            }
         } else if name == "prompt" {
-            prompt = field.text().await.unwrap_or_default();
+            prompt = match field.text().await {
+                Ok(v) => v,
+                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+            };
         } else if known.contains(&name.as_str()) || has_file {
-            let _ = field.bytes().await; // consume + discard
+            if let Err(e) = field.bytes().await {
+                return error(400, &e.to_string(), "invalid_request_error");
+            }
         } else {
-            let v = field.text().await.unwrap_or_default();
+            let v = match field.text().await {
+                Ok(v) => v,
+                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+            };
             let parsed = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
             extra.insert(name, parsed);
         }
@@ -646,11 +730,23 @@ fn images_response(chunks: Vec<ResultChunk>) -> Value {
 }
 
 /// Each Cosmos3 video chunk is an mp4 (H.264), returned base64-encoded in the
-/// image endpoint's `b64_json` shape. A sound request also emits a raw PCM audio
-/// chunk that mstar muxes into the mp4 as an AAC track; the Rust frontend has no
-/// mp4/PCM muxer, so it returns the video-only container — the same shape mstar
-/// degrades to when muxing fails. Muxing the audio track is a follow-up.
+/// image endpoint's `b64_json` shape. A sound request (`generate_sound`) also
+/// emits a raw PCM audio chunk that mstar muxes into the mp4 as an AAC track;
+/// the Rust frontend has no mp4/PCM muxer, so it returns the video-only
+/// container — the same shape mstar degrades to when muxing fails. If audio
+/// chunks are present they are DROPPED and a warning is logged, since the model
+/// spent extra compute generating a track the client won't receive. Muxing the
+/// audio track (or a 501 when `generate_sound` is set) is a follow-up.
 fn videos_response(chunks: Vec<ResultChunk>) -> Value {
+    let dropped_audio = chunks.iter().filter(|c| c.modality == "audio").count();
+    if dropped_audio > 0 {
+        eprintln!(
+            "mstar-server: WARNING dropping {dropped_audio} audio chunk(s) from a Cosmos3 \
+             video response — the Rust frontend cannot mux audio into the mp4; the generated \
+             sound track is discarded. Do not set 'generate_sound' on the Rust frontend, or \
+             use the Python frontend for sound video."
+        );
+    }
     let data: Vec<Value> = chunks
         .iter()
         .filter(|c| c.modality == "video")
@@ -688,18 +784,21 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         // these clients already behave.
         let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
             Ok(b) => b,
-            Err(e) => {
-                return error(400, &format!("reading form body: {e}"),
-                             "invalid_request_error")
-            }
+            Err(e) => return detail_error(400, &format!("reading form body: {e}")),
         };
         for (k, v) in form_urlencoded::parse(&body) {
             match k.as_ref() {
                 "text" => text = Some(v.into_owned()),
                 "input_modalities" => in_mods_raw = Some(v.into_owned()),
                 "output_modalities" => out_mods_raw = v.into_owned(),
-                "streaming" => streaming = matches!(v.as_ref(), "true" | "True" | "1"),
-                "tokenize" => tokenize = matches!(v.as_ref(), "true" | "True" | "1"),
+                "streaming" => match parse_form_bool(&v) {
+                    Ok(b) => streaming = b,
+                    Err(e) => return detail_error(400, &e),
+                },
+                "tokenize" => match parse_form_bool(&v) {
+                    Ok(b) => tokenize = b,
+                    Err(e) => return detail_error(400, &e),
+                },
                 "model_kwargs" => mk_raw = Some(v.into_owned()),
                 "request_id" => request_id = Some(v.into_owned()),
                 _ => {}
@@ -712,40 +811,38 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         .await;
     }
     if !content_type.starts_with("multipart/form-data") {
-        return error(
+        return detail_error(
             400,
             &format!(
-                "unsupported Content-Type for /generate: {content_type:?}                  (expected multipart/form-data or                  application/x-www-form-urlencoded)"
+                "unsupported Content-Type for /generate: {content_type:?} \
+                 (expected multipart/form-data or application/x-www-form-urlencoded)"
             ),
-            "invalid_request_error",
         );
     }
     let mut mp = match Multipart::from_request(req, &st).await {
         Ok(m) => m,
-        Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+        Err(e) => return detail_error(400, &e.to_string()),
     };
 
     loop {
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return error(
-                400, &format!("malformed multipart body: {e}"),
-                "invalid_request_error"),
+            Err(e) => return detail_error(400, &format!("malformed multipart body: {e}")),
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "files" {
             let filename = field.file_name().unwrap_or("").to_string();
             let modality = media::modality_from_filename(&filename);
             if modality == "unknown" {
-                return error(400, &format!("Cannot determine modality for file: {filename}"), "invalid_request_error");
+                return detail_error(400, &format!("Cannot determine modality for file: {filename}"));
             }
             let bytes = match field.bytes().await {
                 Ok(b) => b,
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => return detail_error(400, &e.to_string()),
             };
             if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
-                return error(500, &e.to_string(), "server_error");
+                return detail_error(500, &e.to_string());
             }
             // Sanitize: take ONLY the final path component of the
             // client-supplied name. `join` treats embedded separators as
@@ -759,20 +856,32 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 .unwrap_or("upload");
             let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
             if let Err(e) = std::fs::write(&save_path, &bytes) {
-                return error(500, &e.to_string(), "server_error");
+                return detail_error(500, &e.to_string());
             }
             file_paths
                 .entry(modality.to_string())
                 .or_default()
                 .push(save_path.to_string_lossy().into_owned());
         } else {
-            let val = field.text().await.unwrap_or_default();
+            // Propagate a field read failure (body-limit overrun, mid-upload
+            // disconnect, non-UTF-8) as a 400 rather than silently treating it
+            // as an empty value.
+            let val = match field.text().await {
+                Ok(v) => v,
+                Err(e) => return detail_error(400, &format!("reading form field {name:?}: {e}")),
+            };
             match name.as_str() {
                 "text" => text = Some(val),
                 "input_modalities" => in_mods_raw = Some(val),
                 "output_modalities" => out_mods_raw = val,
-                "streaming" => streaming = matches!(val.as_str(), "true" | "True" | "1"),
-                "tokenize" => tokenize = matches!(val.as_str(), "true" | "True" | "1"),
+                "streaming" => match parse_form_bool(&val) {
+                    Ok(b) => streaming = b,
+                    Err(e) => return detail_error(400, &e),
+                },
+                "tokenize" => match parse_form_bool(&val) {
+                    Ok(b) => tokenize = b,
+                    Err(e) => return detail_error(400, &e),
+                },
                 "model_kwargs" => mk_raw = Some(val),
                 "request_id" => request_id = Some(val),
                 _ => {}
@@ -825,8 +934,8 @@ async fn generate_finish(
     let model_kwargs: Map<String, Value> = match mk_raw {
         Some(raw) if !raw.is_empty() => match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(m)) => m,
-            Ok(_) => return error(400, "model_kwargs must be a JSON object", "invalid_request_error"),
-            Err(e) => return error(400, &format!("model_kwargs JSON: {e}"), "invalid_request_error"),
+            Ok(_) => return detail_error(400, "model_kwargs must be a JSON object"),
+            Err(e) => return detail_error(400, &format!("model_kwargs JSON: {e}")),
         },
         _ => Map::new(),
     };
@@ -837,8 +946,8 @@ async fn generate_finish(
     let mut tokens: Option<Vec<u32>> = None;
     if tokenize {
         let Some(tok) = &st.tok else {
-            return error(400, "tokenize=true requires the server to be started \
-                               with MSTAR_TOKENIZER", "invalid_request_error");
+            return detail_error(400, "tokenize=true requires the server to be started \
+                                      with MSTAR_TOKENIZER");
         };
         tokens = Some(tok.encode(text.as_deref().unwrap_or("")));
         text = None; // the model side must use the ids, not re-tokenize
@@ -875,7 +984,7 @@ async fn generate_finish(
 
     let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => chunks,
-        Err(e) => return error(500, &e, "server_error"),
+        Err(e) => return detail_error(500, &e),
     };
     let mut outputs: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for c in &chunks {

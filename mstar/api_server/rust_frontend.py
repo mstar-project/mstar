@@ -159,17 +159,29 @@ class RustFrontendBridge:
             blocking=True, timeout_s=BRIDGE_RECV_WAIT_S)
         while self.running:
             for msg in await loop.run_in_executor(None, recv):
-                t = msg.get("t")
-                if t == "submit":
-                    self._submit(msg)
-                elif t == "abort":
-                    self.server.abort_request(msg["rid"])
-                elif t == "ping":
-                    # Deep-health liveness: the frontend's /health goes red
-                    # unless this loop answers.
-                    self._send({"t": "pong", "rid": msg["rid"]})
-                else:
-                    logger.warning("bridge: unknown message type %r", t)
+                # Per-message isolation: FastAPI turns a handler exception into
+                # one 500 and keeps serving. The bridge must restore that — a
+                # failure in any branch (a bad `rid` lookup in abort, a codec
+                # decode error surfacing as a malformed msg, a send failure)
+                # would otherwise propagate out of `_serve` → `run()` →
+                # `entrypoint.py`'s `finally`, which terminates the Rust process
+                # and takes the whole server down. `_submit` is already wrapped;
+                # this guards every other branch.
+                try:
+                    t = msg.get("t")
+                    if t == "submit":
+                        self._submit(msg)
+                    elif t == "abort":
+                        self.server.abort_request(msg["rid"])
+                    elif t == "ping":
+                        # Deep-health liveness: the frontend's /health goes red
+                        # unless this loop answers.
+                        self._send({"t": "pong", "rid": msg["rid"]})
+                    else:
+                        logger.warning("bridge: unknown message type %r", t)
+                except Exception:  # noqa: BLE001 — one bad message must not kill the loop
+                    logger.exception("bridge: dropping a message that raised (%r)",
+                                     msg.get("t"))
 
     def run(self) -> None:
         """Blocking serve loop (the ``uvicorn.run`` replacement)."""
