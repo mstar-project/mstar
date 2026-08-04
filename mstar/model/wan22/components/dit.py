@@ -16,8 +16,8 @@ Numerics contract (bf16 weights with fp32 islands):
     residual adds upcast to fp32, and the cross-attention residual add stays
     bf16.
   * The RoPE cos/sin tables are DERIVED state, not checkpoint state. Non-
-    persistent buffers hold garbage after ``to_empty``, so they are built
-    lazily per device (on CPU first, for device-independent values) rather
+    persistent buffers hold garbage after ``to_empty``, so they are built on
+    CPU at init (device-independent values, copied lazily per device) rather
     than registered as buffers.
 
 Two shared components are deliberately not reused. ``components.norm.RMSNorm``
@@ -56,13 +56,15 @@ class WanFP32LayerNorm(nn.LayerNorm):
         ).to(inputs.dtype)
 
 
-def _sinusoidal_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch.Tensor:
+def _sinusoidal_timestep_embedding(
+    timesteps: torch.Tensor, embedding_dim: int, max_period: float = 10000.0
+) -> torch.Tensor:
     """diffusers ``get_timestep_embedding`` with the Wan condition embedder's
     fixed arguments (``flip_sin_to_cos=True``, ``downscale_freq_shift=0``,
-    ``scale=1``, ``max_period=10000``; even ``embedding_dim``). fp32 in,
-    fp32 out ``[N, embedding_dim]``."""
+    ``scale=1``; even ``embedding_dim``). fp32 in, fp32 out
+    ``[N, embedding_dim]``."""
     half_dim = embedding_dim // 2
-    exponent = -math.log(10000) * torch.arange(half_dim, dtype=torch.float32, device=timesteps.device)
+    exponent = -math.log(max_period) * torch.arange(half_dim, dtype=torch.float32, device=timesteps.device)
     emb = torch.exp(exponent / half_dim)
     emb = timesteps[:, None].float() * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
@@ -76,8 +78,9 @@ class Wan22RoPE3D:
     6)``, ``t`` takes the remainder (44/42/42 for head_dim 128) — each with
     its own 1D table over ``max_seq_len`` positions, computed in float64 and
     stored fp32 concatenated to ``[max_seq_len, head_dim]`` (reference
-    ``WanRotaryPosEmbed.__init__``). Tables are built on CPU on first use
-    (bit-identical regardless of the eventual device) and cached per device.
+    ``WanRotaryPosEmbed.__init__``). The CPU tables are built at init
+    (bit-identical regardless of the eventual device) and copied to each
+    device on first use there.
 
     Deliberately not an ``nn.Module``: the tables are derived state that must
     never ride through ``to_empty``/``state_dict``, and keeping them out of
@@ -88,21 +91,26 @@ class Wan22RoPE3D:
         h_dim = w_dim = 2 * (attention_head_dim // 6)
         self.axis_dims = (attention_head_dim - h_dim - w_dim, h_dim, w_dim)
         self.max_seq_len = max_seq_len
-        self._tables: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._tables: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {
+            torch.device("cpu"): self._build_cpu_tables()
+        }
 
     def _build_cpu_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # device="cpu" explicitly: init now runs under the weight loader's
+        # meta-device context, and an ambient-device arange would build meta
+        # tensors with no data.
         cos_parts, sin_parts = [], []
         for dim in self.axis_dims:
-            freqs = 1.0 / (ROPE_THETA ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim))
-            freqs = torch.outer(torch.arange(self.max_seq_len), freqs)
+            freqs = 1.0 / (
+                ROPE_THETA ** (torch.arange(0, dim, 2, dtype=torch.float64, device="cpu") / dim)
+            )
+            freqs = torch.outer(torch.arange(self.max_seq_len, device="cpu"), freqs)
             cos_parts.append(freqs.cos().repeat_interleave(2, dim=1, output_size=dim).float())
             sin_parts.append(freqs.sin().repeat_interleave(2, dim=1, output_size=dim).float())
         return torch.cat(cos_parts, dim=1), torch.cat(sin_parts, dim=1)
 
     def tables(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if device not in self._tables:
-            if not self._tables:
-                self._tables[torch.device("cpu")] = self._build_cpu_tables()
             cpu_cos, cpu_sin = self._tables[torch.device("cpu")]
             self._tables[device] = (cpu_cos.to(device), cpu_sin.to(device))
         return self._tables[device]

@@ -6,10 +6,18 @@
 #   ./reproduce.sh preflight 0
 #   DEVICES=0 PORT=8100 bash test/wan22/launch_server_wan22.sh   # then, elsewhere:
 #   ./reproduce.sh bench ours 8100 mstar
-#   # tear mstar down, then per baseline (see {vllm_omni,sglang_omni}_instructions.md):
+#   # tear mstar down, then per baseline (sglang: see sglang_omni_instructions.md;
+#   # vllm-omni venv: recipe below):
 #   ./reproduce.sh preflight 0
 #   SERVER_PYTHON=<venv>/bin/python ./reproduce.sh serve-vllm 0 8091   # and, elsewhere:
 #   SERVER_PYTHON=<venv>/bin/python ./reproduce.sh bench vllm 8091 vllm-omni
+#
+# vllm-omni baseline venv (cu12 pin — vllm-omni HEAD moved to vllm 0.20 / CUDA 13
+# on 2026-05-06; 282e0b66 is the last commit pairing with the cu12 vllm below):
+#   uv venv --python 3.12 --seed && source .venv/bin/activate
+#   uv pip install vllm==0.18.0 --torch-backend=auto
+#   git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni
+#   git checkout 282e0b66 && uv pip install -e .
 #
 # Running systems concurrently on separate GPUs is valid for THROUGHPUT only:
 # under power cap the cards clock differently (a 6.7% spread was measured), more

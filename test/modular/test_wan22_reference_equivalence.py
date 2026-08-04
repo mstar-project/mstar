@@ -8,10 +8,22 @@ An oracle is only valid for the torch build and numerics flags it was recorded
 under, so record it on the machine you are testing. The suite skips without CUDA,
 without the checkpoint in the local HF cache, or without ``WAN22_ORACLE_DIR``.
 
+Record the oracle with the SAME python environment that runs this suite, and set
+``NVIDIA_TF32_OVERRIDE=0`` and ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` for the
+recorder and the suite alike. All three are load-bearing for the 0.0 gates:
+cuBLASLt picks TF32 GEMM algorithms per process non-reproducibly (observed on
+H200 / CUDA 12.9: ~2e-2 step-0 latent deltas between fresh processes, bit-exact
+within a process), two venvs with different CUDA-adjacent libraries settle on
+different kernel dispatch even with TF32 pinned, and a fixed cuBLAS workspace
+pins GEMM algorithm selection against allocator-history drift (the suite
+process's fixture loads change available workspace mid-run). The bounded gates
+absorb all three effects; the bit-exact gates cannot.
+
     export WAN22_ORACLE_DIR=/somewhere/with/room/wan22_oracle
-    CUDA_VISIBLE_DEVICES=0 /path/to/wan-oracle-venv/bin/python test/wan22/record_oracle.py \
-        --out-dir "$WAN22_ORACLE_DIR"
-    CUDA_VISIBLE_DEVICES=0 pytest test/modular/test_wan22_reference_equivalence.py -v -s
+    CUDA_VISIBLE_DEVICES=0 NVIDIA_TF32_OVERRIDE=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+        python test/wan22/record_oracle.py --out-dir "$WAN22_ORACLE_DIR"
+    CUDA_VISIBLE_DEVICES=0 NVIDIA_TF32_OVERRIDE=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+        pytest test/modular/test_wan22_reference_equivalence.py -v -s
 
 The initial noise is regenerated here from the seed rather than loaded, so these
 tests do not depend on the recorded run's RNG state.
@@ -79,10 +91,11 @@ TILED_DECODE_MEAN_ABS = 3.0e-3
 # Compiled DiT region vs the eager reference, over the full 50-step batched-CFG
 # trajectory. Only the transformer region compiles (the UniPC solver's CPU-resident
 # sigma stays eager); Inductor's fusion reorders fp accumulation, a step-level noise
-# that compounds exactly like the batched-CFG kernel noise (1.6e-3 at step 0 -> 2.66
-# by step 49 on the RTX 5090). Bound = observed max x ~1.3 headroom. The eager path
-# stays the bit-exact reference (SEQ/UNIPC gates); this only prices compile.
-COMPILED_VS_EAGER_MAX_ABS = 3.5
+# that compounds exactly like the batched-CFG kernel noise (1.6e-3 at step 0 growing
+# through step 49). Observed max over the trajectory: 2.66 (RTX 5090), 2.997 (H100),
+# 3.675 (H200). Bound = worst observed x ~1.3 headroom. The eager path stays the
+# bit-exact reference (SEQ/UNIPC gates); this only prices compile.
+COMPILED_VS_EAGER_MAX_ABS = 4.8
 # No-CFG (guidance_scale <= 1.0) batch-1 path vs a no-CFG oracle. Same discipline
 # as the sequential-CFG trajectory: one batch-1 forward per step, so BIT-EXACT.
 NO_CFG_TRAJECTORY_MAX_ABS = 0.0

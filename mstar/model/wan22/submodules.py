@@ -171,8 +171,11 @@ class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         mask = torch.zeros(1, max_len, dtype=torch.long, device=device)
         mask[0, :seq_len] = 1
         embeds = self.text_encoder(padded, mask).last_hidden_state
-        # Reference keeps u[:seq_len] and re-pads with zeros; in-place zeroing
-        # of the tail is the same tensor.
+        # Zero-pad to text_max_seq_len because the reference's encode_prompt
+        # does: the DiT cross-attends the full fixed-length text stream with NO
+        # mask, so the zero rows participate in attention and the equivalence
+        # gates pin their exact values. (Reference keeps u[:seq_len] and re-pads
+        # with zeros; in-place zeroing of the tail is the same tensor.)
         embeds[:, seq_len:] = 0
         return embeds
 
@@ -291,16 +294,12 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
         self.transformer = transformer
         self.config = config
         self._record_fp32_islands()
-        # Feature 2: compile the inner DiT region only. The region takes tensors
-        # (device latents, device per-token timestep grid, device text embeds) and
-        # returns a tensor — nothing CPU-resident crosses it, so Inductor traces it
-        # cleanly. Compile ``forward`` IN PLACE (not by wrapping the module) so
-        # ``self.transformer`` stays the same nn.Module: parameter names, the fp32
-        # islands, ``.dtype`` and ``.to()`` are all untouched, and the reference
-        # tests' transformer-swap trick keeps working. ``dynamic=False`` traces one
-        # graph per input shape, so the FIRST request at a new resolution pauses to
-        # compile (logged in ``_noise_prediction``); later requests reuse the trace.
-        # ``fullgraph=False`` allows a graph break at the SDPA op, matching cosmos3.
+        # Compile the inner DiT region only (tensors in, tensor out; nothing
+        # CPU-resident crosses it), IN PLACE so ``self.transformer`` keeps its
+        # identity — fp32 islands, ``.dtype``, the tests' transformer swap.
+        # dynamic=False traces one graph per shape (first request at a new
+        # resolution pauses; logged in ``_noise_prediction``); fullgraph=False
+        # allows the SDPA graph break, matching cosmos3.
         self._compile_dit = bool(config.compile_dit)
         self._compiled_shapes: set[tuple[int, ...]] = set()
         if self._compile_dit and transformer is not None:
@@ -520,19 +519,21 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
 
     def __init__(self, vae: nn.Module, config: Wan22Config):
         super().__init__()
-        self.vae = vae
         self.config = config
         self._decode_dtype_cached = None
-        if vae is not None:
-            # Resolve the decode dtype now (a cheap cuDNN-version read) so the
-            # choice is fixed at startup rather than on the first request. Cast
-            # BEFORE recording the fp32 islands: the recorded set must describe
-            # the dtype the decode will actually run in, not the checkpoint's
-            # load dtype, or the mixin re-pins the weights back afterwards.
-            self.vae = vae.to(self._decode_dtype())
+        # Resolve the decode dtype now (a cheap cuDNN-version read) so the
+        # choice is fixed at startup rather than on the first request. Cast
+        # BEFORE recording the fp32 islands: the recorded set must describe
+        # the dtype the decode will actually run in, not the checkpoint's
+        # load dtype, or the mixin re-pins the weights back afterwards.
+        # ``vae`` is never None here: dummy mode returns from
+        # ``_create_submodule`` before any submodule is constructed.
+        self.vae = vae.to(self._decode_dtype())
         self._record_fp32_islands()
 
     def _decode_dtype(self):
+        # TODO: pull conv3d-dtype resolution into a common helper shared with
+        # cosmos3 (same cuDNN-version issue there).
         # cuDNN ships fast bf16 conv3d for this VAE decode only from 9.16. On
         # older builds bf16 is 2-10x SLOWER than fp32/TF32, so read the live cuDNN
         # version and pick accordingly; an upgrade then flips the choice on its own.
