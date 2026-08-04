@@ -24,7 +24,9 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use crate::media;
-use crate::protocol::{ChatCompletionRequest, Content, ImageGenerationRequest, SpeechRequest};
+use crate::protocol::{
+    ChatCompletionRequest, Content, ImageGenerationRequest, SpeechRequest, VideoGenerationRequest,
+};
 
 /// The arguments the bridge submits to the conductor (mirrors mstar's
 /// `SubmitArgs` / `PreprocessInput`).
@@ -209,6 +211,7 @@ pub enum Adapter {
     Bagel,
     Qwen3Omni,
     Orpheus,
+    Cosmos3,
 }
 
 impl Adapter {
@@ -217,6 +220,8 @@ impl Adapter {
             "bagel" => Some(Adapter::Bagel),
             "qwen3_omni" => Some(Adapter::Qwen3Omni),
             "orpheus" => Some(Adapter::Orpheus),
+            // NVIDIA Cosmos3 registers three checkpoints against one adapter.
+            "cosmos3" | "cosmos3_droid" | "cosmos3_super" => Some(Adapter::Cosmos3),
             _ => None,
         }
     }
@@ -230,7 +235,11 @@ impl Adapter {
     }
 
     pub fn supports_images(&self) -> bool {
-        matches!(self, Adapter::Bagel)
+        matches!(self, Adapter::Bagel | Adapter::Cosmos3)
+    }
+
+    pub fn supports_videos(&self) -> bool {
+        matches!(self, Adapter::Cosmos3)
     }
 
     /// Whether this model's prompt processing is expressible in the frontend
@@ -319,7 +328,9 @@ impl Adapter {
                     model_kwargs: mk,
                 })
             }
-            Adapter::Orpheus => Err("chat is not supported by this model".to_string()),
+            Adapter::Orpheus | Adapter::Cosmos3 => {
+                Err("chat is not supported by this model".to_string())
+            }
         }
     }
 
@@ -377,7 +388,9 @@ impl Adapter {
                     model_kwargs: mk,
                 })
             }
-            Adapter::Bagel => Err("audio/speech is not supported by this model".to_string()),
+            Adapter::Bagel | Adapter::Cosmos3 => {
+                Err("audio/speech is not supported by this model".to_string())
+            }
         }
     }
 
@@ -397,7 +410,96 @@ impl Adapter {
                     model_kwargs: mk,
                 })
             }
+            Adapter::Cosmos3 => {
+                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+                if let Some(size) = &req.size {
+                    set_default(&mut mk, "size", Value::from(size.clone()));
+                }
+                if let Some(seed) = req.seed {
+                    set_default(&mut mk, "seed", Value::from(seed));
+                }
+                Ok(SubmitArgs {
+                    tokens: None,
+                    text: Some(req.prompt.clone()),
+                    file_paths: BTreeMap::new(),
+                    input_modalities: vec!["text".to_string()],
+                    output_modalities: vec!["image".to_string()],
+                    model_kwargs: mk,
+                })
+            }
             _ => Err("image generation is not supported by this model".to_string()),
+        }
+    }
+
+    /// `/v1/videos/generations` (Cosmos3). Text-to-video, or image/video-to-video
+    /// when a conditioning reference is supplied. Mirrors the Python
+    /// `Cosmos3Adapter.video_to_request`.
+    pub fn video_to_request(
+        &self,
+        req: &VideoGenerationRequest,
+        upload_dir: &Path,
+        allow_remote: bool,
+    ) -> Result<SubmitArgs, String> {
+        match self {
+            Adapter::Cosmos3 => {
+                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+                if let Some(size) = &req.size {
+                    set_default(&mut mk, "size", Value::from(size.clone()));
+                }
+                if let Some(seed) = req.seed {
+                    set_default(&mut mk, "seed", Value::from(seed));
+                }
+                // num_frames / fps are first-class video fields (not extra_body).
+                if let Some(nf) = req.num_frames {
+                    set_default(&mut mk, "num_frames", Value::from(nf));
+                }
+                if let Some(fps) = req.fps {
+                    set_default(&mut mk, "fps", json_num(fps));
+                }
+                // The conditioning frame (image-to-video) or clip (video-to-video)
+                // is persisted and VAE-encoded by the worker into the clean
+                // frame-0 anchor / pinned latent prefix. At most one may be given.
+                match (req.image.as_deref(), req.video.as_deref()) {
+                    (Some(_), Some(_)) => Err(
+                        "Provide either 'image' or 'video' conditioning, not both.".to_string(),
+                    ),
+                    (Some(image), None) => {
+                        let (_, path) = media::resolve_media_ref(image, upload_dir, allow_remote)?;
+                        let mut file_paths = BTreeMap::new();
+                        file_paths.insert("image".to_string(), vec![path]);
+                        Ok(SubmitArgs {
+                            tokens: None,
+                            text: Some(req.prompt.clone()),
+                            file_paths,
+                            input_modalities: vec!["image".to_string(), "text".to_string()],
+                            output_modalities: vec!["video".to_string()],
+                            model_kwargs: mk,
+                        })
+                    }
+                    (None, Some(video)) => {
+                        let (_, path) = media::resolve_media_ref(video, upload_dir, allow_remote)?;
+                        let mut file_paths = BTreeMap::new();
+                        file_paths.insert("video".to_string(), vec![path]);
+                        Ok(SubmitArgs {
+                            tokens: None,
+                            text: Some(req.prompt.clone()),
+                            file_paths,
+                            input_modalities: vec!["video".to_string(), "text".to_string()],
+                            output_modalities: vec!["video".to_string()],
+                            model_kwargs: mk,
+                        })
+                    }
+                    (None, None) => Ok(SubmitArgs {
+                        tokens: None,
+                        text: Some(req.prompt.clone()),
+                        file_paths: BTreeMap::new(),
+                        input_modalities: vec!["text".to_string()],
+                        output_modalities: vec!["video".to_string()],
+                        model_kwargs: mk,
+                    }),
+                }
+            }
+            _ => Err("video generation is not supported by this model".to_string()),
         }
     }
 

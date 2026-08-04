@@ -239,3 +239,54 @@ def test_generate_accepts_both_content_types(stack):
     texts = [s["text"] for s in stub.submitted]
     assert texts.count("hi") == 2, stub.submitted
     assert all(s["mk"] == {"foo": 1} for s in stub.submitted)
+
+
+class _VideoStubAPIServer(_StubAPIServer):
+    """Data plane for Cosmos3: emits a single (fake) mp4 video chunk."""
+
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("video", b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES")
+
+
+def test_videos_generations_roundtrip():
+    """`/v1/videos/generations` on a Cosmos3 model: the request maps to
+    output_modalities=["video"] and the video chunk comes back b64-encoded in
+    the image endpoint's `b64_json` shape. Cosmos3 was added to the adapter
+    registry after the frontend PR opened; this pins the wiring."""
+    import base64
+    import os
+    import subprocess
+
+    port = _free_port()
+    bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_vid_")
+    upload_dir = tempfile.mkdtemp(prefix="mstar_rf_vidup_")
+    proc = subprocess.Popen(
+        [BINARY, "cosmos3", str(port), bridge_dir, upload_dir],
+        env=dict(os.environ))
+    stub = _VideoStubAPIServer()
+    bridge = RustFrontendBridge(stub, bridge_dir)
+    thread = threading.Thread(target=bridge.run, daemon=True)
+    thread.start()
+    try:
+        assert _wait_healthy(port)
+        body = {"model": "cosmos3", "prompt": "a cat surfing",
+                "num_frames": 24, "fps": 12.0, "guidance_scale": 7.5}
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/videos/generations",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read())
+        # b64_json round-trips back to the raw mp4 bytes.
+        assert base64.b64decode(out["data"][0]["b64_json"]) == \
+            b"\x00\x00\x00\x18ftypmp42FAKE-MP4-BYTES"
+        # text-to-video: text in, video out; first-class knobs + extra_body
+        # both reached model_kwargs.
+        (sub,) = stub.submitted
+        assert sub["in"] == ["text"] and sub["out"] == ["video"]
+        assert sub["mk"]["num_frames"] == 24 and sub["mk"]["fps"] == 12.0
+        assert sub["mk"]["guidance_scale"] == 7.5
+    finally:
+        bridge.stop()
+        proc.terminate()
+        proc.wait(timeout=10)

@@ -124,6 +124,43 @@ pub struct ImageGenerationRequest {
     pub extra: BTreeMap<String, Value>,
 }
 
+/// `/v1/videos/generations` (text/image/video-to-video). Not an OpenAI-standard
+/// surface; modeled on the image endpoint, mirroring `VideoGenerationRequest`.
+/// `image` conditions image-to-video, `video` conditions video-to-video (URL or
+/// data URI). Extra knobs (guidance_scale, num_inference_steps, negative_prompt,
+/// condition_frame_indexes_vision, condition_video_keep …) flow through `extra`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VideoGenerationRequest {
+    pub prompt: String,
+    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    #[serde(default)]
+    pub model: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub n: Option<i64>,
+    #[serde(default)]
+    pub size: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub response_format: Option<String>,
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// First-class video fields (not passed through `extra`), as in mstar.
+    #[serde(default)]
+    pub num_frames: Option<i64>,
+    #[serde(default)]
+    pub fps: Option<f64>,
+    /// URL or data URI conditioning frame (image-to-video).
+    #[serde(default)]
+    pub image: Option<String>,
+    /// URL or data URI conditioning clip (video-to-video).
+    #[serde(default)]
+    pub video: Option<String>,
+
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 fn default_wav() -> String {
     "wav".to_string()
 }

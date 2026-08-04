@@ -50,7 +50,10 @@ use uuid::Uuid;
 
 use adapters::{Adapter, SubmitArgs};
 use bridge::{Bridge, ResultChunk};
-use protocol::{ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest};
+use protocol::{
+    ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
+    VideoGenerationRequest,
+};
 use serving::{collect, now, result_stream, rid, AppState, Out};
 
 #[tokio::main]
@@ -134,6 +137,7 @@ async fn main() {
         .route("/v1/audio/speech", post(audio_speech))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
+        .route("/v1/videos/generations", post(videos_generations))
         .route("/generate", post(generate))
         .route_layer(axum::middleware::from_fn_with_state(permits, admission));
 
@@ -225,6 +229,7 @@ enum Surface {
     Chat,
     Speech,
     Images,
+    Videos,
 }
 
 fn error(status: u16, message: &str, type_: &str) -> Response {
@@ -253,6 +258,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
         Surface::Chat => adapter.supports_chat(),
         Surface::Speech => adapter.supports_speech(),
         Surface::Images => adapter.supports_images(),
+        Surface::Videos => adapter.supports_videos(),
     };
     if !ok {
         return Err(error(
@@ -542,6 +548,28 @@ async fn images_generations(
     }
 }
 
+// ---- POST /v1/videos/generations (Cosmos3) -------------------------------
+
+async fn videos_generations(
+    State(st): State<AppState>,
+    Json(req): Json<VideoGenerationRequest>,
+) -> Response {
+    let adapter = match resolve(&st, Surface::Videos) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let args = match adapter.video_to_request(&req, &st.upload_dir, st.allow_remote) {
+        Ok(a) => a,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
+    schedule_upload_cleanup(&st.upload_dir, &args);
+    let request_id = rid("vid");
+    match collect(result_stream(&st, &args, &request_id, false)).await {
+        Ok(chunks) => Json(videos_response(chunks)).into_response(),
+        Err(e) => error(500, &e, "server_error"),
+    }
+}
+
 async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response {
     let adapter = match resolve(&st, Surface::Images) {
         Ok(a) => a,
@@ -612,6 +640,20 @@ fn images_response(chunks: Vec<ResultChunk>) -> Value {
     let data: Vec<Value> = chunks
         .iter()
         .filter(|c| c.modality == "image")
+        .map(|c| json!({"b64_json": media::b64(&c.data), "url": Value::Null}))
+        .collect();
+    json!({"created": now(), "data": data})
+}
+
+/// Each Cosmos3 video chunk is an mp4 (H.264), returned base64-encoded in the
+/// image endpoint's `b64_json` shape. A sound request also emits a raw PCM audio
+/// chunk that mstar muxes into the mp4 as an AAC track; the Rust frontend has no
+/// mp4/PCM muxer, so it returns the video-only container — the same shape mstar
+/// degrades to when muxing fails. Muxing the audio track is a follow-up.
+fn videos_response(chunks: Vec<ResultChunk>) -> Value {
+    let data: Vec<Value> = chunks
+        .iter()
+        .filter(|c| c.modality == "video")
         .map(|c| json!({"b64_json": media::b64(&c.data), "url": Value::Null}))
         .collect();
     json!({"created": now(), "data": data})
