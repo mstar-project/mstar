@@ -68,6 +68,7 @@ class PreparedBatch:
     submodule: Any | None = None
     node_inputs: list = field(default_factory=list)
     skipped_rids: set[str] = field(default_factory=set)
+    failed_requests: dict[str, str] = field(default_factory=dict) # rid -> error message
     metadata: dict = field(default_factory=dict)
 
     @property
@@ -126,6 +127,22 @@ class NodeOutput:
     # side-stream D→H copy of the produced tokens. Set by the worker in
     # _execute_on_gpu_thread; engines don't populate it themselves.
     completion_event: "torch.cuda.Event | None" = None
+    failed_requests: dict[str, str] = field(default_factory=dict) # rid -> error message
+
+
+@dataclass
+class StopCheckResult:
+    """Outcome of ``check_stop_for_batch``.
+
+    ``stops`` maps request_id -> loop names whose loops should stop.
+    ``failed_requests`` maps request_id -> error message, for rids whose
+    stop check raised: the check is per-rid and reads tensor values, so a
+    raise is attributable to one request and shouldn't take down the batch.
+    Mirrors ``NodeOutput.failed_requests``; the worker funnels both into the
+    same per-request failure path.
+    """
+    stops: dict[str, set[str]] = field(default_factory=dict)
+    failed_requests: dict[str, str] = field(default_factory=dict)
 
 
 class BaseEngine(ABC):
@@ -229,7 +246,8 @@ class BaseEngine(ABC):
         prepared = self.prepare_batch(batch)
         if not prepared.active_request_ids:
             return NodeOutput(
-                per_request_output_tensors={rid: {} for rid in batch.request_ids}
+                per_request_output_tensors={rid: {} for rid in batch.request_ids},
+                failed_requests=dict(prepared.failed_requests),
             )
         planned = self.plan_batch(prepared)
         output = self.execute_forward(planned)
@@ -238,6 +256,11 @@ class BaseEngine(ABC):
         output.per_request_output_tensors.update(
             {rid: {} for rid in prepared.skipped_rids}
         )
+        # Requests that blew up in prepare_inputs are already out of the batch;
+        # carry their errors out so the worker can fail just those rids. Done
+        # here rather than in each engine so every prepare_batch override gets
+        # it — including the early return above.
+        output.failed_requests.update(prepared.failed_requests)
         return output
 
     # ── Async pre-execution hooks ────────────────────────────────────────
@@ -375,6 +398,7 @@ class BaseEngine(ABC):
             output.per_request_output_tensors.update(
                 minibatch_out.per_request_output_tensors
             )
+            output.failed_requests.update(minibatch_out.failed_requests)
             if minibatch_out.allocation_failed:
                 output.allocation_failed = True
                 output.alloc_pages_short = minibatch_out.alloc_pages_short
@@ -401,18 +425,19 @@ class BaseEngine(ABC):
 
     def check_stop_for_batch(
         self, batch: NodeBatch, output: NodeOutput
-    ) -> dict[str, set[str]]:
+    ) -> StopCheckResult:
         """
         Per-rid stop-condition check for a finished batch.
 
         Called by the worker on its slow-postprocess path *after*
-        ``execute_batch`` returns. May read tensor values. Returns
-        ``{request_id: {loop_name, ...}}`` for rids whose loops should stop.
+        ``execute_batch`` returns. May read tensor values. Returns a
+        :class:`StopCheckResult` carrying the rids whose loops should stop and
+        the rids whose check raised.
 
         Default: no stops. Stateless engines override this to delegate the
         check to the submodule; the AR engine has its own value-driven logic.
         """
-        return {}
+        return StopCheckResult()
 
     def warmup(self) -> None:
         """Optional CUDA graph capture. Override in subclasses."""

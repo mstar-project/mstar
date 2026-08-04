@@ -25,6 +25,7 @@ from mstar.engine.base import (
     NodeOutput,
     PlannedBatch,
     PreparedBatch,
+    StopCheckResult,
 )
 from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner, StatelessCudaGraphRunner
 from mstar.model.submodule_base import (
@@ -193,16 +194,16 @@ class StatelessEngine(BaseEngine):
 
     def check_stop_for_batch(
         self, batch: NodeBatch, output: NodeOutput
-    ) -> dict[str, set[str]]:
+    ) -> StopCheckResult:
         """Delegate to each rid's ``submodule.check_stop``.
 
         Called by the worker on its slow-postprocess path so the ``.item()`` /
         ``.cpu()`` reads no longer block ``execute_batch`` on the GPU thread.
         """
+        result = StopCheckResult()
         if batch.node_name not in self.submodules:
-            return {}
+            return result
         submodule = self.submodules[batch.node_name]
-        result: dict[str, set[str]] = {}
         for rid in batch.request_ids:
             req_outputs = output.per_request_output_tensors.get(rid, {})
             if not req_outputs:
@@ -210,9 +211,20 @@ class StatelessEngine(BaseEngine):
             req_info = batch.per_request_info.get(rid)
             if req_info is None:
                 continue
-            stops = submodule.check_stop(rid, req_info, req_outputs)
+            try:
+                stops = submodule.check_stop(rid, req_info, req_outputs)
+            except Exception as e:
+                # Per-rid stage: fail only this request. Letting it escape
+                # would abort the stop check for the rest of the batch too,
+                # leaving their loops running past their stop condition.
+                logger.exception(
+                    "check_stop failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.graph_walk,
+                )
+                result.failed_requests[rid] = f"{type(e).__name__}: {e}"
+                continue
             if stops:
-                result[rid] = stops
+                result.stops[rid] = stops
         return result
 
     # ─── Core execution ────────────────────────────────────────────────
@@ -254,19 +266,21 @@ class StatelessEngine(BaseEngine):
                 skipped_rids=set(batch.request_ids),
             )
 
-        node_inputs, skipped_rids = self._prepare_inputs(batch, submodule)
-        if skipped_rids:
-            batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
+        node_inputs, skipped_rids, failed = self._prepare_inputs(batch, submodule)
+        dropped_rids = skipped_rids | failed.keys()
+        if dropped_rids:
+            batch.request_ids = [rid for rid in batch.request_ids if rid not in dropped_rids]
             batch.per_request_info = {
                 rid: info
                 for rid, info in batch.per_request_info.items()
-                if rid not in skipped_rids
+                if rid not in dropped_rids
             }
         return PreparedBatch(
             batch=batch,
             submodule=submodule,
             node_inputs=node_inputs,
             skipped_rids=skipped_rids,
+            failed_requests=failed,
         )
 
     def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
@@ -284,12 +298,21 @@ class StatelessEngine(BaseEngine):
             info = planned.batch.per_request_info.get(rid)
             if info is None:
                 continue
-            submodule.postprocess(
-                request_id=rid,
-                request_info=info,
-                outputs=output.per_request_output_tensors.get(rid, {}),
-                inputs=node_inputs,
-            )
+            try:
+                submodule.postprocess(
+                    request_id=rid,
+                    request_info=info,
+                    outputs=output.per_request_output_tensors.get(rid, {}),
+                    inputs=node_inputs,
+                )
+            except Exception as e:
+                # Per-rid stage: fail only this request, let the rest of the
+                # batch finish routing normally.
+                logger.exception(
+                    "postprocess failed for request %s (node=%s, walk=%s)",
+                    rid, planned.batch.node_name, planned.batch.graph_walk,
+                )
+                output.failed_requests[rid] = f"{type(e).__name__}: {e}"
 
     # ─── Internals ─────────────────────────────────────────────────────
 
@@ -317,24 +340,39 @@ class StatelessEngine(BaseEngine):
 
     def _prepare_inputs(
         self, batch: NodeBatch, submodule: NodeSubmodule
-    ) -> tuple[list[NodeInputs], set[str]]:
-        """Call ``prepare_inputs`` per rid; ``None`` means skip this rid."""
+    ) -> tuple[list[NodeInputs], set[str], dict[str, str]]:
+        """Call ``prepare_inputs`` per rid; ``None`` means skip this rid.
+
+        Returns ``(node_inputs, skipped_rids, failed_requests)``. A raise is
+        attributable to exactly one rid here, so it becomes a
+        ``failed_requests`` entry (rid -> message) rather than taking down the
+        batch; the caller drops those rids just like skipped ones.
+        """
         if self.enable_nvtx:
             range_push(f"engine.{self.config.name}.prepare_inputs", synchronize=False)
         try:
             node_inputs: list[NodeInputs] = []
             skipped_rids: set[str] = set()
+            failed: dict[str, str] = {}
             for rid in batch.request_ids:
-                req_inputs = submodule.prepare_inputs(
-                    graph_walk=batch.graph_walk,
-                    fwd_info=batch.per_request_info[rid],
-                    inputs=batch.per_request_input_tensors[rid],
-                )
+                try:
+                    req_inputs = submodule.prepare_inputs(
+                        graph_walk=batch.graph_walk,
+                        fwd_info=batch.per_request_info[rid],
+                        inputs=batch.per_request_input_tensors[rid],
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "prepare_inputs failed for request %s (node=%s, walk=%s)",
+                        rid, batch.node_name, batch.graph_walk,
+                    )
+                    failed[rid] = f"{type(e).__name__}: {e}"
+                    continue
                 if req_inputs is None:
                     skipped_rids.add(rid)
                 else:
                     node_inputs.append(req_inputs)
-            return node_inputs, skipped_rids
+            return node_inputs, skipped_rids, failed
         finally:
             if self.enable_nvtx:
                 range_pop(synchronize=False)

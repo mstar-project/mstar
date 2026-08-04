@@ -15,6 +15,7 @@ from mstar.engine.base import (
     NodeOutput,
     PlannedBatch,
     PreparedBatch,
+    StopCheckResult,
 )
 from mstar.engine.cache_manager import (
     BatchedCacheManager,
@@ -938,33 +939,47 @@ class KVCacheEngine(BaseEngine):
 
         node_inputs: list[ARNodeInputs] = []
         skipped_rids: set[str] = set()
+        failed: dict[str, str] = {}
         if self.enable_nvtx:
             range_push("kv_cache.prepare_inputs")
         for rid in batch.request_ids:
-            labels = cache_mgmt.alloc_manager.get_labels(rid)
-            pos_info = {
-                label: cache_mgmt.alloc_manager.get_state(
-                    rid, label
-                ).get_pos_info() for label in labels
-            }
-            req_inputs = submodule.prepare_inputs(
-                graph_walk=batch.graph_walk,
-                fwd_info=batch.per_request_info[rid],
-                inputs=batch.per_request_input_tensors[rid],
-                pos_info=pos_info,
-                seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
-            )
-            if req_inputs is None:
-                skipped_rids.add(rid)
-            else:
-                node_inputs.append(req_inputs)
+            try:
+                labels = cache_mgmt.alloc_manager.get_labels(rid)
+                pos_info = {
+                    label: cache_mgmt.alloc_manager.get_state(
+                        rid, label
+                    ).get_pos_info() for label in labels
+                }
+                req_inputs = submodule.prepare_inputs(
+                    graph_walk=batch.graph_walk,
+                    fwd_info=batch.per_request_info[rid],
+                    inputs=batch.per_request_input_tensors[rid],
+                    pos_info=pos_info,
+                    seen_token_mask=submod_mgmt.sampler.get_token_mask(rid)
+                )
+                if req_inputs is None:
+                    skipped_rids.add(rid)
+                else:
+                    node_inputs.append(req_inputs)
+            except AllocationFailedError:
+                raise  # allocation errors handled separately
+            except Exception as e:
+                # prepare_inputs is per-rid, so we know exactly who is at
+                # fault: record the error and drop the rid instead of taking
+                # the whole batch down with it.
+                logger.exception(
+                    "prepare_inputs failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.graph_walk,
+                )
+                failed[rid] = f"{type(e).__name__}: {e}"
 
-        if skipped_rids:
-            batch.request_ids = [rid for rid in batch.request_ids if rid not in skipped_rids]
+        dropped_rids = skipped_rids | failed.keys()
+        if dropped_rids:
+            batch.request_ids = [rid for rid in batch.request_ids if rid not in dropped_rids]
             batch.per_request_info = {
                 rid: info
                 for rid, info in batch.per_request_info.items()
-                if rid not in skipped_rids
+                if rid not in dropped_rids
             }
 
         if self.enable_nvtx:
@@ -975,6 +990,7 @@ class KVCacheEngine(BaseEngine):
             submodule=submodule,
             node_inputs=node_inputs,
             metadata={"submod_mgmt": submod_mgmt},
+            failed_requests=failed
         )
 
     def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
@@ -1028,12 +1044,23 @@ class KVCacheEngine(BaseEngine):
         batch = planned.batch
         submodule = planned.submodule
         for rid, node_inputs in zip(batch.request_ids, planned.node_inputs, strict=True):
-            submodule.postprocess(
-                request_id=rid,
-                request_info=batch.per_request_info[rid],
-                outputs=output.per_request_output_tensors.get(rid, {}),
-                inputs=node_inputs,
-            )
+            try:
+                submodule.postprocess(
+                    request_id=rid,
+                    request_info=batch.per_request_info[rid],
+                    outputs=output.per_request_output_tensors.get(rid, {}),
+                    inputs=node_inputs,
+                )
+            except AllocationFailedError:
+                raise  # allocation errors handled separately
+            except Exception as e:
+                # Per-rid stage: fail only this request, let the rest of the
+                # batch finish routing normally.
+                logger.exception(
+                    "postprocess failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.graph_walk,
+                )
+                output.failed_requests[rid] = f"{type(e).__name__}: {e}"
 
     def _get_needed_labels(
         self, node_name: str, graph_walk: str,
@@ -1099,14 +1126,14 @@ class KVCacheEngine(BaseEngine):
 
     def check_stop_for_batch(
         self, batch: NodeBatch, output: NodeOutput
-    ) -> dict[str, set[str]]:
+    ) -> StopCheckResult:
         """Delegate to each rid's submodule.check_stop. Worker calls this on
         the slow-postprocess path so the .item() / .cpu() reads no longer
         block ``execute_batch`` on the GPU thread."""
+        result = StopCheckResult()
         if batch.node_name not in self.submodule_management:
-            return {}
+            return result
         submodule = self.submodule_management[batch.node_name].submodule
-        result: dict[str, set[str]] = {}
         for rid in batch.request_ids:
             req_outputs = output.per_request_output_tensors.get(rid, {})
             if not req_outputs:
@@ -1114,9 +1141,20 @@ class KVCacheEngine(BaseEngine):
             req_info = batch.per_request_info.get(rid)
             if req_info is None:
                 continue
-            stops = submodule.check_stop(rid, req_info, req_outputs)
+            try:
+                stops = submodule.check_stop(rid, req_info, req_outputs)
+            except Exception as e:
+                # Per-rid stage: fail only this request. Letting it escape
+                # would abort the stop check for the rest of the batch too,
+                # leaving their loops running past their stop condition.
+                logger.exception(
+                    "check_stop failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.graph_walk,
+                )
+                result.failed_requests[rid] = f"{type(e).__name__}: {e}"
+                continue
             if stops:
-                result[rid] = stops
+                result.stops[rid] = stops
         return result
 
     def reserve_replay_slot(self, batch: NodeBatch) -> int | None:
