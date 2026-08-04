@@ -588,12 +588,15 @@ def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
             "suppress_eos": torch.tensor([False]),
         }),
     ]
-    mask = submodule._get_batch_suppress_mask(inputs)
+    suppress_eos = submodule._get_batch_suppress_eos(inputs)
     eos = config.talker.codec_eos_token_id
+    logits = submodule._mask_invalid_logits(
+        torch.zeros(2, config.talker.vocab_size), suppress_eos
+    )
 
-    assert mask.shape == (2, config.talker.vocab_size)
-    assert mask[0, eos].item() is True
-    assert mask[1, eos].item() is False
+    assert suppress_eos.tolist() == [True, False]
+    assert torch.isneginf(logits[0, eos])
+    assert logits[1, eos].item() == 0.0
 
 
 def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
@@ -633,7 +636,11 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
 
     eos = config.talker.codec_eos_token_id
     assert prepared.tensor_inputs["suppress_eos"].item() is False
-    assert packed["suppress_mask"][0, eos].item() is False
+    assert packed["suppress_eos"].item() is False
+    logits = submodule._mask_invalid_logits(
+        torch.zeros(1, config.talker.vocab_size), packed["suppress_eos"]
+    )
+    assert logits[0, eos].item() == 0.0
     assert "__graph_dummy__" not in submodule.request_states
 
 
@@ -691,6 +698,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     )
     assert packed["input_embeds"].shape == (2, 16)
     assert packed["last_token_indices"].tolist() == [0, 1]
+    assert packed["suppress_eos"].tolist() == [True, True]
     graph_config = submodule.get_cuda_graph_configs(torch.device("cpu"))[0]
     assert graph_config.capture_graph_walk == "talker_decode"
     assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
@@ -724,6 +732,16 @@ def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
         layer.self_attn.q_norm = torch.nn.Identity()
         layer.self_attn.k_norm = torch.nn.Identity()
     predictor.model.norm = torch.nn.Identity()
+    rope_calls = []
+
+    def capture_rope(q, k, position_ids, rope_theta):
+        rope_calls.append((q.shape, k.shape, position_ids.dtype, rope_theta))
+        return q, k
+
+    monkeypatch.setattr(
+        "mstar.model.qwen3_tts.components.talker.apply_rope_pos_ids",
+        capture_rope,
+    )
     original_sdpa = torch.nn.functional.scaled_dot_product_attention
     calls = []
 
@@ -756,6 +774,8 @@ def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
     assert key_shape[1] == config.talker.code_predictor.num_key_value_heads
     assert value_shape[1] == config.talker.code_predictor.num_key_value_heads
     assert kwargs["enable_gqa"] is True
+    assert len(rope_calls) == config.talker.code_predictor.num_hidden_layers
+    assert rope_calls[0][2] == torch.int32
 
 
 def test_qwen3_tts_piecewise_sampling_is_tensor_only():
