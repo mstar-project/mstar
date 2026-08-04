@@ -2257,17 +2257,17 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         overlap = st["ar_overlap"] if index > 0 else 0
         new = latents[:, :, overlap:] if overlap else latents
         tail = st.get("ar_tail")
-        if tail is None:
-            pixels = self._decode_pixels(new)
-        else:
-            ctx = tail[:, :, -st["ar_ctx"]:]
-            pixels = self._decode_pixels(torch.cat([ctx, new.to(ctx.dtype)], dim=2))
+        # The retained tail is already capped at ar_ctx latents, so appending
+        # the window's new latents yields the [context | window] decode input
+        # and the next tail in one tensor.
+        stream_tail = new if tail is None else torch.cat([tail, new.to(tail.dtype)], dim=2)
+        pixels = self._decode_pixels(stream_tail)
+        if tail is not None:
             # A mid-stream latent decodes to scale_factor_temporal frames; the
             # leading context (and the clip-start special frame, which falls
             # inside it) is exactly the part being trimmed.
             keep = new.shape[2] * self.config.vae.scale_factor_temporal
             pixels = pixels[:, :, -keep:]
-        stream_tail = new if tail is None else torch.cat([tail, new.to(tail.dtype)], dim=2)
         st.add("ar_tail", stream_tail[:, :, -st["ar_ctx"]:])
         st.add("ar_chunks", index + 1)
         if st["ar_stream"]:
