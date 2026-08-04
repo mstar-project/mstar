@@ -184,8 +184,10 @@ class Wan22Model(Model):
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
-                # Don't let async scheduling overshoot check_stop by an iteration.
-                enable_async_scheduling=False,
+                # Async scheduling may dispatch an iteration past the stop
+                # check_stop registers; Wan22DitSubmodule.prepare_inputs vetoes
+                # the overshoot (None -> the engine skips that forward).
+                enable_async_scheduling=True,
             ),
             # Ceiling only; the request's step count stops the loop early.
             max_iters=self.config.max_denoise_steps,

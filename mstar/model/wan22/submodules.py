@@ -122,6 +122,9 @@ class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     ``text_embeds_pos`` / ``text_embeds_neg``, each ``[1, text_max_seq_len,
     text_dim]``, zero-padded past the true sequence length. The two prompts run as
     two batch-1 forwards, as the reference's separate ``encode_prompt`` calls do.
+    With CFG off (``guidance_scale <= 1.0``) the negative prompt is not encoded
+    at all: the dit never reads it, so ``text_embeds_neg`` is a 1-element
+    placeholder that only keeps the persisted edge populated.
     """
 
     disable_torch_compile = True
@@ -139,25 +142,27 @@ class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        return NodeInputs(
-            tensor_inputs={
-                "positive_ids": inputs["text_inputs"][0],
-                "negative_ids": inputs["text_inputs"][1],
-            }
-        )
+        tensor_inputs = {"positive_ids": inputs["text_inputs"][0]}
+        # CFG off: skip the negative prompt's UMT5 forward entirely (see the
+        # class docstring); forward emits the placeholder when the key is absent.
+        if float(fwd_info.step_metadata["guidance_scale"]) > 1.0:
+            tensor_inputs["negative_ids"] = inputs["text_inputs"][1]
+        return NodeInputs(tensor_inputs=tensor_inputs)
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         positive_ids: torch.Tensor,
-        negative_ids: torch.Tensor,
+        negative_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
         with _no_autocast():
+            pos = self._encode_one(positive_ids)
+            neg = self._encode_one(negative_ids) if negative_ids is not None else pos.new_zeros(1)
             return {
-                "text_embeds_pos": [self._encode_one(positive_ids)],
-                "text_embeds_neg": [self._encode_one(negative_ids)],
+                "text_embeds_pos": [pos],
+                "text_embeds_neg": [neg],
             }
 
     def _encode_one(self, ids: torch.Tensor) -> torch.Tensor:
@@ -213,7 +218,13 @@ class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     ) -> NodeInputs:
         # The image's size is checked at the request seam (Wan22Model.process_prompt),
         # so a mismatch is a 400 rather than a fault here on the compute worker.
-        return NodeInputs(tensor_inputs={"image": inputs["image_inputs"][0]})
+        image = inputs["image_inputs"][0]
+        # uint8 -> float [0, 1] here rather than in forward: prepare_inputs is
+        # the per-request preprocessing seam, so a future batched forward sees
+        # dtype-uniform inputs.
+        if image.dtype == torch.uint8:
+            image = image.float() / 255.0
+        return NodeInputs(tensor_inputs={"image": image})
 
     def forward(
         self,
@@ -224,8 +235,6 @@ class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     ) -> NameToTensorList:
         with _no_autocast():
             device = self.get_device()
-            if image.dtype == torch.uint8:
-                image = image.float() / 255.0
             # VideoProcessor.preprocess normalizes to [-1, 1].
             video = (image.float() * 2.0 - 1.0).to(device=device, dtype=self.vae.dtype)
             video = video[None, :, None]  # [1, C, 1, H, W]
@@ -317,7 +326,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
         **kwargs,
-    ) -> NodeInputs:
+    ) -> NodeInputs | None:
         tensor_inputs = {
             "text_embeds_pos": inputs["text_embeds_pos"][0],
             "text_embeds_neg": inputs["text_embeds_neg"][0],
@@ -342,8 +351,22 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
             )
             tensor_inputs["unipc_last_sample"] = torch.zeros(shape, dtype=torch.float32, device=device)
         else:
+            time_index = inputs["time_index"][0]
+            k = int(time_index.reshape(-1)[0].item())
+            num_steps = int(fwd_info.step_metadata["num_inference_steps"])
+            if k >= num_steps:
+                # Async scheduling dispatched an iteration past this request's
+                # stop (check_stop fired at k == N - 1 but the conductor had
+                # already sent iteration N). Veto it: None makes the engine
+                # skip this forward — the cosmos3 pattern.
+                logger.info(
+                    "Wan2.2 dit: skipping async-overshoot iteration %d "
+                    "(request %s runs %d steps)",
+                    k, fwd_info.request_id, num_steps,
+                )
+                return None
             tensor_inputs["latents"] = inputs["latents"][0]
-            tensor_inputs["time_index"] = inputs["time_index"][0]
+            tensor_inputs["time_index"] = time_index
             tensor_inputs["unipc_model_outputs"] = inputs["unipc_model_outputs"][0]
             tensor_inputs["unipc_last_sample"] = inputs["unipc_last_sample"][0]
         return NodeInputs(tensor_inputs=tensor_inputs)
@@ -472,10 +495,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
         While iteration k (0-based) is being postprocessed the iteration count
         still reads k, and the stop registered here ends the loop at the end of
         that iteration. So for N steps it must fire at k == N - 1, i.e. when
-        ``k + 1 >= N``. Overshoot cannot happen: the dit node sets
-        ``enable_async_scheduling=False``, and an iteration N would fault on
-        the N-element timestep table anyway. ``>=`` over ``==`` is plain
-        defensive arithmetic, not overshoot handling.
+        ``k + 1 >= N``. The dit node runs with async scheduling, so the
+        conductor may dispatch a speculative iteration N before this stop
+        lands; ``prepare_inputs`` vetoes that overshoot by returning None, and
+        ``>=`` keeps the stop firing when the deferred count reads N.
         """
         iter_idx = request_info.dynamic_loop_iter_counts.get(DENOISE_LOOP_NAME, 0)
         requested = int(request_info.step_metadata.get("num_inference_steps", 0) or 0)

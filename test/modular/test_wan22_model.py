@@ -28,6 +28,7 @@ from mstar.model.wan22.submodules import (
     _DECODE_UNTILED_SAFETY_MARGIN,
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
+    Wan22TextEncoderSubmodule,
     Wan22VaeDecoderSubmodule,
     normalize_decode_tiling_mode,
 )
@@ -157,8 +158,9 @@ def test_wan22_video_gen_walk_structure(walk_name, expect_image_latent):
     assert loop.max_iters == model.config.max_denoise_steps
     body = loop.section
     assert isinstance(body, GraphNode) and body.name == "dit"
-    # Async scheduling off, or a speculative iteration overshoots the stop.
-    assert body.enable_async_scheduling is False
+    # Async scheduling on; the speculative overshoot iteration is vetoed by
+    # Wan22DitSubmodule.prepare_inputs returning None.
+    assert body.enable_async_scheduling is True
     assert {e.name for e in body.outputs} == LOOP_BACK_NAMES
     assert all(e.next_node == "dit" for e in body.outputs)
 
@@ -411,6 +413,68 @@ def test_wan22_check_stop_without_step_metadata_never_stops():
     info = _fwd_info(requested_steps=0, iter_count=99)
     info.step_metadata = {}
     assert submodule.check_stop("r0", info, outputs={}) == set()
+
+
+# ----------------------------------------------------------------------
+# prepare_inputs: async-overshoot veto (dit) and no-CFG negative skip
+# (text encoder)
+# ----------------------------------------------------------------------
+
+
+def _dit_loop_inputs(k: int) -> dict:
+    """The dit's inputs as they arrive on loop iteration k >= 1."""
+    shape = (1, 4, 2, 2, 2)
+    return {
+        "text_embeds_pos": [torch.zeros(1, 8, 16)],
+        "text_embeds_neg": [torch.zeros(1, 8, 16)],
+        "latents": [torch.zeros(shape)],
+        "time_index": [torch.tensor([k], dtype=torch.int64)],
+        "unipc_model_outputs": [torch.zeros((2, *shape))],
+        "unipc_last_sample": [torch.zeros(shape)],
+    }
+
+
+def test_wan22_dit_prepare_inputs_vetoes_async_overshoot():
+    # Async scheduling can dispatch iteration N after check_stop fired at
+    # N - 1; prepare_inputs returns None so the engine skips that forward.
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    result = submodule.prepare_inputs(
+        graph_walk=Wan22Model.VIDEO_GEN_WALK,
+        fwd_info=_fwd_info(requested_steps=2, iter_count=2),
+        inputs=_dit_loop_inputs(k=2),
+    )
+    assert result is None
+
+
+def test_wan22_dit_prepare_inputs_passes_in_range_iteration():
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+    node_inputs = submodule.prepare_inputs(
+        graph_walk=Wan22Model.VIDEO_GEN_WALK,
+        fwd_info=_fwd_info(requested_steps=2, iter_count=1),
+        inputs=_dit_loop_inputs(k=1),
+    )
+    assert node_inputs is not None
+    assert int(node_inputs.tensor_inputs["time_index"][0]) == 1
+
+
+@pytest.mark.parametrize("guidance,expect_negative", [
+    (5.0, True),
+    (1.0, False),  # the no-CFG boundary: the dit's do_cfg is guidance > 1.0
+    (0.0, False),
+])
+def test_wan22_text_encoder_prepare_inputs_negative_skip(guidance, expect_negative):
+    # CFG off: the negative prompt's UMT5 forward is skipped; prepare_inputs
+    # drops negative_ids and forward emits a 1-element placeholder instead.
+    submodule = Wan22TextEncoderSubmodule(text_encoder=None, config=Wan22Config())
+    info = _fwd_info(requested_steps=50, iter_count=0)
+    info.step_metadata["guidance_scale"] = guidance
+    node_inputs = submodule.prepare_inputs(
+        graph_walk=Wan22Model.ENCODE_TEXT_WALK,
+        fwd_info=info,
+        inputs={"text_inputs": [torch.tensor([1, 2]), torch.tensor([3])]},
+    )
+    assert ("negative_ids" in node_inputs.tensor_inputs) == expect_negative
+    assert torch.equal(node_inputs.tensor_inputs["positive_ids"], torch.tensor([1, 2]))
 
 
 # ----------------------------------------------------------------------
