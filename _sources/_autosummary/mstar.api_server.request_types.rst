@@ -21,6 +21,7 @@ mstar.api\_server.request\_types
       DataWorkerProfile
       PreprocessInput
       RequestComplete
+      RequestFailed
       ResultChunk
       ResultTensors
    
