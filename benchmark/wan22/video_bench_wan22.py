@@ -263,15 +263,39 @@ def _gen_vllm(cfg: "CellConfig", prompt: str) -> GenResult:
         return GenResult(ok=False, e2e_s=time.perf_counter() - t0, error=f"{type(e).__name__}: {str(e)[:160]}")
 
 
-_ENGINES = {"ours": _gen_ours, "vllm": _gen_vllm}
+def _gen_sglang(cfg: "CellConfig", prompt: str) -> GenResult:
+    """SGLang-Diffusion baseline: multipart POST /v1/videos → poll → /content.
 
-# SGLang-Diffusion has no client here: it never produced usable numbers (blocked
-# on an upstream packaging skew, and TI2V-5B is 720p-only there). run_cell refuses
-# an --engine sglang cell with this message rather than pretend to measure it.
-_SGLANG_UNSUPPORTED = (
-    "--engine sglang is not measurable by this harness: SGLang-Diffusion is blocked "
-    "on an upstream packaging skew (its cu12x wheels ship a broken deep_gemm)."
-)
+    Same async job API shape as vllm-omni. flow_shift is not a request field
+    there; the server's Wan2.2-TI2V-5B pipeline config pins 5.0, matching this
+    grid's pin. The earlier packaging blocker (cu12x deep_gemm) is resolved by
+    installing from the cu129 wheel index, and 0.5.x accepts the 480p tier.
+    """
+    base = f"http://{cfg.host}:{cfg.port}/v1/videos"
+    fields = {
+        "model": _baseline_model_id(cfg),
+        "prompt": prompt,
+        "negative_prompt": cfg.negative_prompt,
+        "size": cfg.size,
+        "num_frames": cfg.frames,
+        "fps": cfg.fps,
+        "num_inference_steps": cfg.steps,
+        "guidance_scale": cfg.guidance_scale,
+        "seed": cfg.seed,
+    }
+    body, content_type = _multipart(fields)
+    req = urllib.request.Request(base, data=body, headers={"Content-Type": content_type})
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=cfg.timeout_s) as r:
+            job = json.load(r)
+        vid = job.get("id") or job.get("video_id")
+        return _poll_and_download(base, vid, cfg, t0)
+    except Exception as e:  # noqa: BLE001
+        return GenResult(ok=False, e2e_s=time.perf_counter() - t0, error=f"{type(e).__name__}: {str(e)[:160]}")
+
+
+_ENGINES = {"ours": _gen_ours, "vllm": _gen_vllm, "sglang": _gen_sglang}
 
 # What the client's measured wall actually spans, per engine. Stamped into every row
 # so a cross-system delta is never read without its measurement boundary.
@@ -279,6 +303,8 @@ TIMING_BOUNDARY = {
     "ours": "POST /v1/videos/generations → response (mp4 inline, base64); synchronous, no polling",
     "vllm": "POST /v1/videos (multipart) → poll GET /v1/videos/{{id}} every {poll}ms → GET /content; "
             "includes submit + poll quantisation (+{halfpoll}ms expected bias) + download",
+    "sglang": "POST /v1/videos (multipart) → poll GET /v1/videos/{{id}} every {poll}ms → GET /content; "
+              "includes submit + poll quantisation (+{halfpoll}ms expected bias) + download",
 }
 
 
@@ -412,8 +438,6 @@ def _require_supported_task(cfg: CellConfig) -> None:
 def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
              server_info: dict | None = None) -> dict:
     _require_supported_task(cfg)
-    if cfg.engine == "sglang":
-        raise ValueError(_SGLANG_UNSUPPORTED)
     gen = _ENGINES[cfg.engine]
     server_info = server_info or probe_server_versions(cfg.server_python)
 
@@ -476,10 +500,10 @@ def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
     row = {
         # ---- identity / config ----
         "label": cfg.label,
-        "system": {"ours": "mstar", "vllm": "vllm-omni"}[cfg.engine],
+        "system": {"ours": "mstar", "vllm": "vllm-omni", "sglang": "sglang-diffusion"}[cfg.engine],
         "engine": cfg.engine,
         "model": cfg.model if cfg.engine == "ours" else _baseline_model_id(cfg),
-        "endpoint": {"ours": "/v1/videos/generations", "vllm": "/v1/videos"}[cfg.engine],
+        "endpoint": {"ours": "/v1/videos/generations", "vllm": "/v1/videos", "sglang": "/v1/videos"}[cfg.engine],
         # Only the mstar client sends the conditioning image; a baseline i2v request
         # is refused rather than run as t2v and mislabelled (_require_supported_task).
         "task": "i2v" if cfg.image_data_uri else "t2v",
@@ -505,7 +529,7 @@ def run_cell(cfg: CellConfig, prompts: list[str], gpu_info: dict,
         # What the measured wall actually spans on THIS engine's transport — never
         # compare an e2e across engines without reading this (see TIMING_BOUNDARY).
         "timing_boundary": _timing_boundary(cfg),
-        "poll_interval_s": cfg.poll_interval_s if cfg.engine == "vllm" else None,
+        "poll_interval_s": cfg.poll_interval_s if cfg.engine in ("vllm", "sglang") else None,
         # ---- environment ----
         "gpu_name": gpu_info.get("name"),
         "gpu_count": gpu_info.get("count"),
