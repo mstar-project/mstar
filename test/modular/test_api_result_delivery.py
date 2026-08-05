@@ -159,7 +159,9 @@ def test_text_chunks_carry_token_ids():
 
     from mstar.graph.base import TensorPointerInfo
 
-    edge = GraphEdge(next_node="emit_to_client", name="new_token")
+    # _read_result_tensor renames incoming edges to f"{modality}_output"
+    # before registering them; this edge models the post-rename state.
+    edge = GraphEdge(next_node="emit_to_client", name="text_output")
     edge.tensor_info = [TensorPointerInfo(
         dims=[1], dtype="torch.int64", nbytes=8, address=0, stride=[1],
         uuid="u0", source_session_id="s", source_entity="worker_0",
