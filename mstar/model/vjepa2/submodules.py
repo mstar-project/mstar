@@ -922,9 +922,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """One BATCHED piecewise graph (``"block_loop"``) for the AC predictor.
 
-        Extra kwargs (e.g. ``sampler_buffers``) are accepted and ignored: this
-        graph does no in-graph sampling.
-
         ``capture_seq_len = cond_tokens + N*N`` is the per-frame token count
         (one rollout step processes one frame). The block loop reads the
         FlashInfer KV cache, so ``uses_kv_cache=True``.

@@ -969,16 +969,12 @@ class CudaGraphRunner:
         return key if key in self.graphs else None
 
     def _get_sampler(
-        self, per_request_info: dict[str, CurrentForwardPassInfo],
-        request_ids: list[str], padded_bs: int,
+        self, request_ids: list[str], padded_bs: int,
         gather_seen_tokens: bool = True,
     ):
         # Per-request sampling configs are pre-staged on master GPU buffers
         # (see ``register_request`` / ``update_request_config`` from KVCacheEngine);
-        # the per-step path is just a slot-index gather + index_select. The
-        # ``per_request_info`` argument is unused here but kept on the
-        # signature for symmetry with the older callers.
-        del per_request_info
+        # the per-step path is just a slot-index gather + index_select.
         return self.sampler_buffer.gather_for_request_ids(
             request_ids=request_ids, padded_bs=padded_bs,
             gather_seen_tokens=gather_seen_tokens,
@@ -1407,7 +1403,6 @@ class CudaGraphRunner:
                 per_request_info=real_metadata,
                 cache_manager=static_cm,
                 sampler=self._get_sampler(
-                    per_request_info=per_request_info,
                     request_ids=request_ids,
                     padded_bs=padded_bs,
                     gather_seen_tokens=graph_data.applied_penalty_in_graph,
@@ -1641,7 +1636,6 @@ class CudaGraphRunner:
                 per_request_info=real_metadata,
                 cache_manager=static_cm,
                 sampler=self._get_sampler(
-                    per_request_info=per_request_info,
                     request_ids=request_ids,
                     padded_bs=padded_bs,
                     gather_seen_tokens=graph_data.applied_penalty_in_graph,
@@ -2437,6 +2431,7 @@ class PiecewiseCudaGraphRunner:
         kv_cache_config: KVCacheConfig | None = None,
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
+        sampler_buffers: MultiSamplerBuffers | None = None,
         tp_group=None,
     ):
         from mstar.distributed.communication import CommGroup
@@ -2447,6 +2442,7 @@ class PiecewiseCudaGraphRunner:
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.buffer_manager = buffer_manager
+        self.sampler_buffer = sampler_buffers
         # ``tp_group`` is the per-node TP comm group. Defaults to the trivial
         # single-rank group so the runner behaves identically for non-TP
         # submodules. When ``world_size > 1`` the captured region may include
@@ -2520,11 +2516,21 @@ class PiecewiseCudaGraphRunner:
                 dynamic=False,
             )
 
+        # TODO: in the future, consider inputting a ModelInputsFromEngine struct
+        # instead of inputting static_cm and sampler separately
+        extra_kwargs = {}
+        if self.sampler_buffer is not None:
+            extra_kwargs["sampler"] = self.sampler_buffer.gather_for_request_ids(
+                request_ids=[],
+                padded_bs=shape.bs
+            )
+
         def run_fn():
             return fn(
                 static_inputs=static_inputs,
                 static_cm=static_cm,
                 **self.config.forward_kwargs,
+                **extra_kwargs
             )
 
         def plan():
@@ -2793,6 +2799,14 @@ class PiecewiseCudaGraphRunner:
                 seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
             )
 
+        if self.sampler_buffer is not None and request_ids is not None:
+            # TODO: add "gather_seen_tokens" as an explicit flag in the piecewise cuda
+            # graph config so we don't do unnecessary work here
+            self.sampler_buffer.gather_for_request_ids(
+                request_ids=request_ids, padded_bs=data.shape.bs,
+                gather_seen_tokens=True,
+            )
+
         # --- 3: replay ---
         data.graph.replay()
 
@@ -2841,7 +2855,7 @@ def build_piecewise_runners(
     opts into none, or whose capture fails, yields an empty dict (eager path).
     """
     configs = submodule.get_piecewise_cuda_graph_configs(
-        device, autocast_dtype, tp_world_size, sampler_buffers=sampler_buffers,
+        device, autocast_dtype, tp_world_size
     )
     runners: dict[str, PiecewiseCudaGraphRunner] = {}
     for label, config in configs.items():
@@ -2853,6 +2867,7 @@ def build_piecewise_runners(
                 kv_cache_config=kv_cache_config if config.uses_kv_cache else None,
                 alloc_manager=alloc_manager if config.uses_kv_cache else None,
                 buffer_manager=buffer_manager if config.uses_kv_cache else None,
+                sampler_buffers=sampler_buffers if config.uses_sampler else None,
                 tp_group=tp_group,
             )
             runner.warmup_and_capture()

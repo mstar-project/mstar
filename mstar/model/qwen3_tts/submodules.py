@@ -54,8 +54,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
 )
 from mstar.utils.sampling import (
-    CudaGraphableSampler,
-    MultiSamplerBuffers,
+    BaseMultiSampler,
     SeenTokenMask,
 )
 
@@ -99,10 +98,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.num_codes = config.talker.num_code_groups
         self._suppress_mask: torch.Tensor | None = None
         self._cp_kv_cache: torch.Tensor | None = None
-        # Set when the engine hands over its sampler buffers at piecewise
-        # capture; the captured depth loop samples straight out of them.
-        self._cp_sampler_buffers: MultiSamplerBuffers | None = None
-        self._cp_capture_samplers: dict[int, CudaGraphableSampler] = {}
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -463,7 +458,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _code_predictor_piecewise_capture(
         self,
         static_inputs: dict[str, torch.Tensor],
-        static_cm=None,
+        sampler: BaseMultiSampler,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Capture entry point: the depth loop *including* its sampling.
 
@@ -471,12 +467,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         so nothing about sampling has to be hoisted out as a static input the
         way per-step uniforms and scalars used to be.
         """
-        del static_cm
         layer0_codes = static_inputs["layer0_codes"]
-        aux = self._cp_capture_samplers[layer0_codes.shape[0]]
         all_codes, codec_embed_sum = self._depth_loop(
             static_inputs["last_hidden"], layer0_codes,
-            lambda cp_logits: aux.sample([], cp_logits),
+            lambda cp_logits: sampler.sample_aux("code_predictor", [], cp_logits),
         )
         return {"all_codes": all_codes, "codec_embed_sum": codec_embed_sum}
 
@@ -496,23 +490,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         batch_size = layer0_codes.shape[0]
         if runner is None or not runner.can_run(batch_size=batch_size):
             return None
-        # Called for its side effect only: it stages this step's per-request
-        # sampling params into the shared gather buffers that every per-bucket
-        # capture sampler in ``_cp_capture_samplers`` aliases, so the returned
-        # sampler is intentionally discarded. ``padded_bs=batch_size`` fills
-        # only the real rows; the bucket graph samples its full captured width,
-        # but PiecewiseOutput slices the padded tail off (those rows always hold
-        # a well-formed, stale config).
-        self._cp_sampler_buffers.aux["code_predictor"].gather_for_request_ids(
-            request_ids=engine_inputs.request_ids,
-            padded_bs=batch_size,
-            gather_seen_tokens=False,
-        )
+
         output = runner.run(
             static_inputs={
                 "last_hidden": last_hidden,
                 "layer0_codes": layer0_codes,
             },
+            request_ids=engine_inputs.request_ids,
             real_bs=batch_size,
         )
         return output["all_codes"], output["codec_embed_sum"]
@@ -669,7 +653,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         device: torch.device,
         autocast_dtype: torch.dtype,
         tp_world_size: int = 1,
-        sampler_buffers: MultiSamplerBuffers | None = None,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """Capture the CodePredictor depth loop, sampling included.
 
@@ -679,20 +662,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine KV cache: its frame-local cache is a static tensor owned here.
         """
         del tp_world_size
-        if sampler_buffers is None or "code_predictor" not in sampler_buffers.aux:
-            # Without the aux buffers the loop cannot sample in-graph; skip
-            # capture and let the eager path run it.
-            return {}
-        self._cp_sampler_buffers = sampler_buffers
         hidden_size = self.talker_config.hidden_size
         capture_dtype = autocast_dtype or self.model.model.codec_embedding.weight.dtype
-        aux_buffers = sampler_buffers.aux["code_predictor"]
-        # One sampler per capture bucket, over that bucket's slice of the shared
-        # buffers, built up-front so each capture reads a stable address.
-        self._cp_capture_samplers = {
-            bs: CudaGraphableSampler(**aux_buffers.slice_for_bs(bs))
-            for bs in self.DECODE_CAPTURE_BATCH_SIZES
-        }
 
         def make_static_inputs(
             shape: PiecewiseCaptureShape,
@@ -712,6 +683,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 make_static_inputs=make_static_inputs,
                 seq_len=1,
                 uses_kv_cache=False,
+                uses_sampler=True,
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,
             )

@@ -780,11 +780,14 @@ def test_qwen3_tts_depth_loop_piecewise_captures_its_own_sampling():
         bufs.register_request(rid, multi)
 
     configs = submodule.get_piecewise_cuda_graph_configs(
-        dev, torch.bfloat16, sampler_buffers=bufs,
+        dev, torch.bfloat16
     )
     runner = PiecewiseCudaGraphRunner(
         config=configs["code_predictor_loop"], device=dev,
         autocast_dtype=torch.bfloat16,
+        # uses_sampler=True config: the engine wires the node's sampler buffers
+        # into the runner, which injects a sampler into the captured depth loop.
+        sampler_buffers=bufs,
     )
     runner.warmup_and_capture()
     assert runner.graphs, "depth-loop capture produced no graphs"

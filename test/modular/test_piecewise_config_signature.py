@@ -1,11 +1,11 @@
 """Signature-conformance test for ``get_piecewise_cuda_graph_configs`` overrides.
 
-The engine calls this method with ``sampler_buffers=`` (added when in-graph
-sampling landed) OUTSIDE the per-label try/except, so an override with the old
-signature raises ``TypeError`` at engine warmup and kills the worker — but no
-modular test builds every model's piecewise runners, so the suite stays green
-on a branch that can't serve. This CPU-only test binds the engine's call args
-against each override's signature to catch that mismatch cheaply.
+``build_piecewise_runners`` calls this method OUTSIDE the per-label try/except,
+so an override whose signature drifts from the base raises ``TypeError`` at
+engine warmup and kills the worker — but no modular test builds every model's
+piecewise runners, so the suite stays green on a branch that can't serve. This
+CPU-only test binds the engine's call args against each override's signature to
+catch that mismatch cheaply.
 """
 import importlib
 import inspect
@@ -47,5 +47,4 @@ def test_piecewise_config_accepts_engine_call(cls):
     sig.bind(
         object(),  # self placeholder
         torch.device("cpu"), torch.bfloat16, 1,
-        sampler_buffers=None,
     )
