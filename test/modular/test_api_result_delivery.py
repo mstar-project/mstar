@@ -126,6 +126,68 @@ def test_result_reads_drain_ahead_of_preprocess():
     assert not thread.is_alive()
 
 
+class _ReadyOnceTensorManager(_RecordingTensorManager):
+    """Serves one ready text tensor, then goes quiet."""
+
+    def __init__(self, edge, tensor):
+        super().__init__()
+        self._pending = {"r0": [edge]}
+        self._tensor = tensor
+        self.dereferenced = []
+
+    def get_ready_tensors(self):
+        pending, self._pending = self._pending, {}
+        return pending
+
+    def get_tensor(self, request_id, uuid):
+        return self._tensor
+
+    def dereference(self, request_id, uuid):
+        self.dereferenced.append(uuid)
+
+
+class _DecodingModel:
+    def postprocess(self, tensor, modality, request_kwargs=None):
+        return b"hi"
+
+
+def test_text_chunks_carry_token_ids():
+    """Text chunk metadata must expose the raw ids: postprocess decodes
+    per-token (lossy across multi-byte chars), and engine-parity diffs at
+    temp 0 need id-exact comparison."""
+    import torch
+
+    from mstar.graph.base import TensorPointerInfo
+
+    edge = GraphEdge(next_node="emit_to_client", name="new_token")
+    edge.tensor_info = [TensorPointerInfo(
+        dims=[1], dtype="torch.int64", nbytes=8, address=0, stride=[1],
+        uuid="u0", source_session_id="s", source_entity="worker_0",
+    )]
+    tm = _ReadyOnceTensorManager(edge, torch.tensor([42, 7]))
+    worker = PreprocessWorkerThread(
+        in_queue=queue.Queue(),
+        result_tensor_queue=queue.Queue(),
+        out_queue=queue.Queue(),
+        profile_queue=queue.Queue(),
+        cleanup_request_queue=queue.Queue(),
+        abort_request_queue=queue.Queue(),
+        discard_tensor_queue=queue.Queue(),
+        stop_event=threading.Event(),
+        communicator=_RecordingCommunicator(),
+        tensor_manager=tm,
+        model=_DecodingModel(),
+    )
+    worker.tensor_uuid_to_metadata_per_request["r0"] = {"u0": {}}
+
+    assert worker._process_read_tensors() is True
+    chunk = worker.out_queue.get_nowait()
+    assert chunk.modality == "text"
+    assert chunk.data == b"hi"
+    assert chunk.metadata["token_ids"] == [42, 7]
+    assert tm.dereferenced == ["u0"]
+
+
 class _StubPreprocessWorker:
     def __init__(self, pending=False, final=True):
         self.pending = pending
