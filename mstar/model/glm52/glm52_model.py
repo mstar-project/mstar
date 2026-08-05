@@ -91,10 +91,31 @@ class Glm52Model(Model):
             tokenizer_source = _resolve_local_hf_snapshot(
                 self.model_path_hf, cache_dir=self.cache_dir,
             )
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_source, cache_dir=self.cache_dir,
-            )
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer_source, cache_dir=self.cache_dir,
+                )
+            except ValueError:
+                # The checkpoint's tokenizer_config declares transformers-5's
+                # TokenizersBackend class, which transformers 4.x cannot
+                # construct — but the underlying tokenizer.json is
+                # version-independent. Verified on transformers 4.57:
+                # template render, roundtrip, and special-token decode all
+                # match the checkpoint's declared ids.
+                self._tokenizer = self._fast_tokenizer_fallback(tokenizer_source)
         return self._tokenizer
+
+    @staticmethod
+    def _fast_tokenizer_fallback(source: str):
+        from transformers import PreTrainedTokenizerFast
+
+        snap = Path(source)
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=str(snap / "tokenizer.json"))
+        template = snap / "chat_template.jinja"
+        if template.is_file():
+            tokenizer.chat_template = template.read_text()
+        return tokenizer
 
     # -------------------------------------------------------------------
     # Model ABC: KV cache config
