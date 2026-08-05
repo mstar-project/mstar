@@ -380,6 +380,13 @@ class Model(ABC):
         The submodule samples these via ``sampler.sample_aux(label, ...)``; each
         label gets its own sampler buffers, so the params are per-request and
         CUDA-graph safe.
+
+        Contract: the label SET must not depend on ``model_kwargs`` — only the
+        values may. The aux SamplerBuffers are allocated once at engine build
+        from the default config, and MultiSampler.set_config /
+        MultiSamplerBuffers.update_request_config intersect against that fixed
+        set, so any label introduced later (per-request) is silently dropped
+        (and only asserts if the submodule then tries to sample it).
         """
         return {}
 

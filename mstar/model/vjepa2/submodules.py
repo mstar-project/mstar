@@ -21,7 +21,7 @@ branch.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -918,8 +918,12 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
     def get_piecewise_cuda_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+        **kwargs: Any,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """One BATCHED piecewise graph (``"block_loop"``) for the AC predictor.
+
+        Extra kwargs (e.g. ``sampler_buffers``) are accepted and ignored: this
+        graph does no in-graph sampling.
 
         ``capture_seq_len = cond_tokens + N*N`` is the per-frame token count
         (one rollout step processes one frame). The block loop reads the

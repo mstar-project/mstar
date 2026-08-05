@@ -1224,19 +1224,3 @@ class MultiSamplerBuffers:
                 ) for label, bufs in self.aux.items()
             },
         )
-
-
-def make_sampler_from_buffers(
-    bufs: MultiSamplerBuffers,
-    request_ids: list[str],
-    sampling_configs: dict[str, SamplingConfig],
-    padded_bs: int,
-) -> MultiCudaGraphableSampler:
-    """Compatibility shim. Prefer ``bufs.gather_for_request_ids`` directly.
-
-    ``sampling_configs`` is no longer consulted — per-request configs live
-    on ``bufs`` (set via ``register_request`` / ``update_request_config``).
-    The argument is kept for source-level compatibility with older callers.
-    """
-    del sampling_configs
-    return bufs.gather_for_request_ids(request_ids, padded_bs)

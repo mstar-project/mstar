@@ -48,7 +48,6 @@ from mstar.utils.sampling import (
     MultiSampler,
     MultiSamplerBuffers,
     MultiSamplingConfig,
-    make_sampler_from_buffers,
 )
 
 logger = logging.getLogger(__name__)
@@ -498,11 +497,10 @@ class CudaGraphRunner:
             request_ids=dummy_rids,
             per_request_info=dummy_metadata,
             cache_manager=cache_manager,
-            sampler=make_sampler_from_buffers(
-                bufs=self.sampler_buffer,
-                request_ids=[], sampling_configs={},
+            sampler=self.sampler_buffer.gather_for_request_ids(
+                request_ids=[],
                 padded_bs=len(dummy_rids)
-            ),
+            )
         )
 
     def _make_dummy_seq_lens(

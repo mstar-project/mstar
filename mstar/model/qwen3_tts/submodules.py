@@ -496,10 +496,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         batch_size = layer0_codes.shape[0]
         if runner is None or not runner.can_run(batch_size=batch_size):
             return None
-        # Stage this step's per-request sampling params into the very buffers
-        # the captured graph reads. Only the first ``batch_size`` rows matter:
-        # the graph samples the padded tail too, but PiecewiseOutput slices it
-        # off, and those rows always hold a well-formed (stale) config.
+        # Called for its side effect only: it stages this step's per-request
+        # sampling params into the shared gather buffers that every per-bucket
+        # capture sampler in ``_cp_capture_samplers`` aliases, so the returned
+        # sampler is intentionally discarded. ``padded_bs=batch_size`` fills
+        # only the real rows; the bucket graph samples its full captured width,
+        # but PiecewiseOutput slices the padded tail off (those rows always hold
+        # a well-formed, stale config).
         self._cp_sampler_buffers.aux["code_predictor"].gather_for_request_ids(
             request_ids=engine_inputs.request_ids,
             padded_bs=batch_size,
