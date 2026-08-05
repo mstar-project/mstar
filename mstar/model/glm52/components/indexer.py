@@ -135,9 +135,9 @@ class Glm52Indexer(nn.Module):
 
         # score[t, s] = sum_h w[t, h] * relu(q[t, h] . k[s]): per-head ReLU
         # BEFORE the weighted sum; the raw weights get no softmax/sigmoid.
-        # [recollection] verified against the DeepGEMM fp8_mqa_logits
-        # contract (the kernel body is not in the Phase C sources) — pending
-        # an on-box op check before parity tests are frozen.
+        # [code-verified] against DeepGEMM's sm100_fp8_mqa_logits.cuh
+        # (fmaxf(accum[j], 0) FMA'd with weights[i][j] — checked on the
+        # box's vendored copy, 2026-08-05).
         dots = torch.einsum("thd,sd->ths", q, k_history).relu()
         scores = torch.einsum("th,ths->ts", w, dots)
 
