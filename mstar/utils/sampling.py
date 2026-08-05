@@ -665,17 +665,18 @@ def sample_cuda_graphable_gpu(
     """
     import flashinfer
 
-    probs = fused_temperature_softmax(
-        logits, temperature,
-        penalty=rep_penalty if apply_penalty else None,
-        seen_mask=seen_tokens if apply_penalty else None,
-        include_greedy=False,
-    )
-    top_k = torch.where(top_k > 0, top_k, logits.shape[1])
-    samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        probs, top_k, top_p, deterministic=True,
-        seed=seed, offset=offset,
-    )
+    with torch.cuda.device(logits.device):
+        probs = fused_temperature_softmax(
+            logits, temperature,
+            penalty=rep_penalty if apply_penalty else None,
+            seen_mask=seen_tokens if apply_penalty else None,
+            include_greedy=False,
+        )
+        top_k = torch.where(top_k > 0, top_k, logits.shape[1])
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p, deterministic=True,
+            seed=seed, offset=offset,
+        )
     return samples.to(torch.int64)
 
 
@@ -904,6 +905,11 @@ class SamplerBuffers:
     # index tensor that ``index_select`` reads from.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
+    # Per-request RNG offset (CPU counter, staged into ``offset_buf`` each gather
+    # so the RNG stream follows the request across batch positions and is
+    # reproducible under a fixed seed — mirrors the eager ``Sampler._step_offset``).
+    _step_offset: dict[str, int] = field(default_factory=dict, repr=False)
+    _offset_cpu: torch.Tensor = field(default=None, repr=False)
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
@@ -956,6 +962,7 @@ class SamplerBuffers:
             _master_capacity=cap,
             _slot_idx_cpu=torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            _offset_cpu=torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned),
             _free_slots=list(range(cap)),
         )
 
@@ -1026,6 +1033,7 @@ class SamplerBuffers:
             self._grow_master(self._master_capacity * 2)
         slot = self._free_slots.pop()
         self._rid_to_slot[rid] = slot
+        self._step_offset[rid] = 0
         cfg = sampling_config if sampling_config is not None else SamplingConfig()
         self._cached_config[rid] = cfg
         self._write_master_row(slot, cfg)
@@ -1041,6 +1049,7 @@ class SamplerBuffers:
         if slot is None:
             return
         self._cached_config.pop(rid, None)
+        self._step_offset.pop(rid, None)
         self._free_slots.append(slot)
 
     def update_request_config(
@@ -1126,16 +1135,24 @@ class SamplerBuffers:
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs)
 
-        # offset_buf is NOT reset here. With per-request fixed seed and
-        # ``deterministic=True`` sampling, resetting offset every call
-        # would make every iteration sample with (same seed, offset=0)
-        # — identical RNG draws. Once the logits also stabilise (e.g.,
-        # Talker decode after the producer stream ends and inputs become
-        # the static TTS_EOS/pad embed), the sampler returns the same
-        # token forever and the loop never reaches its natural EOS.
-        # Letting offset accumulate from the in-graph ``offset_buf += 1``
-        # advances the RNG step per iteration so identical-logit
-        # iterations still produce different samples.
+        # Stage each request's own RNG offset into ``offset_buf`` (padding rows
+        # keep 0). Keyed by rid, so a request's stream follows it across batch
+        # positions and reproduces under a fixed seed — unlike the old
+        # position-indexed accumulator. Within a step the in-graph
+        # ``offset_buf += 1`` still advances per sample, so multiple identical
+        # logits (e.g. stabilised Talker EOS) draw distinct tokens; we then bump
+        # each request's base by a fixed step so the next step starts fresh.
+        # A fixed +1 is enough: cross-step overlap is harmless because the logits
+        # differ every step.
+        for i, rid in enumerate(request_ids):
+            self._offset_cpu[i] = self._step_offset.get(rid, 0)
+        for i in range(len(request_ids), padded_bs):
+            self._offset_cpu[i] = 0
+        self.offset_buf[:padded_bs].copy_(
+            self._offset_cpu[:padded_bs], non_blocking=True,
+        )
+        for rid in request_ids:
+            self._step_offset[rid] = self._step_offset.get(rid, 0) + 1
 
         slices = self.slice_for_bs(padded_bs)
         return CudaGraphableSampler(**slices)
