@@ -2,6 +2,7 @@ import torch
 
 from mstar.model.glm52._testing import fake_quantize_fp8_block
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
+from mstar.model.glm52.components.indexer import is_full_indexer_layer
 from mstar.model.glm52.components.moe import Glm52MoEGate, Glm52SparseMoeBlock
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.quantization import dequantize_fp8_block_weight
@@ -179,6 +180,20 @@ def _fabricate_checkpoint(cfg):
         _fp8_entry(state, refs, f"{p}.self_attn.o_proj",
                    (hid, heads * cfg.v_head_dim))
 
+        # DSA indexer weights exist only on FULL layers: wq_b/wk are fp8
+        # pairs, weights_proj bf16, k_norm a full LayerNorm (weight + bias).
+        if is_full_indexer_layer(cfg, n):
+            ip = f"{p}.self_attn.indexer"
+            _fp8_entry(state, refs, f"{ip}.wq_b",
+                       (cfg.index_n_heads * cfg.index_head_dim, q_lora))
+            _fp8_entry(state, refs, f"{ip}.wk", (cfg.index_head_dim, hid))
+            state.append((f"{ip}.weights_proj.weight",
+                          torch.randn(cfg.index_n_heads, hid).bfloat16()))
+            state.append((f"{ip}.k_norm.weight",
+                          torch.randn(cfg.index_head_dim).bfloat16()))
+            state.append((f"{ip}.k_norm.bias",
+                          torch.randn(cfg.index_head_dim).bfloat16()))
+
         if n < cfg.first_k_dense_replace:
             inter = cfg.intermediate_size
             _fp8_entry(state, refs, f"{p}.mlp.gate_proj", (inter, hid))
@@ -204,17 +219,19 @@ def _fabricate_checkpoint(cfg):
             _fp8_entry(state, refs, f"{p}.mlp.shared_experts.down_proj",
                        (hid, moe_inter))
 
-    # Poison: DSA indexer key (Phase C) and MTP layer keys (Phase D). The MTP
-    # fp8 weight deliberately has NO scale sibling — if the skip ever ran
-    # after the dequant stream instead of before, the stream would raise
+    # Poison: MTP layer keys (Phase D) — including the MTP block's own
+    # indexer, which must skip by layer index even with load_indexer=True.
+    # The fp8 weights deliberately have NO scale sibling — if the skip ever
+    # ran after the dequant stream instead of before, the stream would raise
     # "unpaired" and this test would fail.
-    state.append(("model.layers.0.self_attn.indexer.q_proj.weight",
-                  torch.randn(8, cfg.hidden_size).bfloat16()))
     mtp = f"model.layers.{cfg.num_hidden_layers}"
     state.append((f"{mtp}.enorm.weight", torch.randn(cfg.hidden_size).bfloat16()))
     state.append((f"{mtp}.mlp.experts.0.gate_proj.weight",
                   torch.randn(cfg.moe_intermediate_size, cfg.hidden_size)
                   .to(torch.float8_e4m3fn)))
+    state.append((f"{mtp}.self_attn.indexer.wq_b.weight",
+                  torch.randn(cfg.index_n_heads * cfg.index_head_dim,
+                              cfg.q_lora_rank).to(torch.float8_e4m3fn)))
     return state, refs
 
 

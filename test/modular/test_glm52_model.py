@@ -28,12 +28,15 @@ def _make_model() -> Glm52Model:
 
 def test_glm52_registered():
     # The registry imports every model; qwen3_omni pulls GPU-only deps
-    # (flashinfer) at module level, so skip where those aren't installed
-    # (macOS dev) and assert fully on CI / the cluster.
-    registry = pytest.importorskip(
-        "mstar.model.registry",
-        reason="full registry import needs GPU-only deps (flashinfer)",
-    )
+    # (flashinfer/triton) at module level, so skip where those aren't
+    # installed (macOS dev) and assert fully on CI / the cluster. Plain
+    # importorskip is not enough: the conftest triton stub makes
+    # transformers' find_spec probe raise ValueError, not
+    # ModuleNotFoundError, on dev machines.
+    try:
+        from mstar.model import registry
+    except (ImportError, ValueError) as e:
+        pytest.skip(f"full registry import needs GPU-only deps: {e}")
 
     assert registry.MODEL_REGISTRY["glm52"] is Glm52Model
     assert registry.HF_MODELS["glm52"]["model_path_hf"] == "zai-org/GLM-5.2-FP8"

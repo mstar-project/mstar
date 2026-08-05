@@ -6,11 +6,14 @@ v_head 256, 64 heads — and plain (non-Yarn) RoPE, so every mscale term is 1.
 qk_head_dim is exactly 256, so the FlashInfer pad on the naive path is a
 no-op for the full model (reduced test configs still exercise it: 24 -> 64).
 
-The DSA indexer attaches here in Phase C. It is deliberately NOT
-instantiated yet: dormant indexer parameters would sit uninitialized after
-``to_empty`` while the loader skips their checkpoint keys — worse than no
-module at all. At ctx <= 2048, top-2048 selection of <= 2048 tokens is the
-identity, so this dense module IS the exact DSA computation in that regime.
+Phase C: FULL indexer layers (``is_full_indexer_layer``) instantiate a
+``Glm52Indexer`` whose checkpoint weights now load; the naive path accepts
+a precomputed ``dsa_selection`` and restricts softmax to the selected set
+(reference semantics: masked dense attention, -1 entries excluded). The
+absorbed/cache_handle sparse path — paged indexer k-cache, per-request
+block-table index mapping — is the marked engine follow-up. At ctx <= 2048
+top-2048 selection of <= 2048 tokens is the identity, so the dense path IS
+the exact DSA computation in that regime.
 """
 from __future__ import annotations
 
@@ -24,13 +27,44 @@ from mstar.distributed.communication import CommGroup
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
+from mstar.model.glm52.components.indexer import Glm52Indexer, is_full_indexer_layer
 from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
 from mstar.model.glm52.config import Glm52ModelConfig
 
 
+def dsa_selection_to_mask(
+    dsa_selection: torch.Tensor, num_keys: int, dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Additive ``(T, num_keys)`` mask from per-query top-k rows (-1 = padding)."""
+    num_tokens = dsa_selection.shape[0]
+    mask = torch.full(
+        (num_tokens, num_keys), float("-inf"), dtype=dtype, device=device)
+    valid = dsa_selection >= 0
+    rows = torch.arange(num_tokens, device=device).unsqueeze(1).expand_as(valid)
+    mask[rows[valid], dsa_selection[valid].long()] = 0.0
+    return mask
+
+
+def masked_reference_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    """Dense ``(T, H, D)`` attention with an additive ``(T, T)`` mask.
+
+    Matches ``run_attention`` semantics: scale is 1/sqrt(padded head dim)
+    (any intended softmax-scale correction is pre-folded into ``q``).
+    """
+    scale = q.shape[-1] ** -0.5
+    scores = torch.einsum("qhd,khd->hqk", q, k) * scale + mask
+    return torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), v)
+
+
 class Glm52MLAAttention(nn.Module):
     def __init__(
-        self, config: Glm52ModelConfig, comm_group: CommGroup | None = None
+        self,
+        config: Glm52ModelConfig,
+        comm_group: CommGroup | None = None,
+        layer_idx: int | None = None,
     ) -> None:
         super().__init__()
         if comm_group is None:
@@ -70,6 +104,15 @@ class Glm52MLAAttention(nn.Module):
 
         self.rotary = Glm52RotaryEmbedding(
             rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
+
+        # DSA indexer only on FULL layers — SHARED layers carry no indexer
+        # weights in the checkpoint (they reuse the last FULL selection),
+        # and a dormant module would sit uninitialized after ``to_empty``.
+        self.indexer = (
+            Glm52Indexer(config)
+            if layer_idx is not None and is_full_indexer_layer(config, layer_idx)
+            else None
+        )
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
         # qk_head_dim**-0.5 into q on the padded path. No Yarn -> no mscale.
         self.softmax_scale_boost = math.sqrt(self.padded_head_dim / self.qk_head_dim)
@@ -86,8 +129,19 @@ class Glm52MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
+        dsa_selection: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``dsa_selection``: optional ``(T, index_topk)`` int rows from
+        ``Glm52Indexer.compute_selection`` (-1 = padding). When given, the
+        naive path restricts softmax to the selected keys of the current
+        batch; when None, dense behavior is unchanged. The absorbed path
+        does not take a selection yet (engine follow-up)."""
         if self.mla_absorb:
+            if dsa_selection is not None:
+                raise NotImplementedError(
+                    "dsa_selection on the absorbed path is the Phase C engine "
+                    "follow-up; only the naive reference path consumes it"
+                )
             return self._forward_absorbed(hidden_states, cache_handle, position_ids)
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
@@ -115,7 +169,15 @@ class Glm52MLAAttention(nn.Module):
         v = F.pad(v, [0, self.padded_head_dim - self.v_head_dim])  # (T, H, Dpad)
 
         q = q * self.softmax_scale_boost
-        attn = cache_handle.run_attention(q=q, k=k, v=v)  # (T, H, Dpad)
+        if dsa_selection is None:
+            attn = cache_handle.run_attention(q=q, k=k, v=v)  # (T, H, Dpad)
+        else:
+            # Reference sparse path: softmax over the selected keys only,
+            # via an additive mask over the current batch (a gather of the
+            # selected k/v rows is semantically identical; -1 excluded).
+            mask = dsa_selection_to_mask(
+                dsa_selection, num_tokens, dtype=q.dtype, device=q.device)
+            attn = masked_reference_attention(q, k, v, mask)  # (T, H, Dpad)
         attn = attn[..., : self.v_head_dim].reshape(num_tokens, h * self.v_head_dim)
         return self.o_proj(attn)
 

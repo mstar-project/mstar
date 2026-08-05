@@ -43,6 +43,11 @@ def _fill_layer(layer, cfg):
         lin.weight.data.normal_(0, 0.03)
     for norm in (a.q_a_layernorm, a.kv_a_layernorm):
         norm.weight.data.normal_(1.0, 0.02)
+    if a.indexer is not None:  # FULL indexer layers (layer 0 at reduced dims)
+        for lin in (a.indexer.wq_b, a.indexer.wk, a.indexer.weights_proj):
+            lin.weight.data.normal_(0, 0.03)
+        a.indexer.k_norm.weight.data.normal_(1.0, 0.02)
+        a.indexer.k_norm.bias.data.normal_(0, 0.02)
     layer.input_layernorm.weight.data.normal_(1.0, 0.02)
     layer.post_attention_layernorm.weight.data.normal_(1.0, 0.02)
     mlp = layer.mlp
@@ -96,6 +101,13 @@ def _hf_checkpoint(model, cfg):
         sd[p + "self_attn.kv_a_layernorm.weight"] = a.kv_a_layernorm.weight
         _fp8_pair(sd, p + "self_attn.kv_b_proj", a.kv_b_proj.weight)
         _fp8_pair(sd, p + "self_attn.o_proj", a.o_proj.weight)
+        if a.indexer is not None:
+            # Checkpoint layout: wq_b/wk fp8 pairs, weights_proj/k_norm bf16.
+            _fp8_pair(sd, p + "self_attn.indexer.wq_b", a.indexer.wq_b.weight)
+            _fp8_pair(sd, p + "self_attn.indexer.wk", a.indexer.wk.weight)
+            sd[p + "self_attn.indexer.weights_proj.weight"] = a.indexer.weights_proj.weight
+            sd[p + "self_attn.indexer.k_norm.weight"] = a.indexer.k_norm.weight
+            sd[p + "self_attn.indexer.k_norm.bias"] = a.indexer.k_norm.bias
         sd[p + "input_layernorm.weight"] = layer.input_layernorm.weight
         sd[p + "post_attention_layernorm.weight"] = layer.post_attention_layernorm.weight
         mlp = layer.mlp

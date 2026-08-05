@@ -36,9 +36,10 @@ class Glm52ModelConfig:
     # engine path). The naive path is the reduced-test parity fallback.
     mla_absorb: bool = True
 
-    # --- DSA sparse-attention indexer (unused by the scaffold) ---
+    # --- DSA sparse-attention indexer (Phase C) ---
     # indexer_types in the checkpoint alternate "full" every
-    # index_topk_freq=4 layers with "shared" in between (IndexShare).
+    # index_topk_freq=4 layers with "shared" in between (IndexShare);
+    # components/indexer.py::is_full_indexer_layer holds the exact formula.
     index_n_heads: int = 32
     index_head_dim: int = 128
     index_topk: int = 2048
@@ -142,6 +143,17 @@ class Glm52ModelConfig:
             qk_nope_head_dim=16,
             qk_rope_head_dim=8,
             v_head_dim=16,
+            # Indexer at test scale. offset=1 anchors the every-freq series
+            # at layer 0, so the 2-layer model is layer 0 FULL / 1 SHARED.
+            # index_topk stays serve-safe: the submodule's preprocess guard
+            # refuses ctx > index_topk, and the GPU e2e serve tests run
+            # ~16-token contexts. Truncation-regime unit tests override
+            # cfg.index_topk locally.
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=64,
+            index_topk_freq=4,
+            index_skip_topk_offset=1,
             first_k_dense_replace=1,
             intermediate_size=256,
             moe_intermediate_size=64,

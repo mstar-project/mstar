@@ -23,7 +23,8 @@ class Glm52DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.self_attn = Glm52MLAAttention(config, comm_group=comm_group)
+        self.self_attn = Glm52MLAAttention(
+            config, comm_group=comm_group, layer_idx=layer_idx)
         self.mlp = build_mlp_for_layer(config, layer_idx, comm_group=comm_group)
         self.input_layernorm = build_rmsnorm(config)
         self.post_attention_layernorm = build_rmsnorm(config)

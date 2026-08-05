@@ -5,9 +5,11 @@ bf16 module, ``self_attn.indexer.*`` appears on every 4th layer (DSA), and
 layer index 78 (== num_hidden_layers) is the MTP module in DeepSeek-V3
 naming (enorm/hnorm/eh_proj/shared_head + a full decoder layer).
 
-M1 scope: indexer and MTP keys are skipped up front — with a count logged,
-not silently — because the M1 model instantiates neither (ctx <= 2048 makes
-DSA identical to dense attention; MTP is Phase D). Everything else
+Phase C: indexer keys load on FULL layers (``load_indexer=True`` default) —
+``wq_b``/``wk`` arrive as plain fp8 ``.weight`` + ``weight_scale_inv``
+pairs the dequant stream handles like any other, ``weights_proj``/``k_norm``
+(weight AND bias) pass through bf16. MTP layer-78 keys are still skipped up
+front — with a count logged, not silently — until Phase D. Everything else
 dequantizes to bf16 except routed experts, which load FP8-resident (see
 ``quantization.py`` for why).
 """
@@ -57,16 +59,19 @@ def glm52_name_remapper(name: str) -> str | None:
 def skip_phase_b_keys(
     weights: Iterable[tuple[str, torch.Tensor]],
     num_hidden_layers: int,
+    load_indexer: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Drop DSA-indexer and MTP-layer keys before any dequant buffering.
+    """Drop MTP-layer keys — and, with ``load_indexer=False``, indexer keys —
+    before any dequant buffering.
 
     Runs upstream of the fp8 stream so skipped fp8 pairs are never buffered
-    or dequantized (the MTP layer alone carries ~9.7B expert params).
+    or dequantized (the MTP layer alone carries ~9.7B expert params, and its
+    indexer weights would otherwise sit unpaired in the stream).
     """
     skipped_indexer = 0
     skipped_mtp = 0
     for name, tensor in weights:
-        if ".self_attn.indexer." in name:
+        if not load_indexer and ".self_attn.indexer." in name:
             skipped_indexer += 1
             continue
         m = _LAYER_RE.match(name)
@@ -76,8 +81,8 @@ def skip_phase_b_keys(
         yield name, tensor
     if skipped_indexer or skipped_mtp:
         logger.info(
-            "GLM-5.2 M1 load: skipped %d DSA-indexer keys (Phase C) and %d "
-            "MTP-layer keys (Phase D).", skipped_indexer, skipped_mtp,
+            "GLM-5.2 load: skipped %d DSA-indexer keys and %d MTP-layer keys "
+            "(Phase D).", skipped_indexer, skipped_mtp,
         )
 
 
@@ -153,10 +158,11 @@ def load_glm52_hf_weights(
     quant_config: "Fp8BlockQuantConfig | None" = None,
     fp8_experts: bool = False,
     num_hidden_layers: int = 78,
+    load_indexer: bool = True,
 ) -> set[str]:
     from mstar.model.loader import load_hf_weights
 
-    weights = skip_phase_b_keys(weights, num_hidden_layers)
+    weights = skip_phase_b_keys(weights, num_hidden_layers, load_indexer=load_indexer)
     if quant_config is not None:
         keep = _is_routed_expert_base if fp8_experts else None
         weights = dequant_fp8_block_stream(weights, quant_config, keep_fp8=keep)
