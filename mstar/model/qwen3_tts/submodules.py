@@ -467,6 +467,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         so nothing about sampling has to be hoisted out as a static input the
         way per-step uniforms and scalars used to be.
         """
+        assert sampler is not None
         layer0_codes = static_inputs["layer0_codes"]
         all_codes, codec_embed_sum = self._depth_loop(
             static_inputs["last_hidden"], layer0_codes,
