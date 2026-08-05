@@ -70,8 +70,18 @@ pub fn flatten_messages(
 ) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>), String> {
     let mut text_parts: Vec<String> = Vec::new();
     let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Modalities in first-encounter order (Python builds `input_modalities` from
+    // an insertion-ordered dict; a BTreeMap would sort them, which can perturb
+    // downstream walk construction that reads this list positionally).
+    let mut mod_order: Vec<String> = Vec::new();
 
-    let add_file = |modality: String, path: String, fp: &mut BTreeMap<String, Vec<String>>| {
+    let add_file = |modality: String,
+                    path: String,
+                    fp: &mut BTreeMap<String, Vec<String>>,
+                    order: &mut Vec<String>| {
+        if !order.contains(&modality) {
+            order.push(modality.clone());
+        }
         fp.entry(modality).or_default().push(path);
     };
 
@@ -105,7 +115,7 @@ pub fn flatten_messages(
                     if !url.is_empty() {
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { "image".to_string() } else { m };
-                        add_file(m, p, &mut file_paths);
+                        add_file(m, p, &mut file_paths, &mut mod_order);
                     }
                 }
                 "video_url" => {
@@ -113,7 +123,7 @@ pub fn flatten_messages(
                     if !url.is_empty() {
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { "video".to_string() } else { m };
-                        add_file(m, p, &mut file_paths);
+                        add_file(m, p, &mut file_paths, &mut mod_order);
                     }
                 }
                 "audio_url" => {
@@ -121,7 +131,7 @@ pub fn flatten_messages(
                     if !url.is_empty() {
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { "audio".to_string() } else { m };
-                        add_file(m, p, &mut file_paths);
+                        add_file(m, p, &mut file_paths, &mut mod_order);
                     }
                 }
                 "input_audio" => {
@@ -132,7 +142,7 @@ pub fn flatten_messages(
                         let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
                         if !data.is_empty() {
                             let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(m, p, &mut file_paths);
+                            add_file(m, p, &mut file_paths, &mut mod_order);
                         }
                     }
                 }
@@ -141,7 +151,9 @@ pub fn flatten_messages(
         }
     }
 
-    let mut input_modalities: Vec<String> = file_paths.keys().cloned().collect();
+    // First-encounter order (see `mod_order`), matching Python's insertion-
+    // ordered dict rather than the BTreeMap's sorted keys.
+    let mut input_modalities = mod_order;
     let text = if text_parts.is_empty() {
         None
     } else {

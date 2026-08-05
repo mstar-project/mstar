@@ -127,6 +127,40 @@ def test_chat_roundtrip(stack):
     assert sub["out"] == ["text"]
 
 
+def _post_raw(port, path, raw_bytes, timeout=15):
+    """POST a raw body (possibly malformed) as application/json; return
+    (status, parsed_json_or_None)."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}", data=raw_bytes,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        try:
+            return e.code, json.loads(body)
+        except ValueError:
+            return e.code, None
+
+
+def test_malformed_json_body_is_422_with_detail(stack):
+    """A malformed / schema-invalid JSON body returns FastAPI's 422 +
+    {"detail": [{...}]} shape, not axum's default 400 + text/plain."""
+    port, _stub, _bridge, _proc = stack
+    # Broken JSON syntax.
+    code, body = _post_raw(port, "/v1/chat/completions", b"{not json")
+    assert code == 422, (code, body)
+    assert isinstance(body["detail"], list) and body["detail"]
+    # Missing required field `role` (Python's pydantic ChatMessage requires it).
+    code, body = _post_raw(
+        port, "/v1/chat/completions",
+        json.dumps({"model": "qwen3_omni",
+                    "messages": [{"content": "hi"}]}).encode())
+    assert code == 422, (code, body)
+    assert isinstance(body["detail"], list) and body["detail"]
+
+
 def test_ingest_failure_is_a_500_not_a_hang(stack):
     port, stub, _bridge, _proc = stack
     with pytest.raises(urllib.error.HTTPError) as e:

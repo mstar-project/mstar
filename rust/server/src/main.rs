@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, FromRequest, Multipart, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
     http::{header::CONTENT_TYPE, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -250,6 +250,23 @@ fn detail_error(status: u16, message: &str) -> Response {
     (code, Json(json!({"detail": message}))).into_response()
 }
 
+/// Turn a `Json` extractor rejection into FastAPI + pydantic's `422` +
+/// `{"detail": [{"loc", "msg", "type"}]}` shape, instead of axum's default
+/// `400` + `text/plain`, so a malformed/invalid body looks the same as the
+/// Python frontend's validation error. Handlers take
+/// `Result<Json<T>, JsonRejection>` and route the error through here.
+fn json_422(rej: JsonRejection) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({"detail": [{
+            "loc": ["body"],
+            "msg": rej.body_text(),
+            "type": "value_error",
+        }]})),
+    )
+        .into_response()
+}
+
 /// Parse a form-field boolean the way FastAPI's `bool = Form(...)` does (pydantic
 /// v2 lax coercion): a fixed truthy/falsy set, case-insensitive, and a hard
 /// error on anything else. The naive `== "true"` accepted a subset and silently
@@ -348,8 +365,12 @@ async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
 
 async fn chat_completions(
     State(st): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
+    let Json(req) = match payload {
+        Ok(j) => j,
+        Err(e) => return json_422(e),
+    };
     let adapter = match resolve(&st, Surface::Chat) {
         Ok(a) => a,
         Err(r) => return r,
@@ -510,7 +531,14 @@ fn build_chat_response(
 
 // ---- POST /v1/audio/speech -----------------------------------------------
 
-async fn audio_speech(State(st): State<AppState>, Json(req): Json<SpeechRequest>) -> Response {
+async fn audio_speech(
+    State(st): State<AppState>,
+    payload: Result<Json<SpeechRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(j) => j,
+        Err(e) => return json_422(e),
+    };
     let adapter = match resolve(&st, Surface::Speech) {
         Ok(a) => a,
         Err(r) => return r,
@@ -581,8 +609,12 @@ async fn audio_speech(State(st): State<AppState>, Json(req): Json<SpeechRequest>
 
 async fn images_generations(
     State(st): State<AppState>,
-    Json(req): Json<ImageGenerationRequest>,
+    payload: Result<Json<ImageGenerationRequest>, JsonRejection>,
 ) -> Response {
+    let Json(req) = match payload {
+        Ok(j) => j,
+        Err(e) => return json_422(e),
+    };
     let adapter = match resolve(&st, Surface::Images) {
         Ok(a) => a,
         Err(r) => return r,
@@ -622,8 +654,12 @@ async fn images_generations(
 
 async fn videos_generations(
     State(st): State<AppState>,
-    Json(req): Json<VideoGenerationRequest>,
+    payload: Result<Json<VideoGenerationRequest>, JsonRejection>,
 ) -> Response {
+    let Json(req) = match payload {
+        Ok(j) => j,
+        Err(e) => return json_422(e),
+    };
     let adapter = match resolve(&st, Surface::Videos) {
         Ok(a) => a,
         Err(r) => return r,

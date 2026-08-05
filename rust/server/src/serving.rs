@@ -97,6 +97,15 @@ pub fn result_stream(
                                 })
                             })
                         }
+                        // A "token" chunk that isn't a 4-byte LE id is malformed
+                        // — drop it rather than forwarding an unknown modality.
+                        Out::Chunk(c) if c.modality == "token" => {
+                            eprintln!(
+                                "mstar-server: dropping malformed token chunk ({} bytes, expected 4)",
+                                c.data.len()
+                            );
+                            None
+                        }
                         other => Some(other),
                     };
                     futures::future::ready(Some(mapped))

@@ -17,8 +17,10 @@ use std::collections::BTreeMap;
 /// / `video_url`); both are accepted, matching `str | list[dict] | None`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessage {
-    #[allow(dead_code)] // role is flattened away (v1 simplification, as in mstar)
-    #[serde(default)]
+    // Required, matching Python's pydantic `ChatMessage` (a message with no
+    // `role` is a 422 there). The value is otherwise flattened away — the v1
+    // simplification, as in mstar.
+    #[allow(dead_code)]
     pub role: String,
     #[serde(default)]
     pub content: Option<Content>,

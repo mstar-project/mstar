@@ -111,8 +111,18 @@ impl Bridge {
             let Some(payload) = mbox.recv_timeout(Duration::from_millis(500)) else {
                 continue;
             };
-            let Ok(msg) = rmp_serde::from_slice::<Inbound>(&payload) else {
-                continue;
+            let msg = match rmp_serde::from_slice::<Inbound>(&payload) {
+                Ok(m) => m,
+                Err(e) => {
+                    // A frame we can't decode is a bridge-protocol mismatch or a
+                    // corrupt message; log it rather than dropping silently
+                    // (otherwise a systematic mismatch looks like a hang).
+                    eprintln!(
+                        "mstar-server bridge: dropping undecodable message ({e}); {} bytes",
+                        payload.len()
+                    );
+                    continue;
+                }
             };
             let (item, done) = match msg.t.as_str() {
                 "chunk" => (

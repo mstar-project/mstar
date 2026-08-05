@@ -152,7 +152,9 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats"]
     if args.log_stats_file:
         argv += ["--log-stats-file", args.log_stats_file]
-    if args.rust_frontend:
+    # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
+    # silently staying on uvicorn would be a footgun.
+    if args.rust_frontend or args.rust_frontend_bin:
         argv += ["--rust-frontend"]
     if args.rust_frontend_bin:
         argv += ["--rust-frontend-bin", args.rust_frontend_bin]
