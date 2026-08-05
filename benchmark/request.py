@@ -735,6 +735,10 @@ class OurSystem(InferenceSystem):
         try:
             form = aiohttp.FormData()
             form.add_field("text", req_input.prompt)
+            # Explicit even though it matches the server default
+            # (entrypoint.py: `streaming: bool = Form(True)`) — the NDJSON
+            # chunk protocol parsed below only exists on the streaming path.
+            form.add_field("streaming", "true")
             form.add_field("model_kwargs", model_kwargs)
             form.add_field("output_modalities", output_mod)
             # VLA and other multi-modal input types require an explicit
@@ -779,13 +783,20 @@ class OurSystem(InferenceSystem):
                     arrival_time = time.monotonic()
                     mod = msg.get("modality")
                     data_b64 = msg.get("data", "")
+                    metadata = msg.get("metadata") or {}
+                    # mstar emits one token per chunk; where the server also
+                    # surfaces the raw ids (text chunks carry `token_ids` in
+                    # metadata — data_worker.py) trust their count instead of
+                    # assuming 1.
+                    token_ids = metadata.get("token_ids")
+                    n_tokens = len(token_ids) if token_ids else 1
 
                     metrics.record_output_chunk(
                         modality=mod,
                         data_b64=data_b64,
                         arrival_time=arrival_time,
-                        n_tokens=1,  # mstar server emits one token per chunk
-                        metadata=msg.get("metadata"),
+                        n_tokens=n_tokens,
+                        metadata=metadata,
                     )
 
         except Exception as e:
