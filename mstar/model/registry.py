@@ -41,9 +41,10 @@ HF_MODELS: dict[str, dict] = {
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).
     "cosmos3_super": {"model_path_hf": "nvidia/Cosmos3-Super"},
-    # GLM-5.2: 753B/40B MoE causal LM (MLA + DSA, FP8 e4m3 block-scale
-    # checkpoint). Real serving is TP8 on an 8xH200 node.
-    "glm52": {"model_path_hf": "zai-org/GLM-5.2"},
+    # GLM-5.2: 753B/40B MoE causal LM (MLA + DSA). The official release ships
+    # FP8 e4m3 block-scale under the -FP8 repo id (what clusters cache and
+    # what vLLM serves). Real serving is TP8 on an 8xH200 node.
+    "glm52": {"model_path_hf": "zai-org/GLM-5.2-FP8"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},

@@ -36,7 +36,7 @@ def test_glm52_registered():
     )
 
     assert registry.MODEL_REGISTRY["glm52"] is Glm52Model
-    assert registry.HF_MODELS["glm52"]["model_path_hf"] == "zai-org/GLM-5.2"
+    assert registry.HF_MODELS["glm52"]["model_path_hf"] == "zai-org/GLM-5.2-FP8"
 
 
 def test_glm52_graph_walks_match_engine_types():
