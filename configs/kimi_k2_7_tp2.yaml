@@ -1,0 +1,15 @@
+model: "kimi_k2_7"
+# Reduced synthetic TP=2 config. Generate tools/kimi_goldens/repro/checkpoint first.
+max_seq_len: 512
+model_kwargs:
+  config_variant: reduced
+  checkpoint_path: tools/kimi_goldens/repro/checkpoint
+  tokenizer_mode: byte
+kv_cache:
+  max_num_pages: 256
+  page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+    graph_walks: [prefill, decode]

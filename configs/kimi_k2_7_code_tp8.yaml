@@ -1,0 +1,18 @@
+model: "kimi_k2_7"
+# Fallback TP8 config for local Kimi-K2.7-Code snapshot; prefer the /dev/shm variant.
+max_seq_len: 8192
+# See kimi_k2_7_code_tp8_shm.yaml — a 1T INT4 load at TP8 outruns PyTorch's
+# default process-group timeout; this path is slower still (disk, not tmpfs).
+dist_timeout_s: 7200
+model_kwargs:
+  config_variant: k27_code
+  checkpoint_path: /m-coriander/coriander/garv901/kimi_k2_7_code
+  tokenizer_mode: hf
+kv_cache:
+  max_num_pages: 512
+  page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
