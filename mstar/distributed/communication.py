@@ -4,6 +4,16 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+# torch 2.13 renamed the single-tensor collectives (all_gather_into_tensor ->
+# all_gather_single, reduce_scatter_tensor -> reduce_scatter_single) and the
+# old names emit a FutureWarning on every call. Resolve the name once here,
+# keeping the old spelling on the torch>=2.9.1 floor where the new one
+# doesn't exist yet.
+_all_gather_single = getattr(dist, "all_gather_single", dist.all_gather_into_tensor)
+_reduce_scatter_single = getattr(
+    dist, "reduce_scatter_single", dist.reduce_scatter_tensor
+)
+
 
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
@@ -48,7 +58,7 @@ class CommGroup:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        _all_gather_single(output_tensor, input_, group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -96,9 +106,7 @@ class CommGroup:
         )
 
         # Perform reduce-scatter operation
-        dist.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
+        _reduce_scatter_single(output_tensor, input_tensor, group=self.device_group)
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
@@ -238,6 +246,12 @@ class WorkerParallelGroups:
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
+            # Bind the group to this rank's GPU (same ordinal set_device uses
+            # above): barrier() stops guessing the device — muting the
+            # "using the device under current context" warning — and NCCL
+            # sets up communicators eagerly instead of at the first
+            # collective.
+            device_id=torch.device("cuda", self.global_rank),
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
