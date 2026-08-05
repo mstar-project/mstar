@@ -1,0 +1,9 @@
+# GLM-5.2 — single-rank bring-up config (dummy mode / small-scale dev).
+# The real checkpoint is ~750 GB FP8: production serving is TP=8 on an
+# 8xH200 node (a glm52_tp8.yaml with tp_size: 8 lands with the components).
+model: "glm52"
+max_seq_len: 32768
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    graph_walks: [prefill, decode]
