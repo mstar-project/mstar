@@ -40,5 +40,6 @@
    submodule_base
    utils
    vjepa2
+   wan22
    whisper
 

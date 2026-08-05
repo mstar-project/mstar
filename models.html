@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 04, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -264,6 +264,10 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -513,6 +517,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
 </ul>
             </nav>
         </div>
@@ -530,8 +535,8 @@
 families, their registry key (the value of <code class="docutils literal notranslate"><span class="pre">model:</span></code> in a config YAML), and a
 representative Hugging Face identifier.</p>
 <p>Registry keys live in <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code> (<code class="docutils literal notranslate"><span class="pre">MODEL_REGISTRY</span></code> / <code class="docutils literal notranslate"><span class="pre">HF_MODELS</span></code>).</p>
-<div class="pst-scrollable-table-container"><table class="table" id="id1">
-<caption><span class="caption-text">Registered model families</span><a class="headerlink" href="#id1" title="Link to this table">#</a></caption>
+<div class="pst-scrollable-table-container"><table class="table" id="id3">
+<caption><span class="caption-text">Registered model families</span><a class="headerlink" href="#id3" title="Link to this table">#</a></caption>
 <colgroup>
 <col style="width: 17.9%" />
 <col style="width: 43.6%" />
@@ -593,6 +598,10 @@ serves the released policy sampling defaults (4 steps, guidance 3.0).</p></td>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bosonai/higgs-audio-v3-stt</span></code></p></td>
 <td><p>Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
+<td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
 </tr>
 </tbody>
 </table>
@@ -681,6 +690,107 @@ pip-installable).</p></li>
 automatically.</p></li>
 </ul>
 </section>
+<section id="wan2-2-wan22">
+<h2>Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)<a class="headerlink" href="#wan2-2-wan22" title="Link to this heading">#</a></h2>
+<p>Text-to-video and image-to-video on <strong>Wan2.2-TI2V-5B</strong> — the dense 5B variant
+(<code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code>): a native video DiT, a UMT5-XXL prompt
+encoder and the Wan2.2-VAE, all four nodes stateless. The A14B (MoE dual-DiT)
+variants are <strong>not</strong> supported; <code class="docutils literal notranslate"><span class="pre">wan22</span></code> rejects any other variant explicitly.</p>
+<p>Install and serve on one GPU:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;.[wan22]&quot;</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>wan22<span class="w">                              </span><span class="c1"># configs/wan22.yaml</span>
+<span class="c1"># or: mstar-serve --config configs/wan22.yaml --port 8000</span>
+</pre></div>
+</div>
+<p>Two routes are served. <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> is the native one (multipart form, like
+every other model); the mp4 comes back base64-encoded in <code class="docutils literal notranslate"><span class="pre">outputs.video[0].data</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8000/generate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s1">&#39;text=a fluffy cat walking across a sunlit floor&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s1">&#39;output_modalities=video&#39;</span><span class="w"> </span>-F<span class="w"> </span><span class="s1">&#39;streaming=false&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s1">&#39;model_kwargs={&quot;height&quot;:480,&quot;width&quot;:832,&quot;num_frames&quot;:33,&quot;num_inference_steps&quot;:50,&quot;guidance_scale&quot;:5.0}&#39;</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/videos/generations</span></code> is the OpenAI-shaped surface (JSON body, mp4 in
+<code class="docutils literal notranslate"><span class="pre">data[0].b64_json</span></code>). Here the size is a single <code class="docutils literal notranslate"><span class="pre">WxH</span></code> string — <strong>width first</strong>,
+the opposite order to the <code class="docutils literal notranslate"><span class="pre">height</span></code>/<code class="docutils literal notranslate"><span class="pre">width</span></code> kwargs above — and supplying an
+<code class="docutils literal notranslate"><span class="pre">image</span></code> (URL or data URI) turns the request into image-to-video:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-sS<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/videos/generations<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;prompt&quot;: &quot;a fluffy cat walking across a sunlit floor&quot;,</span>
+<span class="s1">       &quot;size&quot;: &quot;832x480&quot;, &quot;num_frames&quot;: 33, &quot;seed&quot;: 42,</span>
+<span class="s1">       &quot;num_inference_steps&quot;: 50, &quot;guidance_scale&quot;: 5.0}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import sys,json,base64; d=json.load(sys.stdin); \</span>
+<span class="s2">               open(&#39;out.mp4&#39;,&#39;wb&#39;).write(base64.b64decode(d[&#39;data&#39;][0][&#39;b64_json&#39;]))&quot;</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">test/wan22/t2v_request.sh</span></code> and <code class="docutils literal notranslate"><span class="pre">i2v_request.sh</span></code> wrap these two calls.</p>
+<p>Generation knobs (per request, via <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> or the request body):</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 22.0%" />
+<col style="width: 14.0%" />
+<col style="width: 64.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Knob</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">height</span></code> / <code class="docutils literal notranslate"><span class="pre">width</span></code></p></td>
+<td><p>704 / 1280</p></td>
+<td><p>The checkpoint’s native 720P tier. <strong>Both must be multiples of 32</strong> — see
+below. Rejected with a 400 otherwise.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_frames</span></code></p></td>
+<td><p>81</p></td>
+<td><p><strong>Must be 4k+1</strong> — see below. Rejected with a 400 otherwise. Latent
+frames = <code class="docutils literal notranslate"><span class="pre">(num_frames</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">//</span> <span class="pre">4</span> <span class="pre">+</span> <span class="pre">1</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code></p></td>
+<td><p>50</p></td>
+<td><p>Clamped to <code class="docutils literal notranslate"><span class="pre">max_denoise_steps</span></code> (100), the denoise loop’s ceiling.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code></p></td>
+<td><p>5.0</p></td>
+<td><p>Classifier-free guidance; run as a single batched forward.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">negative_prompt</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code></p></td>
+<td><p>Empty by default, matching the reference pipeline.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fps</span></code></p></td>
+<td><p>24</p></td>
+<td><p><strong>Playback rate only</strong> — it is the mp4 container rate, not a generation
+knob. Wan2.2 always generates a fixed <code class="docutils literal notranslate"><span class="pre">num_frames</span></code> clip at an implied
+24 fps, so another value just rescales the clip’s duration.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The ÷32 rule.</strong> Height and width must each be an exact multiple of <strong>32</strong>:
+a pixel dimension is downsampled 16x by the VAE and then patchified 2x by the
+DiT, and only exact multiples survive both. So <code class="docutils literal notranslate"><span class="pre">720x1280</span></code> is <strong>not</strong> a valid
+size for this model (720/32 = 22.5) — the 720p-class tier is <a href="#id1"><span class="problematic" id="id2">**</span></a>704**x1280. An
+unaligned size is rejected at the request seam with a 400 naming the rule and
+the nearest valid sizes, because it has no clean failure deeper in: the two
+paths round the latent extent differently and the DiT dies mid-forward.</p>
+<p><strong>The 4k+1 frame rule.</strong> <code class="docutils literal notranslate"><span class="pre">num_frames</span></code> must be one more than a multiple of 4
+(33, 81, 121 …): the VAE compresses time by 4 around an anchor frame, so only
+<code class="docutils literal notranslate"><span class="pre">4k+1</span></code> survives the round trip. Anything else is <em>silently floored</em> — ask for
+32 frames and you would get 29 — so it too is rejected with a 400 naming the
+nearest valid counts.</p>
+<p><strong>UniPC runs inline, inside the DiT node.</strong> Unlike cosmos3, the scheduler is not
+a separate stage: the solver state (the order-2 history buffer and the
+corrector’s <code class="docutils literal notranslate"><span class="pre">last_sample</span></code>) is carried on the denoise loop’s own edges, so it
+travels with the request rather than living in a scheduler object on one rank.
+Requests are therefore independent and the loop is resumable across ranks.</p>
+<p><strong>Nothing is accelerated by default.</strong> wan22 serves the DiT eager: no
+<code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>, no CUDA-graph capture, no continuous batching, no component
+offload, and the VAE decode is always tiled (which bounds its workspace so the
+untiled conv3d cannot OOM a 32 GiB card).</p>
+</section>
 </section>
 
 
@@ -733,6 +843,7 @@ automatically.</p></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-tts-notes">Qwen3-TTS notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-environment-requirements">Cosmos3 environment requirements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
 </ul>
   </nav></div>
 
@@ -766,7 +877,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 04, 2026.
+  Last updated on Aug 05, 2026.
   <br/>
 </p>
   </div>

@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 04, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -615,6 +615,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1234,6 +1238,65 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="Wan22Adapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Wan22Adapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Wan22Adapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wan2.2-TI2V-5B: text/image-to-video generation (video only).</span>
+
+<span class="sd">    ``size`` (&quot;WxH&quot;) maps to the model&#39;s ``width`` / ``height`` kwargs; ``seed``</span>
+<span class="sd">    and any extra knobs (``guidance_scale``, ``num_inference_steps``,</span>
+<span class="sd">    ``negative_prompt``) pass through via ``extra_body``. ``fps`` is a playback</span>
+<span class="sd">    rate (the mp4 container rate), not a generation knob — see</span>
+<span class="sd">    ``Wan22Model.postprocess``.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+
+    <span class="n">supports_videos</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="Wan22Adapter.video_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Wan22Adapter.video_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">video_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="c1"># Unlike cosmos3, the model has no &quot;size&quot; kwarg — its generation</span>
+            <span class="c1"># knobs are width/height, so the adapter does the split here.</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">width</span><span class="p">,</span> <span class="n">height</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;x&quot;</span><span class="p">))</span>
+            <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;size must be &#39;WxH&#39; (e.g. &#39;832x480&#39;); got </span><span class="si">{</span><span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;width&quot;</span><span class="p">,</span> <span class="n">width</span><span class="p">)</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;height&quot;</span><span class="p">,</span> <span class="n">height</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="c1"># num_frames / fps are first-class video fields (not in extra_body).</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">num_frames</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">fps</span><span class="p">)</span>
+        <span class="c1"># Image-to-video: the conditioning frame (URL / data URI) is persisted</span>
+        <span class="c1"># and loaded by the worker, which VAE-encodes it into the frame-0</span>
+        <span class="c1"># anchor. Wan2.2 has no video-conditioned mode.</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;video&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Wan2.2 does not support &#39;video&#39; conditioning; provide &#39;image&#39; or neither.&quot;</span><span class="p">)</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">image</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+                <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">],</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+                <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <span class="c1"># Only models with an OpenAI-standard surface are registered. Action/world-model</span>
 <span class="c1"># models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.</span>
 <span class="n">ADAPTER_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">OpenAIAdapter</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
@@ -1243,6 +1306,7 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">&quot;cosmos3&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">&quot;cosmos3_droid&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">&quot;cosmos3_super&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">&quot;wan22&quot;</span><span class="p">:</span> <span class="n">Wan22Adapter</span><span class="p">(),</span>
 <span class="p">}</span>
 
 
@@ -1298,7 +1362,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 04, 2026.
+  Last updated on Aug 05, 2026.
   <br/>
 </p>
   </div>

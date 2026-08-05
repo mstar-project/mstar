@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 04, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -264,6 +264,10 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -557,6 +561,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.SubmitArgs.text"><code class="docutils literal notranslate"><span class="pre">SubmitArgs.text</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Wan22Adapter"><code class="docutils literal notranslate"><span class="pre">Wan22Adapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Wan22Adapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">Wan22Adapter.supports_videos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Wan22Adapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">Wan22Adapter.video_to_request()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.flatten_messages"><code class="docutils literal notranslate"><span class="pre">flatten_messages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.get_adapter"><code class="docutils literal notranslate"><span class="pre">get_adapter()</span></code></a></li>
 </ul>
@@ -623,6 +632,9 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmitArgs</span></code></a>(text, file_paths, ...)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Wan22Adapter" title="mstar.api_server.openai.adapters.Wan22Adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Wan22Adapter</span></code></a>()</p></td>
+<td><p>Wan2.2-TI2V-5B: text/image-to-video generation (video only).</p></td>
 </tr>
 </tbody>
 </table>
@@ -983,6 +995,39 @@ them via <code class="docutils literal notranslate"><span class="pre">extra_body
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Wan22Adapter">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.adapters.</span></span><span class="sig-name descname"><span class="pre">Wan22Adapter</span></span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#Wan22Adapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.Wan22Adapter" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-class docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a></p>
+<p>Wan2.2-TI2V-5B: text/image-to-video generation (video only).</p>
+<p><code class="docutils literal notranslate"><span class="pre">size</span></code> (“WxH”) maps to the model’s <code class="docutils literal notranslate"><span class="pre">width</span></code> / <code class="docutils literal notranslate"><span class="pre">height</span></code> kwargs; <code class="docutils literal notranslate"><span class="pre">seed</span></code>
+and any extra knobs (<code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code>,
+<code class="docutils literal notranslate"><span class="pre">negative_prompt</span></code>) pass through via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>. <code class="docutils literal notranslate"><span class="pre">fps</span></code> is a playback
+rate (the mp4 container rate), not a generation knob — see
+<code class="docutils literal notranslate"><span class="pre">Wan22Model.postprocess</span></code>.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Wan22Adapter.supports_videos">
+<span class="sig-name descname"><span class="pre">supports_videos</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.Wan22Adapter.supports_videos" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Wan22Adapter.video_to_request">
+<span class="sig-name descname"><span class="pre">video_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#Wan22Adapter.video_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.Wan22Adapter.video_to_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>req</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VideoGenerationRequest" title="mstar.api_server.openai.protocol.VideoGenerationRequest"><em>VideoGenerationRequest</em></a>)</p></li>
+<li><p><strong>upload_dir</strong> (<em>Path</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs">SubmitArgs</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.flatten_messages">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.adapters.</span></span><span class="sig-name descname"><span class="pre">flatten_messages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">messages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">allow_remote</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#flatten_messages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.flatten_messages" title="Link to this definition">#</a></dt>
@@ -1114,6 +1159,11 @@ the models here apply their own prompt formatting in <code class="docutils liter
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.SubmitArgs.text"><code class="docutils literal notranslate"><span class="pre">SubmitArgs.text</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Wan22Adapter"><code class="docutils literal notranslate"><span class="pre">Wan22Adapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Wan22Adapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">Wan22Adapter.supports_videos</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Wan22Adapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">Wan22Adapter.video_to_request()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.flatten_messages"><code class="docutils literal notranslate"><span class="pre">flatten_messages()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.get_adapter"><code class="docutils literal notranslate"><span class="pre">get_adapter()</span></code></a></li>
 </ul>
@@ -1149,7 +1199,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 04, 2026.
+  Last updated on Aug 05, 2026.
   <br/>
 </p>
   </div>

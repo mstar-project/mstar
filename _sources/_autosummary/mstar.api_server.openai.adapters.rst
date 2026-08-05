@@ -30,6 +30,7 @@ mstar.api\_server.openai.adapters
       OrpheusAdapter
       Qwen3OmniAdapter
       SubmitArgs
+      Wan22Adapter
    
    
 
