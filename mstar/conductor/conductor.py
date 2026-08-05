@@ -414,6 +414,7 @@ class Conductor:
         self.parallel_config = GlobalParallelConfig(
             worker_graphs=self.worker_graphs,
             worker_ids=self.worker_ids,
+            dist_timeout_s=self.model_config.get("dist_timeout_s"),
         )
 
     def _launch_workers(self):

@@ -178,6 +178,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``dist_timeout_s``
+     - *(optional)* Timeout in seconds for the NCCL world group and its parallel
+       subgroups. Unset keeps PyTorch's default.
 
 Node names are model-specific — they are the keys of the model's
 ``get_node_engine_types`` (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``,
