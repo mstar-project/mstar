@@ -26,6 +26,8 @@ Scaffold status (bring-up order, per docs/adding_models.rst):
 """
 
 import logging
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -42,6 +44,36 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _gpu_liveness_heartbeat(device: str, interval_s: float = 1.0):
+    """Tick a microscopic CUDA kernel while the checkpoint loads.
+
+    The 700 GB load is host-bound (shard walking + CPU dequant): each rank
+    holds ~100 GB of GPU memory with 0% SM utilization for ~30 minutes.
+    Two TP8 loads were externally SIGTERM'd at ~+30 min with the conductor
+    left alive — the signature of a box-level idle-GPU reaper misreading a
+    live load as squatting (the 08-04 vLLM wedge matches too). One 64x64
+    matmul per second makes the liveness legible; the cost is microseconds.
+    """
+    if not str(device).startswith("cuda"):
+        yield
+        return
+    stop = threading.Event()
+
+    def _tick():
+        a = torch.ones(64, 64, device=device)
+        while not stop.wait(interval_s):
+            torch.mm(a, a)
+
+    t = threading.Thread(target=_tick, daemon=True, name="glm52-load-heartbeat")
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=5)
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -416,8 +448,9 @@ class Glm52Model(Model):
         if autocast_dtype is not None:
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
-        load_weights(language_model, source, device=device)
-        process_weights_after_loading(language_model, torch.device(device))
+        with _gpu_liveness_heartbeat(device):
+            load_weights(language_model, source, device=device)
+            process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
