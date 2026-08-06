@@ -167,6 +167,10 @@ class Glm52SparseMoeBlock(nn.Module):
         self.fp8_experts = (
             config.quantization_config is not None and config.moe_fp8_resident
         )
+        self.quant_kernel = getattr(config, "moe_quant_kernel", "reference")
+        # Resolved on the real device by process_weights_after_loading;
+        # blocks used without the load hook (CPU tests) stay on reference.
+        self._use_fused = False
 
         self.gate = Glm52MoEGate(
             hidden_size=config.hidden_size,
@@ -269,7 +273,22 @@ class Glm52SparseMoeBlock(nn.Module):
         topk_weights, topk_ids = self.gate(flat)
         topk_weights = topk_weights.to(flat.dtype)
         if self.fp8_experts:
-            routed = self._dispatch_fp8_reference(flat, topk_weights, topk_ids)
+            if self._use_fused:
+                from mstar.utils.fused_moe import fused_experts_fp8
+
+                routed = fused_experts_fp8(
+                    flat,
+                    self.experts.gate_up_proj_fp8,
+                    self.experts.down_proj_fp8,
+                    self.experts.gate_up_proj_scale_inv,
+                    self.experts.down_proj_scale_inv,
+                    topk_weights, topk_ids,
+                    block_size=self.block_size,
+                )
+                if self.tp_size > 1:
+                    self.comm_group.all_reduce(routed)
+            else:
+                routed = self._dispatch_fp8_reference(flat, topk_weights, topk_ids)
         elif self.tp_size == 1:
             routed = _dispatch(
                 flat,
@@ -336,13 +355,33 @@ class Glm52SparseMoeBlock(nn.Module):
         return final
 
     def process_weights_after_loading(self, device) -> None:
-        del device
+        """Resolve reference-vs-fused dispatch on the real device (kimi
+        quant_kernel semantics: explicit "triton" must not silently
+        downgrade; "auto" probes; "reference" keeps the bitwise loop)."""
+        if not self.fp8_experts:
+            return
+        dev = torch.device(device) if device is not None else torch.device("cpu")
+        kernel = self.quant_kernel
+        fused_ok = dev.type == "cuda"
+        if fused_ok:
+            try:
+                from mstar.utils.fused_moe import fused_experts_fp8  # noqa: F401
+            except Exception:
+                fused_ok = False
+        if kernel == "triton" and not fused_ok:
+            raise RuntimeError(
+                "moe_quant_kernel='triton' requested but the fused fp8 path "
+                "is unavailable (needs CUDA + triton). Use 'auto' to fall "
+                "back to the reference dispatch."
+            )
+        self._use_fused = kernel == "triton" or (kernel == "auto" and fused_ok)
         global _BACKEND_LOGGED
-        if self.fp8_experts and not _BACKEND_LOGGED:
+        if not _BACKEND_LOGGED:
             logger.info(
-                "Glm52SparseMoeBlock routed-expert backend: fp8-resident "
-                "reference dispatch (per-hit-expert block dequant, block_size=%s, "
-                "tp_size=%d). Fused fp8 kernel is tracked M4 perf debt.",
-                self.block_size, self.tp_size,
+                "Glm52SparseMoeBlock routed-expert backend: %s "
+                "(moe_quant_kernel=%s, block_size=%s, tp_size=%d).",
+                "fused_experts_fp8 W8A8" if self._use_fused
+                else "fp8-resident reference dispatch",
+                kernel, self.block_size, self.tp_size,
             )
             _BACKEND_LOGGED = True

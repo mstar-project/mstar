@@ -1,0 +1,20 @@
+model: "glm52"
+# GLM-5.2 TP8 fast serving: fused fp8 MoE kernel (W8A8, capture-safe) with
+# CUDA graphs re-enabled. NUMERICS DIFFER from glm52_tp8_coriander.yaml's
+# reference dispatch (activations quantize to fp8 in-kernel) — the
+# reference config remains the token-diff anchor; this one is for speed.
+# Opt in only after the M1 reference baseline is banked.
+max_seq_len: 2048
+dist_timeout_s: 7200
+model_kwargs:
+  checkpoint_path: /m-coriander/coriander/hf/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541
+  tokenizer_mode: hf
+  moe_quant_kernel: triton
+kv_cache:
+  max_num_pages: 512
+  page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

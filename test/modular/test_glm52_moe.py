@@ -124,6 +124,54 @@ def test_submodule_refuses_post_load_dtype_cast():
     assert moe.experts.gate_up_proj_fp8.dtype == torch.uint8
 
 
+def test_moe_quant_kernel_resolution():
+    """Kimi quant_kernel semantics: auto probes, triton must not downgrade,
+    reference (the default until the M1 baseline is banked) keeps the loop."""
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    assert cfg.moe_quant_kernel == "reference"
+
+    block = Glm52SparseMoeBlock(cfg)
+    block.process_weights_after_loading("cpu")
+    assert block._use_fused is False
+
+    cfg_auto = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    cfg_auto.moe_quant_kernel = "auto"
+    block_auto = Glm52SparseMoeBlock(cfg_auto)
+    block_auto.process_weights_after_loading("cpu")
+    assert block_auto._use_fused is False  # no CUDA here -> reference
+
+    cfg_triton = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    cfg_triton.moe_quant_kernel = "triton"
+    block_triton = Glm52SparseMoeBlock(cfg_triton)
+    try:
+        block_triton.process_weights_after_loading("cpu")
+        raise AssertionError("explicit triton on CPU must not silently downgrade")
+    except RuntimeError:
+        pass
+
+
+def test_cuda_graphs_return_with_fused_dispatch():
+    """Graph configs are gated on the RESOLVED dispatch: reference -> none
+    (uncapturable host loops), fused -> registered."""
+    import torch as _torch
+
+    from mstar.model.glm52.submodules import Glm52LLMSubmodule
+
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    sub = object.__new__(Glm52LLMSubmodule)
+    sub.config = cfg
+
+    lm = _torch.nn.Module()
+    lm.blk = Glm52SparseMoeBlock(cfg)
+    # object.__new__ skipped nn.Module.__init__, so bypass its __setattr__.
+    object.__setattr__(sub, "language_model", lm)
+
+    lm.blk._use_fused = False
+    assert sub.get_cuda_graph_configs(_torch.device("cpu")) == []
+    lm.blk._use_fused = True
+    assert len(sub.get_cuda_graph_configs(_torch.device("cpu"))) == 2
+
+
 def test_autocast_then_restore_keeps_fp8_layout():
     cfg8 = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     block8 = Glm52SparseMoeBlock(cfg8)

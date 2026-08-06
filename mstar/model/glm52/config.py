@@ -107,6 +107,15 @@ class Glm52ModelConfig:
     # experts too — fine for reduced tests, OOM on the real 753B checkpoint
     # (bf16 experts alone are ~181 GB/rank at TP8 vs the H200's 141 GB).
     moe_fp8_resident: bool = True
+    # Routed-expert dispatch for the fp8-resident path (kimi quant_kernel
+    # semantics): "reference" = the per-hit-expert dequant loop (bitwise
+    # CPU-testable, uncapturable, slow); "triton" = fused_experts_fp8 W8A8
+    # (fast, capture-safe, activation-quant numerics) and must not silently
+    # downgrade; "auto" = triton on CUDA, reference elsewhere. Default stays
+    # "reference" until the M1 reference-path baseline is banked — the fused
+    # kernel changes numerics (activations quantize to fp8), so flipping it
+    # mid-baseline would invalidate the token-diff anchor.
+    moe_quant_kernel: str = "reference"
 
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None

@@ -59,6 +59,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
+    def _moe_resolved_fused(self) -> bool:
+        """True iff the loaded MoE blocks resolved to the fused fp8 kernel."""
+        from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
+
+        lm = getattr(self, "language_model", None)
+        if lm is None:
+            return False
+        for module in lm.modules():
+            if isinstance(module, Glm52SparseMoeBlock):
+                return bool(getattr(module, "_use_fused", False))
+        return False
+
     def _build_prefill_packed(
         self, num_tokens: int, device: torch.device,
     ) -> dict[str, torch.Tensor]:
@@ -102,11 +114,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # naive bf16 loop under TP) use .nonzero()/host loops — illegal under
         # CUDA-graph stream capture. Capturing would fail for every bucket,
         # leave runner.graphs empty, and serve eagerly anyway; registering
-        # no configs makes eager-only serving explicit. Graphs return with
-        # the fused fp8 kernel (M4).
+        # no configs makes eager-only serving explicit. The fused
+        # fused_experts_fp8 path IS capture-safe: when the loaded MoE blocks
+        # resolved to it (moe_quant_kernel triton/auto-on-cuda), graphs come
+        # back. Called post-load, so the resolved flag is authoritative.
         fp8_reference = (
             self.config.quantization_config is not None
             and self.config.moe_fp8_resident
+            and not self._moe_resolved_fused()
         )
         naive_tp = self.config.quantization_config is None and tp_world_size > 1
         if fp8_reference or naive_tp:

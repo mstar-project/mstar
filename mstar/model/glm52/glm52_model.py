@@ -132,6 +132,8 @@ class Glm52Model(Model):
             # 8192 restores the checkpoint's generation default; real 1M
             # context is gated on sparse prefill + the fp8 paged k-pool.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
+        if "moe_quant_kernel" in kwargs:
+            self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
