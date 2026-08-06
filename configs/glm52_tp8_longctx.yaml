@@ -6,8 +6,11 @@ model: "glm52"
 # max_seq_len: FULL indexer layers maintain a per-request bf16 k-store
 # (~5.4 KB/token/rank across the 21 FULL layers) and decode beyond 2048
 # runs sparse absorbed attention over each token's top-2048 selected
-# latents (mstar/model/glm52/dsa.py). Within 2048 nothing changes — the
-# dense paged path is bit-identical to glm52_tp8.yaml.
+# latents (mstar/model/glm52/dsa.py). A request whose whole batch stays
+# within 2048 runs the dense paged path bit-identically to glm52_tp8.yaml;
+# a within-2048 request BATCHED WITH a beyond-2048 one is routed through
+# the fp32 sparse gather instead — same selection (its full prefix), same
+# math, but not bitwise-stable against batch composition.
 #
 # v1 limits (both marked follow-ups in components/attention.py):
 #   - prefill prompts must still fit index_topk (sparse prefill pending);
