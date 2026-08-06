@@ -151,6 +151,71 @@ def restore_fp32_params(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
+def build_glm52_read_plan(
+    checkpoint_keys: Iterable[str],
+    config,
+    tp_rank: int,
+    tp_size: int,
+    load_indexer: bool = True,
+) -> tuple[set[str], "dict[str, tuple[int, int, int]]"]:
+    """Keys-to-read + per-key slice specs for the TP fast read path.
+
+    Cuts per-rank checkpoint IO two ways: (1) keys the model never loads
+    (MTP layer, non-FULL-layer indexer keys) are excluded up front so the
+    iterator never reads them; (2) routed-expert tensors — ~96% of the
+    checkpoint's bytes — get ``(dim, start, stop)`` specs so each rank
+    reads only its TP shard (GLM-5.2 at TP8: ~704 GB -> ~120 GB per rank).
+    The expert loaders accept these pre-sliced shards shape-driven.
+
+    Scale slicing relies on the shard/block divisibility the MoE block
+    already asserts (per-rank intermediate is a whole number of scale
+    blocks), so sliced fp8 bytes and sliced scales stay aligned.
+    """
+    from mstar.model.glm52.components.indexer import is_full_indexer_layer
+
+    fp8_experts = config.quantization_config is not None and config.moe_fp8_resident
+    shard_inter = config.moe_intermediate_size // tp_size
+    keys: set[str] = set()
+    specs: dict[str, tuple[int, int, int]] = {}
+    if fp8_experts:
+        bo, bi = config.quantization_config.weight_block_size
+        assert shard_inter % bo == 0 and shard_inter % bi == 0, (
+            f"per-rank intermediate {shard_inter} must be a multiple of the "
+            f"scale block ({bo}, {bi}) for sliced reads"
+        )
+
+    for key in checkpoint_keys:
+        m_layer = _LAYER_RE.match(key)
+        layer = int(m_layer.group(1)) if m_layer else None
+        if layer is not None and layer >= config.num_hidden_layers:
+            continue  # MTP (Phase D): never read, never transfer
+        if ".self_attn.indexer." in key and (
+            not load_indexer
+            or layer is None
+            or not is_full_indexer_layer(config, layer)
+        ):
+            continue
+        keys.add(key)
+
+        if not fp8_experts:
+            continue
+        m = _EXPERT_RE.match(key)
+        if not m:
+            continue
+        _, _, proj, suffix = m.groups()
+        is_scale = suffix == "weight_scale_inv"
+        if proj in ("gate_proj", "up_proj"):
+            unit = bo if is_scale else 1
+            rows = shard_inter // unit
+            specs[key] = (0, tp_rank * rows, (tp_rank + 1) * rows)
+        else:  # down_proj: contraction dim is sharded -> column slice
+            unit = bi if is_scale else 1
+            cols = shard_inter // unit
+            specs[key] = (1, tp_rank * cols, (tp_rank + 1) * cols)
+
+    return keys, specs
+
+
 def load_glm52_hf_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],

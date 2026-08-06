@@ -67,8 +67,11 @@ def _gpu_liveness_heartbeat(device: str):
         # execute: a microsecond kernel per second still samples as 0% —
         # measured the hard way (third external kill, offset +33:59, with
         # the 64x64 version ticking). ~2.7 ms of matmul every 50 ms.
+        # 0.25 s cadence: 20 wakeups/s of GIL churn measurably taxed the
+        # loader's hot python loop (~2.5x slower load); 4/s with ~13 ms of
+        # matmul still samples ~5% utilization — visible, near-free.
         a = torch.ones(8192, 8192, device=device, dtype=torch.bfloat16)
-        while not stop.wait(0.05):
+        while not stop.wait(0.25):
             for _ in range(5):
                 torch.mm(a, a)
 
@@ -446,7 +449,6 @@ class Glm52Model(Model):
         )
         from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
         from mstar.model.glm52.submodules import Glm52LLMSubmodule
-        from mstar.model.loader import load_weights
 
         with torch.device("meta"):
             language_model = Glm52ForCausalLM(self.config, comm_group=tp_group)
@@ -454,12 +456,48 @@ class Glm52Model(Model):
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
         with _gpu_liveness_heartbeat(device):
-            load_weights(language_model, source, device=device)
+            self._load_checkpoint(language_model, source, device, tp_group)
             process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
         return Glm52LLMSubmodule(language_model=language_model, config=self.config)
+
+    def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
+        """Load weights, taking the sliced fast read path when possible.
+
+        The generic driver has every rank read the full checkpoint and keep
+        its TP slice — 8x the bytes at TP8, and the reads dominate load
+        time. With a sharded index present, build a read plan instead:
+        skip keys the model never loads (MTP layer, non-FULL indexer keys)
+        and read only this rank's shard of every routed-expert tensor.
+        """
+        from mstar.model.glm52.weight_loader import build_glm52_read_plan
+        from mstar.model.loader import load_weights
+        from mstar.model.loader.iterators import iter_safetensors_shards
+
+        index_file = Path(source) / "model.safetensors.index.json"
+        if not index_file.is_file():
+            load_weights(language_model, source, device=device)
+            return
+
+        import json
+
+        with open(index_file) as f:
+            checkpoint_keys = list(json.load(f)["weight_map"])
+        tp_rank = tp_group.rank if tp_group is not None else 0
+        tp_size = tp_group.world_size if tp_group is not None else 1
+        keys, specs = build_glm52_read_plan(
+            checkpoint_keys, self.config, tp_rank, tp_size,
+        )
+        logger.info(
+            "Glm52Model fast read plan: %d/%d keys, %d sliced (tp %d/%d)",
+            len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
+        )
+        weights = iter_safetensors_shards(
+            source, device=device, keys=keys, slice_spec=specs.get,
+        )
+        language_model.load_weights(weights)
 
     def _resolve_checkpoint(self) -> str | None:
         path = getattr(self, "model_path_hf", None)

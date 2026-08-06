@@ -49,24 +49,33 @@ def _gate_up_fp8_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: str | int | None = None,
 ):
-    """Route one expert's full gate/up tensor into the stacked per-rank param.
+    """Route one expert's gate/up tensor into the stacked per-rank param.
 
     ``row_unit`` is 1 for the fp8 bytes and block_size[0] for the scale rows;
     the same slicing logic covers both because scales tile the row axis.
+    Shape-driven: a full checkpoint tensor is TP-sliced here; a pre-sliced
+    shard (the ``slice_spec`` fast read path — each rank reads only its
+    bytes) is written as-is.
     """
     assert loaded_shard_id is not None
     kind, expert_str = str(loaded_shard_id).split(":")
     expert_idx = int(expert_str)
-    shard_inter = divide(full_inter, tp_size)
-    rows = divide(shard_inter, row_unit)
-    start = tp_rank * rows
+    rows = divide(divide(full_inter, tp_size), row_unit)
+    full_rows = divide(full_inter, row_unit)
     if loaded_weight.dtype == FP8_DTYPE:
         loaded_weight = loaded_weight.view(torch.uint8)
-    tp_slice = loaded_weight[start:start + rows, :]
+    if loaded_weight.shape[0] == full_rows:
+        start = tp_rank * rows
+        loaded_weight = loaded_weight[start:start + rows, :]
+    elif loaded_weight.shape[0] != rows:
+        raise ValueError(
+            f"expert gate/up tensor has {loaded_weight.shape[0]} rows; expected "
+            f"the full {full_rows} or the per-rank {rows}"
+        )
     if kind == "gate":
-        param.data[expert_idx, :rows, :] = tp_slice
+        param.data[expert_idx, :rows, :] = loaded_weight
     else:
-        param.data[expert_idx, rows:2 * rows, :] = tp_slice
+        param.data[expert_idx, rows:2 * rows, :] = loaded_weight
 
 
 def _down_fp8_loader(
@@ -77,12 +86,19 @@ def _down_fp8_loader(
     """Column (contraction-dim) sharding twin of :func:`_gate_up_fp8_loader`."""
     assert loaded_shard_id is not None
     expert_idx = int(str(loaded_shard_id).split(":")[1])
-    shard_inter = divide(full_inter, tp_size)
-    cols = divide(shard_inter, col_unit)
-    start = tp_rank * cols
+    cols = divide(divide(full_inter, tp_size), col_unit)
+    full_cols = divide(full_inter, col_unit)
     if loaded_weight.dtype == FP8_DTYPE:
         loaded_weight = loaded_weight.view(torch.uint8)
-    param.data[expert_idx, :, :] = loaded_weight[:, start:start + cols]
+    if loaded_weight.shape[1] == full_cols:
+        start = tp_rank * cols
+        loaded_weight = loaded_weight[:, start:start + cols]
+    elif loaded_weight.shape[1] != cols:
+        raise ValueError(
+            f"expert down tensor has {loaded_weight.shape[1]} cols; expected "
+            f"the full {full_cols} or the per-rank {cols}"
+        )
+    param.data[expert_idx, :, :] = loaded_weight
 
 
 class Glm52MoEGate(nn.Module):
