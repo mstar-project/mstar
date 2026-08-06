@@ -41,6 +41,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
+        self._load_heartbeat_stop = None
+
+    def set_load_heartbeat_stop(self, stop) -> None:
+        """Adopt the load-time GPU liveness tick; stopped on first forward."""
+        self._load_heartbeat_stop = stop
+
+    def _stop_load_heartbeat(self) -> None:
+        if self._load_heartbeat_stop is not None:
+            self._load_heartbeat_stop.set()
+            self._load_heartbeat_stop = None
         # DSA indexer k-cache (dsa.py): per-request bf16 index keys, appended
         # by FULL layers each forward when dsa_long_context is on. Owned here
         # so the engine's request lifecycle covers it — ``cleanup_request``
@@ -264,6 +274,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
+        self._stop_load_heartbeat()
         cache_handle = engine_inputs.cache_manager
         hidden = self._hidden(
             input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
@@ -281,6 +292,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
+        self._stop_load_heartbeat()
         cache_handle = engine_inputs.cache_manager
         sampler = engine_inputs.sampler
         cache_handle.set_active_label(_MAIN)

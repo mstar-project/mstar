@@ -27,7 +27,6 @@ Scaffold status (bring-up order, per docs/adding_models.rst):
 
 import logging
 import threading
-from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -46,20 +45,18 @@ from mstar.utils.sampling import SamplingConfig
 logger = logging.getLogger(__name__)
 
 
-@contextmanager
-def _gpu_liveness_heartbeat(device: str):
-    """Tick a microscopic CUDA kernel while the checkpoint loads.
+def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
+    """Tick a small CUDA kernel until the first real forward pass.
 
-    The 700 GB load is host-bound (shard walking + CPU dequant): each rank
-    holds ~100 GB of GPU memory with 0% SM utilization for ~30 minutes.
-    Two TP8 loads were externally SIGTERM'd at ~+30 min with the conductor
-    left alive — the signature of a box-level idle-GPU reaper misreading a
-    live load as squatting (the 08-04 vLLM wedge matches too). One 64x64
-    matmul per second makes the liveness legible; the cost is microseconds.
+    The box reaps processes that hold GPU memory with ~30 min of no GPU
+    activity ATTRIBUTED TO THEM (per-process: an external tickler on the
+    same GPU did not prevent kill #4). The idle window spans the host-bound
+    weight load AND the first-request flashinfer JIT storm, so the tick
+    must live from load start until the submodule's first forward — the
+    caller owns the returned stop event and sets it there.
     """
     if not str(device).startswith("cuda"):
-        yield
-        return
+        return None
     stop = threading.Event()
 
     def _tick():
@@ -77,11 +74,7 @@ def _gpu_liveness_heartbeat(device: str):
 
     t = threading.Thread(target=_tick, daemon=True, name="glm52-load-heartbeat")
     t.start()
-    try:
-        yield
-    finally:
-        stop.set()
-        t.join(timeout=5)
+    return stop
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -457,13 +450,19 @@ class Glm52Model(Model):
         if autocast_dtype is not None:
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
-        with _gpu_liveness_heartbeat(device):
-            self._load_checkpoint(language_model, source, device, tp_group)
-            process_weights_after_loading(language_model, torch.device(device))
+        heartbeat_stop = _start_gpu_liveness_heartbeat(device)
+        self._load_checkpoint(language_model, source, device, tp_group)
+        process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
-        return Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        # The heartbeat outlives the load: the first request's flashinfer JIT
+        # is another long 0%-GPU stretch, and the reaper's per-process idle
+        # clock doesn't care whose fault that is. The submodule stops the
+        # tick on its first real forward.
+        submodule.set_load_heartbeat_stop(heartbeat_stop)
+        return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
         """Load weights, taking the sliced fast read path when possible.
