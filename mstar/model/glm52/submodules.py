@@ -15,6 +15,11 @@ from mstar.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mstar.engine.kv_store import PositionInfo
 from mstar.model.glm52.config import Glm52ModelConfig
+from mstar.model.glm52.dsa import (
+    Glm52DsaForwardContext,
+    Glm52DsaKStore,
+    Glm52DsaRequestSpan,
+)
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -36,6 +41,20 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
+        # DSA indexer k-cache (dsa.py): per-request bf16 index keys, appended
+        # by FULL layers each forward when dsa_long_context is on. Owned here
+        # so the engine's request lifecycle covers it — ``cleanup_request``
+        # below evicts on retirement.
+        self._dsa_k_store = Glm52DsaKStore()
+
+    def cleanup_request(self, request_id: str):
+        """Evict the request's DSA k-history alongside the base per-request
+        state. ``KVCacheEngine.remove_request`` calls this for every managed
+        submodule (the contract ``test_kv_cache_engine_cleanup.py`` pins);
+        skipping it would leak ~5.4 KB/token/request of index keys per rank
+        forever."""
+        self._dsa_k_store.evict(request_id)
+        super().cleanup_request(request_id)
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
@@ -72,6 +91,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
+        if self.config.dsa_long_context:
+            # DSA maintenance is host-side per-request work (k-store appends,
+            # per-request selection + gather loops): a captured decode would
+            # replay only the recorded kernels and silently skip index
+            # upkeep, corrupting every later selection. Eager-only until the
+            # fp8 paged k-pool + captured-scatter follow-up.
+            return []
         # The reference MoE dispatch paths (fp8-resident per-hit-expert loop;
         # naive bf16 loop under TP) use .nonzero()/host loops — illegal under
         # CUDA-graph stream capture. Capturing would fail for every bucket,
@@ -143,20 +169,51 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label=_MAIN)
 
         device = self.get_device()
-        # Until Phase C lands the DSA indexer, dense MLA equals the reference
+        # With dsa_long_context off, dense MLA equals the reference
         # computation ONLY while every attended context fits in the top-k
-        # window (index_topk = 2048). Beyond it the ~20 FULL-indexer layers
-        # would silently diverge, so refuse rather than serve off-spec logits.
-        limit = self.config.index_topk
+        # window (index_topk = 2048) — beyond it the ~20 FULL-indexer layers
+        # would silently diverge, so refuse rather than serve off-spec
+        # logits. With the flag on, the DSA engine path serves beyond topk
+        # and the cap moves to the configured serving window.
+        long_context = self.config.dsa_long_context
+        limit = self.config.max_seq_len if long_context else self.config.index_topk
+        topk = self.config.index_topk
         pos_ids_list: list[int] = []
+        spans: list[Glm52DsaRequestSpan] = []
+        needs_selection = False
+        q_start = 0
         for rid, sl in zip(cache_manager.request_ids, seq_lens, strict=True):
-            start = cache_manager._get_state(rid, _MAIN).position_id_start
+            state = cache_manager._get_state(rid, _MAIN)
+            start = state.position_id_start
             if start + sl > limit:
                 raise RuntimeError(
                     f"request {rid}: context {start + sl} exceeds {limit}, "
-                    "the regime where dense MLA is exactly GLM-5.2's DSA "
-                    "computation. Long context needs the Phase C indexer."
+                    + (
+                        "the configured max_seq_len serving window."
+                        if long_context
+                        else "the regime where dense MLA is exactly GLM-5.2's "
+                        "DSA computation. Long context needs the Phase C "
+                        "indexer engine path (dsa_long_context=True)."
+                    )
                 )
+            if long_context:
+                if start + sl > topk:
+                    if sl > 1:
+                        raise RuntimeError(
+                            f"request {rid}: prefill context {start + sl} "
+                            f"exceeds index_topk={topk}. Sparse attention "
+                            "beyond topk is decode-only in v1 — long-prompt "
+                            "sparse prefill (per-token windows inside the "
+                            "chunk) is the marked follow-up."
+                        )
+                    needs_selection = True
+                # plan_attention already allocated this chunk's pages, so the
+                # snapshot covers every position the sparse path touches.
+                spans.append(Glm52DsaRequestSpan(
+                    request_id=rid, q_start=q_start, q_len=sl,
+                    ctx_start=start, page_indices=list(state.page_indices),
+                ))
+                q_start += sl
             pos_ids_list.extend(range(start, start + sl))
         position_ids = torch.tensor(pos_ids_list, dtype=torch.long, device=device)
 
@@ -168,6 +225,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # materializes qo_indptr_buf under CUDA-graph capture, and the
             # reference-dispatch configs register no graphs.
             "last_token_indices": seq_len_t.cumsum(0) - 1,
+            "dsa_ctx": Glm52DsaForwardContext(
+                spans=spans, k_store=self._dsa_k_store,
+                needs_selection=needs_selection,
+            ) if long_context else None,
         }
 
     def _hidden(
@@ -175,8 +236,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         cache_handle: BatchedCacheManager,
+        dsa_ctx: Glm52DsaForwardContext | None = None,
     ) -> torch.Tensor:
-        return self.language_model.model(input_ids, cache_handle, position_ids)
+        return self.language_model.model(
+            input_ids, cache_handle, position_ids, dsa_ctx=dsa_ctx)
 
     def forward(
         self,
@@ -187,7 +250,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         cache_handle = engine_inputs.cache_manager
-        hidden = self._hidden(input_ids, position_ids, cache_handle)
+        hidden = self._hidden(
+            input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
         logits = self.lm_head(hidden[-1:])
         return {"logits": [logits]}
 
@@ -206,7 +270,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         sampler = engine_inputs.sampler
         cache_handle.set_active_label(_MAIN)
 
-        hidden = self._hidden(input_ids, position_ids, cache_handle)
+        hidden = self._hidden(
+            input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
 
         if graph_walk == "prefill":
             qo_indptr_buf = cache_handle.get_qo_indptr_buf(_MAIN)

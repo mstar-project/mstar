@@ -13,6 +13,7 @@ from mstar.model.glm52.components.language_model import (
     build_rmsnorm,
 )
 from mstar.model.glm52.config import Glm52ModelConfig
+from mstar.model.glm52.dsa import Glm52DsaForwardContext
 
 
 class Glm52LanguageModel(nn.Module):
@@ -34,12 +35,17 @@ class Glm52LanguageModel(nn.Module):
         input_ids: torch.Tensor,
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
+        dsa_ctx: Glm52DsaForwardContext | None = None,
     ) -> torch.Tensor:
+        """``dsa_ctx`` (engine DSA threading, None when dsa_long_context is
+        off): layer order IS the IndexShare order — each FULL layer
+        overwrites ``dsa_ctx.last_selection`` and the SHARED layers between
+        it and the next FULL layer consume that value."""
         hidden_states = self.embed_tokens(input_ids)
         for layer_idx, decoder_layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
-                hidden_states, cache_handle, position_ids
+                hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx
             )
         cache_handle.advance_seq_lens()
         return self.norm(hidden_states)

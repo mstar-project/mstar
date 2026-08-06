@@ -9,11 +9,21 @@ no-op for the full model (reduced test configs still exercise it: 24 -> 64).
 Phase C: FULL indexer layers (``is_full_indexer_layer``) instantiate a
 ``Glm52Indexer`` whose checkpoint weights now load; the naive path accepts
 a precomputed ``dsa_selection`` and restricts softmax to the selected set
-(reference semantics: masked dense attention, -1 entries excluded). The
-absorbed/cache_handle sparse path — paged indexer k-cache, per-request
-block-table index mapping — is the marked engine follow-up. At ctx <= 2048
-top-2048 selection of <= 2048 tokens is the identity, so the dense path IS
-the exact DSA computation in that regime.
+(reference semantics: masked dense attention, -1 entries excluded). At
+ctx <= index_topk, top-k selection of <= topk tokens is the identity, so
+the dense path IS the exact DSA computation in that regime.
+
+Engine half (``dsa_ctx``, absorbed path only): FULL layers append this
+chunk's index keys to the per-request k-store and — once any request's
+context exceeds ``index_topk`` — compute the selection SHARED layers then
+reuse (``_dsa_update``). Beyond topk, decode queries run
+``_run_sparse_absorbed``: gather the selected <= topk latent vectors from
+the paged MLA cache through the request's page table and run dense MQA
+over the gathered set — the same math as ``MlaAbsorbCacheManager._sdpa_mla``
+restricted to the selected rows (-1 padding excluded; the spec marks
+gather + dense semantically identical to the FlashMLA sparse kernel,
+dsa-indexer-spec.md section 4). While every context fits topk the paged
+``run_attention_mla`` path runs UNTOUCHED — bit-identical to flag-off.
 """
 from __future__ import annotations
 
@@ -30,6 +40,7 @@ from mstar.model.components.norm import RMSNorm
 from mstar.model.glm52.components.indexer import Glm52Indexer, is_full_indexer_layer
 from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
 from mstar.model.glm52.config import Glm52ModelConfig
+from mstar.model.glm52.dsa import Glm52DsaForwardContext
 
 
 def dsa_selection_to_mask(
@@ -108,6 +119,7 @@ class Glm52MLAAttention(nn.Module):
         # DSA indexer only on FULL layers — SHARED layers carry no indexer
         # weights in the checkpoint (they reuse the last FULL selection),
         # and a dormant module would sit uninitialized after ``to_empty``.
+        self.layer_idx = layer_idx  # k-store key + selection provenance
         self.indexer = (
             Glm52Indexer(config)
             if layer_idx is not None and is_full_indexer_layer(config, layer_idx)
@@ -130,19 +142,32 @@ class Glm52MLAAttention(nn.Module):
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
         dsa_selection: torch.Tensor | None = None,
+        dsa_ctx: Glm52DsaForwardContext | None = None,
     ) -> torch.Tensor:
         """``dsa_selection``: optional ``(T, index_topk)`` int rows from
         ``Glm52Indexer.compute_selection`` (-1 = padding). When given, the
         naive path restricts softmax to the selected keys of the current
-        batch; when None, dense behavior is unchanged. The absorbed path
-        does not take a selection yet (engine follow-up)."""
+        batch; when None, dense behavior is unchanged.
+
+        ``dsa_ctx``: the engine-threaded per-forward DSA context (absorbed
+        path only) — see the module docstring and ``_dsa_update``."""
+        if dsa_ctx is not None and not self.mla_absorb:
+            # The sparse gather path reads the paged 576-dim latent cache;
+            # the naive backend stores padded per-head K/V instead. The
+            # naive path stays what it is: the reduced-test parity fallback.
+            raise RuntimeError(
+                "dsa_long_context requires mla_absorb: the sparse gather path "
+                "consumes the paged MLA latent cache, which only the absorbed "
+                "backend maintains"
+            )
         if self.mla_absorb:
             if dsa_selection is not None:
                 raise NotImplementedError(
-                    "dsa_selection on the absorbed path is the Phase C engine "
-                    "follow-up; only the naive reference path consumes it"
+                    "dsa_selection is the naive-path reference hook; the "
+                    "absorbed path takes the engine dsa_ctx instead"
                 )
-            return self._forward_absorbed(hidden_states, cache_handle, position_ids)
+            return self._forward_absorbed(
+                hidden_states, cache_handle, position_ids, dsa_ctx)
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
 
@@ -186,6 +211,7 @@ class Glm52MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
+        dsa_ctx: Glm52DsaForwardContext | None = None,
     ) -> torch.Tensor:
         """Run MLA over the compressed latent cache after folding kv_b into Q/O."""
         if self.w_kc is None or self.w_vc is None:
@@ -209,7 +235,12 @@ class Glm52MLAAttention(nn.Module):
         q_c = q_c.contiguous()
         kv_a = kv_a.clone(memory_format=torch.contiguous_format)
 
-        q = self.q_b_proj(self.q_a_layernorm(q_c))
+        # Keep the post-q_a_layernorm latent: it is ALSO the indexer's query
+        # input (the shared 2048-dim bottleneck, dsa-indexer-spec.md section
+        # 6 item 1). Same ops in the same order as the previous fused
+        # expression — bit-identical.
+        q_c = self.q_a_layernorm(q_c)
+        q = self.q_b_proj(q_c)
         q = q.view(num_tokens, h, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -218,13 +249,149 @@ class Glm52MLAAttention(nn.Module):
 
         q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe)
 
+        # None-guarded here (not just inside _dsa_update) so the default
+        # flag-off path never crosses the compiler.disable boundary — dynamo
+        # specializes on dsa_ctx=None and folds the branch away.
+        selection = (
+            self._dsa_update(dsa_ctx, hidden_states, q_c, position_ids)
+            if dsa_ctx is not None else None
+        )
+
         q_nope = torch.einsum("thd,hdl->thl", q_nope, self.w_kc)
 
-        attn_latent = cache_handle.run_attention_mla(
-            q_nope=q_nope, q_pe=q_pe, kv_c=kv_c, k_pe=k_pe)
+        if selection is None:
+            # Identity regime (or DSA off): the paged path, untouched.
+            attn_latent = cache_handle.run_attention_mla(
+                q_nope=q_nope, q_pe=q_pe, kv_c=kv_c, k_pe=k_pe)
+        else:
+            attn_latent = self._run_sparse_absorbed(
+                cache_handle, dsa_ctx, selection, q_nope, q_pe, kv_c, k_pe)
 
         out = torch.einsum("thl,hdl->thd", attn_latent, self.w_vc)
         return self.o_proj(out.reshape(num_tokens, h * self.v_head_dim))
+
+    # Host-side per-request work (dict mutation, python loops over spans):
+    # keep dynamo out of it, same as the cache-manager plan/run methods —
+    # under the engine's warmup torch.compile these run eagerly via the
+    # disable wrapper instead of graph-breaking token by token.
+    @torch.compiler.disable
+    def _dsa_update(
+        self,
+        dsa_ctx: Glm52DsaForwardContext,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Maintain the indexer k-store and return the selection to apply.
+
+        FULL layers (``self.indexer`` set) always append this chunk's
+        roped+normed keys — history must be complete from token 0 for the
+        step that first crosses topk — and, when any request is beyond topk,
+        score their per-request history (current chunk included: the causal
+        window is self-inclusive) and publish the selection on ``dsa_ctx``.
+        SHARED layers publish nothing and reuse the most recent FULL layer's
+        rows (IndexShare, spec section 3). Returns None in the identity
+        regime so the caller keeps the untouched dense path.
+        """
+        if self.indexer is None:
+            if not dsa_ctx.needs_selection:
+                return None
+            if dsa_ctx.last_selection is None:
+                raise RuntimeError(
+                    f"SHARED layer {self.layer_idx} needs a DSA selection but no "
+                    "FULL layer ran before it — the skip formula guarantees "
+                    "layer 0 is FULL, so the threading order is broken"
+                )
+            return dsa_ctx.last_selection
+
+        keys = self.indexer.compute_k(hidden_states, position_ids)
+        for span in dsa_ctx.spans:
+            dsa_ctx.k_store.append(
+                span.request_id,
+                self.layer_idx,
+                keys[span.q_start : span.q_start + span.q_len],
+                start_pos=span.ctx_start,
+            )
+        if not dsa_ctx.needs_selection:
+            return None
+
+        rows = []
+        for span in dsa_ctx.spans:
+            token_slice = slice(span.q_start, span.q_start + span.q_len)
+            history = dsa_ctx.k_store.history(
+                span.request_id, self.layer_idx, span.ctx_start + span.q_len)
+            rows.append(self.indexer.compute_selection(
+                q_c[token_slice],
+                hidden_states[token_slice],
+                position_ids[token_slice],
+                history,
+            ))
+        selection = torch.cat(rows, dim=0) if len(rows) > 1 else rows[0]
+        dsa_ctx.last_selection = selection
+        dsa_ctx.last_selection_layer = self.layer_idx
+        return selection
+
+    @torch.compiler.disable
+    def _run_sparse_absorbed(
+        self,
+        cache_handle: BatchedCacheManager,
+        dsa_ctx: Glm52DsaForwardContext,
+        selection: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sparse absorbed MLA: gather the selected latents, dense MQA over them.
+
+        Replaces ``run_attention_mla`` beyond topk, so it also does that
+        call's cache write: scatter this chunk's 576-dim latents to their
+        page slots (same ``page_indices[pos // page_size]`` mapping the
+        MlaAbsorbCacheManager plan uses) BEFORE gathering — the causal
+        window includes self, so the current token's latent must be
+        readable. Then, per query, gather the selected <= topk latents
+        (request-local indices -> page slots; -1 padding excluded by the
+        gather itself) and run ``_sdpa_mla``'s math over the gathered set:
+        fp32 MQA, softmax over exactly the selected rows, value = the
+        ckv slice. Gathered-row order is irrelevant up to fp addition order.
+
+        v1 is decode-shaped (q_len == 1 per request; the submodule guard
+        keeps prefill within topk) and loops requests on the host — fine at
+        decode batch sizes, and the batched-gather kernel belongs to the
+        fp8 paged-pool follow-up.
+        """
+        latent_cache = cache_handle.kv_cache[cache_handle.layer_idx]
+        page_size = cache_handle.kv_cache_config.page_size
+        latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)  # (T, L + Drope)
+        latent_dim = q_nope.shape[-1]  # ckv width (post-w_kc absorption)
+        query = torch.cat([q_nope, q_pe], dim=-1).float()  # (T, H, L + Drope)
+
+        out = torch.empty_like(q_nope)
+        for span in dsa_ctx.spans:
+            if span.q_len != 1:
+                raise RuntimeError(
+                    f"request {span.request_id!r}: sparse attention beyond "
+                    "index_topk is decode-only in v1 (q_len == 1); prefill "
+                    "beyond topk is refused by the submodule guard"
+                )
+            pages = torch.tensor(
+                span.page_indices, dtype=torch.long, device=latent.device)
+            pos = span.ctx_start  # this decode token's absolute position
+            latent_cache[pages[pos // page_size], pos % page_size] = (
+                latent[span.q_start].to(latent_cache.dtype))
+
+            row = selection[span.q_start]
+            picked = row[row >= 0].long()  # request-local positions, causal
+            gathered = latent_cache[
+                pages[picked // page_size], picked % page_size
+            ].float()  # (n, L + Drope)
+
+            scores = torch.einsum(
+                "hd,kd->hk", query[span.q_start], gathered) * self.softmax_scale
+            attn = scores.softmax(dim=-1)
+            out[span.q_start] = torch.einsum(
+                "hk,kd->hd", attn, gathered[:, :latent_dim]).to(out.dtype)
+        return out
 
     def process_weights_after_loading(self, device: torch.device | str | None = None) -> None:
         """Build absorbed Q/O projections from the local-head ``kv_b_proj`` shard."""

@@ -12,6 +12,7 @@ from mstar.model.glm52.components.language_model import (
     build_rmsnorm,
 )
 from mstar.model.glm52.config import Glm52ModelConfig
+from mstar.model.glm52.dsa import Glm52DsaForwardContext
 
 
 class Glm52DecoderLayer(nn.Module):
@@ -34,10 +35,12 @@ class Glm52DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
+        dsa_ctx: Glm52DsaForwardContext | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cache_handle, position_ids)
+        hidden_states = self.self_attn(
+            hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx)
         hidden_states = residual + hidden_states
 
         residual = hidden_states

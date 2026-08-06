@@ -228,6 +228,8 @@ ignore = [
 "mstar/graph/graph_io.py" = ["F403", "F405"]
 # Imports are deliberately placed after a module-level pytest.skip().
 "test/modular/test_phase1.py" = ["E402"]
+# Same pattern: the no-GPU skip must precede the triton-pulling mstar imports.
+"test/integration/test_glm52_dsa_longctx_serve.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"

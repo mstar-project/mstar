@@ -17,8 +17,10 @@ Scaffold status (bring-up order, per docs/adding_models.rst):
     [x] components/ + weight loading (fp8-block dequant; experts fp8-resident)
     [x] MLA attention (absorbed default + naive fallback) on the paged latent
         cache path from users/garv/kimik27-integration
-    [ ] DSA indexer + IndexShare (Phase C — at ctx <= 2048 dense MLA IS the
-        exact DSA computation, so M1 correctness needs no indexer)
+    [x] DSA indexer + IndexShare (Phase C components + engine v1: opt-in
+        dsa_long_context flag, per-request bf16 indexer k-store, sparse
+        gather-and-dense decode beyond index_topk; prefill prompts must
+        still fit topk, sparse prefill + fp8 paged k-pool are follow-ups)
     [ ] MTP speculation (Phase D; layer-78 weights consciously skipped)
     [ ] fused fp8 expert kernel (M4 perf debt; reference dispatch until then)
 """
@@ -76,6 +78,20 @@ class Glm52Model(Model):
             self.config = Glm52ModelConfig.reduced_fp8()
         else:
             self.config = Glm52ModelConfig()
+        if kwargs.get("dsa_long_context", False):
+            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). The
+            # sparse gather reads the paged latent cache, so the naive
+            # (mla_absorb=False) backend cannot host it.
+            if not self.config.mla_absorb:
+                raise ValueError(
+                    "dsa_long_context requires mla_absorb: the sparse path "
+                    "gathers selected latents from the paged MLA cache"
+                )
+            self.config.dsa_long_context = True
+            # Guard + KV sizing move from index_topk to the serving window.
+            # 8192 restores the checkpoint's generation default; real 1M
+            # context is gated on sparse prefill + the fp8 paged k-pool.
+            self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None

@@ -47,6 +47,16 @@ class Glm52ModelConfig:
     index_skip_topk_offset: int = 3
     index_share_for_mtp_iteration: bool = True
     indexer_rope_interleave: bool = True
+    # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
+    # submodule guard holds every context to index_topk, where dense MLA IS
+    # the exact DSA computation, and nothing about M1 serving changes. On:
+    # the guard checks max_seq_len instead, FULL layers maintain a
+    # per-request indexer k-store + compute selection, and decode beyond
+    # index_topk runs sparse absorbed attention over the selected latents
+    # (dsa.py / components/attention.py). v1 is decode-only beyond topk
+    # (prefill prompts must still fit index_topk) and eager-only (selection
+    # is host-side per-request work a captured graph would not replay).
+    dsa_long_context: bool = False
 
     # --- MoE ---
     first_k_dense_replace: int = 3  # layers 0..2 are dense
@@ -67,9 +77,11 @@ class Glm52ModelConfig:
     max_position_embeddings: int = 1_048_576
     # Serving cap, consumed by get_kv_cache_config (the top-level YAML
     # max_seq_len key is only presence-checked by the conductor — it does
-    # not override this). Held to index_topk until Phase C: dense MLA is
-    # exactly GLM-5.2's DSA computation only within the top-2048 window,
-    # and the submodule's preprocess guard enforces the same bound.
+    # not override this). Held to index_topk while dsa_long_context is off:
+    # dense MLA is exactly GLM-5.2's DSA computation only within the
+    # top-2048 window, and the submodule's preprocess guard enforces the
+    # same bound. With dsa_long_context on, Glm52Model raises this from the
+    # ``max_seq_len`` model kwarg and the guard checks against it instead.
     max_seq_len: int = 2048
 
     # --- MTP (speculative decoding; unused by the scaffold) ---
