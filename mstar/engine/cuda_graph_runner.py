@@ -1465,6 +1465,9 @@ class CudaGraphRunner:
                 engine_inputs.sampler.sync_seen_token_masks(
                     request_ids, self.sampler,
                 )
+            # Persist the in-graph-advanced RNG offsets back to their slot
+            # masters (GPU-only; keyed by slot, so batch-position invariant).
+            self.sampler_buffer.scatter_offsets()
 
             # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
             # advance_seq_lens is not captured in the graph; we call it manually so
@@ -1695,6 +1698,8 @@ class CudaGraphRunner:
                 engine_inputs.sampler.sync_seen_token_masks(
                     request_ids, self.sampler,
                 )
+            # Persist the in-graph-advanced RNG offsets back to their slot masters.
+            self.sampler_buffer.scatter_offsets()
 
             # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
             if self.enable_nvtx:
@@ -2809,6 +2814,11 @@ class PiecewiseCudaGraphRunner:
 
         # --- 3: replay ---
         data.graph.replay()
+
+        if self.sampler_buffer is not None and request_ids is not None:
+            # Persist the in-graph-advanced RNG offsets back to their slot
+            # masters (mirrors the gather above; GPU-only, real rows only).
+            self.sampler_buffer.scatter_offsets()
 
         # --- 4: advance seq_lens (Python-only, post-replay) ---
         # Uses the per-request lengths planned in step 2, so this is correct for

@@ -673,6 +673,12 @@ def sample_cuda_graphable_gpu(
             include_greedy=False,
         )
         top_k = torch.where(top_k > 0, top_k, logits.shape[1])
+        # NOTE: this is NOT batch-invariant — flashinfer's deterministic RNG
+        # folds the batch row index into philox, so identical (probs, seed,
+        # offset) yield different tokens at different batch positions. Sampling
+        # is thus reproducible only within a fixed batch layout; under
+        # continuous batching (shifting positions) a request's stream is not.
+        # Measured in test/sampling_test/flashinfer_batch_test.py.
         samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             probs, top_k, top_p, deterministic=True,
             seed=seed, offset=offset,
@@ -822,6 +828,15 @@ class Buffer:
     def gather(self, idx_view: torch.Tensor, padded_bs: int) -> None:
         torch.index_select(self.master, 0, idx_view, out=self.buf[:padded_bs])
 
+    def scatter(self, idx_view: torch.Tensor, real_bs: int) -> None:
+        """Persist the per-step rows back to their slots (GPU-only, no CPU).
+
+        Inverse of ``gather`` — for buffers whose per-step value is advanced in
+        graph (the RNG offset). REAL rows only: padding rows all gather from
+        slot 0 and get advanced too, so scattering them would clobber slot 0.
+        """
+        self.master.index_copy_(0, idx_view[:real_bs], self.buf[:real_bs])
+
 
 @dataclass
 class MaskBuffer:
@@ -868,10 +883,13 @@ class SamplerBuffers:
 
     Each per-request scalar parameter (temperature, top_k, top_p, seed,
     repetition_penalty) is a ``Buffer`` owning a per-step slice, a slot-indexed
-    master cache, and pinned row staging. ``offset_buf`` is special-cased (no
-    master; it accumulates in-graph via ``offset_buf += 1``). The optional
-    ``seen_tokens`` ``MaskBuffer`` (allocated only when ``vocab_size`` is given)
-    carries the per-request repetition-penalty mask for the CUDA-graph path.
+    master cache, and pinned row staging. The RNG ``offset`` is also a ``Buffer``
+    but round-trips on the GPU with no CPU middleman: gathered from its slot
+    master before sampling, advanced in graph (``offset_buf += 1`` per sample),
+    then scattered back to the master after replay — so a request's RNG stream
+    follows its slot (batch-position invariant) and reproduces under a fixed
+    seed. The optional ``seen_tokens`` ``MaskBuffer`` (allocated only when
+    ``vocab_size`` is given) carries the per-request repetition-penalty mask.
 
     ``gather_for_request_ids`` builds a pinned slot-index tensor, async-copies it
     to GPU, and ``index_select``s each master into the per-step buffers — one
@@ -883,7 +901,11 @@ class SamplerBuffers:
     top_p: Buffer
     seed: Buffer
     rep_penalty: Buffer
-    offset_buf: torch.Tensor        # [max_bs], int64
+    # Per-request RNG offset: gathered by slot, advanced in graph, scattered
+    # back after replay (all on GPU). Not a config value, so it's kept out of
+    # ``_scalar_buffers`` (never written from a SamplingConfig) and reset to 0
+    # on register instead.
+    offset: Buffer
     # TP communicator for the submodule that owns these buffers. Passed
     # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
     # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
@@ -905,11 +927,9 @@ class SamplerBuffers:
     # index tensor that ``index_select`` reads from.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
-    # Per-request RNG offset (CPU counter, staged into ``offset_buf`` each gather
-    # so the RNG stream follows the request across batch positions and is
-    # reproducible under a fixed seed — mirrors the eager ``Sampler._step_offset``).
-    _step_offset: dict[str, int] = field(default_factory=dict, repr=False)
-    _offset_cpu: torch.Tensor = field(default=None, repr=False)
+    # Real (unpadded) batch size of the last gather — the scatter-back writes
+    # only these rows (padding rows all map to slot 0).
+    _last_real_bs: int = field(default=0, repr=False)
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
@@ -956,13 +976,12 @@ class SamplerBuffers:
             top_p=mk(torch.float32, 1.0),
             seed=mk(torch.long, 0),
             rep_penalty=mk(torch.float32, 1.0),
-            offset_buf=torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            offset=mk(torch.long, 0),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             _master_capacity=cap,
             _slot_idx_cpu=torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(max_batch_size, dtype=torch.long, device=device),
-            _offset_cpu=torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned),
             _free_slots=list(range(cap)),
         )
 
@@ -975,7 +994,7 @@ class SamplerBuffers:
             "top_k_buf": self.top_k.buf[:bs],
             "top_p_buf": self.top_p.buf[:bs],
             "seed_buf": self.seed.buf[:bs],
-            "offset_buf": self.offset_buf[:bs],
+            "offset_buf": self.offset.buf[:bs],
             "rep_penalty_buf": self.rep_penalty.buf[:bs],
             "seen_tokens_buf": self.seen_tokens.buf[:bs] if self.seen_tokens is not None else None,
             "tp_group": self.tp_group,
@@ -1015,6 +1034,7 @@ class SamplerBuffers:
         """
         for buf in self._scalar_buffers():
             buf.grow_master(new_capacity)
+        self.offset.grow_master(new_capacity)
         if self.seen_tokens is not None:
             self.seen_tokens.grow_master(new_capacity)
         self._free_slots.extend(range(self._master_capacity, new_capacity))
@@ -1033,7 +1053,9 @@ class SamplerBuffers:
             self._grow_master(self._master_capacity * 2)
         slot = self._free_slots.pop()
         self._rid_to_slot[rid] = slot
-        self._step_offset[rid] = 0
+        # Fresh RNG offset for this slot (counter, not a config value): zero the
+        # master row on GPU. Gather/advance/scatter keeps it there afterwards.
+        self.offset.master[slot:slot + 1].zero_()
         cfg = sampling_config if sampling_config is not None else SamplingConfig()
         self._cached_config[rid] = cfg
         self._write_master_row(slot, cfg)
@@ -1049,7 +1071,6 @@ class SamplerBuffers:
         if slot is None:
             return
         self._cached_config.pop(rid, None)
-        self._step_offset.pop(rid, None)
         self._free_slots.append(slot)
 
     def update_request_config(
@@ -1126,36 +1147,28 @@ class SamplerBuffers:
         idx_view.copy_(self._slot_idx_cpu[:padded_bs], non_blocking=True)
 
         # One index_select per buffer, writing directly into the
-        # cuda-graph-friendly per-step buffers.
+        # cuda-graph-friendly per-step buffers. The RNG offset gathers the same
+        # way (by slot); the graph advances it in place and ``scatter_offset``
+        # persists it back to the master after replay — no CPU round-trip, and
+        # the offset follows the request's slot regardless of batch position.
         for buf in self._scalar_buffers():
             buf.gather(idx_view, padded_bs)
+        self.offset.gather(idx_view, padded_bs)
+        self._last_real_bs = len(request_ids)
         # The seen-token mask is large ([bs, V] bool); only gather it when the
         # caller's graph actually applies the penalty in-graph (the Talker), so
         # non-penalty graphs that happen to allocate the buffer don't pay for it.
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs)
 
-        # Stage each request's own RNG offset into ``offset_buf`` (padding rows
-        # keep 0). Keyed by rid, so a request's stream follows it across batch
-        # positions and reproduces under a fixed seed — unlike the old
-        # position-indexed accumulator. Within a step the in-graph
-        # ``offset_buf += 1`` still advances per sample, so multiple identical
-        # logits (e.g. stabilised Talker EOS) draw distinct tokens; we then bump
-        # each request's base by a fixed step so the next step starts fresh.
-        # A fixed +1 is enough: cross-step overlap is harmless because the logits
-        # differ every step.
-        for i, rid in enumerate(request_ids):
-            self._offset_cpu[i] = self._step_offset.get(rid, 0)
-        for i in range(len(request_ids), padded_bs):
-            self._offset_cpu[i] = 0
-        self.offset_buf[:padded_bs].copy_(
-            self._offset_cpu[:padded_bs], non_blocking=True,
-        )
-        for rid in request_ids:
-            self._step_offset[rid] = self._step_offset.get(rid, 0) + 1
-
         slices = self.slice_for_bs(padded_bs)
         return CudaGraphableSampler(**slices)
+
+    def scatter_offset(self) -> None:
+        """Persist the (in-graph advanced) per-step offsets back to their slot
+        masters. Call once AFTER the graph replay for the last gather; GPU-only,
+        real rows only (padding rows all map to slot 0)."""
+        self.offset.scatter(self._slot_idx_gpu, self._last_real_bs)
 
 
 @dataclass
@@ -1241,3 +1254,10 @@ class MultiSamplerBuffers:
                 ) for label, bufs in self.aux.items()
             },
         )
+
+    def scatter_offsets(self) -> None:
+        """Persist every label's advanced RNG offset back to its master. Call
+        once after the graph replay for the gather (see ``SamplerBuffers``)."""
+        self.main.scatter_offset()
+        for bufs in self.aux.values():
+            bufs.scatter_offset()
