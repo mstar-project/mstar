@@ -349,9 +349,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # GLM-5.2 defines three stop ids: <|endoftext|>, <|user|>, <|observation|>.
         is_eos = token in self.config.eos_token_ids
         ignore_eos = request_info.sampling_config["LLM"].ignore_eos
-        if (not ignore_eos and is_eos) or (
-            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-            >= request_info.max_tokens
-        ):
+        # Total generated = 1 prefill-emitted token + (iters + 1) decode
+        # tokens. Counting only decode iters against max_tokens made every
+        # length-capped completion one token long — measured in the M1 diff
+        # (m = v + 1 on all 20 prompts vs vLLM's max_tokens semantics).
+        generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
+        if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
             return {"decode_loop"}
         return set()

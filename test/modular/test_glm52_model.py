@@ -156,8 +156,14 @@ def test_glm52_check_stop_ignore_eos_runs_to_max_tokens():
     sub = _make_submodule(Glm52ModelConfig())
     outputs = {"new_token": [torch.tensor([154820])]}
     assert sub.check_stop("r0", _fwd_info(ignore_eos=True), outputs) == set()
+    # max_tokens counts TOTAL generated (vLLM semantics): 1 prefill token +
+    # iters+1 decode tokens. For max 8 the stop fires at decode iter 6
+    # (8 total), not 7 (which produced the measured off-by-one).
     assert sub.check_stop(
-        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=7), outputs,
+        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=5), outputs,
+    ) == set()
+    assert sub.check_stop(
+        "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=6), outputs,
     ) == {"decode_loop"}
 
 
