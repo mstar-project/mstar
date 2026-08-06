@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def _gpu_liveness_heartbeat(device: str, interval_s: float = 1.0):
+def _gpu_liveness_heartbeat(device: str):
     """Tick a microscopic CUDA kernel while the checkpoint loads.
 
     The 700 GB load is host-bound (shard walking + CPU dequant): each rank
@@ -63,9 +63,14 @@ def _gpu_liveness_heartbeat(device: str, interval_s: float = 1.0):
     stop = threading.Event()
 
     def _tick():
-        a = torch.ones(64, 64, device=device)
-        while not stop.wait(interval_s):
-            torch.mm(a, a)
+        # Sized to REGISTER in sampled utilization (~15-25%), not just to
+        # execute: a microsecond kernel per second still samples as 0% —
+        # measured the hard way (third external kill, offset +33:59, with
+        # the 64x64 version ticking). ~2.7 ms of matmul every 50 ms.
+        a = torch.ones(8192, 8192, device=device, dtype=torch.bfloat16)
+        while not stop.wait(0.05):
+            for _ in range(5):
+                torch.mm(a, a)
 
     t = threading.Thread(target=_tick, daemon=True, name="glm52-load-heartbeat")
     t.start()
