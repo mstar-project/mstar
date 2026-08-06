@@ -42,6 +42,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._load_heartbeat_stop = None
+        # DSA indexer k-cache (dsa.py): per-request bf16 index keys, appended
+        # by FULL layers each forward when dsa_long_context is on. Owned here
+        # so the engine's request lifecycle covers it — ``cleanup_request``
+        # below evicts on retirement.
+        self._dsa_k_store = Glm52DsaKStore()
 
     def set_load_heartbeat_stop(self, stop) -> None:
         """Adopt the load-time GPU liveness tick; stopped on first forward."""
@@ -51,11 +56,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if self._load_heartbeat_stop is not None:
             self._load_heartbeat_stop.set()
             self._load_heartbeat_stop = None
-        # DSA indexer k-cache (dsa.py): per-request bf16 index keys, appended
-        # by FULL layers each forward when dsa_long_context is on. Owned here
-        # so the engine's request lifecycle covers it — ``cleanup_request``
-        # below evicts on retirement.
-        self._dsa_k_store = Glm52DsaKStore()
 
     def cleanup_request(self, request_id: str):
         """Evict the request's DSA k-history alongside the base per-request
