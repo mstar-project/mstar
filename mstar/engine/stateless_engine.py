@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.attention_state import RaggedAttention
 from mstar.engine.base import (
     BaseEngine,
     EngineType,
@@ -135,6 +136,9 @@ class StatelessEngine(BaseEngine):
         # node_name -> {label -> PiecewiseCudaGraphRunner}; spread into
         # ModelInputsFromEngine at execute time.
         self._piecewise_runners: dict[str, dict[str, "PiecewiseCudaGraphRunner"]] = {}
+        # Eager cacheless attention for nodes that declared a
+        # RaggedAttentionConfig; built at warmup. Captured buckets get their own.
+        self._ragged: RaggedAttention | None = None
 
         # Dedup set for "captured graphs exist but don't match this shape"
         # warnings — each unique miss is logged at most once.
@@ -184,6 +188,7 @@ class StatelessEngine(BaseEngine):
         # ``self._piecewise_runners[node_name]`` directly; warmup overwrites
         # entries for nodes that capture piecewise graphs.
         self._piecewise_runners = {name: {} for name in self.submodules}
+        self._ragged = RaggedAttention(device=device)
 
     def add_request(self, request_id: str, **kwargs) -> None:
         pass  # stateless
@@ -315,6 +320,10 @@ class StatelessEngine(BaseEngine):
                 output.failed_requests[rid] = f"{type(e).__name__}: {e}"
 
     # ─── Internals ─────────────────────────────────────────────────────
+
+    def _ragged_state_for(self, node_name: str):
+        """The node's eager AttentionState, or None if it declared no config."""
+        return self._ragged.get(node_name) if self._ragged is not None else None
 
     def _inference_context(self, autocast_dtype_override: torch.dtype | None = None):
         """Pick the right grad/autocast context.
@@ -477,6 +486,7 @@ class StatelessEngine(BaseEngine):
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
             piecewise_runners=self._piecewise_runners[batch.node_name],
+            ragged_attention_state=self._ragged_state_for(batch.node_name),
             per_request_states={
                 rid: submodule.request_state(rid) for rid in batch.request_ids
             },
@@ -525,6 +535,7 @@ class StatelessEngine(BaseEngine):
                 request_ids=[rid],
                 per_request_info={rid: fwd_info},
                 piecewise_runners=self._piecewise_runners[batch.node_name],
+                ragged_attention_state=self._ragged_state_for(batch.node_name),
             )
 
             if self.enable_nvtx:
@@ -557,12 +568,20 @@ class StatelessEngine(BaseEngine):
     # ─── Warmup ────────────────────────────────────────────────────────
 
     def warmup(self) -> None:
-        """Apply ``torch.compile`` and capture optional CUDA graphs.
+        """Build attention states, apply ``torch.compile``, capture CUDA graphs.
 
-        Each step is opt-in by the submodule (via ``get_cuda_graph_configs``
-        and ``get_piecewise_cuda_graph_configs``) so submodules that don't
-        support a feature are skipped without error.
+        Each step is opt-in by the submodule (via ``get_ragged_attention_config``,
+        ``get_cuda_graph_configs`` and ``get_piecewise_cuda_graph_configs``) so
+        submodules that don't support a feature are skipped without error.
+
+        Attention states are built first, and outside the CUDA guard: they are
+        per-node resources rather than compile/capture artifacts, so a state
+        whose backend doesn't need a GPU still gets built on a CPU-only run.
         """
+        if self._ragged is not None:
+            for node_name, submodule in self.submodules.items():
+                self._install_ragged_attention(node_name, submodule)
+
         if not torch.cuda.is_available() or self.device is None:
             return
 
@@ -573,6 +592,40 @@ class StatelessEngine(BaseEngine):
                 self._capture_codec_graphs(node_name, submodule)
             if self.config.enable_piecewise_runner:
                 self._install_piecewise_runner(node_name, submodule)
+
+    def _install_ragged_attention(self, node_name: str, submodule: NodeSubmodule) -> None:
+        """Build the node's eager AttentionState, if it declared a config."""
+        tp_config = self.parallel_groups.get_tp_config_for_node(node_name)
+        config = submodule.get_ragged_attention_config(
+            tp_world_size=getattr(tp_config, "world_size", 1)
+        )
+        if config is None:
+            return
+        if not config.eager_enabled:
+            # Capture buckets still build their own states; this node just keeps
+            # a different backend outside captured regions.
+            logger.info(
+                "StatelessEngine[%s]: %s declared ragged attention as %s; "
+                "skipping its eager state",
+                self.config.name, node_name, config.enabled_for.value,
+            )
+            return
+        try:
+            self._ragged.build(
+                node_name, config, q_data_type=self.config.autocast_dtype or torch.bfloat16
+            )
+            logger.info(
+                "StatelessEngine[%s]: ragged attention state built for %s "
+                "(heads=%d, head_dim=%d, causal=%s)",
+                self.config.name, node_name, config.num_qo_heads,
+                config.head_dim, config.causal,
+            )
+        except Exception:
+            logger.warning(
+                "StatelessEngine[%s]: ragged attention setup failed for %s; "
+                "the submodule's own fallback path will be used",
+                self.config.name, node_name, exc_info=True,
+            )
 
     def _apply_torch_compile(self, node_name: str, submodule: NodeSubmodule) -> None:
         if getattr(submodule, "disable_torch_compile", False):
@@ -614,7 +667,8 @@ class StatelessEngine(BaseEngine):
                 submodule_name=node_name,
                 submodule=submodule,
                 device=self.device,
-                tp_group=self.parallel_groups.get_tp_config_for_node(node_name)
+                tp_group=self.parallel_groups.get_tp_config_for_node(node_name),
+                autocast_dtype=self.config.autocast_dtype or torch.bfloat16,
             )
             runner.enable_nvtx = self.enable_nvtx
             runner.warmup_and_capture()

@@ -71,9 +71,23 @@ def run_attention(
     max_seqlen: int,
     causal: bool = False,
     scale: float | None = None,
+    attn_state=None,
 ) -> torch.Tensor:
-    # cu_seqlens isolates per-image attention when multiple images are packed.
-    # flashinfer's varlen kernels silently miscompute at SigLIP2's head_dim=72.
+    """Varlen attention; ``cu_seqlens`` isolates per-image attention when
+    multiple images are packed.
+
+    Two backends, picked by whether the caller supplies an ``attn_state``:
+
+    - ``attn_state`` given (CUDA-graph path) — the engine-owned FlashInfer
+      ragged wrapper, already planned OUTSIDE the graph. The only capture-legal
+      option: flash-attn's varlen entry point is not reliably capturable, and
+      the SDPA fallback builds masks from data.
+    - otherwise (eager path) — flash-attn varlen. Preferred when not capturing
+      because FlashInfer has no kernel for SigLIP2's head_dim=72 and has to
+      zero-pad q/k/v to 128, which flash-attn does not.
+    """
+    if attn_state is not None:
+        return attn_state.run(q, k, v)
     if _FLASH_ATTN_AVAILABLE:
         return flash_attn_varlen_func(
             q, k, v,
@@ -215,6 +229,7 @@ class BagelViTAttention(nn.Module):
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
         sin_w: torch.Tensor = None,
+        attn_state=None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -232,7 +247,6 @@ class BagelViTAttention(nn.Module):
             qh, qw = q[:, :, :self.head_dim // 2], q[:, :, self.head_dim // 2:]
             kh, kw = k[:, :, :self.head_dim // 2], k[:, :, self.head_dim // 2:]
 
-            # TODO: replace this with flashinfer
             qh, kh = apply_rotary_pos_emb(qh, kh, cos_h, sin_h)
             qw, kw = apply_rotary_pos_emb(qw, kw, cos_w, sin_w)
 
@@ -246,6 +260,7 @@ class BagelViTAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             causal=False,
+            attn_state=attn_state,
         )
 
         attn_output = attn_output.reshape(total_q_len, -1)
@@ -286,7 +301,8 @@ class BagelViTEncoderLayer(nn.Module):
         cos_h: torch.Tensor = None,
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
-        sin_w: torch.Tensor = None
+        sin_w: torch.Tensor = None,
+        attn_state=None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -298,7 +314,8 @@ class BagelViTEncoderLayer(nn.Module):
             cos_h=cos_h,
             sin_h=sin_h,
             cos_w=cos_w,
-            sin_w=sin_w
+            sin_w=sin_w,
+            attn_state=attn_state,
         )
         hidden_states = residual + hidden_states
 
@@ -327,12 +344,16 @@ class BagelViTEncoder(nn.Module):
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
         sin_w: torch.Tensor = None,
+        attn_state=None,
     ) -> torch.Tensor:
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            hidden_states = encoder_layer(hidden_states, cu_seqlens, max_seqlen,
-                                          cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w)
+            hidden_states = encoder_layer(
+                hidden_states, cu_seqlens, max_seqlen,
+                cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w,
+                attn_state=attn_state
+            )
 
         return hidden_states
 
@@ -352,33 +373,67 @@ class BagelVisionTransformer(nn.Module):
         self.encoder = BagelViTEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
+    def embed(
+        self,
+        packed_pixel_values: torch.Tensor,
+        packed_flattened_position_ids: torch.LongTensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Preamble: patch embedding + the gathered 2D-RoPE tables.
+
+        Split out from ``forward`` so a caller can run it eagerly and hand the
+        results to a captured block loop — the gathers are data-dependent
+        indexing that has no business inside a graph.
+        """
+        hidden_states = self.embeddings(
+            packed_pixel_values=packed_pixel_values,
+            packed_flattened_position_ids=packed_flattened_position_ids
+        )
+
+        rope_inputs = {}
+        if self.config.rope:
+            rope_inputs.update(
+                cos_h = self.rope.cos_h[packed_flattened_position_ids],
+                sin_h = self.rope.sin_h[packed_flattened_position_ids],
+                cos_w = self.rope.cos_w[packed_flattened_position_ids],
+                sin_w = self.rope.sin_w[packed_flattened_position_ids]
+            )
+        return hidden_states, rope_inputs
+
+    def encode(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.IntTensor,
+        max_seqlen: int,
+        attn_state=None,
+        **rope_inputs,
+    ) -> torch.Tensor:
+        """The capturable tail: encoder block loop + post-layernorm.
+
+        Constant for a fixed token layout, so this is the region a piecewise
+        CUDA graph records. ``attn_state`` selects the attention backend — see
+        ``run_attention``.
+        """
+        last_hidden_state = self.encoder(
+            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            attn_state=attn_state, **rope_inputs
+        )
+        return self.post_layernorm(last_hidden_state)
+
     def forward(
         self,
         packed_pixel_values: torch.Tensor,
         packed_flattened_position_ids: torch.LongTensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
+        attn_state=None,
     ) -> torch.Tensor:
-        hidden_states = self.embeddings(
-            packed_pixel_values=packed_pixel_values,
-            packed_flattened_position_ids=packed_flattened_position_ids
+        hidden_states, rope_inputs = self.embed(
+            packed_pixel_values, packed_flattened_position_ids
         )
-
-        extra_inputs = {}
-        if self.config.rope:
-            extra_inputs.update(
-                cos_h = self.rope.cos_h[packed_flattened_position_ids],
-                sin_h = self.rope.sin_h[packed_flattened_position_ids],
-                cos_w = self.rope.cos_w[packed_flattened_position_ids],
-                sin_w = self.rope.sin_w[packed_flattened_position_ids]
-            )
-
-        last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-            **extra_inputs
+        return self.encode(
+            hidden_states, cu_seqlens, max_seqlen,
+            attn_state=attn_state, **rope_inputs,
         )
-        last_hidden_state = self.post_layernorm(last_hidden_state)
-        return last_hidden_state
 
 
 class BagelVisionModel(nn.Module):
@@ -395,6 +450,7 @@ class BagelVisionModel(nn.Module):
         packed_flattened_position_ids: torch.LongTensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
+        attn_state=None,
     ) -> torch.Tensor:
 
         return self.vision_model(
@@ -402,4 +458,5 @@ class BagelVisionModel(nn.Module):
             packed_flattened_position_ids=packed_flattened_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            attn_state=attn_state,
         )

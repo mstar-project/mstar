@@ -317,13 +317,14 @@ incoming tensor along that parameter's shard dim before copying it in. That is w
 
 .. _step-5:
 
-Step 5 — Continuous batching and CUDA graphs
---------------------------------------------
+Step 5 — Continuous batching, CUDA graphs, and attention
+---------------------------------------------------------
 
 Continuous batching and CUDA graphs are the two fundamental throughput optimizations a
 submodule opts into. They are optional, but for any autoregressive node you almost
 certainly want both, and getting their contracts right is the subtlest part of writing a
-submodule — hence this dedicated step.
+submodule — hence this dedicated step. Nodes that attend without a KV cache declare
+that here too (:ref:`ragged attention <ragged-attention>`).
 
 **Continuous batching.** The worker's micro-scheduler groups compatible in-flight
 requests into one GPU call. A submodule controls this with three methods:
@@ -466,6 +467,7 @@ argument and returns a dict::
 
    capture_fn(static_inputs: dict[str, Tensor],
               static_cm: BatchedCacheManager | None = None,
+              static_attn: AttentionState | None = None,   # only if ragged attention
               **forward_kwargs) -> dict[str, Tensor]
 
 The one rule that makes it CUDA-graph-safe: **read tensors out of** ``static_inputs``
@@ -553,6 +555,83 @@ and the ``advance_seq_lens`` call — the runner only performs those on the capt
 For a real, KV-cached instance see the V-JEPA2 AC predictor
 (``mstar/model/vjepa2/submodules.py``, label ``"block_loop"``).
 
+.. _ragged-attention:
+
+Attention without a KV cache (ragged attention)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``KV_CACHE`` nodes attend through ``engine_inputs.cache_manager``. Encoder towers need
+none of what it owns — an audio or vision tower attends *within* variable-length
+segments of one packed forward, with no cache and no cross-step state. Return a config
+from ``get_ragged_attention_config(self, tp_world_size=1)`` and the engine builds an
+``AttentionState`` for the node, injected as ``engine_inputs.ragged_attention_state``:
+
+.. code-block:: python
+
+   from mstar.engine.attention_state import RaggedAttentionConfig
+
+   class MyEncoderSubmodule(NodeSubmodule):
+       def get_ragged_attention_config(self, tp_world_size=1):
+           return RaggedAttentionConfig(
+               num_qo_heads=self.num_heads // tp_world_size,   # POST-sharding
+               num_kv_heads=self.num_heads // tp_world_size,
+               head_dim=self.head_dim,                         # TRUE dim; padded internally
+           )
+
+       def forward(self, graph_walk, engine_inputs, hidden, cu_seqlens, **kwargs):
+           attn = engine_inputs.ragged_attention_state
+           attn.plan(cu_seqlens)               # once per forward, not per layer
+           for block in self.blocks:
+               hidden = block(hidden, attn)    # block calls attn.run(q, k, v)
+           return {"embeds": [hidden]}
+
+``AttentionState`` is just ``plan(cu_seqlens)`` and ``run(q, k, v)``. Everything
+kernel-selecting is fixed at build time, which is what lets a captured graph re-plan
+between replays. See ``mstar/engine/attention_state.py`` for the full field list;
+the ones with non-obvious contracts:
+
+- ``head_dim`` — the TRUE dim. FlashInfer only has kernels for 64 / 128 / 256, so
+  anything else (SigLIP2-style towers use 72) is zero-padded internally.
+- ``max_segments_per_request`` / ``max_tokens_per_request`` — per-request bounds sizing
+  a CUDA-graph bucket (a capture at ``bs`` gets ``bs *`` these). Required to capture at
+  all.
+- ``enabled_for`` — ``AttentionMode.BOTH`` (default) / ``EAGER`` / ``CUDA_GRAPH``. Each
+  path costs its own state and workspace, so narrow it when your submodule keeps a
+  different backend on one path (BAGEL's ViT declares ``CUDA_GRAPH``; eager stays on
+  flash-attn, which needs no padding).
+- ``make_attn_state`` — escape hatch for a non-default backend.
+
+.. warning::
+
+   A **segment** is an independently-attending span, not a request: an audio clip
+   window-chunks into several, and a multi-image request contributes one per image. The
+   segment count a graph fixes is *not* the batch size.
+
+**Under CUDA graphs**, capture is gated purely on your submodule returning a config —
+there is no opt-in on ``CudaGraphConfig``. Each bucket gets its own state, since the
+graph records that state's buffers. The one rule: **plan outside the graph, run inside
+it** (``plan()`` does host work and writes static buffers; neither is capture-legal).
+Both stateless runners give you a seam outside the captured region — ``preprocess`` for
+``StatelessCudaGraphRunner``, and for ``PiecewiseCudaGraphRunner`` the runner itself
+plans, taking the layout via ``runner.run(..., cu_seqlens=...)`` and handing your
+``capture_fn`` a ``static_attn`` keyword. Layouts shorter than a bucket are padded with
+zero-length segments, so one graph serves any layout that fits its ceilings.
+
+.. note::
+
+   Only ``PiecewiseCudaGraphRunner`` buckets by *token count* today.
+   ``StatelessCudaGraphRunner`` buckets on batch size alone, so an encoder whose token
+   count varies independently of the batch size has to capture its inner loop
+   piecewise (as BAGEL's ViT does) rather than its whole forward. Token bucketing on
+   the whole-forward runner will be added in a future release.
+
+.. note::
+
+   Only ``StatelessEngine`` populates ``ragged_attention_state`` today; on a
+   ``KV_CACHE`` node it is ``None``. The field is engine-agnostic on purpose — a
+   KV-cached node that needs ragged attention (a cross-attention encoder inside an AR
+   node) should populate this rather than add a third mechanism.
+
 Step 6 — Choose engine types
 ----------------------------
 
@@ -575,7 +654,9 @@ The engine type — not the submodule — decides whether the node gets a manage
      - Every node *without* cross-step KV state — ViT / VAE / audio encoders and
        decoders, embedding and projection stages, flow-matching combine steps, codec
        (waveform) decoders. Runs on
-       :class:`~mstar.engine.stateless_engine.StatelessEngine`.
+       :class:`~mstar.engine.stateless_engine.StatelessEngine`. Nodes here that still
+       need attention declare it with :ref:`get_ragged_attention_config
+       <ragged-attention>`.
 
 A model's job is just to label each node; the worker instantiates the right engine and
 gives ``KV_CACHE`` nodes their cache from ``get_kv_cache_config``.
@@ -884,6 +965,7 @@ Checklist
          [ ] get_submodule
    [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
    [ ] configs/<your_model>.yaml                  — node_groups → ranks
+   [ ] (optional) get_ragged_attention_config      — stateless nodes that attend
    [ ] (optional) async partitions if pipelined
 
 Testing
