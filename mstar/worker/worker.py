@@ -2518,6 +2518,13 @@ class Worker:
                     in_flight = set(spec_pending.batch.node_objects.keys()) if spec_pending else set()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     _set_pending(None)
+                    if phase_period:
+                        # Includes the CUDA-event wait on N's output tensors
+                        # (the GPU thread returns at enqueue, so THIS is
+                        # where actual forward time surfaces at B=1) +
+                        # routing + removes. The _t0 above predated this
+                        # record — it was set but never consumed.
+                        _phase_record("postprocess", _time.perf_counter() - _t0)
 
                 if spec_pending is not None:
                     if speculation.is_yield_away:
