@@ -1,5 +1,8 @@
 import functools
 import logging
+import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -19,6 +22,27 @@ from mstar.utils.flashinfer_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock spent in plan_attention* per execute, gated by the same env as
+# the worker's phase records (zero-cost when unset). Thread-local because the
+# plan_executor's pre_plan_for_batch also calls plan_attention from its own
+# thread — only the GPU executor thread's inline plans should land in the
+# per-execute total the worker reads (reset_plan_wall at
+# _execute_on_gpu_thread entry, get_plan_wall at exit; same thread both).
+_PLAN_TIMING = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0") > 0
+_plan_wall = threading.local()
+
+
+def reset_plan_wall() -> None:
+    _plan_wall.s = 0.0
+
+
+def get_plan_wall() -> float:
+    return getattr(_plan_wall, "s", 0.0)
+
+
+def _add_plan_wall(dt: float) -> None:
+    _plan_wall.s = getattr(_plan_wall, "s", 0.0) + dt
 
 
 def cross_attn_label(label: str, source: str = "default") -> str:
@@ -711,6 +735,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         from mstar.utils.profiler import range_pop, range_push
         self._batched_cfg_info = None
 
+        _t0 = time.perf_counter() if _PLAN_TIMING else 0.0
         if self.enable_nvtx:
             range_push("cache.plan_attention", synchronize=False)
         try:
@@ -739,6 +764,8 @@ class FlashInferCacheManager(BatchedCacheManager):
                 label=label,
             )
         finally:
+            if _PLAN_TIMING:
+                _add_plan_wall(time.perf_counter() - _t0)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -918,6 +945,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         See ``BatchedCacheManager.plan_attention_batched_cfg`` for the argument
         contract.
         """
+        _t0 = time.perf_counter() if _PLAN_TIMING else 0.0
         assert self.kv_cache is not None
         if isinstance(seq_lens, list):
             seq_lens = {
@@ -1022,6 +1050,8 @@ class FlashInferCacheManager(BatchedCacheManager):
         # A paged plan clears any prior dense plan (set by DenseGenCacheManager)
         # so run_attention routes this label back through the wrapper.
         ps.dense_gen = None
+        if _PLAN_TIMING:
+            _add_plan_wall(time.perf_counter() - _t0)
 
     @torch.compiler.disable
     def run_attention(
@@ -1536,6 +1566,7 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
         """Allocate pages and plan the FlashInfer MLA or eager SDPA path."""
         self._batched_cfg_info = None
 
+        _t0 = time.perf_counter() if _PLAN_TIMING else 0.0
         effective_label = label if label is not None else self._active_label()
         # Always re-plan; this backend does not support the overlap skip yet.
         self._pre_planned_labels.discard(effective_label)
@@ -1640,6 +1671,8 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
         ps.seq_lens = seq_lens
         ps.write_store = write_store
         ps.dense_gen = None
+        if _PLAN_TIMING:
+            _add_plan_wall(time.perf_counter() - _t0)
 
     @torch.compiler.disable
     def run_attention_mla(
