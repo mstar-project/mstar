@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -144,6 +145,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             num_tokens: self._build_prefill_packed(num_tokens, device)
             for num_tokens in prefill_buckets
         }
+        # MSTAR_GLM52_GRAPH_COMPILE=0: capture the eager forward instead of
+        # the torch.compile'd one. Escape hatch for the Inductor-subprocess
+        # Triton crash (per_token_group_quant_fp8_kernel dies with
+        # "PassManager::run failed" in make_llir under the subprocess compile
+        # pool, 2026-08-07 — the same kernel compiles fine in-process) that
+        # failed all 296 captures and silently degraded the fast config to
+        # eager. Pure stream capture still buys the launch-overhead win;
+        # Inductor fusion returns when the toolchain bug is resolved.
+        # Env-gated per MSTAR_PRE_PLAN_SPEC precedent (worker.py).
+        graph_compile = os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1"
         return [
             BasicBatchedCudaGraphConfig(
                 capture_graph_walk="decode",
@@ -153,6 +164,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1,
                 ),
+                compile=graph_compile,
             ),
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill",
@@ -160,7 +172,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 packed_seq_len_to_inputs=prefill_packed,
                 requires_cfg=False,
                 labels=[_MAIN],
-                compile=True,
+                compile=graph_compile,
                 causal_attention=True,
                 capture_batch_sizes=prefill_batch_sizes,
             ),

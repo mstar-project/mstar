@@ -180,6 +180,20 @@ def test_glm52_no_cuda_graphs_under_reference_dispatch():
     assert len(bf16.get_cuda_graph_configs(torch.device("cpu"))) == 2
 
 
+def test_glm52_graph_compile_env_escape_hatch(monkeypatch):
+    # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (both walks) —
+    # the escape hatch for the Inductor-subprocess Triton crash that failed
+    # all 296 captures on 08-07. Default stays compile-on.
+    sub = _make_submodule(Glm52ModelConfig.reduced())
+    assert all(
+        c.compile for c in sub.get_cuda_graph_configs(torch.device("cpu"))
+    )
+    monkeypatch.setenv("MSTAR_GLM52_GRAPH_COMPILE", "0")
+    assert not any(
+        c.compile for c in sub.get_cuda_graph_configs(torch.device("cpu"))
+    )
+
+
 class _FakeSeqState:
     def __init__(self, start):
         self.position_id_start = start
