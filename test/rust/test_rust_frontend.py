@@ -417,6 +417,60 @@ def test_videos_both_conditioning_is_400():
         assert not stub.submitted  # rejected before submit
 
 
+class _ErrorChunkStub(_StubAPIServer):
+    """Deliver a backend failure the way the data plane does: a terminal chunk
+    with modality 'error' + metadata.status that ends cleanly (no raise) — the
+    path collect_results re-raises on the Python side."""
+
+    def __init__(self, status=500):
+        super().__init__()
+        self.status = status
+
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("error", b"Error in worker: boom", {"status": self.status})
+
+
+def _generate_nonstream(port, timeout=15):
+    import urllib.parse
+    data = urllib.parse.urlencode(
+        {"text": "hi", "output_modalities": "text", "streaming": "false"}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate", data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_nonstreaming_backend_error_maps_to_real_status():
+    """A non-streaming request whose backend fails (in-band 'error' chunk with
+    metadata.status) must return that HTTP status, not a 200 with the error
+    silently filtered (chat/speech/images/videos) or buried in outputs
+    (/generate). Regression for the 200-on-failure bug."""
+    # /v1 chat: OpenAI error envelope with the real status.
+    with _model_stack("qwen3_omni", _ErrorChunkStub(500)) as (port, _up):
+        code, body = _post_raw(
+            port, "/v1/chat/completions",
+            json.dumps({"model": "qwen3_omni",
+                        "messages": [{"role": "user", "content": "hi"}]}).encode())
+        assert code == 500, (code, body)
+        assert "boom" in body["error"]["message"]
+    # /generate: FastAPI {"detail": ...}, not 200 with the error in outputs.
+    with _model_stack("qwen3_omni", _ErrorChunkStub(500)) as (port, _up):
+        code, body = _generate_nonstream(port)
+        assert code == 500, (code, body)
+        assert "boom" in body["detail"]
+    # Status is carried in-band (400 vs 500 distinction), not hardcoded.
+    with _model_stack("qwen3_omni", _ErrorChunkStub(400)) as (port, _up):
+        code, body = _post_raw(
+            port, "/v1/chat/completions",
+            json.dumps({"model": "qwen3_omni",
+                        "messages": [{"role": "user", "content": "hi"}]}).encode())
+        assert code == 400, (code, body)
+
+
 def test_images_generations_on_cosmos3():
     """Cosmos3 also serves `/v1/images/generations` (text-to-image)."""
     import base64

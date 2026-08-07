@@ -41,8 +41,9 @@ pub struct ResultChunk {
 pub enum StreamItem {
     Chunk(ResultChunk),
     /// The backend failed this request (worker exception, bad input);
-    /// terminal — the route is removed.
-    Error(String),
+    /// terminal — the route is removed. `status` is the HTTP status the
+    /// frontend should return (from the error chunk's `metadata.status`).
+    Error { status: u16, message: String },
     Done,
 }
 
@@ -125,6 +126,22 @@ impl Bridge {
                 }
             };
             let (item, done) = match msg.t.as_str() {
+                // A failed request is delivered in-band as a terminal chunk with
+                // modality "error" (message in `data`, HTTP status in
+                // `metadata.status`) that ends cleanly — the backend does NOT
+                // raise. Surface it as a terminal Error so non-streaming handlers
+                // return the real status instead of a 200 with the error chunk
+                // buried in `outputs` (/generate) or silently filtered out
+                // (chat/speech/images/videos).
+                "chunk" if msg.modality == "error" => {
+                    let status = msg
+                        .metadata
+                        .get("status")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(500) as u16;
+                    let message = String::from_utf8_lossy(&msg.data.into_vec()).into_owned();
+                    (Some(StreamItem::Error { status, message }), true)
+                }
                 "chunk" => (
                     Some(StreamItem::Chunk(ResultChunk {
                         modality: msg.modality,
@@ -133,7 +150,12 @@ impl Bridge {
                     })),
                     false,
                 ),
-                "err" => (Some(StreamItem::Error(msg.msg)), true),
+                // Legacy out-of-band error (the bridge relay caught an exception
+                // and sent `t="err"`); no status carried, default to 500.
+                "err" => (
+                    Some(StreamItem::Error { status: 500, message: msg.msg }),
+                    true,
+                ),
                 "done" => (Some(StreamItem::Done), true),
                 // Liveness reply: completes the ping's route like a request.
                 "pong" => (Some(StreamItem::Done), true),
@@ -183,9 +205,10 @@ impl Bridge {
             // Backend bridge unreachable: fail the request now instead of
             // leaving the client hanging until request_timeout with no
             // signal. The receiver is already routed to `tx`.
-            let _ = tx.send(StreamItem::Error(
-                "backend unreachable (bridge send failed)".to_string(),
-            ));
+            let _ = tx.send(StreamItem::Error {
+                status: 500,
+                message: "backend unreachable (bridge send failed)".to_string(),
+            });
             self.routes.lock().expect("routes lock").remove(request_id);
         }
         rx

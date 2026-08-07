@@ -47,7 +47,9 @@ pub struct AppState {
 pub enum Out {
     Chunk(ResultChunk),
     /// Terminal backend failure (worker exception, bad input, timeout).
-    Error(String),
+    /// `status` is the HTTP status to return (carried in-band from the error
+    /// chunk's `metadata.status`; defaults to 500).
+    Error { status: u16, message: String },
 }
 
 pub type OutStream = Pin<Box<dyn Stream<Item = Out> + Send>>;
@@ -145,9 +147,12 @@ fn raw_result_stream(
                         Ok(Some(StreamItem::Chunk(c))) => {
                             Some((Out::Chunk(c), (rx, guard, deadline, false)))
                         }
-                        Ok(Some(StreamItem::Error(e))) => {
+                        Ok(Some(StreamItem::Error { status, message })) => {
                             guard.done = true; // conductor already cleaned up
-                            Some((Out::Error(e), (rx, guard, deadline, true)))
+                            Some((
+                                Out::Error { status, message },
+                                (rx, guard, deadline, true),
+                            ))
                         }
                         Ok(Some(StreamItem::Done)) => {
                             guard.done = true;
@@ -160,7 +165,10 @@ fn raw_result_stream(
                             // "Request timed out" and aborts. The guard (still
                             // not done) sends the abort when the state drops.
                             Some((
-                                Out::Error("Request timed out".to_string()),
+                                Out::Error {
+                                    status: 500,
+                                    message: "Request timed out".to_string(),
+                                },
                                 (rx, guard, deadline, true),
                             ))
                         }
@@ -175,15 +183,16 @@ fn raw_result_stream(
 }
 
 /// Gather a non-streaming request's chunks; the first error wins (mstar's
-/// `collect_results` raising into the handler).
-pub async fn collect(stream: OutStream) -> Result<Vec<ResultChunk>, String> {
+/// `collect_results` raising into the handler). The error carries the HTTP
+/// status to return `(status, message)`.
+pub async fn collect(stream: OutStream) -> Result<Vec<ResultChunk>, (u16, String)> {
     use futures::StreamExt;
     let mut chunks = Vec::new();
     let mut s = stream;
     while let Some(item) = s.next().await {
         match item {
             Out::Chunk(c) => chunks.push(c),
-            Out::Error(e) => return Err(e),
+            Out::Error { status, message } => return Err((status, message)),
         }
     }
     Ok(chunks)

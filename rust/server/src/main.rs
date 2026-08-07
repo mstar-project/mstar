@@ -332,9 +332,9 @@ fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
 }
 
 /// An SSE data event carrying an OpenAI error envelope (terminal mid-stream).
-fn sse_error_event(msg: &str) -> Event {
+fn sse_error_event(status: u16, msg: &str) -> Event {
     Event::default().data(
-        json!({"error": {"message": msg, "type": "server_error", "code": 500}}).to_string(),
+        json!({"error": {"message": msg, "type": "server_error", "code": status}}).to_string(),
     )
 }
 
@@ -397,7 +397,7 @@ async fn chat_completions(
             &st.model_name, &request_id, chunks, st.sample_rate,
         ))
         .into_response(),
-        Err(e) => error(500, &e, "server_error"),
+        Err((status, msg)) => error(status, &msg, "server_error"),
     }
 }
 
@@ -434,9 +434,9 @@ fn chat_sse(
             // Terminal mid-stream failure: an OpenAI error event, and suppress
             // the normal stop/[DONE] tail (mstar's generator exception drops the
             // connection; the explicit error event is strictly more informative).
-            Out::Error(e) => {
+            Out::Error { status, message } => {
                 errored.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(sse_error_event(&e))
+                Ok(sse_error_event(status, &message))
             }
         })
     };
@@ -590,7 +590,7 @@ async fn audio_speech(
 
     let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => chunks,
-        Err(e) => return error(500, &e, "server_error"),
+        Err((status, msg)) => return error(status, &msg, "server_error"),
     };
     let mut pcm: Vec<u8> = Vec::new();
     for c in &chunks {
@@ -644,7 +644,7 @@ async fn images_generations(
     for r in futures::future::join_all(futs).await {
         match r {
             Ok(chunks) => all.extend(chunks),
-            Err(e) => return error(500, &e, "server_error"),
+            Err((status, msg)) => return error(status, &msg, "server_error"),
         }
     }
     Json(images_response(all)).into_response()
@@ -672,7 +672,7 @@ async fn videos_generations(
     let request_id = rid("vid");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(videos_response(chunks)).into_response(),
-        Err(e) => error(500, &e, "server_error"),
+        Err((status, msg)) => error(status, &msg, "server_error"),
     }
 }
 
@@ -752,7 +752,7 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     let request_id = rid("img");
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(images_response(chunks)).into_response(),
-        Err(e) => error(500, &e, "server_error"),
+        Err((status, msg)) => error(status, &msg, "server_error"),
     }
 }
 
@@ -1004,8 +1004,8 @@ async fn generate_finish(
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
-                Out::Error(e) => {
-                    let mut s = json!({"error": e}).to_string();
+                Out::Error { message, .. } => {
+                    let mut s = json!({"error": message}).to_string();
                     s.push('\n');
                     s.into_bytes()
                 }
@@ -1020,7 +1020,7 @@ async fn generate_finish(
 
     let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => chunks,
-        Err(e) => return detail_error(500, &e),
+        Err((status, msg)) => return detail_error(status, &msg),
     };
     let mut outputs: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for c in &chunks {
