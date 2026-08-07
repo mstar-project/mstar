@@ -31,6 +31,7 @@ from benchmark.request import (
     RequestMetrics,
     SGLangOmni,
     VLLMOmni,
+    VllmCompletions,
     VoxServe,
     aggregate_metrics,
 )
@@ -52,6 +53,7 @@ class InferenceSystemType(Enum):
     OURS = "ours"
     OURS_OPENAI = "ours_openai"
     VLLM_OMNI = "vllm_omni"
+    VLLM_COMPLETIONS = "vllm_completions"
     VOX_SERVE = "vox_serve"
     SGLANG_OMNI = "sglang_omni"
 
@@ -62,6 +64,8 @@ class InferenceSystemType(Enum):
             return OursOpenAI()
         elif self == InferenceSystemType.VLLM_OMNI:
             return VLLMOmni()
+        elif self == InferenceSystemType.VLLM_COMPLETIONS:
+            return VllmCompletions()
         elif self == InferenceSystemType.VOX_SERVE:
             return VoxServe()
         elif self == InferenceSystemType.SGLANG_OMNI:

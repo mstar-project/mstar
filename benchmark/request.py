@@ -1685,3 +1685,139 @@ class OursOpenAI(VLLMOmni):
         else:
             metrics.record_completion()
         return metrics
+
+
+# Keys forwarded verbatim to vLLM's /v1/completions. Everything else in the
+# merged model_kwargs is mstar-native (e.g. ``max_output_tokens``) and would
+# 400 on vLLM's stricter OpenAI schema.
+_VLLM_COMPLETIONS_KEYS = {
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "seed",
+    "stop",
+    "ignore_eos",
+}
+
+
+def _record_vllm_completions_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
+    """Record one /v1/completions SSE chunk: text deltas and/or usage.
+
+    Like vllm-omni (see :class:`VLLMOmni` note 2), a chunk can carry BOTH
+    choices and usage — usage must be read on every chunk, never `continue`d
+    past. The final usage overwrites the per-chunk token count, which is an
+    estimate (one token per chunk holds for vLLM's default detokenize path
+    but not for multi-token bursts).
+    """
+    arrival_time = time.monotonic()
+    for choice in chunk.get("choices") or []:
+        text = choice.get("text")
+        if text:
+            metrics.record_output_chunk(
+                modality="text",
+                data_b64=base64.b64encode(text.encode()).decode(),
+                arrival_time=arrival_time,
+                n_tokens=1,
+            )
+    usage = chunk.get("usage") or {}
+    if (ct := usage.get("completion_tokens")) is not None:
+        metrics.output_text_tokens = ct
+    if (pt := usage.get("prompt_tokens")) is not None:
+        metrics.input_tokens = pt
+
+
+class VllmCompletions(InferenceSystem):
+    """Benchmark adapter for a plain vLLM OpenAI server's ``/v1/completions``.
+
+    Exists for engine-vs-engine T2T parity runs (the M4/M5 protocol):
+    :class:`OurSystem` drives mstar's native ``/generate`` with raw completion
+    text, so the vLLM side must be raw completions too. Pointing the same
+    prompts at ``/v1/chat/completions`` (:class:`VLLMOmni`) would wrap them in
+    the model's chat template server-side — for GLM-5.2 that adds role
+    headers and a thinking-mode preamble, a different workload than the one
+    M* is serving. Text-only by design.
+    """
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        req_type = req_input.req_type
+        assert (
+            req_type.get_input_modalities() == "text"
+            and req_type.get_output_modalities() == "text"
+        ), "vllm_completions is a raw text adapter; use vllm_omni for multimodal"
+
+        metrics = RequestMetrics(
+            request_id=request_id,
+            type=req_type,
+            expected_output_modalities=["text"],
+        )
+
+        try:
+            merged = {
+                **model.get_model_kwargs(req_type),
+                **req_input.model_kwargs,
+                **additional_model_kwargs,
+            }
+            payload = {k: v for k, v in merged.items() if k in _VLLM_COMPLETIONS_KEYS}
+            payload.update(
+                model=model.get_hf_url(),
+                prompt=req_input.prompt,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+            metrics.start_time = time.monotonic()
+            async with session.post(
+                f"{base_url}/v1/completions",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                read_bufsize=2**24,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+
+                # Same SSE discipline as VLLMOmni: iter_any() + manual \n\n
+                # framing (the default line iterator drops oversized lines),
+                # keep reading past [DONE], flush a possible unterminated tail.
+                buffer = b""
+                async for raw_bytes in resp.content.iter_any():
+                    if not raw_bytes:
+                        continue
+                    buffer += raw_bytes
+                    while b"\n\n" in buffer:
+                        message, buffer = buffer.split(b"\n\n", 1)
+                        message = message.strip()
+                        if not message:
+                            continue
+                        chunk = _parse_sse_chunk(message)
+                        if chunk is None or chunk.get("_done"):
+                            continue
+                        _record_vllm_completions_chunk(chunk, metrics)
+
+                tail = buffer.strip()
+                if tail.startswith(b"data:"):
+                    payload_str = tail[len(b"data:") :].strip()
+                    if payload_str and payload_str != b"[DONE]":
+                        try:
+                            json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            pass
+                        else:
+                            chunk = _parse_sse_chunk(tail)
+                            if chunk is not None and not chunk.get("_done"):
+                                _record_vllm_completions_chunk(chunk, metrics)
+
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+
+        return metrics

@@ -177,3 +177,135 @@ def test_glm52_native_generate_payload_and_chunk_accounting(tmp_path):
     assert "".join(metrics._text_chunks) == "Paris is the capital."
     assert "text" in metrics.ttft
     assert len(metrics.chunk_arrivals["text"]) == 4
+
+
+def test_prompts_json_dataset_accepts_harness_dict_format(tmp_path):
+    """The on-box M1 prompts.json is {"_comment": ..., "prompts": [...]} —
+    the format that 400'd two stage-6 box windows when the loader demanded
+    a bare list. Both shapes must load identically."""
+    path = tmp_path / "prompts_dict.json"
+    path.write_text(
+        json.dumps({"_comment": "harness file", "prompts": PROMPTS}),
+        encoding="utf-8",
+    )
+    dataset = PromptsJsonDataset(filename=str(path), num_requests=2)
+    requests = dataset.get_requests()
+    assert [r.prompt for r in requests] == [p["text"] for p in PROMPTS]
+    assert requests[0].model_kwargs == {"max_tokens": 64, "max_output_tokens": 64}
+
+
+def test_prompts_json_dataset_rejects_dict_without_prompts_key(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({"rows": PROMPTS}), encoding="utf-8")
+    try:
+        PromptsJsonDataset(filename=str(path), num_requests=2)
+    except ValueError as e:
+        assert "prompts" in str(e)
+    else:
+        raise AssertionError("expected ValueError for dict without 'prompts'")
+
+
+# ---------------------------------------------------------------------------
+# VllmCompletions: the vLLM half of the same-client parity protocol
+# ---------------------------------------------------------------------------
+
+
+class _FakeSseContent:
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def iter_any(self):
+        async def _gen():
+            # Deliberately split mid-message to exercise the \n\n reframing.
+            mid = len(self._payload) // 2
+            yield self._payload[:mid]
+            yield self._payload[mid:]
+
+        return _gen()
+
+
+class _FakeSseResponse:
+    status = 200
+
+    def __init__(self, payload: bytes):
+        self.content = _FakeSseContent(payload)
+
+    async def text(self):
+        return ""
+
+
+class _FakeJsonSession:
+    """Captures the JSON payload passed to post() and streams canned SSE."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+        self.captured_url: str | None = None
+        self.captured_json: dict | None = None
+
+    def post(self, url, json=None, **kwargs):
+        self.captured_url = url
+        self.captured_json = json
+        response = _FakeSseResponse(self._payload)
+
+        class _Ctx:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        return _Ctx()
+
+
+def _sse(events: list) -> bytes:
+    out = b""
+    for e in events:
+        body = e if isinstance(e, str) else json.dumps(e)
+        out += b"data: " + body.encode() + b"\n\n"
+    return out
+
+
+def test_vllm_completions_payload_and_accounting(tmp_path):
+    from benchmark.request import VllmCompletions
+
+    dataset = PromptsJsonDataset(filename=_write_prompts(tmp_path), num_requests=2)
+    req_input = dataset[0]
+    model = ModelType.GLM52.inst()
+
+    payload = _sse([
+        {"choices": [{"text": "Par"}]},
+        {"choices": [{"text": "is"}]},
+        # Final chunk carries BOTH a delta and usage: usage must not be
+        # skipped, and it overwrites the per-chunk count (3 -> 7).
+        {"choices": [{"text": "."}], "usage": {"completion_tokens": 7, "prompt_tokens": 11}},
+        "[DONE]",
+    ])
+    session = _FakeJsonSession(payload)
+
+    metrics = asyncio.run(
+        VllmCompletions().send_request(
+            session=session,
+            req_input=req_input,
+            base_url="http://localhost:8100",
+            request_id=0,
+            model=model,
+        )
+    )
+
+    assert session.captured_url == "http://localhost:8100/v1/completions"
+    body = session.captured_json
+    assert body["model"] == "zai-org/GLM-5.2-FP8"
+    assert body["prompt"] == PROMPTS[0]["text"]
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
+    assert body["temperature"] == 0.0
+    # Per-prompt 64 overrides the model-level 1024; the mstar-only spelling
+    # must NOT reach vLLM's stricter schema.
+    assert body["max_tokens"] == 64
+    assert "max_output_tokens" not in body
+
+    assert metrics.status == Status.SUCCESS, metrics.error
+    assert "".join(metrics._text_chunks) == "Paris."
+    assert metrics.output_text_tokens == 7  # usage overwrites chunk count
+    assert metrics.input_tokens == 11
+    assert "text" in metrics.ttft

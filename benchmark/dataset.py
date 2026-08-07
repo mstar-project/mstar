@@ -80,8 +80,9 @@ class TxtFileDataset(BaseDataset):
 class PromptsJsonDataset(BaseDataset):
     """
     Dataset loader for text-to-text prompts from a JSON file in the M1
-    harness format: a list of ``{"id": ..., "text": ..., "max_tokens": ...}``
-    objects — the same file the GLM-5.2 M1 parity harness feeds both engines.
+    harness format: ``{"prompts": [{"id", "text", "max_tokens"}, ...]}``
+    (top-level keys other than ``prompts`` — e.g. ``_comment`` — are
+    ignored), or a bare list of the same row objects.
 
     ``max_tokens`` is optional per row; when present it is stamped onto the
     request as both ``max_tokens`` and ``max_output_tokens`` (the OpenAI and
@@ -99,9 +100,12 @@ class PromptsJsonDataset(BaseDataset):
 
         with open(filename) as f:
             rows = json.load(f)
+        if isinstance(rows, dict):
+            rows = rows.get("prompts")
         if not isinstance(rows, list):
             raise ValueError(
-                f"{filename}: expected a JSON list of prompt objects, got {type(rows).__name__}"
+                f"{filename}: expected a JSON list of prompt objects or a "
+                f'{{"prompts": [...]}} object, got {type(rows).__name__}'
             )
 
         self.items: list[RequestInput] = []
