@@ -449,3 +449,262 @@ class Cosmos3Pipeline:
         if return_video:
             return action_out, self._decode(latents)
         return action_out
+
+    # ------------------------------------------------------------------
+    # Windowed block-causal reference (the kv-mode oracle): a hand-rolled
+    # window loop with explicit per-layer context K/V, run directly against
+    # the transformer's layers — no engine cache machinery involved.
+    # ------------------------------------------------------------------
+
+    def _ref_und_prefill(
+        self, branch_ids: list[list[int]], branch_pos: list[torch.Tensor]
+    ) -> list[list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Understanding tower over the guidance branches' text prompts,
+        packed [cond | uncond] the way the served prefill runs — projections
+        and MLPs over the packed rows, causal attention per branch — so the
+        collected per-branch, per-layer rotated (k, v) is bit-identical to
+        what the engine caches (a separate per-branch run differs by GEMM
+        tiling rounding, which coarse few-step schedules amplify)."""
+        tf = self.transformer
+        lens = [len(ids) for ids in branch_ids]
+        flat = [i for ids in branch_ids for i in ids]
+        und_seq = tf.embed_tokens(
+            torch.tensor(flat, dtype=torch.long, device=self.device)
+        )
+        pos = branch_pos[0] if len(branch_pos) == 1 else torch.cat(branch_pos, dim=1)
+        cos, sin = tf._rotary(pos, und_seq.device, und_seq.dtype)
+        kvs: list[list[tuple[torch.Tensor, torch.Tensor]]] = [[] for _ in branch_ids]
+        for layer in tf.layers:
+            attn = layer.self_attn
+            h, hkv, d = attn.num_attention_heads, attn.num_key_value_heads, attn.head_dim
+            und_norm = layer.input_layernorm(und_seq)
+            q = attn.norm_q(attn.to_q(und_norm).view(-1, h, d))
+            k = attn.norm_k(attn.to_k(und_norm).view(-1, hkv, d))
+            v = attn.to_v(und_norm).view(-1, hkv, d)
+            q = attn._apply_rope(q, cos, sin)
+            k = attn._apply_rope(k, cos, sin)
+            outs, off = [], 0
+            for bi, n in enumerate(lens):
+                sl = slice(off, off + n)
+                off += n
+                kvs[bi].append((k[sl], v[sl]))
+                outs.append(attn._attend(q[sl], k[sl], v[sl], is_causal=True))
+            out = outs[0] if len(outs) == 1 else torch.cat(outs, 0)
+            residual = und_seq + attn.to_out(out)
+            und_seq = residual + layer.mlp(layer.post_attention_layernorm(residual))
+        return kvs
+
+    def _ref_gen_layers(self, gen_seq, cos, sin, ctx_kv, collect=False):
+        """Generation layer stack with explicit context: each layer attends
+        its fresh tokens over ``ctx_kv[i]`` (the branch's [text | retained
+        frames] K/V) plus itself, non-causally. With ``collect`` the fresh
+        rotated (k, v) per layer is returned — what a commit appends."""
+        tf = self.transformer
+        collected = []
+        for i, layer in enumerate(tf.layers):
+            attn = layer.self_attn
+            h, hkv, d = attn.num_attention_heads, attn.num_key_value_heads, attn.head_dim
+            gen_norm = layer.input_layernorm_moe_gen(gen_seq)
+            q = attn.norm_added_q(attn.add_q_proj(gen_norm).view(-1, h, d))
+            k = attn.norm_added_k(attn.add_k_proj(gen_norm).view(-1, hkv, d))
+            v = attn.add_v_proj(gen_norm).view(-1, hkv, d)
+            q = attn._apply_rope(q, cos, sin)
+            k = attn._apply_rope(k, cos, sin)
+            if collect:
+                collected.append((k, v))
+            ck, cv = ctx_kv[i]
+            out = attn._attend(
+                q, torch.cat([ck, k], 0), torch.cat([cv, v], 0), is_causal=False
+            )
+            residual = gen_seq + attn.to_add_out(out)
+            gen_seq = residual + layer.mlp_moe_gen(
+                layer.post_attention_layernorm_moe_gen(residual)
+            )
+        return gen_seq, collected
+
+    @torch.no_grad()
+    def windowed_kv(
+        self,
+        cond_ids: list[int],
+        uncond_ids: list[int] | None,
+        total_units: int,
+        window_units: int,
+        context_units: int,
+        height: int,
+        width: int,
+        num_inference_steps: int,
+        guidance_scale: float = 6.0,
+        fps: float = 24.0,
+        flow_shift: float | None = None,
+        generator: torch.Generator | None = None,
+        page_size: int = 128,
+    ) -> list[torch.Tensor]:
+        """Block-causal windowed generation, the served kv mode's oracle.
+
+        Per window: denoise over [text | committed context | window] with a
+        fresh scheduler, commit the finished window's clean K/V (no timestep
+        embedding), then evict committed frames older than ``context_units``
+        behind the frontier under the paged cache's contract — whole pages
+        from the first page fully past the text prefix, floor semantics with
+        the shortfall re-offered (``context_units`` 0 retains everything).
+        Noise draws mirror the serving path: window 0 first, then one draw
+        per boundary from the same generator. Returns the per-window clean
+        latents (windows carry no overlap in kv mode)."""
+        from diffusers import UniPCMultistepScheduler
+
+        device, dtype = self.device, self.dtype
+        tf_cfg = self.config
+        # The serving schedule pads requests up to whole windows, so the
+        # reference takes that as a precondition.
+        assert total_units % window_units == 0, "pass a whole-window total"
+        num_windows = total_units // window_units
+        tokens_per_unit = (height // self.vae_scale_spatial // tf_cfg.latent_patch_size) * (
+            width // self.vae_scale_spatial // tf_cfg.latent_patch_size
+        )
+
+        branches = [("cond", cond_ids)]
+        if uncond_ids is not None and guidance_scale != 1.0:
+            branches.append(("uncond", uncond_ids))
+
+        # Per-branch state: text K/V, per-window statics, committed frame K/V
+        # ([tokens, heads, dim] per layer, all committed windows concatenated)
+        # and the release bookkeeping mirroring the allocator's contract.
+        state: dict[str, dict] = {}
+        for name, ids in branches:
+            statics = []
+            for w in range(num_windows):
+                start = w * window_units
+                s = build_static_inputs(
+                    ids,
+                    (1, tf_cfg.latent_channel, window_units,
+                     height // self.vae_scale_spatial, width // self.vae_scale_spatial),
+                    tf_cfg, self.vae_scale_temporal, fps, device,
+                    has_image_condition=False, start_frame_offset=start,
+                )
+                statics.append(s)
+            state[name] = {
+                "statics": statics,
+                "frames": [None] * len(self.transformer.layers),
+                "und_len": len(ids),
+                "released": 0,
+            }
+        branch_kvs = self._ref_und_prefill(
+            [ids for _, ids in branches],
+            [state[name]["statics"][0]["text_mrope_ids"] for name, _ in branches],
+        )
+        for (name, _), kvs in zip(branches, branch_kvs, strict=True):
+            state[name]["text_kv"] = kvs
+
+        def _ctx(branch):
+            """Per-layer [text | retained frames] K/V for one branch. The
+            eviction hole starts at the first page boundary past the text
+            (frame tokens sharing the text's tail page are never released)."""
+            st = state[branch]
+            keep = -(-st["und_len"] // page_size) * page_size - st["und_len"]
+            out = []
+            for i, (tk, tv) in enumerate(st["text_kv"]):
+                fr = st["frames"][i]
+                if fr is None:
+                    out.append((tk, tv))
+                    continue
+                fk, fv = fr
+                k = torch.cat([tk, fk[:keep], fk[keep + st["released"]:]], 0)
+                v = torch.cat([tv, fv[:keep], fv[keep + st["released"]:]], 0)
+                out.append((k, v))
+            return out
+
+        def _release(branch, committed_units):
+            st = state[branch]
+            if context_units == 0:
+                return
+            target = max(0, committed_units - context_units) * tokens_per_unit
+            ask = target - st["released"]
+            if ask <= 0:
+                return
+            stream_len = st["und_len"] + committed_units * tokens_per_unit - st["released"]
+            first = -(-st["und_len"] // page_size)
+            releasable = stream_len // page_size - first
+            k = min(ask // page_size, releasable)
+            if k > 0:
+                st["released"] += k * page_size
+
+        tf = self.transformer
+        gen_latent_shape = (
+            1, tf_cfg.latent_channel, window_units,
+            height // self.vae_scale_spatial, width // self.vae_scale_spatial,
+        )
+        latents = torch.randn(gen_latent_shape, generator=generator, device=device, dtype=dtype)
+        windows_out: list[torch.Tensor] = []
+        for w in range(num_windows):
+            if flow_shift is not None:
+                scheduler = UniPCMultistepScheduler.from_config(
+                    self.scheduler.config, flow_shift=flow_shift
+                )
+            else:
+                scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
+            scheduler.set_timesteps(num_inference_steps, device=device)
+            s0 = state["cond"]["statics"][w]
+            num_noisy = s0["num_noisy_vision_tokens"]
+            for t in scheduler.timesteps:
+                vts = torch.full((num_noisy,), t.item(), device=device)
+                vels = {}
+                for name, _ in branches:
+                    st = state[name]
+                    static = st["statics"][w]
+                    packed, orig_shapes = tf._patchify_and_pack_latents([latents.to(dtype)])
+                    packed = tf.proj_in(packed)
+                    ts_embeds = tf.time_embedder(
+                        tf.time_proj(vts * tf_cfg.timestep_scale)
+                    ).to(packed.dtype)
+                    gen_seq = tf._apply_timestep_embeds_to_noisy_tokens(
+                        packed_tokens=packed,
+                        packed_timestep_embeds=ts_embeds,
+                        noisy_frame_indexes=static["vision_noisy_frame_indexes"],
+                        token_shapes=static["vision_token_shapes"],
+                    )
+                    cos, sin = tf._rotary(
+                        static["vision_mrope_ids"], gen_seq.device, gen_seq.dtype
+                    )
+                    gen_seq, _ = self._ref_gen_layers(gen_seq, cos, sin, _ctx(name))
+                    gen_out = tf.norm_moe_gen(gen_seq)
+                    mse_idx = static["vision_mse_loss_indexes"] - static["und_len"]
+                    preds = tf._unpatchify_and_unpack_latents(
+                        tf.proj_out(gen_out[mse_idx]),
+                        token_shapes_vision=static["vision_token_shapes"],
+                        noisy_frame_indexes_vision=static["vision_noisy_frame_indexes"],
+                        original_latent_shapes=orig_shapes,
+                    )
+                    vels[name] = preds[0]
+                if len(branches) > 1:
+                    velocity = vels["uncond"] + guidance_scale * (vels["cond"] - vels["uncond"])
+                else:
+                    velocity = vels["cond"]
+                latents = scheduler.step(
+                    velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
+                )[0].squeeze(0)
+            windows_out.append(latents.clone())
+
+            # Commit the finished window's clean K/V per branch, then evict.
+            for name, _ in branches:
+                st = state[name]
+                static = st["statics"][w]
+                packed, _ = tf._patchify_and_pack_latents([latents.to(dtype)])
+                gen_seq = tf.proj_in(packed)
+                cos, sin = tf._rotary(
+                    static["vision_mrope_ids"], gen_seq.device, gen_seq.dtype
+                )
+                _, fresh = self._ref_gen_layers(
+                    gen_seq, cos, sin, _ctx(name), collect=True
+                )
+                for i, (k, v) in enumerate(fresh):
+                    fr = st["frames"][i]
+                    st["frames"][i] = (
+                        (k, v) if fr is None
+                        else (torch.cat([fr[0], k], 0), torch.cat([fr[1], v], 0))
+                    )
+                _release(name, (w + 1) * window_units)
+            if w + 1 < num_windows:
+                latents = torch.randn(
+                    gen_latent_shape, generator=generator, device=device, dtype=dtype
+                )
+        return windows_out

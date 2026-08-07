@@ -133,6 +133,29 @@ class Cosmos3Config:
     # audio_decoder node with its ~1.9 GB AVAE). Requires the checkpoint to ship
     # sound_tokenizer/; set False to serve video-only and skip loading it.
     enable_sound: bool = True
+    # Serve opt-in windowed autoregressive video generation (the video_gen_ar
+    # walk plus the vae_decoder_ar node and its streaming decoder partition).
+    # Off by default: the served node set, walks and partitions are unchanged
+    # unless a deployment enables it, and requests only run windowed when they
+    # ask for a window_mode.
+    enable_windowed_video: bool = False
+    # Cap on how many windows one request may span (bounds the AR loop's
+    # static iteration count together with max_inference_steps).
+    max_windows: int = 64
+    # Windowed-request defaults, in pixel frames (quantized to latent frames
+    # server-side; the Wan VAE downsamples time by scale_factor_temporal).
+    # The overlap default matches the V2V recipe's two pinned latent frames —
+    # one-frame conditioning visibly degrades the continuation.
+    window_frames_default: int = 29
+    overlap_frames_default: int = 8
+    # kv-mode committed-context horizon (61 px = 16 latent frames): frames
+    # older than this behind the commit frontier are evicted from the cache.
+    # A request may pass context_frames=0 to retain everything.
+    context_frames_default: int = 61
+    # Latent frames of already-generated context re-decoded ahead of each
+    # window so the causal VAE's conv stack is warm at the kept frames; the
+    # context-derived pixels are trimmed. Raise if window boundaries seam.
+    windowed_decode_context_latents: int = 8
     video_temporal_causal: bool = False
     freeze_und: bool = False
 
