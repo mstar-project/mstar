@@ -2534,8 +2534,14 @@ class Worker:
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
+                # TP nodes live here EVERY step (_can_speculate refuses
+                # lockstep-parallel nodes), so this path carries its own
+                # phase records + flush — without them a TP-serving worker
+                # buffers phase data forever and never prints (the 08-07
+                # glm52 TP8 run: env set, zero histogram lines).
                 if self.enable_nvtx:
                     range_push("worker.schedule", synchronize=False)
+                _t0 = _time.perf_counter() if phase_period else 0.0
                 batch = None
                 if yield_away_from_target is not None:
                     batch = self.scheduler.get_next_batch(
@@ -2544,12 +2550,15 @@ class Worker:
                     )
                 if batch is None:
                     batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
+                if phase_period:
+                    _phase_record("sched", _time.perf_counter() - _t0)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 if batch is None:
                     self.communicator.wait_for_work(10)
                     continue
 
+                _t0 = _time.perf_counter() if phase_period else 0.0
                 if self.enable_nvtx:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_node_batch(batch)
@@ -2594,6 +2603,11 @@ class Worker:
                     graph_walk=batch.graph_walk,
                     future=future
                 ))
+                if phase_period:
+                    _phase_record("build_submit", _time.perf_counter() - _t0)
+                    _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_iter[0] += 1
+                    _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch)
                 # Clear the in-flight step. Without this the next iteration
