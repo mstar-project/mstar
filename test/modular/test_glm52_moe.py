@@ -335,3 +335,16 @@ def test_load_end_to_end_reduced_fp8():
 
     # Router selection bias stays fp32.
     assert moe.gate.e_score_correction_bias.dtype == torch.float32
+
+
+def test_per_token_group_quant_is_compiler_disabled():
+    """The quant wrapper must stay outside torch.compile: Inductor's
+    recompile of its Triton kernel crashes (PassManager::run failed,
+    08-07 — in-process and subprocess alike) and killed all 296 graph
+    captures. The graph break keeps compile+graphs coexisting; this pins
+    the wrap so a refactor can't silently drop it."""
+    from mstar.utils.fused_moe.kernels import per_token_group_quant_fp8
+
+    assert hasattr(per_token_group_quant_fp8, "_torchdynamo_disable") or hasattr(
+        per_token_group_quant_fp8, "_torchdynamo_orig_callable"
+    ), "per_token_group_quant_fp8 lost its torch.compiler.disable wrap"

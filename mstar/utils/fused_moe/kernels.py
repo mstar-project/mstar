@@ -658,6 +658,7 @@ def per_token_group_quant_fp8_kernel(
     tl.store(y_s_ptr, y_s)
 
 
+@torch.compiler.disable
 def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -668,6 +669,13 @@ def per_token_group_quant_fp8(
     Returns ``(x_q, x_s)`` with ``x_q`` e4m3 of ``x.shape`` and ``x_s`` fp32 of
     shape ``(M, K // group_size)``; dequant is ``x_q * x_s`` (the same
     multiply-back convention as the checkpoint's ``weight_scale_inv``).
+
+    ``torch.compiler.disable``: Inductor's (re)compile of THIS kernel dies
+    with "PassManager::run failed" in Triton make_llir — in-process and
+    subprocess alike (2026-08-07; the kernel's own JIT path is fine, it ran
+    3,264+ tokens eager). The graph break keeps Inductor out of the launch
+    while stream capture still records it, so compiled-forward capture and
+    this kernel coexist. Remove when the toolchain bug is fixed upstream.
     """
     assert x.dim() == 2 and x.is_contiguous()
     assert x.shape[-1] % group_size == 0, f"last dim {x.shape[-1]} must be a multiple of group_size {group_size}"
