@@ -79,6 +79,36 @@ class PlanCacheKey(NamedTuple):
 
 
 @dataclass
+class MlaRequestSlice:
+    """One request's slice of an absorbed-MLA SDPA plan.
+
+    ``q_start``/``seq_len`` locate this request's rows in the packed query batch;
+    ``total_len`` is its context length after this step (so the causal mask knows
+    how many cached tokens precede the new ones); ``page_indices`` gathers its
+    latent pages.
+    """
+    q_start: int
+    seq_len: int
+    total_len: int
+    page_indices: torch.Tensor
+
+
+@dataclass
+class MlaSdpaPlan:
+    """Absorbed-MLA fallback plan: latent scatter indices + per-request gather layout.
+
+    Built only when the FlashInfer MLA kernel cannot serve the configured latent
+    dims (see :func:`mla_kernel_available_for`); the kernel path plans a
+    :class:`FlashInferMLAWrapper` instead. For an ``mla_absorb`` label exactly one
+    of ``_PlanState.wrapper`` / ``_PlanState.mla`` is set — ``run_attention_mla``
+    uses that to choose a path, so leaving a stale value in either is a bug.
+    """
+    token_to_page: torch.Tensor
+    token_to_cache: torch.Tensor
+    requests: list[MlaRequestSlice]
+
+
+@dataclass
 class _PlanState:
     """Pre-computed state from plan_attention/plan_rope for a single cache label.
 
@@ -127,8 +157,9 @@ class _PlanState:
     # segment over its contiguous frozen prefix. None on paged plans, which
     # keep the FlashInfer path. See DenseGenCacheManager._build_dense_gen_plan.
     dense_gen: dict | None = None
-    # MLA absorb fallback plan: latent scatter indices and per-request gather layout.
-    mla: dict | None = None
+    # MLA absorb fallback plan: latent scatter indices and per-request gather
+    # layout. Mutually exclusive with ``wrapper`` (see MlaSdpaPlan).
+    mla: "MlaSdpaPlan | None" = None
 
 
 class WorkspaceBufferManager:
@@ -1519,6 +1550,27 @@ def _mla_kernel_available(ckv: int, kpe: int, sm_major: int) -> bool:
     return True
 
 
+def mla_kernel_available_for(kv_cache_config: KVCacheConfig, device) -> bool:
+    """Whether ``kv_cache_config``'s latent dims can use the FlashInfer MLA kernel.
+
+    The single predicate behind both the runtime plan (:class:`MlaAbsorbCacheManager`)
+    and the capture decision (``cuda_graph_runner.mla_absorb_capture_blocked``). They
+    must not drift: a capture that assumes the kernel while the plan takes SDPA builds
+    a paged wrapper the 4-D latent cache cannot serve.
+
+    Total by construction — a non-CUDA device returns False rather than raising, so the
+    absorbed-SDPA fallback is reachable on CPU. ``_mla_kernel_available`` explains why
+    this must be decided *before* any kernel is constructed.
+    """
+    ckv = kv_cache_config.mla_ckv_dim
+    if ckv is None:
+        return False
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        return False
+    sm_major = torch.cuda.get_device_capability(device)[0]
+    return _mla_kernel_available(ckv, kv_cache_config.head_dim - ckv, sm_major)
+
+
 class MlaAbsorbCacheManager(FlashInferCacheManager):
     """Paged-cache backend for weight-absorbed MLA.
 
@@ -1549,8 +1601,7 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
         page_size = cfg.page_size
         ckv = cfg.mla_ckv_dim
         kpe = (cfg.head_dim - ckv) if ckv is not None else None
-        sm_major = torch.cuda.get_device_capability(self.device)[0]
-        use_kernel = ckv is not None and _mla_kernel_available(ckv, kpe, sm_major)
+        use_kernel = mla_kernel_available_for(cfg, self.device)
 
         if use_kernel:
             qo_indptr_list = [0]
@@ -1599,7 +1650,7 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
         else:
             token_to_page: list[int] = []
             token_to_cache: list[int] = []
-            requests: list[dict] = []
+            requests: list[MlaRequestSlice] = []
             q_start = 0
             for i, rid in enumerate(self.request_ids):
                 state = self._get_state(rid, effective_label)
@@ -1618,25 +1669,30 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
                     token_to_page.append(page_indices[g // page_size])
                     token_to_cache.append(g % page_size)
 
-                requests.append({
-                    "q_start": q_start,
-                    "seq_len": sl,
-                    "total_len": total_len,
-                    "page_indices": torch.tensor(
+                requests.append(MlaRequestSlice(
+                    q_start=q_start,
+                    seq_len=sl,
+                    total_len=total_len,
+                    page_indices=torch.tensor(
                         page_indices, dtype=torch.long, device=self.device
                     ),
-                })
+                ))
                 q_start += sl
 
-            ps.mla = {
-                "token_to_page": torch.tensor(
+            ps.mla = MlaSdpaPlan(
+                token_to_page=torch.tensor(
                     token_to_page, dtype=torch.long, device=self.device
                 ),
-                "token_to_cache": torch.tensor(
+                token_to_cache=torch.tensor(
                     token_to_cache, dtype=torch.long, device=self.device
                 ),
-                "requests": requests,
-            }
+                requests=requests,
+            )
+            # Clear any wrapper a CUDA-graph capture injected: run_attention_mla
+            # picks its path with ``ps.wrapper is not None``, and a paged wrapper
+            # cannot read the 4-D latent cache. Mirrors how the paged path clears
+            # ``dense_gen`` in DenseGenCacheManager.
+            ps.wrapper = None
 
         # Keep advance_seq_lens / flush_to_store aligned with the base manager.
         ps.seq_lens = seq_lens
@@ -1683,7 +1739,7 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
         mla = ps.mla
         assert mla is not None
 
-        latent_cache[mla["token_to_page"], mla["token_to_cache"]] = latent.to(
+        latent_cache[mla.token_to_page, mla.token_to_cache] = latent.to(
             latent_cache.dtype
         )
 
@@ -1692,13 +1748,13 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
         query_all = torch.cat([q_nope, q_pe], dim=-1)
         out = torch.empty(T, H, L, dtype=q_nope.dtype, device=q_nope.device)
 
-        for req in mla["requests"]:
-            q_start = req["q_start"]
-            sl = req["seq_len"]
-            total_len = req["total_len"]
+        for req in mla.requests:
+            q_start = req.q_start
+            sl = req.seq_len
+            total_len = req.total_len
 
             # Mirror the dense-gen page gather for the fallback.
-            gathered = latent_cache[req["page_indices"]].reshape(
+            gathered = latent_cache[req.page_indices].reshape(
                 -1, latent_cache.shape[-1]
             )[:total_len]
             key = gathered

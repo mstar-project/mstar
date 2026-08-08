@@ -4,7 +4,9 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.cache_manager import (
     MlaAbsorbCacheManager,
+    MlaSdpaPlan,
     WorkspaceBufferManager,
+    _PlanState,
     create_cache_manager,
 )
 from mstar.engine.kv_store import (
@@ -137,3 +139,25 @@ def test_paged_latent_mla_real_dims():
 
 def test_paged_latent_mla_reduced_dims():
     _run_prefill_then_decode(L=32, Drope=8, H=4, T=6, page_size=4)
+
+
+def test_sdpa_plan_clears_any_injected_wrapper():
+    """``run_attention_mla`` picks its path with ``ps.wrapper is not None``, so the
+    SDPA branch must clear the slot — otherwise a wrapper injected by CUDA-graph
+    capture routes latent attention into a paged kernel that cannot read the 4-D
+    cache. Mirrors how the paged path clears ``dense_gen``."""
+    L, Drope = 32, 8  # reduced dims: no MLA kernel, so plan_attention takes SDPA
+    cm, alloc = _make_latent_cache_manager(L + Drope, torch.bfloat16, 0.1)
+    try:
+        cm.set_active_label("main")
+        # Stand in for a persistent wrapper injected via cuda_graph_plan_states.
+        cm._plan_states["main"] = _PlanState(wrapper=object())
+
+        cm.plan_attention(seq_lens=[4], is_causal=True, dtype=torch.bfloat16)
+
+        ps = cm._plan_states["main"]
+        assert ps.wrapper is None, "SDPA plan left a stale wrapper in the plan state"
+        assert isinstance(ps.mla, MlaSdpaPlan)
+        assert [r.seq_len for r in ps.mla.requests] == [4]
+    finally:
+        alloc.cleanup()

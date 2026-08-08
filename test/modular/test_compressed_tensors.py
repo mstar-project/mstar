@@ -1,14 +1,14 @@
 import pytest
 import torch
 
-from mstar.model.kimi_k2_7._testing import fake_quantize_weight
-from mstar.model.kimi_k2_7.quantization import (
+from mstar.model.components.quantization import (
     CompressedTensorsQuantConfig,
     dequant_compressed_tensors_stream,
     dequantize_weight,
     pack_int32,
     unpack_int32,
 )
+from mstar.model.kimi_k2_7._testing import fake_quantize_weight
 
 
 def test_pack_known_answer():

@@ -1,7 +1,17 @@
-"""Compressed-tensors INT4 W4A16 helpers for Kimi-K2.7 weights.
+"""Reader for the compressed-tensors checkpoint format (neuralmagic / vLLM).
+
+Model-agnostic: this is a *serialization format*, not one model's quirk. Kimi-K2.7
+is simply the first mstar model whose checkpoint ships in it.
 
 Packed values are stored low-order-first in int32 containers. Symmetric INT4 is
 offset-binary, so dequant subtracts 8 to match vLLM's ``uint4b8`` layout.
+
+:class:`CompressedTensorsQuantConfig` describes how a checkpoint was *written*;
+:meth:`CompressedTensorsQuantConfig.moe_quant_data` translates that into the
+:class:`~mstar.utils.quantization.QuantizationData` a specific kernel call needs.
+:attr:`~CompressedTensorsQuantConfig.quant_type` is the only place ``num_bits`` is
+mapped to a supported scheme; :meth:`~CompressedTensorsQuantConfig.ensure_kernel_support`
+is how callers reject a width no kernel implements.
 """
 from __future__ import annotations
 
@@ -9,6 +19,8 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 
 import torch
+
+from mstar.utils.quantization import QuantizationData, QuantizationType, W4A16Data
 
 _PACKED = ".weight_packed"
 _SCALE = ".weight_scale"
@@ -32,6 +44,58 @@ class CompressedTensorsQuantConfig:
     @property
     def pack_factor(self) -> int:
         return 32 // self.num_bits
+
+    @property
+    def quant_type(self) -> QuantizationType | None:
+        """The scheme mstar's kernels implement for this checkpoint, else ``None``.
+
+        The single ``num_bits`` -> scheme decision. ``None`` means "no kernel for
+        this width"; call :meth:`ensure_kernel_support` to turn that into an error.
+        """
+        return QuantizationType.W4A16 if self.num_bits == 4 else None
+
+    def ensure_kernel_support(self) -> QuantizationType:
+        """Return this checkpoint's scheme, raising if mstar has no kernel for it.
+
+        Call before allocating packed parameters or selecting a backend. The
+        packed-expert kernels hardcode 4-bit nibble extraction, so an INT8
+        checkpoint would otherwise allocate self-consistent shapes, load without
+        complaint, and return wrong numbers — this turns that into a load-time
+        error naming the width the checkpoint declared.
+        """
+        quant_type = self.quant_type
+        if quant_type is None:
+            raise ValueError(
+                f"compressed-tensors checkpoint declares num_bits={self.num_bits}, which "
+                "mstar does not implement (supported: 4-bit / W4A16). The fused-MoE and "
+                "Marlin kernels are INT4-only."
+            )
+        return quant_type
+
+    def moe_quant_data(
+        self,
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w1_zp: torch.Tensor | None = None,
+        w2_zp: torch.Tensor | None = None,
+    ) -> QuantizationData:
+        """Companion data for one stacked routed-expert GEMM under this config.
+
+        Call per dispatch rather than caching on the module: the scales are
+        ``nn.Parameter`` s that ``Module._apply`` rebuilds on ``.to(device)``, so
+        binding them at call time keeps the returned object from ever holding a
+        stale tensor.
+        """
+        quant_type = self.ensure_kernel_support()
+        if quant_type is QuantizationType.W4A16:
+            return W4A16Data(
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                group_size=self.group_size,
+                w1_zp=None if self.symmetric else w1_zp,
+                w2_zp=None if self.symmetric else w2_zp,
+            )
+        raise ValueError(f"No routed-expert quantization data for {quant_type}")
 
     @classmethod
     def from_hf_config_dict(

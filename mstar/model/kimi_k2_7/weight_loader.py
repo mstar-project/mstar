@@ -12,7 +12,7 @@ from torch import nn
 from mstar.model.loader.base import StackedParamRule
 
 if TYPE_CHECKING:
-    from mstar.model.kimi_k2_7.quantization import CompressedTensorsQuantConfig
+    from mstar.model.components.quantization import CompressedTensorsQuantConfig
 
 # Keep the expert index attached while remapping both bf16 and packed sub-keys.
 _EXPERT_RE = re.compile(
@@ -107,7 +107,7 @@ def load_kimi_hf_weights(
     from mstar.model.loader import load_hf_weights
 
     if quant_config is not None:
-        from mstar.model.kimi_k2_7.quantization import (
+        from mstar.model.components.quantization import (
             dequant_compressed_tensors_stream,
         )
 
