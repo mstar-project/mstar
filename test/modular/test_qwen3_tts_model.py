@@ -343,7 +343,10 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     assert talker.full_metadata.graph_walk == "talker_prefill"
     assert [edge.name for edge in talker.inputs] == list(pointers)
     assert talker.full_metadata.kwargs["talker_max_tokens"] == 12
-    assert talker.step_metadata["subtalker_sampling"]["top_k"] == 7
+    # Residual-group sampling rides the aux sampling config, not step metadata.
+    assert "subtalker_sampling" not in talker.step_metadata
+    aux = model.get_aux_sampling_configs("Talker", {"subtalker_top_k": 7})
+    assert aux["code_predictor"].top_k == 7
 
     codec = model.get_initial_forward_pass_args(
         "Codec",
@@ -365,7 +368,6 @@ def test_qwen3_tts_talker_prefill_transitions_to_decode():
         is_prefill=True,
         kwargs={
             "talker_max_tokens": 100,
-            "subtalker_sampling": {},
         },
     )
 
@@ -644,16 +646,8 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
         Qwen3TTSCodePredictor(config),
         config,
     )
-    expected_sampling = {
-        "do_sample": config.generation.subtalker_dosample,
-        "temperature": config.generation.subtalker_temperature,
-        "top_k": config.generation.subtalker_top_k,
-        "top_p": config.generation.subtalker_top_p,
-    }
     info = {
-        request_id: SimpleNamespace(
-            step_metadata={"subtalker_sampling": expected_sampling.copy()}
-        )
+        request_id: SimpleNamespace(step_metadata={})
         for request_id in ("a", "b")
     }
     batch = NodeBatch(
@@ -697,20 +691,12 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert graph_config.single_request_inputs.tensor_inputs[
         "suppress_eos"
     ].item() is True
-    piecewise = submodule.get_piecewise_cuda_graph_configs(
-        torch.device("cpu"), torch.float32
-    )["code_predictor_loop"]
-    assert piecewise.seq_len == 1
-    assert piecewise.uses_kv_cache is False
-    assert piecewise.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
-    capture_shape = piecewise.get_capture_shapes([2])[0]
-    static_inputs = piecewise.make_static_inputs(capture_shape)
-    assert static_inputs["last_hidden"].shape == (2, 16)
-    assert static_inputs["uniforms"].shape == (2, 3)
-
-    info["b"].step_metadata["subtalker_sampling"]["temperature"] = 0.7
-    assert not submodule.can_batch(batch, model_inputs)
-    assert not submodule.can_use_cuda_graphs(batch, model_inputs)
+    # Residual sampling params live in per-request sampler buffers, so requests
+    # that disagree about them still batch AND still replay the decode graph.
+    # (They used to fall out of both.)
+    info["b"].step_metadata["subtalker_sampling"] = {"temperature": 0.7}
+    assert submodule.can_batch(batch, model_inputs)
+    assert submodule.can_use_cuda_graphs(batch, model_inputs)
 
 
 def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
@@ -758,72 +744,126 @@ def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
     assert kwargs["enable_gqa"] is True
 
 
-def test_qwen3_tts_piecewise_sampling_is_tensor_only():
-    logits = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
-    tokens = TalkerSubmodule._sample_from_uniform(
-        logits=logits,
-        uniform=torch.tensor([0.3, 0.7]),
-        temperature=torch.ones(2),
-        top_k=torch.tensor([1, 1]),
-        top_p=torch.ones(2),
-        do_sample=torch.tensor([True, False]),
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="piecewise capture requires CUDA"
+)
+def test_qwen3_tts_depth_loop_piecewise_captures_its_own_sampling():
+    """The depth loop is captured *including* sampling, off the engine's aux
+    buffers — so eager paths (above all prefill) still replay it, and per-request
+    params stay live after capture.
+    """
+    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.utils.sampling import (
+        MultiSamplerBuffers,
+        MultiSamplingConfig,
+        SamplingConfig,
     )
-    assert tokens.tolist() == [2, 0]
 
-
-def test_qwen3_tts_uses_piecewise_runner_when_available():
+    # Indexed device: the capture path pins kernels with torch.cuda.device(...),
+    # which rejects a bare "cuda".
+    dev = torch.device("cuda:0")
     config = _tiny_model_config()
     submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config),
-        Qwen3TTSCodePredictor(config),
-        config,
+        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config,
+    ).to(device=dev, dtype=torch.bfloat16).eval()
+    submodule.code_predictor.consolidate_stacked_weights()
+    submodule.DECODE_CAPTURE_BATCH_SIZES = [1, 2]
+
+    rids = ["a", "b"]
+    multi = MultiSamplingConfig(
+        main=SamplingConfig(vocab_size=config.talker.vocab_size),
+        aux={"code_predictor": SamplingConfig(temperature=0.9, top_k=8)},
     )
+    multi.set_seed(11)
+    bufs = MultiSamplerBuffers.allocate(max_batch_size=2, device=dev, config=multi)
+    for rid in rids:
+        bufs.register_request(rid, multi)
 
-    class _Sampler:
-        @staticmethod
-        def _broadcast_tokens(tensor):
-            return tensor
-
-    class _Runner:
-        called = False
-
-        @staticmethod
-        def can_run(batch_size):
-            return batch_size == 1
-
-        def run(self, static_inputs, real_bs):
-            self.called = True
-            assert real_bs == 1
-            assert static_inputs["uniforms"].shape == (1, 3)
-            return {
-                "all_codes": torch.tensor([[1, 2, 3, 4]]),
-                "codec_embed_sum": torch.zeros(1, 16),
-            }
-
-    runner = _Runner()
-    result = submodule._run_code_predictor_piecewise(
-        engine_inputs=ModelInputsFromEngine(
-            request_ids=["request"],
-            per_request_info={
-                "request": SimpleNamespace(random_seed=123)
-            },
-            sampler=_Sampler(),
-            piecewise_runners={"code_predictor_loop": runner},
-        ),
-        last_hidden=torch.zeros(1, 16),
-        layer0_codes=torch.tensor([1]),
-        sampling={
-            "do_sample": True,
-            "temperature": 0.9,
-            "top_k": 10,
-            "top_p": 0.8,
-        },
+    configs = submodule.get_piecewise_cuda_graph_configs(
+        dev, torch.bfloat16
     )
+    runner = PiecewiseCudaGraphRunner(
+        config=configs["code_predictor_loop"], device=dev,
+        autocast_dtype=torch.bfloat16,
+        # uses_sampler=True config: the engine wires the node's sampler buffers
+        # into the runner, which injects a sampler into the captured depth loop.
+        sampler_buffers=bufs,
+    )
+    runner.warmup_and_capture()
+    assert runner.graphs, "depth-loop capture produced no graphs"
 
-    assert runner.called
-    assert result is not None
-    assert result[0].tolist() == [[1, 2, 3, 4]]
-    assert result[1].shape == (1, 16)
+    hidden = config.talker.hidden_size
+    engine_inputs = SimpleNamespace(
+        piecewise_runners={"code_predictor_loop": runner}, request_ids=rids,
+    )
+    last_hidden = torch.randn(2, hidden, device=dev, dtype=torch.bfloat16)
+    layer0 = torch.tensor([1, 2], device=dev)
+    codes, embed_sum = submodule._run_depth_loop_piecewise(
+        engine_inputs, last_hidden, layer0
+    )
+    assert codes.shape == (2, config.talker.num_code_groups)
+    assert embed_sum.shape == (2, hidden)
+    assert codes[:, 0].tolist() == [1, 2]
+
+    # A sub-bucket batch replays in the bs=2 graph, sliced back to its real size.
+    single = SimpleNamespace(
+        piecewise_runners={"code_predictor_loop": runner}, request_ids=["a"],
+    )
+    solo_codes, _ = submodule._run_depth_loop_piecewise(
+        single, last_hidden[:1], layer0[:1]
+    )
+    assert solo_codes.shape == (1, config.talker.num_code_groups)
+
+    # Switch request "a" to greedy AFTER capture; its row must go deterministic
+    # while the graph is untouched. (A capture-time constant could not.)
+    greedy = MultiSamplingConfig(
+        main=multi.main, aux={"code_predictor": SamplingConfig(temperature=0.0)},
+    )
+    greedy.set_seed(11)
+    bufs.update_request_config("a", greedy)
+    first, _ = submodule._run_depth_loop_piecewise(engine_inputs, last_hidden, layer0)
+    first = first.clone()
+    second, _ = submodule._run_depth_loop_piecewise(engine_inputs, last_hidden, layer0)
+    torch.cuda.synchronize()
+    assert first[0].tolist() == second[0].tolist()
+
+
+def test_qwen3_tts_aux_sampling_config_drives_code_predictor():
+    """Residual groups are configured through the ``code_predictor`` aux config,
+    which the engine turns into its own per-request sampler buffers."""
+    model = _make_model()
+    generation = model.config.generation
+
+    default = model.get_aux_sampling_configs("Talker")["code_predictor"]
+    assert default.temperature == generation.subtalker_temperature
+    assert default.top_k == generation.subtalker_top_k
+    assert default.top_p == generation.subtalker_top_p
+    # No penalty on the depth loop => no seen-token mask buffers for this label.
+    assert default.vocab_size is None
+
+    overridden = model.get_aux_sampling_configs(
+        "Talker",
+        {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
+    )["code_predictor"]
+    assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
+
+    # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
+    greedy = model.get_aux_sampling_configs(
+        "Talker", {"subtalker_dosample": False}
+    )["code_predictor"]
+    assert greedy.temperature == 0.0
+
+    # Only the Talker owns an aux sampler.
+    assert model.get_aux_sampling_configs("Codec") == {}
+
+    # The bundle the engines actually consume.
+    multi = model.resolve_sampling_configs("Talker", {})
+    assert multi.main.vocab_size is not None
+    assert set(multi.aux) == {"code_predictor"}
+    multi.set_seed(99)
+    assert multi.main.seed == 99
+    # Aux stream is seeded independently of the Talker's.
+    assert multi.aux["code_predictor"].seed != 99
 
 
 class _FakeCodecDecoder(torch.nn.Module):

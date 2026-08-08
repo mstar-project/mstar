@@ -611,6 +611,8 @@ class BatchedCacheManager(ABC):
             for i, rid in enumerate(self.request_ids):
                 label = self.active_labels[rid]
                 ps = self._plan_states[label]
+                if ps.seq_lens is None:
+                    continue
                 n = ps.seq_lens[i]
                 state = self._get_state(rid, label=label)
                 state.seq_len += n

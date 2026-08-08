@@ -21,7 +21,7 @@ branch.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -918,6 +918,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
     def get_piecewise_cuda_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+        **kwargs: Any,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """One BATCHED piecewise graph (``"block_loop"``) for the AC predictor.
 

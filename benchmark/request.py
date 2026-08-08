@@ -725,6 +725,7 @@ class OurSystem(InferenceSystem):
         # on top of model-level defaults.
         model_kwargs = json.dumps(
             {
+                "seed": request_id,
                 **model.get_model_kwargs(req_type),
                 **req_input.model_kwargs,
                 **additional_model_kwargs,

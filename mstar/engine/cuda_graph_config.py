@@ -200,9 +200,12 @@ class PiecewiseCudaGraphConfig(ABC):
     # (1) function that gets captured. Contract:
     #     capture_fn(static_inputs: dict[str, Tensor],
     #                static_cm: BatchedCacheManager | None = None,
+    #                sampler: BaseMultiSampler = ...,  # only when uses_sampler
     #                **forward_kwargs) -> dict[str, Tensor]
     # It must READ tensors out of ``static_inputs`` (never reassign them) so the
-    # runner-owned buffers stay the ones captured into the graph.
+    # runner-owned buffers stay the ones captured into the graph. When
+    # ``uses_sampler`` is True the runner also passes a ``sampler`` bound to the
+    # node's static sampler buffers, so sampling can live inside the capture.
     capture_fn: Callable[..., dict[str, torch.Tensor]]
     # (2) factory: shape -> the static input buffers the runner will own + copy
     #     real inputs into before each replay.
@@ -214,6 +217,11 @@ class PiecewiseCudaGraphConfig(ABC):
     #     ``plan_fn(static_cm, shape)`` if given, else a type-default (uniform
     #     seq_lens for BATCHED, packed indptr for PACKED).
     uses_kv_cache: bool = False
+    # When True the runner is handed the node's ``MultiSamplerBuffers`` and
+    # passes a ``sampler`` (bound to their stable addresses) into ``capture_fn``,
+    # then re-gathers each request's params into those buffers before every
+    # replay so in-graph sampling stays per-request.
+    uses_sampler: bool = False
     plan_fn: Callable[["BatchedCacheManager", PiecewiseCaptureShape], None] | None = None
     # Whether the runner advances cache seq_lens (Python-only, post-replay) after
     # each ``run``. True suits the common case where the captured region consumes

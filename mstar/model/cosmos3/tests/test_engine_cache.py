@@ -625,7 +625,7 @@ def _run_cuda_graph_denoise(ctx):
     from mstar.distributed.communication import CommGroup
     from mstar.engine.cuda_graph_runner import CudaGraphRunner
     from mstar.model.submodule_base import ModelInputsFromEngine
-    from mstar.utils.sampling import Sampler, SamplingConfig
+    from mstar.utils.sampling import MultiSampler, MultiSamplingConfig
 
     model, dit = ctx["model"], ctx["dit"]
     device, dtype = ctx["device"], ctx["dtype"]
@@ -649,9 +649,11 @@ def _run_cuda_graph_denoise(ctx):
 
     runner = CudaGraphRunner(
         submodule_name="dit", submodule=dit, kv_cache_config=shared["cfg"],
-        alloc_manager=shared["alloc"], sampler=Sampler(device=dev, tp_group=CommGroup.trivial()),
+        alloc_manager=shared["alloc"], sampler=MultiSampler.new(
+            aux_labels=[], device=dev, tp_group=CommGroup.trivial(),
+        ),
         buffer_manager=shared["buf"], device=dev, autocast_dtype=dtype,
-        default_sampling_config=SamplingConfig(), tp_group=CommGroup.trivial(),
+        default_sampling_config=MultiSamplingConfig(), tp_group=CommGroup.trivial(),
     )
     runner.warmup_and_capture()
     assert runner.graphs, "no CUDA graph captured for cosmos3 image_gen"
