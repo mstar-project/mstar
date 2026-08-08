@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from mstar.model.kimi_k2_7.quantization import CompressedTensorsQuantConfig
+from mstar.model.components.quantization import CompressedTensorsQuantConfig
 
 
 @dataclass

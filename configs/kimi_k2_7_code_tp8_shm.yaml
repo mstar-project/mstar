@@ -4,9 +4,12 @@ max_seq_len: 8192
 # Loading ~600GB of INT4 experts across 8 ranks
 # MSTAR_DIST_TIMEOUT_S overrides this.
 dist_timeout_s: 7200
+# Copy the checkpoint into /dev/shm first, then point at it at launch:
+#   mstar serve kimi_k2_7 --model-path /dev/shm/kimi_k2_7_code
+#   mstar-serve --config configs/kimi_k2_7_code_tp8_shm.yaml \
+#               --model-path /dev/shm/kimi_k2_7_code
 model_kwargs:
   config_variant: k27_code
-  checkpoint_path: /dev/shm/kimi_k2_7_code
   tokenizer_mode: hf
 kv_cache:
   max_num_pages: 512

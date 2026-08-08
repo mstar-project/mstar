@@ -2,20 +2,21 @@
 
 NOT part of the serving path. These helpers exist only to let the test suite
 fabricate a synthetic quantized checkpoint and its exact bf16 reference, so a
-golden can assert the real load path (``quantization.py`` +
-``weight_loader.py``) reproduces the reference bit-for-bit. Nothing here is
+golden can assert the real load path (:mod:`mstar.model.components.quantization`
++ ``weight_loader.py``) reproduces the reference bit-for-bit. Nothing here is
 imported by the model or the loader at serve time.
 
 The real load-path primitives (``pack_int32`` / ``unpack_int32`` /
 ``dequantize_weight`` / ``dequant_compressed_tensors_stream`` /
-``CompressedTensorsQuantConfig``) live in ``quantization.py``; this module builds
+``CompressedTensorsQuantConfig``) live in
+:mod:`mstar.model.components.quantization.compressed_tensors`; this module builds
 on them.
 """
 from __future__ import annotations
 
 import torch
 
-from mstar.model.kimi_k2_7.quantization import dequantize_weight, pack_int32
+from mstar.model.components.quantization import dequantize_weight, pack_int32
 
 
 def fake_quantize_weight(

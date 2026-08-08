@@ -2,6 +2,7 @@
 import pytest
 import torch
 
+from mstar.model.components.quantization import W4A16Data
 from mstar.model.kimi_k2_7._testing import fake_quantize_weight
 
 pytestmark = pytest.mark.skipif(
@@ -83,7 +84,7 @@ def test_marlin_moe_matches_bf16_and_triton(num_tokens):
     out_bf16 = fused_experts(x, w1_deq, w2_deq, topk_weights, topk_ids)  # ground truth
     out_triton = fused_experts(  # same packed nibbles, Triton W4A16 kernel
         x, w1_packed, w2_packed, topk_weights, topk_ids,
-        w1_scale=w1_scale, w2_scale=w2_scale, group_size=GROUP_SIZE, pack_factor=PACK_FACTOR,
+        quant=W4A16Data(w1_scale=w1_scale, w2_scale=w2_scale, group_size=GROUP_SIZE),
     )
 
     assert out_marlin.shape == (num_tokens, H) and out_marlin.dtype == torch.bfloat16

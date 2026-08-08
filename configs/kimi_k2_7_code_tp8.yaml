@@ -4,9 +4,12 @@ max_seq_len: 8192
 # See kimi_k2_7_code_tp8_shm.yaml — a 1T INT4 load at TP8 outruns PyTorch's
 # default process-group timeout; this path is slower still (disk, not tmpfs).
 dist_timeout_s: 7200
+# Point at your checkpoint at launch — this config hardcodes no path:
+#   mstar-serve --config configs/kimi_k2_7_code_tp8.yaml \
+#               --model-path /path/to/Kimi-K2.7-Code
+# Omit --model-path to pull moonshotai/Kimi-K2.7-Code from HuggingFace.
 model_kwargs:
   config_variant: k27_code
-  checkpoint_path: /m-coriander/coriander/garv901/kimi_k2_7_code
   tokenizer_mode: hf
 kv_cache:
   max_num_pages: 512

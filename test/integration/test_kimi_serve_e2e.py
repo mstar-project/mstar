@@ -198,8 +198,8 @@ def test_serve_path_prefill_decode_loop(tmp_path):
     cfg = _write_checkpoint(tmp_path, seed=0)
 
     model = KimiK2Model(
-        model_path_hf="", config_variant="reduced",
-        checkpoint_path=str(tmp_path), tokenizer_mode="byte",
+        model_path_hf=str(tmp_path), config_variant="reduced",
+        tokenizer_mode="byte",
     )
     assert model.config.vocab_size == 256
 
@@ -228,8 +228,8 @@ def test_serve_path_prefill_decode_loop(tmp_path):
 def test_serve_path_is_deterministic(tmp_path):
     cfg = _write_checkpoint(tmp_path, seed=1)
     model = KimiK2Model(
-        model_path_hf="", config_variant="reduced",
-        checkpoint_path=str(tmp_path), tokenizer_mode="byte",
+        model_path_hf=str(tmp_path), config_variant="reduced",
+        tokenizer_mode="byte",
     )
     submodule = model.get_submodule("LLM", device="cuda", autocast_dtype=torch.bfloat16)
     prompt_ids = model.process_prompt("serve", ["text"], ["text"])["text_inputs"][0].to(DEVICE)

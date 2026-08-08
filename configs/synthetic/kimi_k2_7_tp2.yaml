@@ -1,0 +1,17 @@
+model: "kimi_k2_7"
+# Reduced synthetic TP=2 config — random weights, NOT a production deployment.
+# Generate the checkpoint first, then point at it:
+#   mstar-serve --config configs/synthetic/kimi_k2_7_tp2.yaml \
+#               --model-path tools/kimi_goldens/repro/checkpoint
+max_seq_len: 512
+model_kwargs:
+  config_variant: reduced
+  tokenizer_mode: byte
+kv_cache:
+  max_num_pages: 256
+  page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+    graph_walks: [prefill, decode]

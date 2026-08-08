@@ -1,8 +1,8 @@
 import pytest
 import torch
 
+from mstar.model.components.quantization import W4A16Data, unpack_int32
 from mstar.model.kimi_k2_7._testing import fake_quantize_weight
-from mstar.model.kimi_k2_7.quantization import unpack_int32
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -58,7 +58,7 @@ def test_w4a16_matches_bf16_on_same_dequant(num_tokens):
 
     out_quant = fused_experts(
         x, w1_packed, w2_packed, topk_weights, topk_ids,
-        w1_scale=w1_scale, w2_scale=w2_scale, group_size=GROUP_SIZE, pack_factor=PACK_FACTOR,
+        quant=W4A16Data(w1_scale=w1_scale, w2_scale=w2_scale, group_size=GROUP_SIZE),
     )
     out_bf16 = fused_experts(x, w1_deq, w2_deq, topk_weights, topk_ids)
 
@@ -81,7 +81,7 @@ def test_w4a16_reduce_results_false_shape():
 
     got = fused_experts(
         x, w1_packed, w2_packed, topk_weights, topk_ids,
-        w1_scale=w1_scale, w2_scale=w2_scale, group_size=GROUP_SIZE, pack_factor=PACK_FACTOR,
+        quant=W4A16Data(w1_scale=w1_scale, w2_scale=w2_scale, group_size=GROUP_SIZE),
         reduce_results=False,
     )
     exp = fused_experts(x, w1_deq, w2_deq, topk_weights, topk_ids, reduce_results=False)

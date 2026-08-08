@@ -30,6 +30,7 @@ from mstar.engine.cache_manager import (
     BatchedCacheManager,
     WorkspaceBufferManager,
     create_cache_manager,
+    mla_kernel_available_for,
 )
 from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
@@ -50,6 +51,21 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_AR_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
+
+def mla_absorb_capture_blocked(
+    kv_cache_config: KVCacheConfig, device
+) -> str | None:
+    if kv_cache_config.attention_backend != "mla_absorb":
+        return None
+    if mla_kernel_available_for(kv_cache_config, device):
+        return None
+    ckv = kv_cache_config.mla_ckv_dim
+    return (
+        "attention_backend='mla_absorb' without the FlashInfer MLA kernel "
+        f"(mla_ckv_dim={ckv}, kpe={None if ckv is None else kv_cache_config.head_dim - ckv}, "
+        f"device={device}); the absorbed-SDPA fallback runs eager and plans no wrapper"
+    )
 
 
 @dataclass
@@ -253,6 +269,14 @@ class CudaGraphRunner:
                            self.submodule_name)
             return
 
+        blocked = mla_absorb_capture_blocked(self.kv_cache_config, self.device)
+        if blocked is not None:
+            logger.info(
+                "Skipping CUDA graph capture for %s: %s. This node serves eagerly.",
+                self.submodule_name, blocked,
+            )
+            return
+
         if not hasattr(self.submodule, 'forward_batched'):
             logger.info("Submodule %s does not support batched forward, "
                         "skipping CUDA graph capture", self.submodule_name)
@@ -321,7 +345,7 @@ class CudaGraphRunner:
         can run on plan_stream concurrently with replay(slot 0) on
         default_stream without racing on the wrapper's persistent state.
         """
-        from mstar.engine.cache_manager import _mla_kernel_available, _PlanState
+        from mstar.engine.cache_manager import _PlanState
         from mstar.utils.flashinfer_utils import (
             FlashInferDecodeWrapper,
             FlashInferMLAWrapper,
@@ -333,15 +357,16 @@ class CudaGraphRunner:
         cfg = self.kv_cache_config
 
         # Only the FlashInfer MLA path is capturable; absorbed SDPA stays eager.
-        use_mla_kernel = (
-            cfg.attention_backend == "mla_absorb"
-            and cfg.mla_ckv_dim is not None
-            and _mla_kernel_available(
-                cfg.mla_ckv_dim,
-                cfg.head_dim - cfg.mla_ckv_dim,
-                torch.cuda.get_device_capability(self.device)[0],
+        # warmup_and_capture already cancelled capture in that case, so reaching
+        # here with mla_absorb-and-no-kernel means the two decisions drifted —
+        # refuse rather than fall through and build a paged wrapper that cannot
+        # read the 4-D latent cache.
+        blocked = mla_absorb_capture_blocked(cfg, self.device)
+        if blocked is not None:
+            raise RuntimeError(
+                f"_create_persistent_wrappers called for an uncapturable config: {blocked}"
             )
-        )
+        use_mla_kernel = cfg.attention_backend == "mla_absorb"
 
         # Allocate workspace buffer for CUDA graph wrappers.
         # Each (label, slot) gets its own workspace — slots must NOT share

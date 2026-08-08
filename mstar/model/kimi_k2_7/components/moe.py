@@ -164,6 +164,10 @@ class KimiSparseMoeBlock(nn.Module):
         self.packed_experts = (
             config.quantization_config is not None and config.moe_in_kernel_dequant
         )
+        # Hold the checkpoint descriptor rather than copying its fields out: it is
+        # the single source for group_size / pack_factor / symmetric, and it builds
+        # the per-dispatch QuantizationData.
+        self.quant_config = config.quantization_config if self.packed_experts else None
         self.quant_kernel = getattr(config, "quant_kernel", "auto")
         self._marlin_method = None
         self._use_marlin = False
@@ -182,11 +186,9 @@ class KimiSparseMoeBlock(nn.Module):
 
         self.experts = nn.Module()
         if self.packed_experts:
-            qc = config.quantization_config
-            self.group_size = qc.group_size
-            self.pack_factor = qc.pack_factor  # 8 for INT4
-            self.symmetric = qc.symmetric
-            hidden, gs, pf = config.hidden_size, self.group_size, self.pack_factor
+            qc = self.quant_config
+            qc.ensure_kernel_support()
+            hidden, gs, pf = config.hidden_size, qc.group_size, qc.pack_factor
             assert hidden % pf == 0 and hidden % gs == 0, (
                 f"hidden {hidden} must divide pack_factor {pf} and group_size {gs}"
             )
@@ -241,7 +243,7 @@ class KimiSparseMoeBlock(nn.Module):
 
         full_inter = self.moe_intermediate_size
         if self.packed_experts:
-            pf, gs = self.pack_factor, self.group_size
+            pf, gs = self.quant_config.pack_factor, self.quant_config.group_size
             self.experts.gate_up_proj_packed.weight_loader = partial(
                 _gate_up_packed_loader, self.tp_rank, self.tp_size, full_inter,
             )
@@ -303,16 +305,18 @@ class KimiSparseMoeBlock(nn.Module):
         from mstar.utils.fused_moe import fused_experts, moe_sum_reduce_triton
 
         reduce = self.tp_size == 1
+        # Built per dispatch, not cached: Module._apply rebuilds these Parameters
+        # on .to(device), so a cached descriptor could hold a stale tensor.
+        quant = self.quant_config.moe_quant_data(
+            self.experts.gate_up_proj_scale, self.experts.down_proj_scale,
+        )
         out = fused_experts(
             flat,
             self.experts.gate_up_proj_packed,
             self.experts.down_proj_packed,
             topk_weights,
             topk_ids,
-            w1_scale=self.experts.gate_up_proj_scale,
-            w2_scale=self.experts.down_proj_scale,
-            group_size=self.group_size,
-            pack_factor=self.pack_factor,
+            quant=quant,
             reduce_results=reduce,
         )
         if reduce:
@@ -329,16 +333,17 @@ class KimiSparseMoeBlock(nn.Module):
         from mstar.model.components.quantization import MarlinMoEMethod
         from mstar.utils.marlin import is_marlin_available
 
+        qc = self.quant_config
         dev = torch.device(device)
         shard_inter = divide(self.moe_intermediate_size, self.tp_size)
         legal_shapes = MarlinMoEMethod.shapes_are_legal(
-            self.hidden_size, shard_inter, self.group_size
+            self.hidden_size, shard_inter, qc.group_size
         )
         eligible = (
             self.quant_kernel != "triton"
             and dev.type == "cuda"
             and torch.cuda.get_device_capability(dev) >= (8, 0)
-            and self.symmetric
+            and qc.symmetric
             and legal_shapes
             and is_marlin_available()
         )
@@ -347,7 +352,7 @@ class KimiSparseMoeBlock(nn.Module):
                 "quant_kernel='marlin' requested but Marlin is ineligible "
                 f"(needs CUDA sm80+, symmetric INT4, legal shapes: hidden="
                 f"{self.hidden_size}, shard_inter={shard_inter}, "
-                f"group_size={self.group_size}, legal={legal_shapes}). "
+                f"group_size={qc.group_size}, legal={legal_shapes}). "
                 "Use quant_kernel='auto' to fall back to the Triton path."
             )
         global _BACKEND_LOGGED
@@ -365,11 +370,11 @@ class KimiSparseMoeBlock(nn.Module):
             logger.info(
                 "KimiSparseMoeBlock routed-expert backend: Marlin W4A16 "
                 "(quant_kernel=%s, group_size=%d, tp_size=%d).",
-                self.quant_kernel, self.group_size, self.tp_size,
+                self.quant_kernel, qc.group_size, self.tp_size,
             )
             _BACKEND_LOGGED = True
 
-        method = MarlinMoEMethod(num_bits=32 // self.pack_factor, group_size=self.group_size)
+        method = MarlinMoEMethod.from_quant_config(qc)
         method.prepare(
             self.experts.gate_up_proj_packed.data,
             self.experts.gate_up_proj_scale.data,

@@ -86,6 +86,19 @@ class KimiMLAAttention(nn.Module):
     ) -> torch.Tensor:
         if self.mla_absorb:
             return self._forward_absorbed(hidden_states, cache_handle, position_ids)
+
+        # Naive/materialized MLA — the reduced-capability fallback (see the
+        # ``mla_absorb`` note in config.py), not a co-equal path. It projects the
+        # latent up to full per-head K/V and uses the standard paged MHA
+        # interface, so it works on any dims/hardware, at the cost of caching
+        # H*(Dnope+Dv) per token instead of one shared latent. Kept for parity
+        # tests and for configs the absorbed path's kernels cannot serve.
+        #
+        # Two numerical quirks follow from reusing that MHA interface: q/k/v are
+        # padded to ``padded_head_dim`` (FlashInfer paged kernels only accept
+        # 64/128/256), and because ``run_attention`` then scales by
+        # 1/sqrt(padded_head_dim), DeepSeek's intended qk_head_dim**-0.5 * mscale**2
+        # is folded into q via ``softmax_scale_boost`` below.
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
 

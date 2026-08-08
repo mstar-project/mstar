@@ -1,18 +1,26 @@
 """Marlin W4A16 backend for routed-expert MoE GEMMs."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from mstar.utils.marlin import ops as marlin_ops
+from mstar.utils.quantization import QuantizationType
+
+if TYPE_CHECKING:
+    from mstar.model.components.quantization.compressed_tensors import (
+        CompressedTensorsQuantConfig,
+    )
 
 
 class MarlinMoEMethod:
     """Marlin routed-expert GEMM backend (symmetric INT4, group-wise).
 
-    Stateful: :meth:`prepare` repacks the loaded packed experts into Marlin
-    layout and stores them (plus the workspace) on the instance; the source
-    packed params can then be freed by the owning block. :meth:`apply` runs the
-    two Marlin GEMMs.
+    A kernel *backend*, not a quantization descriptor: stateful, and it owns
+    Marlin-layout weights after :meth:`prepare` repacks the loaded packed experts
+    (the source packed params can then be freed by the owning block).
+    :meth:`apply` runs the two Marlin GEMMs.
     """
 
     def __init__(self, *, num_bits: int = 4, group_size: int = 32) -> None:
@@ -27,6 +35,23 @@ class MarlinMoEMethod:
         self.w13_scale: torch.Tensor | None = None
         self.w2_scale: torch.Tensor | None = None
         self.workspace: torch.Tensor | None = None
+
+    @classmethod
+    def from_quant_config(
+        cls, quant_config: "CompressedTensorsQuantConfig"
+    ) -> "MarlinMoEMethod":
+        """Build from the checkpoint descriptor, so the bit width is read forward
+        from ``num_bits`` rather than reconstructed backwards from a pack factor."""
+        quant_type = quant_config.ensure_kernel_support()
+        if quant_type is not QuantizationType.W4A16:
+            raise ValueError(
+                f"MarlinMoEMethod supports {QuantizationType.W4A16} only, got {quant_type}"
+            )
+        return cls(num_bits=quant_config.num_bits, group_size=quant_config.group_size)
+
+    @property
+    def quant_type(self) -> QuantizationType:
+        return QuantizationType.W4A16
 
     def prepare(
         self,

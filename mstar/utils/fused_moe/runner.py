@@ -19,6 +19,7 @@ from mstar.utils.fused_moe.kernels import (
     invoke_fused_moe_kernel_w4a16,
     moe_sum_reduce_triton,
 )
+from mstar.utils.quantization import QuantizationData, QuantizationType
 
 
 def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
@@ -29,6 +30,53 @@ def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
     raise ValueError(f"fused_experts: unsupported dtype {dtype}; use bf16 or fp16")
 
 
+def _validate_expert_shapes(
+    hidden: int,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    quant: QuantizationData | None,
+) -> tuple[int, int, int]:
+    """Check the stacked expert weights against ``hidden`` and the quant scheme.
+
+    Returns ``(num_experts, two_inter, inter)``. Raising here — rather than
+    dispatching on whichever argument happened to be non-None — is what keeps a
+    newly-added scheme from silently falling through to the bf16 kernel.
+    """
+    if quant is None:
+        assert w1.is_contiguous(), "w1 must be contiguous"
+        assert w2.is_contiguous(), "w2 must be contiguous"
+        E, two_inter, k_in = w1.shape
+        assert k_in == hidden, f"w1 last dim {k_in} != hidden {hidden}"
+        _, w2_hidden, inter = w2.shape
+        assert w2_hidden == hidden, f"w2 dim[1] {w2_hidden} != hidden {hidden}"
+        assert two_inter == 2 * inter, f"w1 dim[1] {two_inter} != 2 * w2 dim[2] {2 * inter}"
+        return E, two_inter, inter
+
+    if quant.quant_type is not QuantizationType.W4A16:
+        raise ValueError(
+            f"fused_experts: no kernel for {quant.quant_type}; the Triton MoE path "
+            f"implements {QuantizationType.W4A16} only"
+        )
+
+    pack_factor = quant.pack_factor
+    assert w1.dtype == torch.int32 and w2.dtype == torch.int32, (
+        "W4A16 path expects packed int32 weights"
+    )
+    assert w1.is_contiguous(), "w1 (packed) must be contiguous"
+    assert w2.is_contiguous(), "w2 (packed) must be contiguous"
+    E, two_inter, k1_packed = w1.shape
+    assert k1_packed == hidden // pack_factor, (
+        f"w1 packed last dim {k1_packed} != hidden//pack_factor {hidden // pack_factor}"
+    )
+    _, w2_hidden, k2_packed = w2.shape
+    assert w2_hidden == hidden, f"w2 dim[1] {w2_hidden} != hidden {hidden}"
+    inter = two_inter // 2
+    assert k2_packed == inter // pack_factor, (
+        f"w2 packed last dim {k2_packed} != inter//pack_factor {inter // pack_factor}"
+    )
+    return E, two_inter, inter
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -37,12 +85,7 @@ def fused_experts(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     reduce_results: bool = True,
-    w1_scale: torch.Tensor | None = None,
-    w2_scale: torch.Tensor | None = None,
-    w1_zp: torch.Tensor | None = None,
-    w2_zp: torch.Tensor | None = None,
-    group_size: int | None = None,
-    pack_factor: int | None = None,
+    quant: QuantizationData | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -72,12 +115,11 @@ def fused_experts(
         ``(tokens, hidden)``. If False, skip the sum-reduce and return
         ``(tokens, top_k, hidden)`` — the caller is responsible for the
         reduce (e.g. after an all-reduce for TP).
-    w1_scale, w2_scale : torch.Tensor | None
-        W4A16 group scales; both ``None`` keeps the historical bf16 path.
-    w1_zp, w2_zp : torch.Tensor | None
-        Optional asymmetric zero points (unused for Kimi's symmetric INT4).
-    group_size, pack_factor : int | None
-        Required on the W4A16 path.
+    quant : QuantizationData | None
+        Scheme descriptor plus its scales/zero points. ``None`` (default) is the
+        bf16/fp16 path. A :class:`~mstar.utils.quantization.W4A16Data` selects the
+        packed-INT4 kernel and supplies its group scales; an unimplemented scheme
+        raises rather than silently taking the bf16 path.
 
     Returns
     -------
@@ -91,36 +133,9 @@ def fused_experts(
     # Only weights are quantized; activations stay bf16/fp16.
     assert hidden_states.dtype in (torch.bfloat16, torch.float16)
 
-    quantized = w1_scale is not None
     num_tokens, hidden = hidden_states.shape
-    if quantized:
-        assert pack_factor is not None and group_size is not None, (
-            "W4A16 path requires pack_factor and group_size"
-        )
-        assert w2_scale is not None, "W4A16 path requires both w1_scale and w2_scale"
-        assert w1.dtype == torch.int32 and w2.dtype == torch.int32, (
-            "W4A16 path expects packed int32 weights"
-        )
-        assert w1.is_contiguous(), "w1 (packed) must be contiguous"
-        assert w2.is_contiguous(), "w2 (packed) must be contiguous"
-        E, two_inter, k1_packed = w1.shape
-        assert k1_packed == hidden // pack_factor, (
-            f"w1 packed last dim {k1_packed} != hidden//pack_factor {hidden // pack_factor}"
-        )
-        _, w2_hidden, k2_packed = w2.shape
-        assert w2_hidden == hidden, f"w2 dim[1] {w2_hidden} != hidden {hidden}"
-        inter = two_inter // 2
-        assert k2_packed == inter // pack_factor, (
-            f"w2 packed last dim {k2_packed} != inter//pack_factor {inter // pack_factor}"
-        )
-    else:
-        assert w1.is_contiguous(), "w1 must be contiguous"
-        assert w2.is_contiguous(), "w2 must be contiguous"
-        E, two_inter, k_in = w1.shape
-        assert k_in == hidden, f"w1 last dim {k_in} != hidden {hidden}"
-        _, w2_hidden, inter = w2.shape
-        assert w2_hidden == hidden, f"w2 dim[1] {w2_hidden} != hidden {hidden}"
-        assert two_inter == 2 * inter, f"w1 dim[1] {two_inter} != 2 * w2 dim[2] {2 * inter}"
+    E, two_inter, inter = _validate_expert_shapes(hidden, w1, w2, quant)
+    group_size = quant.group_size if quant is not None else None
 
     top_k = topk_ids.shape[1]
     # moe_align_block_size expects int32; torch.topk returns int64.
@@ -154,13 +169,13 @@ def fused_experts(
     )
 
     # 3. Gate+up GEMM: cache1[slot] = hidden[slot // top_k] @ w1[expert].T
-    if quantized:
+    if quant is not None:
         invoke_fused_moe_kernel_w4a16(
             A=hidden_states,
             B_packed=w1,
             C=cache1,
-            B_scale=w1_scale,
-            B_zp=w1_zp,
+            B_scale=quant.w1_scale,
+            B_zp=quant.w1_zp,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             sorted_token_ids=sorted_token_ids,
@@ -171,8 +186,8 @@ def fused_experts(
             config=config,
             compute_type=compute_type,
             K=hidden,
-            pack_factor=pack_factor,
-            group_size=group_size,
+            pack_factor=quant.pack_factor,
+            group_size=quant.group_size,
         )
     else:
         invoke_fused_moe_kernel(
@@ -196,13 +211,13 @@ def fused_experts(
     # 5. Down GEMM (weighted): cache3[slot] = topk_weight[slot] * (cache2[slot] @ w2[expert].T)
     # top_k=1 for this GEMM so the kernel's offs_token // top_k is identity
     # -- it reads cache2 rows directly instead of the (slot // top_k)-th source row.
-    if quantized:
+    if quant is not None:
         invoke_fused_moe_kernel_w4a16(
             A=cache2,
             B_packed=w2,
             C=cache3.view(m_topk, hidden),
-            B_scale=w2_scale,
-            B_zp=w2_zp,
+            B_scale=quant.w2_scale,
+            B_zp=quant.w2_zp,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             sorted_token_ids=sorted_token_ids,
@@ -213,8 +228,8 @@ def fused_experts(
             config=config,
             compute_type=compute_type,
             K=inter,
-            pack_factor=pack_factor,
-            group_size=group_size,
+            pack_factor=quant.pack_factor,
+            group_size=quant.group_size,
         )
     else:
         invoke_fused_moe_kernel(

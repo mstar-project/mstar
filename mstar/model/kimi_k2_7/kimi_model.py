@@ -48,8 +48,10 @@ class KimiK2Model(Model):
         **kwargs,
     ):
         self.cache_dir = cache_dir
-        checkpoint_path = kwargs.get("checkpoint_path")
-        self.model_path_hf = checkpoint_path or model_path_hf
+        # A local checkpoint directory or an HF repo id. Deployments point this at
+        # their own copy with ``mstar serve --model-path`` / ``mstar-serve
+        # --model-path`` rather than hardcoding a path in the config yaml.
+        self.model_path_hf = model_path_hf
         self._config_variant = kwargs.get("config_variant", "full")
         if self._config_variant == "reduced":
             self.config = KimiK2Config.reduced()
@@ -327,7 +329,7 @@ class KimiK2Model(Model):
         import json
         from pathlib import Path
 
-        from mstar.model.kimi_k2_7.quantization import CompressedTensorsQuantConfig
+        from mstar.model.components.quantization import CompressedTensorsQuantConfig
 
         if self.config.quantization_config is not None:
             return
