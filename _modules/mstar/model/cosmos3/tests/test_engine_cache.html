@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -1463,7 +1463,7 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">CommGroup</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphRunner</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.sampling</span><span class="w"> </span><span class="kn">import</span> <span class="n">Sampler</span><span class="p">,</span> <span class="n">SamplingConfig</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.sampling</span><span class="w"> </span><span class="kn">import</span> <span class="n">MultiSampler</span><span class="p">,</span> <span class="n">MultiSamplingConfig</span>
 
     <span class="n">model</span><span class="p">,</span> <span class="n">dit</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">&quot;dit&quot;</span><span class="p">]</span>
     <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">&quot;device&quot;</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">&quot;dtype&quot;</span><span class="p">]</span>
@@ -1487,9 +1487,11 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">runner</span> <span class="o">=</span> <span class="n">CudaGraphRunner</span><span class="p">(</span>
         <span class="n">submodule_name</span><span class="o">=</span><span class="s2">&quot;dit&quot;</span><span class="p">,</span> <span class="n">submodule</span><span class="o">=</span><span class="n">dit</span><span class="p">,</span> <span class="n">kv_cache_config</span><span class="o">=</span><span class="n">shared</span><span class="p">[</span><span class="s2">&quot;cfg&quot;</span><span class="p">],</span>
-        <span class="n">alloc_manager</span><span class="o">=</span><span class="n">shared</span><span class="p">[</span><span class="s2">&quot;alloc&quot;</span><span class="p">],</span> <span class="n">sampler</span><span class="o">=</span><span class="n">Sampler</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span> <span class="n">tp_group</span><span class="o">=</span><span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">()),</span>
+        <span class="n">alloc_manager</span><span class="o">=</span><span class="n">shared</span><span class="p">[</span><span class="s2">&quot;alloc&quot;</span><span class="p">],</span> <span class="n">sampler</span><span class="o">=</span><span class="n">MultiSampler</span><span class="o">.</span><span class="n">new</span><span class="p">(</span>
+            <span class="n">aux_labels</span><span class="o">=</span><span class="p">[],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span> <span class="n">tp_group</span><span class="o">=</span><span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">(),</span>
+        <span class="p">),</span>
         <span class="n">buffer_manager</span><span class="o">=</span><span class="n">shared</span><span class="p">[</span><span class="s2">&quot;buf&quot;</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-        <span class="n">default_sampling_config</span><span class="o">=</span><span class="n">SamplingConfig</span><span class="p">(),</span> <span class="n">tp_group</span><span class="o">=</span><span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">(),</span>
+        <span class="n">default_sampling_config</span><span class="o">=</span><span class="n">MultiSamplingConfig</span><span class="p">(),</span> <span class="n">tp_group</span><span class="o">=</span><span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">(),</span>
     <span class="p">)</span>
     <span class="n">runner</span><span class="o">.</span><span class="n">warmup_and_capture</span><span class="p">()</span>
     <span class="k">assert</span> <span class="n">runner</span><span class="o">.</span><span class="n">graphs</span><span class="p">,</span> <span class="s2">&quot;no CUDA graph captured for cosmos3 image_gen&quot;</span>
@@ -1618,7 +1620,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 05, 2026.
+  Last updated on Aug 08, 2026.
   <br/>
 </p>
   </div>

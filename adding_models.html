@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -698,8 +698,23 @@ Cache the result. Return <code class="docutils literal notranslate"><span class=
 </dd>
 </dl>
 <p>Useful overridable defaults (not abstract): <code class="docutils literal notranslate"><span class="pre">get_sampling_config</span></code> (temperature/top-p
-per node), <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code> /
-<code class="docutils literal notranslate"><span class="pre">load_audio</span></code> / <code class="docutils literal notranslate"><span class="pre">load_video</span></code>, and the partition API below.</p>
+per node), <code class="docutils literal notranslate"><span class="pre">get_aux_sampling_configs</span></code> (see below), <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>,
+<code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code> / <code class="docutils literal notranslate"><span class="pre">load_audio</span></code> / <code class="docutils literal notranslate"><span class="pre">load_video</span></code>, and the
+partition API below.</p>
+<p>A node whose forward samples <strong>more than once per step</strong> with different parameters
+declares the extra configs from <code class="docutils literal notranslate"><span class="pre">get_aux_sampling_configs(node_name,</span> <span class="pre">model_kwargs)</span></code>,
+which returns <code class="docutils literal notranslate"><span class="pre">label</span> <span class="pre">-&gt;</span> <span class="pre">SamplingConfig</span></code>. Qwen3-Omni’s Talker does this: the Talker LLM
+samples codec group 0 from the main config, and the CodePredictor samples groups
+1..N-1 from the <code class="docutils literal notranslate"><span class="pre">&quot;code_predictor&quot;</span></code> aux config. The submodule then samples with:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">layer0</span> <span class="o">=</span> <span class="n">sampler</span><span class="o">.</span><span class="n">sample</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>                      <span class="c1"># main config</span>
+<span class="n">code</span> <span class="o">=</span> <span class="n">sampler</span><span class="o">.</span><span class="n">sample_aux</span><span class="p">(</span><span class="s2">&quot;code_predictor&quot;</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>  <span class="c1"># aux config</span>
+</pre></div>
+</div>
+<p>Each label gets its own sampler buffers (independent per-request params, philox stream
+and optional repetition-penalty mask), so aux params stay per-request and CUDA-graph
+safe. Do <strong>not</strong> pass sampling parameters into a captured forward as Python scalars:
+they are baked into the captured kernel launch and every replay silently reuses the
+capture-time values.</p>
 </section>
 <section id="step-3-declare-the-computation-graph">
 <h2>Step 3 — Declare the computation graph<a class="headerlink" href="#step-3-declare-the-computation-graph" title="Link to this heading">#</a></h2>
@@ -1500,7 +1515,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 05, 2026.
+  Last updated on Aug 08, 2026.
   <br/>
 </p>
   </div>

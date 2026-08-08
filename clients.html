@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -740,9 +740,10 @@ semantics. Point any OpenAI client at <code class="docutils literal notranslate"
 <ul class="simple">
 <li><p><strong>BAGEL</strong> — chat returns text only; use <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> and
 <code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for image output.</p></li>
-<li><p><strong>Qwen3-Omni</strong> — text sampling uses <code class="docutils literal notranslate"><span class="pre">thinker_*</span></code> keys and speech uses <code class="docutils literal notranslate"><span class="pre">talker_*</span></code>; set
-the speaker with <code class="docutils literal notranslate"><span class="pre">voice</span></code> (default <code class="docutils literal notranslate"><span class="pre">Ethan</span></code>) and request audio output by including
-<code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">modalities</span></code>. Non-OpenAI knobs (e.g. <code class="docutils literal notranslate"><span class="pre">talker_top_k</span></code>) go through
+<li><p><strong>Qwen3-Omni</strong> — text sampling uses <code class="docutils literal notranslate"><span class="pre">thinker_*</span></code> keys, speech uses <code class="docutils literal notranslate"><span class="pre">talker_*</span></code>, and the
+residual codec groups use <code class="docutils literal notranslate"><span class="pre">code_predictor_*</span></code>; set the speaker with <code class="docutils literal notranslate"><span class="pre">voice</span></code> (default
+<code class="docutils literal notranslate"><span class="pre">Ethan</span></code>) and request audio output by including <code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">modalities</span></code>.
+Non-OpenAI knobs (e.g. <code class="docutils literal notranslate"><span class="pre">talker_top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">code_predictor_top_p</span></code>) go through
 <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p></li>
 <li><p><strong>Orpheus</strong> — set the speaker with <code class="docutils literal notranslate"><span class="pre">voice</span></code> — one of <code class="docutils literal notranslate"><span class="pre">tara</span></code> (default), <code class="docutils literal notranslate"><span class="pre">zoe</span></code>,
 <code class="docutils literal notranslate"><span class="pre">zac</span></code>, <code class="docutils literal notranslate"><span class="pre">jess</span></code>, <code class="docutils literal notranslate"><span class="pre">leo</span></code>, <code class="docutils literal notranslate"><span class="pre">mia</span></code>, <code class="docutils literal notranslate"><span class="pre">julia</span></code>, <code class="docutils literal notranslate"><span class="pre">leah</span></code> (the <code class="docutils literal notranslate"><span class="pre">available_voices</span></code> list
@@ -834,7 +835,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 05, 2026.
+  Last updated on Aug 08, 2026.
   <br/>
 </p>
   </div>

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -905,10 +905,12 @@ docstring) and are reached only via <code class="docutils literal notranslate"><
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.adapters.</span></span><span class="sig-name descname"><span class="pre">Qwen3OmniAdapter</span></span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#Qwen3OmniAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-class docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a></p>
 <p>Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.</p>
-<p>Sampling is split across two stages: the Thinker (text) takes
-<code class="docutils literal notranslate"><span class="pre">thinker_*</span></code> keys, the Talker (speech) <code class="docutils literal notranslate"><span class="pre">talker_*</span></code>. The other Talker knobs
-(<code class="docutils literal notranslate"><span class="pre">talker_top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">talker_repetition_penalty</span></code>) aren’t OpenAI fields — pass
-them via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p>
+<p>Sampling is split across three stages: the Thinker (text) takes
+<code class="docutils literal notranslate"><span class="pre">thinker_*</span></code> keys, the Talker (speech) <code class="docutils literal notranslate"><span class="pre">talker_*</span></code>, and the Talker’s
+CodePredictor (residual codec groups) <code class="docutils literal notranslate"><span class="pre">code_predictor_*</span></code>. Everything
+except temperature/top_p is not an OpenAI field (<code class="docutils literal notranslate"><span class="pre">talker_top_k</span></code>,
+<code class="docutils literal notranslate"><span class="pre">talker_repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">code_predictor_top_k</span></code>, …) — pass those
+via <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Qwen3OmniAdapter.chat_to_request">
 <span class="sig-name descname"><span class="pre">chat_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#Qwen3OmniAdapter.chat_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.chat_to_request" title="Link to this definition">#</a></dt>
@@ -1199,7 +1201,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 05, 2026.
+  Last updated on Aug 08, 2026.
   <br/>
 </p>
   </div>

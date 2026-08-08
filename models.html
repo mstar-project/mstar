@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -631,11 +631,12 @@ batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
 graphs are resident; larger Codec batches therefore use the scheduler’s safe
 ceiling.</p></li>
 <li><p>Talker prefill remains eager because it runs once with variable sequence
-lengths. Decode uses a whole-walk CUDA Graph when residual sampling matches
-the captured defaults; request-local EOS suppression is carried as a graph
-tensor input so replay does not consult capture-slot dummy request state.
-Requests with custom <code class="docutils literal notranslate"><span class="pre">subtalker_*</span></code> sampling fall back to eager Talker
-execution while retaining the piecewise-captured 15-step CodePredictor loop.</p></li>
+lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
+CodePredictor loop captured inside it; request-local EOS suppression is
+carried as a graph tensor input so replay does not consult capture-slot dummy
+request state. Residual <code class="docutils literal notranslate"><span class="pre">subtalker_*</span></code> sampling is per-request through the
+<code class="docutils literal notranslate"><span class="pre">code_predictor</span></code> aux sampler, so custom values neither block batching nor
+fall off the graph.</p></li>
 <li><p>The 12 Hz decoder does not require the system SoX executable. M* imports only
 the exact upstream decoder modules, avoiding qwen-tts’s unrelated 25 Hz SoX
 probe during worker startup.</p></li>
@@ -877,7 +878,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 05, 2026.
+  Last updated on Aug 08, 2026.
   <br/>
 </p>
   </div>

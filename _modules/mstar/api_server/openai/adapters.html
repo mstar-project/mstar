@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 05, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 08, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -1077,10 +1077,12 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">Qwen3OmniAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.</span>
 
-<span class="sd">    Sampling is split across two stages: the Thinker (text) takes</span>
-<span class="sd">    ``thinker_*`` keys, the Talker (speech) ``talker_*``. The other Talker knobs</span>
-<span class="sd">    (``talker_top_k``, ``talker_repetition_penalty``) aren&#39;t OpenAI fields — pass</span>
-<span class="sd">    them via ``extra_body``.</span>
+<span class="sd">    Sampling is split across three stages: the Thinker (text) takes</span>
+<span class="sd">    ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker&#39;s</span>
+<span class="sd">    CodePredictor (residual codec groups) ``code_predictor_*``. Everything</span>
+<span class="sd">    except temperature/top_p is not an OpenAI field (``talker_top_k``,</span>
+<span class="sd">    ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those</span>
+<span class="sd">    via ``extra_body``.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="n">supports_chat</span> <span class="o">=</span> <span class="kc">True</span>
@@ -1362,7 +1364,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 05, 2026.
+  Last updated on Aug 08, 2026.
   <br/>
 </p>
   </div>
