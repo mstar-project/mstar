@@ -933,6 +933,9 @@ class SamplerBuffers:
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
+    # Slots awaiting GPU init, consumed by the next gather so every write is
+    # enqueued from the GPU thread rather than racing it from the main one.
+    _pending_init: set[int] = field(default_factory=set, repr=False)
     # Last-known config per rid — change-detect for ``update_request_config``
     # so steady-state per-step calls do zero GPU work (for the scalar rows).
     _cached_config: dict[str, SamplingConfig] = field(default_factory=dict, repr=False)
@@ -1053,17 +1056,11 @@ class SamplerBuffers:
             self._grow_master(self._master_capacity * 2)
         slot = self._free_slots.pop()
         self._rid_to_slot[rid] = slot
-        # Fresh RNG offset for this slot (counter, not a config value): zero the
-        # master row on GPU. Gather/advance/scatter keeps it there afterwards.
-        self.offset.master[slot:slot + 1].zero_()
-        cfg = sampling_config if sampling_config is not None else SamplingConfig()
-        self._cached_config[rid] = cfg
-        self._write_master_row(slot, cfg)
-        # Clear any stale seen-token history from a previously-freed slot. The
-        # first per-step ``update_request_config`` overwrites it with the live
-        # mask before the slot is gathered, but clearing is cheap insurance.
-        if self.seen_tokens is not None:
-            self.seen_tokens.clear_master_row(slot)
+        # CPU-only; every GPU write for this slot is deferred to the next gather.
+        self._pending_init.add(slot)
+        self._cached_config[rid] = (
+            sampling_config if sampling_config is not None else SamplingConfig()
+        )
 
     def unregister_request(self, rid: str) -> None:
         """Free the slot owned by ``rid`` (no GPU writes)."""
@@ -1071,6 +1068,7 @@ class SamplerBuffers:
         if slot is None:
             return
         self._cached_config.pop(rid, None)
+        self._pending_init.discard(slot)
         self._free_slots.append(slot)
 
     def update_request_config(
@@ -1093,7 +1091,9 @@ class SamplerBuffers:
         if prev == sampling_config:
             return
         self._cached_config[rid] = sampling_config
-        self._write_master_row(slot, sampling_config)
+        # A slot awaiting init writes this row at gather time instead.
+        if slot not in self._pending_init:
+            self._write_master_row(slot, sampling_config)
 
     def stage_seen_token_masks(
         self, request_ids: list[str], seen_masks: "Iterable[SeenTokenMask]",
@@ -1110,9 +1110,22 @@ class SamplerBuffers:
             slot = self._rid_to_slot.get(rid)
             if slot is None:
                 continue
+            # Runs before the gather, so init here or the clear would wipe it.
+            if slot in self._pending_init:
+                self._init_slot(slot, rid)
             mask = m._seen_token_mask
             if mask is not None:
                 self.seen_tokens.write_master_row(slot, mask)
+
+    def _init_slot(self, slot: int, rid: str) -> None:
+        """GPU-side init for a newly registered slot. Must run on the thread
+        that gathers, so these writes are ordered ahead of the index_selects
+        that read them (``register_request`` runs on the main thread)."""
+        self.offset.master[slot:slot + 1].zero_()
+        self._write_master_row(slot, self._cached_config[rid])
+        if self.seen_tokens is not None:
+            self.seen_tokens.clear_master_row(slot)
+        self._pending_init.discard(slot)
 
     # ------------------------------------------------------------------
     # Per-step gather: pinned-H2D slot-index → index_select into per-step bufs
@@ -1138,7 +1151,13 @@ class SamplerBuffers:
         # fall back to slot 0 (matches the defaults — temp=1, top_k=0, top_p=1,
         # rep_penalty=1 — for any rid the AR engine forgot to register).
         for i, rid in enumerate(request_ids):
-            self._slot_idx_cpu[i] = self._rid_to_slot.get(rid, 0)
+            slot = self._rid_to_slot.get(rid)
+            if slot is None:
+                slot = 0
+            elif slot in self._pending_init:
+                # Ordered ahead of the gathers below because it's issued here.
+                self._init_slot(slot, rid)
+            self._slot_idx_cpu[i] = slot
         for i in range(len(request_ids), padded_bs):
             self._slot_idx_cpu[i] = 0
 
