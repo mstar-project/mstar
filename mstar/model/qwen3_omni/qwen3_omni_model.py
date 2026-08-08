@@ -509,6 +509,25 @@ class Qwen3OmniModel(Model):
         # fallback to default config
         return SamplingConfig()
 
+    def get_aux_sampling_configs(
+        self, node_name: str,
+        model_kwargs: dict | None = None,
+    ) -> dict[str, SamplingConfig]:
+        """The Talker's CodePredictor samples residual codec groups 1..N-1 with
+        its own params (the Talker LLM samples group 0 via the main config)."""
+        if node_name != "Talker":
+            return {}
+        model_kwargs = model_kwargs or {}
+        # No vocab_size: the depth loop applies no repetition penalty, so the
+        # seen-token mask buffers aren't allocated for this label.
+        return {
+            "code_predictor": SamplingConfig(
+                temperature=model_kwargs.get("code_predictor_temperature", 1.0),
+                top_k=model_kwargs.get("code_predictor_top_k", 50),
+                top_p=model_kwargs.get("code_predictor_top_p", 0.8),
+            )
+        }
+
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         # Qwen3-Omni's Code2Wav vocoder emits speech at 24 kHz.
         return 24000

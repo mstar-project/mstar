@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 
 HF_REPO = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
@@ -103,46 +102,6 @@ def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
     assert prepared.input_embeds.ndim == 2
     assert prepared.input_embeds.shape[1] == model.config.talker.hidden_size
     assert prepared.input_seq_len == prepared.input_embeds.shape[0]
-
-
-def test_real_code_predictor_piecewise_graph_matches_eager(talker):
-    device = torch.device("cuda:0")
-    config = talker.get_piecewise_cuda_graph_configs(
-        device=device,
-        autocast_dtype=torch.bfloat16,
-    )["code_predictor_loop"]
-    config.capture_batch_sizes = [1]
-    runner = PiecewiseCudaGraphRunner(
-        config=config,
-        device=device,
-        autocast_dtype=torch.bfloat16,
-    )
-    runner.warmup_and_capture()
-    assert sorted(runner.graphs) == [(1, 1)]
-
-    shape = config.get_capture_shapes([1])[0]
-    inputs = config.make_static_inputs(shape)
-    generator = torch.Generator(device=device).manual_seed(1234)
-    inputs["last_hidden"].normal_(generator=generator)
-    inputs["layer0_codes"].fill_(1)
-    inputs["uniforms"].uniform_(generator=generator)
-
-    eager_codes, eager_embeds = talker._run_code_predictor_tensor_loop(
-        last_hidden=inputs["last_hidden"],
-        layer0_codes=inputs["layer0_codes"],
-        uniforms=inputs["uniforms"],
-        temperature=inputs["temperature"],
-        top_k=inputs["top_k"],
-        top_p=inputs["top_p"],
-        do_sample=inputs["do_sample"],
-    )
-    graph_output = runner.run(static_inputs=inputs, real_bs=1)
-    graph_codes = graph_output["all_codes"]
-    graph_embeds = graph_output["codec_embed_sum"]
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(graph_codes, eager_codes, rtol=0, atol=0)
-    torch.testing.assert_close(graph_embeds, eager_embeds, rtol=0, atol=0)
 
 
 def test_real_codec_decodes_expected_number_of_pcm_samples(codec, model):

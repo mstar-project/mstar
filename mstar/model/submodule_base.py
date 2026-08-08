@@ -338,7 +338,7 @@ class NodeSubmodule(torch.nn.Module):
         return []
 
     def get_piecewise_cuda_graph_configs(
-        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """Return the piecewise CUDA graph configs this submodule opts into.
 
@@ -356,6 +356,12 @@ class NodeSubmodule(torch.nn.Module):
             runner = engine_inputs.piecewise_runners.get("block_loop")
             if runner is not None and runner.can_run(bs):
                 out = runner.run(static_inputs={...}, request_ids=..., seq_lens=...)
+
+        A config that sets ``uses_sampler=True`` has the engine's per-node
+        sampler buffers wired into its runner, which passes a ``sampler`` into
+        the config's ``capture_fn`` so sampling can live INSIDE the capture
+        (params are read straight from buffers whose addresses are stable across
+        replays) instead of being hoisted out as static inputs.
 
         Default: no piecewise graphs. Override to return
         ``{label: PiecewiseCudaGraphConfig}``; multiple labels capture multiple
