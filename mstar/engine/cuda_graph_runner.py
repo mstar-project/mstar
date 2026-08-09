@@ -2434,7 +2434,9 @@ class PiecewiseCudaGraphRunner:
     - FlashInfer wrappers are PERSISTENT (created once per bucket at capture).
     - plan_attention is called OUTSIDE the graph before each replay.
     - advance_seq_lens is called OUTSIDE the graph after each replay.
-    - KV state is swapped onto dummy slots before replay and restored after.
+    - The cache manager is addressed at the real request ids before each
+      replay; padding rows keep the capture-time ids and their pages are
+      freed after the step.
     """
 
     DEFAULT_CAPTURE_BATCH_SIZES = DEFAULT_AR_CAPTURE_BATCH_SIZES
@@ -2757,10 +2759,11 @@ class PiecewiseCudaGraphRunner:
         Steps (mirroring CudaGraphRunner._run_basic_batched):
           1. Copy each real input tensor into the runner-owned static buffer of
              the same name (zeroing any padded tail).
-          2. Swap real KV states onto dummy slots + plan_attention (if KV).
+          2. Address the cache manager at the real request ids + plan_attention
+             (if KV); padding rows keep the capture-time ids.
           3. graph.replay().
           4. advance_seq_lens (Python-only, outside graph).
-          5. Restore dummy states.
+          5. Release the slot: capture addressing back, padding pages freed.
           6. Return a ``PiecewiseOutput`` over the captured output buffers.
 
         ``real_bs`` is inferred from ``request_ids`` or ``seq_lens`` when not
@@ -2800,55 +2803,63 @@ class PiecewiseCudaGraphRunner:
             if n < buf.shape[0]:
                 buf[n:].zero_()
 
-        # --- 2: KV state swap + plan_attention ---
+        # --- 2: address the slot at the step's request ids + plan_attention ---
         static_cm = data.static_cache_manager
-        if static_cm is not None and request_ids is not None:
-            for i, rid in enumerate(request_ids):
-                dummy_rid = data.dummy_rids[i]
+        addressed = False
+        try:
+            if static_cm is not None and request_ids is not None:
+                step_ids = list(request_ids) + data.dummy_rids[len(request_ids):]
+                static_cm.request_ids = step_ids
+                static_cm.active_labels = {
+                    rid: self.cache_labels[0] for rid in step_ids
+                }
+                addressed = True
+                self._plan(
+                    static_cm,
+                    data.shape,
+                    seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
+                )
+
+            if self.sampler_buffer is not None and request_ids is not None:
+                # TODO: add "gather_seen_tokens" as an explicit flag in the piecewise cuda
+                # graph config so we don't do unnecessary work here
+                self.sampler_buffer.gather_for_request_ids(
+                    request_ids=request_ids, padded_bs=data.shape.bs,
+                    gather_seen_tokens=True,
+                )
+
+            # --- 3: replay ---
+            data.graph.replay()
+
+            if self.sampler_buffer is not None and request_ids is not None:
+                # Persist the in-graph-advanced RNG offsets back to their slot
+                # masters (mirrors the gather above; GPU-only, real rows only).
+                self.sampler_buffer.scatter_offsets()
+
+            # --- 4: advance seq_lens (Python-only, post-replay) ---
+            # Uses the per-request lengths planned in step 2, so this is correct for
+            # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
+            # config.advance_seq_lens=False when the caller advances the cache itself.
+            if (
+                self.config.advance_seq_lens
+                and static_cm is not None
+                and request_ids is not None
+            ):
                 for label in self.cache_labels:
-                    real_state = self.alloc_manager.get_state(rid, label)
-                    self.alloc_manager.get_state(dummy_rid, label)  # ensure slot exists
-                    self.alloc_manager.request_states[dummy_rid][label] = real_state
-            self._plan(
-                static_cm,
-                data.shape,
-                seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
-            )
-
-        if self.sampler_buffer is not None and request_ids is not None:
-            # TODO: add "gather_seen_tokens" as an explicit flag in the piecewise cuda
-            # graph config so we don't do unnecessary work here
-            self.sampler_buffer.gather_for_request_ids(
-                request_ids=request_ids, padded_bs=data.shape.bs,
-                gather_seen_tokens=True,
-            )
-
-        # --- 3: replay ---
-        data.graph.replay()
-
-        if self.sampler_buffer is not None and request_ids is not None:
-            # Persist the in-graph-advanced RNG offsets back to their slot
-            # masters (mirrors the gather above; GPU-only, real rows only).
-            self.sampler_buffer.scatter_offsets()
-
-        # --- 4: advance seq_lens (Python-only, post-replay) ---
-        # Uses the per-request lengths planned in step 2, so this is correct for
-        # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
-        # config.advance_seq_lens=False when the caller advances the cache itself.
-        if (
-            self.config.advance_seq_lens
-            and static_cm is not None
-            and request_ids is not None
-        ):
-            for label in self.cache_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
-
-        # --- 5: restore dummy states ---
-        if static_cm is not None and request_ids is not None:
-            for i, dummy_rid in enumerate(data.dummy_rids):
-                for label in self.cache_labels:
-                    self.alloc_manager.reset_label(dummy_rid, label, free=i >= real_bs)
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
+        finally:
+            # --- 5: release the slot (capture addressing back, padding freed) ---
+            if addressed:
+                static_cm.request_ids = list(data.dummy_rids)
+                static_cm.active_labels = {
+                    rid: self.cache_labels[0] for rid in data.dummy_rids
+                }
+                for i in range(real_bs, len(data.dummy_rids)):
+                    for label in self.cache_labels:
+                        self.alloc_manager.reset_label(
+                            data.dummy_rids[i], label, free=True,
+                        )
 
         # --- 6: return output view ---
         real_len = real_total_tokens if is_packed else real_bs
