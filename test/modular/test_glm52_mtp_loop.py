@@ -69,9 +69,14 @@ class _StubTrunkRunner:
         self.calls += 1
         # preprocess skipped its plan (replay decision) — the runner owns it.
         self.handle.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
-        hidden = self.sub._hidden(
-            static_inputs["input_ids"], static_inputs["position_ids"], self.handle)
-        return {"hidden": hidden.clone(), "logits": self.sub.lm_head(hidden).clone()}
+        hidden, prenorm = self.sub._hidden(
+            static_inputs["input_ids"], static_inputs["position_ids"],
+            self.handle, with_prenorm=True)
+        return {
+            "hidden": hidden.clone(),
+            "prenorm": prenorm.clone(),
+            "logits": self.sub.lm_head(hidden).clone(),
+        }
 
 
 def _mtp_cfg(k: int) -> Glm52ModelConfig:

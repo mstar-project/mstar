@@ -98,14 +98,18 @@ class Glm52MTPModule(nn.Module):
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
         dsa_ctx: Glm52DsaForwardContext | None = None,
-    ) -> torch.Tensor:
-        """Returns the normed hidden state — logits are
-        ``lm_head(output)``, applied by the caller that owns the head."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(head_input, raw_hidden)``: the shared_head-normed
+        state for ``lm_head`` (applied by the caller that owns the head),
+        and the raw layer output for chaining the next draft iteration —
+        ``hnorm``/``fuse`` expect the UN-normalized stream, exactly as the
+        trunk pairing does (feeding normed hidden double-norms the fusion
+        input; measured to zero out acceptance, 2026-08-09)."""
         hidden_states = self.fuse(token_embeds, prev_hidden)
         hidden_states = self.transformer_layer(
             hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx
         )
-        return self.shared_head(hidden_states)
+        return self.shared_head(hidden_states), hidden_states
 
 
 # Checkpoint sub-keys under ``model.layers.78.`` that belong to the MTP glue

@@ -36,11 +36,20 @@ class Glm52LanguageModel(nn.Module):
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
         dsa_ctx: Glm52DsaForwardContext | None = None,
-    ) -> torch.Tensor:
+        return_prenorm: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``dsa_ctx`` (engine DSA threading, None when dsa_long_context is
         off): layer order IS the IndexShare order — each FULL layer
         overwrites ``dsa_ctx.last_selection`` and the SHARED layers between
-        it and the next FULL layer consume that value."""
+        it and the next FULL layer consume that value.
+
+        ``return_prenorm``: additionally return the raw last-layer hidden
+        BEFORE the final norm as ``(normed, prenorm)``. The MTP plane pairs
+        drafts against this raw stream — its ``hnorm`` is a LEARNED norm
+        over the trunk's un-normalized hidden (DeepSeek-V3 MTP glue);
+        feeding it the final-norm output double-norms the fusion input and
+        was measured to zero out draft acceptance (0.00 over 3584
+        request-steps, 2026-08-09 bench)."""
         hidden_states = self.embed_tokens(input_ids)
         for layer_idx, decoder_layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)
@@ -48,7 +57,10 @@ class Glm52LanguageModel(nn.Module):
                 hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx
             )
         cache_handle.advance_seq_lens()
-        return self.norm(hidden_states)
+        normed = self.norm(hidden_states)
+        if return_prenorm:
+            return normed, hidden_states
+        return normed
 
 
 class Glm52ForCausalLM(nn.Module):

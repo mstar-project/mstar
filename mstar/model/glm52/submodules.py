@@ -321,9 +321,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         — it runs at capture but not at replay, where the runner's own
         post-replay advance takes over (same +k+1 per request)."""
         static_cm.set_active_label(_MAIN)
-        hidden = self._hidden(
-            static_inputs["input_ids"], static_inputs["position_ids"], static_cm)
-        return {"hidden": hidden, "logits": self.lm_head(hidden)}
+        hidden, prenorm = self._hidden(
+            static_inputs["input_ids"], static_inputs["position_ids"], static_cm,
+            with_prenorm=True)
+        return {
+            "hidden": hidden,
+            "prenorm": prenorm,
+            "logits": self.lm_head(hidden),
+        }
 
     def _mtp_trunk_plan(
         self, cache_manager: BatchedCacheManager, shape: PiecewiseCaptureShape,
@@ -464,9 +469,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         cache_handle: BatchedCacheManager,
         dsa_ctx: Glm52DsaForwardContext | None = None,
-    ) -> torch.Tensor:
+        with_prenorm: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.language_model.model(
-            input_ids, cache_handle, position_ids, dsa_ctx=dsa_ctx)
+            input_ids, cache_handle, position_ids, dsa_ctx=dsa_ctx,
+            return_prenorm=with_prenorm)
 
     def forward(
         self,
@@ -564,8 +571,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if graph_walk == "prefill":
             # Prefill stays eager (v1 scope): its tail needs the engine
             # sampler plus the same uncapturable sync/draft phases.
-            hidden = self._hidden(
-                input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
+            hidden, prenorm = self._hidden(
+                input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"),
+                with_prenorm=True)
             # Emit the prefill token through the engine sampler, exactly as
             # flag-off does — bit-parity for the first emitted token.
             qo_indptr_buf = cache_handle.get_qo_indptr_buf(_MAIN)
@@ -588,7 +596,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 self._mtp_emitted[rid] = 1
                 sync_tokens.append(torch.cat(
                     [input_ids[r][1:], new_tokens[i:i + 1]]))
-                pair_hiddens.append(hidden[r])
+                # Pair with the RAW (pre-final-norm) trunk stream — hnorm
+                # is the learned norm for it (post-norm pairing measured
+                # 0.00 acceptance on the real checkpoint).
+                pair_hiddens.append(prenorm[r])
             drafts = self._mtp_sync_and_draft(
                 cache_handle, sync_tokens, pair_hiddens)
             return {
@@ -622,11 +633,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 seq_lens=list(seq_lens),
             )
             hidden = replay["hidden"]
+            prenorm = replay["prenorm"]
             logits = replay["logits"]
         else:
             self._warn_mtp_trunk_eager_once(len(request_ids), sum(seq_lens))
-            hidden = self._hidden(
-                input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
+            hidden, prenorm = self._hidden(
+                input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"),
+                with_prenorm=True)
             logits = self.lm_head(hidden)  # (sum(k+1), vocab)
         results: dict[str, NameToTensorList] = {}
         rewinds: list[int] = []
@@ -659,7 +672,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # processed.
             rewinds.append(m - e)
             sync_tokens.append(emitted)
-            pair_hiddens.append(hidden[r][:e])
+            # RAW trunk rows for the MTP pairing (see prefill branch).
+            pair_hiddens.append(prenorm[r][:e])
             results[rid] = {"new_token": [emitted]}
         self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
@@ -712,7 +726,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             pos_list.extend(range(st - e + 1, st + 1))
         positions = torch.tensor(pos_list, dtype=torch.long, device=device)
         cache_handle.plan_rope(seq_lens=e_list, pos_ids=positions, label=_MAIN)
-        h = mtp(
+        h_head, h_raw = mtp(
             embed(torch.cat(sync_tokens)), torch.cat(pair_hiddens),
             cache_handle, positions,
         )
@@ -720,8 +734,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
         last_rows = torch.tensor(
             e_list, dtype=torch.long, device=device).cumsum(0) - 1
-        prev_h = h.index_select(0, last_rows)          # (B, hid)
-        prev_d = self.lm_head(prev_h).argmax(dim=-1)   # (B,) = draft 1
+        # Head reads the shared_head-normed rows; the CHAIN threads the raw
+        # layer output (hnorm re-norms it next iteration — same convention
+        # as the trunk pairing).
+        prev_h = h_raw.index_select(0, last_rows)      # (B, hid) chain
+        prev_d = self.lm_head(
+            h_head.index_select(0, last_rows)).argmax(dim=-1)  # (B,) draft 1
         draft_cols = [prev_d]
         ones = [1] * num
         for it in range(1, k):
@@ -730,9 +748,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             positions = torch.tensor(
                 [st + it for st in starts], dtype=torch.long, device=device)
             cache_handle.plan_rope(seq_lens=ones, pos_ids=positions, label=_MAIN)
-            prev_h = mtp(embed(prev_d), prev_h, cache_handle, positions)
+            it_head, prev_h = mtp(embed(prev_d), prev_h, cache_handle, positions)
             cache_handle.advance_seq_lens()
-            prev_d = self.lm_head(prev_h).argmax(dim=-1)
+            prev_d = self.lm_head(it_head).argmax(dim=-1)
             draft_cols.append(prev_d)
         if k > 1:
             cache_handle.rewind_seq_lens([k - 1] * num)
