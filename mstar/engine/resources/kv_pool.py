@@ -9,7 +9,12 @@ arena.
 
 import torch
 
-from mstar.engine.kv_store import PageAllocator, PagedAllocationManager
+from mstar.conductor.request_info import SequenceInfo
+from mstar.engine.kv_store import (
+    PageAllocator,
+    PagedAllocationManager,
+    PositionInfo,
+)
 from mstar.engine.resources.base import Reservation, Segment, SequenceView
 
 
@@ -118,6 +123,14 @@ class KVCachePool:
         """Current position counter for one stream, read-only."""
         return self._manager.get_state(request_id, label).position_id_start
 
+    def pos_info(self, request_id: str, label: str) -> PositionInfo:
+        """One stream's stored length and position counter, read-only."""
+        return self._manager.get_state(request_id, label).get_pos_info()
+
+    def labels(self, request_id: str) -> list[str]:
+        """The cache streams currently existing for one request."""
+        return self._manager.get_labels(request_id)
+
     def fork(
         self,
         request_id: str,
@@ -151,3 +164,28 @@ class KVCachePool:
             strict=True,
         ):
             tensor[:, dst_page] = tensor[:, src_page]
+
+    def retrieve(self, request_id: str, label: str, seq_info: SequenceInfo) -> None:
+        """Bring one stream's published state into residency, synchronously.
+        Allocates the pages the published length needs, so it can fail like
+        any admit."""
+        self._manager.sync_retrieve(request_id, label, seq_info)
+
+    def publish(self, request_id: str) -> dict[str, SequenceInfo]:
+        """Describe the request's durable streams to another process, one
+        ``SequenceInfo`` per label. Waits out any in-flight retrieves first
+        so the description never covers half-arrived pages."""
+        manager = self._manager
+        transfer_info = manager.get_kv_transfer_info()
+        per_label_seq_info: dict[str, SequenceInfo] = {}
+        for label in list(manager.request_states.get(request_id, {})):
+            manager.wait_for_retrieves(request_id, label)
+
+            state = manager.get_state(request_id, label)
+            per_label_seq_info[label] = SequenceInfo(
+                seq_len=state.seq_len,
+                pos_id=state.position_id_start,
+                latest_kv_transfer_info=transfer_info,
+                page_indices=state.page_indices,
+            )
+        return per_label_seq_info

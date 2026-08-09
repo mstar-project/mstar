@@ -36,6 +36,8 @@ from mstar.engine.kv_store import (
     StoreWritePolicy,
     TransferEngineInfo,
 )
+from mstar.engine.resources import KVCachePool, RopeEmbedder
+from mstar.engine.resources.step import StepPlan, StepRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mstar.utils.profiler import range_pop, range_push
 from mstar.utils.sampling import MultiSampler, MultiSamplingConfig
@@ -57,6 +59,13 @@ class KVManagement:
     # sources); precomputed at build time since it can't change after
     # startup, so per-request add/remove doesn't re-walk cross_pools.
     cross_alloc_managers: list[PagedAllocationManager] = field(default_factory=list)
+    # Persistent resource fronts over the managers above: the pool is the
+    # engine's surface for admission, retrieval, position reads, and
+    # publishing; the embedder owns position semantics. Built once at
+    # load_model and shared by every step's facade.
+    kv_pool: KVCachePool | None = None
+    cross_kv_pools: dict[str, KVCachePool] = field(default_factory=dict)
+    rope_embedder: RopeEmbedder | None = None
 
 
 def _build_cross_pools(
@@ -154,6 +163,10 @@ class KVCacheEngine(BaseEngine):
 
         self.kv_management: dict[str, KVManagement] = {}
         self.submodule_management: dict[str, SubmoduleManagement] = {}
+
+        # Sequences each batch's resource lifecycle: admit before prepare,
+        # plan surface before forward, publish after.
+        self.step_runner = StepRunner()
 
         self.device = None
         self.autocast_dtype = autocast_dtype
@@ -256,14 +269,15 @@ class KVCacheEngine(BaseEngine):
                 if all(pool.alloc_manager is not m for m in cross_alloc_managers):
                     cross_alloc_managers.append(pool.alloc_manager)
 
+            alloc_manager = PagedAllocationManager(
+                config=cfg,
+                kv_cache=kv_cache,
+                transfer_engine_info=transfer_engine_info
+            )
             kv_mgmt = KVManagement(
                 kv_cache_config=cfg,
                 kv_cache=kv_cache,
-                alloc_manager=PagedAllocationManager(
-                    config=cfg,
-                    kv_cache=kv_cache,
-                    transfer_engine_info=transfer_engine_info
-                ),
+                alloc_manager=alloc_manager,
                 cpu_page_pool=cpu_page_pool,
                 buffer_manager = WorkspaceBufferManager(
                     int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024,
@@ -271,6 +285,12 @@ class KVCacheEngine(BaseEngine):
                 ),
                 cross_pools=cross_pools,
                 cross_alloc_managers=cross_alloc_managers,
+                kv_pool=KVCachePool(alloc_manager),
+                cross_kv_pools={
+                    source: KVCachePool(pool.alloc_manager)
+                    for source, pool in cross_pools.items()
+                },
+                rope_embedder=RopeEmbedder(),
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
 
@@ -316,6 +336,9 @@ class KVCacheEngine(BaseEngine):
             auto_write_store=autowrite,
             enable_nvtx=self.enable_nvtx,
             cross_pools=cache_mgmt.cross_pools,
+            kv_pool=cache_mgmt.kv_pool,
+            cross_kv_pools=cache_mgmt.cross_kv_pools,
+            rope_embedder=cache_mgmt.rope_embedder,
         )
 
     def _compile_submodules(self) -> None:
@@ -517,11 +540,9 @@ class KVCacheEngine(BaseEngine):
     def _execute_batched(
         self, batch: NodeBatch, submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs], sampler: MultiSampler,
+        cache_manager: BatchedCacheManager,
     ) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
-        cache_manager = self._create_cache_manager(
-            batch.request_ids, batch.node_name
-        )
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
@@ -639,13 +660,14 @@ class KVCacheEngine(BaseEngine):
         submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs],
         sampler: MultiSampler,
+        cache_managers: list[BatchedCacheManager],
     ) -> NodeOutput:
         """Original per-request execution with CacheHandle."""
         per_request_outputs = {}
 
-        for rid, node_inputs in zip(batch.request_ids, inputs, strict=True):
-            cache_manager = self._create_cache_manager([rid], batch.node_name)
-            inputs = batch.per_request_input_tensors.get(rid, {})
+        for rid, node_inputs, cache_manager in zip(
+            batch.request_ids, inputs, cache_managers, strict=True
+        ):
             engine_inputs = ModelInputsFromEngine(
                 request_ids=[rid],
                 per_request_info={
@@ -869,30 +891,27 @@ class KVCacheEngine(BaseEngine):
                 range_pop()
 
     def finalize_batch(self, batch: NodeBatch) -> None:
-        """Mirror this engine's per-request KV seq_info back onto
+        """Publish each request's durable pool state onto
         ``batch.per_request_info`` so the next iter / conductor sees the
         updated page indices, seq_len, and position_id_start.
 
         Safe to call after a successful forward, after an allocation
-        failure, or after an unrelated exception — the writeback reads
-        the alloc manager's current state, which always reflects whatever
-        progress this batch made.
+        failure, or after an unrelated exception — publish describes the
+        pool's current state, which always reflects whatever progress this
+        batch made.
         """
         if batch.node_name not in self.submodule_management:
             return
         submod_mgmt = self.submodule_management[batch.node_name]
         cache_mgmt = submod_mgmt.kv_management
-        kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
-        for req_id in batch.request_ids:
-            info = batch.per_request_info.get(req_id)
-            if info is None:
-                continue
-            info.per_label_seq_info.add(
-                kv_cache_string,
-                submod_mgmt.tp_group.rank,
-                submod_mgmt.tp_group.world_size,
-                cache_mgmt.alloc_manager.get_per_label_seq_info(req_id),
-            )
+        self.step_runner.publish(
+            request_ids=batch.request_ids,
+            per_request_info=batch.per_request_info,
+            pool=cache_mgmt.kv_pool,
+            kv_cache_string=cache_mgmt.kv_cache_config.get_node_str(),
+            tp_rank=submod_mgmt.tp_group.rank,
+            tp_world_size=submod_mgmt.tp_group.world_size,
+        )
 
     def prepare_batch(self, batch: NodeBatch) -> PreparedBatch:
         """KV sync retrieve, per-request sampler config, then per-rid
@@ -912,18 +931,14 @@ class KVCacheEngine(BaseEngine):
 
         if self.enable_nvtx:
             range_push("kv_cache.kv_sync_retrieve", synchronize=False)
-        world_size = submod_mgmt.tp_group.world_size
-        for req_id, info in batch.per_request_info.items():
-            if info.per_label_seq_info.world_size.get(kv_cache_string, world_size) != world_size:
-                raise RuntimeError(
-                    "KV cache transfer across TP world size is currently disallowed"
-                ) # TODO: figure out fanin/fanout for KV cache transfer
-            for label, seq_info in info.per_label_seq_info.get(
-                kv_cache_string, submod_mgmt.tp_group.rank
-            ).items():
-                if needed_labels is not None and label not in needed_labels:
-                    continue
-                cache_mgmt.alloc_manager.sync_retrieve(req_id, label, seq_info)
+        self.step_runner.admit(
+            per_request_info=batch.per_request_info,
+            pool=cache_mgmt.kv_pool,
+            kv_cache_string=kv_cache_string,
+            tp_rank=submod_mgmt.tp_group.rank,
+            tp_world_size=submod_mgmt.tp_group.world_size,
+            needed_labels=needed_labels,
+        )
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -949,11 +964,9 @@ class KVCacheEngine(BaseEngine):
             range_push("kv_cache.prepare_inputs")
         for rid in batch.request_ids:
             try:
-                labels = cache_mgmt.alloc_manager.get_labels(rid)
                 pos_info = {
-                    label: cache_mgmt.alloc_manager.get_state(
-                        rid, label
-                    ).get_pos_info() for label in labels
+                    label: cache_mgmt.kv_pool.pos_info(rid, label)
+                    for label in cache_mgmt.kv_pool.labels(rid)
                 }
                 req_inputs = submodule.prepare_inputs(
                     graph_walk=batch.graph_walk,
@@ -998,12 +1011,43 @@ class KVCacheEngine(BaseEngine):
             failed_requests=failed
         )
 
-    def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
-        """Dispatch CUDA-graph / batched / sequential.
+    def plan_batch(self, prepared: PreparedBatch) -> PlannedBatch:
+        """Choose the execution path and build the step's plan surface.
 
         Priority: CUDA graph (largest single launch) > batched (single
-        FlashInfer plan + forward) > sequential (per-rid fallback).
+        FlashInfer plan + forward) > sequential (per-rid fallback). The
+        graph path keeps its captured surface inside the runner; the eager
+        paths get their cache-manager facades built here, before the
+        forward, so the model's plan calls in preprocess land on a surface
+        whose pools were admitted first.
         """
+        batch = prepared.batch
+        submodule = prepared.submodule
+        node_inputs = prepared.node_inputs
+
+        if not batch.request_ids:
+            return PlannedBatch(
+                prepared=prepared, metadata={"step": StepPlan(mode="sequential")}
+            )
+
+        if self._can_use_cuda_graph(batch, node_inputs):
+            mode = "graph"
+        elif submodule.can_batch(batch, node_inputs):
+            mode = "batched"
+        else:
+            mode = "sequential"
+
+        step = self.step_runner.plan(
+            mode=mode,
+            request_ids=batch.request_ids,
+            build_manager=lambda rids: self._create_cache_manager(
+                rids, batch.node_name
+            ),
+        )
+        return PlannedBatch(prepared=prepared, metadata={"step": step})
+
+    def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
+        """Run the batch on the path ``plan_batch`` chose."""
         batch = planned.batch
         submodule = planned.submodule
         node_inputs = planned.node_inputs
@@ -1015,7 +1059,8 @@ class KVCacheEngine(BaseEngine):
 
         submod_mgmt.tp_group.barrier()
 
-        if self._can_use_cuda_graph(batch, node_inputs):
+        step: StepPlan = planned.metadata["step"]
+        if step.mode == "graph":
             if self.enable_nvtx:
                 range_push("kv_cache.cuda_graph_path", synchronize=False)
             try:
@@ -1023,12 +1068,13 @@ class KVCacheEngine(BaseEngine):
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
-        elif submodule.can_batch(batch, node_inputs):
+        elif step.mode == "batched":
             if self.enable_nvtx:
                 range_push("kv_cache.batched_path", synchronize=False)
             try:
                 output = self._execute_batched(
-                    batch, submodule, node_inputs, sampler=sampler
+                    batch, submodule, node_inputs, sampler=sampler,
+                    cache_manager=step.cache_manager,
                 )
             finally:
                 if self.enable_nvtx:
@@ -1038,7 +1084,8 @@ class KVCacheEngine(BaseEngine):
                 range_push("kv_cache.sequential_path", synchronize=False)
             try:
                 output = self._execute_sequential(
-                    batch, submodule, node_inputs, sampler=sampler
+                    batch, submodule, node_inputs, sampler=sampler,
+                    cache_managers=step.per_request_managers,
                 )
             finally:
                 if self.enable_nvtx:

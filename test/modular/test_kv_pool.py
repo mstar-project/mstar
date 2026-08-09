@@ -18,6 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.conductor.request_info import SequenceInfo
 from mstar.engine.kv_store import (
     AllocationFailedError,
     KVCacheConfig,
@@ -33,6 +34,20 @@ from mstar.engine.resources import (
     Segment,
     SequenceView,
 )
+
+
+class _StubTransferEngine:
+    """Transfer engine that never actually moves bytes: reads complete
+    immediately and the transfer descriptor is a sentinel."""
+
+    def __init__(self):
+        self.transfer_info = object()
+
+    def read_batched_async(self, remote_kv_info, read_info):
+        return None
+
+    def get_kv_transfer_info(self):
+        return self.transfer_info
 
 
 def _make_pool(
@@ -55,7 +70,7 @@ def _make_pool(
         torch.zeros(1, max_num_pages, 2, page_size, 1, 1) if with_tensor else None
     )
     manager.write_policy = StoreWritePolicy.ALWAYS
-    manager._kv_transfer_engine = None
+    manager._kv_transfer_engine = _StubTransferEngine()
     manager._offload_stream = None
     manager.pending_reads = {}
     manager._lock = threading.RLock()
@@ -299,6 +314,84 @@ class TestFork:
 
         with pytest.raises(AllocationFailedError):
             pool.fork("r", "main", "snap")
+
+
+class TestRetrieveAndPublish:
+    def test_retrieve_installs_published_state(self):
+        pool, manager = _make_pool(page_size=8)
+        manager.add_request("r", ["main"])
+        seq_info = SequenceInfo(
+            seq_len=12,
+            pos_id=34,
+            latest_kv_transfer_info=object(),
+            page_indices=[5, 6],
+        )
+
+        pool.retrieve("r", "main", seq_info)
+
+        state = manager.get_state("r", "main")
+        assert state.seq_len == 12
+        assert state.position_id_start == 34
+        assert len(state.page_indices) == 2
+        assert state.read_in_progress is False
+
+    def test_publish_describes_every_stream(self):
+        pool, manager = _make_pool(page_size=8)
+        manager.add_request("r", ["main", "cfg"])
+        for label, span, pos in (("main", 12, 12), ("cfg", 3, 0)):
+            segment = Segment("r", label, span)
+            pool.admit(segment)
+            pool.commit(segment, pos_advance=pos)
+
+        published = pool.publish("r")
+
+        assert set(published) == {"main", "cfg"}
+        assert published["main"].seq_len == 12
+        assert published["main"].pos_id == 12
+        assert published["cfg"].seq_len == 3
+        assert published["cfg"].pos_id == 0
+        transfer_info = manager._kv_transfer_engine.transfer_info
+        for label, info in published.items():
+            assert info.latest_kv_transfer_info is transfer_info
+            assert info.page_indices == manager.get_state("r", label).page_indices
+
+    def test_publish_roundtrips_through_retrieve(self):
+        """What one pool publishes, another can retrieve: the consumer ends
+        up with the producer's stored length and position counter."""
+        producer, producer_manager = _make_pool(page_size=8)
+        producer_manager.add_request("r", ["main"])
+        segment = Segment("r", "main", 20)
+        producer.admit(segment)
+        producer.commit(segment)
+
+        consumer, consumer_manager = _make_pool(page_size=8)
+        consumer_manager.add_request("r", ["main"])
+        consumer.retrieve("r", "main", producer.publish("r")["main"])
+
+        assert consumer.view(Segment("r", "main", 0)).length == 20
+        assert consumer.positions("r", "main") == 20
+
+    def test_publish_unknown_request_is_empty(self):
+        pool, _ = _make_pool()
+        assert pool.publish("ghost") == {}
+
+
+class TestPosInfoAndLabels:
+    def test_pos_info_reads_one_stream(self):
+        pool, manager = _make_pool()
+        manager.add_request("r", ["main"])
+        segment = Segment("r", "main", 9)
+        pool.admit(segment)
+        pool.commit(segment, pos_advance=4)
+
+        info = pool.pos_info("r", "main")
+        assert info.full_seq_len == 9
+        assert info.position_id_start == 4
+
+    def test_labels_lists_the_request_streams(self):
+        pool, manager = _make_pool()
+        manager.add_request("r", ["main", "cfg"])
+        assert pool.labels("r") == ["main", "cfg"]
 
 
 class TestBoundaryValuesAreImmutable:

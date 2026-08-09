@@ -12,6 +12,7 @@ from mstar.engine.resources.base import (
 )
 from mstar.engine.resources.kv_pool import KVCachePool, PageArena
 from mstar.engine.resources.positions import RopeEmbedder
+from mstar.engine.resources.step import StepPlan, StepRunner
 
 __all__ = [
     "CrossAttentionManager",
@@ -24,5 +25,7 @@ __all__ = [
     "RopeEmbedder",
     "Segment",
     "SequenceView",
+    "StepPlan",
+    "StepRunner",
     "WorkspaceBufferManager",
 ]
