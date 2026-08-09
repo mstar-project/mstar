@@ -21,7 +21,8 @@ Scaffold status (bring-up order, per docs/adding_models.rst):
         dsa_long_context flag, per-request bf16 indexer k-store, sparse
         gather-and-dense decode beyond index_topk; prefill prompts must
         still fit topk, sparse prefill + fp8 paged k-pool are follow-ups)
-    [ ] MTP speculation (Phase D; layer-78 weights consciously skipped)
+    [x] MTP speculation (M3: draft-then-verify decode + KV rewind; trunk
+        verify forward CUDA-graph captured piecewise, drafts eager)
     [ ] fused fp8 expert kernel (M4 perf debt; reference dispatch until then)
 """
 

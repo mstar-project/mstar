@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -12,7 +13,12 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
 from mstar.engine.cache_manager import BatchedCacheManager
-from mstar.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
+from mstar.engine.cuda_graph_config import (
+    FlashInferPackedCudaGraphConfig,
+    PiecewiseCaptureShape,
+    PiecewiseConfigType,
+    PiecewiseCudaGraphConfig,
+)
 from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mstar.engine.kv_store import PositionInfo
 from mstar.model.glm52.config import Glm52ModelConfig
@@ -32,6 +38,38 @@ from mstar.utils.sampling import Sampler
 logger = logging.getLogger(__name__)
 
 _MAIN = "main"
+# Piecewise-graph label for the MTP decode step's trunk verify forward.
+MTP_TRUNK_LABEL = "mtp_trunk"
+
+
+@dataclass(kw_only=True)
+class Glm52MtpTrunkGraphConfig(PiecewiseCudaGraphConfig):
+    """PACKED piecewise config with exactly one (bs, [k+1]*bs) bucket per
+    capture batch size.
+
+    Every MTP decode step feeds exactly k+1 rows per request (last emitted
+    token + k drafts), so the generic ``PiecewisePackedConfig`` bs x
+    token-bucket cross product would enumerate shapes that can never occur.
+    PACKED (not BATCHED) because the trunk is row-packed — replay must
+    slice outputs to the real token count and pad absent requests with
+    zero-length plan rows rather than whole capture-length rows.
+    """
+    rows_per_request: int
+
+    def get_config_type(self) -> PiecewiseConfigType:
+        return PiecewiseConfigType.PACKED
+
+    def get_capture_shapes(
+        self, batch_sizes: list[int],
+    ) -> list[PiecewiseCaptureShape]:
+        return [
+            PiecewiseCaptureShape(
+                bs=bs,
+                seq_lens=[self.rows_per_request] * bs,
+                total_tokens=self.rows_per_request * bs,
+            )
+            for bs in batch_sizes
+        ]
 
 
 class Glm52LLMSubmodule(ARNodeSubmodule):
@@ -57,6 +95,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_emitted: dict[str, int] = {}
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
+        # One-shot flag: warn the first time an MTP decode trunk runs eager
+        # (no captured piecewise bucket) — the 2026-08-09 bench showed that
+        # regression is 13x and silence lets it masquerade as "MTP is slow".
+        self._mtp_trunk_eager_warned = False
+        # Acceptance instrumentation (global, not per-request): raw emitted
+        # tokens (n_accepted + 1, pre-truncation) and request-step count.
+        self._mtp_stat_emitted = 0
+        self._mtp_stat_steps = 0
+        self._mtp_stat_logged = 0
 
     def set_load_heartbeat_stop(self, stop) -> None:
         """Adopt the load-time GPU liveness tick; stopped on first forward."""
@@ -93,6 +140,25 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             if isinstance(module, Glm52SparseMoeBlock):
                 return bool(getattr(module, "_use_fused", False))
         return False
+
+    def _moe_capture_blocked(self, tp_world_size: int) -> bool:
+        """The reference MoE dispatch paths (fp8-resident per-hit-expert
+        loop; naive bf16 loop under TP) use .nonzero()/host loops — illegal
+        under CUDA-graph stream capture. Capturing would fail for every
+        bucket, leave runner.graphs empty, and serve eagerly anyway;
+        registering no configs makes eager-only serving explicit. The fused
+        fused_experts_fp8 path IS capture-safe: when the loaded MoE blocks
+        resolved to it (moe_quant_kernel triton/auto-on-cuda), graphs come
+        back. Called post-load, so the resolved flag is authoritative.
+        Shared by the full-forward and MTP-trunk piecewise config gates —
+        the trunk forward contains the same MoE dispatch."""
+        fp8_reference = (
+            self.config.quantization_config is not None
+            and self.config.moe_fp8_resident
+            and not self._moe_resolved_fused()
+        )
+        naive_tp = self.config.quantization_config is None and tp_world_size > 1
+        return fp8_reference or naive_tp
 
     def _build_prefill_packed(
         self, num_tokens: int, device: torch.device,
@@ -133,21 +199,27 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # upkeep, corrupting every later selection. Eager-only until the
             # fp8 paged k-pool + captured-scatter follow-up.
             return []
-        # The reference MoE dispatch paths (fp8-resident per-hit-expert loop;
-        # naive bf16 loop under TP) use .nonzero()/host loops — illegal under
-        # CUDA-graph stream capture. Capturing would fail for every bucket,
-        # leave runner.graphs empty, and serve eagerly anyway; registering
-        # no configs makes eager-only serving explicit. The fused
-        # fused_experts_fp8 path IS capture-safe: when the loaded MoE blocks
-        # resolved to it (moe_quant_kernel triton/auto-on-cuda), graphs come
-        # back. Called post-load, so the resolved flag is authoritative.
-        fp8_reference = (
-            self.config.quantization_config is not None
-            and self.config.moe_fp8_resident
-            and not self._moe_resolved_fused()
-        )
-        naive_tp = self.config.quantization_config is None and tp_world_size > 1
-        if fp8_reference or naive_tp:
+        if self._moe_capture_blocked(tp_world_size):
+            return []
+        if self.config.mtp_num_draft_tokens > 0:
+            # The MTP step's host phases — greedy verify (a device→host
+            # sync), KV rewind, per-request emission bookkeeping, and the
+            # draft loop's in-forward re-plans — are not stream-capturable,
+            # and the packed prefill capture path never runs preprocess, so
+            # full-forward captures with MTP on crash during warmup (the
+            # seq_lens assert). Measured 2026-08-09: all 296 captures
+            # failed and the whole decode silently served eager, 3.39 vs
+            # 43.09 tok/s. The capturable heavy half — the trunk verify
+            # forward over (bs, k+1) rows — registers as a piecewise graph
+            # instead (get_piecewise_cuda_graph_configs); prefill and the
+            # draft iterations stay eager per the config's declared scope.
+            logger.info(
+                "Glm52LLMSubmodule: MTP k=%d — skipping full-forward CUDA "
+                "graphs (host-side verify/rewind is uncapturable); the trunk "
+                "verify forward is captured piecewise, prefill + draft "
+                "iterations run eager.",
+                self.config.mtp_num_draft_tokens,
+            )
             return []
         prefill_buckets = self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS
         prefill_batch_sizes = (
@@ -190,6 +262,84 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             ),
         ]
 
+    MTP_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+
+    def get_piecewise_cuda_graph_configs(
+        self,
+        device: torch.device,
+        autocast_dtype: torch.dtype,
+        tp_world_size: int = 1,
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        """One piecewise graph (``mtp_trunk``): the MTP decode step's trunk
+        verify forward — embed + 78 layers + lm_head over the packed
+        (bs, k+1) rows. The step's host tail (greedy verify, rewind, MTP
+        sync + draft loop) stays eager in ``_forward_batched_mtp``, which
+        replays this graph in place of the eager ``_hidden``/``lm_head``
+        pair. Same MSTAR_GLM52_GRAPH_COMPILE gate as the full-forward
+        captures so the trunk kernel stack matches the k=0 fast config."""
+        k = self.config.mtp_num_draft_tokens
+        if (
+            k <= 0
+            or self.config.dsa_long_context
+            or self._moe_capture_blocked(tp_world_size)
+        ):
+            return {}
+        rows = k + 1
+
+        def make_static_inputs(
+            shape: PiecewiseCaptureShape,
+        ) -> dict[str, torch.Tensor]:
+            return {
+                "input_ids": torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=device),
+                "position_ids": torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=device),
+            }
+
+        return {
+            MTP_TRUNK_LABEL: Glm52MtpTrunkGraphConfig(
+                rows_per_request=rows,
+                capture_fn=self._mtp_trunk_captured,
+                make_static_inputs=make_static_inputs,
+                plan_fn=self._mtp_trunk_plan,
+                uses_kv_cache=True,
+                cache_labels=[_MAIN],
+                capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
+                compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
+            )
+        }
+
+    def _mtp_trunk_captured(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        static_cm: BatchedCacheManager | None = None,
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Captured region for the MTP decode step (PiecewiseCudaGraphRunner
+        contract: read static buffers, return name->tensor). The in-forward
+        ``advance_seq_lens`` at the end of the trunk loop is host-only code
+        — it runs at capture but not at replay, where the runner's own
+        post-replay advance takes over (same +k+1 per request)."""
+        static_cm.set_active_label(_MAIN)
+        hidden = self._hidden(
+            static_inputs["input_ids"], static_inputs["position_ids"], static_cm)
+        return {"hidden": hidden, "logits": self.lm_head(hidden)}
+
+    def _mtp_trunk_plan(
+        self, cache_manager: BatchedCacheManager, shape: PiecewiseCaptureShape,
+    ) -> None:
+        """Outside-the-graph plan for capture and every replay: attention +
+        rope on the trunk label, mirroring ``preprocess`` (which skips its
+        own plan when the trunk is about to replay — this one, against the
+        runner's persistent wrappers, is the live plan). At replay the
+        runner has already aliased the real request states onto the dummy
+        slots, so position reads see real counters."""
+        cache_manager.set_active_label(_MAIN)
+        cache_manager.plan_attention(
+            seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
+        cache_manager.plan_rope(
+            seq_lens=shape.seq_lens, pos_ids=None, label=_MAIN)
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -219,9 +369,26 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_manager = engine_inputs.cache_manager
         seq_lens = [inp.input_seq_len for inp in inputs]
 
+        # M3 trunk replay decision, made ONCE here so plan and forward agree:
+        # when the MTP decode trunk will replay its piecewise graph, the
+        # graph's own plan (on its persistent wrappers, from the same aliased
+        # request states) is the live one — the eager plan below would be
+        # dead work on the step-critical path. getattr: older engine-input
+        # stubs (tests) predate the piecewise_runners field.
+        trunk_runner = None
+        if self.config.mtp_num_draft_tokens > 0 and graph_walk == "decode":
+            runners = getattr(engine_inputs, "piecewise_runners", None) or {}
+            candidate = runners.get(MTP_TRUNK_LABEL)
+            if candidate is not None and candidate.can_run(
+                len(inputs), sum(seq_lens)
+            ):
+                trunk_runner = candidate
+
         cache_manager.set_active_label(_MAIN)
-        cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label=_MAIN)
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label=_MAIN)
+        if trunk_runner is None:
+            cache_manager.plan_attention(
+                seq_lens=seq_lens, is_causal=True, label=_MAIN)
+            cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label=_MAIN)
 
         device = self.get_device()
         # With dsa_long_context off, dense MLA equals the reference
@@ -282,6 +449,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "last_token_indices": seq_len_t.cumsum(0) - 1,
             # Per-request row counts for the M3 step (verify slicing).
             "seq_lens": list(seq_lens),
+            # Non-None only when this decode step's trunk replays its
+            # piecewise graph (decision above; forward must not re-decide).
+            "mtp_trunk_runner": trunk_runner,
             "dsa_ctx": Glm52DsaForwardContext(
                 spans=spans, k_store=self._dsa_k_store,
                 needs_selection=needs_selection,
@@ -387,14 +557,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         assert seq_lens is not None, "MTP step needs seq_lens from preprocess"
         request_ids = list(cache_handle.request_ids)
 
-        hidden = self._hidden(
-            input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
-
         row_starts = [0]
         for sl in seq_lens:
             row_starts.append(row_starts[-1] + sl)
 
         if graph_walk == "prefill":
+            # Prefill stays eager (v1 scope): its tail needs the engine
+            # sampler plus the same uncapturable sync/draft phases.
+            hidden = self._hidden(
+                input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
             # Emit the prefill token through the engine sampler, exactly as
             # flag-off does — bit-parity for the first emitted token.
             qo_indptr_buf = cache_handle.get_qo_indptr_buf(_MAIN)
@@ -433,7 +604,30 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             raise ValueError(
                 f"Batched forward not supported for graph walk: {graph_walk!r}")
 
-        logits = self.lm_head(hidden)  # (sum(k+1), vocab)
+        trunk_runner = kwargs.get("mtp_trunk_runner")
+        if trunk_runner is not None:
+            # Replay the captured trunk (embed + layers + lm_head over the
+            # packed (bs, k+1) rows). The runner plans on its persistent
+            # wrappers from the aliased real states, replays, and advances
+            # — the same net bookkeeping as the eager trunk's in-forward
+            # advance. Outputs come back cloned and sliced to the real
+            # token rows. preprocess already skipped its eager plan for
+            # this step (the decision is made once, there).
+            replay = trunk_runner.run(
+                static_inputs={
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                },
+                request_ids=request_ids,
+                seq_lens=list(seq_lens),
+            )
+            hidden = replay["hidden"]
+            logits = replay["logits"]
+        else:
+            self._warn_mtp_trunk_eager_once(len(request_ids), sum(seq_lens))
+            hidden = self._hidden(
+                input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
+            logits = self.lm_head(hidden)  # (sum(k+1), vocab)
         results: dict[str, NameToTensorList] = {}
         rewinds: list[int] = []
         sync_tokens, pair_hiddens = [], []
@@ -444,6 +638,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             drafts_in = r_inputs[1:]
             target_argmax = logits[r].argmax(dim=-1)
             n_acc, bonus = mtp_greedy_verify(drafts_in, target_argmax)
+            # Raw (pre-truncation) emission is the draft-quality signal.
+            self._mtp_stat_steps += 1
+            self._mtp_stat_emitted += n_acc + 1
             emitted = torch.cat([drafts_in[:n_acc], bonus.reshape(1)])
             # Truncate: max_tokens budget first, then first stop id. EOS is
             # always the LAST element after truncation, which is the
@@ -464,6 +661,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             sync_tokens.append(emitted)
             pair_hiddens.append(hidden[r][:e])
             results[rid] = {"new_token": [emitted]}
+        self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
         drafts = self._mtp_sync_and_draft(cache_handle, sync_tokens, pair_hiddens)
         for i, rid in enumerate(request_ids):
@@ -540,6 +738,37 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             cache_handle.rewind_seq_lens([k - 1] * num)
         stacked = torch.stack(draft_cols, dim=1)       # (B, k)
         return [stacked[i] for i in range(num)]
+
+    def _warn_mtp_trunk_eager_once(self, bs: int, num_rows: int) -> None:
+        """The 2026-08-09 lesson: an MTP decode whose trunk silently runs
+        eager is a 13x regression that looks like "MTP is slow". Say it
+        once, loudly, with the likely causes."""
+        if self._mtp_trunk_eager_warned:
+            return
+        self._mtp_trunk_eager_warned = True
+        logger.warning(
+            "MTP decode trunk running EAGER (bs=%d, %d rows): no piecewise "
+            "CUDA graph bucket available — capture failed at warmup, the "
+            "MoE resolved to an uncapturable dispatch path, or bs exceeds "
+            "the captured sizes %s. Expect roughly reference-pace decode.",
+            bs, num_rows, self.MTP_CAPTURE_BATCH_SIZES,
+        )
+
+    _MTP_STAT_LOG_EVERY = 512  # request-steps between acceptance log lines
+
+    def _maybe_log_mtp_acceptance(self) -> None:
+        if self._mtp_stat_steps - self._mtp_stat_logged < self._MTP_STAT_LOG_EVERY:
+            return
+        self._mtp_stat_logged = self._mtp_stat_steps
+        k = self.config.mtp_num_draft_tokens
+        mean_emitted = self._mtp_stat_emitted / self._mtp_stat_steps
+        logger.info(
+            "MTP acceptance: %.2f emitted/step (ceiling %d, plain decode "
+            "would be 1.00) — draft acceptance rate %.2f over %d "
+            "request-steps.",
+            mean_emitted, k + 1, (mean_emitted - 1.0) / k if k else 0.0,
+            self._mtp_stat_steps,
+        )
 
     @staticmethod
     def _sample(

@@ -44,9 +44,34 @@ class _ArgmaxSampler:
 
 
 class _EngineInputs:
-    def __init__(self, cache_manager, sampler):
+    def __init__(self, cache_manager, sampler, piecewise_runners=None):
         self.cache_manager = cache_manager
         self.sampler = sampler
+        self.piecewise_runners = piecewise_runners or {}
+
+
+class _StubTrunkRunner:
+    """Contract double for ``PiecewiseCudaGraphRunner.run`` on the MTP
+    trunk: plans on the (real) handle, runs the trunk eagerly, returns
+    cloned row-sliced outputs — everything the submodule may rely on from
+    a replay, with none of the CUDA. The submodule must produce a
+    bit-identical stream through this seam vs the fully eager path."""
+
+    def __init__(self, sub, handle):
+        self.sub = sub
+        self.handle = handle
+        self.calls = 0
+
+    def can_run(self, batch_size, total_tokens=None):
+        return True
+
+    def run(self, static_inputs, request_ids=None, seq_lens=None, real_bs=None):
+        self.calls += 1
+        # preprocess skipped its plan (replay decision) — the runner owns it.
+        self.handle.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
+        hidden = self.sub._hidden(
+            static_inputs["input_ids"], static_inputs["position_ids"], self.handle)
+        return {"hidden": hidden.clone(), "logits": self.sub.lm_head(hidden).clone()}
 
 
 def _mtp_cfg(k: int) -> Glm52ModelConfig:
@@ -65,9 +90,9 @@ def _fwd_info(max_tokens: int, ignore_eos: bool) -> SimpleNamespace:
     )
 
 
-def _drive(sub, handle, prompt, fwd_info, max_steps=64):
+def _drive(sub, handle, prompt, fwd_info, max_steps=64, runners=None):
     """Run prefill + decode through the submodule protocol until stop."""
-    ei = _EngineInputs(handle, _ArgmaxSampler())
+    ei = _EngineInputs(handle, _ArgmaxSampler(), piecewise_runners=runners)
     emitted = []
     walk, text_inputs, decode_step = "prefill", prompt, 0
     for _ in range(max_steps):
@@ -139,6 +164,121 @@ def test_mtp_eos_truncation_matches_baseline():
     first = (base2 == eos).nonzero()[0, 0]
     assert base2.shape[0] == int(first) + 1
     assert torch.equal(base2, spec2)
+
+
+def test_mtp_trunk_replay_seam_bit_identical():
+    """THE capture-fix property: routing the decode trunk through the
+    piecewise-runner seam (plan -> trunk forward -> cloned outputs, with
+    preprocess skipping its own plan) emits the bit-identical stream to
+    the fully eager MTP path."""
+    torch.manual_seed(0)
+    cfg = _mtp_cfg(2)
+    model = Glm52ForCausalLM(cfg)
+    prompt = torch.arange(5, dtype=torch.long) + 3
+
+    sub_eager = Glm52LLMSubmodule(model, cfg)
+    stream_eager = _drive(
+        sub_eager, ReferenceCacheHandle(["r0"]), prompt, _fwd_info(24, True))
+
+    sub_replay = Glm52LLMSubmodule(model, cfg)
+    handle = ReferenceCacheHandle(["r0"])
+    runner = _StubTrunkRunner(sub_replay, handle)
+    stream_replay = _drive(
+        sub_replay, handle, prompt, _fwd_info(24, True),
+        runners={"mtp_trunk": runner})
+
+    assert runner.calls > 0, "decode trunk never went through the runner seam"
+    assert torch.equal(stream_eager, stream_replay), (
+        f"replay-seam stream diverged: {stream_eager.tolist()} vs "
+        f"{stream_replay.tolist()}")
+
+
+def test_preprocess_skips_plan_only_when_trunk_replays():
+    """The replay decision is made once, in preprocess: with a runnable
+    trunk graph the eager plan is skipped (the runner's plan is the live
+    one) and the runner rides the kwargs; without one, preprocess plans
+    as before and the forward gets None."""
+    torch.manual_seed(0)
+    cfg = _mtp_cfg(2)
+    sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
+    fwd = _fwd_info(10, True)
+    decode_inputs = {"text_inputs": [torch.tensor([1, 2, 3])]}
+
+    handle = ReferenceCacheHandle(["r0"])
+    runner = _StubTrunkRunner(sub, handle)
+    ar = sub.prepare_inputs("decode", fwd, decode_inputs)
+    kw = sub.preprocess(
+        "decode", _EngineInputs(handle, _ArgmaxSampler(), {"mtp_trunk": runner}),
+        [ar])
+    assert kw["mtp_trunk_runner"] is runner
+    assert handle._plan is None, "eager plan should be skipped on replay steps"
+
+    handle2 = ReferenceCacheHandle(["r0"])
+    ar2 = sub.prepare_inputs("decode", fwd, decode_inputs)
+    kw2 = sub.preprocess(
+        "decode", _EngineInputs(handle2, _ArgmaxSampler()), [ar2])
+    assert kw2["mtp_trunk_runner"] is None
+    assert handle2._plan is not None, "eager path must still plan"
+
+
+def test_mtp_disables_full_forward_capture_configs():
+    """With MTP on, no full-forward CUDA-graph configs may register: their
+    warmup captures crash (host-side verify/rewind; packed prefill never
+    runs preprocess) and the failure mode is a silent 13x eager fallback.
+    Flag off keeps the decode + prefill capture pair."""
+    cfg = _mtp_cfg(2)
+    sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
+    assert sub.get_cuda_graph_configs(torch.device("cpu")) == []
+    cfg.mtp_num_draft_tokens = 0
+    assert len(sub.get_cuda_graph_configs(torch.device("cpu"))) == 2
+
+
+def test_mtp_trunk_piecewise_config_shapes():
+    """The trunk graph registers exactly one (bs, [k+1]*bs) PACKED bucket
+    per capture batch size — never the bs x token-bucket cross product."""
+    from mstar.engine.cuda_graph_config import PiecewiseConfigType
+
+    cfg = _mtp_cfg(2)  # rows per request = 3
+    sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
+    configs = sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)
+    assert set(configs) == {"mtp_trunk"}
+    pc = configs["mtp_trunk"]
+    assert pc.get_config_type() == PiecewiseConfigType.PACKED
+    assert pc.uses_kv_cache and pc.cache_labels == ["main"]
+
+    shapes = pc.get_capture_shapes(pc.capture_batch_sizes)
+    assert [(s.bs, s.total_tokens) for s in shapes] == [
+        (1, 3), (2, 6), (4, 12), (8, 24), (16, 48)]
+    assert all(s.seq_lens == [3] * s.bs for s in shapes)
+
+    static = pc.make_static_inputs(shapes[0])
+    assert set(static) == {"input_ids", "position_ids"}
+    assert static["input_ids"].shape == (3,)
+    assert static["input_ids"].dtype == torch.long
+
+    cfg.mtp_num_draft_tokens = 0
+    assert sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1) == {}
+
+
+def test_all_captures_failed_logs_error(caplog):
+    """Zero-of-N captured must be an ERROR naming the eager consequence;
+    partial failure a WARNING; full success silent."""
+    import logging as _logging
+
+    from mstar.engine.cuda_graph_runner import _log_capture_outcome
+
+    with caplog.at_level(
+        _logging.INFO, logger="mstar.engine.cuda_graph_runner",
+    ):
+        _log_capture_outcome("LLM", attempted=296, captured=0)
+        _log_capture_outcome("LLM", attempted=10, captured=7)
+        _log_capture_outcome("LLM", attempted=5, captured=5)
+    errors = [r for r in caplog.records if r.levelno == _logging.ERROR]
+    warns = [r for r in caplog.records if r.levelno == _logging.WARNING]
+    assert len(errors) == 1 and "EAGER" in errors[0].getMessage()
+    assert len(warns) == 1 and "3/10" in warns[0].getMessage()
 
 
 def test_mtp_trunk_kv_and_plane_bookkeeping():

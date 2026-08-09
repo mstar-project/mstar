@@ -12,9 +12,14 @@ model: "glm52"
 # 1.15 KB/token/layer.
 #
 # v1 limits: greedy-only (drafts and verification bypass the sampler);
-# short-context only (mutually exclusive with dsa_long_context); serving
-# is eager for the MTP phases (draft iterations are not captured — CUDA
-# graph shapes for the (batch, k+1) family are the perf follow-up).
+# short-context only (mutually exclusive with dsa_long_context). The
+# trunk verify forward — the (batch, k+1) row family — IS CUDA-graph
+# captured (piecewise, replayed inside the eager MTP step); prefill and
+# the k draft iterations serve eager: their host-side verify/rewind/
+# re-plan phases are not stream-capturable, which is also why MTP
+# registers no full-forward captures at all (a full capture attempt
+# crashes warmup and silently degrades the whole decode to eager —
+# measured 13x on 2026-08-09).
 # k=5 is the vLLM recipe for DeepSeek-family MTP-1 modules.
 max_seq_len: 2048
 dist_timeout_s: 7200
