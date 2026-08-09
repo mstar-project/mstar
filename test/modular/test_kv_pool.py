@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import SequenceInfo
+from mstar.engine.cpu_page_pool import OffloadedState
 from mstar.engine.kv_store import (
     AllocationFailedError,
     KVCacheConfig,
@@ -50,10 +51,51 @@ class _StubTransferEngine:
         return self.transfer_info
 
 
+class _FakeCpuPool:
+    """CPU tier double: tracks offloaded page bookkeeping without pinned
+    memory or GPU copies."""
+
+    def __init__(self, max_pages: int = 16):
+        self.page_allocator = PageAllocator(max_pages)
+        self.offloaded: dict[str, dict[str, OffloadedState]] = {}
+
+    def is_offloaded(self, request_id: str) -> bool:
+        return bool(self.offloaded.get(request_id))
+
+    def offload_pages(
+        self, request_id, label, gpu_kv_cache, gpu_page_indices,
+        seq_len, position_id_start,
+    ) -> None:
+        cpu_pages = self.page_allocator.try_allocate(len(gpu_page_indices))
+        if cpu_pages is None:
+            return
+        self.offloaded.setdefault(request_id, {})[label] = OffloadedState(
+            cpu_page_indices=cpu_pages,
+            seq_len=seq_len,
+            position_id_start=position_id_start,
+        )
+
+    def reload_pages(self, request_id, label, gpu_kv_cache, gpu_page_indices):
+        state = self.offloaded[request_id][label]
+        self.page_allocator.free(state.cpu_page_indices)
+        del self.offloaded[request_id][label]
+        if not self.offloaded[request_id]:
+            del self.offloaded[request_id]
+        return state.seq_len, state.position_id_start
+
+    def sync(self) -> None:
+        return
+
+    def remove_request(self, request_id: str) -> None:
+        for state in self.offloaded.pop(request_id, {}).values():
+            self.page_allocator.free(state.cpu_page_indices)
+
+
 def _make_pool(
     max_num_pages: int = 16,
     page_size: int = 8,
     with_tensor: bool = False,
+    cpu_pool: _FakeCpuPool | None = None,
 ) -> tuple[KVCachePool, PagedAllocationManager]:
     manager = PagedAllocationManager.__new__(PagedAllocationManager)
     manager.config = KVCacheConfig(
@@ -74,7 +116,7 @@ def _make_pool(
     manager._offload_stream = None
     manager.pending_reads = {}
     manager._lock = threading.RLock()
-    return KVCachePool(manager), manager
+    return KVCachePool(manager, cpu_pool=cpu_pool), manager
 
 
 class TestAdmit:
@@ -374,6 +416,90 @@ class TestRetrieveAndPublish:
     def test_publish_unknown_request_is_empty(self):
         pool, _ = _make_pool()
         assert pool.publish("ghost") == {}
+
+
+class TestOffloadTier:
+    def _fill(self, pool, tokens=20):
+        segment = Segment("r", "main", tokens)
+        pool.admit(segment)
+        pool.commit(segment)
+
+    def test_without_tier_the_pool_declines(self):
+        pool, manager = _make_pool()
+        manager.add_request("r", ["main"])
+        self._fill(pool)
+
+        assert pool.supports_offload is False
+        assert pool.offload_candidates() == []
+        assert pool.offload("r") == 0
+        assert pool.is_offloaded("r") is False
+        assert pool.reload("r") is False
+
+    def test_candidates_list_page_holding_requests(self):
+        pool, manager = _make_pool(cpu_pool=_FakeCpuPool())
+        manager.add_request("r", ["main"])
+        manager.add_request("empty", ["main"])
+        self._fill(pool, tokens=20)  # 3 pages for "r", none for "empty"
+
+        assert dict(pool.offload_candidates()) == {"r": 3}
+
+    def test_offload_frees_gpu_pages_and_reload_restores(self):
+        pool, manager = _make_pool(with_tensor=True, cpu_pool=_FakeCpuPool())
+        manager.add_request("r", ["main"])
+        self._fill(pool, tokens=20)  # 3 pages
+        free_before = pool.num_free_pages
+
+        freed = pool.offload("r")
+        assert freed == 3
+        assert pool.num_free_pages == free_before + 3
+        assert pool.is_offloaded("r") is True
+        assert manager.get_state("r", "main").page_indices == []
+
+        assert pool.reload("r") is True
+        assert pool.is_offloaded("r") is False
+        state = manager.get_state("r", "main")
+        assert state.seq_len == 20
+        assert len(state.page_indices) == 3
+        assert pool.num_free_pages == free_before
+
+    def test_reload_declines_when_gpu_pages_are_short(self):
+        pool, manager = _make_pool(
+            max_num_pages=3, with_tensor=True, cpu_pool=_FakeCpuPool(),
+        )
+        manager.add_request("r", ["main"])
+        self._fill(pool, tokens=20)  # all 3 pages
+        assert pool.offload("r") == 3
+
+        # Another request takes the freed pages; the reload cannot fit.
+        manager.add_request("greedy", ["main"])
+        greedy = Segment("greedy", "main", 24)
+        pool.admit(greedy)
+        pool.commit(greedy)
+
+        assert pool.reload("r") is False
+        assert pool.is_offloaded("r") is True
+
+    def test_remove_request_clears_the_cpu_tier(self):
+        cpu_pool = _FakeCpuPool(max_pages=4)
+        pool, manager = _make_pool(with_tensor=True, cpu_pool=cpu_pool)
+        manager.add_request("r", ["main"])
+        self._fill(pool, tokens=20)
+        pool.offload("r")
+        assert cpu_pool.page_allocator.num_free == 1
+
+        pool.remove_request("r")
+        assert cpu_pool.page_allocator.num_free == 4
+        assert "r" not in manager.request_states
+
+    def test_write_policy_reaches_the_manager(self):
+        pool, manager = _make_pool()
+        pool.set_write_policy(StoreWritePolicy.NEVER)
+        assert manager.write_policy is StoreWritePolicy.NEVER
+
+    def test_add_request_opens_streams(self):
+        pool, manager = _make_pool()
+        pool.add_request("r", ["main", "cfg"])
+        assert pool.labels("r") == ["main", "cfg"]
 
 
 class TestPosInfoAndLabels:

@@ -52,7 +52,6 @@ class KVManagement:
     kv_cache_config: KVCacheConfig
     kv_cache: torch.Tensor
     alloc_manager: PagedAllocationManager
-    cpu_page_pool: CPUPagePool | None
     buffer_manager: WorkspaceBufferManager
     # source name -> cross-attention context pool (see KVCacheConfig.cross_attn)
     cross_pools: dict[str, CrossAttnPool] = field(default_factory=dict)
@@ -61,9 +60,9 @@ class KVManagement:
     # startup, so per-request add/remove doesn't re-walk cross_pools.
     cross_alloc_managers: list[PagedAllocationManager] = field(default_factory=list)
     # Persistent resource fronts over the managers above: the pool is the
-    # engine's surface for admission, retrieval, position reads, and
-    # publishing; the embedder owns position semantics. Built once at
-    # load_model and shared by every step's facade.
+    # engine's surface for admission, retrieval, offload tiers, position
+    # reads, and publishing; the embedder owns position semantics. Built
+    # once at load_model and shared by every step's facade.
     kv_pool: KVCachePool | None = None
     cross_kv_pools: dict[str, KVCachePool] = field(default_factory=dict)
     rope_embedder: RopeEmbedder | None = None
@@ -183,10 +182,7 @@ class KVCacheEngine(BaseEngine):
         # warnings — logged at most once per (node, graph walk).
         self._logged_missing_rid_outputs: set[tuple[str, str]] = set()
 
-    capabilities = EngineCapabilities(
-        requires_kv_cache=True,
-        supports_cpu_offload=True,
-    )
+    capabilities = EngineCapabilities(requires_kv_cache=True)
 
     def node_resources(self, node_name: str) -> dict[str, object]:
         return self._node_resources.get(node_name, {})
@@ -293,14 +289,13 @@ class KVCacheEngine(BaseEngine):
                 kv_cache_config=cfg,
                 kv_cache=kv_cache,
                 alloc_manager=alloc_manager,
-                cpu_page_pool=cpu_page_pool,
                 buffer_manager = WorkspaceBufferManager(
                     int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024,
                     device=device,
                 ),
                 cross_pools=cross_pools,
                 cross_alloc_managers=cross_alloc_managers,
-                kv_pool=KVCachePool(alloc_manager),
+                kv_pool=KVCachePool(alloc_manager, cpu_pool=cpu_page_pool),
                 cross_kv_pools={
                     source: KVCachePool(pool.alloc_manager)
                     for source, pool in cross_pools.items()
@@ -354,7 +349,6 @@ class KVCacheEngine(BaseEngine):
         submod_mgmt = self.submodule_management[node_name]
         cache_mgmt = submod_mgmt.kv_management
 
-        from mstar.engine.kv_store import StoreWritePolicy
         autowrite = (cache_mgmt.alloc_manager.write_policy == StoreWritePolicy.ALWAYS)
 
         return create_cache_manager(
@@ -1166,12 +1160,10 @@ class KVCacheEngine(BaseEngine):
         submod_mgmt = self.submodule_management[node_name]
         cache_mgmt = submod_mgmt.kv_management
         # If this request was offloaded to CPU, try reloading first
-        if cache_mgmt.cpu_page_pool is not None and cache_mgmt.cpu_page_pool.is_offloaded(request_id):
-            try:
-                cache_mgmt.alloc_manager.reload_request(request_id, cache_mgmt.cpu_page_pool)
-                logger.info("Reloaded offloaded request %s from CPU", request_id)
-            except RuntimeError:
+        if cache_mgmt.kv_pool.is_offloaded(request_id):
+            if not cache_mgmt.kv_pool.reload(request_id):
                 return False  # can't reload yet, not ready
+            logger.info("Reloaded offloaded request %s from CPU", request_id)
 
         needed_labels = self._get_needed_labels(
             node_name, request_info.graph_walk, {
@@ -1329,7 +1321,7 @@ class KVCacheEngine(BaseEngine):
         self, request_id: str, cache_labels: list[str] | None = None,
     ) -> None:
         for submodule_mgmt in self.submodule_management.values():
-            submodule_mgmt.kv_management.alloc_manager.add_request(request_id, cache_labels or ["main"])
+            submodule_mgmt.kv_management.kv_pool.add_request(request_id, cache_labels or ["main"])
             for cross_mgr in submodule_mgmt.kv_management.cross_alloc_managers:
                 cross_mgr.add_request(request_id)
             submodule_mgmt.sampler.add_request(request_id)
@@ -1342,9 +1334,7 @@ class KVCacheEngine(BaseEngine):
     def remove_request(self, request_id: str) -> None:
         for submodule_mgmt in self.submodule_management.values():
             cache_mgmt = submodule_mgmt.kv_management
-            if cache_mgmt.cpu_page_pool is not None:
-                cache_mgmt.cpu_page_pool.remove_request(request_id)
-            cache_mgmt.alloc_manager.remove_request(request_id)
+            cache_mgmt.kv_pool.remove_request(request_id)
             for cross_mgr in cache_mgmt.cross_alloc_managers:
                 cross_mgr.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
@@ -1367,65 +1357,6 @@ class KVCacheEngine(BaseEngine):
         for submodule_mgmt in self.submodule_management.values():
             cache_mgmt = submodule_mgmt.kv_management
             cache_mgmt.alloc_manager.get_state(request_id, cache_label).is_paused = False
-
-    # ── Optional surfaces declared via ``capabilities`` ─────────────────
-
-    def lru_tracked_nodes(self) -> list[str]:
-        return list(self.submodule_management.keys())
-
-    def set_alloc_write_policy(self, policy: StoreWritePolicy) -> None:
-        for submod_mgmt in self.submodule_management.values():
-            submod_mgmt.kv_management.alloc_manager.write_policy = policy
-
-    def offload_candidates(self, node_name: str) -> list[tuple[str, int]]:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None or submod_mgmt.kv_management.cpu_page_pool is None:
-            return []
-        alloc = submod_mgmt.kv_management.alloc_manager
-        out: list[tuple[str, int]] = []
-        for rid, labels in alloc.request_states.items():
-            total_pages = sum(len(s.page_indices) for s in labels.values())
-            if total_pages > 0:
-                out.append((rid, total_pages))
-        return out
-
-    def offload_request(self, node_name: str, request_id: str) -> int:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None:
-            return 0
-        cache_mgmt = submod_mgmt.kv_management
-        if cache_mgmt.cpu_page_pool is None:
-            return 0
-        return cache_mgmt.alloc_manager.offload_request(
-            request_id, cache_mgmt.cpu_page_pool,
-        )
-
-    def reload_request(self, node_name: str, request_id: str) -> bool:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None:
-            return False
-        cache_mgmt = submod_mgmt.kv_management
-        if cache_mgmt.cpu_page_pool is None:
-            return False
-        if not cache_mgmt.cpu_page_pool.is_offloaded(request_id):
-            return False
-        try:
-            cache_mgmt.alloc_manager.reload_request(
-                request_id, cache_mgmt.cpu_page_pool,
-            )
-            return True
-        except RuntimeError:
-            # Not enough GPU pages to reload — caller will retry later.
-            return False
-
-    def is_offloaded(self, node_name: str, request_id: str) -> bool:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None:
-            return False
-        cache_mgmt = submod_mgmt.kv_management
-        if cache_mgmt.cpu_page_pool is None:
-            return False
-        return cache_mgmt.cpu_page_pool.is_offloaded(request_id)
 
     def shutdown(self) -> None:
         for submodule_mgmt in self.submodule_management.values():

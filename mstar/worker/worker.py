@@ -797,11 +797,13 @@ class Worker:
 
         Returns the victim request_id, or None if offloading wasn't possible.
         """
-        engine = self.engine_manager.get_engine(node_name)
-        if not engine.capabilities.supports_cpu_offload:
+        pool = self.engine_manager.get_engine(node_name).node_resources(
+            node_name
+        ).get("kv")
+        if pool is None or not pool.supports_offload:
             return None
 
-        candidates_raw = engine.offload_candidates(node_name)
+        candidates_raw = pool.offload_candidates()
         if not candidates_raw:
             return None
 
@@ -820,7 +822,7 @@ class Worker:
             return None
 
         victim_id = self._select_eviction_victim(node_name, candidates)
-        freed = engine.offload_request(node_name, victim_id)
+        freed = pool.offload(victim_id)
         logger.info(
             "Offloaded request %s to CPU (%d GPU pages freed, "
             "policy=%s, in_batch=%s)",
@@ -851,10 +853,12 @@ class Worker:
 
     def _try_reload_request(self, node_name: str, request_id: str) -> bool:
         """Reload an offloaded request back to GPU. Returns True if reloaded."""
-        engine = self.engine_manager.get_engine(node_name)
-        if not engine.is_offloaded(node_name, request_id):
+        pool = self.engine_manager.get_engine(node_name).node_resources(
+            node_name
+        ).get("kv")
+        if pool is None or not pool.is_offloaded(request_id):
             return False
-        if engine.reload_request(node_name, request_id):
+        if pool.reload(request_id):
             logger.info("Reloaded request %s from CPU to GPU", request_id)
             return True
         logger.debug(

@@ -10,10 +10,12 @@ arena.
 import torch
 
 from mstar.conductor.request_info import SequenceInfo
+from mstar.engine.cpu_page_pool import CPUPagePool
 from mstar.engine.kv_store import (
     PageAllocator,
     PagedAllocationManager,
     PositionInfo,
+    StoreWritePolicy,
 )
 from mstar.engine.resources.base import Reservation, Segment, SequenceView
 
@@ -71,10 +73,19 @@ class KVCachePool:
     (its lock, its request states, its transfer machinery); the pool is the
     surface planning code goes through, so callers stop reaching into
     request-state internals.
+
+    ``cpu_pool`` is the pool's optional CPU tier: with one attached, whole
+    requests can be offloaded there and reloaded later, and the pool
+    answers the offload questions eviction policy asks.
     """
 
-    def __init__(self, manager: PagedAllocationManager):
+    def __init__(
+        self,
+        manager: PagedAllocationManager,
+        cpu_pool: CPUPagePool | None = None,
+    ):
         self._manager = manager
+        self._cpu_pool = cpu_pool
         self._arena = PageArena(
             tensor=manager.kv_cache,
             allocator=manager.page_allocator,
@@ -141,6 +152,59 @@ class KVCachePool:
     def labels(self, request_id: str) -> list[str]:
         """The cache streams currently existing for one request."""
         return self._manager.get_labels(request_id)
+
+    def add_request(self, request_id: str, labels: list[str]) -> None:
+        """Open per-request accounting with the given initial streams."""
+        self._manager.add_request(request_id, labels)
+
+    def remove_request(self, request_id: str) -> None:
+        """Drop a request's accounting on every tier and free its pages."""
+        if self._cpu_pool is not None:
+            self._cpu_pool.remove_request(request_id)
+        self._manager.remove_request(request_id)
+
+    def set_write_policy(self, policy: StoreWritePolicy) -> None:
+        """Set whether committed pages are pushed to the distributed store."""
+        self._manager.write_policy = policy
+
+    @property
+    def supports_offload(self) -> bool:
+        """Whether a CPU tier is attached to offload requests into."""
+        return self._cpu_pool is not None
+
+    def offload_candidates(self) -> list[tuple[str, int]]:
+        """``(request_id, gpu_pages_held)`` for every request holding GPU
+        pages, for eviction-victim selection. Empty without a CPU tier."""
+        if self._cpu_pool is None:
+            return []
+        out: list[tuple[str, int]] = []
+        for request_id, states in self._manager.request_states.items():
+            total_pages = sum(len(s.page_indices) for s in states.values())
+            if total_pages > 0:
+                out.append((request_id, total_pages))
+        return out
+
+    def offload(self, request_id: str) -> int:
+        """Move all of one request's streams to the CPU tier. Returns the
+        number of GPU pages freed (0 without a CPU tier)."""
+        if self._cpu_pool is None:
+            return 0
+        return self._manager.offload_request(request_id, self._cpu_pool)
+
+    def reload(self, request_id: str) -> bool:
+        """Bring an offloaded request back to GPU. False when the request
+        is not offloaded or GPU pages are insufficient right now."""
+        if self._cpu_pool is None or not self._cpu_pool.is_offloaded(request_id):
+            return False
+        try:
+            self._manager.reload_request(request_id, self._cpu_pool)
+            return True
+        except RuntimeError:
+            return False
+
+    def is_offloaded(self, request_id: str) -> bool:
+        """Whether the request currently lives on the CPU tier."""
+        return self._cpu_pool is not None and self._cpu_pool.is_offloaded(request_id)
 
     def fork(
         self,

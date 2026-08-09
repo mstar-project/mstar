@@ -24,7 +24,6 @@ def _mgmt(submodule):
     """A SubmoduleManagement with mocked infra and the given submodule. Uses the
     real dataclass so a field rename breaks the test loudly."""
     kv = MagicMock(name="kv_management")
-    kv.cpu_page_pool = None  # exercise the None branch (skip cpu pool teardown)
     return SubmoduleManagement(
         submodule=submodule,
         kv_management=kv,
@@ -53,7 +52,7 @@ def test_remove_request_invokes_submodule_cleanup():
     b.cleanup_request.assert_called_once_with("req-1")
     # the teardown that already worked must still fire
     engine.submodule_management["n0"].sampler.remove_request.assert_called_once_with("req-1")
-    engine.submodule_management["n0"].kv_management.alloc_manager.remove_request.assert_called_once_with("req-1")
+    engine.submodule_management["n0"].kv_management.kv_pool.remove_request.assert_called_once_with("req-1")
 
 
 class _PooledSubmodule:
