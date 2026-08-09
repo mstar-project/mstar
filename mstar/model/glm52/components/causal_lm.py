@@ -59,6 +59,13 @@ class Glm52ForCausalLM(nn.Module):
         self.config = config
         self.model = Glm52LanguageModel(config, comm_group=comm_group)
         self.lm_head = build_lm_head(config, comm_group=comm_group)
+        # M3: the layer-78 draft module exists only when drafting is on, so
+        # flag-off keeps the parameter set (and load) byte-identical to M1.
+        self.mtp = None
+        if config.mtp_num_draft_tokens > 0:
+            from mstar.model.glm52.components.mtp import Glm52MTPModule
+
+            self.mtp = Glm52MTPModule(config, comm_group=comm_group)
 
     def forward(
         self,
@@ -81,4 +88,5 @@ class Glm52ForCausalLM(nn.Module):
                 and self.config.moe_fp8_resident
             ),
             num_hidden_layers=self.config.num_hidden_layers,
+            load_mtp=self.mtp is not None,
         )

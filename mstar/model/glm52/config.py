@@ -47,6 +47,10 @@ class Glm52ModelConfig:
     index_skip_topk_offset: int = 3
     index_share_for_mtp_iteration: bool = True
     indexer_rope_interleave: bool = True
+    # M3 ablation switch (0 = MTP off, byte-identical to the M1 baseline;
+    # k > 0 = draft k tokens per step with the layer-78 MTP module). Gates
+    # both the Glm52MTPModule construction and the layer-78 weight load.
+    mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
     # the exact DSA computation, and nothing about M1 serving changes. On:

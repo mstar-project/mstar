@@ -127,6 +127,8 @@ class Glm52Model(Model):
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
+        if "mtp_num_draft_tokens" in kwargs:
+            self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None

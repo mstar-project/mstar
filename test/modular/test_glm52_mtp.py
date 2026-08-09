@@ -225,3 +225,76 @@ def test_verify_emission_invariant():
     n, tok = _verify(draft, target)
     emitted = draft[:n] + [tok]
     assert emitted == target[: n + 1]
+
+
+# ---------------------------------------------------------------------------
+# M3 weight loader path: layer-78 keys -> the ``mtp.`` submodule.
+# ---------------------------------------------------------------------------
+
+def test_mtp_flag_default_off_no_module():
+    from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
+
+    cfg = Glm52ModelConfig.reduced()
+    assert cfg.mtp_num_draft_tokens == 0
+    model = Glm52ForCausalLM(cfg)
+    assert model.mtp is None
+    assert not any(n.startswith("mtp.") for n in dict(model.named_parameters()))
+
+
+def test_mtp_load_end_to_end_reduced_fp8():
+    """The M3 loader contract, executed: layer-78 keys ride the single-pass
+    stream — fp8 dequant, fused expert stacking, glue keys — onto the mtp
+    submodule, with completeness both ways."""
+    from test_glm52_moe import BLOCK, _fabricate_checkpoint
+
+    from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
+    from mstar.model.glm52.weight_loader import load_glm52_hf_weights
+
+    torch.manual_seed(6)
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    cfg.num_hidden_layers = 4  # MTP position lands FULL (4 = offset-1 + freq)
+    cfg.mtp_num_draft_tokens = 2
+    model = Glm52ForCausalLM(cfg)
+    assert model.mtp is not None
+    assert model.mtp.transformer_layer.self_attn.indexer is not None
+
+    state, refs = _fabricate_checkpoint(cfg, include_mtp=True)
+    loaded = load_glm52_hf_weights(
+        model, iter(state), cfg.n_routed_experts,
+        quant_config=cfg.quantization_config, fp8_experts=True,
+        num_hidden_layers=cfg.num_hidden_layers, load_mtp=True,
+    )
+
+    # Completeness both ways, now including the mtp.* subtree.
+    params = set(dict(model.named_parameters()))
+    assert any(n.startswith("mtp.") for n in params)
+    assert loaded == params
+
+    # Glue: bf16 passthrough bit-exact; eh_proj dequantized bit-exact.
+    ckpt = dict(state)
+    mtp_p = f"model.layers.{cfg.num_hidden_layers}"
+    for param, key in (
+        (model.mtp.enorm.weight, "enorm.weight"),
+        (model.mtp.hnorm.weight, "hnorm.weight"),
+        (model.mtp.shared_head.norm.weight, "shared_head.norm.weight"),
+    ):
+        assert torch.equal(param.data, ckpt[f"{mtp_p}.{key}"].to(param.dtype))
+    _, _, eh_deq = refs[f"{mtp_p}.eh_proj"]
+    assert torch.equal(
+        model.mtp.eh_proj.weight.data,
+        eh_deq.to(model.mtp.eh_proj.weight.dtype),
+    )
+
+    # The MTP MoE's routed experts land fp8-resident like the trunk's.
+    moe = model.mtp.transformer_layer.mlp
+    shard = cfg.moe_intermediate_size
+    g8, _, _ = refs[f"{mtp_p}.mlp.experts.0.gate_proj"]
+    u8, _, _ = refs[f"{mtp_p}.mlp.experts.0.up_proj"]
+    got = moe.experts.gate_up_proj_fp8.data[0]
+    assert torch.equal(got[:shard], g8.view(torch.uint8))
+    assert torch.equal(got[shard:], u8.view(torch.uint8))
+
+    # The MTP module's own FULL indexer got real weights too.
+    idxr = model.mtp.transformer_layer.self_attn.indexer
+    _, _, wk_deq = refs[f"{mtp_p}.self_attn.indexer.wk"]
+    assert torch.equal(idxr.wk.weight.data, wk_deq.to(idxr.wk.weight.dtype))

@@ -197,8 +197,13 @@ def _fp8_entry(state, refs, base, shape):
     refs[base] = (w8, s, deq)
 
 
-def _fabricate_checkpoint(cfg):
-    """HF-style stream for the reduced config + poison keys that must skip."""
+def _fabricate_checkpoint(cfg, include_mtp=False):
+    """HF-style stream for the reduced config + poison keys that must skip.
+
+    ``include_mtp=True`` (M3): emit layer ``num_hidden_layers`` as a full,
+    properly-paired MTP layer (decoder inventory via the same loop body —
+    the position is FULL by the IndexShare formula — plus the glue keys)
+    instead of the poison keys."""
     state: list[tuple[str, torch.Tensor]] = []
     refs: dict[str, tuple] = {}
     hid, q_lora, kv_lora = cfg.hidden_size, cfg.q_lora_rank, cfg.kv_lora_rank
@@ -209,7 +214,7 @@ def _fabricate_checkpoint(cfg):
     state.append(("lm_head.weight", torch.randn(cfg.vocab_size, hid).bfloat16()))
     state.append(("model.norm.weight", torch.randn(hid).bfloat16()))
 
-    for n in range(cfg.num_hidden_layers):
+    for n in range(cfg.num_hidden_layers + (1 if include_mtp else 0)):
         p = f"model.layers.{n}"
         state.append((f"{p}.input_layernorm.weight", torch.randn(hid).bfloat16()))
         state.append((f"{p}.post_attention_layernorm.weight",
@@ -267,12 +272,22 @@ def _fabricate_checkpoint(cfg):
             _fp8_entry(state, refs, f"{p}.mlp.shared_experts.down_proj",
                        (hid, moe_inter))
 
+    mtp = f"model.layers.{cfg.num_hidden_layers}"
+    if include_mtp:
+        # The DeepSeek-V3 MTP glue; the decoder inventory for this layer
+        # already came out of the loop above.
+        state.append((f"{mtp}.enorm.weight", torch.randn(hid).bfloat16()))
+        state.append((f"{mtp}.hnorm.weight", torch.randn(hid).bfloat16()))
+        _fp8_entry(state, refs, f"{mtp}.eh_proj", (hid, 2 * hid))
+        state.append((f"{mtp}.shared_head.norm.weight",
+                      torch.randn(hid).bfloat16()))
+        return state, refs
+
     # Poison: MTP layer keys (Phase D) — including the MTP block's own
     # indexer, which must skip by layer index even with load_indexer=True.
     # The fp8 weights deliberately have NO scale sibling — if the skip ever
     # ran after the dequant stream instead of before, the stream would raise
     # "unpaired" and this test would fail.
-    mtp = f"model.layers.{cfg.num_hidden_layers}"
     state.append((f"{mtp}.enorm.weight", torch.randn(cfg.hidden_size).bfloat16()))
     state.append((f"{mtp}.mlp.experts.0.gate_proj.weight",
                   torch.randn(cfg.moe_intermediate_size, cfg.hidden_size)

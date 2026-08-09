@@ -60,6 +60,7 @@ def skip_phase_b_keys(
     weights: Iterable[tuple[str, torch.Tensor]],
     num_hidden_layers: int,
     load_indexer: bool = True,
+    load_mtp: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Drop MTP-layer keys — and, with ``load_indexer=False``, indexer keys —
     before any dequant buffering.
@@ -67,6 +68,10 @@ def skip_phase_b_keys(
     Runs upstream of the fp8 stream so skipped fp8 pairs are never buffered
     or dequantized (the MTP layer alone carries ~9.7B expert params, and its
     indexer weights would otherwise sit unpaired in the stream).
+
+    ``load_mtp=True`` (M3) passes layer-78 keys through instead; the
+    indexer rule still runs first, so ``load_indexer=False`` drops the MTP
+    block's own indexer along with the trunk's.
     """
     skipped_indexer = 0
     skipped_mtp = 0
@@ -75,7 +80,7 @@ def skip_phase_b_keys(
             skipped_indexer += 1
             continue
         m = _LAYER_RE.match(name)
-        if m and int(m.group(1)) >= num_hidden_layers:
+        if not load_mtp and m and int(m.group(1)) >= num_hidden_layers:
             skipped_mtp += 1
             continue
         yield name, tensor
@@ -216,6 +221,26 @@ def build_glm52_read_plan(
     return keys, specs
 
 
+def _make_glm52_name_remapper(num_hidden_layers: int, load_mtp: bool):
+    """Trunk remapping, plus (M3) layer-78 routing onto the ``mtp.``
+    submodule: strip the layer prefix, apply ``remap_mtp_key`` (glue keys
+    direct, the rest under ``transformer_layer.``), then the trunk naming
+    conventions — the expert/shared-expert regexes are prefix-agnostic, so
+    the fused stacked-param rules apply to the MTP MoE unchanged."""
+    if not load_mtp:
+        return glm52_name_remapper
+
+    from mstar.model.glm52.components.mtp import remap_mtp_key
+
+    def remap(name: str) -> str | None:
+        m = _LAYER_RE.match(name)
+        if m and int(m.group(1)) >= num_hidden_layers:
+            return glm52_name_remapper("mtp." + remap_mtp_key(name[m.end():]))
+        return glm52_name_remapper(name)
+
+    return remap
+
+
 def load_glm52_hf_weights(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
@@ -224,10 +249,13 @@ def load_glm52_hf_weights(
     fp8_experts: bool = False,
     num_hidden_layers: int = 78,
     load_indexer: bool = True,
+    load_mtp: bool = False,
 ) -> set[str]:
     from mstar.model.loader import load_hf_weights
 
-    weights = skip_phase_b_keys(weights, num_hidden_layers, load_indexer=load_indexer)
+    weights = skip_phase_b_keys(
+        weights, num_hidden_layers, load_indexer=load_indexer, load_mtp=load_mtp,
+    )
     if quant_config is not None:
         keep = _is_routed_expert_base if fp8_experts else None
         weights = dequant_fp8_block_stream(weights, quant_config, keep_fp8=keep)
@@ -241,7 +269,7 @@ def load_glm52_hf_weights(
         stacked_params=build_glm52_stacked_params(
             n_routed_experts, fp8_experts=fp8_experts,
         ),
-        name_remapper=glm52_name_remapper,
+        name_remapper=_make_glm52_name_remapper(num_hidden_layers, load_mtp),
     )
 
 
