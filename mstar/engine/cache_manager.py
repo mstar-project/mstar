@@ -658,6 +658,27 @@ class BatchedCacheManager(ABC):
         for ps in self._plan_states.values():
             ps.custom_pos_advance = None
 
+    def rewind_seq_lens(self, ns: list[int] | int) -> None:
+        """Roll each request's seq_len / position_id_start back by ``ns``
+        tokens (M3 draft rejection: the paged layout is truncation-friendly
+        — rolled-back positions are simply re-appended by the next forward,
+        overwriting the stale rows in every layer plane, so no KV data
+        movement is needed). Pages allocated for the rolled-back tail stay
+        in ``page_indices`` and are reused as the position re-advances."""
+        for i, rid in enumerate(self.request_ids):
+            n = ns if isinstance(ns, int) else ns[i]
+            if n == 0:
+                continue
+            label = self.active_labels[rid]
+            state = self._get_state(rid, label=label)
+            if n < 0 or n > state.seq_len:
+                raise ValueError(
+                    f"rewind_seq_lens: request {rid} asked to rewind {n} of "
+                    f"{state.seq_len} tokens"
+                )
+            state.seq_len -= n
+            state.position_id_start -= n
+
     @torch.compiler.disable
     def snapshot_all(
         self, from_label: str,

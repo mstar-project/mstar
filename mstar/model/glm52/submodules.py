@@ -48,6 +48,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # so the engine's request lifecycle covers it — ``cleanup_request``
         # below evicts on retirement.
         self._dsa_k_store = Glm52DsaKStore()
+        # M3 per-request draft-loop state (mtp_num_draft_tokens > 0 only):
+        # total emitted tokens (incl. the prefill-emitted one — max_tokens
+        # counts it, the M1 off-by-one lesson) and the stop parameters
+        # stashed at prepare_inputs time so the batched step can truncate
+        # emission without engine round-trips. All evicted in
+        # ``cleanup_request``.
+        self._mtp_emitted: dict[str, int] = {}
+        self._mtp_max_tokens: dict[str, int] = {}
+        self._mtp_ignore_eos: dict[str, bool] = {}
 
     def set_load_heartbeat_stop(self, stop) -> None:
         """Adopt the load-time GPU liveness tick; stopped on first forward."""
@@ -65,6 +74,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         skipping it would leak ~5.4 KB/token/request of index keys per rank
         forever."""
         self._dsa_k_store.evict(request_id)
+        self._mtp_emitted.pop(request_id, None)
+        self._mtp_max_tokens.pop(request_id, None)
+        self._mtp_ignore_eos.pop(request_id, None)
         super().cleanup_request(request_id)
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
@@ -187,6 +199,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> ARNodeInputs:
         text_inputs = inputs["text_inputs"][0]
+        if self.config.mtp_num_draft_tokens > 0:
+            rid = fwd_info.request_id
+            self._mtp_max_tokens[rid] = fwd_info.max_tokens
+            self._mtp_ignore_eos[rid] = (
+                fwd_info.sampling_config["LLM"].ignore_eos
+            )
         return ARNodeInputs(
             input_ids=text_inputs,
             input_seq_len=text_inputs.shape[0],
@@ -262,6 +280,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # materializes qo_indptr_buf under CUDA-graph capture, and the
             # reference-dispatch configs register no graphs.
             "last_token_indices": seq_len_t.cumsum(0) - 1,
+            # Per-request row counts for the M3 step (verify slicing).
+            "seq_lens": list(seq_lens),
             "dsa_ctx": Glm52DsaForwardContext(
                 spans=spans, k_store=self._dsa_k_store,
                 needs_selection=needs_selection,
@@ -304,6 +324,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
+        if self.config.mtp_num_draft_tokens > 0:
+            return self._forward_batched_mtp(
+                graph_walk, engine_inputs, input_ids, position_ids, **kwargs
+            )
         self._stop_load_heartbeat()
         cache_handle = engine_inputs.cache_manager
         sampler = engine_inputs.sampler
@@ -334,6 +358,189 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             for i, rid in enumerate(request_ids)
         }
 
+    # ------------------------------------------------------------------
+    # M3: the MTP draft loop. One step = verify the previous k drafts in a
+    # single target forward (k+1 tokens/request), emit accepted + 1, rewind
+    # the rejected KV tail, then sync + draft the next k with the layer-78
+    # module. Drafts ride the walk's text_inputs loop-back edge together
+    # with the last emitted token, so every decode step is uniformly
+    # (k+1)-in / (accepted+1)-out and TP followers rebuild identical
+    # batches from replicated edges. Greedy-verify keeps the emitted
+    # stream bit-identical to non-speculative decoding at temp 0 (v1 is
+    # greedy-only; drafts and verification bypass the engine sampler).
+    # ------------------------------------------------------------------
+
+    def _forward_batched_mtp(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        from mstar.model.glm52.components.mtp import mtp_greedy_verify
+
+        self._stop_load_heartbeat()
+        cache_handle = engine_inputs.cache_manager
+        cache_handle.set_active_label(_MAIN)
+        seq_lens = kwargs.get("seq_lens")
+        assert seq_lens is not None, "MTP step needs seq_lens from preprocess"
+        request_ids = list(cache_handle.request_ids)
+
+        hidden = self._hidden(
+            input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"))
+
+        row_starts = [0]
+        for sl in seq_lens:
+            row_starts.append(row_starts[-1] + sl)
+
+        if graph_walk == "prefill":
+            # Emit the prefill token through the engine sampler, exactly as
+            # flag-off does — bit-parity for the first emitted token.
+            qo_indptr_buf = cache_handle.get_qo_indptr_buf(_MAIN)
+            if qo_indptr_buf is not None:
+                last_token_indices = (qo_indptr_buf[1:] - 1).long()
+            else:
+                last_token_indices = kwargs.get("last_token_indices")
+                assert last_token_indices is not None
+            last_hidden = hidden.index_select(0, last_token_indices)
+            new_tokens = self._sample(
+                engine_inputs.sampler, request_ids, self.lm_head(last_hidden))
+            # MTP-plane sync over the whole prompt: entry for token t_p
+            # pairs (embed(t_p), h_{p-1}); the prompt's first token has no
+            # predecessor and is never an entry. The last entry — the
+            # prefill-emitted token paired with the prompt-final hidden —
+            # yields draft 1.
+            sync_tokens, pair_hiddens = [], []
+            for i, rid in enumerate(request_ids):
+                r = slice(row_starts[i], row_starts[i + 1])
+                self._mtp_emitted[rid] = 1
+                sync_tokens.append(torch.cat(
+                    [input_ids[r][1:], new_tokens[i:i + 1]]))
+                pair_hiddens.append(hidden[r])
+            drafts = self._mtp_sync_and_draft(
+                cache_handle, sync_tokens, pair_hiddens)
+            return {
+                rid: {
+                    "new_token": [new_tokens[i:i + 1]],
+                    "text_inputs": [
+                        torch.cat([new_tokens[i:i + 1], drafts[i]])],
+                }
+                for i, rid in enumerate(request_ids)
+            }
+
+        if graph_walk != "decode":
+            raise ValueError(
+                f"Batched forward not supported for graph walk: {graph_walk!r}")
+
+        logits = self.lm_head(hidden)  # (sum(k+1), vocab)
+        results: dict[str, NameToTensorList] = {}
+        rewinds: list[int] = []
+        sync_tokens, pair_hiddens = [], []
+        for i, rid in enumerate(request_ids):
+            r = slice(row_starts[i], row_starts[i + 1])
+            m = seq_lens[i]
+            r_inputs = input_ids[r]
+            drafts_in = r_inputs[1:]
+            target_argmax = logits[r].argmax(dim=-1)
+            n_acc, bonus = mtp_greedy_verify(drafts_in, target_argmax)
+            emitted = torch.cat([drafts_in[:n_acc], bonus.reshape(1)])
+            # Truncate: max_tokens budget first, then first stop id. EOS is
+            # always the LAST element after truncation, which is the
+            # contract check_stop relies on.
+            budget = self._mtp_max_tokens[rid] - self._mtp_emitted[rid]
+            e = min(emitted.shape[0], max(budget, 1))
+            if not self._mtp_ignore_eos[rid]:
+                for j in range(e):
+                    if int(emitted[j]) in self.config.eos_token_ids:
+                        e = j + 1
+                        break
+            emitted = emitted[:e]
+            self._mtp_emitted[rid] += e
+            # m tokens appended KV this forward; the committed prefix is
+            # input[0] plus the e-1 now-emitted drafts. The bonus was never
+            # processed.
+            rewinds.append(m - e)
+            sync_tokens.append(emitted)
+            pair_hiddens.append(hidden[r][:e])
+            results[rid] = {"new_token": [emitted]}
+        cache_handle.rewind_seq_lens(rewinds)
+        drafts = self._mtp_sync_and_draft(cache_handle, sync_tokens, pair_hiddens)
+        for i, rid in enumerate(request_ids):
+            emitted = results[rid]["new_token"][0]
+            results[rid]["text_inputs"] = [
+                torch.cat([emitted[-1:], drafts[i]])]
+        return results
+
+    def _mtp_sync_and_draft(
+        self,
+        cache_handle: BatchedCacheManager,
+        sync_tokens: list[torch.Tensor],
+        pair_hiddens: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Extend the MTP plane over the newly committed tokens, then draft
+        k tokens autoregressively. Returns per-request (k,) draft tensors.
+
+        The MTP plane (layer index ``num_hidden_layers``) shares the trunk's
+        page table and position counter, SHIFTED BY ONE: the entry for the
+        token at stream position p — ``fuse(embed(t_p), h_{p-1})`` — lives
+        at plane position p-1, so after the sync pass the plane holds
+        exactly ``position_id_start`` entries, aligned with the trunk. RoPE
+        uses the token's true position (the explicit position_ids arg).
+        Draft-iteration entries beyond the counter are transient: the
+        counter is rolled back at the end, and the next step's writes
+        overwrite them in place (paged layout, no data movement).
+        """
+        k = self.config.mtp_num_draft_tokens
+        mtp = self.language_model.mtp
+        embed = self.language_model.model.embed_tokens
+        request_ids = list(cache_handle.request_ids)
+        num = len(request_ids)
+        mtp_layer = self.config.num_hidden_layers
+        device = pair_hiddens[0].device
+        e_list = [t.shape[0] for t in sync_tokens]
+        starts = [
+            cache_handle._get_state(rid, _MAIN).position_id_start
+            for rid in request_ids
+        ]
+
+        # Sync pass (+ draft 1 from its last row): plane positions
+        # start-e .. start-1, token positions start-e+1 .. start.
+        cache_handle.rewind_seq_lens(e_list)
+        cache_handle.set_layer_idx(mtp_layer)
+        cache_handle.plan_attention(seq_lens=e_list, is_causal=True, label=_MAIN)
+        pos_list: list[int] = []
+        for st, e in zip(starts, e_list, strict=True):
+            pos_list.extend(range(st - e + 1, st + 1))
+        positions = torch.tensor(pos_list, dtype=torch.long, device=device)
+        cache_handle.plan_rope(seq_lens=e_list, pos_ids=positions, label=_MAIN)
+        h = mtp(
+            embed(torch.cat(sync_tokens)), torch.cat(pair_hiddens),
+            cache_handle, positions,
+        )
+        cache_handle.advance_seq_lens()
+
+        last_rows = torch.tensor(
+            e_list, dtype=torch.long, device=device).cumsum(0) - 1
+        prev_h = h.index_select(0, last_rows)          # (B, hid)
+        prev_d = self.lm_head(prev_h).argmax(dim=-1)   # (B,) = draft 1
+        draft_cols = [prev_d]
+        ones = [1] * num
+        for it in range(1, k):
+            cache_handle.set_layer_idx(mtp_layer)
+            cache_handle.plan_attention(seq_lens=ones, is_causal=True, label=_MAIN)
+            positions = torch.tensor(
+                [st + it for st in starts], dtype=torch.long, device=device)
+            cache_handle.plan_rope(seq_lens=ones, pos_ids=positions, label=_MAIN)
+            prev_h = mtp(embed(prev_d), prev_h, cache_handle, positions)
+            cache_handle.advance_seq_lens()
+            prev_d = self.lm_head(prev_h).argmax(dim=-1)
+            draft_cols.append(prev_d)
+        if k > 1:
+            cache_handle.rewind_seq_lens([k - 1] * num)
+        stacked = torch.stack(draft_cols, dim=1)       # (B, k)
+        return [stacked[i] for i in range(num)]
+
     @staticmethod
     def _sample(
         sampler: Sampler, request_ids: list[str], logits: torch.Tensor,
@@ -348,6 +555,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     ):
         if "new_token" not in outputs:
             return
+        if "text_inputs" in outputs:
+            # M3 step: the forward already assembled the loop-back input
+            # ([last emitted, k drafts]); new_token carries only the
+            # verified emission.
+            return
         outputs["text_inputs"] = outputs["new_token"]
 
     def check_stop(
@@ -356,6 +568,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
         if "new_token" not in outputs:
+            return set()
+        if self.config.mtp_num_draft_tokens > 0:
+            # Multi-token emission: in-step truncation guarantees a stop id
+            # can only be the LAST element; totals live in the per-request
+            # counter (loop iters no longer count tokens).
+            tokens = outputs["new_token"][0]
+            last = int(tokens[-1])
+            is_eos = last in self.config.eos_token_ids
+            ignore_eos = request_info.sampling_config["LLM"].ignore_eos
+            generated = self._mtp_emitted.get(request_id, 0)
+            if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
+                return {"decode_loop"}
             return set()
         token = outputs["new_token"][0].item()
         # GLM-5.2 defines three stop ids: <|endoftext|>, <|user|>, <|observation|>.

@@ -90,12 +90,18 @@ def test_cleanup_request_evicts_kstore():
     sub.config = Glm52ModelConfig.reduced()
     sub.request_states = {}
     sub._dsa_k_store = Glm52DsaKStore()
+    sub._mtp_emitted = {"r0": 7}
+    sub._mtp_max_tokens = {"r0": 32}
+    sub._mtp_ignore_eos = {"r0": False}
 
     sub._dsa_k_store.append("r0", 0, torch.randn(5, 16), start_pos=0)
     sub.request_state("r0")  # base per-request state exists too
     sub.cleanup_request("r0")
     assert sub._dsa_k_store.tracked_requests() == set()
     assert sub.request_states == {}
+    assert sub._mtp_emitted == {}
+    assert sub._mtp_max_tokens == {}
+    assert sub._mtp_ignore_eos == {}
     sub.cleanup_request("r0")  # idempotent, like the base hook
 
 

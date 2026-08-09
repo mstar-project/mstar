@@ -1,0 +1,32 @@
+model: "glm52"
+# GLM-5.2 TP8 with MTP speculation (M3, opt-in). Same box shape as
+# glm52_tp8.yaml; the difference is model_kwargs.mtp_num_draft_tokens.
+#
+# mtp_num_draft_tokens=k loads the layer-78 draft module (~9.7B extra
+# params, fp8-resident experts like the trunk) and turns each decode step
+# into draft-then-verify: the target forwards k+1 tokens per request,
+# emits accepted+1 (greedy prefix-match — the stream stays bit-identical
+# to k=0 at temp 0), rewinds the rejected KV tail in place, and the MTP
+# module drafts the next k. KV grows by ONE layer plane (the draft
+# module's own cache, sharing the trunk's page table): 79 planes at
+# 1.15 KB/token/layer.
+#
+# v1 limits: greedy-only (drafts and verification bypass the sampler);
+# short-context only (mutually exclusive with dsa_long_context); serving
+# is eager for the MTP phases (draft iterations are not captured — CUDA
+# graph shapes for the (batch, k+1) family are the perf follow-up).
+# k=5 is the vLLM recipe for DeepSeek-family MTP-1 modules.
+max_seq_len: 2048
+dist_timeout_s: 7200
+model_kwargs:
+  mtp_num_draft_tokens: 5
+kv_cache:
+  # One extra layer plane vs glm52_tp8.yaml (79 total): ~91 KB/token
+  # across planes; 512 x 128-token pages = 64k cached tokens/rank.
+  max_num_pages: 512
+  page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

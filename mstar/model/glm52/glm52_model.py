@@ -129,6 +129,14 @@ class Glm52Model(Model):
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         if "mtp_num_draft_tokens" in kwargs:
             self.config.mtp_num_draft_tokens = int(kwargs["mtp_num_draft_tokens"])
+            if self.config.mtp_num_draft_tokens > 0 and self.config.dsa_long_context:
+                # v1 scope: the MTP draft loop stays in the short-context
+                # regime (k-store sync/rewind for the sparse path is the
+                # marked follow-up alongside sparse prefill).
+                raise ValueError(
+                    "mtp_num_draft_tokens and dsa_long_context are mutually "
+                    "exclusive in v1 — MTP drafting is short-context only"
+                )
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
@@ -181,9 +189,16 @@ class Glm52Model(Model):
         # vLLM/SGLang use for DeepSeek-family models, served by the
         # mla_absorb engine path from users/garv/kimik27-integration.
         # No Yarn -> softmax scale is plain qk_head_dim**-0.5.
+        # With MTP on, the layer-78 draft module keeps its own KV in one
+        # extra layer plane at index num_hidden_layers, sharing the trunk's
+        # page table and position bookkeeping (draft-tail rows are simply
+        # overwritten as the verified stream advances into them).
+        num_kv_layers = self.config.num_hidden_layers + (
+            1 if self.config.mtp_num_draft_tokens > 0 else 0
+        )
         if self.config.mla_absorb:
             return [KVCacheConfig(
-                num_layers=self.config.num_hidden_layers,
+                num_layers=num_kv_layers,
                 num_kv_heads=1,
                 head_dim=self.config.cache_latent_dim,
                 max_seq_len=self.config.max_seq_len,
@@ -195,7 +210,7 @@ class Glm52Model(Model):
         # Naive fallback (reduced-test parity): full K/V padded to the
         # FlashInfer head size, one KV head per query head.
         return [KVCacheConfig(
-            num_layers=self.config.num_hidden_layers,
+            num_layers=num_kv_layers,
             num_kv_heads=self.config.num_attention_heads,
             head_dim=self.config.padded_head_dim,
             max_seq_len=self.config.max_seq_len,
