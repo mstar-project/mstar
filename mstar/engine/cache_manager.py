@@ -13,7 +13,7 @@ from mstar.engine.kv_store import (
     KVRequestState,
     PagedAllocationManager,
 )
-from mstar.engine.resources import KVCachePool, Segment
+from mstar.engine.resources import KVCachePool, RopeEmbedder, Segment
 from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
 
 logger = logging.getLogger(__name__)
@@ -202,6 +202,9 @@ class BatchedCacheManager(ABC):
             source: KVCachePool(pool.alloc_manager)
             for source, pool in self.cross_pools.items()
         }
+        # Position semantics live on the embedder; the pool's counters are
+        # read at plan time and advanced only through commit.
+        self.rope_embedder = RopeEmbedder()
 
         self.auto_write_store = auto_write_store
 
@@ -408,21 +411,19 @@ class BatchedCacheManager(ABC):
 
         computed_pos_ids = pos_ids
         if computed_pos_ids is None:
-            # CPU-accumulate the position list (1 int per output token). The
-            # old `torch.cat([torch.arange(...) + start for ...])` launched
-            # 2 GPU kernels per request.
+            # The embedder builds the position list on CPU (1 int per output
+            # token); placement is decided here.
             if self.enable_nvtx:
                 range_push("cache.plan_rope.build_pos_ids", synchronize=False)
             try:
-                pos_ids_list: list[int] = []
-                for rid, sl in zip(self.request_ids, seq_lens, strict=True):
-                    start = self._get_state(rid, effective_label).position_id_start
-                    pos_ids_list.extend(range(start, start + sl))
-                computed_pos_ids = torch.tensor(
-                    pos_ids_list,
-                    dtype=torch.long,
-                    device=None if static_copy_from_cpu else self.device,
-                )
+                segments = [
+                    Segment(rid, effective_label, sl)
+                    for rid, sl in zip(self.request_ids, seq_lens, strict=True)
+                ]
+                position_plan = self.rope_embedder.plan(segments, self.kv_pool)
+                computed_pos_ids = position_plan.pos_ids
+                if not static_copy_from_cpu:
+                    computed_pos_ids = computed_pos_ids.to(self.device)
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
@@ -482,13 +483,12 @@ class BatchedCacheManager(ABC):
             if per_label_pos_ids and label in per_label_pos_ids:
                 parts.append(torch.cat(per_label_pos_ids[label]))
             else:
-                pos_ids_list: list[int] = []
-                for rid, sl in zip(self.request_ids, seq_lens[label], strict=True):
-                    start = self._get_state(rid, label).position_id_start
-                    pos_ids_list.extend(range(start, start + sl))
-                parts.append(torch.tensor(
-                    pos_ids_list, dtype=torch.long, device=self.device,
-                ))
+                segments = [
+                    Segment(rid, label, sl)
+                    for rid, sl in zip(self.request_ids, seq_lens[label], strict=True)
+                ]
+                plan = self.rope_embedder.plan(segments, self.kv_pool)
+                parts.append(plan.pos_ids.to(self.device))
         combined_pos_ids = parts[0] if len(parts) == 1 else torch.cat(parts)
         self._plan_states[combined_label].pos_ids = combined_pos_ids
 
@@ -510,43 +510,15 @@ class BatchedCacheManager(ABC):
         ps = self._plan_states[label]
         assert ps.pos_ids is not None
 
-        orig_dtype = q.dtype
-
-        if rope_dtype is not None:
-            q, k = q.to(rope_dtype), k.to(rope_dtype)
-        elif torch.is_autocast_enabled():
-            dtype = torch.get_autocast_gpu_dtype()
-            q, k = q.to(dtype), k.to(dtype)
-        elif q.dtype == torch.float32:
-            dtype = torch.bfloat16
-            q, k = q.to(dtype), k.to(dtype)
-
-        llama31_params = {}
-        for key, value in kwargs.items():
-            if key in ['low_freq_factor', 'high_freq_factor', 'old_context_len']:
-                llama31_params[key] = value
-
-        import flashinfer
-
-        if not llama31_params:
-            flashinfer.rope.apply_rope_pos_ids_inplace(
-                q, k, ps.pos_ids,
-                rotary_dim=rotary_dim,
-                interleave=interleave,
-                rope_scale=rope_scale,
-                rope_theta=rope_theta,
-
-            )
-        else:
-            flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
-                q, k, ps.pos_ids,
-                rotary_dim=rotary_dim,
-                interleave=interleave,
-                rope_scale=rope_scale,
-                rope_theta=rope_theta,
-                **llama31_params
-            )
-        return q.to(orig_dtype), k.to(orig_dtype)
+        return self.rope_embedder.apply(
+            q, k, ps.pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            rope_dtype=rope_dtype,
+            **kwargs,
+        )
 
     @torch.compiler.disable
     def advance_seq_len(self, n: int | None = None, pos_id_n: int | None = None) -> None:
@@ -559,9 +531,11 @@ class BatchedCacheManager(ABC):
         if n is None:
             return self.advance_seq_lens(pos_id_n)
         for rid in self.request_ids:
-            state = self._get_state(rid)
-            state.seq_len += n
-            state.position_id_start += (pos_id_n if pos_id_n is not None else n)
+            label = self.active_labels.get(rid, "main")
+            self.kv_pool.commit(
+                Segment(rid, label, n),
+                pos_advance=pos_id_n if pos_id_n is not None else n,
+            )
 
     @torch.compiler.disable
     def set_custom_pos_advance(
@@ -612,14 +586,15 @@ class BatchedCacheManager(ABC):
             for label, seq_lens in self._batched_cfg_info.per_label_seq_len.items():
                 for i, rid in enumerate(self.request_ids):
                     n = seq_lens[i]
-                    state = self._get_state(rid, label=label)
-                    state.seq_len += n
                     if pos_id_ns is None:
-                        state.position_id_start += n
+                        pos_advance = n
                     elif isinstance(pos_id_ns, int):
-                        state.position_id_start += pos_id_ns
+                        pos_advance = pos_id_ns
                     else:
-                        state.position_id_start += pos_id_ns[i]
+                        pos_advance = pos_id_ns[i]
+                    self.kv_pool.commit(
+                        Segment(rid, label, n), pos_advance=pos_advance
+                    )
         else:
             for i, rid in enumerate(self.request_ids):
                 label = self.active_labels[rid]
@@ -627,17 +602,18 @@ class BatchedCacheManager(ABC):
                 if ps.seq_lens is None:
                     continue
                 n = ps.seq_lens[i]
-                state = self._get_state(rid, label=label)
-                state.seq_len += n
                 if pos_id_ns is None:
                     if ps.custom_pos_advance is not None:
-                        state.position_id_start += ps.custom_pos_advance[i]
+                        pos_advance = ps.custom_pos_advance[i]
                     else:
-                        state.position_id_start += n
+                        pos_advance = n
                 elif isinstance(pos_id_ns, int):
-                    state.position_id_start += pos_id_ns
+                    pos_advance = pos_id_ns
                 else:
-                    state.position_id_start += pos_id_ns[i]
+                    pos_advance = pos_id_ns[i]
+                self.kv_pool.commit(
+                    Segment(rid, label, n), pos_advance=pos_advance
+                )
         # Clear the side-channel on every consumer so a stale value can't
         # bleed into a subsequent walk.
         for ps in self._plan_states.values():
