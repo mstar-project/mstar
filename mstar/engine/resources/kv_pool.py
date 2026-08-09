@@ -246,6 +246,22 @@ class KVCachePool:
         any admit."""
         self._manager.sync_retrieve(request_id, label, seq_info)
 
+    def admit_retrieve(
+        self, request_id: str, label: str, seq_info: SequenceInfo,
+    ) -> Reservation:
+        """Start bringing one stream's published state into residency and
+        report the admit outcome: ``pending`` stays True while pages are
+        in flight, and polling again re-checks without restarting the
+        transfer. Allocates on first call, so it can fail like any
+        admit."""
+        self._manager.start_async_retrieve(request_id, label, seq_info)
+        ready = self._manager.check_retrieve_ready(request_id, label)
+        return Reservation(
+            resident=self._manager.get_state(request_id, label).seq_len,
+            to_compute=0,
+            pending=not ready,
+        )
+
     def publish(self, request_id: str) -> dict[str, SequenceInfo]:
         """Describe the request's durable streams to another process, one
         ``SequenceInfo`` per label. Waits out any in-flight retrieves first

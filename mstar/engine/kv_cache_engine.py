@@ -1171,7 +1171,7 @@ class KVCacheEngine(BaseEngine):
             }
         )
 
-        labels_to_check = []
+        outcomes = []
         try:
             kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
             world_size = submod_mgmt.tp_group.world_size
@@ -1184,19 +1184,14 @@ class KVCacheEngine(BaseEngine):
             ).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
-                cache_mgmt.alloc_manager.start_async_retrieve(
+                outcomes.append(cache_mgmt.kv_pool.admit_retrieve(
                     request_id, label, seq_info
-                )
-                labels_to_check.append(label)
+                ))
         except RuntimeError:
             # Not enough pages to allocate for retrieval — not ready
             return False
 
-        ar_ready = all([
-            cache_mgmt.alloc_manager.check_retrieve_ready(request_id, label)
-            for label in labels_to_check
-        ])
-        if not ar_ready:
+        if any(outcome.pending for outcome in outcomes):
             return False
         return super().check_ready(node_name, request_id, request_info)
 

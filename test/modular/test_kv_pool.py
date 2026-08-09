@@ -502,6 +502,63 @@ class TestOffloadTier:
         assert pool.labels("r") == ["main", "cfg"]
 
 
+class _FakeFuture:
+    def __init__(self):
+        self._done = False
+
+    def done(self) -> bool:
+        return self._done
+
+    def result(self):
+        return None
+
+
+class TestAdmitRetrieve:
+    def _seq_info(self, seq_len=12, pos_id=34):
+        return SequenceInfo(
+            seq_len=seq_len,
+            pos_id=pos_id,
+            latest_kv_transfer_info=object(),
+            page_indices=[5, 6],
+        )
+
+    def test_instant_transfer_is_not_pending(self):
+        pool, manager = _make_pool(page_size=8)
+        manager.add_request("r", ["main"])
+
+        outcome = pool.admit_retrieve("r", "main", self._seq_info())
+
+        assert outcome.pending is False
+        assert outcome.resident == 12
+        assert manager.get_state("r", "main").position_id_start == 34
+
+    def test_pending_until_the_transfer_lands(self):
+        pool, manager = _make_pool(page_size=8)
+        manager.add_request("r", ["main"])
+        future = _FakeFuture()
+        manager._kv_transfer_engine.read_batched_async = (
+            lambda remote_kv_info, read_info: future
+        )
+
+        first = pool.admit_retrieve("r", "main", self._seq_info())
+        assert first.pending is True
+
+        # Polling again neither restarts the transfer nor clears it early.
+        second = pool.admit_retrieve("r", "main", self._seq_info())
+        assert second.pending is True
+
+        future._done = True
+        third = pool.admit_retrieve("r", "main", self._seq_info())
+        assert third.pending is False
+
+    def test_admit_retrieve_can_fail_like_any_admit(self):
+        pool, manager = _make_pool(max_num_pages=1, page_size=8)
+        manager.add_request("r", ["main"])
+
+        with pytest.raises(AllocationFailedError):
+            pool.admit_retrieve("r", "main", self._seq_info(seq_len=100))
+
+
 class TestPosInfoAndLabels:
     def test_pos_info_reads_one_stream(self):
         pool, manager = _make_pool()
