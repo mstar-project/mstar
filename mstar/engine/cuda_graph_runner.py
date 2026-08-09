@@ -1545,7 +1545,8 @@ class CudaGraphRunner:
         which FlashInfer's attention path actually walks. Trailing static-buffer
         slots [real_num_tokens : padded_num_tokens] keep their capture-time
         contents; non-attention compute over them is wasted work, not a correctness
-        issue. State swap / advance_seq_lens / output remap mirror _run_basic_matched.
+        issue. Slot addressing / advance_seq_lens / output remap mirror
+        _run_basic_batched.
 
         ``slot_data`` selects one of the captured double-buffer slots.
         Prefill paths don't speculate or pre-plan today, so slot alternation
@@ -1565,31 +1566,22 @@ class CudaGraphRunner:
         static_input_keys = static["static_input_keys"]
         config_labels = graph_data.config.labels
 
-        # Swap-and-restore must be paired (see _run_basic_batched). On a
-        # submodule.preprocess failure mid-flight, the dummy slots are still
-        # aliased to real RequestState objects; the finally below un-aliases
-        # them and skips the store flush (no captured forward ran).
-        swapped = False
+        # Address-and-release must be paired (see _run_basic_batched). On a
+        # submodule.preprocess failure mid-flight, the finally below restores
+        # the capture addressing, frees the padding tail's pages, and skips
+        # the store flush (no captured forward ran).
+        addressed = False
         success = False
         try:
-            # --- Step 1: Swap real request states onto dummy slots ---
+            # --- Step 1: Address the slot at the step's request ids ---
             if self.enable_nvtx:
                 mark("gpu_thread.preprocess_start")
                 range_push("gpu_thread.preprocess", synchronize=False)
             if self.enable_nvtx:
-                range_push("cg.swap_states", synchronize=False)
-            for i, rid in enumerate(request_ids):
-                dummy_rid = dummy_rids[i]
-                for label in config_labels:
-                    real_state = self.alloc_manager.get_state(rid, label)
-                    self.alloc_manager.get_state(dummy_rid, label)
-                    self.alloc_manager.request_states[dummy_rid][label] = real_state
-
-            for i in range(real_bs, padded_bs):
-                dummy_rid = dummy_rids[i]
-                for label in config_labels:
-                    self.alloc_manager.get_state(dummy_rid, label)
-            swapped = True
+                range_push("cg.address_slot", synchronize=False)
+            step_ids = self._slot_step_ids(slot_data, request_ids)
+            self._address_slot(slot_data, step_ids)
+            addressed = True
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1615,9 +1607,8 @@ class CudaGraphRunner:
 
             if self.enable_nvtx:
                 range_push("cg.preprocess_replan.metadata", synchronize=False)
-            real_metadata = self._build_replay_metadata(
-                dummy_rids, request_ids, real_bs,
-                per_request_info, static["dummy_metadata"],
+            step_metadata = self._build_step_metadata(
+                step_ids, real_bs, per_request_info, static["dummy_metadata"],
             )
             # Stage the live seen-token masks into master before the gather so
             # the per-step buffer reflects the request's accumulated tokens for
@@ -1627,8 +1618,8 @@ class CudaGraphRunner:
                     request_ids, self.sampler,
                 )
             engine_inputs = ModelInputsFromEngine(
-                request_ids=dummy_rids,
-                per_request_info=real_metadata,
+                request_ids=step_ids,
+                per_request_info=step_metadata,
                 cache_manager=static_cm,
                 sampler=self._get_sampler(
                     request_ids=request_ids,
@@ -1693,7 +1684,7 @@ class CudaGraphRunner:
             # Persist the in-graph-advanced RNG offsets back to their slot masters.
             self.sampler_buffer.scatter_offsets()
 
-            # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
+            # --- Step 5: Advance seq_lens on the real request states (Python-only) ---
             if self.enable_nvtx:
                 mark("gpu_thread.postprocess_start")
                 range_push("gpu_thread.postprocess", synchronize=False)
@@ -1740,14 +1731,13 @@ class CudaGraphRunner:
             success = True
             return outputs
         finally:
-            # --- Step 7: Restore dummy states (always — un-aliases dummy slots) ---
-            if swapped:
-                self._restore_dummy_states(
-                    dummy_rids=dummy_rids,
+            # --- Step 7: Release the slot (capture addressing back, padding freed) ---
+            if addressed:
+                self._release_slot_step(
+                    slot_data=slot_data,
                     request_ids=request_ids,
                     real_bs=real_bs,
                     config_labels=config_labels,
-                    static_cm=static_cm,
                     flush_writes=success,
                 )
             if self.enable_nvtx:
@@ -1798,24 +1788,6 @@ class CudaGraphRunner:
         out = {}
         for i, rid in enumerate(step_ids):
             out[rid] = per_request_info[rid] if i < real_bs else dummy_metadata[rid]
-        return out
-
-    def _build_replay_metadata(
-        self,
-        dummy_rids: list[str],
-        request_ids: list[str],
-        real_bs: int,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-        dummy_metadata: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, CurrentForwardPassInfo]:
-        """Map dummy_rid → real per_request_info for [:real_bs], dummy_metadata
-        from capture for [real_bs:]. Used by the packed replay path."""
-        out = {}
-        for i, dummy_rid in enumerate(dummy_rids):
-            if i < real_bs:
-                out[dummy_rid] = per_request_info[request_ids[i]]
-            else:
-                out[dummy_rid] = dummy_metadata[dummy_rid]
         return out
 
     def _zero_padding_input(self, template: ARNodeInputs) -> ARNodeInputs:
@@ -1893,37 +1865,6 @@ class CudaGraphRunner:
         for i in range(real_bs, len(dummy_rids)):
             for label in config_labels:
                 self.alloc_manager.reset_label(dummy_rids[i], label, free=True)
-        if flush_writes:
-            for rid in request_ids:
-                for label in config_labels:
-                    ps = static_cm._plan_states.get(label)
-                    if ps is not None and ps.write_store:
-                        self.alloc_manager.flush_to_store(rid, label)
-        if self.enable_nvtx:
-            range_pop(synchronize=False)
-
-    def _restore_dummy_states(
-        self,
-        dummy_rids: list[str],
-        request_ids: list[str],
-        real_bs: int,
-        config_labels: list[str],
-        static_cm: BatchedCacheManager,
-        flush_writes: bool = True,
-    ) -> None:
-        """Reset every dummy slot's per-label state and (on the success path)
-        flush real-request KV writes to the store for any label whose plan_state
-        had write_store enabled. ``flush_writes=False`` on a failure path skips
-        the flush — the captured forward never executed, so there's nothing to
-        commit, and flushing partial state would publish stale pages.
-        """
-        if self.enable_nvtx:
-            range_push("cg.restore_states", synchronize=False)
-        for i, rid in enumerate(dummy_rids):
-            for label in config_labels:
-                self.alloc_manager.reset_label(
-                    rid, label, free=i >= real_bs,
-                )
         if flush_writes:
             for rid in request_ids:
                 for label in config_labels:

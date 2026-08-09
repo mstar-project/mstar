@@ -500,14 +500,14 @@ class LLMSubmodule(ARNodeSubmodule):
 
         cfg-on prefill_text is intentionally NOT captured. BAGEL's
         ``preprocess`` for prefill_text+cfg calls
-        ``cache_handle.snapshot_all("main", "cfg_text")`` which writes to
-        the cache_manager's ``request_ids`` (= ``dummy_rids`` at replay).
-        ``cfg_text`` is not in ``config.labels`` (only ``main`` + ``cfg_img``
-        get FlashInfer wrappers), so the runner's state-swap doesn't alias
-        it onto the real request and the snapshot lands on the dummy slot.
-        cfg-on prefill_text continues to use the eager path; downstream
-        image_gen / decode+cfg captures are unaffected (they don't depend
-        on this capture's snapshot semantics).
+        ``cache_handle.snapshot_all("main", "cfg_text")``, an allocating
+        fork of the main stream. Replay addresses the cache manager at the
+        real request ids, so the snapshot would land on real state now,
+        but a captured cfg-on prefill has never been exercised and stays
+        off until verified on its own. cfg-on prefill_text continues to
+        use the eager path; downstream image_gen / decode+cfg captures are
+        unaffected (they don't depend on this capture's snapshot
+        semantics).
         """
         dummy = ARNodeInputs(
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
