@@ -581,6 +581,13 @@ class KVCacheEngine(BaseEngine):
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
+        declaration = submodule.declare_step(
+            graph_walk=batch.graph_walk,
+            engine_inputs=engine_inputs,
+            inputs=inputs,
+        )
+        if declaration is not None:
+            self.step_runner.drive(declaration, cache_manager)
         preprocessed = submodule.preprocess(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -607,6 +614,8 @@ class KVCacheEngine(BaseEngine):
         if self.enable_nvtx:
             range_pop()
 
+        if declaration is not None:
+            self.step_runner.commit(declaration, cache_manager)
         cache_manager.flush_to_store()
 
         # `__batched_logits__` is the stacked [B, V] logits the submodule
@@ -707,6 +716,13 @@ class KVCacheEngine(BaseEngine):
 
             if self.enable_nvtx:
                 range_push("ar.seq.preprocess", synchronize=False)
+            declaration = submodule.declare_step(
+                graph_walk=batch.graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=[node_inputs],
+            )
+            if declaration is not None:
+                self.step_runner.drive(declaration, cache_manager)
             preprocessed = submodule.preprocess(
                 batch.graph_walk,
                 engine_inputs=engine_inputs,
@@ -733,6 +749,8 @@ class KVCacheEngine(BaseEngine):
             if self.enable_nvtx:
                 range_pop()
 
+            if declaration is not None:
+                self.step_runner.commit(declaration, cache_manager)
             cache_manager.flush_to_store()
             per_request_outputs[rid] = output
 

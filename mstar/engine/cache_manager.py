@@ -184,6 +184,12 @@ class BatchedCacheManager(ABC):
         graph runner's per-slot store when one was passed in)."""
         return self.attention.states
 
+    @property
+    def is_captured(self) -> bool:
+        """Whether this step surface fronts a captured graph's persistent
+        per-slot plan store rather than a per-step eager one."""
+        return self._cuda_graph_mode
+
     @torch.compiler.disable
     def _get_state(self, request_id: str, label: str | None = None) -> KVRequestState:
         label = label or self.active_labels.get(request_id, "main")
@@ -281,14 +287,17 @@ class BatchedCacheManager(ABC):
         k: torch.Tensor,
         v: torch.Tensor,
         layer_idx: int | None=None,
+        label: str | None = None,
     ) -> torch.Tensor:
-        """Run the pre-planned attention for the active label.
+        """Run the pre-planned attention for a cache label.
 
         Args:
             q: [total_tokens, num_q_heads, head_dim]
             k: [total_tokens, num_kv_heads, head_dim]
             v: [total_tokens, num_kv_heads, head_dim]
             layer_idx: transformer layer index
+            label: plan key to run (a cache label, or a combined key such
+                as ``_cfg_batched``). If None, uses the active label.
         Returns:
             output: [total_tokens, num_q_heads, head_dim]
         """
@@ -436,10 +445,13 @@ class BatchedCacheManager(ABC):
         rope_scale: float = 1,
         rope_theta: float = 10000.0,
         rope_dtype=None,
+        label: str | None = None,
         **kwargs
     ):
-        """Apply RoPE using the active label's pre-computed position IDs."""
-        label = self._active_label()
+        """Apply RoPE using a label's pre-computed position IDs (the
+        active label when ``label`` is None)."""
+        if label is None:
+            label = self._active_label()
 
         ps = self._plan_states[label]
         assert ps.pos_ids is not None
@@ -708,12 +720,14 @@ class FlashInferCacheManager(BatchedCacheManager):
         k: torch.Tensor,
         v: torch.Tensor,
         layer_idx: int | None=None,
+        label: str | None = None,
     ) -> torch.Tensor:
         """Run pre-planned FlashInfer attention with KV cache write.
 
-        Uses the active label's plan state (set up by a prior plan_attention
-        call). Writes K and V to the paged KV cache at pre-computed page
-        positions, then runs the FlashInfer wrapper for batched attention.
+        Uses the given label's plan state (the active label when ``label``
+        is None; set up by a prior plan_attention call). Writes K and V to
+        the paged KV cache at pre-computed page positions, then runs the
+        FlashInfer wrapper for batched attention.
 
         In CUDA graph mode, the wrapper's set_kv_cache() + run() operate on
         pre-computed token_to_page/token_to_cache or kv_cache_locations
@@ -725,7 +739,8 @@ class FlashInferCacheManager(BatchedCacheManager):
 
         orig_dtype = q.dtype
 
-        label = self._active_label()
+        if label is None:
+            label = self._active_label()
         ps = self._plan_states[label]
 
         assert self.kv_cache is not None and ps.wrapper is not None
@@ -968,16 +983,19 @@ class DenseGenCacheManager(FlashInferCacheManager):
         k: torch.Tensor,
         v: torch.Tensor,
         layer_idx: int | None=None,
+        label: str | None = None,
     ) -> torch.Tensor:
-        """Route the active label to its dense plan when one was built, else
-        run the inherited paged FlashInfer attention."""
-        label = self._active_label()
+        """Route the label (the active one when None) to its dense plan
+        when one was built, else run the inherited paged FlashInfer
+        attention."""
+        if label is None:
+            label = self._active_label()
         ps = self._plan_states[label]
         if ps.dense_gen is not None:
             if layer_idx is None:
                 layer_idx = self.layer_idx
             return self.attention.run_dense(q, k, v, layer_idx, ps.dense_gen).to(q.dtype)
-        return super().run_attention(q, k, v, layer_idx=layer_idx)
+        return super().run_attention(q, k, v, layer_idx=layer_idx, label=label)
 
 
 # Backend registry: KVCacheConfig.attention_backend names one of these.

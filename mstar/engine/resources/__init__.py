@@ -10,6 +10,7 @@ from mstar.engine.resources.base import (
     Segment,
     SequenceView,
 )
+from mstar.engine.resources.declare import PlanSpec, StepDeclaration
 from mstar.engine.resources.kv_pool import KVCachePool, PageArena, ScratchKVPool
 from mstar.engine.resources.positions import RopeEmbedder
 from mstar.engine.resources.spec import NodeResourceSpec, ScratchKVSpec
@@ -22,6 +23,7 @@ __all__ = [
     "KVCachePool",
     "NodeResourceSpec",
     "PageArena",
+    "PlanSpec",
     "PositionPlan",
     "Reservation",
     "RopeEmbedder",
@@ -29,6 +31,7 @@ __all__ = [
     "ScratchKVSpec",
     "Segment",
     "SequenceView",
+    "StepDeclaration",
     "StepPlan",
     "StepRunner",
     "WorkspaceBufferManager",

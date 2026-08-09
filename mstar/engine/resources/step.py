@@ -12,6 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from mstar.engine.resources.base import Segment
+from mstar.engine.resources.declare import StepDeclaration
 from mstar.engine.resources.kv_pool import KVCachePool
 
 if TYPE_CHECKING:
@@ -75,6 +77,82 @@ class StepRunner:
             mode=mode,
             per_request_managers=[build_manager([rid]) for rid in request_ids],
         )
+
+    def drive(
+        self,
+        declaration: StepDeclaration,
+        cache_manager: "BatchedCacheManager",
+    ) -> None:
+        """Execute a declared step's admission and planning: forks first,
+        then each plan in declaration order. Every plan goes through the
+        step surface's own plan calls, so a declared step admits, plans,
+        and short-circuits pre-planned labels exactly as a facade-driven
+        model would."""
+        for from_label, to_label in declaration.pre_forks:
+            cache_manager.snapshot_all(from_label, to_label)
+        for plan in declaration.plans:
+            if len(plan.labels) > 1:
+                seq_lens = {
+                    label: list(plan.spans[label]) for label in plan.labels
+                }
+                cache_manager.plan_attention_batched_cfg(
+                    labels=list(plan.labels),
+                    seq_lens=seq_lens,
+                    is_causal=plan.is_causal,
+                    write_store=plan.write_store,
+                    combined_label=plan.combined_key,
+                    dense_gen=plan.dense_gen,
+                )
+                if plan.rope:
+                    cache_manager.plan_rope_batched_cfg(
+                        labels=list(plan.labels),
+                        seq_lens=seq_lens,
+                        per_label_pos_ids=plan.rope_pos_ids,
+                        combined_label=plan.combined_key,
+                    )
+            else:
+                label = plan.labels[0]
+                spans = list(plan.spans[label])
+                cache_manager.plan_attention(
+                    seq_lens=spans,
+                    is_causal=plan.is_causal,
+                    write_store=plan.write_store,
+                    label=label,
+                    dense_gen=plan.dense_gen,
+                )
+                if plan.rope:
+                    cache_manager.plan_rope(
+                        seq_lens=spans,
+                        pos_ids=plan.rope_pos_ids,
+                        label=label,
+                    )
+
+    def commit(
+        self,
+        declaration: StepDeclaration,
+        cache_manager: "BatchedCacheManager",
+    ) -> None:
+        """Commit a declared step once its forward is launched: advance
+        each committing plan's streams by their planned spans (and any
+        declared position advances) straight on the pool, then apply the
+        declared post-forward forks."""
+        pool = cache_manager.kv_pool
+        request_ids = cache_manager.request_ids
+        for plan in declaration.plans:
+            if not plan.commit:
+                continue
+            for label in plan.labels:
+                spans = plan.spans[label]
+                for i, rid in enumerate(request_ids):
+                    pool.commit(
+                        Segment(rid, label, spans[i]),
+                        pos_advance=(
+                            None if plan.pos_advance is None
+                            else plan.pos_advance[i]
+                        ),
+                    )
+        for from_label, to_label in declaration.post_forks:
+            cache_manager.snapshot_all(from_label, to_label)
 
     def publish(
         self,

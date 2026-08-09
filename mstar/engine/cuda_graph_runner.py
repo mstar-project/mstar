@@ -41,6 +41,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCudaGraphConfig,
 )
 from mstar.engine.kv_store import KVCacheConfig, PagedAllocationManager
+from mstar.engine.resources.step import StepRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mstar.profile.worker import ExecTimings
 from mstar.utils.profiler import mark, range_pop, range_push
@@ -206,6 +207,10 @@ class CudaGraphRunner:
         # allocation below (and any future use) is None-safe.
         self.default_sampling_config = default_sampling_config or MultiSamplingConfig()
         self.enable_nvtx = False  # set by KVCacheEngine after construction
+
+        # Drives declared steps (submodules that return a StepDeclaration)
+        # at capture and replay, in place of plan calls in preprocess.
+        self.step_runner = StepRunner()
 
         self.graphs: dict[CudaGraphKey, CudaGraphData] = {}
 
@@ -806,9 +811,18 @@ class CudaGraphRunner:
                 dummy_rids=dummy_rids, plan_states=plan_states, config=config,
             )
 
-            # Preprocess (plans attention+rope outside graph) and intern
-            # the resulting tensors into the shared static-buffer pool so
-            # both slots' captures read from the same GPU addresses.
+            # Declared steps plan through the runner; preprocess then only
+            # marshals data. Undeclared submodules keep planning inside
+            # preprocess. Either way the resulting tensors are interned
+            # into the shared static-buffer pool so both slots' captures
+            # read from the same GPU addresses.
+            declaration = submodule.declare_step(
+                graph_walk=config.capture_graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=dummy_inputs,
+            )
+            if declaration is not None:
+                self.step_runner.drive(declaration, engine_inputs.cache_manager)
             preprocessed = submodule.preprocess(
                 graph_walk=config.capture_graph_walk,
                 engine_inputs=engine_inputs,
@@ -825,6 +839,9 @@ class CudaGraphRunner:
             ]
 
             def re_prepare() -> None:
+                if declaration is not None:
+                    self.step_runner.drive(declaration, engine_inputs.cache_manager)
+                    return
                 submodule.preprocess(
                     graph_walk=config.capture_graph_walk,
                     engine_inputs=engine_inputs,
@@ -1404,6 +1421,13 @@ class CudaGraphRunner:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
                 range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
+            declaration = submodule.declare_step(
+                graph_walk=key.graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=real_inputs,
+            )
+            if declaration is not None:
+                self.step_runner.drive(declaration, static_cm)
             real_inputs = submodule.preprocess(
                 graph_walk=key.graph_walk,
                 engine_inputs=engine_inputs,
@@ -1472,8 +1496,12 @@ class CudaGraphRunner:
                 range_push("cg.advance_seq_lens", synchronize=False)
             # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
             # same tail pages every step, so they opt out of the advance (it would
-            # grow the prefix across steps and corrupt attention).
-            if graph_data.config.advance_seq_lens:
+            # grow the prefix across steps and corrupt attention). Declared
+            # steps carry their own commit spans (including the padding
+            # tail, whose inputs the declaration covered).
+            if declaration is not None:
+                self.step_runner.commit(declaration, static_cm)
+            elif graph_data.config.advance_seq_lens:
                 for label in config_labels:
                     static_cm.set_active_label(label)
                     static_cm.advance_seq_lens()
@@ -1630,6 +1658,13 @@ class CudaGraphRunner:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
                 range_push("cg.preprocess_replan.submodule_preprocess", synchronize=False)
+            declaration = submodule.declare_step(
+                graph_walk=key.graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=padded_inputs,
+            )
+            if declaration is not None:
+                self.step_runner.drive(declaration, static_cm)
             real_packed = submodule.preprocess(
                 graph_walk=key.graph_walk,
                 engine_inputs=engine_inputs,
@@ -1692,8 +1727,11 @@ class CudaGraphRunner:
                 range_push("cg.advance_seq_lens", synchronize=False)
             # Frozen-prefix denoise walks re-read a fixed prefix and overwrite the
             # same tail pages every step, so they opt out of the advance (it would
-            # grow the prefix across steps and corrupt attention).
-            if graph_data.config.advance_seq_lens:
+            # grow the prefix across steps and corrupt attention). Declared
+            # steps carry their own commit spans (padding tail included).
+            if declaration is not None:
+                self.step_runner.commit(declaration, static_cm)
+            elif graph_data.config.advance_seq_lens:
                 if graph_data.config.batched_cfg:
                     # _batched_cfg_info (set by the preprocess plan above) makes a
                     # single advance_seq_lens walk every label's state; looping
