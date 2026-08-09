@@ -1239,21 +1239,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         # inject tts_eos_embed for ONE step before falling back to pad.
         self._eos_embed_sent: set[str] = set()
 
-        # TODO: this is hacky; when we have time, refactor it to make this
-        # come from the engine
-        self._cp_kv_cache: torch.Tensor | None = None
-
     def _get_cp_kv_cache(self):
-        if self._cp_kv_cache is None:
-            self._cp_kv_cache = torch.zeros((
-                    self.cp_cfg.num_hidden_layers,
-                    self.MAX_BATCH_SIZE, 2, self.num_codes,
-                    self.cp_cfg.num_key_value_heads,
-                    self.cp_cfg.head_dim
-                ), dtype=self.talker_code_emb.weight.dtype,
-                device=self.get_device(),
-            )
-        return self._cp_kv_cache
+        """The engine-built CodePredictor scratch cache, overwritten every
+        Talker step."""
+        return self.node_resources["code_predictor"].tensor
 
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's

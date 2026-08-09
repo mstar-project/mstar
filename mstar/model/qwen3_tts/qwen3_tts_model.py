@@ -40,6 +40,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.engine.base import EngineType
 from mstar.engine.kv_cache_engine import KVCacheConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ScratchKVSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -232,6 +233,33 @@ class Qwen3TTSModel(Model):
             # toolchain cannot build the Hopper FA3 JIT kernels.
             flashinfer_backend="auto",
         )]
+
+    def get_node_resources(
+        self, kv_cache_config: list[KVCacheConfig],
+    ) -> list[NodeResourceSpec]:
+        """The Talker adds the CodePredictor's fixed-shape scratch cache.
+
+        CodePredictor attention is local to one 16-group frame, so its
+        cache is overwritten every Talker step rather than paged across
+        steps; a maximum-batch allocation gives the captured decode graph
+        stable addresses.
+        """
+        from mstar.model.qwen3_tts.submodules import TalkerSubmodule
+
+        specs = super().get_node_resources(kv_cache_config)
+        cp = self.config.talker.code_predictor
+        for spec in specs:
+            nodes = spec.kv_cache_config.nodes or []
+            if "Talker" in nodes:
+                spec.scratch["code_predictor"] = ScratchKVSpec(shape=(
+                    cp.num_hidden_layers,
+                    TalkerSubmodule.MAX_BATCH_SIZE,
+                    2,
+                    self.config.talker.num_code_groups,
+                    cp.num_key_value_heads,
+                    cp.head_dim,
+                ))
+        return specs
 
     def get_node_engine_types(self) -> dict[str, EngineType]:
         """Talker keeps cross-step KV state; Codec is a pure frame decoder."""
