@@ -320,6 +320,13 @@ class BaseEngine(ABC):
 
     capabilities = EngineCapabilities()
 
+    def node_resources(self, node_name: str) -> dict[str, Any]:
+        """The named resources this engine built for ``node_name`` (KV
+        cache pool, embedder, cross pools, scratch caches). Engines that
+        build none return an empty dict.
+        """
+        return {}
+
     def lru_tracked_nodes(self) -> list[str]:
         """Nodes for which the worker should LRU-track per-request activity
         (used to pick CPU-offload victims). Default: no nodes — stateless

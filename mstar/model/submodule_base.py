@@ -236,6 +236,14 @@ class NodeSubmodule(torch.nn.Module):
         # of the same objects. The engine removes a request's entry via
         # ``cleanup_request`` when the request is removed.
         self.request_states: dict[str, PerRequestState] = {}
+        # Engine-built resources for this submodule's node (KV cache pool,
+        # embedder, scratch caches), bound once at load. Empty until then
+        # and on engines that build none.
+        self.node_resources: dict[str, Any] = {}
+
+    def bind_node_resources(self, resources: dict[str, Any]) -> None:
+        """Receive the engine-built resources for this submodule's node."""
+        self.node_resources = resources
 
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""

@@ -87,6 +87,7 @@ class EngineManager:
         real computation.
         """
         node_to_engine_type = model.get_node_engine_types()
+        node_resource_specs = model.get_node_resources(kv_config)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
@@ -163,6 +164,7 @@ class EngineManager:
                 device=device,
                 transfer_engine_info=transfer_engine_info,
                 kv_cache_type=autocast_dtype,
+                node_resources=node_resource_specs,
                 default_sampling_config={
                     node: model.resolve_sampling_configs(node, {}) \
                         for node in submodules

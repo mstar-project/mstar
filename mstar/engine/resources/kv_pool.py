@@ -50,6 +50,17 @@ class PageArena:
         return self.allocator.max_num_pages
 
 
+class ScratchKVPool:
+    """Fixed-shape scratch KV storage with a trivial lifecycle: no admit,
+    no publish, no per-request lifetime. The tensor is overwritten every
+    step and slot-indexed by batch position. Models that need a depth
+    loop's per-step cache take it from here instead of allocating their
+    own tensors on the side."""
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+
+
 class KVCachePool:
     """Per-request cache accounting behind the segment lifecycle.
 

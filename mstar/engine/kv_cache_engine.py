@@ -36,7 +36,8 @@ from mstar.engine.kv_store import (
     StoreWritePolicy,
     TransferEngineInfo,
 )
-from mstar.engine.resources import KVCachePool, RopeEmbedder
+from mstar.engine.resources import KVCachePool, RopeEmbedder, ScratchKVPool
+from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import StepPlan, StepRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mstar.utils.profiler import range_pop, range_push
@@ -163,6 +164,9 @@ class KVCacheEngine(BaseEngine):
 
         self.kv_management: dict[str, KVManagement] = {}
         self.submodule_management: dict[str, SubmoduleManagement] = {}
+        # node name -> the named resources built for it at load_model
+        # (shared between nodes on the same KV cache group).
+        self._node_resources: dict[str, dict[str, object]] = {}
 
         # Sequences each batch's resource lifecycle: admit before prepare,
         # plan surface before forward, publish after.
@@ -184,6 +188,9 @@ class KVCacheEngine(BaseEngine):
         supports_cpu_offload=True,
     )
 
+    def node_resources(self, node_name: str) -> dict[str, object]:
+        return self._node_resources.get(node_name, {})
+
     def engine_type(self) -> EngineType:
         return EngineType.KV_CACHE
 
@@ -196,13 +203,21 @@ class KVCacheEngine(BaseEngine):
         transfer_engine_info: TransferEngineInfo,
         default_sampling_config: dict[str, MultiSamplingConfig],
         kv_cache_type=None,
+        node_resources: list[NodeResourceSpec] | None = None,
     ) -> None:
         self.device = device
         if kv_cache_type is None:
             kv_cache_type = self.autocast_dtype
 
+        # Callers that pass only raw configs get the default declaration,
+        # the same one Model.get_node_resources derives.
+        specs = node_resources or [
+            NodeResourceSpec(kv_cache_config=cfg) for cfg in kv_cache_config
+        ]
+
         node_to_kv_mgmt = {}
-        for cfg in kv_cache_config:
+        for spec in specs:
+            cfg = spec.kv_cache_config
             num_layers = cfg.num_layers
             max_num_pages = cfg.max_num_pages
             page_size = cfg.page_size
@@ -294,11 +309,28 @@ class KVCacheEngine(BaseEngine):
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
 
+            resources: dict[str, object] = {
+                "kv": kv_mgmt.kv_pool,
+                "rope": kv_mgmt.rope_embedder,
+            }
+            for source, cross_kv_pool in kv_mgmt.cross_kv_pools.items():
+                resources[f"cross_kv:{source}"] = cross_kv_pool
+            for key, scratch_spec in spec.scratch.items():
+                resources[key] = ScratchKVPool(torch.zeros(
+                    scratch_spec.shape,
+                    dtype=scratch_spec.dtype or kv_cache_type,
+                    device=device,
+                ))
+
             for node_name in nodes:
                 node_to_kv_mgmt[node_name] = kv_mgmt
+                self._node_resources[node_name] = resources
 
         for node_name, submodule in submodules.items():
             tp_group = parallel_groups.get_tp_config_for_node(node_name)
+            submodule.bind_node_resources(
+                self._node_resources.get(node_name, {})
+            )
             sampl_cfg = default_sampling_config.get(
                 node_name, MultiSamplingConfig()
             )
