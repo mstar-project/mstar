@@ -354,3 +354,32 @@ def test_mtp_trunk_kv_and_plane_bookkeeping():
     assert ("r0", 4) not in h_off._store
     on_plane = h_on.committed_rows("r0", 4)
     assert len(on_plane) == h_on._states["r0"].position_id_start
+
+
+def test_mtp_acceptance_log_per_position(caplog):
+    """The 512-step acceptance line must carry the conditional per-position
+    profile (the datum that separates "first draft mediocre" from "chained
+    drafts collapse"). Short tests never cross the threshold, so drive the
+    method directly with a synthetic histogram."""
+    import logging as _logging
+
+    k = 3
+    ns = SimpleNamespace(
+        config=SimpleNamespace(mtp_num_draft_tokens=k),
+        _MTP_STAT_LOG_EVERY=Glm52LLMSubmodule._MTP_STAT_LOG_EVERY,
+        _mtp_stat_steps=512,
+        _mtp_stat_logged=0,
+        # 512 steps halving at each position: reached = [512, 256, 128, 64].
+        _mtp_stat_acc_hist=[256, 128, 64, 64],
+        _mtp_stat_emitted=256 * 1 + 128 * 2 + 64 * 3 + 64 * 4,
+    )
+    with caplog.at_level(
+        _logging.INFO, logger="mstar.model.glm52.submodules",
+    ):
+        Glm52LLMSubmodule._maybe_log_mtp_acceptance(ns)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("emitted/step" in m for m in msgs)
+    (pos_line,) = [m for m in msgs if "by position" in m]
+    assert "[256, 128, 64, 64]" in pos_line
+    assert "0.50 0.50 0.50" in pos_line
+    assert ns._mtp_stat_logged == 512

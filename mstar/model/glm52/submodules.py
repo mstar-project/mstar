@@ -104,6 +104,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_stat_emitted = 0
         self._mtp_stat_steps = 0
         self._mtp_stat_logged = 0
+        # Histogram of n_accepted per decode step (bins 0..k). The aggregate
+        # rate can't separate "first draft mediocre" from "chained drafts
+        # collapse" — the conditional per-position profile can.
+        self._mtp_stat_acc_hist = [0] * (config.mtp_num_draft_tokens + 1)
 
     def set_load_heartbeat_stop(self, stop) -> None:
         """Adopt the load-time GPU liveness tick; stopped on first forward."""
@@ -654,6 +658,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # Raw (pre-truncation) emission is the draft-quality signal.
             self._mtp_stat_steps += 1
             self._mtp_stat_emitted += n_acc + 1
+            self._mtp_stat_acc_hist[n_acc] += 1
             emitted = torch.cat([drafts_in[:n_acc], bonus.reshape(1)])
             # Truncate: max_tokens budget first, then first stop id. EOS is
             # always the LAST element after truncation, which is the
@@ -786,6 +791,23 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "request-steps.",
             mean_emitted, k + 1, (mean_emitted - 1.0) / k if k else 0.0,
             self._mtp_stat_steps,
+        )
+        # Conditional per-position profile: p_i = P(draft i accepted | drafts
+        # 1..i-1 accepted). Greedy verify accepts prefixes, so "reached
+        # position i" = n_acc >= i. A flat profile means draft quality is
+        # uniform (domain-limited); a falling one means the chained
+        # iterations degrade (loop bug or compounding drift).
+        reached = [
+            sum(self._mtp_stat_acc_hist[i:]) for i in range(k + 1)
+        ]  # reached[0] = all steps
+        cond = [
+            f"{reached[i] / reached[i - 1]:.2f}" if reached[i - 1] else "-"
+            for i in range(1, k + 1)
+        ]
+        logger.info(
+            "MTP acceptance by position: n_acc histogram %s, conditional "
+            "accept per position %s",
+            self._mtp_stat_acc_hist, " ".join(cond),
         )
 
     @staticmethod
