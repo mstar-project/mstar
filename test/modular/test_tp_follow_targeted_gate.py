@@ -16,9 +16,14 @@ collective. The guard under test: targeted calls leave the FIFO untouched;
 untargeted calls still serve it, in order.
 """
 
-from mstar.graph.base import GraphNode
-from mstar.utils.ipc_format import ScheduleTPNode
-from mstar.worker.micro_scheduler import MicroScheduler
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from mstar.graph.base import GraphNode  # noqa: E402
+from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
+from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 
 
 class _FakeEngine:
