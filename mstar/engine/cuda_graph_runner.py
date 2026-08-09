@@ -52,6 +52,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_AR_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
+def _log_capture_outcome(submodule_name: str, attempted: int, captured: int) -> None:
+    """Summarize a warmup's capture results at the right volume.
+
+    A submodule that registered configs but captured NOTHING serves every
+    batch on the eager fallback — an order-of-magnitude decode regression
+    (measured 13x on GLM-5.2 MTP, 2026-08-09) that previously announced
+    itself only as per-shape warnings scrolled off during warmup. Make the
+    all-failed case an ERROR with the consequence spelled out; partial
+    failure stays a WARNING.
+    """
+    if attempted == 0 or captured == attempted:
+        return
+    if captured == 0:
+        logger.error(
+            "CudaGraphRunner[%s]: ALL %d CUDA-graph captures FAILED — every "
+            "batch will run the EAGER fallback (order-of-magnitude slower "
+            "decode). First failure above has the traceback.",
+            submodule_name, attempted,
+        )
+    else:
+        logger.warning(
+            "CudaGraphRunner[%s]: %d/%d captures failed; batches without a "
+            "captured shape fall back to eager.",
+            submodule_name, attempted - captured, attempted,
+        )
+
+
 @dataclass
 class DummyCaptureInput:
     tensors: dict[str, list[torch.Tensor]]  # {tensor_name: [tensor(s)]}
@@ -202,6 +229,9 @@ class CudaGraphRunner:
         self.enable_nvtx = False  # set by KVCacheEngine after construction
 
         self.graphs: dict[CudaGraphKey, CudaGraphData] = {}
+        # Filled by warmup_and_capture; read by tests and health checks.
+        self.capture_attempted = 0
+        self.capture_failed = 0
 
         self.memory_pool = None
 
@@ -261,6 +291,8 @@ class CudaGraphRunner:
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
         mem_before = torch.cuda.memory_allocated(self.device)
 
+        attempted = 0
+        captured = 0
         for config in self.capture_configs:
             sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
             for bs in reversed(sizes):
@@ -271,6 +303,8 @@ class CudaGraphRunner:
                         bs=bs, num_tokens=num_tokens
                     )
                     self.tp_group.barrier()
+                    attempted += 1
+                    registered_before = len(self.graphs)
                     try:
                         cfg_type = config.get_config_type()
                         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
@@ -287,6 +321,15 @@ class CudaGraphRunner:
                         logger.warning(
                             "Failed to capture CUDA graph for %s: %s bs=%d",
                             self.submodule_name, key, bs, exc_info=True)
+                    # Registration is the ground truth for "captured" — the
+                    # per-type paths can also bail without raising (e.g. a
+                    # BASIC_BATCHED config with no template inputs).
+                    if len(self.graphs) > registered_before:
+                        captured += 1
+
+        self.capture_attempted = attempted
+        self.capture_failed = attempted - captured
+        _log_capture_outcome(self.submodule_name, attempted, captured)
 
         mem_after = torch.cuda.memory_allocated(self.device)
         shared_bytes = sum(
@@ -2614,28 +2657,67 @@ class PiecewiseCudaGraphRunner:
         return static_cm, dummy_rids
 
     def _build_persistent_wrappers(self, shape: PiecewiseCaptureShape) -> dict:
-        from mstar.engine.cache_manager import _PlanState
-        from mstar.utils.flashinfer_utils import FlashInferPrefillWrapper
+        from mstar.engine.cache_manager import _mla_kernel_available, _PlanState
+        from mstar.utils.flashinfer_utils import (
+            FlashInferMLAWrapper,
+            FlashInferPrefillWrapper,
+        )
 
         cfg = self.kv_cache_config
+        # Mirror CudaGraphRunner._create_persistent_wrappers: an mla_absorb
+        # cache plans through the MLA wrapper (the GLM-5.2 / Kimi latent
+        # layout); everything else through the ragged prefill wrapper.
+        use_mla_kernel = (
+            cfg.attention_backend == "mla_absorb"
+            and cfg.mla_ckv_dim is not None
+            and _mla_kernel_available(
+                cfg.mla_ckv_dim,
+                cfg.head_dim - cfg.mla_ckv_dim,
+                torch.cuda.get_device_capability(self.device)[0],
+            )
+        )
         plan_states: dict = {}
         for label in self.cache_labels:
-            wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self.buffer_manager.get(
-                    f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
-                ),
-                num_qo_heads=cfg.num_qo_heads,
-                num_kv_heads=cfg.num_kv_heads,
-                head_dim=cfg.head_dim,
-                page_size=cfg.page_size,
-                batch_size=shape.bs,
-                max_total_tokens=shape.total_tokens,
-                max_num_pages=cfg.max_num_pages,
-                device=self.device,
-                use_cuda_graph=True,
-                backend=cfg.flashinfer_backend,
+            workspace = self.buffer_manager.get(
+                f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
             )
-            plan_states[label] = _PlanState(wrapper=wrapper)
+            if use_mla_kernel:
+                wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=workspace,
+                    num_heads=cfg.num_qo_heads,
+                    head_dim_ckv=cfg.mla_ckv_dim,
+                    head_dim_kpe=cfg.head_dim - cfg.mla_ckv_dim,
+                    page_size=cfg.page_size,
+                    sm_scale=cfg.softmax_scale,
+                    batch_size=shape.bs,
+                    max_num_pages=cfg.max_num_pages,
+                    max_total_tokens=shape.total_tokens,
+                    device=self.device,
+                    use_cuda_graph=True,
+                )
+            else:
+                wrapper = FlashInferPrefillWrapper(
+                    workspace_buffer=workspace,
+                    num_qo_heads=cfg.num_qo_heads,
+                    num_kv_heads=cfg.num_kv_heads,
+                    head_dim=cfg.head_dim,
+                    page_size=cfg.page_size,
+                    batch_size=shape.bs,
+                    max_total_tokens=shape.total_tokens,
+                    max_num_pages=cfg.max_num_pages,
+                    device=self.device,
+                    use_cuda_graph=True,
+                    backend=cfg.flashinfer_backend,
+                )
+            plan_states[label] = _PlanState(
+                wrapper=wrapper,
+                # Static RoPE position buffer so plan_rope's graph-mode
+                # .copy_() path has a stable address (same contract as
+                # CudaGraphRunner's per-slot static_pos_ids).
+                pos_ids=torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=self.device
+                ),
+            )
         return plan_states
 
     def _plan(
