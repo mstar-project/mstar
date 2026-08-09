@@ -2578,7 +2578,28 @@ class PiecewiseCudaGraphRunner:
     def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
         static_inputs = self.config.make_static_inputs(shape)
         static_cm, dummy_rids = self._setup_cache_manager(shape)
+        try:
+            self._capture_one_inner(shape, static_inputs, static_cm, dummy_rids)
+        finally:
+            # Free dummy KV state on SUCCESS AND FAILURE. A failed capture
+            # that keeps its dummy pages skews num_free_pages on just this
+            # rank — and since capture failures (e.g. the Inductor autotune
+            # sync race) land on different ranks at different buckets, the
+            # leak turns into cross-rank allocator asymmetry that
+            # _verify_tp_kv_symmetry rejects, killing the whole server at
+            # warmup (hit 2026-08-09: [508,508,504,...] = one bs-sized leak
+            # per rank's failed bucket).
+            for rid in dummy_rids:
+                for label in self.cache_labels:
+                    self.alloc_manager.reset_label(rid, label, free=True)
 
+    def _capture_one_inner(
+        self,
+        shape: PiecewiseCaptureShape,
+        static_inputs: dict[str, torch.Tensor],
+        static_cm: BatchedCacheManager | None,
+        dummy_rids: list[str],
+    ) -> None:
         fn = self.config.capture_fn
         if self.config.compile:
             fn = torch.compile(
@@ -2617,11 +2638,9 @@ class PiecewiseCudaGraphRunner:
                 static_out = self._normalize_output(run_fn())
         torch.cuda.synchronize()
 
-        # Free dummy KV state so it doesn't accumulate across buckets.
-        for rid in dummy_rids:
-            for label in self.cache_labels:
-                self.alloc_manager.reset_label(rid, label, free=True)
-
+        # Dummy KV state is freed by _capture_one's finally — success and
+        # failure both — so per-bucket leftovers can't accumulate or skew
+        # cross-rank allocator symmetry.
         self.graphs[(shape.bs, shape.total_tokens)] = PiecewiseGraphData(
             graph=graph,
             static_inputs=static_inputs,

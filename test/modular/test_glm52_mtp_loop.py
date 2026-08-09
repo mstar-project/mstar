@@ -262,6 +262,49 @@ def test_mtp_trunk_piecewise_config_shapes():
         torch.device("cpu"), torch.bfloat16, tp_world_size=1) == {}
 
 
+def test_piecewise_capture_failure_frees_dummy_kv(monkeypatch):
+    """The 2026-08-09 server kill: a failed piecewise capture that keeps its
+    dummy pages skews this rank's free-page count, and since capture
+    failures land on different ranks at different buckets, the TP symmetry
+    guard rejects the allocator state and the whole server dies at warmup.
+    _capture_one must free dummy KV state on failure exactly as on
+    success."""
+    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+
+    cfg = _mtp_cfg(2)
+    sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
+    pc = sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)["mtp_trunk"]
+
+    runner = PiecewiseCudaGraphRunner.__new__(PiecewiseCudaGraphRunner)
+    runner.config = pc
+    runner.cache_labels = ["main"]
+    freed = []
+
+    class _FakeAlloc:
+        def reset_label(self, rid, label, free=False):
+            freed.append((rid, label, free))
+
+    runner.alloc_manager = _FakeAlloc()
+    rids = ["__pcgr_a__", "__pcgr_b__"]
+    monkeypatch.setattr(
+        runner, "_setup_cache_manager", lambda shape: (object(), rids))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("capture blew up mid-graph")
+
+    monkeypatch.setattr(runner, "_capture_one_inner", _boom)
+
+    shape = pc.get_capture_shapes([2])[0]
+    try:
+        runner._capture_one(shape)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected the capture failure to propagate")
+    assert freed == [(rid, "main", True) for rid in rids]
+
+
 def test_all_captures_failed_logs_error(caplog):
     """Zero-of-N captured must be an ERROR naming the eager consequence;
     partial failure a WARNING; full success silent."""
