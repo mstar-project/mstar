@@ -79,6 +79,46 @@ class _StubTrunkRunner:
         }
 
 
+class _StubDraftRunner:
+    """Contract double for the ``mtp_draft`` piecewise graph: one chain
+    iteration — plan on the plane, rope at counter+1 derived from the
+    aliased states (asserted equal to the caller's positions: the property
+    the real plan_fn depends on), fused MTP forward, head argmax, advance
+    — with cloned outputs, mimicking PiecewiseOutput's clone-on-index."""
+
+    def __init__(self, sub, handle):
+        self.sub = sub
+        self.handle = handle
+        self.calls = 0
+
+    def can_run(self, batch_size, total_tokens=None):
+        return True
+
+    def run(self, static_inputs, request_ids=None, seq_lens=None, real_bs=None):
+        self.calls += 1
+        sub, handle = self.sub, self.handle
+        handle.set_layer_idx(sub.config.num_hidden_layers)
+        handle.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
+        pos = torch.tensor(
+            [handle._get_state(rid, "main").position_id_start + 1
+             for rid in request_ids], dtype=torch.long)
+        assert torch.equal(pos, static_inputs["position_ids"].cpu()), (
+            "replay plan positions (counter+1) diverge from the loop's "
+            f"st+it: {pos.tolist()} vs "
+            f"{static_inputs['position_ids'].tolist()}")
+        handle.plan_rope(seq_lens=seq_lens, pos_ids=pos, label="main")
+        mtp = sub.language_model.mtp
+        embed = sub.language_model.model.embed_tokens
+        h_head, h_raw = mtp(
+            embed(static_inputs["draft_ids"]), static_inputs["prev_hidden"],
+            handle, pos)
+        handle.advance_seq_lens()
+        return {
+            "draft_ids": sub.lm_head(h_head).argmax(dim=-1).clone(),
+            "prev_hidden": h_raw.clone(),
+        }
+
+
 def _mtp_cfg(k: int) -> Glm52ModelConfig:
     cfg = Glm52ModelConfig.reduced()
     cfg.num_hidden_layers = 4  # MTP position lands FULL (4 = offset-1 + freq)
@@ -198,6 +238,44 @@ def test_mtp_trunk_replay_seam_bit_identical():
         f"{stream_replay.tolist()}")
 
 
+def test_mtp_draft_replay_seam_bit_identical():
+    """Routing the chain iterations through the mtp_draft runner seam must
+    draft — and therefore emit — the bit-identical stream to the eager
+    loop. k=3 gives two chained iterations per step; the stub also pins
+    the replay-plan position arithmetic (counter+1 == st+it)."""
+    torch.manual_seed(0)
+    cfg = _mtp_cfg(3)
+    model = Glm52ForCausalLM(cfg)
+    prompt = torch.arange(5, dtype=torch.long) + 3
+
+    sub_eager = Glm52LLMSubmodule(model, cfg)
+    stream_eager = _drive(
+        sub_eager, ReferenceCacheHandle(["r0"]), prompt, _fwd_info(24, True))
+
+    sub_replay = Glm52LLMSubmodule(model, cfg)
+    handle = ReferenceCacheHandle(["r0"])
+    draft_runner = _StubDraftRunner(sub_replay, handle)
+    stream_replay = _drive(
+        sub_replay, handle, prompt, _fwd_info(24, True),
+        runners={"mtp_draft": draft_runner})
+
+    assert draft_runner.calls > 0, "chain never went through the runner seam"
+    assert torch.equal(stream_eager, stream_replay), (
+        f"draft-seam stream diverged: {stream_eager.tolist()} vs "
+        f"{stream_replay.tolist()}")
+
+    # Both seams together (the production shape at k>=2).
+    sub_both = Glm52LLMSubmodule(model, cfg)
+    handle_b = ReferenceCacheHandle(["r0"])
+    stream_both = _drive(
+        sub_both, handle_b, prompt, _fwd_info(24, True),
+        runners={
+            "mtp_trunk": _StubTrunkRunner(sub_both, handle_b),
+            "mtp_draft": _StubDraftRunner(sub_both, handle_b),
+        })
+    assert torch.equal(stream_eager, stream_both)
+
+
 def test_preprocess_skips_plan_only_when_trunk_replays():
     """The replay decision is made once, in preprocess: with a runnable
     trunk graph the eager plan is skipped (the runner's plan is the live
@@ -211,11 +289,15 @@ def test_preprocess_skips_plan_only_when_trunk_replays():
 
     handle = ReferenceCacheHandle(["r0"])
     runner = _StubTrunkRunner(sub, handle)
+    draft = _StubDraftRunner(sub, handle)
     ar = sub.prepare_inputs("decode", fwd, decode_inputs)
     kw = sub.preprocess(
-        "decode", _EngineInputs(handle, _ArgmaxSampler(), {"mtp_trunk": runner}),
+        "decode",
+        _EngineInputs(handle, _ArgmaxSampler(),
+                      {"mtp_trunk": runner, "mtp_draft": draft}),
         [ar])
     assert kw["mtp_trunk_runner"] is runner
+    assert kw["mtp_draft_runner"] is draft
     assert handle._plan is None, "eager plan should be skipped on replay steps"
 
     handle2 = ReferenceCacheHandle(["r0"])
@@ -223,7 +305,21 @@ def test_preprocess_skips_plan_only_when_trunk_replays():
     kw2 = sub.preprocess(
         "decode", _EngineInputs(handle2, _ArgmaxSampler()), [ar2])
     assert kw2["mtp_trunk_runner"] is None
+    assert kw2["mtp_draft_runner"] is None
     assert handle2._plan is not None, "eager path must still plan"
+
+    # Prefill drafts too: the chain runner rides along, the trunk (a
+    # decode-shape graph) does not, and the prefill plan is untouched.
+    handle3 = ReferenceCacheHandle(["r0"])
+    ar3 = sub.prepare_inputs("prefill", fwd, decode_inputs)
+    kw3 = sub.preprocess(
+        "prefill",
+        _EngineInputs(handle3, _ArgmaxSampler(),
+                      {"mtp_trunk": runner, "mtp_draft": draft}),
+        [ar3])
+    assert kw3["mtp_trunk_runner"] is None
+    assert kw3["mtp_draft_runner"] is draft
+    assert handle3._plan is not None, "prefill must keep its eager plan"
 
 
 def test_mtp_disables_full_forward_capture_configs():
@@ -240,14 +336,15 @@ def test_mtp_disables_full_forward_capture_configs():
 
 def test_mtp_trunk_piecewise_config_shapes():
     """The trunk graph registers exactly one (bs, [k+1]*bs) PACKED bucket
-    per capture batch size — never the bs x token-bucket cross product."""
+    per capture batch size — never the bs x token-bucket cross product —
+    and k >= 2 adds the 1-row-per-request draft-chain graph."""
     from mstar.engine.cuda_graph_config import PiecewiseConfigType
 
     cfg = _mtp_cfg(2)  # rows per request = 3
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
     configs = sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)
-    assert set(configs) == {"mtp_trunk"}
+    assert set(configs) == {"mtp_trunk", "mtp_draft"}
     pc = configs["mtp_trunk"]
     assert pc.get_config_type() == PiecewiseConfigType.PACKED
     assert pc.uses_kv_cache and pc.cache_labels == ["main"]
@@ -262,9 +359,27 @@ def test_mtp_trunk_piecewise_config_shapes():
     assert static["input_ids"].shape == (3,)
     assert static["input_ids"].dtype == torch.long
 
+    dc = configs["mtp_draft"]
+    assert dc.get_config_type() == PiecewiseConfigType.PACKED
+    assert dc.uses_kv_cache and dc.cache_labels == ["main"]
+    dshapes = dc.get_capture_shapes(dc.capture_batch_sizes)
+    assert [(s.bs, s.total_tokens) for s in dshapes] == [
+        (1, 1), (2, 2), (4, 4), (8, 8), (16, 16)]
+    dstatic = dc.make_static_inputs(dshapes[1])
+    assert set(dstatic) == {"draft_ids", "prev_hidden", "position_ids"}
+    assert dstatic["draft_ids"].shape == (2,)
+    assert dstatic["prev_hidden"].shape == (2, cfg.hidden_size)
+    assert dstatic["prev_hidden"].dtype == torch.bfloat16
+
+    # k=1 has no chain iterations — no draft graph to pay capture for.
+    cfg.mtp_num_draft_tokens = 1
+    assert set(sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {"mtp_trunk"}
+
     cfg.mtp_num_draft_tokens = 0
     assert sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1) == {}
+    cfg.mtp_num_draft_tokens = 2
 
 
 def test_piecewise_capture_failure_frees_dummy_kv(monkeypatch):

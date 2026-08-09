@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 _MAIN = "main"
 # Piecewise-graph label for the MTP decode step's trunk verify forward.
 MTP_TRUNK_LABEL = "mtp_trunk"
+MTP_DRAFT_LABEL = "mtp_draft"
 
 
 @dataclass(kw_only=True)
@@ -99,6 +100,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # (no captured piecewise bucket) — the 2026-08-09 bench showed that
         # regression is 13x and silence lets it masquerade as "MTP is slow".
         self._mtp_trunk_eager_warned = False
+        self._mtp_draft_eager_warned = False
         # Acceptance instrumentation (global, not per-request): raw emitted
         # tokens (n_accepted + 1, pre-truncation) and request-step count.
         self._mtp_stat_emitted = 0
@@ -274,13 +276,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         autocast_dtype: torch.dtype,
         tp_world_size: int = 1,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
-        """One piecewise graph (``mtp_trunk``): the MTP decode step's trunk
+        """Two piecewise graphs for the MTP step. ``mtp_trunk``: the trunk
         verify forward — embed + 78 layers + lm_head over the packed
-        (bs, k+1) rows. The step's host tail (greedy verify, rewind, MTP
-        sync + draft loop) stays eager in ``_forward_batched_mtp``, which
-        replays this graph in place of the eager ``_hidden``/``lm_head``
-        pair. Same MSTAR_GLM52_GRAPH_COMPILE gate as the full-forward
-        captures so the trunk kernel stack matches the k=0 fast config."""
+        (bs, k+1) rows. ``mtp_draft`` (k >= 2 only): ONE chain iteration of
+        the draft loop — fuse(embed(draft), prev_hidden) through the
+        layer-78 module + head argmax, 1 row per request — replayed k-1
+        times per step. The step's remaining host phases (greedy verify,
+        rewind, the variable-row sync pass whose per-request lengths are
+        data-dependent) stay eager in ``_forward_batched_mtp``. Same
+        MSTAR_GLM52_GRAPH_COMPILE gate as the full-forward captures so the
+        kernel stack matches the k=0 fast config."""
         k = self.config.mtp_num_draft_tokens
         if (
             k <= 0
@@ -300,7 +305,20 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     shape.total_tokens, dtype=torch.long, device=device),
             }
 
-        return {
+        def make_draft_static_inputs(
+            shape: PiecewiseCaptureShape,
+        ) -> dict[str, torch.Tensor]:
+            return {
+                "draft_ids": torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=device),
+                "prev_hidden": torch.zeros(
+                    shape.total_tokens, self.config.hidden_size,
+                    dtype=autocast_dtype, device=device),
+                "position_ids": torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=device),
+            }
+
+        configs: dict[str, PiecewiseCudaGraphConfig] = {
             MTP_TRUNK_LABEL: Glm52MtpTrunkGraphConfig(
                 rows_per_request=rows,
                 capture_fn=self._mtp_trunk_captured,
@@ -312,6 +330,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
             )
         }
+        if k >= 2:
+            configs[MTP_DRAFT_LABEL] = Glm52MtpTrunkGraphConfig(
+                rows_per_request=1,
+                capture_fn=self._mtp_draft_captured,
+                make_static_inputs=make_draft_static_inputs,
+                plan_fn=self._mtp_draft_plan,
+                uses_kv_cache=True,
+                cache_labels=[_MAIN],
+                capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
+                compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
+            )
+        return configs
 
     def _mtp_trunk_captured(
         self,
@@ -349,6 +379,57 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_manager.plan_rope(
             seq_lens=shape.seq_lens, pos_ids=None, label=_MAIN)
 
+    def _mtp_draft_captured(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        static_cm: BatchedCacheManager | None = None,
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Captured region for one draft-chain iteration: fuse the previous
+        draft's embedding with the chained raw hidden, run the layer-78
+        module, take the head argmax. Output names deliberately match the
+        input names so each replay's outputs feed the next replay's
+        copy-in unchanged."""
+        static_cm.set_active_label(_MAIN)
+        mtp = self.language_model.mtp
+        embed = self.language_model.model.embed_tokens
+        h_head, h_raw = mtp(
+            embed(static_inputs["draft_ids"]),
+            static_inputs["prev_hidden"],
+            static_cm,
+            static_inputs["position_ids"],
+        )
+        return {
+            "draft_ids": self.lm_head(h_head).argmax(dim=-1),
+            "prev_hidden": h_raw,
+        }
+
+    def _mtp_draft_plan(
+        self, cache_manager: BatchedCacheManager, shape: PiecewiseCaptureShape,
+    ) -> None:
+        """Plan one chain iteration on the MTP plane: 1 row per request,
+        RoPE at counter+1 — the plane stores the entry for the token at
+        stream position p in slot p-1, so the row written at the current
+        counter carries the NEXT stream position (the same shift-by-one as
+        the eager loop's ``st + it``). Derivable entirely from the aliased
+        request states, for capture (dummy counters) and replay (real
+        counters) alike; zero-length padding rows contribute no tokens."""
+        cache_manager.set_active_label(_MAIN)
+        cache_manager.set_layer_idx(self.config.num_hidden_layers)
+        cache_manager.plan_attention(
+            seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
+        pos = [
+            cache_manager._get_state(rid, _MAIN).position_id_start + 1
+            for rid, sl in zip(
+                cache_manager.request_ids, shape.seq_lens, strict=True)
+            if sl > 0
+        ]
+        cache_manager.plan_rope(
+            seq_lens=shape.seq_lens,
+            pos_ids=torch.tensor(
+                pos, dtype=torch.long, device=self.get_device()),
+            label=_MAIN)
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -385,13 +466,20 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # dead work on the step-critical path. getattr: older engine-input
         # stubs (tests) predate the piecewise_runners field.
         trunk_runner = None
-        if self.config.mtp_num_draft_tokens > 0 and graph_walk == "decode":
+        draft_runner = None
+        if self.config.mtp_num_draft_tokens > 0:
             runners = getattr(engine_inputs, "piecewise_runners", None) or {}
-            candidate = runners.get(MTP_TRUNK_LABEL)
-            if candidate is not None and candidate.can_run(
-                len(inputs), sum(seq_lens)
-            ):
-                trunk_runner = candidate
+            if graph_walk == "decode":
+                candidate = runners.get(MTP_TRUNK_LABEL)
+                if candidate is not None and candidate.can_run(
+                    len(inputs), sum(seq_lens)
+                ):
+                    trunk_runner = candidate
+            # The draft chain runs after decode AND prefill (both draft):
+            # 1 row per request, so bs is the token count.
+            dcand = runners.get(MTP_DRAFT_LABEL)
+            if dcand is not None and dcand.can_run(len(inputs), len(inputs)):
+                draft_runner = dcand
 
         cache_manager.set_active_label(_MAIN)
         if trunk_runner is None:
@@ -461,6 +549,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # Non-None only when this decode step's trunk replays its
             # piecewise graph (decision above; forward must not re-decide).
             "mtp_trunk_runner": trunk_runner,
+            # Non-None when the draft-chain iterations can replay theirs.
+            "mtp_draft_runner": draft_runner,
             "dsa_ctx": Glm52DsaForwardContext(
                 spans=spans, k_store=self._dsa_k_store,
                 needs_selection=needs_selection,
@@ -605,7 +695,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 # 0.00 acceptance on the real checkpoint).
                 pair_hiddens.append(prenorm[r])
             drafts = self._mtp_sync_and_draft(
-                cache_handle, sync_tokens, pair_hiddens)
+                cache_handle, sync_tokens, pair_hiddens,
+                draft_runner=kwargs.get("mtp_draft_runner"))
             return {
                 rid: {
                     "new_token": [new_tokens[i:i + 1]],
@@ -682,7 +773,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             results[rid] = {"new_token": [emitted]}
         self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
-        drafts = self._mtp_sync_and_draft(cache_handle, sync_tokens, pair_hiddens)
+        drafts = self._mtp_sync_and_draft(
+            cache_handle, sync_tokens, pair_hiddens,
+            draft_runner=kwargs.get("mtp_draft_runner"))
         for i, rid in enumerate(request_ids):
             emitted = results[rid]["new_token"][0]
             results[rid]["text_inputs"] = [
@@ -694,6 +787,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_handle: BatchedCacheManager,
         sync_tokens: list[torch.Tensor],
         pair_hiddens: list[torch.Tensor],
+        draft_runner=None,
     ) -> list[torch.Tensor]:
         """Extend the MTP plane over the newly committed tokens, then draft
         k tokens autoregressively. Returns per-request (k,) draft tensors.
@@ -747,15 +841,38 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             h_head.index_select(0, last_rows)).argmax(dim=-1)  # (B,) draft 1
         draft_cols = [prev_d]
         ones = [1] * num
+        if k > 1 and draft_runner is None:
+            self._warn_mtp_draft_eager_once(num)
         for it in range(1, k):
-            cache_handle.set_layer_idx(mtp_layer)
-            cache_handle.plan_attention(seq_lens=ones, is_causal=True, label=_MAIN)
             positions = torch.tensor(
                 [st + it for st in starts], dtype=torch.long, device=device)
-            cache_handle.plan_rope(seq_lens=ones, pos_ids=positions, label=_MAIN)
-            it_head, prev_h = mtp(embed(prev_d), prev_h, cache_handle, positions)
-            cache_handle.advance_seq_lens()
-            prev_d = self.lm_head(it_head).argmax(dim=-1)
+            if draft_runner is not None:
+                # Replay the captured chain iteration. The runner plans on
+                # its persistent wrappers from the aliased states (rope at
+                # counter+1 == st+it, matching ``positions``), replays, and
+                # advances +1 per request — the same bookkeeping as the
+                # eager body, so the final k-1 rewind below is unchanged.
+                out = draft_runner.run(
+                    static_inputs={
+                        "draft_ids": prev_d,
+                        "prev_hidden": prev_h,
+                        "position_ids": positions,
+                    },
+                    request_ids=request_ids,
+                    seq_lens=ones,
+                )
+                prev_d = out["draft_ids"]
+                prev_h = out["prev_hidden"]
+            else:
+                cache_handle.set_layer_idx(mtp_layer)
+                cache_handle.plan_attention(
+                    seq_lens=ones, is_causal=True, label=_MAIN)
+                cache_handle.plan_rope(
+                    seq_lens=ones, pos_ids=positions, label=_MAIN)
+                it_head, prev_h = mtp(
+                    embed(prev_d), prev_h, cache_handle, positions)
+                cache_handle.advance_seq_lens()
+                prev_d = self.lm_head(it_head).argmax(dim=-1)
             draft_cols.append(prev_d)
         if k > 1:
             cache_handle.rewind_seq_lens([k - 1] * num)
@@ -775,6 +892,21 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "MoE resolved to an uncapturable dispatch path, or bs exceeds "
             "the captured sizes %s. Expect roughly reference-pace decode.",
             bs, num_rows, self.MTP_CAPTURE_BATCH_SIZES,
+        )
+
+    def _warn_mtp_draft_eager_once(self, bs: int) -> None:
+        """Same silence-is-a-regression lesson for the chain: each eager
+        iteration costs ~7 ms of launch overhead vs ~1-2 replayed, and at
+        k>=3 that dominates the MTP step."""
+        if self._mtp_draft_eager_warned:
+            return
+        self._mtp_draft_eager_warned = True
+        logger.warning(
+            "MTP draft chain running EAGER (bs=%d): no mtp_draft piecewise "
+            "bucket available — capture failed at warmup or bs exceeds the "
+            "captured sizes %s. Each chain iteration pays eager launch "
+            "overhead.",
+            bs, self.MTP_CAPTURE_BATCH_SIZES,
         )
 
     _MTP_STAT_LOG_EVERY = 512  # request-steps between acceptance log lines
