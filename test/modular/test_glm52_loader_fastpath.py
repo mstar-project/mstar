@@ -111,16 +111,104 @@ def test_expert_loaders_accept_full_and_presliced():
     assert torch.equal(dparam.data[2], d_from_full)
 
 
-def _fabricate_checkpoint_files(tmp_path, cfg):
+def _fabricate_checkpoint_files(tmp_path, cfg, include_mtp=False):
     """On-disk fp8 checkpoint reusing the in-memory fabricator's layout."""
     from test.modular.test_glm52_moe import _fabricate_checkpoint
 
-    state, refs = _fabricate_checkpoint(cfg)
+    state, refs = _fabricate_checkpoint(cfg, include_mtp=include_mtp)
     tensors = {}
     for name, tensor in state:
         tensors[name] = tensor.contiguous()
     _write_sharded(tmp_path, tensors)
     return refs
+
+
+def _mtp_fp8_config():
+    """reduced_fp8 with the MTP position landing FULL: 4 trunk layers put
+    layer 4 on the IndexShare grid (offset-1 + freq, the same geometry as
+    the real 78 = 2 + 19·4), and drafting on builds the mtp submodule."""
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    cfg.num_hidden_layers = 4
+    cfg.mtp_num_draft_tokens = 2
+    return cfg
+
+
+def test_read_plan_includes_mtp_when_enabled():
+    """The 2026-08-09 0.00-acceptance bug: the plan dropped every layer-78
+    key regardless of drafting (1569/118629 keys on the real checkpoint),
+    so the MTP module served ``to_empty`` memory. ``load_mtp=True`` must
+    read the MTP layer like trunk: glue + decoder + FULL indexer, with
+    its routed experts sliced by the same specs."""
+    cfg = _mtp_fp8_config()
+    keys = [
+        "model.layers.3.self_attn.q_a_proj.weight",
+        "model.layers.4.enorm.weight",
+        "model.layers.4.eh_proj.weight",
+        "model.layers.4.self_attn.indexer.wk.weight",   # layer 4 FULL
+        "model.layers.4.mlp.experts.0.up_proj.weight",
+        "model.layers.4.mlp.experts.0.up_proj.weight_scale_inv",
+    ]
+    # Default stays M1 flag-off behavior: the MTP layer is never read.
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=1, tp_size=2)
+    assert "model.layers.3.self_attn.q_a_proj.weight" in plan_keys
+    assert not any(".layers.4." in k for k in plan_keys)
+
+    plan_keys, specs = build_glm52_read_plan(
+        keys, cfg, tp_rank=1, tp_size=2, load_mtp=True)
+    assert "model.layers.4.enorm.weight" in plan_keys
+    assert "model.layers.4.eh_proj.weight" in plan_keys
+    assert "model.layers.4.self_attn.indexer.wk.weight" in plan_keys
+    shard = cfg.moe_intermediate_size // 2
+    assert specs["model.layers.4.mlp.experts.0.up_proj.weight"] == (
+        0, shard, 2 * shard)
+    srows = shard // BLOCK[0]
+    assert specs["model.layers.4.mlp.experts.0.up_proj.weight_scale_inv"] == (
+        0, srows, 2 * srows)
+    assert "model.layers.4.enorm.weight" not in specs
+
+
+def test_fast_path_mtp_guard_and_bitwise(tmp_path):
+    torch.manual_seed(4)
+    cfg = _mtp_fp8_config()
+    refs = _fabricate_checkpoint_files(tmp_path, cfg, include_mtp=True)
+    assert refs
+    with open(tmp_path / "model.safetensors.index.json") as f:
+        ckpt_keys = list(json.load(f)["weight_map"])
+
+    # A plan built without load_mtp while drafting is on is exactly the
+    # bench failure: mtp.* params never see the checkpoint. The load must
+    # refuse loudly instead of serving garbage drafts.
+    model = Glm52ForCausalLM(cfg)
+    keys, specs = build_glm52_read_plan(ckpt_keys, cfg, 0, 1)
+    stream = iter_safetensors_shards(tmp_path, keys=keys, slice_spec=specs.get)
+    try:
+        model.load_weights(stream)
+        raise AssertionError("mtp-less weight stream must be refused")
+    except RuntimeError as e:
+        assert "mtp." in str(e)
+
+    # With load_mtp, fast path == generic driver, bit for bit, mtp included.
+    def load(use_plan):
+        torch.manual_seed(7)  # identical init for unloaded-buffer parity
+        model = Glm52ForCausalLM(cfg)
+        if use_plan:
+            keys, specs = build_glm52_read_plan(
+                ckpt_keys, cfg, 0, 1, load_mtp=True)
+            model.load_weights(iter_safetensors_shards(
+                tmp_path, keys=keys, slice_spec=specs.get))
+        else:
+            from mstar.model.glm52.weight_loader import load_weights as generic
+            generic(model, tmp_path)
+        return model
+
+    fast, ref = load(True), load(False)
+    mtp_params = 0
+    for (name, p_fast), (_, p_ref) in zip(
+        fast.named_parameters(), ref.named_parameters(), strict=True,
+    ):
+        assert torch.equal(p_fast, p_ref), f"fast path diverged at {name}"
+        mtp_params += name.startswith("mtp.")
+    assert mtp_params  # the comparison actually covered the draft module
 
 
 def test_fast_path_matches_generic_driver_bitwise(tmp_path):

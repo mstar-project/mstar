@@ -92,7 +92,7 @@ class Glm52ForCausalLM(nn.Module):
     def load_weights(self, weights, **kwargs) -> set[str]:
         from mstar.model.glm52.weight_loader import load_glm52_hf_weights
 
-        return load_glm52_hf_weights(
+        loaded = load_glm52_hf_weights(
             self, weights, self.config.n_routed_experts,
             quant_config=self.config.quantization_config,
             fp8_experts=(
@@ -102,3 +102,17 @@ class Glm52ForCausalLM(nn.Module):
             num_hidden_layers=self.config.num_hidden_layers,
             load_mtp=self.mtp is not None,
         )
+        if self.mtp is not None:
+            missing = {
+                f"mtp.{name}" for name, _ in self.mtp.named_parameters()
+            } - loaded
+            if missing:
+                raise RuntimeError(
+                    f"MTP drafting is on but {len(missing)} mtp.* "
+                    f"parameters received no checkpoint weights (e.g. "
+                    f"{sorted(missing)[:3]}) — the weight stream is "
+                    "missing the MTP layer's keys, typically a read plan "
+                    "built without load_mtp. Drafting from uninitialized "
+                    "memory is silent 0.00 acceptance; refuse to serve."
+                )
+        return loaded

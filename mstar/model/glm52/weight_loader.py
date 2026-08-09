@@ -162,15 +162,25 @@ def build_glm52_read_plan(
     tp_rank: int,
     tp_size: int,
     load_indexer: bool = True,
+    load_mtp: bool = False,
 ) -> tuple[set[str], "dict[str, tuple[int, int, int]]"]:
     """Keys-to-read + per-key slice specs for the TP fast read path.
 
     Cuts per-rank checkpoint IO two ways: (1) keys the model never loads
-    (MTP layer, non-FULL-layer indexer keys) are excluded up front so the
-    iterator never reads them; (2) routed-expert tensors — ~96% of the
-    checkpoint's bytes — get ``(dim, start, stop)`` specs so each rank
-    reads only its TP shard (GLM-5.2 at TP8: ~704 GB -> ~120 GB per rank).
-    The expert loaders accept these pre-sliced shards shape-driven.
+    (the MTP layer unless ``load_mtp``, non-FULL-layer indexer keys) are
+    excluded up front so the iterator never reads them; (2) routed-expert
+    tensors — ~96% of the checkpoint's bytes — get ``(dim, start, stop)``
+    specs so each rank reads only its TP shard (GLM-5.2 at TP8: ~704 GB ->
+    ~120 GB per rank). The expert loaders accept these pre-sliced shards
+    shape-driven.
+
+    ``load_mtp`` MUST mirror the model's drafting flag: this plan runs
+    UPSTREAM of ``skip_phase_b_keys``, so a plan built without it starves
+    the loader of every layer-78 key with nothing left to log — the draft
+    module then serves ``to_empty`` memory, which is silent 0.00
+    acceptance (measured, 2026-08-09 bench). With it, the MTP layer's
+    keys flow like trunk keys: its FULL indexer is read and its routed
+    experts hit the same slice specs (the expert regex is layer-agnostic).
 
     Scale slicing relies on the shard/block divisibility the MoE block
     already asserts (per-rank intermediate is a whole number of scale
@@ -192,8 +202,12 @@ def build_glm52_read_plan(
     for key in checkpoint_keys:
         m_layer = _LAYER_RE.match(key)
         layer = int(m_layer.group(1)) if m_layer else None
-        if layer is not None and layer >= config.num_hidden_layers:
-            continue  # MTP (Phase D): never read, never transfer
+        if (
+            layer is not None
+            and layer >= config.num_hidden_layers
+            and not load_mtp
+        ):
+            continue  # MTP module off: never read, never transfer
         if ".self_attn.indexer." in key and (
             not load_indexer
             or layer is None

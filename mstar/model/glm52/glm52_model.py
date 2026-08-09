@@ -488,8 +488,9 @@ class Glm52Model(Model):
         The generic driver has every rank read the full checkpoint and keep
         its TP slice — 8x the bytes at TP8, and the reads dominate load
         time. With a sharded index present, build a read plan instead:
-        skip keys the model never loads (MTP layer, non-FULL indexer keys)
-        and read only this rank's shard of every routed-expert tensor.
+        skip keys the model never loads (the MTP layer unless drafting is
+        on, non-FULL indexer keys) and read only this rank's shard of
+        every routed-expert tensor.
         """
         from mstar.model.glm52.weight_loader import build_glm52_read_plan
         from mstar.model.loader import load_weights
@@ -508,6 +509,7 @@ class Glm52Model(Model):
         tp_size = tp_group.world_size if tp_group is not None else 1
         keys, specs = build_glm52_read_plan(
             checkpoint_keys, self.config, tp_rank, tp_size,
+            load_mtp=language_model.mtp is not None,
         )
         logger.info(
             "Glm52Model fast read plan: %d/%d keys, %d sliced (tp %d/%d)",
