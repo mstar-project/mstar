@@ -1,6 +1,7 @@
 import functools
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -12,6 +13,7 @@ from mstar.engine.kv_store import (
     KVRequestState,
     PagedAllocationManager,
 )
+from mstar.engine.resources import KVCachePool, Segment
 from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
 
 logger = logging.getLogger(__name__)
@@ -35,7 +37,7 @@ class PagedIndptrs(NamedTuple):
 
 def build_paged_indptrs(
     q_seq_lens: list[int],
-    page_indices_per_request: list[list[int]],
+    page_indices_per_request: list[Sequence[int]],
     context_lens: list[int],
     page_size: int,
 ) -> PagedIndptrs:
@@ -189,6 +191,17 @@ class BatchedCacheManager(ABC):
         self.enable_nvtx = enable_nvtx
         # source name -> CrossAttnPool (see KVCacheConfig.cross_attn)
         self.cross_pools = cross_pools or {}
+
+        # Segment-lifecycle surface over the allocation manager: planning
+        # goes through admit/view on these pools instead of reading
+        # KVRequestState fields and allocating mid-plan.
+        self.kv_pool = (
+            KVCachePool(alloc_manager) if alloc_manager is not None else None
+        )
+        self.cross_kv_pools: dict[str, KVCachePool] = {
+            source: KVCachePool(pool.alloc_manager)
+            for source, pool in self.cross_pools.items()
+        }
 
         self.auto_write_store = auto_write_store
 
@@ -693,9 +706,9 @@ class FlashInferCacheManager(BatchedCacheManager):
     ):
         """Pre-compute FlashInfer plan and page positions for a cache label.
 
-        Allocates pages, computes page_indices/page_offsets/token_offsets for
-        vectorized KV writes, builds FlashInfer index tensors, and plans the
-        wrapper. All state is stored in _plan_states[label].
+        Admits one segment per request on the KV pool (reserving pages),
+        builds FlashInfer index tensors from the resulting sequence views,
+        and plans the wrapper. All state is stored in _plan_states[label].
 
         In CUDA graph mode, uses the persistent wrapper from _plan_states
         (pre-built by CudaGraphRunner) and calls its plan() method which
@@ -784,22 +797,18 @@ class FlashInferCacheManager(BatchedCacheManager):
             kv_cache_locations_list = []
 
             for i, rid in enumerate(self.request_ids):
-                state = self._get_state(rid, effective_label)
-                sl = seq_lens[i]
-                total_len = state.seq_len + sl
+                segment = Segment(rid, effective_label, seq_lens[i])
+                self.kv_pool.admit(segment)
+                view = self.kv_pool.view(segment)
 
-                self.alloc_manager.alloc(
-                    rid, label=effective_label, seq_len=total_len
-                )
+                qo_indptr_list.append(qo_indptr_list[-1] + segment.span)
+                all_page_indices.extend(view.page_indices)
+                kv_indptr_list.append(kv_indptr_list[-1] + len(view.page_indices))
 
-                qo_indptr_list.append(qo_indptr_list[-1] + sl)
-                all_page_indices.extend(state.page_indices)
-                kv_indptr_list.append(kv_indptr_list[-1] + len(state.page_indices))
-
-                last_page_len = total_len % page_size or page_size
+                last_page_len = view.length % page_size or page_size
                 kv_last_page_lens.append(last_page_len)
-                if sl == 1:
-                    kv_cache_locations_list.append([state.page_indices[-1], last_page_len - 1])
+                if segment.span == 1:
+                    kv_cache_locations_list.append([view.page_indices[-1], last_page_len - 1])
         finally:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
@@ -940,21 +949,19 @@ class FlashInferCacheManager(BatchedCacheManager):
 
         for label in labels:
             for i, rid in enumerate(self.request_ids):
-                state = self._get_state(rid, label)
-                sl = seq_lens[label][i]
-                total_len = state.seq_len + sl
+                segment = Segment(rid, label, seq_lens[label][i])
+                self.kv_pool.admit(segment)
+                view = self.kv_pool.view(segment)
 
-                self.alloc_manager.alloc(rid, label=label, seq_len=total_len)
-
-                qo_indptr_list.append(qo_indptr_list[-1] + sl)
-                all_page_indices.extend(state.page_indices)
+                qo_indptr_list.append(qo_indptr_list[-1] + segment.span)
+                all_page_indices.extend(view.page_indices)
                 kv_indptr_list.append(
-                    kv_indptr_list[-1] + len(state.page_indices)
+                    kv_indptr_list[-1] + len(view.page_indices)
                 )
 
-                last_page_len = total_len % page_size or page_size
+                last_page_len = view.length % page_size or page_size
                 kv_last_page_lens.append(last_page_len)
-                combined_seq_lens.append(sl)
+                combined_seq_lens.append(segment.span)
 
         # CPU tensors — see comment in ``plan_attention`` above. FlashInfer
         # async-H2Ds these inside ``plan()``; passing GPU tensors would
@@ -1110,6 +1117,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         allocated on first write (layer 0) and reused for the rest.
         """
         pool = self._get_cross_pool(source)
+        kv_pool = self.cross_kv_pools[source]
         base_label = self._active_base_label(label)
         cross_label = cross_attn_label(base_label, source)
         page_size = pool.alloc_config.page_size
@@ -1122,19 +1130,25 @@ class FlashInferCacheManager(BatchedCacheManager):
 
         offset = 0
         for rid, ctx_len in zip(request_ids, seq_lens, strict=True):
-            state = pool.alloc_manager.get_state(rid, cross_label)
-            if state.seq_len == 0:
-                pool.alloc_manager.alloc(rid, label=cross_label, seq_len=ctx_len)
-                state.seq_len = ctx_len
+            resident = kv_pool.view(Segment(rid, cross_label, 0)).length
+            if resident == 0:
+                # First write for this context: reserve its pages and commit
+                # the extent up front; later layers reuse them. The position
+                # counter stays untouched (context positions are baked in at
+                # encode time).
+                segment = Segment(rid, cross_label, ctx_len)
+                kv_pool.admit(segment)
+                kv_pool.commit(segment, pos_advance=0)
             else:
-                assert state.seq_len == ctx_len, (
+                assert resident == ctx_len, (
                     f"cross-attn context for {rid!r}/{source!r} already written "
-                    f"with length {state.seq_len}, got {ctx_len}"
+                    f"with length {resident}, got {ctx_len}"
                 )
+            view = kv_pool.view(Segment(rid, cross_label, 0))
 
             positions = torch.arange(ctx_len, device=self.device)
             page_indices = torch.tensor(
-                state.page_indices, dtype=torch.long, device=self.device,
+                view.page_indices, dtype=torch.long, device=self.device,
             )
             token_to_page = page_indices[
                 torch.div(positions, page_size, rounding_mode="floor")
@@ -1168,6 +1182,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         the full context).
         """
         pool = self._get_cross_pool(source)
+        kv_pool = self.cross_kv_pools[source]
         base_label = self._active_base_label(label)
         cross_label = cross_attn_label(base_label, source)
         cfg = pool.alloc_config
@@ -1176,16 +1191,16 @@ class FlashInferCacheManager(BatchedCacheManager):
         if dtype is None:
             dtype = pool.kv_cache.dtype
 
-        page_indices_per_request: list[list[int]] = []
+        page_indices_per_request: list[tuple[int, ...]] = []
         context_lens: list[int] = []
         for rid in self.request_ids:
-            state = pool.alloc_manager.get_state(rid, cross_label)
-            assert state.seq_len > 0, (
+            view = kv_pool.view(Segment(rid, cross_label, 0))
+            assert view.length > 0, (
                 f"plan_cross_attention before add_cross_attn_kv for {rid!r} "
                 f"(source {source!r})"
             )
-            page_indices_per_request.append(state.page_indices)
-            context_lens.append(state.seq_len)
+            page_indices_per_request.append(view.page_indices)
+            context_lens.append(view.length)
 
         indptrs = build_paged_indptrs(
             q_seq_lens, page_indices_per_request, context_lens, page_size,
@@ -1418,16 +1433,20 @@ class DenseGenCacheManager(FlashInferCacheManager):
         max_k = 0
         for label in labels:
             for i, rid in enumerate(self.request_ids):
-                state = self._get_state(rid, label)
-                prefix_len = state.seq_len
+                # The frozen prefix is read without extending the stream (the
+                # generation K/V never enters the pages), so plan it from a
+                # zero-span view.
+                view = self.kv_pool.view(Segment(rid, label, 0))
+                prefix_len = view.length
                 gen_len = seq_lens[label][i]
                 n_pages = (prefix_len + page_size - 1) // page_size
                 idx = torch.tensor(
-                    state.page_indices[:n_pages], dtype=torch.long, device=self.device
+                    view.page_indices[:n_pages], dtype=torch.long, device=self.device
                 )
                 # Carry the persistent KVRequestState so run_attention can cache
                 # the gathered frozen prefix on it across denoise steps (the
                 # manager itself is rebuilt every forward).
+                state = self._get_state(rid, label)
                 segs.append((idx, prefix_len, gen_len, state))
                 cu_q.append(cu_q[-1] + gen_len)
                 cu_k.append(cu_k[-1] + prefix_len + gen_len)
