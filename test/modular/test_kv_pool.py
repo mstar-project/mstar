@@ -35,7 +35,11 @@ from mstar.engine.resources import (
 )
 
 
-def _make_pool(max_num_pages: int = 16, page_size: int = 8) -> tuple[KVCachePool, PagedAllocationManager]:
+def _make_pool(
+    max_num_pages: int = 16,
+    page_size: int = 8,
+    with_tensor: bool = False,
+) -> tuple[KVCachePool, PagedAllocationManager]:
     manager = PagedAllocationManager.__new__(PagedAllocationManager)
     manager.config = KVCacheConfig(
         num_layers=1,
@@ -47,7 +51,9 @@ def _make_pool(max_num_pages: int = 16, page_size: int = 8) -> tuple[KVCachePool
     )
     manager.page_allocator = PageAllocator(max_num_pages)
     manager.request_states = {}
-    manager.kv_cache = None
+    manager.kv_cache = (
+        torch.zeros(1, max_num_pages, 2, page_size, 1, 1) if with_tensor else None
+    )
     manager.write_policy = StoreWritePolicy.ALWAYS
     manager._kv_transfer_engine = None
     manager._offload_stream = None
@@ -213,6 +219,86 @@ class TestPageArena:
         arena = PageArena(tensor=None, allocator=PageAllocator(2), page_size=8)
         assert arena.try_allocate(3) is None
         assert arena.num_free == 2
+
+
+class TestFork:
+    def _fill_stream(self, pool, manager, rid, label, tokens):
+        segment = Segment(rid, label, tokens)
+        pool.admit(segment)
+        pool.commit(segment)
+        # Stamp each page with its own index so copies are checkable.
+        for page in manager.get_state(rid, label).page_indices:
+            manager.kv_cache[:, page] = float(page + 1)
+
+    def test_fork_mirrors_accounting_and_copies_pages(self):
+        pool, manager = _make_pool(page_size=8, with_tensor=True)
+        manager.add_request("r", ["main", "snap"])
+        self._fill_stream(pool, manager, "r", "main", 12)
+        pool.commit(Segment("r", "main", 0), pos_advance=30)  # counter != length
+
+        pool.fork("r", "main", "snap")
+
+        main_state = manager.get_state("r", "main")
+        snap_state = manager.get_state("r", "snap")
+        assert snap_state.seq_len == 12
+        assert snap_state.position_id_start == 42
+        assert snap_state.page_indices != main_state.page_indices
+        for src, dst in zip(
+            main_state.page_indices, snap_state.page_indices, strict=True
+        ):
+            assert torch.equal(manager.kv_cache[:, dst], manager.kv_cache[:, src])
+
+    def test_fork_tops_up_only_past_the_destination_length(self):
+        pool, manager = _make_pool(page_size=8, with_tensor=True)
+        manager.add_request("r", ["main", "snap"])
+        self._fill_stream(pool, manager, "r", "main", 16)  # 2 full pages
+
+        # The destination already holds one committed page of its own data.
+        snap_seg = Segment("r", "snap", 8)
+        pool.admit(snap_seg)
+        pool.commit(snap_seg)
+        first_snap_page = manager.get_state("r", "snap").page_indices[0]
+        manager.kv_cache[:, first_snap_page] = -1.0
+
+        pool.fork("r", "main", "snap")
+
+        snap_state = manager.get_state("r", "snap")
+        assert snap_state.seq_len == 16
+        # Page 0 was already resident on the destination and is not re-copied.
+        assert torch.all(manager.kv_cache[:, snap_state.page_indices[0]] == -1.0)
+        src_page_1 = manager.get_state("r", "main").page_indices[1]
+        assert torch.equal(
+            manager.kv_cache[:, snap_state.page_indices[1]],
+            manager.kv_cache[:, src_page_1],
+        )
+
+    def test_fork_with_realloc_replaces_the_destination(self):
+        pool, manager = _make_pool(page_size=8, with_tensor=True)
+        manager.add_request("r", ["main", "snap"])
+        self._fill_stream(pool, manager, "r", "main", 8)
+        self._fill_stream(pool, manager, "r", "snap", 16)
+        free_before = pool.num_free_pages
+
+        pool.fork("r", "main", "snap", realloc=True)
+
+        snap_state = manager.get_state("r", "snap")
+        assert snap_state.seq_len == 8
+        assert len(snap_state.page_indices) == 1
+        # The two old destination pages went back, one new page came out.
+        assert pool.num_free_pages == free_before + 1
+        src_page = manager.get_state("r", "main").page_indices[0]
+        assert torch.equal(
+            manager.kv_cache[:, snap_state.page_indices[0]],
+            manager.kv_cache[:, src_page],
+        )
+
+    def test_fork_can_fail_like_any_admit(self):
+        pool, manager = _make_pool(max_num_pages=2, page_size=8, with_tensor=True)
+        manager.add_request("r", ["main", "snap"])
+        self._fill_stream(pool, manager, "r", "main", 16)  # both pages
+
+        with pytest.raises(AllocationFailedError):
+            pool.fork("r", "main", "snap")
 
 
 class TestBoundaryValuesAreImmutable:

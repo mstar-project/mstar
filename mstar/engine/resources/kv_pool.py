@@ -117,3 +117,37 @@ class KVCachePool:
     def positions(self, request_id: str, label: str) -> int:
         """Current position counter for one stream, read-only."""
         return self._manager.get_state(request_id, label).position_id_start
+
+    def fork(
+        self,
+        request_id: str,
+        from_label: str,
+        to_label: str,
+        realloc: bool = False,
+    ) -> None:
+        """Make one stream's content the state of another stream of the same
+        request: reserve the destination's pages, mirror the stored length
+        and position counter, and copy the page data. With ``realloc`` the
+        destination is reset first; otherwise only the pages past its
+        current length are copied (an incremental top-up). Allocates, so it
+        can fail like any admit."""
+        manager = self._manager
+        from_state = manager.get_state(request_id, from_label)
+
+        if realloc:
+            manager.reset_label(request_id, to_label)
+
+        to_state = manager.get_state(request_id, to_label)
+        start_pos = to_state.seq_len // self.page_size
+        manager.alloc(request_id, to_label, seq_len=from_state.seq_len)
+
+        to_state.seq_len = from_state.seq_len
+        to_state.position_id_start = from_state.position_id_start
+
+        tensor = self._arena.tensor
+        for src_page, dst_page in zip(
+            from_state.page_indices[start_pos:],
+            to_state.page_indices[start_pos:],
+            strict=True,
+        ):
+            tensor[:, dst_page] = tensor[:, src_page]
