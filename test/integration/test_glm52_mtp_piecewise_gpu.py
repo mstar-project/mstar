@@ -65,7 +65,9 @@ pytestmark = pytest.mark.skipif(
     reason="piecewise capture needs a real GPU (CUDA graphs + FlashInfer)",
 )
 
-DEVICE = torch.device("cuda")
+# Indexed on purpose: PiecewiseCudaGraphRunner.warmup_and_capture calls
+# torch.cuda.set_device(self.device), which rejects a bare "cuda".
+DEVICE = torch.device("cuda:0")
 K = 2  # rows per MTP step = k+1 = 3
 
 
