@@ -321,32 +321,13 @@ class FlashInferAttentionManager:
         cfg = self.kv_cache_config
         page_size = cfg.page_size
 
-        # CPU-side accumulation (see plan for the same pattern).
-        qo_indptr_list = [0]
-        kv_indptr_list = [0]
-        all_page_indices = []
-        kv_last_page_lens = []
-        combined_seq_lens = []
-
-        for segment, view in zip(segments, views, strict=True):
-            qo_indptr_list.append(qo_indptr_list[-1] + segment.span)
-            all_page_indices.extend(view.page_indices)
-            kv_indptr_list.append(
-                kv_indptr_list[-1] + len(view.page_indices)
-            )
-
-            last_page_len = view.length % page_size or page_size
-            kv_last_page_lens.append(last_page_len)
-            combined_seq_lens.append(segment.span)
-
-        # CPU tensors — see comment in ``plan`` above. FlashInfer
-        # async-H2Ds these inside ``plan()``; passing GPU tensors would
-        # trigger a synchronous default-stream sync via the internal
-        # ``.to("cpu")`` call.
-        qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
-        paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
-        paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
-        paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+        combined_seq_lens = [segment.span for segment in segments]
+        indptrs = build_paged_indptrs(
+            q_seq_lens=combined_seq_lens,
+            page_indices_per_request=[view.page_indices for view in views],
+            context_lens=[view.length for view in views],
+            page_size=page_size,
+        )
 
         ps = self.states.get(combined_label)
         if self.cuda_graph_mode and ps is not None and ps.wrapper is not None:
@@ -389,10 +370,10 @@ class FlashInferAttentionManager:
             self.states[combined_label] = ps
 
         wrapper.plan(
-            qo_indptr=qo_indptr,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_last_page_len=paged_kv_last_page_len,
+            qo_indptr=indptrs.qo_indptr,
+            paged_kv_indptr=indptrs.paged_kv_indptr,
+            paged_kv_indices=indptrs.paged_kv_indices,
+            paged_kv_last_page_len=indptrs.paged_kv_last_page_len,
             causal=is_causal,
             dtype=dtype,
         )
