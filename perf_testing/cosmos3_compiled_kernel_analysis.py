@@ -1,52 +1,56 @@
-"""Op-/kernel-level feedback for the SERVED Cosmos3-Nano DiT (torch.compile + CUDA graph).
+"""Kernel-level HEADROOM feedback for the SERVED Cosmos3-Nano DiT (torch.compile + CUDA graph).
 
 Builds the DiT the way it is actually served (``compile_denoise=True`` + the real
-``CudaGraphRunner`` capture), then produces a per-step, per-kernel breakdown that
-backtracks each kernel to its M* source line -- so you can see where the served
-denoise step spends its time and which ``transformer.py`` lines to optimize.
+``CudaGraphRunner`` capture), measures every kernel of one denoise step, and — via
+the model-agnostic ``perf_testing/kernel_feedback`` package — scores each kernel
+against the GPU's speed-of-light and buckets the gap:
 
-What it prints, for one denoise step:
-  1. every compiled subgraph, and for each:
-       - the fused Triton kernels  -> the source line(s) each one fuses
-         (via Inductor ``output_code.py`` provenance + ``fx_graph_readable.py``)
-       - the NON-fused extern/cuBLAS calls (matmuls) -> their source line(s)
-  2. a FULL measured device-time breakdown across ALL kernels
-       (Triton fused / cuBLAS GEMM / FlashInfer attention / eager-uncompiled / ...),
-       measured by replaying the captured graph under torch.profiler.
-  3. the source lines the most fused kernels touch (fusion-boundary hot spots).
+    observed -> kernel_quality_gap -> speed_of_light
+             -> movement_elimination -> fusion_in_graph -> estimated_floor
 
-Why it is built this way (compile + CUDA-graph gotchas this handles):
+so the report ranks kernels by *recoverable* ms (better kernel / fuse / eliminate),
+not merely by observed ms, and maps each back to its M* source line.
+
+How the three measurement passes fit together (compile + CUDA-graph gotchas):
   - torch.compile silently no-ops if the DiT submodule was already built eager and
     cached -> we evict ``_submodule_cache['dit']`` before rebuilding.
-  - Under CUDA-graph *replay* the profiler loses CPU<->kernel correlation, so we
-    attribute source at *compile* time (Inductor provenance) and measure time at
-    *replay* time, then join by kernel name.
   - Inductor serves compiles from an on-disk cache and skips the debug dump, so we
-    ``force_disable_caches`` for a cold recompile that re-emits the provenance.
+    ``force_disable_caches`` for a cold recompile that re-emits provenance. The dump
+    gives every fused Triton kernel its exact tensor traffic + source lines, and
+    every extern GEMM its shapes (-> exact FLOPs).
+  - Under CUDA-graph *replay* the profiler loses CPU<->kernel correlation, so times
+    come from replaying the captured graph under torch.profiler (join by kernel name).
+  - Eager glue kernels (around the attention graph break) have no Inductor
+    provenance; a separate single EAGER step under ``with_stack``+``record_shapes``
+    attributes them to source and estimates their bytes.
 
-Requirements:
-  - the ``mstar`` conda env (torch + flashinfer + diffusers + mstar)
-  - a CUDA GPU with a free ~24 GB
-  - a local Cosmos3-Nano checkpoint. Point COSMOS3_NANO_DIR at it, or edit the
-    default below. (HF: nvidia/Cosmos3-Nano.)
+Requirements: the ``mstar`` conda env, a CUDA GPU with ~24 GB free, and a local
+Cosmos3-Nano checkpoint (COSMOS3_NANO_DIR, HF: nvidia/Cosmos3-Nano).
 
 Run:
   cd <mstar repo>
   COSMOS3_NANO_DIR=/path/to/Cosmos3-Nano \
     CUDA_VISIBLE_DEVICES=<free gpu> python perf_testing/cosmos3_compiled_kernel_analysis.py
 
-NOTE: this uses the offline test scaffolding (``tests/test_engine_cache``) which
-runs with ``use_deterministic_algorithms(True)`` -- so a few ``_assert_async``
-kernels appear in the breakdown that are absent in production. Treat absolute ms
-as indicative; the relative split and the kernel->source mapping are the point.
+NOTE: the offline scaffolding (``tests/test_engine_cache``) runs with
+``use_deterministic_algorithms(True)``; the induced ``_assert_async`` kernels are
+bucketed as ``harness_artifacts`` and excluded from the floor.
 """
-import os, re, sys, glob, shutil, tempfile, datetime, collections, torch
+import collections
+import datetime
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+import torch
 
 # ---- output recording ----
-# By default the whole report is written to a FILE (not the console):
-# perf_testing/results/cosmos3_feedback_<ts>.txt. Override the path with
+# By default the whole report is written to FILES (not the console):
+# perf_testing/results/cosmos3_feedback_<ts>.txt (+ .json). Override the path with
 # COSMOS3_FEEDBACK_OUT, or set it empty (COSMOS3_FEEDBACK_OUT=) to print to stdout.
-# COSMOS3_KEEP_TRACE=1 keeps the Inductor debug dump (output_code.py, fx_graph_readable.py).
+# COSMOS3_KEEP_TRACE=1 keeps the Inductor debug dump.
 _OUT = os.environ.get("COSMOS3_FEEDBACK_OUT")
 if _OUT is None:
     _results = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -70,13 +74,18 @@ TRACE_DIR = tempfile.mkdtemp(prefix="cosmos3_inductor_")   # Inductor debug dump
 
 import torch._inductor.config as ind_cfg
 import torch._inductor.metrics as ind_metrics
+
 ind_cfg.trace.enabled = True
 ind_cfg.trace.debug_dir = TRACE_DIR
 ind_cfg.force_disable_caches = True                        # cold recompile -> re-emit provenance
 os.environ["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
 
-from torch.profiler import profile, ProfilerActivity
+from torch.profiler import ProfilerActivity, profile
+
 import mstar.model.cosmos3.tests.test_engine_cache as T
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from kernel_feedback import build_report, parse_dump, profile_eager_attribution, render_text
 
 # ---------- 1. build served DiT (compile ON) + capture ----------
 ctx = T._scenario(1)                                       # image (num_frames=1)
@@ -114,155 +123,90 @@ runner = CudaGraphRunner(submodule_name="dit", submodule=dit, kv_cache_config=sh
 print(">> warmup_and_capture (torch.compile + cuda-graph capture)...", flush=True)
 runner.warmup_and_capture()
 runner.register_request(rid)
-print(f">> compiled: {ind_metrics.generated_kernel_count} Triton kernels\n", flush=True)
+print(f">> compiled: {ind_metrics.generated_kernel_count} Triton kernels", flush=True)
 
 # ---------- 2. measured device-ms per kernel name via graph replay ----------
 REPLAYS = 20
 KTIME = collections.defaultdict(lambda: [0.0, 0])          # kernel name -> [us, calls]
+fwd.graph_walk = "image_gen"
+ni_fixed = dit.prepare_inputs("image_gen", fwd,
+    {"latents": [ctx["init"].clone()], "time_index": [torch.zeros(1, dtype=torch.long, device=device)]})
+def replay():
+    return runner.run(graph_walk="image_gen", requires_cfg=False, request_ids=[rid],
+                      inputs=[ni_fixed], per_request_info={rid: fwd}, submodule=dit)
 try:
-    fwd.graph_walk = "image_gen"
-    ni_fixed = dit.prepare_inputs("image_gen", fwd,
-        {"latents": [ctx["init"].clone()], "time_index": [torch.zeros(1, dtype=torch.long, device=device)]})
-    replay = lambda: runner.run(graph_walk="image_gen", requires_cfg=False, request_ids=[rid],
-                                inputs=[ni_fixed], per_request_info={rid: fwd}, submodule=dit)
-    for _ in range(3): replay()
+    for _ in range(3):
+        replay()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
-        for _ in range(REPLAYS): replay()
+        for _ in range(REPLAYS):
+            replay()
         torch.cuda.synchronize()
     for k in p.key_averages():
         us = getattr(k, "self_device_time_total", getattr(k, "self_cuda_time_total", 0))
-        if us > 0: KTIME[k.key][0] += us; KTIME[k.key][1] += k.count
+        if us > 0:
+            KTIME[k.key][0] += us
+            KTIME[k.key][1] += k.count
 except Exception as e:
     print(f"(replay timing skipped: {e})\n")
 
-def lookup_ms(name):
-    for key, (us, cnt) in KTIME.items():
-        if name in key: return us / 1e3 / REPLAYS, cnt
-    return None, None
+_total_ms = sum(us for us, _ in KTIME.values()) / 1e3 / REPLAYS
+print(f">> replay timing: {len(KTIME)} kernels, ~{_total_ms:.2f} ms/step", flush=True)
 
-# ---------- 3. parse each subgraph: kernel -> source nodes -> source lines ----------
-FILE_RE = re.compile(r'#\s*File:\s*(.+?):(\d+)\s+in\s+(\w+),\s*code:\s*(.*)')
-NODE_RE = re.compile(r'^\s*(\w+)\s*:\s*"')                 # `pow_1: "f32[...]" = ...`
-SRC_RE  = re.compile(r'Source Nodes:\s*\[(.*?)\],\s*Original ATen:\s*\[(.*?)\]')
-DEF_RE  = re.compile(r'^\s*(triton_\w+)\s*=\s*async_compile')
-RUN_RE  = re.compile(r'(triton_\w+)\.run\(')
-META_RE = re.compile(r"'num_load':\s*(\d+),\s*'num_store':\s*(\d+),\s*'num_reduction':\s*(\d+)")
-EXTERN_RE = re.compile(r'extern_kernels\.(\w+)\(')         # non-fused cuBLAS/library calls
+# ---------- 3. parse the dump BEFORE the eager pass ----------
+# (the eager step may compile extra dynamic-shape variants into TRACE_DIR;
+# freeze the subgraph set that corresponds to the captured graph first)
+subgraphs = parse_dump(TRACE_DIR)
 
-def node_to_source(fx_path):
-    m, cur = {}, None
-    if not os.path.exists(fx_path): return m
-    for line in open(fx_path):
-        f = FILE_RE.search(line)
-        if f: cur = (os.path.basename(f.group(1)), f.group(2), f.group(4).strip()); continue
-        n = NODE_RE.match(line)
-        if n and cur: m[n.group(1)] = cur
-    return m
+# ---------- 4. one EAGER step under with_stack -> eager-kernel attribution ----------
+# The compiled subgraphs are warm by now, so this profiles only real execution
+# (not compilation); correlation works because nothing replays a CUDA graph here.
+# The eager path must use the SAME attention backend as the captured graph:
+# cosmos3 defaults to "dense_gen" (FlashAttention-3), which has no sm100 kernel
+# image and aborts the process on B200 — the capture itself runs FlashInfer.
+eager_attr = {}
+try:
+    _saved_backend = shared["cfg"].attention_backend
+    shared["cfg"].attention_backend = "flashinfer"
+    try:
+        cm_e = T._mk_cm(shared, [rid])
+    finally:
+        shared["cfg"].attention_backend = _saved_backend
+    ei_e = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm_e)
 
-def kernels_of(oc_path):
-    """returns (triton: name -> [set(nodes), set(aten), (nl,ns,nr)],
-                extern: list of (op, set(nodes), set(aten)))."""
-    lines = open(oc_path).read().splitlines()
-    K = collections.defaultdict(lambda: [set(), set(), None])
-    externs, last_src = [], None
-    for i, line in enumerate(lines):
-        s = SRC_RE.search(line)
-        if s:
-            nodes = [x.strip() for x in s.group(1).split(",") if x.strip()]
-            aten  = [x.strip() for x in s.group(2).split(",") if x.strip()]
-            last_src = (nodes, aten); continue
-        e = EXTERN_RE.search(line)
-        if e:
-            n, a = last_src if last_src else ([], [])
-            externs.append((e.group(1), set(n), set(a)))
-        for rx in (DEF_RE, RUN_RE):
-            mm = rx.search(line)
-            if mm and last_src:
-                K[mm.group(1)][0].update(last_src[0]); K[mm.group(1)][1].update(last_src[1])
-        d = DEF_RE.search(line)
-        if d:
-            for j in range(i, min(i + 40, len(lines))):
-                mt = META_RE.search(lines[j])
-                if mt: K[d.group(1)][2] = tuple(map(int, mt.groups())); break
-    return K, externs
+    def _eager_step():
+        ni_e = dit.prepare_inputs("image_gen", fwd,
+            {"latents": [ctx["init"].clone()],
+             "time_index": [torch.zeros(1, dtype=torch.long, device=device)]})
+        with torch.amp.autocast("cuda", enabled=True, dtype=dtype):
+            dit.forward("image_gen", ei_e, **dit.preprocess("image_gen", ei_e, [ni_e]))
+        torch.cuda.synchronize()
 
-subgraphs = sorted(glob.glob(f"{TRACE_DIR}/**/output_code.py", recursive=True))
-print(f"# {len(subgraphs)} compiled subgraph(s); {ind_metrics.generated_kernel_count} Triton kernels total")
-print("# each kernel below -> the M* source line(s) it fuses (transformer.py unless noted)\n")
+    _eager_step()                                          # settle: compiles eager-path variants
+    eager_attr = profile_eager_attribution(_eager_step, project_markers=("mstar",))
+    print(f">> eager attribution: {len(eager_attr)} kernel names mapped", flush=True)
+except Exception as e:
+    print(f"(eager attribution skipped: {e})", flush=True)
 
-srcline_hits = collections.Counter()
-KSRC = collections.defaultdict(collections.OrderedDict)   # triton kernel name -> {loc: source-line text}
-EXT_SRC = collections.OrderedDict()                       # extern/GEMM call-site loc -> source-line text
-def src_of(nodes, n2s):
-    srcs = collections.OrderedDict()
-    for nd in nodes:
-        if nd in n2s:
-            f, ln, code = n2s[nd]; srcs[f"{f}:{ln}"] = code; srcline_hits[f"{f}:{ln}"] += 1
-    return srcs
+# ---------- 5. build the headroom report ----------
+report = build_report(
+    subgraphs,
+    {k: tuple(v) for k, v in KTIME.items()},
+    replays=REPLAYS,
+    gpu_name=torch.cuda.get_device_name(),
+    eager_attr=eager_attr,
+    meta={"model": "Cosmos3-Nano DiT", "walk": "image_gen", "height": T.H, "width": T.W,
+          "num_frames": 1, "steps": T.STEPS, "guidance_scale": T.GS, "replays": REPLAYS,
+          "compiled_subgraphs": len(subgraphs),
+          "triton_kernels_compiled": ind_metrics.generated_kernel_count},
+)
+print()
+print(render_text(report))
 
-for gi, oc in enumerate(subgraphs):
-    d = os.path.dirname(oc)
-    n2s = node_to_source(os.path.join(d, "fx_graph_readable.py"))
-    K, externs = kernels_of(oc)
-    print("=" * 100)
-    print(f"SUBGRAPH {gi}: {os.path.basename(d)}   ({len(K)} fused Triton, {len(externs)} extern/library calls)")
-    print("=" * 100)
-    for name, (nodes, aten, meta) in sorted(K.items()):
-        ms, calls = lookup_ms(name)
-        srcs = src_of(nodes, n2s)
-        for loc, code in srcs.items(): KSRC[name][loc] = code
-        tag = f"{ms:.3f} ms/step" if ms is not None else "n/a"
-        memhint = f" loads/stores/reductions={meta}" if meta else ""
-        ops = ",".join(a.replace("aten.", "") for a in sorted(aten))
-        print(f"\n  > [Triton] {name}")
-        print(f"      device time : {tag}   ({calls or 0} calls/{REPLAYS}-step-window)")
-        print(f"      fused ATen  : {ops}{memhint}")
-        print(f"      SOURCE LINES ({len(srcs)}):")
-        for loc, code in srcs.items():
-            print(f"         {loc:<26} {code}")
-    for op, nodes, aten in externs:
-        srcs = src_of(nodes, n2s)
-        for loc, code in srcs.items(): EXT_SRC[loc] = code
-        atens = ",".join(a.replace("aten.", "") for a in sorted(aten))
-        print(f"\n  > [extern/cuBLAS] extern_kernels.{op}   (NON-fused library call; {atens or 'matmul'})")
-        for loc, code in srcs.items():
-            print(f"         {loc:<26} {code}")
-
-# ---------- 4. EVERY kernel ranked by execution time, mapped to source ----------
-def kind(key):
-    k = key.lower()
-    if key.startswith("triton_"): return "triton"
-    if "conv" in k or "nchwtonhwc" in k or "implicit_gemm" in k: return "conv"
-    if any(x in k for x in ("nvjet", "cublas", "cutlass", "splitkreduce")): return "gemm"
-    if any(x in k for x in ("flashinfer", "fmha", "flash", "scaled_dot")): return "attention"
-    if any(x in k for x in ("memcpy", "memset", "graphlaunch")): return "memcpy"
-    return "eager"
-
-rows = sorted(((key, us / 1e3 / REPLAYS, cnt // REPLAYS) for key, (us, cnt) in KTIME.items()),
-              key=lambda r: -r[1])
-total = sum(r[1] for r in rows)
-print("\n" + "=" * 100)
-print(f"EVERY KERNEL by execution time -> source   (total ~{total:.2f} ms/step, {len(rows)} kernels)")
-print("=" * 100)
-for rank, (key, ms, cps) in enumerate(rows, 1):
-    k = kind(key)
-    print(f"\n#{rank}  {ms:.3f} ms/step   x{cps}/step")
-    print(f"    kernel: {key}")
-    if key in KSRC and KSRC[key]:                                # exact: Inductor provenance
-        for loc, code in KSRC[key].items():
-            print(f"    source: {loc:<24} {code}")
-    elif k in ("gemm", "conv"):                                  # library matmul/conv: the extern call sites
-        print(f"    source: {k} library kernel (no per-kernel line); extern call sites:")
-        for loc, code in list(EXT_SRC.items())[:8]:
-            print(f"            {loc:<24} {code}")
-    elif k == "attention":
-        print(f"    source: FlashInfer paged attention (library kernel)")
-    elif k == "eager":
-        print(f"    source: uncompiled eager kernel (not in the Inductor graph); the kernel name above")
-        print(f"            names the aten op -- run the capture-time module-hook profiler to pin the line")
-    else:
-        print(f"    source: (runtime/library kernel; no source mapping)")
+if _OUT:
+    json_path = os.path.splitext(_OUT)[0] + ".json"
+    with open(json_path, "w") as f:
+        json.dump(report.to_json(), f, indent=1)
 
 if os.environ.get("COSMOS3_KEEP_TRACE"):
     print(f"\n# Inductor debug dump kept at: {TRACE_DIR}")
@@ -272,3 +216,4 @@ if _OUT:
     sys.stdout = sys.__stdout__      # restore before closing so no flush hits a closed file
     _outfh.close()
     print(f"# report written to {_OUT}")
+    print(f"# json    written to {json_path}")

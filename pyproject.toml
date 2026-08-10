@@ -241,6 +241,8 @@ ignore = [
 "mstar/graph/graph_io.py" = ["F403", "F405"]
 # Imports are deliberately placed after a module-level pytest.skip().
 "test/modular/test_phase1.py" = ["E402"]
+# Inductor trace config/env must be set before importing torch._inductor / mstar.
+"perf_testing/cosmos3_compiled_kernel_analysis.py" = ["E402"]
 
 [tool.ruff.format]
 quote-style = "double"
