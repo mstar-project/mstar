@@ -231,6 +231,8 @@ class Glm52Model(Model):
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
         prefill_outputs = [
             GraphEdge(
                 next_node=EMIT_TO_CLIENT,
@@ -264,7 +266,7 @@ class Glm52Model(Model):
             prefill_outputs.append(
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
-                    name="text_inputs",
+                    name=MTP_DRAFT_BUNDLE,
                     persist=True,
                 )
             )
@@ -362,12 +364,23 @@ class Glm52Model(Model):
                 request_done=True,
             )
 
+        from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
         graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        # M3: an MTP prefill persisted "text_inputs" = [emitted, k drafts];
-        # seeding decode with it makes the first decode step a speculated
-        # (k+1)-row step like every other. k=0 persists no such signal and
-        # seeds from new_token exactly as before.
-        drafts = persist_signals.get("text_inputs", [])
+        # M3: an MTP prefill can persist [emitted, k drafts]; seeding decode
+        # with it makes the first decode step a speculated (k+1)-row step
+        # like every other. k=0 persists no such signal and seeds from
+        # new_token exactly as before.
+        #
+        # The bundle MUST NOT be called "text_inputs". The conductor seeds
+        # persist_signals from initial_signals (conductor.py), and the
+        # initial signal for this model IS named "text_inputs" — the PROMPT.
+        # Reading that key handed decode the whole prompt back as its first
+        # step: measured 2026-08-10 as a 17-row decode step with no capture
+        # bucket (eager trunk, wrong stream) and, with the prefill edge also
+        # on, the p1 0.18 acceptance collapse. A dedicated name cannot
+        # collide.
+        drafts = persist_signals.get(MTP_DRAFT_BUNDLE, [])
         if drafts:
             graph_edge.tensor_info = drafts
             # new_token was persisted too (for the client emission); consume

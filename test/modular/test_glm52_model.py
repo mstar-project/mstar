@@ -110,19 +110,53 @@ def test_glm52_prefill_persists_drafts_only_under_mtp(monkeypatch):
     deflates measured p1). k=0 must keep the byte-identical old walk."""
     from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 
+    from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
     monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1")
     prefill_k0 = _make_model_k(0).get_graph_walk_graphs()["prefill"]
     assert [e.name for e in prefill_k0.outputs] == ["new_token"]
 
     prefill_k2 = _make_model_k(2).get_graph_walk_graphs()["prefill"]
     by_name = {e.name: e for e in prefill_k2.outputs}
-    assert set(by_name) == {"new_token", "text_inputs"}
+    assert set(by_name) == {"new_token", MTP_DRAFT_BUNDLE}
     # Persisted, not emitted: the conductor seeds decode from it, and it must
     # never reach the client as output text.
-    drafts = by_name["text_inputs"]
+    drafts = by_name[MTP_DRAFT_BUNDLE]
     assert drafts.persist is True
     assert drafts.next_node == EMPTY_DESTINATION
     assert by_name["new_token"].next_node == EMIT_TO_CLIENT
+
+
+def test_glm52_decode_never_reseeds_from_the_prompt_signal():
+    """REGRESSION (2026-08-10, cost a 27-min box run to find).
+
+    The conductor seeds persist_signals from initial_signals, and this
+    model's initial signal is named "text_inputs" — the PROMPT. So at the
+    prefill->decode transition, persist_signals["text_inputs"] is already
+    populated with the prompt, and a transition that reads that key hands
+    decode the entire prompt back as its first step: measured as a 17-row
+    decode step with no capture bucket (eager trunk + a diverged token
+    stream), and with the prefill-draft edge also on, a p1 acceptance
+    collapse 0.76 -> 0.18.
+
+    The draft bundle therefore travels under a dedicated name that cannot
+    collide. This test feeds the prompt in under BOTH names to prove the
+    transition ignores the prompt one."""
+    from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
+    assert MTP_DRAFT_BUNDLE != "text_inputs"
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"], output_modalities=["text"],
+        graph_walk="prefill", is_prefill=True,
+    )
+    res = _make_model_k(2).get_partition_forward_pass_args(
+        partition_name="default", partition_metadata=metadata,
+        # exactly what the conductor holds: the prompt under "text_inputs"
+        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
+    )
+    assert res.inputs[0].tensor_info == ["tok"], (
+        "decode was seeded with the PROMPT instead of the emitted token")
+    assert "PROMPT" not in res.unpersist_tensors
 
 
 def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them():
@@ -145,8 +179,13 @@ def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them():
     assert res.unpersist_tensors == ["tok"]
 
     # MTP: seed from the draft bundle, and consume new_token alongside it.
+    # The bundle arrives under its dedicated name; the decode node still
+    # consumes it as its "text_inputs" input.
+    from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
     res = _transition(
-        _make_model_k(2), {"new_token": ["tok"], "text_inputs": ["bundle"]})
+        _make_model_k(2),
+        {"new_token": ["tok"], MTP_DRAFT_BUNDLE: ["bundle"]})
     assert res.inputs[0].name == "text_inputs"
     assert res.inputs[0].tensor_info == ["bundle"]
     assert set(res.unpersist_tensors) == {"bundle", "tok"}

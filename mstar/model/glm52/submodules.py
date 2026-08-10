@@ -42,6 +42,12 @@ _MAIN = "main"
 MTP_TRUNK_LABEL = "mtp_trunk"
 MTP_DRAFT_LABEL = "mtp_draft"
 MTP_SYNC_LABEL = "mtp_sync"
+# Output/edge name for the prefill's [emitted, k drafts] bundle. Deliberately
+# NOT "text_inputs": the conductor seeds persist_signals from initial_signals,
+# where "text_inputs" is the PROMPT, so a persisted edge of that name is
+# indistinguishable from the prompt at the prefill->decode transition — which
+# fed decode the whole prompt back as its first step (measured 2026-08-10).
+MTP_DRAFT_BUNDLE = "mtp_draft_bundle"
 
 
 def mtp_sync_padded_layout(
@@ -907,7 +913,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return {
                 rid: {
                     "new_token": [new_tokens[i:i + 1]],
-                    "text_inputs": [
+                    # Under MTP_DRAFT_BUNDLE, never "text_inputs" — see the
+                    # constant. Consumed only when the prefill-drafts edge is
+                    # declared; otherwise unrouted and dropped, exactly as
+                    # before.
+                    MTP_DRAFT_BUNDLE: [
                         torch.cat([new_tokens[i:i + 1], drafts[i]])],
                 }
                 for i, rid in enumerate(request_ids)

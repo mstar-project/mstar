@@ -203,8 +203,22 @@ def _fwd_info(max_tokens: int, ignore_eos: bool) -> SimpleNamespace:
     )
 
 
-def _drive(sub, handle, prompt, fwd_info, max_steps=64, runners=None):
-    """Run prefill + decode through the submodule protocol until stop."""
+def _drive(sub, handle, prompt, fwd_info, max_steps=64, runners=None,
+           carry_prefill_drafts=True):
+    """Run prefill + decode through the submodule protocol until stop.
+
+    ``carry_prefill_drafts`` mirrors the conductor's prefill->decode
+    handoff. The prefill returns its [emitted, k drafts] bundle under
+    MTP_DRAFT_BUNDLE — deliberately NOT "text_inputs", which is the name of
+    the PROMPT signal (a collision there fed decode the whole prompt back;
+    2026-08-10). True carries the bundle, as the conductor does when the
+    prefill-drafts edge is declared; False drops it and seeds decode from
+    the emitted token alone, which is the current default path. Greedy
+    verify makes the emitted stream identical either way, so both are
+    exercised.
+    """
+    from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
     ei = _EngineInputs(handle, _ArgmaxSampler(), piecewise_runners=runners)
     emitted = []
     walk, text_inputs, decode_step = "prefill", prompt, 0
@@ -221,7 +235,10 @@ def _drive(sub, handle, prompt, fwd_info, max_steps=64, runners=None):
             decode_step += 1
         if sub.check_stop("r0", fwd_info, out):
             break
-        walk, text_inputs = "decode", out["text_inputs"][0]
+        nxt = out["text_inputs"][0]
+        if carry_prefill_drafts and MTP_DRAFT_BUNDLE in out:
+            nxt = out[MTP_DRAFT_BUNDLE][0]
+        walk, text_inputs = "decode", nxt
     return torch.cat(emitted)
 
 
@@ -252,6 +269,28 @@ def test_mtp_stream_matches_baseline_bitwise():
     (base, spec), _ = _run_pair(k=2, max_tokens=24, ignore_eos=True)
     assert torch.equal(base, spec), (
         f"MTP-on diverged from baseline: {base.tolist()} vs {spec.tolist()}")
+
+
+def test_mtp_stream_identical_whether_prefill_drafts_are_carried():
+    """The prefill-drafts handoff is a THROUGHPUT feature, never a
+    correctness one: carrying the bundle into decode step 1 must emit the
+    same tokens as dropping it. Both arms also match plain k=0 decode.
+    Pins the property that made carrying it look safe — while the bug that
+    actually broke it lived in the signal NAME, not in this arithmetic."""
+    torch.manual_seed(0)
+    cfg = _mtp_cfg(2)
+    model = Glm52ForCausalLM(cfg)
+    prompt = torch.arange(5, dtype=torch.long) + 3
+
+    streams = []
+    for carry in (True, False):
+        sub = Glm52LLMSubmodule(model, cfg)
+        streams.append(_drive(
+            sub, ReferenceCacheHandle(["r0"]), prompt, _fwd_info(24, True),
+            carry_prefill_drafts=carry))
+    assert torch.equal(streams[0], streams[1]), (
+        f"carrying prefill drafts changed the stream: "
+        f"{streams[0].tolist()} vs {streams[1].tolist()}")
 
 
 def test_mtp_stream_matches_with_k3():
