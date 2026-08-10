@@ -235,138 +235,40 @@ for gi, oc in enumerate(subgraphs):
         for loc, code in srcs.items():
             print(f"         {loc:<26} {code}")
 
-# ---------- 4. FULL measured per-step breakdown by kernel family ----------
-def classify(key):
+# ---------- 4. EVERY kernel ranked by execution time, mapped to source ----------
+def kind(key):
     k = key.lower()
-    if key.startswith("triton_"): return "Triton (fused compiled)"
-    if any(x in k for x in ("nvjet", "cublas", "cutlass", "gemm")): return "cuBLAS GEMM (non-fused)"
-    if any(x in k for x in ("flashinfer", "fmha", "attention", "flash")): return "attention (FlashInfer)"
-    if "elementwise" in k or "reduce_kernel" in k or k.startswith("void at::native"): return "eager aten (uncompiled)"
-    if any(x in k for x in ("memcpy", "memset", "graphlaunch")): return "memcpy/launch"
-    return "other"
+    if key.startswith("triton_"): return "triton"
+    if "conv" in k or "nchwtonhwc" in k or "implicit_gemm" in k: return "conv"
+    if any(x in k for x in ("nvjet", "cublas", "cutlass", "splitkreduce")): return "gemm"
+    if any(x in k for x in ("flashinfer", "fmha", "flash", "scaled_dot")): return "attention"
+    if any(x in k for x in ("memcpy", "memset", "graphlaunch")): return "memcpy"
+    return "eager"
 
-groups = collections.defaultdict(lambda: [0.0, 0]); rowsK = []
-for key, (us, cnt) in KTIME.items():
-    groups[classify(key)][0] += us; groups[classify(key)][1] += cnt
-    rowsK.append((key, us / 1e3 / REPLAYS, cnt // REPLAYS))
-tot = sum(v[0] for v in groups.values()) / 1e3 / REPLAYS
+rows = sorted(((key, us / 1e3 / REPLAYS, cnt // REPLAYS) for key, (us, cnt) in KTIME.items()),
+              key=lambda r: -r[1])
+total = sum(r[1] for r in rows)
 print("\n" + "=" * 100)
-print(f"FULL measured per-step device breakdown (ALL kernels incl. NON-fused)   total ~{tot:.2f} ms/step")
+print(f"EVERY KERNEL by execution time -> source   (total ~{total:.2f} ms/step, {len(rows)} kernels)")
 print("=" * 100)
-for g, (us, cnt) in sorted(groups.items(), key=lambda x: -x[1][0]):
-    print(f"   {g:<28}{us / 1e3 / REPLAYS:>8.3f} ms/step{100 * us / (tot * 1e3 * REPLAYS) if tot else 0:>7.1f}%")
-
-# ---------- 5. OPTIMALITY LADDER (VibeSim-style) + per-op-class metrics ----------
-# Per op-class: measured device time (R0) vs the hardware-necessary roofline
-# (R6 = max(FLOPs/peak_compute, bytes/peak_bw)). gap = measured/roofline;
-# headroom = measured - roofline = recoverable ms/step. Peaks measured live.
-def _bench(fn, iters=40, warm=20):
-    for _ in range(warm): fn()
-    torch.cuda.synchronize()
-    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
-    s.record()
-    for _ in range(iters): fn()
-    e.record(); torch.cuda.synchronize()
-    return s.elapsed_time(e) / iters
-try:
-    _a = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
-    _b = torch.randn(8192, 8192, device=device, dtype=torch.bfloat16)
-    PEAK_FLOPS = (2 * 8192 ** 3) / (_bench(lambda: torch.mm(_a, _b)) * 1e-3)      # FLOP/s
-    _src = torch.randn(1 << 29, device=device, dtype=torch.bfloat16)             # 1 GiB
-    _dst = torch.empty_like(_src)                                                # preallocated (no per-iter alloc)
-    PEAK_BW = (2 * _src.numel() * 2) / (_bench(lambda: _dst.copy_(_src)) * 1e-3)  # B/s (r+w)
-    del _a, _b, _src, _dst
-except Exception as e:
-    PEAK_FLOPS, PEAK_BW = 2.0e15, 7.0e12
-    print(f"(peak bench failed, using datasheet B200 defaults: {e})")
-
-c = model.config
-d, L = c.hidden_size, c.num_hidden_layers
-Hh, Hkv, Dh, I = c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.intermediate_size
-qdim, kvdim = Hh * Dh, Hkv * Dh
-Tg = max(1, (T.H // 16 // 2) * (T.W // 16 // 2))       # gen latent-patch tokens (image, 1 frame)
-Tund = len(ctx["cond"]); Tctx = Tund + Tg; CFG = 2; bpe = 2
-
-def _gemm(M, N, K): return 2 * M * N * K, (M * K + K * N + M * N) * bpe
-gf = gb = 0.0                                          # per-layer GEN pathway: qkv + o + gate/up/down
-for M, N, K in [(Tg, qdim, d), (Tg, kvdim, d), (Tg, kvdim, d), (Tg, d, qdim),
-                (Tg, I, d), (Tg, I, d), (Tg, d, I)]:
-    f, b = _gemm(M, N, K); gf += f; gb += b
-mult = CFG * L
-gemm_f, gemm_b = mult * gf, mult * gb
-attn_f = mult * (2 * 2 * Hh * Tg * Tctx * Dh)
-attn_b = mult * ((Hh * Tg * Dh + 2 * Hkv * Tctx * Dh + Hh * Tg * Dh) * bpe)
-norm_b = mult * ((6 * Tg * d + Tg * qdim + Tg * kvdim) * 2 * bpe)   # 4 layernorms + qk-norm + mod/gate
-
-def _roof(fl, by): return max(fl / PEAK_FLOPS, by / PEAK_BW) * 1e3   # ms
-ms_of = lambda g: groups.get(g, [0.0, 0])[0] / 1e3 / REPLAYS
-CLASS_DEF = [
-    ("GEMM (proj+MLP)",      ms_of("cuBLAS GEMM (non-fused)"), _roof(gemm_f, gemm_b)),
-    ("attention",            ms_of("attention (FlashInfer)"),  _roof(attn_f, attn_b)),
-    ("norm/adaLN/pointwise", ms_of("Triton (fused compiled)") + ms_of("eager aten (uncompiled)")
-                             + ms_of("other") + ms_of("memcpy/launch"), _roof(0, norm_b)),
-]
-CLASS_OPT = {}                                          # op-class -> (measured, roofline, gap, headroom)
-R0 = R6 = rec = 0.0
-for name, m, roof in CLASS_DEF:
-    gap = m / roof if roof > 0 else float('inf'); hr = max(0.0, m - roof)
-    CLASS_OPT[name] = (m, roof, gap, hr); R0 += m; R6 += roof; rec += hr
-print("\n" + "=" * 100)
-print("OPTIMALITY LADDER (VibeSim-style)   peak: "
-      f"{PEAK_FLOPS/1e12:.0f} TFLOP/s, {PEAK_BW/1e9:.0f} GB/s | shape Tg={Tg} Tctx={Tctx} CFG={CFG} L={L}")
-print("=" * 100)
-print(f"   {'op-class':<24}{'measured':>10}{'roofline':>10}{'gap':>7}{'headroom':>10}   (ms/step)")
-for name, (m, roof, gap, hr) in sorted(CLASS_OPT.items(), key=lambda r: -r[1][3]):
-    print(f"   {name:<24}{m:>10.3f}{roof:>10.3f}{gap:>7.1f}{hr:>10.3f}")
-print("   " + "-" * 68)
-print(f"   {'R0 measured step':<24}{R0:>10.3f}")
-print(f"   {'R6 necessary (roofline)':<24}{'':<10}{R6:>10.3f}")
-print(f"   {'recoverable headroom':<24}{'':<10}{'':<10}{'':<7}{rec:>10.3f}  ({100*rec/R0 if R0 else 0:.0f}% of step)")
-
-# ---------- 6. TOP KERNELS by execution time: source line (+ copy) + optimality ----------
-FAM2LADDER = {"cuBLAS GEMM (non-fused)": "GEMM (proj+MLP)",
-              "attention (FlashInfer)": "attention",
-              "Triton (fused compiled)": "norm/adaLN/pointwise",
-              "eager aten (uncompiled)": "norm/adaLN/pointwise"}
-print("\n" + "=" * 100)
-print("TOP KERNELS by execution time  (for each: source line + copy of the line, and optimality)")
-print("=" * 100)
-for rank, (key, ms, cps) in enumerate(sorted(rowsK, key=lambda r: -r[1])[:14], 1):
-    fam = classify(key)
-    print(f"\n#{rank}  {ms:.3f} ms/step   x{cps}/step   [{fam}]")
+for rank, (key, ms, cps) in enumerate(rows, 1):
+    k = kind(key)
+    print(f"\n#{rank}  {ms:.3f} ms/step   x{cps}/step")
     print(f"    kernel: {key}")
-    # (1) source line(s) + a copy of each line
-    if key in KSRC and KSRC[key]:
-        print("    source:")
+    if key in KSRC and KSRC[key]:                                # exact: Inductor provenance
         for loc, code in KSRC[key].items():
-            print(f"        {loc:<24} {code}")
-    elif fam == "cuBLAS GEMM (non-fused)":
-        print("    source: cuBLAS matmul (library kernel) -> GEN-pathway projection/MLP call sites:")
+            print(f"    source: {loc:<24} {code}")
+    elif k in ("gemm", "conv"):                                  # library matmul/conv: the extern call sites
+        print(f"    source: {k} library kernel (no per-kernel line); extern call sites:")
         for loc, code in list(EXT_SRC.items())[:8]:
-            print(f"        {loc:<24} {code}")
-    elif fam == "attention (FlashInfer)":
-        print("    source: FlashInfer paged attention (library kernel); GEN attends [text K/V | gen]")
-    elif fam == "eager aten (uncompiled)":
-        print("    source: uncompiled eager kernel (not in the Inductor graph) -> attribute via the")
-        print("            capture-time module-hook profiler (eager copies/casts/modulation/residuals")
-        print("            around the attention graph break; the kernel name above hints at the op).")
+            print(f"            {loc:<24} {code}")
+    elif k == "attention":
+        print(f"    source: FlashInfer paged attention (library kernel)")
+    elif k == "eager":
+        print(f"    source: uncompiled eager kernel (not in the Inductor graph); the kernel name above")
+        print(f"            names the aten op -- run the capture-time module-hook profiler to pin the line")
     else:
-        print("    source: (no source mapping for this kernel class)")
-    # (2) optimality analysis (op-class roofline this kernel belongs to)
-    lc = FAM2LADDER.get(fam)
-    if lc and lc in CLASS_OPT:
-        m, roof, gap, hr = CLASS_OPT[lc]
-        verdict = ("at/below roofline -- no recoverable headroom" if gap <= 1.05
-                   else f"{gap:.0f}x off roofline; op-class has {hr:.2f} ms/step recoverable")
-        print(f"    optimality: op-class '{lc}'  measured {m:.2f} vs roofline {roof:.3f} ms/step  ->  {verdict}")
-    else:
-        print("    optimality: overhead/other (no roofline)")
-
-# ---------- 7. hottest source lines by #kernels touching them ----------
-print("\n" + "=" * 100)
-print("SOURCE LINES that the most FUSED kernels touch (fusion-boundary hot spots):")
-for loc, n in srcline_hits.most_common(15):
-    print(f"   {n:>3} kernels   {loc}")
+        print(f"    source: (runtime/library kernel; no source mapping)")
 
 if os.environ.get("COSMOS3_KEEP_TRACE"):
     print(f"\n# Inductor debug dump kept at: {TRACE_DIR}")
