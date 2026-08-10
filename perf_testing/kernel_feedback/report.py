@@ -145,10 +145,6 @@ class Report:
         }
 
 
-def _short(key: str, n: int = 90) -> str:
-    return key if len(key) <= n else key[: n - 3] + "..."
-
-
 def build_report(
     subgraphs: list[Subgraph],
     ktime_us: dict[str, tuple[float, int]],
@@ -405,7 +401,7 @@ def render_text(rep: Report, top: int = 40) -> str:
         byts = f"{r.bytes_call / 1e6:.2f}MB/call" if r.bytes_call else ""
         w(f"\n#{i:<3} opportunity {r.opportunity_ms:.3f} ms/step   observed {r.ms_step:.3f}  sol {sol}  "
           f"x{r.calls_step:.0f}/step   [{r.kind}/{r.klass}] {byts}")
-        w(f"     kernel: {_short(r.key)}")
+        w(f"     kernel: {r.key}")
         for loc, code in r.source[:4]:
             w(f"     source: {loc:<26} {code}")
         for note in r.notes:
@@ -426,7 +422,7 @@ def render_text(rep: Report, top: int = 40) -> str:
         for t in s.tritons:
             tag = "movement" if t["movement"] else "compute "
             sol = f"{t['sol_ms_call']:.5f} ms/call" if t["sol_ms_call"] is not None else "n/a"
-            w(f"   [{tag}] {t['kernel'][:72]:<74} {t['bytes_per_call'] / 1e6:7.3f} MB/call  sol {sol}")
+            w(f"   [{tag}] {t['kernel']}   {t['bytes_per_call'] / 1e6:.3f} MB/call  sol {sol}")
             for src in t["source"][:3]:
                 w(f"        {src['loc']:<26} {src['code']}")
         for e in s.externs:
