@@ -270,21 +270,18 @@ def test_piecewise_graphs_do_not_share_workspace_or_dummy_ids():
     cfg = _cfg()
     model = _build(cfg)
     sub = Glm52LLMSubmodule(model, cfg)
+    # Set the attribute rather than the env: the flag is read in __init__,
+    # so an env write after construction is a no-op (it silently produced a
+    # KeyError'd 'mtp_sync' the first time this test ran).
+    sub._mtp_capture_sync = True
     cm, alloc, buffers, kv_cfg, _ = _kv(cfg, 1)
-    prev = os.environ.get("MSTAR_GLM52_MTP_CAPTURE_SYNC")
-    os.environ["MSTAR_GLM52_MTP_CAPTURE_SYNC"] = "1"
+    runners = build_piecewise_runners(
+        sub, DEVICE, torch.bfloat16, tp_world_size=1,
+        kv_cache_config=kv_cfg, alloc_manager=alloc,
+        buffer_manager=buffers,
+    )
     try:
-        runners = build_piecewise_runners(
-            sub, DEVICE, torch.bfloat16, tp_world_size=1,
-            kv_cache_config=kv_cfg, alloc_manager=alloc,
-            buffer_manager=buffers,
-        )
-    finally:
-        if prev is None:
-            os.environ.pop("MSTAR_GLM52_MTP_CAPTURE_SYNC", None)
-        else:
-            os.environ["MSTAR_GLM52_MTP_CAPTURE_SYNC"] = prev
-    try:
+        assert MTP_SYNC_LABEL in runners, "sync graph did not capture"
         trunk, sync = runners[MTP_TRUNK_LABEL], runners[MTP_SYNC_LABEL]
         # Same shape — the precondition that made the collision possible.
         assert set(trunk.graphs) & set(sync.graphs), (
