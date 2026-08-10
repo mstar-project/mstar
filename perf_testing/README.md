@@ -1,11 +1,26 @@
-# Op-/kernel-level feedback for the served Cosmos3 DiT
+# Op-/kernel-level optimization feedback for Cosmos3
 
-`cosmos3_compiled_kernel_analysis.py` profiles the Cosmos3-Nano DiT **as it is
-actually served** — `torch.compile` (`compile_denoise=True`) + CUDA-graph capture
-via the real `CudaGraphRunner` — and backtracks every kernel to its `transformer.py`
-source line, so you can see where the denoise step spends time and what to optimize.
+Two profilers that report where the recoverable optimization headroom is, using
+VibeSim-style roofline/optimality reasoning:
 
-## Run
+- **`cosmos3_optimality_report.py`** — the **hierarchical report**, in M*'s model
+  abstraction: `Walk > component/node > op-class > kernel`. It profiles each
+  component of a Walk (the served DiT denoise step and the Wan-VAE decode),
+  weights by multiplicity (dit × `num_inference_steps`, vae × 1) so the ranking
+  reflects real per-image priority, and tags each op-class's headroom with a
+  named bucket (fusion / redundant / occupancy / at-roofline). **Start here** to
+  decide *what* to optimize.
+- **`cosmos3_compiled_kernel_analysis.py`** — the **kernel-level drill-down** for
+  one component (the served DiT): every kernel backed to its `transformer.py`
+  source line (Inductor provenance + extern-call parsing), the full per-step
+  device breakdown incl. non-fused kernels, and the per-op-class optimality
+  ladder + top-kernels-with-source. Use this once the report points you at a
+  component.
+
+Both share the same method (measured device time from CUDA-graph replay + an
+analytic/FLOP-counted roofline + live-measured peaks) and the same caveats below.
+
+## Run (kernel-level drill-down)
 
 ```bash
 cd <mstar repo>
@@ -17,6 +32,30 @@ COSMOS3_NANO_DIR=/path/to/Cosmos3-Nano \
   ~24 GB free, and a local Cosmos3-Nano checkpoint (HF `nvidia/Cosmos3-Nano`).
 - `COSMOS3_NANO_DIR` defaults to a local path in the script — override via env.
 - Takes ~2–3 min (it forces a cold recompile so Inductor re-emits provenance).
+
+## Run (hierarchical report)
+
+```bash
+COSMOS3_NANO_DIR=/path/to/Cosmos3-Nano \
+  CUDA_VISIBLE_DEVICES=<free gpu> python perf_testing/cosmos3_optimality_report.py
+```
+
+Example (Cosmos3-Nano, 256×256, one B200) — the top of the report:
+
+```
+WALK TOTAL:  ~1085 ms   |   recoverable ~859 ms (79%)
+  component        per-call ms    xN   walk ms  share  recoverable ms
+  dit                   21.4      50      1072    99%             850
+  vae_decoder           13.2       1        13     1%               9
+COMPONENT: dit  ...
+   op-class                measured roofline  gap  walk-headroom  bucket
+   norm/adaLN/pointwise      15.98    0.089  179x           794   FUSION — unfused/eager pointwise ...
+   attention                  0.66    0.018   37x            32   KERNEL/launch ...
+   GEMM                       4.33    4.644    1x             0   at roofline — no headroom
+```
+
+`walk-headroom` = per-call headroom × multiplicity = recoverable ms per generated
+image. It makes the DiT's per-step cost dominate (×50), which is the real priority.
 
 ### Recording the output
 
