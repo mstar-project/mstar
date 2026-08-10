@@ -48,16 +48,23 @@ class BatchedCfgInfo:
 
 
 class BatchedCacheManager(ABC):
-    """Model-facing facade over the engine's per-step resources.
+    """Internal: the runner's per-step surface over the engine's resources.
 
     Holds the step's addressing (which requests, which label each is on)
     and dispatches every call into the resources behind it: the KV cache
     pool (admission, views, commits, forks), the attention manager (plans,
     wrappers, workspaces), the positional embedder, and one cross-attention
     manager per declared source. The domain state lives on those resources;
-    what stays here is per-step bookkeeping the model or the graph runner
-    drives directly (active labels, the batched-CFG advance info, the
-    pre-plan short-circuit set).
+    what stays here is per-step bookkeeping (active labels, the batched-CFG
+    advance info, the pre-plan short-circuit set).
+
+    Adopted models (cosmos3, qwen3_omni, bagel) never sequence through this
+    surface: they declare their step (``NodeSubmodule.declare_step``), the
+    runner drives the plans, forks, and commits, and their forwards call
+    only the device-side ops with explicit labels (``run_attention``,
+    ``apply_rope``). The plan and advance methods here are transitional
+    surface for the families that have not adopted declarations yet; new
+    model code declares instead of calling them.
 
     Concrete backends pick the attention manager kind via
     ``ATTENTION_MANAGER_CLS``; ``ATTENTION_BACKENDS`` maps
@@ -65,9 +72,7 @@ class BatchedCacheManager(ABC):
     ``create_cache_manager`` instantiates the configured one.
 
     Constructed per batch: one facade serves the whole batch with a single
-    attention call per layer instead of N per-request calls. Complex paths
-    like image_gen (3-pass CFG with label switching) continue using
-    per-request construction.
+    attention call per layer instead of N per-request calls.
     """
 
     ATTENTION_MANAGER_CLS: type[FlashInferAttentionManager] = FlashInferAttentionManager

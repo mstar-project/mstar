@@ -3,9 +3,11 @@
 Storage divides in two. The arena is the physical pool: the backing tensor
 and the page allocator over it. The pool is per-request accounting against
 an arena: which pages a stream holds, its stored length, its position
-counter. Several pools may share one arena; nothing above a pool sees the
-arena.
+counter, and its retention. Several pools may share one arena; nothing
+above a pool sees the arena.
 """
+
+from dataclasses import dataclass
 
 import torch
 
@@ -52,6 +54,18 @@ class PageArena:
         return self.allocator.max_num_pages
 
 
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """Sliding-window retention for one cache stream: keep at most
+    ``context_budget`` tokens of physical history. The pool applies the
+    policy at commit, releasing whole pages from the front of the stream
+    as it grows past the budget; the next view's extent starts past the
+    released tokens. Configured per stream at request admission. Models
+    never call release. The protected-prefix windowed mode maps onto the
+    same release mechanism."""
+    context_budget: int
+
+
 class ScratchKVPool:
     """Fixed-shape scratch KV storage with a trivial lifecycle: no admit,
     no publish, no per-request lifetime. The tensor is overwritten every
@@ -91,6 +105,24 @@ class KVCachePool:
             allocator=manager.page_allocator,
             page_size=manager.config.page_size,
         )
+        # Streams with a retention policy, and how many tokens each has
+        # released from its front (always whole pages). Empty in the
+        # common case, and every hot-path read is gated on that emptiness
+        # so unconfigured pools pay nothing.
+        self._retention: dict[tuple[str, str], RetentionPolicy] = {}
+        self._released: dict[tuple[str, str], int] = {}
+
+    def set_retention_policy(
+        self, request_id: str, label: str, policy: RetentionPolicy,
+    ) -> None:
+        """Configure one stream's retention at request admission."""
+        self._retention[(request_id, label)] = policy
+        self._released[(request_id, label)] = 0
+
+    def _released_tokens(self, request_id: str, label: str) -> int:
+        if not self._released:
+            return 0
+        return self._released.get((request_id, label), 0)
 
     @property
     def page_size(self) -> int:
@@ -106,12 +138,16 @@ class KVCachePool:
 
     def admit(self, segment: Segment) -> Reservation:
         """Reserve pages so the segment's stream can hold its history plus
-        this segment's span. Raises ``AllocationFailedError`` when the arena
-        cannot supply the pages; a zero-span segment reserves nothing."""
+        this segment's span. A retained stream sizes the reservation from
+        its physical remainder (released pages are gone for good). Raises
+        ``AllocationFailedError`` when the arena cannot supply the pages;
+        a zero-span segment reserves nothing."""
         state = self._manager.get_state(segment.request_id, segment.label)
         resident = state.seq_len
+        released = self._released_tokens(segment.request_id, segment.label)
         self._manager.alloc(
-            segment.request_id, segment.label, resident + segment.span
+            segment.request_id, segment.label,
+            resident + segment.span - released,
         )
         return Reservation(
             resident=resident,
@@ -122,24 +158,42 @@ class KVCachePool:
     def view(self, segment: Segment) -> SequenceView:
         """The stream as this step's plans must see it: every page backing
         it and the extent those pages cover once the segment's span lands.
-        Call after ``admit`` for spans that need new pages."""
+        The extent starts past any tokens retention released, so it is not
+        necessarily a prefix from zero. Call after ``admit`` for spans that
+        need new pages."""
         state = self._manager.get_state(segment.request_id, segment.label)
+        released = self._released_tokens(segment.request_id, segment.label)
         return SequenceView(
             pool=self,
             page_indices=tuple(state.page_indices),
-            start=0,
-            length=state.seq_len + segment.span,
+            start=released,
+            length=state.seq_len + segment.span - released,
         )
 
     def commit(self, segment: Segment, pos_advance: int | None = None) -> None:
         """Record that the segment's span was computed: stored length grows
         by the span, the position counter by ``pos_advance`` (defaults to
-        the span)."""
+        the span). A stream configured with a retention policy releases
+        what aged out, whole pages at a time, and the next view's extent
+        reflects the release."""
         state = self._manager.get_state(segment.request_id, segment.label)
         state.seq_len += segment.span
         state.position_id_start += (
             segment.span if pos_advance is None else pos_advance
         )
+        if not self._retention:
+            return
+        key = (segment.request_id, segment.label)
+        policy = self._retention.get(key)
+        if policy is None:
+            return
+        page_size = self.page_size
+        while (
+            state.seq_len - self._released[key] - policy.context_budget
+            >= page_size
+        ):
+            self._arena.free([state.page_indices.pop(0)])
+            self._released[key] += page_size
 
     def positions(self, request_id: str, label: str) -> int:
         """Current position counter for one stream, read-only."""
@@ -161,6 +215,10 @@ class KVCachePool:
         """Drop a request's accounting on every tier and free its pages."""
         if self._cpu_pool is not None:
             self._cpu_pool.remove_request(request_id)
+        if self._retention:
+            for key in [k for k in self._retention if k[0] == request_id]:
+                del self._retention[key]
+                del self._released[key]
         self._manager.remove_request(request_id)
 
     def set_write_policy(self, policy: StoreWritePolicy) -> None:

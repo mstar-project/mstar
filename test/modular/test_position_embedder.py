@@ -23,7 +23,12 @@ from mstar.engine.kv_store import (
     PagedAllocationManager,
     StoreWritePolicy,
 )
-from mstar.engine.resources import KVCachePool, RopeEmbedder, Segment
+from mstar.engine.resources import (
+    BlockRopeEmbedder,
+    KVCachePool,
+    RopeEmbedder,
+    Segment,
+)
 
 
 def _make_manager(max_num_pages: int = 16, page_size: int = 8) -> PagedAllocationManager:
@@ -173,6 +178,54 @@ class TestPlanRopeUsesEmbedder:
 
         cm.plan_rope(seq_lens=[2], pos_ids=explicit, label="main")
         assert cm._plan_states["main"].pos_ids.tolist() == [7, 9]
+
+
+class TestBlockRopeEmbedder:
+    """A second positional scheme as one new embedder implementation:
+    block positions, where every token of a segment shares the stream's
+    current position and the counter advances by one step per segment.
+    Nothing else changes: the pool commits the plan's advance, the
+    attention managers and models are untouched."""
+
+    def _pool(self):
+        alloc = _make_manager()
+        alloc.add_request("a", ["main"])
+        alloc.add_request("b", ["main"])
+        return KVCachePool(alloc)
+
+    def test_tokens_share_the_stream_position(self):
+        pool = self._pool()
+        pool.commit(Segment("a", "main", 0), pos_advance=4)  # counter at 4
+        embedder = BlockRopeEmbedder()
+
+        plan = embedder.plan(
+            [Segment("a", "main", 3), Segment("b", "main", 2)], pool
+        )
+        assert plan.pos_ids.tolist() == [4, 4, 4, 0, 0]
+        assert plan.advance == (1, 1)
+
+    def test_positions_differ_from_tokens_across_commits(self):
+        pool = self._pool()
+        embedder = BlockRopeEmbedder()
+        for expected_pos in (0, 1, 2):
+            segment = Segment("a", "main", 16)
+            plan = embedder.plan([segment], pool)
+            assert plan.pos_ids.tolist() == [expected_pos] * 16
+            pool.commit(segment, pos_advance=plan.advance[0])
+        state_pos = pool.positions("a", "main")
+        length = pool.view(Segment("a", "main", 0)).length
+        assert state_pos == 3 and length == 48
+
+    def test_zero_span_advances_nothing(self):
+        pool = self._pool()
+        plan = BlockRopeEmbedder().plan([Segment("a", "main", 0)], pool)
+        assert plan.pos_ids.numel() == 0
+        assert plan.advance == (0,)
+
+    def test_step_is_configurable(self):
+        pool = self._pool()
+        plan = BlockRopeEmbedder(step=3).plan([Segment("a", "main", 5)], pool)
+        assert plan.advance == (3,)
 
 
 if __name__ == "__main__":

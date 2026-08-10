@@ -11,12 +11,18 @@ from mstar.engine.resources.base import (
     SequenceView,
 )
 from mstar.engine.resources.declare import PlanSpec, StepDeclaration
-from mstar.engine.resources.kv_pool import KVCachePool, PageArena, ScratchKVPool
-from mstar.engine.resources.positions import RopeEmbedder
+from mstar.engine.resources.kv_pool import (
+    KVCachePool,
+    PageArena,
+    RetentionPolicy,
+    ScratchKVPool,
+)
+from mstar.engine.resources.positions import BlockRopeEmbedder, RopeEmbedder
 from mstar.engine.resources.spec import NodeResourceSpec, ScratchKVSpec
 from mstar.engine.resources.step import StepPlan, StepRunner
 
 __all__ = [
+    "BlockRopeEmbedder",
     "CrossAttentionManager",
     "DenseGenAttentionManager",
     "FlashInferAttentionManager",
@@ -26,6 +32,7 @@ __all__ = [
     "PlanSpec",
     "PositionPlan",
     "Reservation",
+    "RetentionPolicy",
     "RopeEmbedder",
     "ScratchKVPool",
     "ScratchKVSpec",

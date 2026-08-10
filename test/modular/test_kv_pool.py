@@ -32,6 +32,7 @@ from mstar.engine.resources import (
     PageArena,
     PositionPlan,
     Reservation,
+    RetentionPolicy,
     Segment,
     SequenceView,
 )
@@ -597,6 +598,80 @@ class TestBoundaryValuesAreImmutable:
         plan = PositionPlan(pos_ids=torch.arange(3), advance=(3,))
         with pytest.raises(dataclasses.FrozenInstanceError):
             plan.advance = (4,)
+
+
+class TestRetentionPolicy:
+    """A windowed retention policy as pool configuration: the pool applies
+    release at commit, whole pages at a time, and the next view's extent
+    reflects it. No attention manager, embedder, runner, or model code is
+    involved; unconfigured streams behave exactly as before."""
+
+    def _stream(self, budget: int):
+        pool, manager = _make_pool()
+        pool.add_request("r", ["main"])
+        pool.set_retention_policy("r", "main", RetentionPolicy(context_budget=budget))
+        return pool, manager
+
+    @staticmethod
+    def _step(pool, span: int) -> None:
+        segment = Segment("r", "main", span)
+        pool.admit(segment)
+        pool.view(segment)
+        pool.commit(segment)
+
+    def test_releases_whole_pages_past_the_budget(self):
+        pool, manager = self._stream(budget=16)
+        free0 = pool.num_free_pages
+        self._step(pool, 8)
+        self._step(pool, 8)
+        view = pool.view(Segment("r", "main", 0))
+        assert view.start == 0 and view.length == 16
+        assert pool.num_free_pages == free0 - 2
+
+        self._step(pool, 8)
+        view = pool.view(Segment("r", "main", 0))
+        assert view.start == 8 and view.length == 16
+        assert pool.num_free_pages == free0 - 2
+        state = manager.get_state("r", "main")
+        assert state.seq_len == 24
+        assert pool.positions("r", "main") == 24
+
+    def test_release_is_page_granular(self):
+        pool, _ = self._stream(budget=12)
+        for _ in range(3):
+            self._step(pool, 5)
+        assert pool.view(Segment("r", "main", 0)).start == 0
+        self._step(pool, 5)
+        view = pool.view(Segment("r", "main", 0))
+        assert view.start == 8 and view.length == 12
+
+    def test_admit_sizes_from_the_physical_remainder(self):
+        pool, manager = self._stream(budget=16)
+        for _ in range(6):
+            self._step(pool, 8)
+        state = manager.get_state("r", "main")
+        assert len(state.page_indices) == 2
+        assert pool.view(Segment("r", "main", 0)).length == 16
+
+        pool.admit(Segment("r", "main", 8))
+        assert len(state.page_indices) == 3
+
+    def test_unconfigured_stream_is_untouched(self):
+        pool, _ = _make_pool()
+        pool.add_request("r", ["main"])
+        for _ in range(4):
+            self._step(pool, 8)
+        view = pool.view(Segment("r", "main", 0))
+        assert view.start == 0 and view.length == 32
+
+    def test_remove_request_clears_retention_state(self):
+        pool, _ = self._stream(budget=16)
+        total = pool.num_free_pages
+        for _ in range(4):
+            self._step(pool, 8)
+        pool.remove_request("r")
+        assert pool.num_free_pages == total
+        assert pool._retention == {} and pool._released == {}
 
 
 if __name__ == "__main__":

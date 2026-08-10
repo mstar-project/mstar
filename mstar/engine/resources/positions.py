@@ -83,3 +83,27 @@ class RopeEmbedder:
                 **llama31_params,
             )
         return q.to(orig_dtype), k.to(orig_dtype)
+
+
+class BlockRopeEmbedder(RopeEmbedder):
+    """Block positional scheme: every token of a segment shares the
+    stream's current position, and the counter advances by ``step`` per
+    non-empty segment regardless of span. This is the image-block shape,
+    where a block of N tokens occupies one position: the positions a step
+    consumes differ from the tokens it carries. ``apply`` is inherited
+    unchanged; only the identifiers and the advance rule differ."""
+
+    def __init__(self, step: int = 1):
+        self.step = step
+
+    def plan(self, segments: list[Segment], pool: KVCachePool) -> PositionPlan:
+        pos_ids: list[int] = []
+        advance: list[int] = []
+        for segment in segments:
+            start = pool.positions(segment.request_id, segment.label)
+            pos_ids.extend([start] * segment.span)
+            advance.append(self.step if segment.span else 0)
+        return PositionPlan(
+            pos_ids=torch.tensor(pos_ids, dtype=torch.long),
+            advance=tuple(advance),
+        )
