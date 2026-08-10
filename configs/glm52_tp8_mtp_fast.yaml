@@ -10,7 +10,10 @@ model_kwargs:
   checkpoint_path: /m-coriander/coriander/hf/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541
   tokenizer_mode: hf
   moe_quant_kernel: triton
-  mtp_num_draft_tokens: 5
+  # k=2 is the measured optimum (49.65 tok/s; k=1 47.95, k=3 47.99 on the
+  # 08-09/10 sweep). m3-sweep2.sh seds this line for per-k copies, so the
+  # sweep is unaffected; this default is what a direct launch gets.
+  mtp_num_draft_tokens: 2
 kv_cache:
   max_num_pages: 512
   page_size: 128
