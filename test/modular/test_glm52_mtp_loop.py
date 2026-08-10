@@ -479,15 +479,20 @@ def test_mtp_acceptance_log_per_position(caplog):
     import logging as _logging
 
     k = 3
-    ns = SimpleNamespace(
-        config=SimpleNamespace(mtp_num_draft_tokens=k),
-        _MTP_STAT_LOG_EVERY=Glm52LLMSubmodule._MTP_STAT_LOG_EVERY,
-        _mtp_stat_steps=512,
-        _mtp_stat_logged=0,
-        # 512 steps halving at each position: reached = [512, 256, 128, 64].
-        _mtp_stat_acc_hist=[256, 128, 64, 64],
-        _mtp_stat_emitted=256 * 1 + 128 * 2 + 64 * 3 + 64 * 4,
-    )
+
+    def _ns(pair_postnorm: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            config=SimpleNamespace(mtp_num_draft_tokens=k),
+            _MTP_STAT_LOG_EVERY=Glm52LLMSubmodule._MTP_STAT_LOG_EVERY,
+            _mtp_stat_steps=512,
+            _mtp_stat_logged=0,
+            # 512 steps halving at each position: reached = [512, 256, 128, 64].
+            _mtp_stat_acc_hist=[256, 128, 64, 64],
+            _mtp_stat_emitted=256 * 1 + 128 * 2 + 64 * 3 + 64 * 4,
+            _mtp_pair_postnorm=pair_postnorm,
+        )
+
+    ns = _ns(False)
     with caplog.at_level(
         _logging.INFO, logger="mstar.model.glm52.submodules",
     ):
@@ -498,3 +503,17 @@ def test_mtp_acceptance_log_per_position(caplog):
     assert "[256, 128, 64, 64]" in pos_line
     assert "0.50 0.50 0.50" in pos_line
     assert ns._mtp_stat_logged == 512
+    # The line must name which trunk-pairing arm produced it. An acceptance
+    # profile whose arm you infer from launch env is one you cannot trust
+    # after the fact — and mislabelling an arm silently inverts the A/B.
+    assert "pre-final-norm" in pos_line and "POST" not in pos_line
+
+    caplog.clear()
+    with caplog.at_level(
+        _logging.INFO, logger="mstar.model.glm52.submodules",
+    ):
+        Glm52LLMSubmodule._maybe_log_mtp_acceptance(_ns(True))
+    (post_line,) = [
+        r.getMessage() for r in caplog.records if "by position" in r.getMessage()
+    ]
+    assert "POST-final-norm" in post_line

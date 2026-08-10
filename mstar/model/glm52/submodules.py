@@ -96,6 +96,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_emitted: dict[str, int] = {}
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
+        # Which trunk stream the MTP plane pairs drafts against — see
+        # ``_mtp_pair_rows``. Default keeps today's pre-final-norm behaviour;
+        # MSTAR_GLM52_MTP_PAIR_POSTNORM=1 selects vLLM's convention for the A/B.
+        self._mtp_pair_postnorm = (
+            os.environ.get("MSTAR_GLM52_MTP_PAIR_POSTNORM", "0") == "1"
+        )
         # One-shot flag: warn the first time an MTP decode trunk runs eager
         # (no captured piecewise bucket) — the 2026-08-09 bench showed that
         # regression is 13x and silence lets it masquerade as "MTP is slow".
@@ -557,6 +563,41 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             ) if long_context else None,
         }
 
+    def _mtp_pair_rows(
+        self, normed: torch.Tensor, prenorm: torch.Tensor
+    ) -> torch.Tensor:
+        """The trunk stream the MTP plane pairs drafts against — an OPEN
+        question, env-switchable so the box can settle it in one A/B.
+
+        ``hnorm`` is a learned RMSNorm over the trunk hidden, so feeding it the
+        wrong stream is a systematic distribution shift that depresses every
+        draft position. Two candidate conventions:
+
+        - **pre-final-norm** (default today, commit 49315a44) — the raw
+          residual stream out of layer 77, before ``model.norm``.
+        - **post-final-norm** (``MSTAR_GLM52_MTP_PAIR_POSTNORM=1``) — what
+          vLLM feeds its drafter.
+
+        Why this is open rather than settled [2026-08-10]: 49315a44 switched to
+        pre-norm citing 0.00 acceptance for post-norm over 3584 request-steps —
+        but the very next commit, 474a95e9, identifies the 0.00-acceptance ROOT
+        CAUSE as the TP fast read plan never loading the MTP layer, i.e.
+        drafting from uninitialized weights (``Glm52ForCausalLM.load_weights``
+        now refuses to serve on exactly that condition). The post-norm arm was
+        never re-measured against loaded weights, so its only evidence is
+        explained by a different bug.
+
+        Meanwhile vLLM, on the identical checkpoint and the same single layer,
+        scores p1=0.866 / p2=0.614 against M*'s 0.77 / 0.34, and it pairs
+        POST-final-norm: ``GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM)``, whose
+        ``forward`` returns ``self.norm(...)`` (``deepseek_v2.py:1339``), and it
+        does not implement the ``get_mtp_target_hidden_states`` override that
+        would swap in a pre-norm residual (DeepSeek-V4 only). Note the CHAIN
+        convention already matches vLLM — both thread the raw pre-shared_head
+        block output — so the trunk pairing is the sole divergence.
+        """
+        return normed if self._mtp_pair_postnorm else prenorm
+
     def _hidden(
         self,
         input_ids: torch.Tensor,
@@ -690,10 +731,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 self._mtp_emitted[rid] = 1
                 sync_tokens.append(torch.cat(
                     [input_ids[r][1:], new_tokens[i:i + 1]]))
-                # Pair with the RAW (pre-final-norm) trunk stream — hnorm
-                # is the learned norm for it (post-norm pairing measured
-                # 0.00 acceptance on the real checkpoint).
-                pair_hiddens.append(prenorm[r])
+                pair_hiddens.append(self._mtp_pair_rows(hidden, prenorm)[r])
             drafts = self._mtp_sync_and_draft(
                 cache_handle, sync_tokens, pair_hiddens,
                 draft_runner=kwargs.get("mtp_draft_runner"))
@@ -768,8 +806,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # processed.
             rewinds.append(m - e)
             sync_tokens.append(emitted)
-            # RAW trunk rows for the MTP pairing (see prefill branch).
-            pair_hiddens.append(prenorm[r][:e])
+            pair_hiddens.append(self._mtp_pair_rows(hidden, prenorm)[r][:e])
             results[rid] = {"new_token": [emitted]}
         self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
@@ -936,10 +973,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             f"{reached[i] / reached[i - 1]:.2f}" if reached[i - 1] else "-"
             for i in range(1, k + 1)
         ]
+        # The pairing convention rides along with the numbers on purpose: this
+        # profile is the A/B's readout, and a profile whose arm you have to
+        # infer from launch env is a profile you cannot trust six hours later.
         logger.info(
             "MTP acceptance by position: n_acc histogram %s, conditional "
-            "accept per position %s",
+            "accept per position %s [trunk pairing: %s]",
             self._mtp_stat_acc_hist, " ".join(cond),
+            "POST-final-norm (vLLM convention)" if self._mtp_pair_postnorm
+            else "pre-final-norm (default)",
         )
 
     @staticmethod
