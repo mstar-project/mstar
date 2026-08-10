@@ -91,7 +91,7 @@ class StepRunner:
         for from_label, to_label in declaration.pre_forks:
             cache_manager.snapshot_all(from_label, to_label)
         for plan in declaration.plans:
-            if len(plan.labels) > 1:
+            if plan.combined:
                 seq_lens = {
                     label: list(plan.spans[label]) for label in plan.labels
                 }

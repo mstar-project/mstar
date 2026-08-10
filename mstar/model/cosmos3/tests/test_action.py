@@ -29,6 +29,7 @@ from mstar.model.cosmos3.components.packing import (
 )
 from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
 from mstar.model.cosmos3.config import Cosmos3Config
+from mstar.model.cosmos3.tests.test_engine_cache import _forward_step
 
 
 # --- verbatim vllm-omni references (transformer_cosmos3.py / action.py) ------
@@ -73,37 +74,34 @@ def _cfg() -> Cosmos3Config:
 
 
 class _SdpaCache:
-    """In-process cache-once handle (stored K/V + sdpa), the BatchedCacheManager
-    surface the DiT uses. Prefill stashes the understanding K/V; the denoise step
-    re-reads it. Also models the batched-CFG plan: under the combined label the
-    packed sequence is split into one block per batched label, each routed to its
-    own committed prefix (so a single-label batch of one request equals the plain
-    single-request path)."""
+    """In-process cache-once handle (stored K/V + sdpa) with the step-surface
+    calls the DiT uses. Prefill stashes the understanding K/V; the denoise
+    step re-reads it. Declared plans land on ``plan_attention*``; the
+    runner's commit lands on the pool surface (``kv_pool.commit``), which
+    promotes the pending K/V to committed. Also models the batched-CFG
+    plan: under the combined key the packed sequence is split into one
+    block per batched label, each routed to its own committed prefix (so a
+    single-label batch of one request equals the plain single-request
+    path)."""
 
-    def __init__(self):
-        self.active, self.layer = "main", 0
+    is_captured = False
+
+    def __init__(self, request_ids=("r0",)):
+        self.request_ids = list(request_ids)
+        self.kv_pool = self
         self.committed, self.pending, self.is_causal = {}, {}, {}
         self.batched_labels = None
 
-    def set_active_label(self, label):
-        self.active = label
-
-    def set_layer_idx(self, i):
-        self.layer = i
-
-    def plan(self, is_causal):
-        self.is_causal[self.active] = is_causal
-
-    # Engine-facing surface (used when the DiT submodule drives the cache).
     def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None, **kwargs):
-        self.is_causal[label or self.active] = is_causal
+        self.is_causal[label] = is_causal
 
     def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
         self.batched_labels = list(labels)
         self.is_causal["_cfg_batched"] = is_causal
 
-    def plan_rope(self, *a, **k):
-        pass
+    def commit(self, segment=None, pos_advance=None):
+        self.committed.update(self.pending)
+        self.pending = {}
 
     @staticmethod
     def _sdpa(q, k, v, c):
@@ -120,21 +118,16 @@ class _SdpaCache:
         self.pending[key] = (k, v)
         return self._sdpa(q, k, v, causal)
 
-    def run_attention(self, q, k, v, layer_idx=None):
-        layer = self.layer if layer_idx is None else layer_idx
-        if self.active == "_cfg_batched":
+    def run_attention(self, q, k, v, layer_idx=None, label=None):
+        if label == "_cfg_batched":
             causal = self.is_causal["_cfg_batched"]
             n = q.shape[0] // len(self.batched_labels)
             outs = []
-            for bi, label in enumerate(self.batched_labels):
+            for bi, blabel in enumerate(self.batched_labels):
                 sl = slice(bi * n, (bi + 1) * n)
-                outs.append(self._attend_label(label, layer, q[sl], k[sl], v[sl], causal))
+                outs.append(self._attend_label(blabel, layer_idx, q[sl], k[sl], v[sl], causal))
             return torch.cat(outs, 0)
-        return self._attend_label(self.active, layer, q, k, v, self.is_causal[self.active])
-
-    def advance_seq_lens(self, pos_id_ns=None):
-        self.committed.update(self.pending)
-        self.pending = {}
+        return self._attend_label(label, layer_idx, q, k, v, self.is_causal[label])
 
 
 _MODES = ("inverse_dynamics", "forward_dynamics", "policy")
@@ -234,18 +227,15 @@ def test_action_denoise_step_matches_fused() -> None:
         )
         cache = _SdpaCache()
         und_len = s["und_len"]
-        cache.set_active_label("main")
-        cache.plan(is_causal=True)
-        _cos, _sin = model._rotary(
-            s["text_mrope_ids"], s["input_ids"].device, model.embed_tokens.weight.dtype
-        )
-        model.prefill_und(s["input_ids"], _cos, _sin, cache)
-        cache.plan(is_causal=False)
+        cache.plan_attention(label="main", is_causal=True)
+        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache, "main")
+        cache.commit()
+        cache.plan_attention(label="main", is_causal=False)
         with torch.no_grad():
             dv, da = model.denoise_step(
                 latents, vts, s["position_ids"][:, und_len:],
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
-                s["vision_mse_loss_indexes"] - und_len, cache,
+                s["vision_mse_loss_indexes"] - und_len, cache, "main",
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
                 action_noisy_frame_indexes=s["action_noisy_frame_indexes"],
                 action_mse_gen_indexes=s["action_mse_loss_indexes"] - und_len,
@@ -273,18 +263,15 @@ def test_action_batched_one_matches_single() -> None:
         und_len = s["und_len"]
         # Reference: the single-request joint denoise step.
         cache = _SdpaCache()
-        cache.set_active_label("main")
-        cache.plan(is_causal=True)
-        _cos, _sin = model._rotary(
-            s["text_mrope_ids"], s["input_ids"].device, model.embed_tokens.weight.dtype
-        )
-        model.prefill_und(s["input_ids"], _cos, _sin, cache)
-        cache.plan(is_causal=False)
+        cache.plan_attention(label="main", is_causal=True)
+        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache, "main")
+        cache.commit()
+        cache.plan_attention(label="main", is_causal=False)
         with torch.no_grad():
             dv, da = model.denoise_step(
                 latents, vts, s["position_ids"][:, und_len:],
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
-                s["vision_mse_loss_indexes"] - und_len, cache,
+                s["vision_mse_loss_indexes"] - und_len, cache, "main",
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
                 action_noisy_frame_indexes=s["action_noisy_frame_indexes"],
                 action_mse_gen_indexes=s["action_mse_loss_indexes"] - und_len,
@@ -292,18 +279,14 @@ def test_action_batched_one_matches_single() -> None:
             )
         # Batched path with one request and no guidance (single-label batch).
         cache2 = _SdpaCache()
-        cache2.set_active_label("main")
-        cache2.plan(is_causal=True)
-        _cos, _sin = model._rotary(
-            s["text_mrope_ids"], s["input_ids"].device, model.embed_tokens.weight.dtype
-        )
-        model.prefill_und(s["input_ids"], _cos, _sin, cache2)
+        cache2.plan_attention(label="main", is_causal=True)
+        model.prefill_und(s["input_ids"], s["text_mrope_ids"], cache2, "main")
+        cache2.commit()
         cache2.plan_attention_batched_cfg(
             labels=["main"],
             seq_lens=[s["num_vision_tokens"] + s["num_action_tokens"]],
             is_causal=False,
         )
-        cache2.set_active_label("_cfg_batched")
         req = {
             "latents": latents, "action_latents": action_lat,
             "vision_timesteps": vts, "action_timesteps": ats,
@@ -317,7 +300,9 @@ def test_action_batched_one_matches_single() -> None:
             "action_domain_id": domain,
         }
         with torch.no_grad():
-            ((bv, ba),), = model.denoise_step_action_batched([req], cache2, with_cfg=False)
+            ((bv, ba),), = model.denoise_step_action_batched(
+                [req], cache2, "_cfg_batched", with_cfg=False
+            )
         assert (dv - bv).abs().max().item() < 1e-5, mode
         assert (da - ba).abs().max().item() < 1e-5, mode
 
@@ -430,14 +415,14 @@ def test_action_engine_matches_fused() -> None:
     cm = _SdpaCache()
     ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
-    dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+    _forward_step(dit, "prefill", ei, [ni])
     fwd.graph_walk = "action_gen"
     latents, action_latents = cond_latent.clone(), a_noise.clone()
     time_index = torch.zeros(1, dtype=torch.long, device=device)
     for _ in range(steps):
         ni = dit.prepare_inputs("action_gen", fwd, {
             "latents": [latents], "action_latents": [action_latents], "time_index": [time_index]})
-        out = dit.forward("action_gen", ei, **dit.preprocess("action_gen", ei, [ni]))
+        out = _forward_step(dit, "action_gen", ei, [ni])
         latents, action_latents, time_index = out["latents"][0], out["action_latents"][0], out["time_index"][0]
     dit.cleanup_request(rid)
     # The loop emits the full action latents (self-edge); trim to the raw action
@@ -616,7 +601,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
         ni = dit.prepare_inputs("prefill", fwd, {
             "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],
         })
-        dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+        _forward_step(dit, "prefill", ei, [ni])
         fwd.graph_walk = "action_gen"
         if rid not in cond_lat:
             cond_lat[rid] = _encode(rid)
@@ -632,7 +617,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
             inp = ({"cond_latents": [cond_lat[rid]]} if lat is None
                    else {"latents": [lat], "action_latents": [act], "time_index": [ti]})
             ni = dit.prepare_inputs("action_gen", fwd, inp)
-            out = dit.forward("action_gen", ei, **dit.preprocess("action_gen", ei, [ni]))
+            out = _forward_step(dit, "action_gen", ei, [ni])
             lat, act, ti = out["latents"][0], out["action_latents"][0], out["time_index"][0]
         dit.cleanup_request(rid)
         return act[:, :, :raw].float().cpu()
@@ -653,7 +638,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
                 inp = {"cond_latents": [cond_lat[rid]]} if lat[rid] is None else {
                     "latents": [lat[rid]], "action_latents": [act[rid]], "time_index": [ti[rid]]}
                 inputs.append(dit.prepare_inputs("action_gen", fwds[rid], inp))
-            out = dit.forward_batched("action_gen", eiN, **dit.preprocess("action_gen", eiN, inputs))
+            out = _forward_step(dit, "action_gen", eiN, inputs, batched=True)
             for rid in rids:
                 o = out[rid]
                 lat[rid], act[rid], ti[rid] = o["latents"][0], o["action_latents"][0], o["time_index"][0]

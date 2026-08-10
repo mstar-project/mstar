@@ -41,33 +41,32 @@ VIDEO_FRAMES = 17  # latent T = 1 + (17 - 1) // 4 = 5
 
 
 class _SdpaCacheHandle:
-    """In-process reference cache with the ``BatchedCacheManager`` surface the
-    DiT uses, backed by stored tensors + sdpa (same kernel as the fused pipeline).
-    Prefill stashes each layer's understanding K/V; every denoise step re-reads it.
+    """In-process reference cache with the step-surface calls the DiT uses,
+    backed by stored tensors + sdpa (same kernel as the fused pipeline).
+    Prefill stashes each layer's understanding K/V; every denoise step
+    re-reads it. Declared plans land on ``plan_attention*``; the runner's
+    commit lands on the pool surface (``kv_pool.commit``), which promotes
+    the prefill's pending K/V to committed.
 
-    Also models the batched classifier-free-guidance plan: when both guidance
-    branches run in one forward, ``run_attention`` receives the two branches
-    concatenated and routes each half to its own label's cached prefix, so the
-    batched result equals running the branches sequentially.
+    Also models the batched classifier-free-guidance plan: under the
+    combined key ``run_attention`` receives the branches concatenated and
+    routes each block to its own label's cached prefix, so the batched
+    result equals running the branches sequentially.
     """
 
-    def __init__(self):
-        self.active = "main"
-        self.layer = 0
+    is_captured = False
+
+    def __init__(self, request_ids=("r0",)):
+        self.request_ids = list(request_ids)
+        self.kv_pool = self
         self.committed: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.pending: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self.is_causal: dict[str, bool] = {}
         self.batched_labels: list[str] | None = None
         self.batched_splits: list[int] | None = None
 
-    def set_active_label(self, label):
-        self.active = label
-
-    def set_layer_idx(self, i):
-        self.layer = i
-
     def plan_attention(self, seq_lens=None, dtype=None, is_causal=True, write_store=True, label=None, **kwargs):
-        self.is_causal[label or self.active] = is_causal
+        self.is_causal[label] = is_causal
 
     def plan_attention_batched_cfg(self, labels, seq_lens, is_causal=False, write_store=False, **kwargs):
         self.batched_labels = list(labels)
@@ -81,8 +80,9 @@ class _SdpaCacheHandle:
         else:
             self.batched_splits = [int(sum(seq_lens))] * len(labels)
 
-    def plan_rope(self, *args, **kwargs):
-        pass
+    def commit(self, segment=None, pos_advance=None):
+        self.committed.update(self.pending)
+        self.pending = {}
 
     @staticmethod
     def _sdpa(q, k, v, is_causal):
@@ -100,21 +100,33 @@ class _SdpaCacheHandle:
         self.pending[key] = (k, v)
         return self._sdpa(q, k, v, causal)
 
-    def run_attention(self, q, k, v, layer_idx=None):
-        layer = self.layer if layer_idx is None else layer_idx
-        if self.active == "_cfg_batched":
+    def run_attention(self, q, k, v, layer_idx=None, label=None):
+        if label == "_cfg_batched":
             causal = self.is_causal["_cfg_batched"]
             outs, off = [], 0
-            for bi, label in enumerate(self.batched_labels):
+            for bi, blabel in enumerate(self.batched_labels):
                 sl = slice(off, off + self.batched_splits[bi])
                 off += self.batched_splits[bi]
-                outs.append(self._attend_label(label, layer, q[sl], k[sl], v[sl], causal))
+                outs.append(self._attend_label(blabel, layer_idx, q[sl], k[sl], v[sl], causal))
             return torch.cat(outs, 0)
-        return self._attend_label(self.active, layer, q, k, v, self.is_causal[self.active])
+        return self._attend_label(label, layer_idx, q, k, v, self.is_causal[label])
 
-    def advance_seq_lens(self, pos_id_ns=None):
-        self.committed.update(self.pending)
-        self.pending = {}
+
+def _forward_step(dit, walk, ei, inputs, batched=False):
+    """Drive one step the way the engine does: declaration, plans, data
+    preprocess, forward, commit."""
+    from mstar.engine.resources.step import StepRunner
+
+    runner = StepRunner()
+    declaration = dit.declare_step(walk, ei, inputs)
+    if declaration is not None:
+        runner.drive(declaration, ei.cache_manager)
+    pre = dit.preprocess(walk, ei, inputs)
+    forward = dit.forward_batched if batched else dit.forward
+    out = forward(walk, ei, **pre)
+    if declaration is not None:
+        runner.commit(declaration, ei.cache_manager)
+    return out
 
 
 def _flashinfer_cache(model, rid, device, dtype, backend=None):
@@ -159,14 +171,14 @@ def _run_cache_once(model, dit, cm, init, cond_ids, uncond_ids, device, num_fram
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+    _forward_step(dit, "prefill", ei, [ni])
 
     latents = init.clone()
     time_index = torch.zeros(1, dtype=torch.long, device=device)
     fwd.graph_walk = "image_gen"
     for _ in range(STEPS):
         ni = dit.prepare_inputs("image_gen", fwd, {"latents": [latents], "time_index": [time_index]})
-        out = dit.forward("image_gen", ei, **dit.preprocess("image_gen", ei, [ni]))
+        out = _forward_step(dit, "image_gen", ei, [ni])
         latents, time_index = out["latents"][0], out["time_index"][0]
     dit.cleanup_request(rid)
     return latents
@@ -226,7 +238,7 @@ def _run_batched(model, dit, shared, init, conds, unconds, device, rids):
         ti = [torch.tensor(conds[i], dtype=torch.long, device=device),
               torch.tensor(unconds[i], dtype=torch.long, device=device)]
         ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": ti})
-        dit.forward("prefill", ei1, **dit.preprocess("prefill", ei1, [ni]))
+        _forward_step(dit, "prefill", ei1, [ni])
 
     cmN = _mk_cm(shared, rids)
     eiN = ModelInputsFromEngine(request_ids=rids, per_request_info=fwds, cache_manager=cmN)
@@ -240,7 +252,7 @@ def _run_batched(model, dit, shared, init, conds, unconds, device, rids):
                                {"latents": [latents[rid]], "time_index": [time_index[rid]]})
             for rid in rids
         ]
-        out = dit.forward_batched("image_gen", eiN, **dit.preprocess("image_gen", eiN, inputs))
+        out = _forward_step(dit, "image_gen", eiN, inputs, batched=True)
         for rid in rids:
             latents[rid], time_index[rid] = out[rid]["latents"][0], out[rid]["time_index"][0]
     for rid in rids:
@@ -645,7 +657,7 @@ def _run_cuda_graph_denoise(ctx):
     ti = [torch.tensor(ctx["cond"], dtype=torch.long, device=device),
           torch.tensor(ctx["uncond"], dtype=torch.long, device=device)]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": ti})
-    dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+    _forward_step(dit, "prefill", ei, [ni])
 
     runner = CudaGraphRunner(
         submodule_name="dit", submodule=dit, kv_cache_config=shared["cfg"],

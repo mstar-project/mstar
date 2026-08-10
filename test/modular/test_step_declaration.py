@@ -99,7 +99,7 @@ class TestDeclarationTypes:
     def test_defaults(self):
         plan = PlanSpec(labels=("main",), spans={"main": (2, 3)})
         assert plan.is_causal and plan.write_store and plan.commit
-        assert not plan.dense_gen and not plan.rope
+        assert not plan.dense_gen and not plan.rope and not plan.combined
         assert plan.pos_advance is None
         decl = StepDeclaration(plans=(plan,))
         assert decl.pre_forks == () and decl.post_forks == ()
@@ -135,6 +135,7 @@ class TestDrive:
                     is_causal=False, write_store=False,
                     dense_gen=True, rope=True,
                     rope_pos_ids={"main": []},
+                    combined=True,
                 ),
             ),
             pre_forks=(("main", "cfg_text"),),
@@ -173,6 +174,18 @@ class TestDrive:
         ))
         StepRunner().drive(decl, cm)
         assert [c[0] for c in cm.calls] == ["plan_attention"]
+
+    def test_single_label_combined_plan_batches(self):
+        cm = _RecordingManager(["r0"])
+        decl = StepDeclaration(plans=(
+            PlanSpec(
+                labels=("main",), spans={"main": (6,)}, combined=True,
+                is_causal=False, write_store=False,
+            ),
+        ))
+        StepRunner().drive(decl, cm)
+        assert [c[0] for c in cm.calls] == ["plan_attention_batched_cfg"]
+        assert cm.calls[0][1]["labels"] == ["main"]
 
 
 class TestCommit:

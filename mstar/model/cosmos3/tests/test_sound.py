@@ -26,6 +26,7 @@ from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
 from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _flashinfer_cache,
+    _forward_step,
     _load,
     _SdpaCacheHandle,
 )
@@ -252,7 +253,7 @@ def _run_cache_once_sound(model, dit, cm, init, sound_init, cond_ids, uncond_ids
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+    _forward_step(dit, "prefill", ei, [ni])
 
     latents, sound_latents = init.clone(), sound_init.clone()
     time_index = torch.zeros(1, dtype=torch.long, device=device)
@@ -261,7 +262,7 @@ def _run_cache_once_sound(model, dit, cm, init, sound_init, cond_ids, uncond_ids
         ni = dit.prepare_inputs(VIDEO_SOUND_GEN_WALK, fwd, {
             "latents": [latents], "sound_latents": [sound_latents], "time_index": [time_index],
         })
-        out = dit.forward(VIDEO_SOUND_GEN_WALK, ei, **dit.preprocess(VIDEO_SOUND_GEN_WALK, ei, [ni]))
+        out = _forward_step(dit, VIDEO_SOUND_GEN_WALK, ei, [ni])
         latents = out["latents"][0]
         sound_latents = out["sound_latents"][0]
         time_index = out["time_index"][0]

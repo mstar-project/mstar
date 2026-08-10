@@ -16,15 +16,17 @@ import torch
 class PlanSpec:
     """One attention (and optional rope) plan of a declared step.
 
-    ``labels`` with a single entry plans that label alone; more than one
-    entry plans a single combined batch across them, label-major, under
-    ``combined_key``. ``spans`` gives each label's per-request token
-    counts in batch order. ``rope_pos_ids`` optionally supplies explicit
-    position ids (a tensor for a single label, a per-label list dict for
-    a combined plan); None lets the embedder build them from the pool's
-    counters. ``commit`` says whether the step's spans become part of the
-    streams' history; ``pos_advance`` overrides the per-request position
-    advance when it differs from the span.
+    A plain plan (``combined`` False) covers exactly one label. A combined
+    plan batches every (label, request) pair label-major into one plan
+    under ``combined_key``; it may carry a single label (a batched forward
+    whose guidance branch is off still runs against the combined key).
+    ``spans`` gives each label's per-request token counts in batch order.
+    ``rope_pos_ids`` optionally supplies explicit position ids (a tensor
+    for a plain plan, a per-label list dict for a combined one); None lets
+    the embedder build them from the pool's counters. ``commit`` says
+    whether the step's spans become part of the streams' history;
+    ``pos_advance`` overrides the per-request position advance when it
+    differs from the span.
     """
     labels: tuple[str, ...]
     spans: dict[str, tuple[int, ...]]
@@ -33,6 +35,7 @@ class PlanSpec:
     dense_gen: bool = False
     rope: bool = False
     rope_pos_ids: "dict[str, list[torch.Tensor]] | torch.Tensor | None" = None
+    combined: bool = False
     combined_key: str = "_cfg_batched"
     commit: bool = True
     pos_advance: tuple[int, ...] | None = None
