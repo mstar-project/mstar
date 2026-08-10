@@ -37,7 +37,7 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.base import EngineType
 from mstar.engine.kv_cache_engine import KVCacheConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.submodule_base import NodeSubmodule
@@ -230,18 +230,36 @@ class Glm52Model(Model):
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        prefill_outputs = [
+            GraphEdge(
+                next_node=EMIT_TO_CLIENT,
+                name="new_token",
+                output_modality="text",
+                conductor_new_token=True,
+                persist=True,
+            ),
+        ]
+        if self.config.mtp_num_draft_tokens > 0:
+            # M3: the MTP prefill's forward also returns "text_inputs" =
+            # [emitted token, k drafts]. Without a declared edge the worker
+            # drops it (undeclared outputs are unrouted), the prefill's whole
+            # sync+draft pass is wasted, and the first decode step runs
+            # unspeculated at m=1 — which also pollutes the acceptance
+            # histogram with one artificial n_acc=0 per request. Persisted
+            # (not emitted) so the prefill→decode transition can seed the
+            # decode loop with it, exactly the qwen3_tts talker_input_embeds
+            # pattern. Gated on k>0 so the k=0 walk stays byte-identical.
+            prefill_outputs.append(
+                GraphEdge(
+                    next_node=EMPTY_DESTINATION,
+                    name="text_inputs",
+                    persist=True,
+                )
+            )
         prefill = GraphNode(
             name="LLM",
             input_names=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="new_token",
-                    output_modality="text",
-                    conductor_new_token=True,
-                    persist=True,
-                ),
-            ],
+            outputs=prefill_outputs,
         )
 
         decode = Loop(
@@ -261,7 +279,14 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # Runaway guard only — the per-request budget lives in
+            # check_stop (which sees the request's real max_tokens). Capping
+            # here at the startup default (1024) silently truncated any
+            # larger requested budget: the decode edge carries no
+            # conductor_new_token, so the conductor's own max-token stop
+            # never fires for this model. max_seq_len iterations always hits
+            # the context-window refusal first.
+            max_iters=self.config.max_seq_len,
             outputs=[],
         )
 
@@ -326,9 +351,20 @@ class Glm52Model(Model):
             )
 
         graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
+        # M3: an MTP prefill persisted "text_inputs" = [emitted, k drafts];
+        # seeding decode with it makes the first decode step a speculated
+        # (k+1)-row step like every other. k=0 persists no such signal and
+        # seeds from new_token exactly as before.
+        drafts = persist_signals.get("text_inputs", [])
+        if drafts:
+            graph_edge.tensor_info = drafts
+            # new_token was persisted too (for the client emission); consume
+            # it alongside so no per-request tensor outlives the transition.
+            unpersist_tensors = list(drafts) + persist_signals.get("new_token", [])
+        else:
+            graph_edge.tensor_info = persist_signals.get("new_token", [])
+            unpersist_tensors = list(graph_edge.tensor_info)
         inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
 
         return ForwardPassArgs(
             full_metadata=metadata,
@@ -382,6 +418,13 @@ class Glm52Model(Model):
             k: model_kwargs.get(k, getattr(self.config, k))
             for k in keys
         }
+        if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
+            # MTP v1 is greedy-only, so greedy is the DECLARED default on MTP
+            # configs: a bare request (no temperature) serves coherently
+            # instead of inheriting config temperature=1.0 and being refused
+            # by prepare_inputs. An EXPLICIT temperature>0 still refuses —
+            # silently ignoring an ask is the failure mode, defaulting isn't.
+            params["temperature"] = 0.0
         return SamplingConfig(
             vocab_size=self.config.vocab_size,
             **params,
