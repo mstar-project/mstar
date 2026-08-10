@@ -21,6 +21,14 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Page index the padded tail of every captured KV scatter aims at. The
+# captured set_kv_cache/set_latent scatters write the FULL capture-bucket
+# row count on every replay; when the real batch is smaller, the plan
+# points the tail rows at (NULL_PAGE_IDX, 0). The paged allocators withhold
+# this page from circulation (PageAllocator(reserve_null_page=True)) so
+# the garbage never lands in a live request's KV.
+NULL_PAGE_IDX = 0
+
 
 @torch.compiler.disable
 def run_rms_norm(
@@ -251,7 +259,10 @@ class FlashInferPrefillWrapper:
             self.token_to_page[:total_tokens].copy_(token_to_page)
             self.token_to_cache[:total_tokens].copy_(token_to_cache)
             if total_tokens < self.max_total_tokens:
-                self.token_to_page[total_tokens:] = 0
+                # The captured set_kv_cache scatter writes max_total_tokens
+                # rows every replay; the tail must aim at the reserved null
+                # page or it stomps slot 0 of a live request's page.
+                self.token_to_page[total_tokens:] = NULL_PAGE_IDX
                 self.token_to_cache[total_tokens:] = 0
         else:
             self.token_to_page = token_to_page
@@ -628,7 +639,11 @@ class FlashInferMLAWrapper:
             self.token_to_page[:total_tokens].copy_(token_to_page)
             self.token_to_cache[:total_tokens].copy_(token_to_cache)
             if total_tokens < self.max_total_tokens:
-                self.token_to_page[total_tokens:] = 0
+                # The captured set_latent scatter writes max_total_tokens
+                # rows every replay; the tail must aim at the reserved null
+                # page or every padded replay stomps slot 0 of a live
+                # request's page across all layer planes.
+                self.token_to_page[total_tokens:] = NULL_PAGE_IDX
                 self.token_to_cache[total_tokens:] = 0
         else:
             self.token_to_page = token_to_page
