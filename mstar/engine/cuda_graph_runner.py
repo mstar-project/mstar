@@ -2708,18 +2708,28 @@ class PiecewiseCudaGraphRunner:
         )
         plan_states: dict = {}
         for label in self.cache_labels:
-            # ``label`` here is the KV CACHE label ("main" for all three
-            # GLM-5.2 graphs) — it does not distinguish runners. Without
-            # self.label in the key, two labels capturing the same shape share
-            # one workspace, and FlashInfer's plan() writes scheduling state
-            # into it that the captured replay reads back: mtp_sync's plan
-            # silently overwrites what mtp_trunk's captured graph is about to
-            # read (both are (bs, k+1)). The full-graph runner has always
-            # keyed per slot for exactly this reason — see
-            # _create_persistent_wrappers.
-            ns = f"{self.label}_" if self.label else ""
+            # Keyed on (cache label, shape) only, so two piecewise labels of
+            # the same shape — GLM-5.2's mtp_trunk and mtp_sync, both
+            # (bs, k+1) — share one workspace. That is SAFE here and the
+            # sharing is deliberate: WorkspaceBufferManager.get allocates a
+            # full MSTAR_WORKSPACE_BUFFER_MB (512 MiB default) per distinct
+            # key, so discriminating by label would cost +5 buffers /
+            # +2.5 GiB per rank at GLM-5.2's five capture batch sizes.
+            #
+            # Safe because there is no concurrency on this path: run() plans
+            # and replays inside one call on the default stream, and the
+            # step's runners execute strictly in order (trunk -> sync ->
+            # draft). Corrupting a replay needs the interleaving
+            # plan-A, plan-B, replay-A, which cannot occur. The full-graph
+            # runner's per-slot split (_create_persistent_wrappers) is NOT a
+            # precedent for splitting here — its key omits bs/tokens/walk, so
+            # it shares across graphs too, and its comment names the reason
+            # as a concurrent plan(slot B) + replay(slot A) race.
+            #
+            # If piecewise runners ever gain pre-planning or multiple slots,
+            # this key must grow a discriminator before that lands.
             workspace = self.buffer_manager.get(
-                f"{label}_pcgr_{ns}{shape.bs}_{shape.total_tokens}"
+                f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
             )
             if use_mla_kernel:
                 wrapper = FlashInferMLAWrapper(

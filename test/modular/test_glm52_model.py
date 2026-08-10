@@ -177,6 +177,32 @@ def test_glm52_decode_never_reseeds_from_the_prompt_signal(monkeypatch):
         assert "PROMPT" not in res.unpersist_tensors
 
 
+def test_glm52_decode_ignores_a_persisted_bundle_when_the_flag_is_off(monkeypatch):
+    """The READ gate, which is the whole point of gating both halves.
+
+    get_graph_walk_graphs is evaluated independently in the conductor and in
+    every worker, so a split-flag deployment can have a worker persisting a
+    bundle that a conductor with the flag OFF would consume. Gating only the
+    write path is what regressed the "off" arm on 2026-08-10; without this
+    test that lesson is documented but unenforced — reverting the read gate
+    alone leaves the rest of the suite green."""
+    from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
+    monkeypatch.delenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", raising=False)
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"], output_modalities=["text"],
+        graph_walk="prefill", is_prefill=True,
+    )
+    res = _make_model_k(2).get_partition_forward_pass_args(
+        partition_name="default", partition_metadata=metadata,
+        persist_signals={"new_token": ["tok"], MTP_DRAFT_BUNDLE: ["bundle"]},
+    )
+    assert res.inputs[0].tensor_info == ["tok"], (
+        "flag off, but the persisted bundle was consumed anyway — the read "
+        "path is ungated")
+    assert "bundle" not in res.unpersist_tensors
+
+
 def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them(monkeypatch):
     """The prefill->decode handoff must prefer the persisted draft bundle
     over the bare new_token, and must unpersist BOTH so no per-request
@@ -226,10 +252,17 @@ def test_glm52_decode_loop_cap_stays_below_the_context_guard():
     test and pass either way — which is what the first version of this test
     did.)"""
     model = _make_model_k(0)
+    cfg = model.config
     decode = model.get_graph_walk_graphs()["decode"]
-    assert decode.max_iters < model.config.index_topk, (
-        "loop cap can reach the batch-killing context guard")
-    assert decode.max_iters <= model.config.max_seq_len
+    # The guard's bound is whichever limit preprocess actually compares
+    # against — index_topk with DSA off, max_seq_len with it on. Asserting
+    # index_topk unconditionally checks a field the guard does not use under
+    # dsa_long_context, and happens to look right today only because both
+    # default to 2048.
+    guard = cfg.max_seq_len if cfg.dsa_long_context else cfg.index_topk
+    assert decode.max_iters < guard, (
+        f"loop cap {decode.max_iters} can reach the batch-killing context "
+        f"guard at {guard}")
     # check_stop is the only thing enforcing the real per-request budget,
     # because the decode edge carries no conductor_new_token.
     assert not any(e.conductor_new_token for e in decode.section.outputs)

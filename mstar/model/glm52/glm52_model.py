@@ -306,17 +306,26 @@ class Glm52Model(Model):
             # Runaway guard. The per-request budget lives in check_stop,
             # which sees the request's real max_tokens.
             #
-            # KNOWN LIMIT: a requested budget above this cap is silently
-            # truncated, because the decode edge carries no
-            # conductor_new_token so the conductor's own max-token stop never
-            # fires for this model. Do NOT "fix" that by raising the cap to
-            # max_seq_len — tried 2026-08-10 and reverted. The context-window
-            # check in preprocess is BATCH-level and raises; kv_cache_engine
-            # only catches AllocationFailedError, so the escape reaches
+            # KNOWN LIMIT: a requested budget above this cap is truncated,
+            # because the decode edge carries no conductor_new_token so the
+            # conductor's own max-token stop never fires for this model. Do
+            # NOT "fix" that by raising the cap to max_seq_len — tried
+            # 2026-08-10 and reverted. The context-window check in preprocess
+            # is BATCH-level and raises; kv_cache_engine only catches
+            # AllocationFailedError, so the escape reaches
             # _handle_main_loop_error and fails every co-batched request, not
-            # just the long one. Raising the cap converts a silent truncation
-            # into a batch kill. The real fix is a per-request budget signal
-            # on the decode edge.
+            # just the long one. Raising the cap makes that FAR more likely,
+            # though it does not make it impossible today: the guard is
+            # start + sl > limit and start includes the prompt, so a prompt
+            # over ~(limit - max_iters) tokens still trips it mid-decode and
+            # still takes its neighbours down.
+            #
+            # Under MTP the truncation is also acceptance-dependent: a step
+            # emits 1..k+1 tokens, so this cap yields 1024-3072 tokens at
+            # k=2 and a given request's length varies with draft quality.
+            #
+            # The real fix is a per-request budget signal on the decode edge,
+            # plus making the context guard per-request rather than batch-fatal.
             max_iters=self.get_max_output_tokens(),
             outputs=[],
         )

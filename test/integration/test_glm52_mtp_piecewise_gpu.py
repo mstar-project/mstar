@@ -261,12 +261,20 @@ def test_sync_capture_matches_eager_bit_identically():
         f"replay {replay['r0']}")
 
 
-def test_piecewise_graphs_do_not_share_workspace_or_dummy_ids():
-    """Two graphs of the SAME shape must not share FlashInfer workspace or
-    dummy request slots. mtp_trunk and mtp_sync are both (bs, k+1), so they
-    collided on both: plan() writes scheduling state into the workspace that
-    the captured replay reads back, and add_request overwrites the dummy
-    state outright. Asserted structurally because the symptom is silent."""
+def test_piecewise_graphs_do_not_share_dummy_request_slots():
+    """Two graphs of the SAME shape must not share dummy request slots.
+
+    mtp_trunk and mtp_sync are both (bs, k+1), and dummy rids were derived
+    from the shape alone — so both runners addressed one slot in the shared
+    allocator, and ``add_request`` OVERWRITES ``request_states[rid]``,
+    discarding the other's dummy state and orphaning the pages capture had
+    allocated to it. Asserted structurally because the symptom is silent.
+
+    Workspace sharing is deliberately NOT asserted here: these runners share
+    one FlashInfer workspace per (cache label, shape) on purpose, and that is
+    safe because plan and replay are paired inside a single run() on one
+    stream with the runners called strictly in order. Splitting it would cost
+    +2.5 GiB/rank. See _build_persistent_wrappers."""
     cfg = _cfg()
     model = _build(cfg)
     sub = Glm52LLMSubmodule(model, cfg)
@@ -291,25 +299,6 @@ def test_piecewise_graphs_do_not_share_workspace_or_dummy_ids():
         s_ids = {r for gd in sync.graphs.values() for r in gd.dummy_rids}
         assert t_ids and s_ids
         assert not (t_ids & s_ids), f"dummy rids collide: {t_ids & s_ids}"
-
-        # Distinct FlashInfer workspace tensors, compared by storage address:
-        # a shared buffer is one allocation reached under two names.
-        def _ws(runner):
-            out = set()
-            for gd in runner.graphs.values():
-                cm_ = gd.static_cache_manager
-                for ps in getattr(cm_, "_plan_states", {}).values():
-                    w = getattr(getattr(ps, "wrapper", None),
-                                "workspace_buffer", None)
-                    if w is not None:
-                        out.add(w.data_ptr())
-            return out
-
-        shared = _ws(trunk) & _ws(sync)
-        assert not shared, (
-            f"trunk and sync share {len(shared)} FlashInfer workspace "
-            "buffer(s); plan() state written by one corrupts the other's "
-            "captured replay")
     finally:
         alloc.cleanup()
 
