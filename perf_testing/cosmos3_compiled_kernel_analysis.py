@@ -43,9 +43,9 @@ as indicative; the relative split and the kernel->source mapping are the point.
 import os, re, sys, glob, shutil, tempfile, datetime, collections, torch
 
 # ---- output recording ----
-# By default the report is tee'd to perf_testing/results/cosmos3_feedback_<ts>.txt
-# (and still printed to the console). Override the path with COSMOS3_FEEDBACK_OUT,
-# or set it empty (COSMOS3_FEEDBACK_OUT=) to disable file recording.
+# By default the whole report is written to a FILE (not the console):
+# perf_testing/results/cosmos3_feedback_<ts>.txt. Override the path with
+# COSMOS3_FEEDBACK_OUT, or set it empty (COSMOS3_FEEDBACK_OUT=) to print to stdout.
 # COSMOS3_KEEP_TRACE=1 keeps the Inductor debug dump (output_code.py, fx_graph_readable.py).
 _OUT = os.environ.get("COSMOS3_FEEDBACK_OUT")
 if _OUT is None:
@@ -53,15 +53,9 @@ if _OUT is None:
     os.makedirs(_results, exist_ok=True)
     _OUT = os.path.join(_results, f"cosmos3_feedback_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt")
 if _OUT:
-    class _Tee:
-        def __init__(self, *streams): self.streams = streams
-        def write(self, s):
-            for st in self.streams: st.write(s)
-        def flush(self):
-            for st in self.streams: st.flush()
+    print(f"# writing report to {_OUT}", file=sys.__stdout__, flush=True)   # only console line
     _outfh = open(_OUT, "w")
-    sys.stdout = _Tee(sys.__stdout__, _outfh)
-    print(f"# recording report to {_OUT}")
+    sys.stdout = _outfh                                                     # everything else -> file
 
 # ---- config ----
 SNAP = os.environ.get(

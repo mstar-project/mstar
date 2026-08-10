@@ -50,13 +50,13 @@ COSMOS3_NANO_DIR=/path/to/Cosmos3-Nano \
 
 ## Recording the output
 
-By **default** the report is tee'd (printed live **and** saved) to
+By **default** the whole report is written to a **file** (not the console) at
 `perf_testing/results/cosmos3_feedback_<timestamp>.txt` — that directory is
-git-ignored. Control it with env vars:
+git-ignored. The console only prints the file path. Control it with env vars:
 
 ```bash
 COSMOS3_FEEDBACK_OUT=report.txt python perf_testing/cosmos3_compiled_kernel_analysis.py  # custom path
-COSMOS3_FEEDBACK_OUT= python perf_testing/cosmos3_compiled_kernel_analysis.py             # console only
+COSMOS3_FEEDBACK_OUT= python perf_testing/cosmos3_compiled_kernel_analysis.py             # print to stdout instead
 COSMOS3_KEEP_TRACE=1 python perf_testing/cosmos3_compiled_kernel_analysis.py              # keep Inductor dump
 ```
 
