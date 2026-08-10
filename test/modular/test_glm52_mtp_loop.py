@@ -119,6 +119,49 @@ class _StubDraftRunner:
         }
 
 
+class _StubSyncRunner:
+    """Contract double for the ``mtp_sync`` piecewise graph: the PADDED
+    sync pass — k+1 rows per request, real rows first. Plans on the plane
+    with rope at counter+1+row derived from the aliased states (asserted
+    equal to the caller's padded positions: the contiguity property the
+    real plan_fn depends on — it must need no knowledge of e), runs the
+    fused MTP forward over ALL rows including pads (so pad entries land in
+    the plane store exactly as a replay would write them), advances the
+    full k+1, and returns cloned outputs. The caller owns the rows-e
+    rewind correction and the last-real-row gather."""
+
+    def __init__(self, sub, handle):
+        self.sub = sub
+        self.handle = handle
+        self.calls = 0
+
+    def can_run(self, batch_size, total_tokens=None):
+        return True
+
+    def run(self, static_inputs, request_ids=None, seq_lens=None, real_bs=None):
+        self.calls += 1
+        sub, handle = self.sub, self.handle
+        handle.set_layer_idx(sub.config.num_hidden_layers)
+        handle.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
+        pos_l = []
+        for rid, sl in zip(request_ids, seq_lens, strict=True):
+            start = handle._get_state(rid, "main").position_id_start
+            pos_l.extend(range(start + 1, start + 1 + sl))
+        pos = torch.tensor(pos_l, dtype=torch.long)
+        assert torch.equal(pos, static_inputs["position_ids"].cpu()), (
+            "padded-sync plan positions (counter+1+row) diverge from the "
+            f"layout's: {pos.tolist()} vs "
+            f"{static_inputs['position_ids'].tolist()}")
+        handle.plan_rope(seq_lens=seq_lens, pos_ids=pos, label="main")
+        mtp = sub.language_model.mtp
+        embed = sub.language_model.model.embed_tokens
+        h_head, h_raw = mtp(
+            embed(static_inputs["sync_ids"]), static_inputs["pair_hidden"],
+            handle, pos)
+        handle.advance_seq_lens()
+        return {"h_head": h_head.clone(), "h_raw": h_raw.clone()}
+
+
 def _mtp_cfg(k: int) -> Glm52ModelConfig:
     cfg = Glm52ModelConfig.reduced()
     cfg.num_hidden_layers = 4  # MTP position lands FULL (4 = offset-1 + freq)
@@ -127,10 +170,14 @@ def _mtp_cfg(k: int) -> Glm52ModelConfig:
 
 
 def _fwd_info(max_tokens: int, ignore_eos: bool) -> SimpleNamespace:
+    # Models the full SamplingConfig contract: the MTP prepare_inputs
+    # guard reads temperature/repetition_penalty (greedy-only refusal).
     return SimpleNamespace(
         request_id="r0",
         max_tokens=max_tokens,
-        sampling_config={"LLM": SimpleNamespace(ignore_eos=ignore_eos)},
+        sampling_config={"LLM": SimpleNamespace(
+            ignore_eos=ignore_eos, temperature=0.0, repetition_penalty=1,
+        )},
         dynamic_loop_iter_counts={},
     )
 
@@ -276,6 +323,49 @@ def test_mtp_draft_replay_seam_bit_identical():
     assert torch.equal(stream_eager, stream_both)
 
 
+def test_mtp_sync_replay_seam_bit_identical():
+    """THE padded-sync property, provable on CPU: routing the decode sync
+    pass through the padded mtp_sync seam — pads written into the plane
+    store and all — emits the bit-identical stream to the eager unpadded
+    sync, and the plane still holds exactly counter entries afterwards.
+    k=3 exercises e in {1..4} against rows=4 across the run."""
+    torch.manual_seed(0)
+    cfg = _mtp_cfg(3)
+    model = Glm52ForCausalLM(cfg)
+    prompt = torch.arange(5, dtype=torch.long) + 3
+
+    sub_eager = Glm52LLMSubmodule(model, cfg)
+    h_eager = ReferenceCacheHandle(["r0"])
+    stream_eager = _drive(sub_eager, h_eager, prompt, _fwd_info(24, True))
+
+    sub_sync = Glm52LLMSubmodule(model, cfg)
+    handle = ReferenceCacheHandle(["r0"])
+    sync_runner = _StubSyncRunner(sub_sync, handle)
+    stream_sync = _drive(
+        sub_sync, handle, prompt, _fwd_info(24, True),
+        runners={"mtp_sync": sync_runner})
+
+    assert sync_runner.calls > 0, "decode sync never went through the seam"
+    assert torch.equal(stream_eager, stream_sync), (
+        f"padded-sync stream diverged: {stream_eager.tolist()} vs "
+        f"{stream_sync.tolist()}")
+    # Shift-by-one alignment must survive padding: plane entries == counter.
+    plane = handle.committed_rows("r0", cfg.num_hidden_layers)
+    assert len(plane) == handle._states["r0"].position_id_start
+
+    # All three seams together — the production shape after this lands.
+    sub_all = Glm52LLMSubmodule(model, cfg)
+    h_all = ReferenceCacheHandle(["r0"])
+    stream_all = _drive(
+        sub_all, h_all, prompt, _fwd_info(24, True),
+        runners={
+            "mtp_trunk": _StubTrunkRunner(sub_all, h_all),
+            "mtp_draft": _StubDraftRunner(sub_all, h_all),
+            "mtp_sync": _StubSyncRunner(sub_all, h_all),
+        })
+    assert torch.equal(stream_eager, stream_all)
+
+
 def test_preprocess_skips_plan_only_when_trunk_replays():
     """The replay decision is made once, in preprocess: with a runnable
     trunk graph the eager plan is skipped (the runner's plan is the live
@@ -290,14 +380,17 @@ def test_preprocess_skips_plan_only_when_trunk_replays():
     handle = ReferenceCacheHandle(["r0"])
     runner = _StubTrunkRunner(sub, handle)
     draft = _StubDraftRunner(sub, handle)
+    sync = _StubSyncRunner(sub, handle)
     ar = sub.prepare_inputs("decode", fwd, decode_inputs)
     kw = sub.preprocess(
         "decode",
         _EngineInputs(handle, _ArgmaxSampler(),
-                      {"mtp_trunk": runner, "mtp_draft": draft}),
+                      {"mtp_trunk": runner, "mtp_draft": draft,
+                       "mtp_sync": sync}),
         [ar])
     assert kw["mtp_trunk_runner"] is runner
     assert kw["mtp_draft_runner"] is draft
+    assert kw["mtp_sync_runner"] is sync
     assert handle._plan is None, "eager plan should be skipped on replay steps"
 
     handle2 = ReferenceCacheHandle(["r0"])
@@ -306,19 +399,23 @@ def test_preprocess_skips_plan_only_when_trunk_replays():
         "decode", _EngineInputs(handle2, _ArgmaxSampler()), [ar2])
     assert kw2["mtp_trunk_runner"] is None
     assert kw2["mtp_draft_runner"] is None
+    assert kw2["mtp_sync_runner"] is None
     assert handle2._plan is not None, "eager path must still plan"
 
-    # Prefill drafts too: the chain runner rides along, the trunk (a
-    # decode-shape graph) does not, and the prefill plan is untouched.
+    # Prefill drafts too: the chain runner rides along; the trunk and the
+    # padded sync (decode-shape graphs) do not, and the prefill plan is
+    # untouched — its sync spans the whole prompt, outside the k+1 family.
     handle3 = ReferenceCacheHandle(["r0"])
     ar3 = sub.prepare_inputs("prefill", fwd, decode_inputs)
     kw3 = sub.preprocess(
         "prefill",
         _EngineInputs(handle3, _ArgmaxSampler(),
-                      {"mtp_trunk": runner, "mtp_draft": draft}),
+                      {"mtp_trunk": runner, "mtp_draft": draft,
+                       "mtp_sync": sync}),
         [ar3])
     assert kw3["mtp_trunk_runner"] is None
     assert kw3["mtp_draft_runner"] is draft
+    assert kw3["mtp_sync_runner"] is None
     assert handle3._plan is not None, "prefill must keep its eager plan"
 
 
@@ -344,7 +441,7 @@ def test_mtp_trunk_piecewise_config_shapes():
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
     configs = sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)
-    assert set(configs) == {"mtp_trunk", "mtp_draft"}
+    assert set(configs) == {"mtp_trunk", "mtp_draft", "mtp_sync"}
     pc = configs["mtp_trunk"]
     assert pc.get_config_type() == PiecewiseConfigType.PACKED
     assert pc.uses_kv_cache and pc.cache_labels == ["main"]
@@ -371,10 +468,24 @@ def test_mtp_trunk_piecewise_config_shapes():
     assert dstatic["prev_hidden"].shape == (2, cfg.hidden_size)
     assert dstatic["prev_hidden"].dtype == torch.bfloat16
 
-    # k=1 has no chain iterations — no draft graph to pay capture for.
+    # The padded sync graph shares the trunk's capture shape exactly.
+    sc = configs["mtp_sync"]
+    assert sc.get_config_type() == PiecewiseConfigType.PACKED
+    sshapes = sc.get_capture_shapes(sc.capture_batch_sizes)
+    assert [(s.bs, s.total_tokens) for s in sshapes] == [
+        (1, 3), (2, 6), (4, 12), (8, 24), (16, 48)]
+    sstatic = sc.make_static_inputs(sshapes[0])
+    assert set(sstatic) == {"sync_ids", "pair_hidden", "position_ids"}
+    assert sstatic["sync_ids"].shape == (3,)
+    assert sstatic["pair_hidden"].shape == (3, cfg.hidden_size)
+    assert sstatic["pair_hidden"].dtype == torch.bfloat16
+
+    # k=1 has no chain iterations — no draft graph to pay capture for —
+    # but the sync pass (rows=2) still captures.
     cfg.mtp_num_draft_tokens = 1
     assert set(sub.get_piecewise_cuda_graph_configs(
-        torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {"mtp_trunk"}
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
+            "mtp_trunk", "mtp_sync"}
 
     cfg.mtp_num_draft_tokens = 0
     assert sub.get_piecewise_cuda_graph_configs(

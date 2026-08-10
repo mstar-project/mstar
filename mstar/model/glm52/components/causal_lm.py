@@ -44,12 +44,13 @@ class Glm52LanguageModel(nn.Module):
         it and the next FULL layer consume that value.
 
         ``return_prenorm``: additionally return the raw last-layer hidden
-        BEFORE the final norm as ``(normed, prenorm)``. The MTP plane pairs
-        drafts against this raw stream — its ``hnorm`` is a LEARNED norm
-        over the trunk's un-normalized hidden (DeepSeek-V3 MTP glue);
-        feeding it the final-norm output double-norms the fusion input and
-        was measured to zero out draft acceptance (0.00 over 3584
-        request-steps, 2026-08-09 bench)."""
+        BEFORE the final norm as ``(normed, prenorm)``. Both streams reach
+        the MTP step because WHICH one the plane's learned ``hnorm`` pairs
+        against is an open A/B — see ``Glm52LLMSubmodule._mtp_pair_rows``.
+        (vLLM pairs post-norm on this checkpoint and scores higher. The
+        0.00-acceptance number that once condemned post-norm here was
+        re-attributed by 474a95e9 to the read plan never loading the MTP
+        weights; do not cite it as pairing evidence.)"""
         hidden_states = self.embed_tokens(input_ids)
         for layer_idx, decoder_layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)

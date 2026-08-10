@@ -153,6 +153,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # regression is 13x and silence lets it masquerade as "MTP is slow".
         self._mtp_trunk_eager_warned = False
         self._mtp_draft_eager_warned = False
+        self._mtp_sync_eager_warned = False
         # Acceptance instrumentation (global, not per-request): raw emitted
         # tokens (n_accepted + 1, pre-truncation) and request-step count.
         self._mtp_stat_emitted = 0
@@ -328,16 +329,20 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         autocast_dtype: torch.dtype,
         tp_world_size: int = 1,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
-        """Two piecewise graphs for the MTP step. ``mtp_trunk``: the trunk
+        """Three piecewise graphs for the MTP step. ``mtp_trunk``: the trunk
         verify forward — embed + 78 layers + lm_head over the packed
         (bs, k+1) rows. ``mtp_draft`` (k >= 2 only): ONE chain iteration of
         the draft loop — fuse(embed(draft), prev_hidden) through the
         layer-78 module + head argmax, 1 row per request — replayed k-1
-        times per step. The step's remaining host phases (greedy verify,
-        rewind, the variable-row sync pass whose per-request lengths are
-        data-dependent) stay eager in ``_forward_batched_mtp``. Same
-        MSTAR_GLM52_GRAPH_COMPILE gate as the full-forward captures so the
-        kernel stack matches the k=0 fast config."""
+        times per step. ``mtp_sync``: the decode sync pass PADDED to k+1
+        rows per request (mtp_sync_padded_layout), sharing the trunk's
+        capture shape — pads cost ~nothing (the 10 ms eager sync is launch
+        overhead, not compute) and buy the fixed shape that makes it
+        capturable at all. The step's remaining host phases (greedy verify,
+        rewind, the whole-prompt prefill sync) stay eager in
+        ``_forward_batched_mtp``. Same MSTAR_GLM52_GRAPH_COMPILE gate as
+        the full-forward captures so the kernel stack matches the k=0 fast
+        config."""
         k = self.config.mtp_num_draft_tokens
         if (
             k <= 0
@@ -370,6 +375,19 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     shape.total_tokens, dtype=torch.long, device=device),
             }
 
+        def make_sync_static_inputs(
+            shape: PiecewiseCaptureShape,
+        ) -> dict[str, torch.Tensor]:
+            return {
+                "sync_ids": torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=device),
+                "pair_hidden": torch.zeros(
+                    shape.total_tokens, self.config.hidden_size,
+                    dtype=autocast_dtype, device=device),
+                "position_ids": torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=device),
+            }
+
         configs: dict[str, PiecewiseCudaGraphConfig] = {
             MTP_TRUNK_LABEL: Glm52MtpTrunkGraphConfig(
                 rows_per_request=rows,
@@ -393,6 +411,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
                 compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
             )
+        configs[MTP_SYNC_LABEL] = Glm52MtpTrunkGraphConfig(
+            rows_per_request=rows,
+            capture_fn=self._mtp_sync_captured,
+            make_static_inputs=make_sync_static_inputs,
+            plan_fn=self._mtp_sync_plan,
+            uses_kv_cache=True,
+            cache_labels=[_MAIN],
+            capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
+            compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
+        )
         return configs
 
     def _mtp_trunk_captured(
@@ -482,6 +510,60 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 pos, dtype=torch.long, device=self.get_device()),
             label=_MAIN)
 
+    def _mtp_sync_captured(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        static_cm: BatchedCacheManager | None = None,
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Captured region for the PADDED sync pass: fuse the committed
+        tokens' embeddings with their paired trunk rows and run the
+        layer-78 module over k+1 rows per request — real rows first, pads
+        after (``mtp_sync_padded_layout`` owns the arithmetic; pads write
+        transient plane entries the chain overwrites next). Draft 1's head
+        gather stays OUTSIDE the graph: which row it reads (the last REAL
+        row) is data-dependent, and the eager (bs,)-row gather + head GEMM
+        is exactly what the eager sync already paid."""
+        static_cm.set_active_label(_MAIN)
+        mtp = self.language_model.mtp
+        embed = self.language_model.model.embed_tokens
+        h_head, h_raw = mtp(
+            embed(static_inputs["sync_ids"]),
+            static_inputs["pair_hidden"],
+            static_cm,
+            static_inputs["position_ids"],
+        )
+        return {"h_head": h_head, "h_raw": h_raw}
+
+    def _mtp_sync_plan(
+        self, cache_manager: BatchedCacheManager, shape: PiecewiseCaptureShape,
+    ) -> None:
+        """Plan the padded sync pass on the plane: k+1 rows per present
+        request (zero-length rows for padding slots). The caller has
+        already rewound the counter by e, so row j's RoPE position is
+        counter+1+j — one contiguous run per request: real rows land on
+        their token's true position and pads continue monotonically past
+        it. That contiguity is the whole point of the padded layout: the
+        plan derives positions from the aliased counters alone, with no
+        knowledge of the data-dependent e, so capture (dummy counters) and
+        replay (real counters) both plan correctly."""
+        cache_manager.set_active_label(_MAIN)
+        cache_manager.set_layer_idx(self.config.num_hidden_layers)
+        cache_manager.plan_attention(
+            seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
+        pos: list[int] = []
+        for rid, sl in zip(
+            cache_manager.request_ids, shape.seq_lens, strict=True,
+        ):
+            if sl > 0:
+                start = cache_manager._get_state(rid, _MAIN).position_id_start
+                pos.extend(range(start + 1, start + 1 + sl))
+        cache_manager.plan_rope(
+            seq_lens=shape.seq_lens,
+            pos_ids=torch.tensor(
+                pos, dtype=torch.long, device=self.get_device()),
+            label=_MAIN)
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -493,10 +575,26 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         text_inputs = inputs["text_inputs"][0]
         if self.config.mtp_num_draft_tokens > 0:
             rid = fwd_info.request_id
+            sampling = fwd_info.sampling_config["LLM"]
+            # v1 is greedy-only: decode drafts and verification bypass the
+            # engine sampler, so temperature would be silently ignored and a
+            # repetition penalty moves even the greedy argmax (prefill would
+            # apply it, verify would not — a mixed stream). Refuse per
+            # request rather than serve a distribution the client didn't ask
+            # for; the engine drops only this rid (kv_cache_engine catches
+            # per-request prepare_inputs failures).
+            if sampling.temperature != 0 or sampling.repetition_penalty != 1:
+                raise RuntimeError(
+                    f"request {rid}: MTP speculative decoding is greedy-only "
+                    f"(v1) but the request asks for "
+                    f"temperature={sampling.temperature}, "
+                    f"repetition_penalty={sampling.repetition_penalty}. "
+                    "Decode tokens are raw argmax and would silently ignore "
+                    "both. Send temperature=0 without a penalty, or serve a "
+                    "k=0 config."
+                )
             self._mtp_max_tokens[rid] = fwd_info.max_tokens
-            self._mtp_ignore_eos[rid] = (
-                fwd_info.sampling_config["LLM"].ignore_eos
-            )
+            self._mtp_ignore_eos[rid] = sampling.ignore_eos
         return ARNodeInputs(
             input_ids=text_inputs,
             input_seq_len=text_inputs.shape[0],
@@ -519,6 +617,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # stubs (tests) predate the piecewise_runners field.
         trunk_runner = None
         draft_runner = None
+        sync_runner = None
         if self.config.mtp_num_draft_tokens > 0:
             runners = getattr(engine_inputs, "piecewise_runners", None) or {}
             if graph_walk == "decode":
@@ -527,6 +626,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     len(inputs), sum(seq_lens)
                 ):
                     trunk_runner = candidate
+                # The padded sync pass is decode-only (prefill's sync spans
+                # the whole prompt, outside the k+1-row family): k+1 rows
+                # per request regardless of how many were accepted.
+                rows = self.config.mtp_num_draft_tokens + 1
+                scand = runners.get(MTP_SYNC_LABEL)
+                if scand is not None and scand.can_run(
+                    len(inputs), rows * len(inputs)
+                ):
+                    sync_runner = scand
             # The draft chain runs after decode AND prefill (both draft):
             # 1 row per request, so bs is the token count.
             dcand = runners.get(MTP_DRAFT_LABEL)
@@ -603,6 +711,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "mtp_trunk_runner": trunk_runner,
             # Non-None when the draft-chain iterations can replay theirs.
             "mtp_draft_runner": draft_runner,
+            # Non-None when the decode sync pass can replay padded.
+            "mtp_sync_runner": sync_runner,
             "dsa_ctx": Glm52DsaForwardContext(
                 spans=spans, k_store=self._dsa_k_store,
                 needs_selection=needs_selection,
@@ -856,9 +966,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             results[rid] = {"new_token": [emitted]}
         self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
+        sync_runner = kwargs.get("mtp_sync_runner")
+        if sync_runner is None:
+            self._warn_mtp_sync_eager_once(len(request_ids))
         drafts = self._mtp_sync_and_draft(
             cache_handle, sync_tokens, pair_hiddens,
-            draft_runner=kwargs.get("mtp_draft_runner"))
+            draft_runner=kwargs.get("mtp_draft_runner"),
+            sync_runner=sync_runner)
         for i, rid in enumerate(request_ids):
             emitted = results[rid]["new_token"][0]
             results[rid]["text_inputs"] = [
@@ -871,6 +985,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         sync_tokens: list[torch.Tensor],
         pair_hiddens: list[torch.Tensor],
         draft_runner=None,
+        sync_runner=None,
     ) -> list[torch.Tensor]:
         """Extend the MTP plane over the newly committed tokens, then draft
         k tokens autoregressively. Returns per-request (k,) draft tensors.
@@ -901,21 +1016,65 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # Sync pass (+ draft 1 from its last row): plane positions
         # start-e .. start-1, token positions start-e+1 .. start.
         cache_handle.rewind_seq_lens(e_list)
-        cache_handle.set_layer_idx(mtp_layer)
-        cache_handle.plan_attention(seq_lens=e_list, is_causal=True, label=_MAIN)
-        pos_list: list[int] = []
-        for st, e in zip(starts, e_list, strict=True):
-            pos_list.extend(range(st - e + 1, st + 1))
-        positions = torch.tensor(pos_list, dtype=torch.long, device=device)
-        cache_handle.plan_rope(seq_lens=e_list, pos_ids=positions, label=_MAIN)
-        h_head, h_raw = mtp(
-            embed(torch.cat(sync_tokens)), torch.cat(pair_hiddens),
-            cache_handle, positions,
-        )
-        cache_handle.advance_seq_lens()
+        if sync_runner is not None:
+            # PADDED replay: k+1 rows per request, the trunk's own capture
+            # shape. Real rows first, pads after; pads write transient
+            # plane entries at slots >= start that the chain (and the next
+            # step's writes) overwrite before any read. Decode-only by
+            # construction — e = emitted <= k+1 — and the guard is loud
+            # because a violated bound here would otherwise surface as
+            # nothing but lower acceptance.
+            rows = k + 1
+            assert all(e <= rows for e in e_list), (
+                f"padded sync got rows {e_list} outside [1, {rows}] — the "
+                "padded family is decode-only")
+            pos_l, last_l, over_advance = mtp_sync_padded_layout(
+                e_list, starts, k)
+            sync_ids = torch.zeros(
+                num * rows, dtype=torch.long, device=device)
+            pair_h = torch.zeros(
+                (num * rows, pair_hiddens[0].shape[-1]),
+                dtype=pair_hiddens[0].dtype, device=device)
+            for i, (t, h) in enumerate(
+                zip(sync_tokens, pair_hiddens, strict=True)
+            ):
+                sync_ids[i * rows:i * rows + t.shape[0]] = t
+                pair_h[i * rows:i * rows + h.shape[0]] = h
+            out = sync_runner.run(
+                static_inputs={
+                    "sync_ids": sync_ids,
+                    "pair_hidden": pair_h,
+                    "position_ids": torch.tensor(
+                        pos_l, dtype=torch.long, device=device),
+                },
+                request_ids=request_ids,
+                seq_lens=[rows] * num,
+            )
+            # The runner advanced `rows` per request; only e were real.
+            cache_handle.rewind_seq_lens(over_advance)
+            h_head, h_raw = out["h_head"], out["h_raw"]
+            last_rows = torch.tensor(
+                last_l, dtype=torch.long, device=device)
+        else:
+            cache_handle.set_layer_idx(mtp_layer)
+            cache_handle.plan_attention(
+                seq_lens=e_list, is_causal=True, label=_MAIN)
+            pos_list: list[int] = []
+            for st, e in zip(starts, e_list, strict=True):
+                pos_list.extend(range(st - e + 1, st + 1))
+            positions = torch.tensor(
+                pos_list, dtype=torch.long, device=device)
+            cache_handle.plan_rope(
+                seq_lens=e_list, pos_ids=positions, label=_MAIN)
+            h_head, h_raw = mtp(
+                embed(torch.cat(sync_tokens)), torch.cat(pair_hiddens),
+                cache_handle, positions,
+            )
+            cache_handle.advance_seq_lens()
+            # Packed (unpadded) layout: last real row via cumsum.
+            last_rows = torch.tensor(
+                e_list, dtype=torch.long, device=device).cumsum(0) - 1
 
-        last_rows = torch.tensor(
-            e_list, dtype=torch.long, device=device).cumsum(0) - 1
         # Head reads the shared_head-normed rows; the CHAIN threads the raw
         # layer output (hnorm re-norms it next iteration — same convention
         # as the trunk pairing).
@@ -989,6 +1148,20 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "bucket available — capture failed at warmup or bs exceeds the "
             "captured sizes %s. Each chain iteration pays eager launch "
             "overhead.",
+            bs, self.MTP_CAPTURE_BATCH_SIZES,
+        )
+
+    def _warn_mtp_sync_eager_once(self, bs: int) -> None:
+        """Same silence-is-a-regression lesson for the sync pass: eager it
+        is ~10 ms of a ~37 ms step — launch overhead, not compute."""
+        if self._mtp_sync_eager_warned:
+            return
+        self._mtp_sync_eager_warned = True
+        logger.warning(
+            "MTP decode sync pass running EAGER (bs=%d): no mtp_sync "
+            "piecewise bucket available — capture failed at warmup or bs "
+            "exceeds the captured sizes %s. Expect ~10 ms of avoidable "
+            "launch overhead per decode step.",
             bs, self.MTP_CAPTURE_BATCH_SIZES,
         )
 
