@@ -416,11 +416,11 @@ def test_qwen3_tts_postprocess_encodes_pcm16():
 def _tiny_model_config() -> Qwen3TTSModelConfig:
     code_predictor = Qwen3TTSCodePredictorConfig(
         num_hidden_layers=1,
-        num_attention_heads=2,
+        num_attention_heads=1,
         num_key_value_heads=1,
         hidden_size=16,
         intermediate_size=32,
-        head_dim=8,
+        head_dim=16,
         vocab_size=32,
         num_code_groups=4,
     )
@@ -590,12 +590,15 @@ def test_qwen3_tts_suppresses_eos_for_official_minimum_frames():
             "suppress_eos": torch.tensor([False]),
         }),
     ]
-    mask = submodule._get_batch_suppress_mask(inputs)
+    suppress_eos = submodule._get_batch_suppress_eos(inputs)
     eos = config.talker.codec_eos_token_id
+    logits = submodule._mask_invalid_logits(
+        torch.zeros(2, config.talker.vocab_size), suppress_eos
+    )
 
-    assert mask.shape == (2, config.talker.vocab_size)
-    assert mask[0, eos].item() is True
-    assert mask[1, eos].item() is False
+    assert suppress_eos.tolist() == [True, False]
+    assert torch.isneginf(logits[0, eos])
+    assert logits[1, eos].item() == 0.0
 
 
 def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
@@ -635,7 +638,11 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
 
     eos = config.talker.codec_eos_token_id
     assert prepared.tensor_inputs["suppress_eos"].item() is False
-    assert packed["suppress_mask"][0, eos].item() is False
+    assert packed["suppress_eos"].item() is False
+    logits = submodule._mask_invalid_logits(
+        torch.zeros(1, config.talker.vocab_size), packed["suppress_eos"]
+    )
+    assert logits[0, eos].item() == 0.0
     assert "__graph_dummy__" not in submodule.request_states
 
 
@@ -685,6 +692,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     )
     assert packed["input_embeds"].shape == (2, 16)
     assert packed["last_token_indices"].tolist() == [0, 1]
+    assert packed["suppress_eos"].tolist() == [True, True]
     graph_config = submodule.get_cuda_graph_configs(torch.device("cpu"))[0]
     assert graph_config.capture_graph_walk == "talker_decode"
     assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
@@ -699,28 +707,43 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert submodule.can_use_cuda_graphs(batch, model_inputs)
 
 
-def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
+def test_qwen3_tts_code_predictor_uses_decode_attn_nhd(monkeypatch):
     config = _tiny_model_config()
     predictor = Qwen3TTSCodePredictor(config)
-    # This CPU-only contract test targets the SDPA call. FlashInfer RMSNorm is
-    # CUDA-only, so replace normalization without changing attention geometry.
+    # This CPU-only contract test targets the decode-attention call. FlashInfer
+    # RMSNorm and the Triton attention kernel are CUDA-only, so replace them
+    # without changing attention geometry.
     for layer in predictor.model.layers:
         layer.input_layernorm = torch.nn.Identity()
         layer.post_attention_layernorm = torch.nn.Identity()
         layer.self_attn.q_norm = torch.nn.Identity()
         layer.self_attn.k_norm = torch.nn.Identity()
     predictor.model.norm = torch.nn.Identity()
-    original_sdpa = torch.nn.functional.scaled_dot_product_attention
-    calls = []
+    rope_calls = []
 
-    def capture_sdpa(query, key, value, **kwargs):
-        calls.append((query.shape, key.shape, value.shape, kwargs))
-        return original_sdpa(query, key, value, **kwargs)
+    def capture_rope(q, k, position_ids, rope_theta):
+        rope_calls.append((q.shape, k.shape, position_ids.dtype, rope_theta))
+        return q, k
 
     monkeypatch.setattr(
-        torch.nn.functional,
-        "scaled_dot_product_attention",
-        capture_sdpa,
+        "mstar.model.qwen3_tts.components.talker.apply_rope_pos_ids",
+        capture_rope,
+    )
+    calls = []
+
+    def capture_decode_attn(q, k_cache, v_cache, cache_len):
+        calls.append((q.shape, k_cache.shape, v_cache.shape, cache_len))
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k_cache[:, :cache_len].transpose(1, 2),
+            v_cache[:, :cache_len].transpose(1, 2),
+            is_causal=False,
+            enable_gqa=True,
+        ).transpose(1, 2)
+
+    monkeypatch.setattr(
+        "mstar.model.qwen3_tts.components.talker.decode_attn_nhd",
+        capture_decode_attn,
     )
     output = predictor.forward_depth_unrolled(
         inputs_embeds=torch.randn(1, 1, config.talker.hidden_size),
@@ -736,12 +759,16 @@ def test_qwen3_tts_code_predictor_uses_native_gqa(monkeypatch):
         cache_pos=0,
     )
 
-    query_shape, key_shape, value_shape, kwargs = calls[0]
+    query_shape, key_shape, value_shape, cache_len = calls[0]
     assert output.shape == (1, 1, config.talker.hidden_size)
-    assert query_shape[1] == config.talker.code_predictor.num_attention_heads
-    assert key_shape[1] == config.talker.code_predictor.num_key_value_heads
-    assert value_shape[1] == config.talker.code_predictor.num_key_value_heads
-    assert kwargs["enable_gqa"] is True
+    assert query_shape[2] == config.talker.code_predictor.num_attention_heads
+    assert key_shape[2] == config.talker.code_predictor.num_key_value_heads
+    assert value_shape[2] == config.talker.code_predictor.num_key_value_heads
+    assert key_shape[1] == config.talker.num_code_groups
+    assert cache_len == 1
+    assert len(calls) == config.talker.code_predictor.num_hidden_layers
+    assert len(rope_calls) == config.talker.code_predictor.num_hidden_layers
+    assert rope_calls[0][2] == torch.int32
 
 
 @pytest.mark.skipif(
