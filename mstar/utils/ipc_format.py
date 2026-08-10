@@ -36,6 +36,10 @@ class WorkerMessageType(Enum):
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
+    # TP async scheduling: void a broadcast speculation. Separate type rather
+    # than a flag on SCHEDULE_TP because it must be dispatchable without
+    # touching the schedule FIFO — see CancelSpec.
+    CANCEL_SPEC = "cancel_spec"
 
 
 @dataclass
@@ -89,9 +93,57 @@ class StopLoops(MessageBody):
 
 @dataclass
 class ScheduleTPNode(MessageBody):
+    """Leader → followers: schedule this node for these rids.
+
+    Deliberately THIN — ids only. Followers rebuild the batch locally from
+    replicated state (``register_tp_follow`` → ``_try_schedule_tp_follow``),
+    so nothing tensor-shaped rides the wire.
+
+    ``speculative``/``spec_seq`` extend the same message for TP async
+    scheduling rather than opening a second channel: a speculative head is the
+    same schedule request, tagged. ``spec_seq`` is the leader's monotonic
+    speculation counter, echoed by ``CancelSpec`` so a void names exactly one
+    batch.
+
+    Both fields are defaulted so every existing construction site keeps working
+    unchanged and today's serial broadcasts stay non-speculative by omission.
+    Note this is *source* compatibility, not wire compatibility: these travel
+    as pickled dataclasses, and an old pickle would leave the new attributes
+    unset rather than defaulted. That is fine here — the ranks of a TP group are
+    launched together from one conductor and always run the same build — but it
+    is not a mixed-version guarantee, so don't lean on it as one.
+    """
+
     node_name: str
     graph_walk: str
     request_ids: list[str]
+    speculative: bool = False
+    spec_seq: int = -1
+
+
+@dataclass
+class CancelSpec(MessageBody):
+    """Leader → followers: VOID speculation ``spec_seq`` — never retract it.
+
+    Void means: the batch still executes on every rank, and only its *effects*
+    are discarded (outputs dropped, speculatively-allocated pages freed, leader
+    reschedules authoritatively afterward).
+
+    It does NOT mean "remove it from the pending FIFO if it hasn't launched
+    yet." That reading is refuted, not merely discouraged: once ``SpecBatch(S)``
+    is broadcast, a rank that drops S while a faster rank already ran it posts a
+    different collective sequence — invariant I1, the NCCL-hang class. The CPU
+    model checker finds it as a ~16-action counterexample on the
+    ``structural-cancel`` scenario (``test/modular/tp_async_sim.py``, mode
+    ``B2_RETRACT``, kept as a pinned negative control).
+
+    Under B1 (gated commit) retraction *is* safe, because the launch gate
+    guarantees no rank has executed — but B1 signals commit, not cancel, so this
+    message keeps void-only semantics in both variants.
+    """
+
+    spec_seq: int
+
 
 @dataclass
 class WorkerMessage:
