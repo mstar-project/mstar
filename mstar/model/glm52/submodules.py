@@ -41,6 +41,52 @@ _MAIN = "main"
 # Piecewise-graph label for the MTP decode step's trunk verify forward.
 MTP_TRUNK_LABEL = "mtp_trunk"
 MTP_DRAFT_LABEL = "mtp_draft"
+MTP_SYNC_LABEL = "mtp_sync"
+
+
+def mtp_sync_padded_layout(
+    e_list: list[int], starts: list[int], k: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Row layout for a PADDED MTP sync pass — the arithmetic behind capturing it.
+
+    The sync pass extends the MTP plane over the tokens just committed. Each
+    request contributes ``e = n_acc + 1`` rows, which is data-dependent, so the
+    pass has no fixed shape and has stayed eager — ~10 of a 36.5 ms step. But
+    that 10 ms is almost entirely *launch overhead*, not compute (the module is
+    one decoder layer ≈ 0.3 ms, against a 79-layer 24 ms trunk), so padding
+    every request out to the maximum ``k+1`` rows costs nearly nothing and buys
+    a single fixed shape per batch size — the very shape ``mtp_trunk`` already
+    captures. That beats one bucket per row count, which at bs > 1 would need a
+    bucket per *composition* (bs=2,k=2 → 9), not per total.
+
+    Returns ``(positions, last_rows, rewind)`` for ``rows = k+1`` per request:
+
+    - ``positions`` — RoPE position per row, real rows first. Request i's real
+      rows carry token positions ``start-e+1 .. start``; its pad rows continue
+      monotonically past ``start`` so RoPE never sees a repeated or negative
+      position. Pads land at plane slots ``>= start``, which is exactly the
+      transient region the draft chain overwrites next, so they are harmless —
+      the same guarantee the chain's own ``k-1`` extra entries already rely on.
+    - ``last_rows`` — index of each request's LAST REAL row, the one draft 1
+      comes from. With padding this is ``i*rows + e - 1``, not a cumsum.
+    - ``rewind`` — per-request counter correction. The runner advances every
+      captured request by ``rows``; only ``e`` of those are real, so rewinding
+      ``rows - e`` restores the counter to ``start``, leaving the plane holding
+      exactly ``position_id_start`` entries as the eager path does.
+
+    Causality is unaffected: real rows precede pads within a request, so a real
+    row never attends to a pad.
+    """
+    rows = k + 1
+    positions: list[int] = []
+    last_rows: list[int] = []
+    for i, (st, e) in enumerate(zip(starts, e_list, strict=True)):
+        if not 1 <= e <= rows:
+            raise ValueError(f"sync rows e={e} outside [1, {rows}] for request {i}")
+        positions.extend(range(st - e + 1, st + 1))
+        positions.extend(range(st + 1, st + 1 + rows - e))
+        last_rows.append(i * rows + e - 1)
+    return positions, last_rows, [rows - e for e in e_list]
 
 
 @dataclass(kw_only=True)
