@@ -1515,17 +1515,12 @@ class Worker:
                     # in-flight step and shouldn't be in ready queues —
                     # but if it does, the in-flight rid wins.
                     #
-                    # KNOWN GAP (latent): if fresh_batch ever came from the
-                    # TP-follow path, ``_try_schedule_tp_follow`` has already
-                    # popped the leader's ScheduleTPNode. Pushing the node
-                    # back onto the ready queue does not undo that, and this
-                    # worker is a follower for that node so nothing will
-                    # reschedule it — the TP group stalls. Unreachable today
-                    # (spec targets exclude ``parallel_nodes``, so the
-                    # target_node_name filter never matches a TP batch), but
-                    # any future overlap needs the scheduler to re-queue the
-                    # message, or to defer the popleft until the caller
-                    # commits to the batch.
+                    # fresh_batch can never be a TP-follow batch here: this
+                    # is a targeted get_next_batch call, and the scheduler
+                    # refuses to pop the TP-follow FIFO for targeted callers
+                    # (``_try_schedule_tp_follow``) precisely because this
+                    # merge may reject rids — a popped ScheduleTPNode has no
+                    # re-queue path, and stranding it stalls the TP group.
                     wg_id = fresh_batch.request_to_worker_graph[rid]
                     self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
                     continue

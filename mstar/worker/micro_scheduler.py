@@ -145,15 +145,19 @@ class MicroScheduler:
     ) -> ScheduledBatch | None:
         if len(self.tp_batches_pending_schedule) == 0:
             return
+        # A TP-follow batch is a mandate from the group leader: once its
+        # ScheduleTPNode is popped from the FIFO, nothing on this worker will
+        # ever reschedule it (followers cannot initiate scheduling for
+        # parallel nodes), so whoever pops it must submit it unconditionally.
+        # Targeted calls come from merge paths (the speculation fresh-rid
+        # merge in ``worker._try_speculate_next``) that may reject or
+        # partially consume the batch they are handed — handing them a
+        # mandate would strand the popped message, and the group would hang
+        # at the next collective. Refuse instead: the message stays queued
+        # for the unconditional scheduling path.
+        if target_node_name is not None or target_graph_walk is not None:
+            return
         first_tp_node: ScheduleTPNode = self.tp_batches_pending_schedule[0]
-        # Respect the caller's filters: a targeted call (e.g. the speculation
-        # path asking for one specific node/walk) must not be handed a TP
-        # follower batch for some other node, or the caller will merge those
-        # node objects into a batch labeled with the target's name.
-        if target_node_name is not None and first_tp_node.node_name != target_node_name:
-            return
-        if target_graph_walk is not None and first_tp_node.graph_walk != target_graph_walk:
-            return
         if exclude_target is not None and \
                 (first_tp_node.node_name, first_tp_node.graph_walk) == exclude_target:
             return
