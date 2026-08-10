@@ -371,7 +371,9 @@ class Model(ABC):
         unchanged, so models that only define ``get_kv_cache_config``
         need no change here. Models with resources those configs cannot
         describe (e.g. a fixed-shape scratch cache) override this and
-        extend the returned specs.
+        extend the returned specs. Once every in-tree model migrates,
+        this replaces ``get_kv_cache_config`` as the resource surface
+        and the per-config pairing gives way to per-node declarations.
         """
         return [NodeResourceSpec(kv_cache_config=cfg) for cfg in kv_cache_config]
 

@@ -31,6 +31,10 @@ class NodeResourceSpec:
     backend, the rope embedder, and the cross-attention pools, exactly as
     it always has. ``scratch`` adds keyed fixed-shape caches built
     alongside them (resource key to spec).
+
+    TODO: once get_kv_cache_config retires, allow several named KV cache
+    configs per node and split the cross-attention and rope settings out
+    of KVCacheConfig into their own spec entries.
     """
     kv_cache_config: KVCacheConfig
     scratch: dict[str, ScratchKVSpec] = field(default_factory=dict)
