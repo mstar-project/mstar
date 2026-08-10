@@ -2905,41 +2905,56 @@ class PiecewiseCudaGraphRunner:
                 buf[n:].zero_()
 
         # --- 2: KV state swap + plan_attention ---
+        # Swap-and-restore must be paired (same lesson as _run_basic_batched):
+        # _plan can raise a retryable AllocationFailedError under page-pool
+        # pressure, and without the finally the dummy slots would stay aliased
+        # to live RequestState objects — a later replay's step-5
+        # reset_label(free=True) on a stale-aliased padding slot would then
+        # free a live request's pages. ``swapped`` is set BEFORE the aliasing
+        # loop: restore is idempotent on never-aliased slots (reset_label
+        # replaces a fresh dummy state with a fresh dummy state and frees an
+        # empty page list), so a mid-loop failure is also covered.
         static_cm = data.static_cache_manager
-        if static_cm is not None and request_ids is not None:
-            for i, rid in enumerate(request_ids):
-                dummy_rid = data.dummy_rids[i]
+        swapped = False
+        try:
+            if static_cm is not None and request_ids is not None:
+                swapped = True
+                for i, rid in enumerate(request_ids):
+                    dummy_rid = data.dummy_rids[i]
+                    for label in self.cache_labels:
+                        real_state = self.alloc_manager.get_state(rid, label)
+                        self.alloc_manager.get_state(dummy_rid, label)  # ensure slot exists
+                        self.alloc_manager.request_states[dummy_rid][label] = real_state
+                self._plan(
+                    static_cm,
+                    data.shape,
+                    seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
+                )
+
+            # --- 3: replay ---
+            data.graph.replay()
+
+            # --- 4: advance seq_lens (Python-only, post-replay) ---
+            # Uses the per-request lengths planned in step 2, so this is correct for
+            # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
+            # config.advance_seq_lens=False when the caller advances the cache itself.
+            if (
+                self.config.advance_seq_lens
+                and static_cm is not None
+                and request_ids is not None
+            ):
                 for label in self.cache_labels:
-                    real_state = self.alloc_manager.get_state(rid, label)
-                    self.alloc_manager.get_state(dummy_rid, label)  # ensure slot exists
-                    self.alloc_manager.request_states[dummy_rid][label] = real_state
-            self._plan(
-                static_cm,
-                data.shape,
-                seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
-            )
-
-        # --- 3: replay ---
-        data.graph.replay()
-
-        # --- 4: advance seq_lens (Python-only, post-replay) ---
-        # Uses the per-request lengths planned in step 2, so this is correct for
-        # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
-        # config.advance_seq_lens=False when the caller advances the cache itself.
-        if (
-            self.config.advance_seq_lens
-            and static_cm is not None
-            and request_ids is not None
-        ):
-            for label in self.cache_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
-
-        # --- 5: restore dummy states ---
-        if static_cm is not None and request_ids is not None:
-            for i, dummy_rid in enumerate(data.dummy_rids):
-                for label in self.cache_labels:
-                    self.alloc_manager.reset_label(dummy_rid, label, free=i >= real_bs)
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
+        finally:
+            # --- 5: restore dummy states ---
+            # free= only for padding slots: slots < real_bs alias live states
+            # on the success path and must never have their pages freed.
+            if swapped:
+                for i, dummy_rid in enumerate(data.dummy_rids):
+                    for label in self.cache_labels:
+                        self.alloc_manager.reset_label(
+                            dummy_rid, label, free=i >= real_bs)
 
         # --- 6: return output view ---
         real_len = real_total_tokens if is_packed else real_bs
