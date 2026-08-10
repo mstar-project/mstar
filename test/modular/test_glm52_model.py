@@ -92,11 +92,16 @@ def _make_model_k(k: int) -> Glm52Model:
     return model
 
 
-def test_glm52_prefill_drafts_are_off_by_default():
+def test_glm52_prefill_drafts_are_off_by_default(monkeypatch):
     """Both MTP perf features ship OFF until GPU-validated. Enabling the
     prefill-draft edge measured 33.02 tok/s / p1 0.18 against the eager
-    path's 49.65 / 0.76 on 2026-08-10 (jointly with the sync capture, not
-    yet bisected), so the DEFAULT walk must be the known-good one."""
+    path's 49.65 / 0.76 on 2026-08-10, so the DEFAULT walk must be the
+    known-good one.
+
+    delenv, not ambient env: reading whatever the process happens to have
+    set is the exact dependence that let 8 tests rot silently in this
+    suite."""
+    monkeypatch.delenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", raising=False)
     prefill = _make_model_k(2).get_graph_walk_graphs()["prefill"]
     assert [e.name for e in prefill.outputs] == ["new_token"]
 
@@ -127,7 +132,7 @@ def test_glm52_prefill_persists_drafts_only_under_mtp(monkeypatch):
     assert by_name["new_token"].next_node == EMIT_TO_CLIENT
 
 
-def test_glm52_decode_never_reseeds_from_the_prompt_signal():
+def test_glm52_decode_never_reseeds_from_the_prompt_signal(monkeypatch):
     """REGRESSION (2026-08-10, cost a 27-min box run to find).
 
     The conductor seeds persist_signals from initial_signals, and this
@@ -158,11 +163,23 @@ def test_glm52_decode_never_reseeds_from_the_prompt_signal():
         "decode was seeded with the PROMPT instead of the emitted token")
     assert "PROMPT" not in res.unpersist_tensors
 
+    # And with the feature ON, so the guarantee is the NAME, not the flag.
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1")
+    res = _make_model_k(2).get_partition_forward_pass_args(
+        partition_name="default", partition_metadata=metadata,
+        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
+    )
+    assert res.inputs[0].tensor_info == ["tok"], (
+        "decode was seeded with the PROMPT instead of the emitted token")
+    assert "PROMPT" not in res.unpersist_tensors
 
-def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them():
+
+def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them(monkeypatch):
     """The prefill->decode handoff must prefer the persisted draft bundle
     over the bare new_token, and must unpersist BOTH so no per-request
     tensor outlives the transition."""
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1")
+
     def _transition(model, persist_signals):
         metadata = CurrentForwardConductorMetadata(
             input_modalities=["text"], output_modalities=["text"],
@@ -191,16 +208,27 @@ def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them():
     assert set(res.unpersist_tensors) == {"bundle", "tok"}
 
 
-def test_glm52_decode_loop_cap_is_not_the_token_budget():
-    """max_iters is a runaway guard, not the budget. Building it from the
-    startup default (1024) silently truncated any larger requested budget:
-    the decode edge carries no conductor_new_token, so the conductor's
-    max-token stop never fires for this model and check_stop — which sees
-    the request's real max_tokens — is the only thing enforcing it."""
+def test_glm52_decode_loop_cap_stays_below_the_context_guard():
+    """The decode loop cap must NOT be raised to max_seq_len.
+
+    The context-window check lives in preprocess, which is BATCH-level and
+    raises; kv_cache_engine catches only AllocationFailedError, so the
+    escape reaches _handle_main_loop_error and fails every CO-BATCHED
+    request. A cap at max_seq_len lets a long request iterate until it trips
+    that guard, converting a silent per-request truncation into a batch
+    kill. Tried 2026-08-10 and reverted; this pins the revert.
+
+    (Asserting the cap is strictly below the guard is the property. Merely
+    asserting it equals whatever the code sets would restate the line under
+    test and pass either way — which is what the first version of this test
+    did.)"""
     model = _make_model_k(0)
     decode = model.get_graph_walk_graphs()["decode"]
-    assert decode.max_iters == model.config.max_seq_len
-    assert decode.max_iters > model.config.max_output_tokens
+    assert decode.max_iters < model.config.index_topk, (
+        "loop cap can reach the batch-killing context guard")
+    assert decode.max_iters <= model.config.max_seq_len
+    # check_stop is the only thing enforcing the real per-request budget,
+    # because the decode edge carries no conductor_new_token.
     assert not any(e.conductor_new_token for e in decode.section.outputs)
 
 

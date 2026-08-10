@@ -2708,8 +2708,18 @@ class PiecewiseCudaGraphRunner:
         )
         plan_states: dict = {}
         for label in self.cache_labels:
+            # ``label`` here is the KV CACHE label ("main" for all three
+            # GLM-5.2 graphs) — it does not distinguish runners. Without
+            # self.label in the key, two labels capturing the same shape share
+            # one workspace, and FlashInfer's plan() writes scheduling state
+            # into it that the captured replay reads back: mtp_sync's plan
+            # silently overwrites what mtp_trunk's captured graph is about to
+            # read (both are (bs, k+1)). The full-graph runner has always
+            # keyed per slot for exactly this reason — see
+            # _create_persistent_wrappers.
+            ns = f"{self.label}_" if self.label else ""
             workspace = self.buffer_manager.get(
-                f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
+                f"{label}_pcgr_{ns}{shape.bs}_{shape.total_tokens}"
             )
             if use_mla_kernel:
                 wrapper = FlashInferMLAWrapper(
@@ -2921,10 +2931,13 @@ class PiecewiseCudaGraphRunner:
         # pressure, and without the finally the dummy slots would stay aliased
         # to live RequestState objects — a later replay's step-5
         # reset_label(free=True) on a stale-aliased padding slot would then
-        # free a live request's pages. ``swapped`` is set BEFORE the aliasing
-        # loop: restore is idempotent on never-aliased slots (reset_label
-        # replaces a fresh dummy state with a fresh dummy state and frees an
-        # empty page list), so a mid-loop failure is also covered.
+        # free a live request's pages — and because the real state's own
+        # page list stays populated, remove_request would later double-free
+        # those indices back into the allocator FIFO. ``swapped`` is set
+        # BEFORE the aliasing loop so a mid-loop failure is covered too:
+        # slots below real_bs that were never reached take free=False, which
+        # frees nothing at all), and slots at/above real_bs hold dummy state
+        # whose pages _capture_one already released.
         static_cm = data.static_cache_manager
         swapped = False
         try:

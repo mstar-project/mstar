@@ -47,6 +47,17 @@ from mstar.utils.sampling import SamplingConfig
 logger = logging.getLogger(__name__)
 
 
+def _mtp_prefill_drafts_enabled() -> bool:
+    """Carry the MTP prefill's [emitted, k drafts] bundle into decode step 1.
+
+    DEFAULT OFF pending GPU validation. Read through one helper so the edge
+    that WRITES the bundle and the transition that READS it can never
+    disagree: gating only the write path left the read live and regressed
+    the "off" arm on 2026-08-10.
+    """
+    return os.environ.get("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "0") == "1"
+
+
 def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
     """Tick a small CUDA kernel until the first real forward pass.
 
@@ -242,9 +253,7 @@ class Glm52Model(Model):
                 persist=True,
             ),
         ]
-        if self.config.mtp_num_draft_tokens > 0 and os.environ.get(
-            "MSTAR_GLM52_MTP_PREFILL_DRAFTS", "0"
-        ) == "1":
+        if self.config.mtp_num_draft_tokens > 0 and _mtp_prefill_drafts_enabled():
             # M3: the MTP prefill's forward also returns "text_inputs" =
             # [emitted token, k drafts]. Without a declared edge the worker
             # drops it (undeclared outputs are unrouted), the prefill's whole
@@ -255,14 +264,15 @@ class Glm52Model(Model):
             # decode loop with it, exactly the qwen3_tts talker_input_embeds
             # pattern.
             #
-            # DEFAULT OFF pending GPU validation. Unverified TP8 risk: this
-            # edge persists per rank, and if the fanout hands the transition
-            # 8 replicas instead of 1, decode step 1 consumes 8*(k+1) tokens
-            # as its text_inputs — which would advance the counter wrongly
-            # and misalign every later step of the request, i.e. exactly the
-            # uniform acceptance collapse measured on 2026-08-10 (33.02
-            # tok/s, p1 0.18). Bisect this against
-            # MSTAR_GLM52_MTP_CAPTURE_SYNC before making either default.
+            # DEFAULT OFF pending GPU validation.
+            #
+            # TP8 is NOT a hazard here, contrary to an earlier note in this
+            # spot: all 8 ranks do persist (to_conductor has no
+            # is_first_tp_rank gate) and persist_signals accumulates all 8,
+            # but _send_partition_inputs re-splits by source_tp_rank and
+            # glm52 is fully replicated, so each rank receives exactly its
+            # own copy — (k+1) tokens, not 8*(k+1). The shipping new_token
+            # seed rides the identical mechanism, which is the proof.
             prefill_outputs.append(
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
@@ -293,14 +303,21 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only — the per-request budget lives in
-            # check_stop (which sees the request's real max_tokens). Capping
-            # here at the startup default (1024) silently truncated any
-            # larger requested budget: the decode edge carries no
-            # conductor_new_token, so the conductor's own max-token stop
-            # never fires for this model. max_seq_len iterations always hits
-            # the context-window refusal first.
-            max_iters=self.config.max_seq_len,
+            # Runaway guard. The per-request budget lives in check_stop,
+            # which sees the request's real max_tokens.
+            #
+            # KNOWN LIMIT: a requested budget above this cap is silently
+            # truncated, because the decode edge carries no
+            # conductor_new_token so the conductor's own max-token stop never
+            # fires for this model. Do NOT "fix" that by raising the cap to
+            # max_seq_len — tried 2026-08-10 and reverted. The context-window
+            # check in preprocess is BATCH-level and raises; kv_cache_engine
+            # only catches AllocationFailedError, so the escape reaches
+            # _handle_main_loop_error and fails every co-batched request, not
+            # just the long one. Raising the cap converts a silent truncation
+            # into a batch kill. The real fix is a per-request budget signal
+            # on the decode edge.
+            max_iters=self.get_max_output_tokens(),
             outputs=[],
         )
 
@@ -380,7 +397,15 @@ class Glm52Model(Model):
         # bucket (eager trunk, wrong stream) and, with the prefill edge also
         # on, the p1 0.18 acceptance collapse. A dedicated name cannot
         # collide.
-        drafts = persist_signals.get(MTP_DRAFT_BUNDLE, [])
+        # Gated on the SAME flag as the edge that produces it. get_graph_walk_
+        # graphs() is evaluated independently in the conductor and in every
+        # worker, so a worker with the flag set and a conductor without it
+        # would persist a bundle that an ungated read here would consume —
+        # the write-gated/read-live split that already cost this lane a run.
+        drafts = (
+            persist_signals.get(MTP_DRAFT_BUNDLE, [])
+            if _mtp_prefill_drafts_enabled() else []
+        )
         if drafts:
             graph_edge.tensor_info = drafts
             # new_token was persisted too (for the client emission); consume

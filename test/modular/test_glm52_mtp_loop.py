@@ -105,7 +105,16 @@ class _StubDraftRunner:
     iteration — plan on the plane, rope at counter+1 derived from the
     aliased states (asserted equal to the caller's positions: the property
     the real plan_fn depends on), fused MTP forward, head argmax, advance
-    — with cloned outputs, mimicking PiecewiseOutput's clone-on-index."""
+    — with cloned outputs, mimicking PiecewiseOutput's clone-on-index.
+
+    SCOPE (true of every stub in this file): it runs EAGERLY on the real
+    handle. It does not replay a captured graph, does not go through
+    static_cm over aliased dummy rids, does not exercise can_run/_resolve_key
+    or batch padding (every test here is bs=1), and does not touch the
+    shared FlashInfer workspace. It proves the CALLER's arithmetic and
+    nothing about the replay machinery — which is exactly where the
+    2026-08-10 regression lived. Do not read a green run here as
+    "the capture works"."""
 
     def __init__(self, sub, handle):
         self.sub = sub
@@ -204,7 +213,7 @@ def _fwd_info(max_tokens: int, ignore_eos: bool) -> SimpleNamespace:
 
 
 def _drive(sub, handle, prompt, fwd_info, max_steps=64, runners=None,
-           carry_prefill_drafts=True):
+           carry_prefill_drafts=False):
     """Run prefill + decode through the submodule protocol until stop.
 
     ``carry_prefill_drafts`` mirrors the conductor's prefill->decode
@@ -213,9 +222,12 @@ def _drive(sub, handle, prompt, fwd_info, max_steps=64, runners=None,
     the PROMPT signal (a collision there fed decode the whole prompt back;
     2026-08-10). True carries the bundle, as the conductor does when the
     prefill-drafts edge is declared; False drops it and seeds decode from
-    the emitted token alone, which is the current default path. Greedy
-    verify makes the emitted stream identical either way, so both are
-    exercised.
+    the emitted token alone. Greedy verify makes the emitted stream
+    identical either way, so both are exercised.
+
+    Defaults to False because that is what SHIPS. A default of True would
+    leave the entire bit-identity suite exercising an off-by-default arm
+    while the production path rode on one test.
     """
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
