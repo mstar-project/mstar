@@ -23,6 +23,7 @@ dim and the out / down projections row-shard their input and all-reduce.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -264,7 +265,10 @@ class Cosmos3PackedMoTAttention(nn.Module):
     # handle's attention plan, not here.
     # ------------------------------------------------------------------
 
-    def forward_und(self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+    def forward_und(
+        self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        cache_handle, layer_idx: int, label: str,
+    ) -> torch.Tensor:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
         q = self.norm_q(self.to_q(und_seq).view(-1, H, D))
         k = self.norm_k(self.to_k(und_seq).view(-1, Hkv, D))
@@ -279,15 +283,20 @@ class Cosmos3PackedMoTAttention(nn.Module):
             q = sp_head_slice(self.sp_group, q)
             k = sp_head_slice(self.sp_group, k)
             v = sp_head_slice(self.sp_group, v)
-            out = cache_handle.run_attention(q=q, k=k, v=v)
+            out = cache_handle.run_attention(
+                q=q, k=k, v=v, layer_idx=layer_idx, label=label,
+            )
             out = sp_head_gather(self.sp_group, out).reshape(-1, H * D)
         else:
-            out = cache_handle.run_attention(q=q, k=k, v=v).reshape(-1, H * D)
+            out = cache_handle.run_attention(
+                q=q, k=k, v=v, layer_idx=layer_idx, label=label,
+            ).reshape(-1, H * D)
         return self.to_out(out)
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        cache_handle, seq_sizes: list[int] | None = None,
+        cache_handle, layer_idx: int, label: str,
+        seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
@@ -303,7 +312,11 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # denoise forward sets prefer_all_gather (the all-to-all does not replay
         # from a CUDA graph; all-gather does).
         out = ulysses_attention(
-            self.sp_group, q, k, v, cache_handle.run_attention, seq_sizes,
+            self.sp_group, q, k, v,
+            functools.partial(
+                cache_handle.run_attention, layer_idx=layer_idx, label=label,
+            ),
+            seq_sizes,
             prefer_all_gather=prefer_all_gather,
         ).reshape(-1, H * D)
         return self.to_add_out(out)
@@ -363,20 +376,27 @@ class Cosmos3MoTDecoderLayer(nn.Module):
 
         return residual_und + mlp_out_und, residual_gen + mlp_out_gen
 
-    def forward_und(self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache_handle) -> torch.Tensor:
+    def forward_und(
+        self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        cache_handle, layer_idx: int, label: str,
+    ) -> torch.Tensor:
         und_norm = self.input_layernorm(und_seq)
-        attn_out = self.self_attn.forward_und(und_norm, cos, sin, cache_handle)
+        attn_out = self.self_attn.forward_und(
+            und_norm, cos, sin, cache_handle, layer_idx, label
+        )
         residual = und_seq + attn_out
         return residual + self.mlp(self.post_attention_layernorm(residual))
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        cache_handle, seq_sizes: list[int] | None = None,
+        cache_handle, layer_idx: int, label: str,
+        seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
         gen_norm = self.input_layernorm_moe_gen(gen_seq)
         attn_out = self.self_attn.forward_gen(
-            gen_norm, cos, sin, cache_handle, seq_sizes, prefer_all_gather
+            gen_norm, cos, sin, cache_handle, layer_idx, label,
+            seq_sizes, prefer_all_gather
         )
         residual = gen_seq + attn_out
         return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
@@ -803,10 +823,11 @@ class Cosmos3OmniTransformer(nn.Module):
     # K/V; the generation tower then runs per denoising step, re-reading that
     # frozen K/V. Because the text tokens never receive a timestep embedding,
     # their K/V is step-independent, so caching it once is exact. ``cache_handle``
-    # is a paged attention handle (set_layer_idx / run_attention / advance_seq_lens);
-    # the attention plan (causal vs not, which label) is configured by the caller.
-    # These entry points pack text + vision, plus an optional action or sound
-    # band appended to the generation block (matching the reference ``forward``'s
+    # is the step's attention surface; every call names its layer and plan key
+    # (``label``), and the plan itself (causal vs not, which pages) was driven
+    # from the step declaration before the forward. These entry points pack
+    # text + vision, plus an optional action or sound band appended to the
+    # generation block (matching the reference ``forward``'s
     # ``[vision | action | sound]`` order).
     # ------------------------------------------------------------------
 
@@ -816,19 +837,18 @@ class Cosmos3OmniTransformer(nn.Module):
         return cos.squeeze(0), sin.squeeze(0)
 
     def prefill_und(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor, cache_handle
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor, cache_handle,
+        label: str,
     ) -> None:
-        """Run the understanding tower over the text prefix, writing per-layer K/V
-        to the cache under the active label and committing the prefix length.
-        ``position_ids`` are the text segment's 3D mRoPE ids ([3, und_len])."""
+        """Run the understanding tower over the text prefix, writing per-layer
+        K/V under ``label`` (the plan key the step declared). ``position_ids``
+        are the text segment's 3D mRoPE ids ([3, und_len])."""
         und_seq = self.embed_tokens(input_ids)
         cos, sin = self._rotary(position_ids, und_seq.device, und_seq.dtype)
         for i, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(i)
-            und_seq = layer.forward_und(und_seq, cos, sin, cache_handle)
-        cache_handle.advance_seq_lens()
+            und_seq = layer.forward_und(und_seq, cos, sin, cache_handle, i, label)
 
-    def _sp_run_gen_layers(self, gen_seq, cos, sin, cache_handle, prefer_all_gather=False):
+    def _sp_run_gen_layers(self, gen_seq, cos, sin, cache_handle, label, prefer_all_gather=False):
         """Run the generation layer stack, sequence-parallel-sharded across the
         SP group when active. ``gen_seq``/``cos``/``sin`` are the FULL sequence
         (identical on every SP rank); returns the FULL post-layer sequence.
@@ -844,17 +864,15 @@ class Cosmos3OmniTransformer(nn.Module):
         sp = self.sp_group
         if sp.world_size == 1:
             for i, layer in enumerate(self.layers):
-                cache_handle.set_layer_idx(i)
-                gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle)
+                gen_seq = layer.forward_gen(gen_seq, cos, sin, cache_handle, i, label)
             return gen_seq
         seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
         gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
         cos = scatter_sequence(sp, cos, seq_sizes)
         sin = scatter_sequence(sp, sin, seq_sizes)
         for i, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(i)
             gen_seq = layer.forward_gen(
-                gen_seq, cos, sin, cache_handle, seq_sizes, prefer_all_gather
+                gen_seq, cos, sin, cache_handle, i, label, seq_sizes, prefer_all_gather
             )
         return gather_sequence(sp, gen_seq, seq_sizes)
 
@@ -867,6 +885,7 @@ class Cosmos3OmniTransformer(nn.Module):
         vision_noisy_frame_indexes: list[torch.Tensor],
         vision_mse_loss_indexes: torch.Tensor,
         cache_handle,
+        label: str,
         action_latents: torch.Tensor | None = None,
         action_token_shapes: list[tuple[int, int, int]] | None = None,
         action_noisy_frame_indexes: list[torch.Tensor] | None = None,
@@ -883,7 +902,7 @@ class Cosmos3OmniTransformer(nn.Module):
 
         Patchifies ``latents`` ([1, C, T, H, W]), scatter-adds the timestep
         embedding to the noisy tokens, runs the generation layers (each reading
-        the active label's cached understanding K/V plus its own freshly written
+        ``label``'s cached understanding K/V plus its own freshly written
         K/V), and decodes the flow velocity. ``position_ids`` are the generation
         segment's 3D mRoPE ids ([3, num_gen]) — the vision band, then the action
         or sound band when present. ``vision_mse_loss_indexes`` /
@@ -919,7 +938,7 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
 
         cos, sin = self._rotary(position_ids, gen_seq.device, gen_seq.dtype)
-        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, cache_handle)
+        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, cache_handle, label)
         gen_out = self.norm_moe_gen(gen_seq)
         preds_packed = self.proj_out(gen_out[vision_mse_loss_indexes])
         preds = self._unpatchify_and_unpack_latents(
@@ -950,6 +969,7 @@ class Cosmos3OmniTransformer(nn.Module):
         vision_noisy_frame_indexes: list[torch.Tensor],
         vision_mse_loss_indexes: torch.Tensor,
         cache_handle,
+        label: str,
         action_latents: torch.Tensor | None = None,
         action_token_shapes: list[tuple[int, int, int]] | None = None,
         action_noisy_frame_indexes: list[torch.Tensor] | None = None,
@@ -1010,7 +1030,8 @@ class Cosmos3OmniTransformer(nn.Module):
         sin = torch.cat([sin_c, sin_u], dim=0)
 
         gen_seq = self._sp_run_gen_layers(
-            gen_seq, cos, sin, cache_handle, prefer_all_gather=prefer_all_gather
+            gen_seq, cos, sin, cache_handle, label,
+            prefer_all_gather=prefer_all_gather,
         )
         gen_out = self.norm_moe_gen(gen_seq)
 
@@ -1036,7 +1057,7 @@ class Cosmos3OmniTransformer(nn.Module):
 
         return _decode(gen_out[:n]), _decode(gen_out[n:])
 
-    def denoise_step_batched(self, requests: list[dict], cache_handle):
+    def denoise_step_batched(self, requests: list[dict], cache_handle, label: str):
         """Denoise one step for several requests at once (image / video).
 
         Each request carries its own latents, timestep, rotary positions (which
@@ -1087,7 +1108,7 @@ class Cosmos3OmniTransformer(nn.Module):
         all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
         cos = torch.cat(cos_cond + cos_uncond, dim=0)
         sin = torch.cat(sin_cond + sin_uncond, dim=0)
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, cache_handle)
+        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, cache_handle, label)
         gen_out = self.norm_moe_gen(all_gen)
 
         sizes = [g.shape[0] for g in gen_seqs]
@@ -1119,7 +1140,9 @@ class Cosmos3OmniTransformer(nn.Module):
             results.append((cond_v, uncond_v))
         return results
 
-    def denoise_step_action_batched(self, requests: list[dict], cache_handle, with_cfg: bool):
+    def denoise_step_action_batched(
+        self, requests: list[dict], cache_handle, label: str, with_cfg: bool,
+    ):
         """Joint ``[video | action]`` denoise for several action requests at once.
 
         The action analogue of ``denoise_step_batched``. Each request carries its
@@ -1183,7 +1206,7 @@ class Cosmos3OmniTransformer(nn.Module):
             cos = torch.cat(cos_cond, dim=0)
             sin = torch.cat(sin_cond, dim=0)
 
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, cache_handle)
+        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, cache_handle, label)
         gen_out = self.norm_moe_gen(all_gen)
 
         sizes = [g.shape[0] for g in gen_seqs]

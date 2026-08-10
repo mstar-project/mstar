@@ -87,6 +87,7 @@ class EngineManager:
         real computation.
         """
         node_to_engine_type = model.get_node_engine_types()
+        node_resource_specs = model.get_node_resources(kv_config)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
@@ -163,6 +164,7 @@ class EngineManager:
                 device=device,
                 transfer_engine_info=transfer_engine_info,
                 kv_cache_type=autocast_dtype,
+                node_resources=node_resource_specs,
                 default_sampling_config={
                     node: model.resolve_sampling_configs(node, {}) \
                         for node in submodules
@@ -209,18 +211,25 @@ class EngineManager:
                 engine.remove_request(request_id)
 
     def set_alloc_write_policies(self, policy):
-        for engine in self._unique_engines():
-            engine.set_alloc_write_policy(policy)
+        """Apply a store write policy to every distinct KV cache pool."""
+        seen: set[int] = set()
+        for node_name, engine in self.node_to_engine.items():
+            pool = engine.node_resources(node_name).get("kv")
+            if pool is None or id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            pool.set_write_policy(policy)
 
     def lru_tracked_nodes(self) -> list[str]:
-        """Aggregate ``engine.lru_tracked_nodes()`` across unique engines.
-        The worker uses this to seed / clean up the per-request LRU
-        timestamps it needs for offload-victim selection.
+        """Nodes whose engine holds a KV cache pool for them. The worker
+        uses this to seed / clean up the per-request LRU timestamps it
+        needs for offload-victim selection.
         """
-        out: list[str] = []
-        for engine in self._unique_engines():
-            out.extend(engine.lru_tracked_nodes())
-        return out
+        return [
+            node_name
+            for node_name, engine in self.node_to_engine.items()
+            if "kv" in engine.node_resources(node_name)
+        ]
 
     def _unique_engines(self) -> list[BaseEngine]:
         seen = set()

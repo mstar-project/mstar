@@ -103,6 +103,8 @@ class Qwen3OmniTalkerLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cache_handle: BatchedCacheManager,
+        layer_idx: int | None = None,
+        label: str | None = None,
     ) -> torch.Tensor:
         # ---------- self-attention with pre-norm ----------
         residual = hidden_states
@@ -110,6 +112,8 @@ class Qwen3OmniTalkerLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             cache_handle=cache_handle,
+            layer_idx=layer_idx,
+            label=label,
         )
         hidden_states = residual + hidden_states
 
@@ -156,15 +160,16 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
         self,
         input_embeds: torch.Tensor,
         cache_handle: BatchedCacheManager,
+        label: str = "main",
     ) -> torch.Tensor:
         hidden_states = input_embeds
         for layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
-                hidden_states=hidden_states, cache_handle=cache_handle
+                hidden_states=hidden_states,
+                cache_handle=cache_handle,
+                layer_idx=layer_idx,
+                label=label,
             )
-
-        cache_handle.advance_seq_lens()
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -230,6 +235,7 @@ class Qwen3OmniTalkerModel(nn.Module):
         self,
         input_embeds: torch.Tensor,
         cache_handle: BatchedCacheManager,
+        label: str = "main",
     ) -> torch.Tensor:
         """Run the Talker backbone and return the final hidden states.
 
@@ -239,12 +245,15 @@ class Qwen3OmniTalkerModel(nn.Module):
         Args:
             input_embeds: [total_tokens, hidden_size] -- pre-embedded input
                 (may combine codec embeddings and projected Thinker states).
-            cache_handle: ``BatchedCacheManager`` for paged KV attention.
+            cache_handle: the step surface for paged KV attention.
+            label: the plan key every layer runs against.
 
         Returns:
             hidden_states: [total_tokens, hidden_size] after final RMS norm.
         """
-        return self.model(input_embeds=input_embeds, cache_handle=cache_handle)
+        return self.model(
+            input_embeds=input_embeds, cache_handle=cache_handle, label=label,
+        )
 
 
 # ---------------------------------------------------------------------------

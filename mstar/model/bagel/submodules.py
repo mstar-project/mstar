@@ -17,6 +17,7 @@ from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mstar.engine.kv_store import PositionInfo
+from mstar.engine.resources import PlanSpec, StepDeclaration
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -396,13 +397,13 @@ class LLMSubmodule(ARNodeSubmodule):
     followed by an Euler step: x_{t+1} = x_t + v_final * dt.
 
     Multi-cache orchestration is driven by the requires_cfg flag in
-    per-request metadata. When True, graph walk methods manage 3 caches:
-      - prefill_text: snapshot main->cfg_text, forward [main, cfg_img]
-      - prefill_vit/vae: forward [main], snapshot main->cfg_text
+    per-request metadata. When True, the declared steps cover 3 caches:
+      - prefill_text: fork main->cfg_text before, forward [main, cfg_img]
+      - prefill_vit/vae: forward [main], fork main->cfg_text at commit
       - decode: forward [main, cfg_img]
       - image_gen: 3-pass CFG with conditional skip and renormalization
-    The CacheHandle (provided by KVCacheEngine) manages label switching, page
-    allocation, and KV data copying.
+    The runner drives the declaration (forks, plans, commits); every
+    forward call names its label.
     """
 
     # Node name → cache label mapping for image_gen_cfg
@@ -498,16 +499,15 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
         """Declare CUDA graph captures for ``decode`` (cfg-off + cfg-on) and ``prefill_text`` (cfg-off only).
 
-        cfg-on prefill_text is intentionally NOT captured. BAGEL's
-        ``preprocess`` for prefill_text+cfg calls
-        ``cache_handle.snapshot_all("main", "cfg_text")`` which writes to
-        the cache_manager's ``request_ids`` (= ``dummy_rids`` at replay).
-        ``cfg_text`` is not in ``config.labels`` (only ``main`` + ``cfg_img``
-        get FlashInfer wrappers), so the runner's state-swap doesn't alias
-        it onto the real request and the snapshot lands on the dummy slot.
-        cfg-on prefill_text continues to use the eager path; downstream
-        image_gen / decode+cfg captures are unaffected (they don't depend
-        on this capture's snapshot semantics).
+        cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
+        prefill_text declares a pre-forward fork of the main stream
+        (main to cfg_text), an allocating operation. Replay addresses the
+        cache manager at the real request ids, so the fork would land on
+        real state now, but a captured cfg-on prefill has never been
+        exercised and stays off until verified on its own. cfg-on prefill_text continues to
+        use the eager path; downstream image_gen / decode+cfg captures are
+        unaffected (they don't depend on this capture's snapshot
+        semantics).
         """
         dummy = ARNodeInputs(
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
@@ -633,106 +633,96 @@ class LLMSubmodule(ARNodeSubmodule):
 
         return node_inputs
 
-    def preprocess(
+    def declare_step(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
-    ) -> dict[str, torch.Tensor | Any]:
-
-        """Data transform + plan attention/rope for all relevant labels.
-
-        When cache_handle is provided (sequential execution), calls
-        plan_attention/plan_rope for every cache label needed by this
-        graph walk. This must happen outside forward() because plan
-        operations are CUDA graph incompatible.
-
-        When cache_handle is None (batched execution preprocesses per-request
-        without planning; planning is done separately via preprocess_batched).
-        """
-        cache_manager = engine_inputs.cache_manager
-
+    ) -> StepDeclaration:
         requires_cfg = self._batch_get_requires_cfg(
             engine_inputs.per_request_info
         )
         labels = self._get_active_labels(graph_walk, requires_cfg)
-        seq_lens = [inp.input_seq_len for inp in inputs]
-        per_label_custom_pos_ids = {
+        spans = tuple(inp.input_seq_len for inp in inputs)
+        per_label_pos_ids = {
             label: [
                 inp.custom_pos_ids[label] for inp in inputs \
                     if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
             ] for label in labels
         }
 
-        result = {}
+        if graph_walk == "image_gen" and requires_cfg:
+            # Batched CFG: one combined plan across all 3 labels so image_gen
+            # runs one forward pass instead of 3. The frozen caches never
+            # grow during flow matching, so nothing commits.
+            return StepDeclaration(plans=(PlanSpec(
+                labels=tuple(labels),
+                spans={label: spans for label in labels},
+                is_causal=False,
+                write_store=False,
+                rope=True,
+                rope_pos_ids=per_label_pos_ids,
+                combined=True,
+                commit=False,
+            ),))
 
+        writes = graph_walk not in ("image_gen", "image_gen_cfg")
+        # Image blocks occupy one position regardless of their token count.
+        pos_advance = (
+            (1,) * len(inputs)
+            if graph_walk in ("prefill_vit", "prefill_vae") else None
+        )
+        plans = []
+        for label in labels:
+            pos_list = per_label_pos_ids.get(label)
+            plans.append(PlanSpec(
+                labels=(label,),
+                spans={label: spans},
+                is_causal=graph_walk in ("prefill_text", "decode"),
+                write_store=writes,
+                rope=True,
+                rope_pos_ids=torch.cat(pos_list) if pos_list else None,
+                commit=writes,
+                pos_advance=pos_advance,
+            ))
 
+        pre_forks: tuple = ()
+        post_forks: tuple = ()
+        if requires_cfg:
+            if graph_walk == "prefill_text":
+                # cfg_text keeps the pre-text context, so it forks before
+                # anything plans or writes.
+                pre_forks = (("main", "cfg_text"),)
+            elif graph_walk in ("prefill_vit", "prefill_vae"):
+                # cfg_text tracks the context including this image, so it
+                # forks at commit, after the step's writes have landed.
+                post_forks = (("main", "cfg_text"),)
+        return StepDeclaration(
+            plans=tuple(plans), pre_forks=pre_forks, post_forks=post_forks,
+        )
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> dict[str, torch.Tensor | Any]:
+        """Data transform for the forward; the plans come from the step
+        declaration the runner drives before this runs."""
         if graph_walk in ("image_gen", "image_gen_cfg"):
             assert len(inputs) == 1 , "Batching not supported for image gen"
 
-        if graph_walk == "image_gen" and requires_cfg:
-            # Batched CFG: plan a single FlashInfer batch across all 3 labels
-            # so that image_gen can run one forward pass instead of 3.
-            cache_manager.plan_attention_batched_cfg(
-                labels=labels,
-                seq_lens=seq_lens,
-                is_causal=False,
-                write_store=False,
-            )
-            cache_manager.plan_rope_batched_cfg(
-                labels=labels,
-                seq_lens=seq_lens,
-                per_label_pos_ids=per_label_custom_pos_ids,
-            )
-        else:
-            self._plan_for_graph_walk(
-                cache_handle=cache_manager,
-                seq_lens=seq_lens,
-                per_label_custom_pos_ids=per_label_custom_pos_ids,
-                is_causal=graph_walk in [
-                    "prefill_text", "decode"
-                ],
-                labels=labels,
-                snapshots=[("main", "cfg_text")] if graph_walk == "prefill_text" and requires_cfg else [],
-                write_cache=graph_walk not in ("image_gen", "image_gen_cfg")
-            )
-
         # Concatenate lists of tensors into single tensors for each input name
         result = ARNodeInputs.collate(inputs, stacking_method=StackingMethod.CAT)
-        result["seq_lens"] = seq_lens
-        result["requires_cfg"] =  requires_cfg
+        result["seq_lens"] = [inp.input_seq_len for inp in inputs]
+        result["requires_cfg"] = self._batch_get_requires_cfg(
+            engine_inputs.per_request_info
+        )
         result["sample_token"] = any([
             info.step_metadata.get("sample_prefill_token", True) \
                 for info in engine_inputs.per_request_info.values()
         ])
         return result
-
-    def _plan_for_graph_walk(
-        self, cache_handle: BatchedCacheManager,
-        seq_lens: list[int],
-        per_label_custom_pos_ids: dict[str, list[torch.Tensor]] = {},
-        is_causal=True,
-        labels=["main"],
-        snapshots=[],
-        write_cache=True
-    ) -> None:
-        """Plan attention and rope for all cache labels needed by this graph walk."""
-        for snap in snapshots:
-            cache_handle.snapshot_all(*snap)
-
-        for label in labels:
-            pos_ids = per_label_custom_pos_ids.get(label)
-            if pos_ids is not None and len(pos_ids) > 0:
-                pos_ids = torch.cat(pos_ids)
-            else:
-                pos_ids = None
-            cache_handle.plan_attention(
-                seq_lens=seq_lens, is_causal=is_causal, label=label,
-                write_store=write_cache
-            )
-            cache_handle.plan_rope(
-                seq_lens=seq_lens, pos_ids=pos_ids, label=label
-            )
 
     def forward(
         self,
@@ -769,11 +759,9 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
 
-        When requires_cfg is True (image generation mode):
-        1. Snapshot main -> cfg_text BEFORE forward (done in preprocess)
-        2. Forward for main and cfg_img (both see the text tokens)
-
-        plan_attention/plan_rope are called in preprocess for all needed labels.
+        When requires_cfg is True (image generation mode), the declared
+        step forks main -> cfg_text before anything plans, and the forward
+        runs for main and cfg_img (both see the text tokens).
         """
         emb = self.embed_tokens(input_ids)
         requires_cfg = kwargs.pop("requires_cfg", False)
@@ -784,22 +772,19 @@ class LLMSubmodule(ARNodeSubmodule):
 
         if requires_cfg and cache_handle is not None:
             for label in ["main", "cfg_img"]:
-                cache_handle.set_active_label(label)
                 out = self.language_model(
                     emb, mode="und",
-                    cache_handle=cache_handle, **kwargs
+                    cache_handle=cache_handle, label=label, **kwargs
                 )
                 if label == "main":
                     hidden = out
         else:
-            if cache_handle is not None:
-                cache_handle.set_active_label("main")
             hidden = self.language_model(
                 emb, mode="und",
-                cache_handle=cache_handle, **kwargs
+                cache_handle=cache_handle, label="main", **kwargs
             )
         if sample_token:
-            qo_indptr_buf = cache_handle.get_qo_indptr_buf("main")
+            qo_indptr_buf = cache_handle.attention.qo_indptr_buf("main")
             assert qo_indptr_buf is not None
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
             last_hidden = hidden.index_select(0, last_token_indices)
@@ -816,28 +801,22 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
         """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
 
-        When requires_cfg is True: forward for main only, then snapshot
-        main -> cfg_text (cfg_text = context including this image).
-
-        plan_attention/plan_rope are called in preprocess.
+        When requires_cfg is True the declared step forks main ->
+        cfg_text at commit (cfg_text = context including this image).
         """
-        requires_cfg = kwargs.pop("requires_cfg", False)
+        kwargs.pop("requires_cfg", None)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
-        cache_handle.set_active_label("main")
         hidden = self.language_model(
             input_embeds, mode="und",
-            custom_advance_pos_id=1,
-            cache_handle=cache_handle, **kwargs
+            cache_handle=cache_handle, label="main", **kwargs
         )
 
-        if requires_cfg:
-            cache_handle.snapshot_all("main", "cfg_text")
         if sample_token:
-            qo_indptr_buf = cache_handle.get_qo_indptr_buf("main")
+            qo_indptr_buf = cache_handle.attention.qo_indptr_buf("main")
             assert qo_indptr_buf is not None
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
             last_hidden = hidden.index_select(0, last_token_indices)
@@ -857,33 +836,26 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
         """VAE image emb -> LLM forward (bidirectional, gen mode).
 
-        When requires_cfg is True: forward for main only, then snapshot
-        main -> cfg_text (cfg_text = context including this image).
-
-        plan_attention/plan_rope are called in preprocess.
+        When requires_cfg is True the declared step forks main ->
+        cfg_text at commit (cfg_text = context including this image).
         """
-        requires_cfg = kwargs.pop("requires_cfg", False)
+        kwargs.pop("requires_cfg", None)
         kwargs.pop("cache_labels", None)
         kwargs.pop("snapshot_after", None)
         kwargs.pop("is_prefill", None)
 
-        if cache_handle is not None:
-            cache_handle.set_active_label("main")
         self.language_model(
             input_embeds, mode="gen",
             cache_handle=cache_handle,
+            label="main",
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
             text_mask=text_mask,
-            custom_advance_pos_id=1,
             **kwargs
         )
 
         # NOTE: we will never sample a token from prefill_vae because it is alwaus
         # followed by prefill_vit
-
-        if requires_cfg and cache_handle is not None:
-            cache_handle.snapshot_all("main", "cfg_text")
         return {}
 
     def _forward_decode(
@@ -898,8 +870,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
         When requires_cfg is True: also forward for cfg_img to keep its
         KV cache in sync (cfg_img tracks all text, no images).
-
-        plan_attention/plan_rope are called in preprocess for all needed labels.
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
@@ -910,18 +880,15 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("top_p", None)
         emb = self.embed_tokens(input_ids)
 
-        if cache_handle is not None:
-            cache_handle.set_active_label("main")
         hidden = self.language_model(
             emb, mode="und",
-            cache_handle=cache_handle, **kwargs
+            cache_handle=cache_handle, label="main", **kwargs
         )
 
         if requires_cfg and cache_handle is not None:
-            cache_handle.set_active_label("cfg_img")
             self.language_model(
                 emb, mode="und",
-                cache_handle=cache_handle, **kwargs
+                cache_handle=cache_handle, label="cfg_img", **kwargs
             )
 
         logits = self.lm_head(hidden[-1:])
@@ -953,9 +920,10 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
         """Flow matching Euler step with optional 3-pass CFG.
 
-        Uses cache_handle to switch between the 3 frozen KV caches
-        (main, cfg_text, cfg_img). write_cache=False since caches are
-        frozen during flow matching.
+        Runs against the 3 frozen KV caches (main, cfg_text, cfg_img)
+        through one combined plan; the declared step writes no store and
+        commits nothing since the caches are frozen during flow
+        matching.
 
         When requires_cfg is False, runs a single forward pass (main only)
         without CFG, saving 2/3 of the compute.
@@ -1029,10 +997,9 @@ class LLMSubmodule(ARNodeSubmodule):
             ])
             batched_text_mask = text_mask.repeat(3)
 
-            cache_handle.set_active_label("_cfg_batched")
             hidden = self.language_model(
                 batched_emb, mode="gen",
-                cache_handle=cache_handle, write_cache=False,
+                cache_handle=cache_handle, label="_cfg_batched",
                 vae_token_indexes=batched_vae_indexes,
                 text_indexes=batched_text_indexes,
                 text_mask=batched_text_mask,
@@ -1077,12 +1044,10 @@ class LLMSubmodule(ARNodeSubmodule):
                     ).clamp(min=cfg_renorm_min, max=1.0)
                 v_final = v_combined * renorm_scale
         else:
-            # No CFG: single forward pass (plan done in preprocess)
-            if cache_handle is not None:
-                cache_handle.set_active_label("main")
+            # No CFG: single forward pass over the declared plan
             hidden = self.language_model(
                 empty_combined_emb, mode="gen",
-                cache_handle=cache_handle, write_cache=False,
+                cache_handle=cache_handle, label="main",
                 vae_token_indexes=vae_token_indexes,
                 text_indexes=text_indexes,
                 text_mask=text_mask,
@@ -1148,12 +1113,9 @@ class LLMSubmodule(ARNodeSubmodule):
         empty_combined_emb[1:-1] = latents_
 
         label = self._NODE_TO_CFG_LABEL.get(self.node_name, "main")
-        if cache_handle is not None:
-            cache_handle.set_active_label(label)
-
         hidden = self.language_model(
             empty_combined_emb, mode="gen",
-            cache_handle=cache_handle, write_cache=False,
+            cache_handle=cache_handle, label=label,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
             text_mask=text_mask,
@@ -1252,25 +1214,21 @@ class LLMSubmodule(ARNodeSubmodule):
 
         Returns logits per request. Token sampling is done by the engine
         post-forward (outside CUDA graph capture).
-
-        plan_attention/plan_rope are called in preprocess_batched.
         """
         # 1. Embed and concatenate
         embs = self.embed_tokens(input_ids)
 
         # 2. Single LLM forward (main cache, already planned)
-        cache_manager.set_active_label("main")
         hidden = self.language_model(
             embs, mode="und",
-            cache_handle=cache_manager,
+            cache_handle=cache_manager, label="main",
         )
 
         # 3. CFG sync pass for cfg_img if needed (already planned)
         if requires_cfg:
-            cache_manager.set_active_label("cfg_img")
             self.language_model(
                 embs, mode="und",
-                cache_handle=cache_manager,
+                cache_handle=cache_manager, label="cfg_img",
             )
 
         # 4. Per-request lm_head -> logits (no sampling — done post-forward)

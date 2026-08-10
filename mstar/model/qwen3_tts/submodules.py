@@ -97,7 +97,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.cp_config = config.talker.code_predictor
         self.num_codes = config.talker.num_code_groups
         self._suppress_mask: torch.Tensor | None = None
-        self._cp_kv_cache: torch.Tensor | None = None
 
     def _get_suppress_mask(self) -> torch.Tensor:
         """Cache the checkpoint's static invalid-token mask on the worker GPU."""
@@ -134,28 +133,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         return mask
 
     def _get_cp_kv_cache(self, batch_size: int) -> torch.Tensor:
-        """Return the fixed CodePredictor scratch cache for this micro-batch.
-
-        CodePredictor attention is local to one 16-group frame, so this cache
-        does not belong to the engine's cross-step paged KV cache. A maximum
-        batch allocation is reused and overwritten for every Talker step,
-        which also gives the captured decode graph stable addresses.
+        """The engine-built CodePredictor scratch cache, sliced to this
+        micro-batch. The fixed maximum-batch tensor is overwritten every
+        Talker step and gives the captured decode graph stable addresses.
         """
-        expected = (
-            self.cp_config.num_hidden_layers,
-            self.MAX_BATCH_SIZE,
-            2,
-            self.num_codes,
-            self.cp_config.num_key_value_heads,
-            self.cp_config.head_dim,
-        )
-        if self._cp_kv_cache is None:
-            self._cp_kv_cache = torch.empty(
-                expected,
-                dtype=self.model.model.codec_embedding.weight.dtype,
-                device=self.get_device(),
-            )
-        return self._cp_kv_cache[:, :batch_size]
+        return self.node_resources["code_predictor"].tensor[:, :batch_size]
 
     def _project_text(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Map tokenizer embeddings into the Talker hidden width."""
@@ -659,8 +641,9 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         The whole-walk decode graph already covers this loop; this runner serves
         the paths it can't — chiefly ``talker_prefill``, which stays eager
-        because it is variable-length and runs once per request. It has no
-        engine KV cache: its frame-local cache is a static tensor owned here.
+        because it is variable-length and runs once per request. It uses no
+        paged KV cache: its frame-local cache is the engine's fixed-shape
+        scratch pool.
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size

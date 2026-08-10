@@ -11,6 +11,7 @@ import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.base import EngineType, NodeBatch
+from mstar.engine.resources import ScratchKVPool
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
@@ -768,6 +769,20 @@ def test_qwen3_tts_depth_loop_piecewise_captures_its_own_sampling():
     ).to(device=dev, dtype=torch.bfloat16).eval()
     submodule.code_predictor.consolidate_stacked_weights()
     submodule.DECODE_CAPTURE_BATCH_SIZES = [1, 2]
+    # The depth loop's scratch cache is engine-built in serving; bind the
+    # same declared shape here since no engine is constructed.
+    class _DeclaringModel(Qwen3TTSModel):
+        def __init__(self):
+            self.config = config
+
+    _DeclaringModel.__abstractmethods__ = frozenset()
+    declaring = _DeclaringModel()
+    scratch = declaring.get_node_resources(
+        declaring.get_kv_cache_config()
+    )[0].scratch["code_predictor"]
+    submodule.bind_node_resources({"code_predictor": ScratchKVPool(
+        torch.zeros(scratch.shape, dtype=torch.bfloat16, device=dev)
+    )})
 
     rids = ["a", "b"]
     multi = MultiSamplingConfig(

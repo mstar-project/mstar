@@ -634,20 +634,10 @@ class PagedAllocationManager:
         state.position_id_start = seq_info.pos_id
         state.read_in_progress = future is not None
 
-    def get_per_label_seq_info(self, request_id: str):
-        per_label_seq_info: dict[str, SequenceInfo] = {}
-        transfer_info = self._kv_transfer_engine.get_kv_transfer_info()
-        for label, state in self.request_states.get(request_id, {}).items():
-            self.wait_for_retrieves(request_id, label)
-
-            state = self.get_state(request_id, label)
-            per_label_seq_info[label] = SequenceInfo(
-                seq_len = state.seq_len,
-                pos_id = state.position_id_start,
-                latest_kv_transfer_info=transfer_info,
-                page_indices=state.page_indices
-            )
-        return per_label_seq_info
+    def get_kv_transfer_info(self):
+        """Descriptor another process needs to read this cache remotely.
+        ``KVCachePool.publish`` stamps it onto every ``SequenceInfo``."""
+        return self._kv_transfer_engine.get_kv_transfer_info()
 
     def get_labels(self, request_id: str):
         return list(self.request_states[request_id].keys())

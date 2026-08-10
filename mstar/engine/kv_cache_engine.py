@@ -36,6 +36,9 @@ from mstar.engine.kv_store import (
     StoreWritePolicy,
     TransferEngineInfo,
 )
+from mstar.engine.resources import KVCachePool, RopeEmbedder, ScratchKVPool
+from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.step import StepPlan, StepRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mstar.utils.profiler import range_pop, range_push
 from mstar.utils.sampling import MultiSampler, MultiSamplingConfig
@@ -49,7 +52,6 @@ class KVManagement:
     kv_cache_config: KVCacheConfig
     kv_cache: torch.Tensor
     alloc_manager: PagedAllocationManager
-    cpu_page_pool: CPUPagePool | None
     buffer_manager: WorkspaceBufferManager
     # source name -> cross-attention context pool (see KVCacheConfig.cross_attn)
     cross_pools: dict[str, CrossAttnPool] = field(default_factory=dict)
@@ -57,6 +59,13 @@ class KVManagement:
     # sources); precomputed at build time since it can't change after
     # startup, so per-request add/remove doesn't re-walk cross_pools.
     cross_alloc_managers: list[PagedAllocationManager] = field(default_factory=list)
+    # Persistent resource fronts over the managers above: the pool is the
+    # engine's surface for admission, retrieval, offload tiers, position
+    # reads, and publishing; the embedder owns position semantics. Built
+    # once at load_model and shared by every step's facade.
+    kv_pool: KVCachePool | None = None
+    cross_kv_pools: dict[str, KVCachePool] = field(default_factory=dict)
+    rope_embedder: RopeEmbedder | None = None
 
 
 def _build_cross_pools(
@@ -154,6 +163,13 @@ class KVCacheEngine(BaseEngine):
 
         self.kv_management: dict[str, KVManagement] = {}
         self.submodule_management: dict[str, SubmoduleManagement] = {}
+        # node name -> the named resources built for it at load_model
+        # (shared between nodes on the same KV cache group).
+        self._node_resources: dict[str, dict[str, object]] = {}
+
+        # Sequences each batch's resource lifecycle: admit before prepare,
+        # plan surface before forward, publish after.
+        self.step_runner = StepRunner()
 
         self.device = None
         self.autocast_dtype = autocast_dtype
@@ -166,10 +182,10 @@ class KVCacheEngine(BaseEngine):
         # warnings — logged at most once per (node, graph walk).
         self._logged_missing_rid_outputs: set[tuple[str, str]] = set()
 
-    capabilities = EngineCapabilities(
-        requires_kv_cache=True,
-        supports_cpu_offload=True,
-    )
+    capabilities = EngineCapabilities(requires_kv_cache=True)
+
+    def node_resources(self, node_name: str) -> dict[str, object]:
+        return self._node_resources.get(node_name, {})
 
     def engine_type(self) -> EngineType:
         return EngineType.KV_CACHE
@@ -183,13 +199,21 @@ class KVCacheEngine(BaseEngine):
         transfer_engine_info: TransferEngineInfo,
         default_sampling_config: dict[str, MultiSamplingConfig],
         kv_cache_type=None,
+        node_resources: list[NodeResourceSpec] | None = None,
     ) -> None:
         self.device = device
         if kv_cache_type is None:
             kv_cache_type = self.autocast_dtype
 
+        # Callers that pass only raw configs get the default declaration,
+        # the same one Model.get_node_resources derives.
+        specs = node_resources or [
+            NodeResourceSpec(kv_cache_config=cfg) for cfg in kv_cache_config
+        ]
+
         node_to_kv_mgmt = {}
-        for cfg in kv_cache_config:
+        for spec in specs:
+            cfg = spec.kv_cache_config
             num_layers = cfg.num_layers
             max_num_pages = cfg.max_num_pages
             page_size = cfg.page_size
@@ -256,29 +280,52 @@ class KVCacheEngine(BaseEngine):
                 if all(pool.alloc_manager is not m for m in cross_alloc_managers):
                     cross_alloc_managers.append(pool.alloc_manager)
 
+            alloc_manager = PagedAllocationManager(
+                config=cfg,
+                kv_cache=kv_cache,
+                transfer_engine_info=transfer_engine_info
+            )
             kv_mgmt = KVManagement(
                 kv_cache_config=cfg,
                 kv_cache=kv_cache,
-                alloc_manager=PagedAllocationManager(
-                    config=cfg,
-                    kv_cache=kv_cache,
-                    transfer_engine_info=transfer_engine_info
-                ),
-                cpu_page_pool=cpu_page_pool,
+                alloc_manager=alloc_manager,
                 buffer_manager = WorkspaceBufferManager(
                     int(os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")) * 1024 * 1024,
                     device=device,
                 ),
                 cross_pools=cross_pools,
                 cross_alloc_managers=cross_alloc_managers,
+                kv_pool=KVCachePool(alloc_manager, cpu_pool=cpu_page_pool),
+                cross_kv_pools={
+                    source: KVCachePool(pool.alloc_manager)
+                    for source, pool in cross_pools.items()
+                },
+                rope_embedder=RopeEmbedder(),
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
 
+            resources: dict[str, object] = {
+                "kv": kv_mgmt.kv_pool,
+                "rope": kv_mgmt.rope_embedder,
+            }
+            for source, cross_kv_pool in kv_mgmt.cross_kv_pools.items():
+                resources[f"cross_kv:{source}"] = cross_kv_pool
+            for key, scratch_spec in spec.scratch.items():
+                resources[key] = ScratchKVPool(torch.zeros(
+                    scratch_spec.shape,
+                    dtype=scratch_spec.dtype or kv_cache_type,
+                    device=device,
+                ))
+
             for node_name in nodes:
                 node_to_kv_mgmt[node_name] = kv_mgmt
+                self._node_resources[node_name] = resources
 
         for node_name, submodule in submodules.items():
             tp_group = parallel_groups.get_tp_config_for_node(node_name)
+            submodule.bind_node_resources(
+                self._node_resources.get(node_name, {})
+            )
             sampl_cfg = default_sampling_config.get(
                 node_name, MultiSamplingConfig()
             )
@@ -302,7 +349,6 @@ class KVCacheEngine(BaseEngine):
         submod_mgmt = self.submodule_management[node_name]
         cache_mgmt = submod_mgmt.kv_management
 
-        from mstar.engine.kv_store import StoreWritePolicy
         autowrite = (cache_mgmt.alloc_manager.write_policy == StoreWritePolicy.ALWAYS)
 
         return create_cache_manager(
@@ -316,6 +362,9 @@ class KVCacheEngine(BaseEngine):
             auto_write_store=autowrite,
             enable_nvtx=self.enable_nvtx,
             cross_pools=cache_mgmt.cross_pools,
+            kv_pool=cache_mgmt.kv_pool,
+            cross_kv_pools=cache_mgmt.cross_kv_pools,
+            rope_embedder=cache_mgmt.rope_embedder,
         )
 
     def _compile_submodules(self) -> None:
@@ -517,11 +566,9 @@ class KVCacheEngine(BaseEngine):
     def _execute_batched(
         self, batch: NodeBatch, submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs], sampler: MultiSampler,
+        cache_manager: BatchedCacheManager,
     ) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
-        cache_manager = self._create_cache_manager(
-            batch.request_ids, batch.node_name
-        )
         engine_inputs = ModelInputsFromEngine(
             request_ids=batch.request_ids,
             per_request_info=batch.per_request_info,
@@ -534,6 +581,13 @@ class KVCacheEngine(BaseEngine):
         )
         if self.enable_nvtx:
             range_push("ar.batched.preprocess", synchronize=False)
+        declaration = submodule.declare_step(
+            graph_walk=batch.graph_walk,
+            engine_inputs=engine_inputs,
+            inputs=inputs,
+        )
+        if declaration is not None:
+            self.step_runner.drive(declaration, cache_manager)
         preprocessed = submodule.preprocess(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -560,6 +614,8 @@ class KVCacheEngine(BaseEngine):
         if self.enable_nvtx:
             range_pop()
 
+        if declaration is not None:
+            self.step_runner.commit(declaration, cache_manager)
         cache_manager.flush_to_store()
 
         # `__batched_logits__` is the stacked [B, V] logits the submodule
@@ -639,13 +695,14 @@ class KVCacheEngine(BaseEngine):
         submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs],
         sampler: MultiSampler,
+        cache_managers: list[BatchedCacheManager],
     ) -> NodeOutput:
         """Original per-request execution with CacheHandle."""
         per_request_outputs = {}
 
-        for rid, node_inputs in zip(batch.request_ids, inputs, strict=True):
-            cache_manager = self._create_cache_manager([rid], batch.node_name)
-            inputs = batch.per_request_input_tensors.get(rid, {})
+        for rid, node_inputs, cache_manager in zip(
+            batch.request_ids, inputs, cache_managers, strict=True
+        ):
             engine_inputs = ModelInputsFromEngine(
                 request_ids=[rid],
                 per_request_info={
@@ -659,6 +716,13 @@ class KVCacheEngine(BaseEngine):
 
             if self.enable_nvtx:
                 range_push("ar.seq.preprocess", synchronize=False)
+            declaration = submodule.declare_step(
+                graph_walk=batch.graph_walk,
+                engine_inputs=engine_inputs,
+                inputs=[node_inputs],
+            )
+            if declaration is not None:
+                self.step_runner.drive(declaration, cache_manager)
             preprocessed = submodule.preprocess(
                 batch.graph_walk,
                 engine_inputs=engine_inputs,
@@ -685,6 +749,8 @@ class KVCacheEngine(BaseEngine):
             if self.enable_nvtx:
                 range_pop()
 
+            if declaration is not None:
+                self.step_runner.commit(declaration, cache_manager)
             cache_manager.flush_to_store()
             per_request_outputs[rid] = output
 
@@ -869,30 +935,27 @@ class KVCacheEngine(BaseEngine):
                 range_pop()
 
     def finalize_batch(self, batch: NodeBatch) -> None:
-        """Mirror this engine's per-request KV seq_info back onto
+        """Publish each request's durable pool state onto
         ``batch.per_request_info`` so the next iter / conductor sees the
         updated page indices, seq_len, and position_id_start.
 
         Safe to call after a successful forward, after an allocation
-        failure, or after an unrelated exception — the writeback reads
-        the alloc manager's current state, which always reflects whatever
-        progress this batch made.
+        failure, or after an unrelated exception — publish describes the
+        pool's current state, which always reflects whatever progress this
+        batch made.
         """
         if batch.node_name not in self.submodule_management:
             return
         submod_mgmt = self.submodule_management[batch.node_name]
         cache_mgmt = submod_mgmt.kv_management
-        kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
-        for req_id in batch.request_ids:
-            info = batch.per_request_info.get(req_id)
-            if info is None:
-                continue
-            info.per_label_seq_info.add(
-                kv_cache_string,
-                submod_mgmt.tp_group.rank,
-                submod_mgmt.tp_group.world_size,
-                cache_mgmt.alloc_manager.get_per_label_seq_info(req_id),
-            )
+        self.step_runner.publish(
+            request_ids=batch.request_ids,
+            per_request_info=batch.per_request_info,
+            pool=cache_mgmt.kv_pool,
+            kv_cache_string=cache_mgmt.kv_cache_config.get_node_str(),
+            tp_rank=submod_mgmt.tp_group.rank,
+            tp_world_size=submod_mgmt.tp_group.world_size,
+        )
 
     def prepare_batch(self, batch: NodeBatch) -> PreparedBatch:
         """KV sync retrieve, per-request sampler config, then per-rid
@@ -912,18 +975,14 @@ class KVCacheEngine(BaseEngine):
 
         if self.enable_nvtx:
             range_push("kv_cache.kv_sync_retrieve", synchronize=False)
-        world_size = submod_mgmt.tp_group.world_size
-        for req_id, info in batch.per_request_info.items():
-            if info.per_label_seq_info.world_size.get(kv_cache_string, world_size) != world_size:
-                raise RuntimeError(
-                    "KV cache transfer across TP world size is currently disallowed"
-                ) # TODO: figure out fanin/fanout for KV cache transfer
-            for label, seq_info in info.per_label_seq_info.get(
-                kv_cache_string, submod_mgmt.tp_group.rank
-            ).items():
-                if needed_labels is not None and label not in needed_labels:
-                    continue
-                cache_mgmt.alloc_manager.sync_retrieve(req_id, label, seq_info)
+        self.step_runner.admit(
+            per_request_info=batch.per_request_info,
+            pool=cache_mgmt.kv_pool,
+            kv_cache_string=kv_cache_string,
+            tp_rank=submod_mgmt.tp_group.rank,
+            tp_world_size=submod_mgmt.tp_group.world_size,
+            needed_labels=needed_labels,
+        )
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -949,11 +1008,9 @@ class KVCacheEngine(BaseEngine):
             range_push("kv_cache.prepare_inputs")
         for rid in batch.request_ids:
             try:
-                labels = cache_mgmt.alloc_manager.get_labels(rid)
                 pos_info = {
-                    label: cache_mgmt.alloc_manager.get_state(
-                        rid, label
-                    ).get_pos_info() for label in labels
+                    label: cache_mgmt.kv_pool.pos_info(rid, label)
+                    for label in cache_mgmt.kv_pool.labels(rid)
                 }
                 req_inputs = submodule.prepare_inputs(
                     graph_walk=batch.graph_walk,
@@ -998,12 +1055,43 @@ class KVCacheEngine(BaseEngine):
             failed_requests=failed
         )
 
-    def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
-        """Dispatch CUDA-graph / batched / sequential.
+    def plan_batch(self, prepared: PreparedBatch) -> PlannedBatch:
+        """Choose the execution path and build the step's plan surface.
 
         Priority: CUDA graph (largest single launch) > batched (single
-        FlashInfer plan + forward) > sequential (per-rid fallback).
+        FlashInfer plan + forward) > sequential (per-rid fallback). The
+        graph path keeps its captured surface inside the runner; the eager
+        paths get their cache-manager facades built here, before the
+        forward, so the model's plan calls in preprocess land on a surface
+        whose pools were admitted first.
         """
+        batch = prepared.batch
+        submodule = prepared.submodule
+        node_inputs = prepared.node_inputs
+
+        if not batch.request_ids:
+            return PlannedBatch(
+                prepared=prepared, metadata={"step": StepPlan(mode="sequential")}
+            )
+
+        if self._can_use_cuda_graph(batch, node_inputs):
+            mode = "graph"
+        elif submodule.can_batch(batch, node_inputs):
+            mode = "batched"
+        else:
+            mode = "sequential"
+
+        step = self.step_runner.plan(
+            mode=mode,
+            request_ids=batch.request_ids,
+            build_manager=lambda rids: self._create_cache_manager(
+                rids, batch.node_name
+            ),
+        )
+        return PlannedBatch(prepared=prepared, metadata={"step": step})
+
+    def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
+        """Run the batch on the path ``plan_batch`` chose."""
         batch = planned.batch
         submodule = planned.submodule
         node_inputs = planned.node_inputs
@@ -1015,7 +1103,8 @@ class KVCacheEngine(BaseEngine):
 
         submod_mgmt.tp_group.barrier()
 
-        if self._can_use_cuda_graph(batch, node_inputs):
+        step: StepPlan = planned.metadata["step"]
+        if step.mode == "graph":
             if self.enable_nvtx:
                 range_push("kv_cache.cuda_graph_path", synchronize=False)
             try:
@@ -1023,12 +1112,13 @@ class KVCacheEngine(BaseEngine):
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
-        elif submodule.can_batch(batch, node_inputs):
+        elif step.mode == "batched":
             if self.enable_nvtx:
                 range_push("kv_cache.batched_path", synchronize=False)
             try:
                 output = self._execute_batched(
-                    batch, submodule, node_inputs, sampler=sampler
+                    batch, submodule, node_inputs, sampler=sampler,
+                    cache_manager=step.cache_manager,
                 )
             finally:
                 if self.enable_nvtx:
@@ -1038,7 +1128,8 @@ class KVCacheEngine(BaseEngine):
                 range_push("kv_cache.sequential_path", synchronize=False)
             try:
                 output = self._execute_sequential(
-                    batch, submodule, node_inputs, sampler=sampler
+                    batch, submodule, node_inputs, sampler=sampler,
+                    cache_managers=step.per_request_managers,
                 )
             finally:
                 if self.enable_nvtx:
@@ -1087,12 +1178,10 @@ class KVCacheEngine(BaseEngine):
         submod_mgmt = self.submodule_management[node_name]
         cache_mgmt = submod_mgmt.kv_management
         # If this request was offloaded to CPU, try reloading first
-        if cache_mgmt.cpu_page_pool is not None and cache_mgmt.cpu_page_pool.is_offloaded(request_id):
-            try:
-                cache_mgmt.alloc_manager.reload_request(request_id, cache_mgmt.cpu_page_pool)
-                logger.info("Reloaded offloaded request %s from CPU", request_id)
-            except RuntimeError:
+        if cache_mgmt.kv_pool.is_offloaded(request_id):
+            if not cache_mgmt.kv_pool.reload(request_id):
                 return False  # can't reload yet, not ready
+            logger.info("Reloaded offloaded request %s from CPU", request_id)
 
         needed_labels = self._get_needed_labels(
             node_name, request_info.graph_walk, {
@@ -1100,7 +1189,7 @@ class KVCacheEngine(BaseEngine):
             }
         )
 
-        labels_to_check = []
+        outcomes = []
         try:
             kv_cache_string = cache_mgmt.kv_cache_config.get_node_str()
             world_size = submod_mgmt.tp_group.world_size
@@ -1113,19 +1202,14 @@ class KVCacheEngine(BaseEngine):
             ).items():
                 if needed_labels is not None and label not in needed_labels:
                     continue
-                cache_mgmt.alloc_manager.start_async_retrieve(
+                outcomes.append(cache_mgmt.kv_pool.admit_retrieve(
                     request_id, label, seq_info
-                )
-                labels_to_check.append(label)
+                ))
         except RuntimeError:
             # Not enough pages to allocate for retrieval — not ready
             return False
 
-        ar_ready = all([
-            cache_mgmt.alloc_manager.check_retrieve_ready(request_id, label)
-            for label in labels_to_check
-        ])
-        if not ar_ready:
+        if any(outcome.pending for outcome in outcomes):
             return False
         return super().check_ready(node_name, request_id, request_info)
 
@@ -1250,7 +1334,7 @@ class KVCacheEngine(BaseEngine):
         self, request_id: str, cache_labels: list[str] | None = None,
     ) -> None:
         for submodule_mgmt in self.submodule_management.values():
-            submodule_mgmt.kv_management.alloc_manager.add_request(request_id, cache_labels or ["main"])
+            submodule_mgmt.kv_management.kv_pool.add_request(request_id, cache_labels or ["main"])
             for cross_mgr in submodule_mgmt.kv_management.cross_alloc_managers:
                 cross_mgr.add_request(request_id)
             submodule_mgmt.sampler.add_request(request_id)
@@ -1263,9 +1347,7 @@ class KVCacheEngine(BaseEngine):
     def remove_request(self, request_id: str) -> None:
         for submodule_mgmt in self.submodule_management.values():
             cache_mgmt = submodule_mgmt.kv_management
-            if cache_mgmt.cpu_page_pool is not None:
-                cache_mgmt.cpu_page_pool.remove_request(request_id)
-            cache_mgmt.alloc_manager.remove_request(request_id)
+            cache_mgmt.kv_pool.remove_request(request_id)
             for cross_mgr in cache_mgmt.cross_alloc_managers:
                 cross_mgr.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
@@ -1288,65 +1370,6 @@ class KVCacheEngine(BaseEngine):
         for submodule_mgmt in self.submodule_management.values():
             cache_mgmt = submodule_mgmt.kv_management
             cache_mgmt.alloc_manager.get_state(request_id, cache_label).is_paused = False
-
-    # ── Optional surfaces declared via ``capabilities`` ─────────────────
-
-    def lru_tracked_nodes(self) -> list[str]:
-        return list(self.submodule_management.keys())
-
-    def set_alloc_write_policy(self, policy: StoreWritePolicy) -> None:
-        for submod_mgmt in self.submodule_management.values():
-            submod_mgmt.kv_management.alloc_manager.write_policy = policy
-
-    def offload_candidates(self, node_name: str) -> list[tuple[str, int]]:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None or submod_mgmt.kv_management.cpu_page_pool is None:
-            return []
-        alloc = submod_mgmt.kv_management.alloc_manager
-        out: list[tuple[str, int]] = []
-        for rid, labels in alloc.request_states.items():
-            total_pages = sum(len(s.page_indices) for s in labels.values())
-            if total_pages > 0:
-                out.append((rid, total_pages))
-        return out
-
-    def offload_request(self, node_name: str, request_id: str) -> int:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None:
-            return 0
-        cache_mgmt = submod_mgmt.kv_management
-        if cache_mgmt.cpu_page_pool is None:
-            return 0
-        return cache_mgmt.alloc_manager.offload_request(
-            request_id, cache_mgmt.cpu_page_pool,
-        )
-
-    def reload_request(self, node_name: str, request_id: str) -> bool:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None:
-            return False
-        cache_mgmt = submod_mgmt.kv_management
-        if cache_mgmt.cpu_page_pool is None:
-            return False
-        if not cache_mgmt.cpu_page_pool.is_offloaded(request_id):
-            return False
-        try:
-            cache_mgmt.alloc_manager.reload_request(
-                request_id, cache_mgmt.cpu_page_pool,
-            )
-            return True
-        except RuntimeError:
-            # Not enough GPU pages to reload — caller will retry later.
-            return False
-
-    def is_offloaded(self, node_name: str, request_id: str) -> bool:
-        submod_mgmt = self.submodule_management.get(node_name)
-        if submod_mgmt is None:
-            return False
-        cache_mgmt = submod_mgmt.kv_management
-        if cache_mgmt.cpu_page_pool is None:
-            return False
-        return cache_mgmt.cpu_page_pool.is_offloaded(request_id)
 
     def shutdown(self) -> None:
         for submodule_mgmt in self.submodule_management.values():

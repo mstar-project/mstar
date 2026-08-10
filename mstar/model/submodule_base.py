@@ -18,6 +18,7 @@ from mstar.utils.sampling import BaseSampler, SeenTokenMask
 if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.engine.resources.declare import StepDeclaration
 
 
 @dataclass
@@ -236,6 +237,14 @@ class NodeSubmodule(torch.nn.Module):
         # of the same objects. The engine removes a request's entry via
         # ``cleanup_request`` when the request is removed.
         self.request_states: dict[str, PerRequestState] = {}
+        # Engine-built resources for this submodule's node (KV cache pool,
+        # embedder, scratch caches), bound once at load. Empty until then
+        # and on engines that build none.
+        self.node_resources: dict[str, Any] = {}
+
+    def bind_node_resources(self, resources: dict[str, Any]) -> None:
+        """Receive the engine-built resources for this submodule's node."""
+        self.node_resources = resources
 
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""
@@ -271,6 +280,21 @@ class NodeSubmodule(torch.nn.Module):
             **inputs[0].tensor_inputs,
             **inputs[0].kwargs
         }
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> "StepDeclaration | None":
+        """Declare this batch's step for the runner to drive: which cache
+        streams it touches, what spans they grow by, which plans back it,
+        which streams fork, and what commits when it lands. The runner
+        drives the declaration before ``preprocess`` and commits it after
+        the forward, so a declaring submodule keeps no plan or advance
+        calls of its own. None means the submodule still plans and
+        advances through the facade itself."""
+        return None
 
     @abstractmethod
     def forward(

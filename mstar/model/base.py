@@ -15,6 +15,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -359,6 +360,20 @@ class Model(ABC):
         share the same config, e.g., Bagel's LLM / LLM_cfg_text / LLM_cfg_img).
         """
         pass
+
+    def get_node_resources(
+        self, kv_cache_config: list[KVCacheConfig],
+    ) -> list[NodeResourceSpec]:
+        """Declare the resources the engine builds per node group.
+
+        ``kv_cache_config`` is this model's config list after any
+        deployment overrides were applied. The default wraps each config
+        unchanged, so models that only define ``get_kv_cache_config``
+        need no change here. Models with resources those configs cannot
+        describe (e.g. a fixed-shape scratch cache) override this and
+        extend the returned specs.
+        """
+        return [NodeResourceSpec(kv_cache_config=cfg) for cfg in kv_cache_config]
 
     def get_sampling_config(
         self, node_name: str,

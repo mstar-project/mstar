@@ -5,8 +5,9 @@ fused QKV projection, and TP-sharded o_proj). The Qwen3-specific piece
 is the 3D MRoPE path used by the Thinker — for ``use_mrope=True`` the
 RoPE call goes through ``apply_interleaved_mrope`` with externally
 provided ``cos_sin_3d`` instead of the cache handle. Talker uses
-standard 1D RoPE (``use_mrope=False``) and inherits the parent's
-``_apply_rope`` as-is.
+standard 1D RoPE (``use_mrope=False``) through the step surface's
+``apply_rope``. Every rope and attention call names its layer and plan
+key explicitly.
 
 Follows the same shape conventions as the shared attention:
   q: [tokens, num_heads, head_dim]
@@ -63,6 +64,8 @@ class Qwen3OmniAttention(ParallelAttention):
         cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
+        layer_idx: int | None = None,
+        label: str | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
@@ -73,8 +76,18 @@ class Qwen3OmniAttention(ParallelAttention):
             cos, sin = cos_sin_3d
             q, k = apply_interleaved_mrope(q, k, cos, sin)
         else:
-            q, k = self._apply_rope(q, k, cache_handle)
+            q, k = cache_handle.apply_rope(
+                q, k,
+                rope_theta=self.rope_theta,
+                rope_scale=self.rope_scale,
+                low_freq_factor=self.rope_low_freq_factor,
+                high_freq_factor=self.rope_high_freq_factor,
+                old_context_len=self.rope_old_context_len,
+                label=label,
+            )
 
-        attn_output = cache_handle.run_attention(q=q, k=k, v=v)
+        attn_output = cache_handle.run_attention(
+            q=q, k=k, v=v, layer_idx=layer_idx, label=label,
+        )
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

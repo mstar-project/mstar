@@ -41,6 +41,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.cuda_graph_runner import CudaGraphKey, CudaGraphRunner  # noqa: E402
 from mstar.engine.kv_cache_engine import KVCacheEngine  # noqa: E402
 from mstar.engine.kv_store import TransferEngineInfo  # noqa: E402
+from mstar.engine.resources.step import StepRunner  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 
 QWEN3_OMNI_REPO = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -279,6 +280,11 @@ def _run_eager_per_rid(
         )
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                runner = StepRunner()
+                declaration = submodule.declare_step(
+                    "prefill_text", engine_inputs, [inp],
+                )
+                runner.drive(declaration, cache_mgr)
                 preprocessed = submodule.preprocess(
                     graph_walk="prefill_text",
                     engine_inputs=engine_inputs,
@@ -289,6 +295,7 @@ def _run_eager_per_rid(
                     engine_inputs=engine_inputs,
                     **preprocessed,
                 )
+                runner.commit(declaration, cache_mgr)
         logits_chunks.append(out["logits"][0])           # (1, V)
         states_chunks.append(out["thinker_states"][0])   # (seq_len, 2*hidden)
     return (
