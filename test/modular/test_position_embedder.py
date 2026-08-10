@@ -2,9 +2,9 @@
 
 ``RopeEmbedder.plan`` turns a segment list plus the pool's counters into a
 ``PositionPlan``; the cache manager's advance paths resolve each step's
-position delta (default span, explicit ``pos_id_ns``, or the
-``custom_pos_advance`` side channel) and record it only through
-``KVCachePool.commit``.
+position delta (default span, or explicit ``pos_id_ns``) and record it
+only through ``KVCachePool.commit``. A declared step's position advance
+rides ``PlanSpec.pos_advance`` instead (see test_step_declaration).
 """
 
 from __future__ import annotations
@@ -109,17 +109,16 @@ class TestAdvanceCommitsThroughPool:
         assert cm.kv_pool.positions("b", "main") == 1
         assert cm.kv_pool.view(Segment("a", "main", 0)).length == 1
 
-    def test_custom_pos_advance_overrides_span(self):
+    def test_pos_id_ns_list_override(self):
         """The vision-prefill shape: position span larger than the token
-        count, delivered through the side channel."""
+        count, passed per request."""
         cm = _make_cache_manager(["a"])
         _seed_planned_seq_lens(cm, "main", [4])
-        cm.set_custom_pos_advance([90], label="main")
 
-        cm.advance_seq_lens()
+        cm.advance_seq_lens(pos_id_ns=[90])
         assert cm.kv_pool.view(Segment("a", "main", 0)).length == 4
         assert cm.kv_pool.positions("a", "main") == 90
-        # The side channel is consumed, not persistent.
+        # The override is per call, not persistent.
         _seed_planned_seq_lens(cm, "main", [1])
         cm.advance_seq_lens()
         assert cm.kv_pool.positions("a", "main") == 91

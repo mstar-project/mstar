@@ -25,6 +25,7 @@ from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
 from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mstar.engine.kv_store import PositionInfo
+from mstar.engine.resources import PlanSpec, StepDeclaration
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
@@ -361,8 +362,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
             embeds = self.model.model.embed_tokens(token_id)
 
             # Next MRoPE position for all 3 components: read from the
-            # per-request cache-manager state (kept in sync by the
-            # post-forward ``advance_seq_lens`` call in ``thinker.py``).
+            # stream's position counter (advanced by the runner's commit
+            # of each declared step).
             pos_ids = torch.tensor(
                 [[start_pos], [start_pos], [start_pos]],
                 dtype=torch.float,
@@ -391,8 +392,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # per-modality helper instead of the full HF parser.
             #
             # ``start_pos`` is the next MRoPE position for this request,
-            # carried forward across walks by ``state.position_id_start``
-            # (advanced post-forward by ``advance_seq_lens``).
+            # carried forward across walks by the stream's position counter
+            # (advanced by the runner's commit of each declared step).
             pos_ids = get_rope_index_text(seq_len, start_pos, device)
             masks_for_talker = torch.stack([
                 torch.zeros(text_ids.shape, dtype=torch.bool, device=device), # multimodal
@@ -487,11 +488,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
 
             # Next MRoPE position after this vision block is ``end_pos_base
-            # + 1`` (one past the EOS token).  ``advance_seq_lens`` by
-            # default advances ``position_id_start`` by ``seq_len``, which
-            # for vision (= vision_len + 2) is typically smaller than the
-            # 3D-grid span.  Emit the correct per-request advance so the
-            # Thinker forward can pass ``pos_id_ns`` through.
+            # + 1`` (one past the EOS token). A commit advances positions by
+            # the span by default, which for vision (= vision_len + 2) is
+            # typically smaller than the 3D-grid span. Emit the correct
+            # per-request advance so ``declare_step`` can declare it.
             mrope_pos_advance = int(end_pos_base + 1 - start_pos)
             deepstack = []
             for deepstack_inp in inputs["deepstack"]:
@@ -509,6 +509,28 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     "deepstack": deepstack,
                 }
             )
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> StepDeclaration:
+        pos_advance = None
+        if graph_walk == "prefill_vision":
+            # The 3D-grid MRoPE span is larger than the token count; the
+            # commit advances the position counter by the declared span.
+            pos_advance = tuple(
+                int(inp.tensor_inputs.get("mrope_pos_advance", 0))
+                for inp in inputs
+            )
+        return StepDeclaration(plans=(PlanSpec(
+            labels=("main",),
+            spans={"main": tuple(inp.input_seq_len for inp in inputs)},
+            is_causal=True,
+            rope=True,
+            pos_advance=pos_advance,
+        ),))
 
     def preprocess(
         self,
@@ -537,15 +559,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             mrope_section=self.MROPE_SECTION,
             target_dtype=input_embeds.dtype,
         )
-
-        # Plan FlashInfer attention and rope for the main cache label
-        cache_manager = engine_inputs.cache_manager
-        cache_manager.set_active_label("main")
-        assert cache_manager is not None
-        cache_manager.plan_attention(
-            seq_lens=seq_lens, is_causal=True, label="main"
-        )
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
 
         extra_inputs = {}
         if graph_walk == "prefill_vision":
@@ -578,19 +591,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 )
                 for i, t in enumerate(deepstack_list):
                     extra_inputs[f"deepstack_{i}"] = t
-            mrope_pos_advance = [
-                inp.tensor_inputs.get("mrope_pos_advance", 0)
-            ]
-            extra_inputs["mrope_pos_advance"] = mrope_pos_advance
-            # Side-channel: stash on the cache_manager's plan state via the
-            # public setter so the CUDA-graph runner's post-replay
-            # ``advance_seq_lens()`` (which is called with no args) advances
-            # ``position_id_start`` by the MRoPE 3D-grid span instead of by
-            # ``seq_len``. The eager path consumes ``mrope_pos_advance`` from
-            # the dict via model.forward → cache_handle.advance_seq_lens(
-            # pos_id_ns=...); both paths converge on the same per-request
-            # advance.
-            cache_manager.set_custom_pos_advance(mrope_pos_advance, label="main")
 
         return {
             "input_embeds": input_embeds,
@@ -642,7 +642,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         cos_3d: torch.Tensor | None = None,
         sin_3d: torch.Tensor | None = None,
         mrope_section: list[int] | None = None,
-        mrope_pos_advance: list[int] | None = None,
         masks_for_talker: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ) -> NameToTensorList:
@@ -670,8 +669,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
             cache_handle=engine_inputs.cache_manager,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
-            mrope_pos_advance=mrope_pos_advance,
             deepstack_visual_embeds=deepstack,
+            label="main",
         )
 
         result: NameToTensorList = {}
@@ -731,8 +730,8 @@ class ThinkerSubmodule(ARNodeSubmodule):
         runner's static-buffer interning is tensor-only by design (non-tensor
         entries are model-static and don't need a per-bucket buffer), so
         ``forward_batched`` recovers ``mrope_section`` from a class constant
-        and reads token boundaries from ``cache_manager.get_qo_indptr_buf``
-        instead. Per-token cos/sin values come from running the real RoPE
+        and reads token boundaries from the attention manager's
+        ``qo_indptr_buf`` instead. Per-token cos/sin values come from running the real RoPE
         math on a sequential dummy position (3 components × num_tokens) so
         the captured kernels see non-degenerate inputs at trace time.
         """
@@ -765,10 +764,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         Mirrors ``_build_prefill_text_packed`` and additionally provides
         ``deepstack_<i>`` (one tensor per ``vision.deepstack_visual_indexes``
         entry). Non-tensor extras (``mrope_section``, ``seq_lens``,
-        ``mrope_pos_advance``, ``masks_for_talker``) are intentionally absent:
-        the runner's static-buffer interning is tensor-only, so non-tensors
-        come back from ``submodule.preprocess`` at replay time. ``mrope_pos_advance``
-        flows through the ``_PlanState`` side-channel (see ``cache_manager._PlanState``).
+        ``masks_for_talker``) are intentionally absent: the runner's
+        static-buffer interning is tensor-only, so non-tensors come back
+        from ``submodule.preprocess`` at replay time. ``mrope_pos_advance``
+        rides the step declaration, which the runner commits post-replay.
 
         Visual_pos_masks is a length-``num_tokens`` bool tensor; at capture
         time we set it to all-False so the inner ``_deepstack_process``
@@ -909,10 +908,9 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 ),
             ),
             # prefill_vision: separate capture because its post-preprocess
-            # tensor signature has extras (deepstack_<i>)
-            # that prefill_text/audio don't. mrope_pos_advance flows
-            # out-of-band via ``BatchedCacheManager.set_custom_pos_advance``
-            # — see ``cache_manager._PlanState.custom_pos_advance``.
+            # tensor signature has extras (deepstack_<i>) that
+            # prefill_text/audio don't. mrope_pos_advance rides the step
+            # declaration, whose commit the runner applies post-replay.
             FlashInferPackedCudaGraphConfig(
                 capture_graph_walk="prefill_vision",
                 replay_graph_walks=["prefill_vision"],
@@ -946,7 +944,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
         cos_3d: torch.Tensor | None = None,
         sin_3d: torch.Tensor | None = None,
         mrope_section: list[int] | None = None,
-        mrope_pos_advance: list[int] | None = None,
         masks_for_talker: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
@@ -978,16 +975,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
           ``prefill_text`` / ``prefill_audio`` share one capture (their
           post-preprocess tensor signature is identical: ``input_embeds`` +
           ``cos_3d`` + ``sin_3d``). ``prefill_vision`` has its own capture
-          because it adds  per-layer ``deepstack_<i>``
-          tensors. ``mrope_pos_advance`` flows out-of-band via
-          ``BatchedCacheManager.set_custom_pos_advance``, which
-          ``preprocess`` populates — see
-          ``cache_manager._PlanState.custom_pos_advance``. The model's inner
-          ``cache_handle.advance_seq_lens(pos_id_ns=mrope_pos_advance)`` call
-          executes only at capture time (it's a ``@torch.compiler.disable``'d
-          Python op so it's not replayed); the runner's post-replay
-          ``advance_seq_lens()`` is what advances the real state, and that
-          path reads the side-channel.
+          because it adds per-layer ``deepstack_<i>`` tensors.
+          ``mrope_pos_advance`` rides the step declaration; the runner
+          commits it post-replay (nothing in the captured region advances
+          state).
         """
 
         # Packed dict from FlashInferPackedCudaGraphConfig is tensor-only by
@@ -1013,12 +1004,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
             cache_handle=cache_manager,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
-            mrope_pos_advance=mrope_pos_advance,
             deepstack_visual_embeds=deepstack,
+            label="main",
         )
 
         if is_prefill:
-            qo_indptr_buf = cache_manager.get_qo_indptr_buf("main")
+            qo_indptr_buf = cache_manager.attention.qo_indptr_buf("main")
             assert qo_indptr_buf is not None, (
                 f"{graph_walk} forward_batched requires a properly initialized "
                 "FlashInferPrefillWrapper (qo_indptr static buffer); got None."
@@ -1416,26 +1407,28 @@ class TalkerSubmodule(ARNodeSubmodule):
             input_seq_len=seq_len,
         )
 
+    def declare_step(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[ARNodeInputs],
+    ) -> StepDeclaration:
+        return StepDeclaration(plans=(PlanSpec(
+            labels=("main",),
+            spans={"main": tuple(inp.input_seq_len for inp in inputs)},
+            is_causal=True,
+            rope=True,
+        ),))
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        cache_manager = engine_inputs.cache_manager
-        assert cache_manager is not None
-        cache_manager.set_active_label("main")
-
         seq_lens = [
             inp.input_seq_len for inp in inputs
         ]
-        cache_manager.plan_attention(
-            seq_lens=seq_lens, is_causal=True, label="main"
-        )
-        cache_manager.plan_rope(
-            seq_lens=seq_lens, pos_ids=None, label="main"
-        )
-
         input_embeds = torch.cat([
             inp.input_embeds for inp in inputs
         ], dim=0)
@@ -1465,7 +1458,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, cache_handle: BatchedCacheManager,
         input_embeds: torch.Tensor,
     ):
-        self.model(input_embeds=input_embeds, cache_handle=cache_handle)
+        self.model(
+            input_embeds=input_embeds, cache_handle=cache_handle, label="main",
+        )
         return {}
 
     def _forward_decode_like(
@@ -1494,7 +1489,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         non-batched (``hidden[-1:, :]``) branches.
         """
         hidden = self.model(
-            input_embeds=input_embeds, cache_handle=cache_handle
+            input_embeds=input_embeds, cache_handle=cache_handle, label="main",
         )
         if last_token_indices is not None:
             last_hidden = hidden.index_select(0, last_token_indices)
@@ -1620,6 +1615,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             hidden = self.model(
                 input_embeds=input_embeds,
                 cache_handle=cache_handle,
+                label="main",
             )
             return {
                 "__batched_talker_prefill_hidden__": hidden,
@@ -1735,7 +1731,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         bs; single_request_inputs has input_seq_len=9 so total_tokens = bs * 9).
         ``total_tokens != bs`` forces ``_create_persistent_wrappers`` to use a
         ``FlashInferPrefillWrapper`` instead of the decode wrapper, which means
-        ``cache_handle.get_qo_indptr_buf("main")`` is non-None at replay so
+        the attention manager's ``qo_indptr_buf("main")`` is non-None at replay so
         ``forward_batched`` can ``index_select`` per-request last hidden out of
         the packed ``(bs * 9, talker_hidden)`` LLM output before codec_head.
         """

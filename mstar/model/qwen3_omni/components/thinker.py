@@ -104,13 +104,17 @@ class Qwen3OmniThinkerLayer(nn.Module):
         cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
+        layer_idx: int | None = None,
+        label: str | None = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [tokens, hidden_size]
-            cache_handle: BatchedCacheManager with pre-planned attention.
+            cache_handle: step surface with pre-planned attention.
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE.
+            layer_idx: this layer's index in the stack.
+            label: the plan key this layer's attention runs against.
 
         Returns:
             hidden_states: [tokens, hidden_size]
@@ -123,6 +127,8 @@ class Qwen3OmniThinkerLayer(nn.Module):
             cache_handle=cache_handle,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
+            layer_idx=layer_idx,
+            label=label,
         )
         hidden_states = residual + hidden_states
 
@@ -191,23 +197,21 @@ class Qwen3OmniThinkerModel(nn.Module):
         cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
-        mrope_pos_advance: Optional[list[int]] = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
+        label: str = "main",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             input_embeds: [tokens, hidden_size] -- pre-embedded input
                 (token embeddings possibly merged with multimodal features).
-            cache_handle: BatchedCacheManager with pre-planned attention
-                and RoPE.
+            cache_handle: step surface with pre-planned attention and RoPE.
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE,
                 e.g. [24, 20, 20].
-            mrope_pos_advance: optional per-request MRoPE position advance
-                for ``advance_seq_lens``.  Vision prefill passes an explicit
-                value because the 3D-grid position span is larger than the
-                number of tokens; text / audio / decode leave it None and
-                ``position_id_start`` advances by ``seq_len``.
+            label: the plan key every layer runs against. The stream's
+                stored length and position counter advance when the runner
+                commits the declared step (vision prefill declares its
+                MRoPE 3D-grid span there).
 
         Returns:
             hidden_states: [tokens, hidden_size] -- final normed hidden states
@@ -222,12 +226,13 @@ class Qwen3OmniThinkerModel(nn.Module):
         layer_n_hidden = None
 
         for layer_idx, decoder_layer in enumerate(self.model.layers):
-            cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
                 cache_handle=cache_handle,
                 cos_sin_3d=cos_sin_3d,
                 mrope_section=mrope_section,
+                layer_idx=layer_idx,
+                label=label,
             )
 
             # add visual features to the hidden states of first several layers
@@ -240,18 +245,6 @@ class Qwen3OmniThinkerModel(nn.Module):
             # Capture hidden states at the accept_hidden_layer for Talker
             if layer_idx == self.accept_hidden_layer:
                 layer_n_hidden = hidden_states.clone()
-
-        # Advance sequence lengths after all layers.  ``pos_id_ns`` decouples
-        # the position-id advance from the seq-len advance (needed for vision
-        # prefill where the 3D-grid span != number of tokens).
-        #
-        # NOTE: correct for eager + decode-only capture.  CudaGraphRunner
-        # does its own post-replay ``advance_seq_lens()`` at
-        # cuda_graph_runner.py:552 with no args, so this ``pos_id_ns`` is
-        # NOT honored on the replay path.  If we ever capture vision
-        # prefill, that runner call would need to accept a submodule-
-        # supplied ``pos_id_ns``.
-        cache_handle.advance_seq_lens(pos_id_ns=mrope_pos_advance)
 
         # Final layer norm
         hidden_states = self.model.norm(hidden_states)

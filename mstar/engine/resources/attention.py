@@ -91,24 +91,11 @@ class _PlanState:
     In CUDA graph mode, wrapper is a persistent FlashInferPrefillWrapper or
     FlashInferDecodeWrapper created once during capture. plan_attention()
     calls wrapper.plan() which updates static buffers via .copy_().
-
-    ``custom_pos_advance`` is a generic out-of-band channel for prefill
-    walks whose position-id span differs from the seq_len being prefilled
-    (e.g. Qwen3-Omni's ``prefill_vision``, where the 3D-grid MRoPE span is
-    larger than the number of tokens). The submodule writes a per-request
-    list here via ``BatchedCacheManager.set_custom_pos_advance``;
-    ``advance_seq_lens`` reads it when ``pos_id_ns`` is None and advances
-    ``position_id_start`` by these values instead of by ``seq_len``.
-    Auto-cleared by ``advance_seq_lens`` so it doesn't leak across calls.
-    The CUDA-graph runner's post-replay ``advance_seq_lens()`` call is what
-    actually consumes this — the model's inner ``advance_seq_lens(pos_id_ns=...)``
-    runs at capture time only and is not replayed.
     """
     wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | None = None
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
     write_store: bool = True
-    custom_pos_advance: list[int] | None = None
     # Plan memo: fingerprint of the last wrapper.plan() inputs for this label;
     # when it matches, the re-plan is skipped. Only the cross-attention path
     # sets it today (its context pages are immutable after add_cross_attn_kv),
@@ -412,6 +399,17 @@ class FlashInferAttentionManager:
         ps.seq_lens = combined_seq_lens
         ps.write_store = write_store
         ps.dense_gen = None
+
+    def qo_indptr_buf(self, label: str) -> torch.Tensor | None:
+        """The persistent qo_indptr static buffer of ``label``'s CUDA-graph
+        prefill wrapper, or None outside that mode. Captured prefill paths
+        read it to recover per-request token boundaries from inside the
+        captured region: ``plan`` updates the buffer via ``.copy_()``
+        outside the graph, so the address stays stable across replay."""
+        ps = self.states.get(label)
+        if ps is None or ps.wrapper is None:
+            return None
+        return getattr(ps.wrapper, "_qo_indptr_buf", None)
 
     def write_kv(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, label: str) -> None:
         """Write this step's K/V into the paged cache at the label's planned

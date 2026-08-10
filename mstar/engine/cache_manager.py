@@ -217,17 +217,9 @@ class BatchedCacheManager(ABC):
 
     @torch.compiler.disable
     def get_qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
-        """Return the persistent qo_indptr static buffer for a CUDA-graph
-        prefill wrapper, or None if not in CUDA-graph mode / wrong wrapper.
-
-        Captured prefill paths read this to recover per-request token boundaries
-        from inside the captured region — plan_attention updates the buffer via
-        .copy_() outside the graph, so the address stays stable across replay.
-        """
-        ps = self._plan_states.get(label)
-        if ps is None or ps.wrapper is None:
-            return None
-        return getattr(ps.wrapper, "_qo_indptr_buf", None)
+        """The attention manager's ``qo_indptr_buf`` for ``label`` (see
+        ``FlashInferAttentionManager.qo_indptr_buf``)."""
+        return self.attention.qo_indptr_buf(label)
 
     @abstractmethod
     def plan_attention(
@@ -484,48 +476,12 @@ class BatchedCacheManager(ABC):
             )
 
     @torch.compiler.disable
-    def set_custom_pos_advance(
-        self, pos_advance: list[int] | None, label: str | None = None,
-    ) -> None:
-        """Stash a per-request position-id advance for the next
-        ``advance_seq_lens()`` call to consume.
-
-        Resolves ``label`` the same way ``plan_attention`` does: explicit
-        label wins; otherwise the (single) currently-active label is used.
-
-        Used by submodules whose forward advances ``position_id_start`` by
-        something other than ``seq_len`` (e.g. Qwen3-Omni's prefill_vision
-        passes the MRoPE 3D-grid span here). Auto-cleared by
-        ``advance_seq_lens`` after use, so it does not leak across calls.
-
-        Pass ``pos_advance=None`` to clear an earlier set explicitly.
-        """
-        effective_label = label
-        if effective_label is None:
-            labels = list(self.active_labels.values())
-            if not labels:
-                return
-            assert len(set(labels)) == 1, (
-                f"All active labels must be the same to omit ``label``, got {labels}"
-            )
-            effective_label = labels[0]
-        ps = self._plan_states.get(effective_label)
-        if ps is None:
-            return
-        ps.custom_pos_advance = (
-            list(pos_advance) if pos_advance is not None else None
-        )
-
-    @torch.compiler.disable
     def advance_seq_lens(self, pos_id_ns: list[int] | int | None = None) -> None:
         """Advance seq_len for each request by different amounts.
 
-        When ``pos_id_ns`` is None, falls back to a per-label side-channel
-        (``_PlanState.custom_pos_advance``, set via
-        ``set_custom_pos_advance``) for walks whose position-id span
-        differs from seq_len (e.g. Qwen3-Omni prefill_vision). The
-        side-channel is auto-cleared after use so it doesn't leak across
-        calls.
+        ``pos_id_ns`` overrides the position-id advance for walks whose
+        position span differs from seq_len; None advances positions by
+        each request's planned seq_len.
         """
 
         if self._batched_cfg_info:
@@ -549,10 +505,7 @@ class BatchedCacheManager(ABC):
                     continue
                 n = ps.seq_lens[i]
                 if pos_id_ns is None:
-                    if ps.custom_pos_advance is not None:
-                        pos_advance = ps.custom_pos_advance[i]
-                    else:
-                        pos_advance = n
+                    pos_advance = n
                 elif isinstance(pos_id_ns, int):
                     pos_advance = pos_id_ns
                 else:
@@ -560,10 +513,6 @@ class BatchedCacheManager(ABC):
                 self.kv_pool.commit(
                     Segment(rid, label, n), pos_advance=pos_advance
                 )
-        # Clear the side-channel on every consumer so a stale value can't
-        # bleed into a subsequent walk.
-        for ps in self._plan_states.values():
-            ps.custom_pos_advance = None
 
     @torch.compiler.disable
     def snapshot_all(
