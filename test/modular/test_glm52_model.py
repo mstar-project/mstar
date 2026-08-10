@@ -150,28 +150,31 @@ def test_glm52_decode_never_reseeds_from_the_prompt_signal(monkeypatch):
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
     assert MTP_DRAFT_BUNDLE != "text_inputs"
-    metadata = CurrentForwardConductorMetadata(
-        input_modalities=["text"], output_modalities=["text"],
-        graph_walk="prefill", is_prefill=True,
-    )
-    res = _make_model_k(2).get_partition_forward_pass_args(
-        partition_name="default", partition_metadata=metadata,
-        # exactly what the conductor holds: the prompt under "text_inputs"
-        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
-    )
-    assert res.inputs[0].tensor_info == ["tok"], (
-        "decode was seeded with the PROMPT instead of the emitted token")
-    assert "PROMPT" not in res.unpersist_tensors
 
-    # And with the feature ON, so the guarantee is the NAME, not the flag.
-    monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1")
-    res = _make_model_k(2).get_partition_forward_pass_args(
-        partition_name="default", partition_metadata=metadata,
-        persist_signals={"text_inputs": ["PROMPT"], "new_token": ["tok"]},
-    )
-    assert res.inputs[0].tensor_info == ["tok"], (
-        "decode was seeded with the PROMPT instead of the emitted token")
-    assert "PROMPT" not in res.unpersist_tensors
+    def _seed_from(persist_signals):
+        # Fresh metadata per call: the transition MUTATES it (prefill ->
+        # decode), so a reused object takes the request-done branch.
+        metadata = CurrentForwardConductorMetadata(
+            input_modalities=["text"], output_modalities=["text"],
+            graph_walk="prefill", is_prefill=True,
+        )
+        return _make_model_k(2).get_partition_forward_pass_args(
+            partition_name="default", partition_metadata=metadata,
+            persist_signals=persist_signals,
+        )
+
+    # exactly what the conductor holds at the transition: the prompt is
+    # already sitting under "text_inputs", seeded from initial_signals.
+    prompt_and_token = {"text_inputs": ["PROMPT"], "new_token": ["tok"]}
+    for flag in ("0", "1"):
+        # Assert under BOTH flag states: the guarantee is the NAME, not the
+        # gating. A collision would be a bug even with the feature on.
+        monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", flag)
+        res = _seed_from(prompt_and_token)
+        assert res.inputs[0].tensor_info == ["tok"], (
+            f"flag={flag}: decode was seeded with the PROMPT instead of the "
+            "emitted token")
+        assert "PROMPT" not in res.unpersist_tensors
 
 
 def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them(monkeypatch):
