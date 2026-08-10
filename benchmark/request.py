@@ -117,6 +117,12 @@ class RequestMetrics:
 
     # For storing outputs of different modalities
     _text_chunks: list[str] = field(default_factory=list, repr=False)
+    # Exact per-chunk token counts, parallel to _text_chunks, valid only when
+    # the server attested raw ids (`token_ids` metadata — the mstar path).
+    # Cross-system adapters estimate n_tokens, so ITL falls back to
+    # re-tokenizing decoded text for them.
+    _text_chunk_tokens: list[int] = field(default_factory=list, repr=False)
+    _token_ids_attested: bool = field(default=False, repr=False)
     _image_chunks: list[bytes] = field(default_factory=list, repr=False)
     _audio_pcm: io.BytesIO = field(default_factory=io.BytesIO, repr=False)
     # Robotics outputs: raw float32 bytes per chunk
@@ -142,7 +148,28 @@ class RequestMetrics:
         for final output assembly. Call this for every streamed chunk.
         """
         data = base64.b64decode(data_b64)
+        if (metadata or {}).get("token_ids"):
+            self._token_ids_attested = True
         if not data:
+            # A text chunk can decode to empty bytes while carrying real
+            # tokens: the k=0 final EOS decodes to "" under
+            # skip_special_tokens, while under MTP the EOS rides a
+            # multi-token chunk and IS counted. Dropping the attested ids
+            # here undercounts k=0 by ~1 token/request vs k>0 — a
+            # systematic skew in exactly the MTP-vs-baseline comparisons
+            # this bench exists to run. Count the emission (and its
+            # arrival, for ITL); contribute no text.
+            token_ids = (metadata or {}).get("token_ids")
+            if modality == "text" and token_ids:
+                self._output_modalities_recvd.append(modality)
+                self.record_token(
+                    modality=modality,
+                    nbytes=0,
+                    arrival_time=arrival_time,
+                    n_tokens=len(token_ids),
+                )
+                self._text_chunks.append("")
+                self._text_chunk_tokens.append(len(token_ids))
             return
 
         if modality == "error":
@@ -170,6 +197,7 @@ class RequestMetrics:
 
         if modality == "text":
             self._text_chunks.append(data.decode("utf-8", errors="replace"))
+            self._text_chunk_tokens.append(n_tokens)
         elif modality == "image":
             self._image_chunks.append(data)
         elif modality == "audio":
@@ -339,18 +367,29 @@ class RequestMetrics:
             return None
         # gap[i] is the time from chunk i's arrival to chunk i+1's arrival; we
         # attribute it to chunk i+1 (the one that "took" that long to arrive).
-        if tokenizer is None or len(self._text_chunks) < 2:
+        if len(self._text_chunks) < 2 or (
+            tokenizer is None and not self._token_ids_attested
+        ):
             return list(gaps)
+        # When the server attested raw ids per chunk, use their exact counts:
+        # re-encoding decoded text mis-tokenizes chunk-boundary multi-byte
+        # splits (errors="replace"), which skews multi-token MTP chunks.
+        use_exact = self._token_ids_attested and len(
+            self._text_chunk_tokens) == len(self._text_chunks)
         out: list[float] = []
         for i, gap in enumerate(gaps):
             chunk_idx = i + 1
             if chunk_idx >= len(self._text_chunks):
                 continue
-            chunk_text = self._text_chunks[chunk_idx]
-            try:
-                n_tokens = len(tokenizer.encode(chunk_text, add_special_tokens=False))
-            except Exception:
-                n_tokens = 1
+            if use_exact:
+                n_tokens = self._text_chunk_tokens[chunk_idx]
+            else:
+                chunk_text = self._text_chunks[chunk_idx]
+                try:
+                    n_tokens = len(
+                        tokenizer.encode(chunk_text, add_special_tokens=False))
+                except Exception:
+                    n_tokens = 1
             if n_tokens <= 0:
                 continue
             per_token = gap / n_tokens
@@ -778,7 +817,13 @@ class OurSystem(InferenceSystem):
                         msg = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not msg.get("data"):
+                    # Empty data alone doesn't disqualify a chunk: the k=0
+                    # final EOS decodes to "" (skip_special_tokens) but its
+                    # metadata still attests the emitted id — it must reach
+                    # record_output_chunk to be counted.
+                    if not msg.get("data") and not (
+                        msg.get("metadata") or {}
+                    ).get("token_ids"):
                         continue
                     arrival_time = time.monotonic()
                     mod = msg.get("modality")
