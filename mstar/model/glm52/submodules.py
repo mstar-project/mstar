@@ -148,6 +148,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_pair_postnorm = (
             os.environ.get("MSTAR_GLM52_MTP_PAIR_POSTNORM", "0") == "1"
         )
+        # Capture the decode sync pass as a padded (bs, k+1) piecewise graph.
+        # DEFAULT OFF: measured 2026-08-10 at 33.02 tok/s with p1 acceptance
+        # 0.18 vs the eager path's 49.65 / 0.76 — the padded replay is
+        # producing a wrong draft 1 somewhere the CPU seam test cannot see
+        # (its stub runner plans and runs eagerly on the real handle; the
+        # real one replays a captured graph through static buffers and
+        # aliased dummy states). An unvalidated capture must not be the
+        # default path: the whole point of this switch is that a graph which
+        # lowers acceptance looks exactly like a modelling problem.
+        self._mtp_capture_sync = (
+            os.environ.get("MSTAR_GLM52_MTP_CAPTURE_SYNC", "0") == "1"
+        )
         # One-shot flag: warn the first time an MTP decode trunk runs eager
         # (no captured piecewise bucket) — the 2026-08-09 bench showed that
         # regression is 13x and silence lets it masquerade as "MTP is slow".
@@ -411,16 +423,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
                 compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
             )
-        configs[MTP_SYNC_LABEL] = Glm52MtpTrunkGraphConfig(
-            rows_per_request=rows,
-            capture_fn=self._mtp_sync_captured,
-            make_static_inputs=make_sync_static_inputs,
-            plan_fn=self._mtp_sync_plan,
-            uses_kv_cache=True,
-            cache_labels=[_MAIN],
-            capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
-            compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
-        )
+        if self._mtp_capture_sync:
+            configs[MTP_SYNC_LABEL] = Glm52MtpTrunkGraphConfig(
+                rows_per_request=rows,
+                capture_fn=self._mtp_sync_captured,
+                make_static_inputs=make_sync_static_inputs,
+                plan_fn=self._mtp_sync_plan,
+                uses_kv_cache=True,
+                cache_labels=[_MAIN],
+                capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
+                compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
+            )
         return configs
 
     def _mtp_trunk_captured(
@@ -967,7 +980,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
         sync_runner = kwargs.get("mtp_sync_runner")
-        if sync_runner is None:
+        if sync_runner is None and self._mtp_capture_sync:
             self._warn_mtp_sync_eager_once(len(request_ids))
         drafts = self._mtp_sync_and_draft(
             cache_handle, sync_tokens, pair_hiddens,

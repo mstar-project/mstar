@@ -27,6 +27,7 @@ Scaffold status (bring-up order, per docs/adding_models.rst):
 """
 
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -239,7 +240,9 @@ class Glm52Model(Model):
                 persist=True,
             ),
         ]
-        if self.config.mtp_num_draft_tokens > 0:
+        if self.config.mtp_num_draft_tokens > 0 and os.environ.get(
+            "MSTAR_GLM52_MTP_PREFILL_DRAFTS", "0"
+        ) == "1":
             # M3: the MTP prefill's forward also returns "text_inputs" =
             # [emitted token, k drafts]. Without a declared edge the worker
             # drops it (undeclared outputs are unrouted), the prefill's whole
@@ -248,7 +251,16 @@ class Glm52Model(Model):
             # histogram with one artificial n_acc=0 per request. Persisted
             # (not emitted) so the prefill→decode transition can seed the
             # decode loop with it, exactly the qwen3_tts talker_input_embeds
-            # pattern. Gated on k>0 so the k=0 walk stays byte-identical.
+            # pattern.
+            #
+            # DEFAULT OFF pending GPU validation. Unverified TP8 risk: this
+            # edge persists per rank, and if the fanout hands the transition
+            # 8 replicas instead of 1, decode step 1 consumes 8*(k+1) tokens
+            # as its text_inputs — which would advance the counter wrongly
+            # and misalign every later step of the request, i.e. exactly the
+            # uniform acceptance collapse measured on 2026-08-10 (33.02
+            # tok/s, p1 0.18). Bisect this against
+            # MSTAR_GLM52_MTP_CAPTURE_SYNC before making either default.
             prefill_outputs.append(
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,

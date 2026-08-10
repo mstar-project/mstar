@@ -460,6 +460,13 @@ def test_mtp_trunk_piecewise_config_shapes():
 
     cfg = _mtp_cfg(2)  # rows per request = 3
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
+    # The sync capture is opt-in (measured 33.02 tok/s / p1 0.18 on
+    # 2026-08-10 vs the eager path's 49.65 / 0.76), so the default set is
+    # the two validated graphs.
+    assert set(sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
+            "mtp_trunk", "mtp_draft"}
+    sub._mtp_capture_sync = True
     configs = sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)
     assert set(configs) == {"mtp_trunk", "mtp_draft", "mtp_sync"}
@@ -502,11 +509,12 @@ def test_mtp_trunk_piecewise_config_shapes():
     assert sstatic["pair_hidden"].dtype == torch.bfloat16
 
     # k=1 has no chain iterations — no draft graph to pay capture for —
-    # but the sync pass (rows=2) still captures.
+    # but the sync pass (rows=2) still registers when opted in.
     cfg.mtp_num_draft_tokens = 1
     assert set(sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
             "mtp_trunk", "mtp_sync"}
+    sub._mtp_capture_sync = False
 
     cfg.mtp_num_draft_tokens = 0
     assert sub.get_piecewise_cuda_graph_configs(

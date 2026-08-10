@@ -92,7 +92,16 @@ def _make_model_k(k: int) -> Glm52Model:
     return model
 
 
-def test_glm52_prefill_persists_drafts_only_under_mtp():
+def test_glm52_prefill_drafts_are_off_by_default():
+    """Both MTP perf features ship OFF until GPU-validated. Enabling the
+    prefill-draft edge measured 33.02 tok/s / p1 0.18 against the eager
+    path's 49.65 / 0.76 on 2026-08-10 (jointly with the sync capture, not
+    yet bisected), so the DEFAULT walk must be the known-good one."""
+    prefill = _make_model_k(2).get_graph_walk_graphs()["prefill"]
+    assert [e.name for e in prefill.outputs] == ["new_token"]
+
+
+def test_glm52_prefill_persists_drafts_only_under_mtp(monkeypatch):
     """The MTP prefill computes [emitted, k drafts] and returns it as
     "text_inputs". An output with no declared edge is UNROUTED — the worker
     drops it — so without this edge the prefill's whole sync+draft pass was
@@ -101,6 +110,7 @@ def test_glm52_prefill_persists_drafts_only_under_mtp():
     deflates measured p1). k=0 must keep the byte-identical old walk."""
     from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1")
     prefill_k0 = _make_model_k(0).get_graph_walk_graphs()["prefill"]
     assert [e.name for e in prefill_k0.outputs] == ["new_token"]
 
