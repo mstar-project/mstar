@@ -2506,10 +2506,19 @@ class PiecewiseCudaGraphRunner:
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
         tp_group=None,
+        label: str = "",
     ):
         from mstar.distributed.communication import CommGroup
 
         self.config = config
+        # Namespaces this runner's dummy request ids. Without it the ids are
+        # derived from the capture SHAPE alone, so two labels that capture the
+        # same (bs, total_tokens) — e.g. GLM-5.2's mtp_trunk and mtp_sync, both
+        # (bs, k+1) — get identical ids and share one slot in the shared
+        # alloc_manager. add_request OVERWRITES request_states[rid], so the
+        # second runner's setup discards the first's dummy state and orphans
+        # any pages capture had allocated to it.
+        self.label = label
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.kv_cache_config = kv_cache_config
@@ -2656,8 +2665,10 @@ class PiecewiseCudaGraphRunner:
         if not self.config.uses_kv_cache:
             return None, []
 
+        ns = f"{self.label}_" if self.label else ""
         dummy_rids = [
-            f"__pcgr_{shape.bs}_{shape.total_tokens}_{i}__" for i in range(shape.bs)
+            f"__pcgr_{ns}{shape.bs}_{shape.total_tokens}_{i}__"
+            for i in range(shape.bs)
         ]
         for rid in dummy_rids:
             self.alloc_manager.add_request(rid, labels=self.cache_labels)
@@ -2994,6 +3005,7 @@ def build_piecewise_runners(
                 alloc_manager=alloc_manager if config.uses_kv_cache else None,
                 buffer_manager=buffer_manager if config.uses_kv_cache else None,
                 tp_group=tp_group,
+                label=label,
             )
             runner.warmup_and_capture()
             if runner.graphs:
