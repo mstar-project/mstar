@@ -55,16 +55,17 @@ class KVManagement:
     buffer_manager: WorkspaceBufferManager
     # source name -> cross-attention context pool (see KVCacheConfig.cross_attn)
     cross_pools: dict[str, CrossAttnPool] = field(default_factory=dict)
-    # Distinct cross-attention alloc managers (pools may be shared between
-    # sources); precomputed at build time since it can't change after
-    # startup, so per-request add/remove doesn't re-walk cross_pools.
-    cross_alloc_managers: list[PagedAllocationManager] = field(default_factory=list)
     # Persistent resource fronts over the managers above: the pool is the
     # engine's surface for admission, retrieval, offload tiers, position
     # reads, and publishing; the embedder owns position semantics. Built
     # once at load_model and shared by every step's facade.
     kv_pool: KVCachePool | None = None
     cross_kv_pools: dict[str, KVCachePool] = field(default_factory=dict)
+    # The distinct cross fronts (sources may share one physical pool, and
+    # share its front); precomputed at build time since it can't change
+    # after startup, so per-request add/remove doesn't re-walk
+    # cross_kv_pools.
+    distinct_cross_kv_pools: list[KVCachePool] = field(default_factory=list)
     rope_embedder: RopeEmbedder | None = None
 
 
@@ -273,12 +274,17 @@ class KVCacheEngine(BaseEngine):
             cross_pools = _build_cross_pools(
                 cfg, num_layers, device, kv_cache_type, transfer_engine_info,
             )
-            # Distinct alloc managers, deduped by identity (shared pools),
-            # computed once here rather than per request.
-            cross_alloc_managers: list[PagedAllocationManager] = []
-            for pool in cross_pools.values():
-                if all(pool.alloc_manager is not m for m in cross_alloc_managers):
-                    cross_alloc_managers.append(pool.alloc_manager)
+            # One accounting front per physical cross pool; sources sharing
+            # a pool share its front. The distinct list is computed once
+            # here rather than per request.
+            cross_kv_pool_by_id: dict[int, KVCachePool] = {}
+            cross_kv_pools: dict[str, KVCachePool] = {}
+            for source, pool in cross_pools.items():
+                front = cross_kv_pool_by_id.get(id(pool))
+                if front is None:
+                    front = KVCachePool(pool.alloc_manager)
+                    cross_kv_pool_by_id[id(pool)] = front
+                cross_kv_pools[source] = front
 
             alloc_manager = PagedAllocationManager(
                 config=cfg,
@@ -294,12 +300,9 @@ class KVCacheEngine(BaseEngine):
                     device=device,
                 ),
                 cross_pools=cross_pools,
-                cross_alloc_managers=cross_alloc_managers,
+                distinct_cross_kv_pools=list(cross_kv_pool_by_id.values()),
                 kv_pool=KVCachePool(alloc_manager, cpu_pool=cpu_page_pool),
-                cross_kv_pools={
-                    source: KVCachePool(pool.alloc_manager)
-                    for source, pool in cross_pools.items()
-                },
+                cross_kv_pools=cross_kv_pools,
                 rope_embedder=RopeEmbedder(),
             )
             self.kv_management[cfg.get_node_str()] = kv_mgmt
@@ -1335,8 +1338,8 @@ class KVCacheEngine(BaseEngine):
     ) -> None:
         for submodule_mgmt in self.submodule_management.values():
             submodule_mgmt.kv_management.kv_pool.add_request(request_id, cache_labels or ["main"])
-            for cross_mgr in submodule_mgmt.kv_management.cross_alloc_managers:
-                cross_mgr.add_request(request_id)
+            for cross_pool in submodule_mgmt.kv_management.distinct_cross_kv_pools:
+                cross_pool.add_request(request_id, [])
             submodule_mgmt.sampler.add_request(request_id)
             # Mirror into the cuda-graph runner's master sampler buffers so
             # the per-step path can index_select instead of rebuilding from
@@ -1348,8 +1351,8 @@ class KVCacheEngine(BaseEngine):
         for submodule_mgmt in self.submodule_management.values():
             cache_mgmt = submodule_mgmt.kv_management
             cache_mgmt.kv_pool.remove_request(request_id)
-            for cross_mgr in cache_mgmt.cross_alloc_managers:
-                cross_mgr.remove_request(request_id)
+            for cross_pool in cache_mgmt.distinct_cross_kv_pools:
+                cross_pool.remove_request(request_id)
             submodule_mgmt.sampler.remove_request(request_id)
             submodule_mgmt.submodule.cleanup_request(request_id)
             if submodule_mgmt.cuda_graph_runner is not None:
@@ -1360,16 +1363,14 @@ class KVCacheEngine(BaseEngine):
     ) -> None:
         """For interleaved loop: mark as paused, keep KV pages allocated."""
         for submodule_mgmt in self.submodule_management.values():
-            cache_mgmt = submodule_mgmt.kv_management
-            cache_mgmt.alloc_manager.get_state(request_id, cache_label).is_paused = True
+            submodule_mgmt.kv_management.kv_pool.pause(request_id, cache_label)
 
     def resume_request(
         self, request_id: str, cache_label: str = "main",
     ) -> None:
         """Resume from paused state for next LLM step in loop."""
         for submodule_mgmt in self.submodule_management.values():
-            cache_mgmt = submodule_mgmt.kv_management
-            cache_mgmt.alloc_manager.get_state(request_id, cache_label).is_paused = False
+            submodule_mgmt.kv_management.kv_pool.resume(request_id, cache_label)
 
     def shutdown(self) -> None:
         for submodule_mgmt in self.submodule_management.values():

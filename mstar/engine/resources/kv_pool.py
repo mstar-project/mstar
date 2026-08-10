@@ -221,6 +221,15 @@ class KVCachePool:
                 del self._released[key]
         self._manager.remove_request(request_id)
 
+    def pause(self, request_id: str, label: str) -> None:
+        """Mark one stream paused between turns of an interleaved loop;
+        its pages stay resident."""
+        self._manager.get_state(request_id, label).is_paused = True
+
+    def resume(self, request_id: str, label: str) -> None:
+        """Clear a stream's paused mark."""
+        self._manager.get_state(request_id, label).is_paused = False
+
     def set_write_policy(self, policy: StoreWritePolicy) -> None:
         """Set whether committed pages are pushed to the distributed store."""
         self._manager.write_policy = policy
