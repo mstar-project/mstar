@@ -14,21 +14,42 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Same import-time stubs as test_glm52_mtp.py — construction-level tests on
-# machines without CUDA wheels.
-if "flashinfer" not in sys.modules:
-    def _cpu_rmsnorm(x, weight, eps=1e-6):
-        x32 = x.float()
-        normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
-        return (normed * weight.float()).to(x.dtype)
 
-    _fi = types.ModuleType("flashinfer")
-    _fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
-    sys.modules["flashinfer"] = _fi
+def _cpu_rmsnorm(x, weight, eps=1e-6):
+    x32 = x.float()
+    normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+    return (normed * weight.float()).to(x.dtype)
+
+
+def _cpu_flashinfer() -> types.ModuleType:
+    fi = types.ModuleType("flashinfer")
+    fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
+    return fi
+
+
+# Import-time stub so this module imports on machines without CUDA wheels.
+if "flashinfer" not in sys.modules:
+    sys.modules["flashinfer"] = _cpu_flashinfer()
+
+
+@pytest.fixture(autouse=True)
+def _force_cpu_flashinfer(monkeypatch):
+    """Force the CPU stub per test — see test_glm52_mtp.py for the why.
+
+    THE property this file exists to prove (MTP-on emits the bit-identical
+    stream to MTP-off) was silently not being proven in full-suite runs on
+    the box: real flashinfer is installed there, an earlier-imported module
+    put it in sys.modules, the import-time guard then skipped the stub, and
+    these tests ran GPU kernels on CPU tensors. Eight tests failed in the
+    suite while every one passed in isolation. A bit-identity suite that
+    quietly stops checking bit-identity is this lane's whole failure class,
+    so the stub is now forced rather than deferred-to."""
+    monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 from mstar.model.glm52._testing import ReferenceCacheHandle  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402

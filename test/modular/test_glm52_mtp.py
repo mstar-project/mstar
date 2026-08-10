@@ -18,19 +18,41 @@ import torch
 from mstar.model.glm52.components.indexer import is_full_indexer_layer
 from mstar.model.glm52.config import Glm52ModelConfig
 
-# mtp.py's import chain reaches flashinfer via decoder_layer -> attention;
-# stub it before the import so construction-level tests run on machines
-# without CUDA wheels (same treatment as test_glm52_indexer.py, which owns
-# the stub for forward-path numerics).
-if "flashinfer" not in sys.modules:
-    def _cpu_rmsnorm(x, weight, eps=1e-6):
-        x32 = x.float()
-        normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
-        return (normed * weight.float()).to(x.dtype)
+def _cpu_rmsnorm(x, weight, eps=1e-6):
+    x32 = x.float()
+    normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+    return (normed * weight.float()).to(x.dtype)
 
-    _fi = types.ModuleType("flashinfer")
-    _fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
-    sys.modules["flashinfer"] = _fi
+
+def _cpu_flashinfer() -> types.ModuleType:
+    fi = types.ModuleType("flashinfer")
+    fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
+    return fi
+
+
+# mtp.py's import chain reaches flashinfer via decoder_layer -> attention;
+# stub it before the import so construction-level tests import at all on
+# machines without CUDA wheels.
+if "flashinfer" not in sys.modules:
+    sys.modules["flashinfer"] = _cpu_flashinfer()
+
+
+@pytest.fixture(autouse=True)
+def _force_cpu_flashinfer(monkeypatch):
+    """Force the CPU stub for the duration of every test in this module.
+
+    The import-time guard above is NOT sufficient: on a GPU box flashinfer
+    is legitimately installed, and any test module imported earlier in the
+    same session (test_fused_rmsnorm imports it directly; qwen3_tts and the
+    api-result tests pull it in transitively) populates sys.modules with the
+    REAL library — after which the guard skips the stub and these CPU tests
+    silently run GPU kernels against CPU tensors. That is how this file's
+    bit-identity assertions started failing in full-suite runs while passing
+    in isolation. monkeypatch.setitem restores the previous entry at
+    teardown, so modules that WANT the real library are unaffected (the
+    test_glm52_indexer.py pattern). ``run_rms_norm`` imports flashinfer
+    inside the call, so a per-test swap reaches it."""
+    monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 from mstar.model.glm52.components.mtp import (  # noqa: E402
     Glm52MTPModule,
