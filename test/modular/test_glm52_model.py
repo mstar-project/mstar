@@ -84,6 +84,90 @@ def test_glm52_prefill_transitions_to_decode():
     assert result.request_done is False
 
 
+def _make_model_k(k: int) -> Glm52Model:
+    model = object.__new__(Glm52Model)
+    cfg = Glm52ModelConfig()
+    cfg.mtp_num_draft_tokens = k
+    model.config = cfg
+    return model
+
+
+def test_glm52_prefill_persists_drafts_only_under_mtp():
+    """The MTP prefill computes [emitted, k drafts] and returns it as
+    "text_inputs". An output with no declared edge is UNROUTED — the worker
+    drops it — so without this edge the prefill's whole sync+draft pass was
+    wasted TTFT work and the first decode step ran unspeculated, injecting
+    one artificial n_acc=0 per request into the acceptance histogram (it
+    deflates measured p1). k=0 must keep the byte-identical old walk."""
+    from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+
+    prefill_k0 = _make_model_k(0).get_graph_walk_graphs()["prefill"]
+    assert [e.name for e in prefill_k0.outputs] == ["new_token"]
+
+    prefill_k2 = _make_model_k(2).get_graph_walk_graphs()["prefill"]
+    by_name = {e.name: e for e in prefill_k2.outputs}
+    assert set(by_name) == {"new_token", "text_inputs"}
+    # Persisted, not emitted: the conductor seeds decode from it, and it must
+    # never reach the client as output text.
+    drafts = by_name["text_inputs"]
+    assert drafts.persist is True
+    assert drafts.next_node == EMPTY_DESTINATION
+    assert by_name["new_token"].next_node == EMIT_TO_CLIENT
+
+
+def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them():
+    """The prefill->decode handoff must prefer the persisted draft bundle
+    over the bare new_token, and must unpersist BOTH so no per-request
+    tensor outlives the transition."""
+    def _transition(model, persist_signals):
+        metadata = CurrentForwardConductorMetadata(
+            input_modalities=["text"], output_modalities=["text"],
+            graph_walk="prefill", is_prefill=True,
+        )
+        return model.get_partition_forward_pass_args(
+            partition_name="default", partition_metadata=metadata,
+            persist_signals=persist_signals,
+        )
+
+    # k=0 (and any step where MTP persisted nothing): seed from new_token.
+    res = _transition(_make_model_k(0), {"new_token": ["tok"]})
+    assert res.inputs[0].tensor_info == ["tok"]
+    assert res.unpersist_tensors == ["tok"]
+
+    # MTP: seed from the draft bundle, and consume new_token alongside it.
+    res = _transition(
+        _make_model_k(2), {"new_token": ["tok"], "text_inputs": ["bundle"]})
+    assert res.inputs[0].name == "text_inputs"
+    assert res.inputs[0].tensor_info == ["bundle"]
+    assert set(res.unpersist_tensors) == {"bundle", "tok"}
+
+
+def test_glm52_decode_loop_cap_is_not_the_token_budget():
+    """max_iters is a runaway guard, not the budget. Building it from the
+    startup default (1024) silently truncated any larger requested budget:
+    the decode edge carries no conductor_new_token, so the conductor's
+    max-token stop never fires for this model and check_stop — which sees
+    the request's real max_tokens — is the only thing enforcing it."""
+    model = _make_model_k(0)
+    decode = model.get_graph_walk_graphs()["decode"]
+    assert decode.max_iters == model.config.max_seq_len
+    assert decode.max_iters > model.config.max_output_tokens
+    assert not any(e.conductor_new_token for e in decode.section.outputs)
+
+
+def test_glm52_mtp_declares_greedy_default_but_honors_explicit_asks():
+    """MTP v1 decode is raw argmax. A bare request must serve coherently
+    (greedy declared) rather than inherit config temperature=1.0 and be
+    refused by prepare_inputs; an EXPLICIT non-greedy ask must survive to
+    that refusal, because silently ignoring an ask is the failure mode."""
+    assert _make_model_k(2).get_sampling_config("LLM").temperature == 0.0
+    assert _make_model_k(2).get_sampling_config(
+        "LLM", {"temperature": 0.7}).temperature == 0.7
+    # k=0 keeps the model default — speculation is what forces greedy.
+    k0 = _make_model_k(0)
+    assert k0.get_sampling_config("LLM").temperature == k0.config.temperature
+
+
 def test_glm52_decode_completion_marks_done():
     model = _make_model()
     metadata = CurrentForwardConductorMetadata(
