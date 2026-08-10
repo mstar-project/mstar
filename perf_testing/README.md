@@ -57,6 +57,60 @@ COMPONENT: dit  ...
 `walk-headroom` = per-call headroom × multiplicity = recoverable ms per generated
 image. It makes the DiT's per-step cost dominate (×50), which is the real priority.
 
+## How to read the hierarchical report
+
+Read it **top-down, biggest-number-first**. The mental model:
+
+> **component share → op-class walk-headroom → bucket (the fix) → top kernels (the place).**
+
+Rank at every level by the recoverable-ms column; the bucket names the fix; drill
+to kernels/source for the exact edit.
+
+**1. WALK TOTAL + component table — "where do I even look".**
+
+| column | meaning |
+| --- | --- |
+| per-call ms | device time for one invocation of the component |
+| xN | how many times it runs per generated image (`num_inference_steps` for dit, 1 for vae) |
+| walk ms | per-call × N — the component's real cost per image |
+| share | % of the whole walk |
+| recoverable ms | headroom at walk scale — **the number to rank by** |
+
+Read: the DiT is 99% of the walk and holds ~850 of the ~859 ms recoverable →
+optimize the DiT. (A naive per-call view would wrongly make the vae's 13 ms look
+comparable to the dit's 21 ms; the ×N weighting corrects that.)
+
+**2. Component's op-class table — "what kind of fix".** Sorted by walk-headroom.
+
+| column | meaning |
+| --- | --- |
+| measured | per-call device time for that op-class |
+| roofline | hardware-necessary time `max(FLOPs/peak, bytes/peak)` |
+| gap | measured/roofline — how far from optimal (higher = more waste) |
+| walk-headroom | (measured − roofline) × N — recoverable ms per image |
+| bucket | the **named fix** (fusion / redundant / occupancy / at-roofline) |
+
+Read: `norm/adaLN/pointwise` at 179× / 794 ms, bucket **FUSION** → fuse the eager
+pointwise. `GEMM` at gap 1×, 0 headroom → **leave it alone.**
+
+**3. Op-class top kernels — "where in source".** The specific kernels carrying the
+headroom. DiT Triton kernels also print their `transformer.py:line` + source text;
+eager/library kernels have no Inductor source — switch to
+`cosmos3_compiled_kernel_analysis.py` (or the capture-time module-hook profiler)
+to pin the exact line.
+
+**Reading caveats (so you don't over-trust a number):**
+- **gap ≈ 1 means "at roofline, leave it"** — the peak benches slightly under-read
+  (compute ~1600 vs B200's ~2250 TFLOP/s), so 0.9–1.0× is *done*, not sub-optimal.
+- The `overhead` row and part of `norm/adaLN/pointwise` include `_assert_async`
+  **determinism-artifact** kernels (harness runs with deterministic algorithms on),
+  absent in production — that headroom is slightly inflated.
+- Headroom is **per-op-class, not per-kernel** — a kernel inherits its class's numbers.
+- Roofline is analytic *necessary* work (dit) / FLOP-counted (vae); treat gaps as
+  **ROI signals** (which class to attack), not exact bounds.
+
+The saved file under `perf_testing/results/` is byte-identical to the console output.
+
 ### Recording the output
 
 By **default** the report is tee'd (printed live **and** saved) to
