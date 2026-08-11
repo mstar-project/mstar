@@ -1,11 +1,7 @@
 
 from dataclasses import dataclass, field
 
-
-class ResourceStep:
-    ...
-
-
+import torch
 
 @dataclass(frozen=True)
 class Segment:
@@ -20,14 +16,48 @@ class Segment:
     label: str
     span: int
 
+@dataclass(frozen=True)
+class ResourceStep:
+    # Work for one resource, for one step
+    segments: tuple[Segment, ...] | None = None
 
-@dataclass
-class KVStep(ResourceStep):
-    segments: list[Segment] = field(default_factory=list)
+@dataclass(frozen=True)
+class StepContext:
+    # engine-only
+    request_ids: tuple[str, ...]
+    graph_walk: str
+    slot: int
+    capture: bool # default true or false?
 
-
-@dataclass
+@dataclass(frozen=True)
 class SubmoduleStep:
-    kv_steps: dict[str, KVStep]
-    # As per Atindra's comment on my PR comment, maybe we can have the
-    # submodule return a dataclass like this
+    # cumulative step over submodule::forward for all resoures
+    ctx: StepContext
+    segments: tuple[Segment, ...] # authoritative ordering
+    steps: dict[str, ResourceStep] # resource key -> step within cumulative
+
+    def get(self, key: str) -> ResourceStep | None: ...
+
+
+"""perhaaps move below to distinct files/location per resource kind"""
+
+@dataclass(frozen=True)
+class KVStep(ResourceStep):
+    write: bool
+    commit: bool
+    pre_forks: tuple[tuple[str, str], ...] = ()
+    post_forks: tuple[tuple[str, str], ...] = ()
+
+@dataclass(frozen=True)
+class AttentionStep(ResourceStep):
+    causal: bool
+    batched_key: str | None
+
+@dataclass(frozen=True)
+class PositionStep(ResourceStep):
+    pos_ids: torch.Tensor | None
+    advance: tuple[int, ...]
+
+@dataclass(frozen=True)
+class SamplerStep(ResourceStep):
+    apply_penalty: bool
