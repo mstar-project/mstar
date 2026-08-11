@@ -87,7 +87,7 @@ class EngineManager:
         real computation.
         """
         node_to_engine_type = model.get_node_engine_types()
-        node_resource_specs = model.get_node_resources(kv_config)
+        node_resource_specs = model.get_node_resources({})
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to

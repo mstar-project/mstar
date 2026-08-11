@@ -1,59 +1,51 @@
-"""Boundary types for engine resources.
 
-A resource (KV cache pool, attention manager, positional embedder) owns one
-piece of per-step machinery. Everything passed between resources is one of
-the immutable values below, valid for a single step.
-"""
-
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from abc import ABC, abstractmethod
+from typing import Any
 
 import torch
 
-if TYPE_CHECKING:
-    from mstar.engine.resources.kv_pool import KVCachePool
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.step import ResourceStep
 
 
-@dataclass(frozen=True)
-class Segment:
-    """One step's addition to a request's cache stream.
+class Resource(ABC):
+	@classmethod
+	@abstractmethod
+	def build(
+		cls, spec: NodeResourceSpec,
+		device: torch.device,
+		**engine_kwargs
+	) -> "Resource":
+		...
 
-    A request contributes one segment per label active for it in a step;
-    the batch's ordered segment list defines the layout of per-token
-    arrays. ``span`` may be 0: a zero-span segment reads its stream
-    without extending it (admission reserves nothing, commit is a no-op).
-    """
-    request_id: str
-    label: str
-    span: int
+	@abstractmethod
+	def ingest_request(self, rid: str, overrides: ResourceReqConfig):
+		...
 
+	@abstractmethod
+	def remove_request(self, rid: str):
+		...
 
-@dataclass(frozen=True)
-class Reservation:
-    """A KV cache pool's answer to admitting one segment: how much of the
-    span is already resident, how much must actually be computed, and
-    whether residency is still being established asynchronously."""
-    resident: int
-    to_compute: int
-    pending: bool = False
+	def admit_retrieve(self, rid: str, published: Any) -> bool:
+		"""
+		Takes the output of publish, possibly from another device, and kicks
+		of a retrieval if needed (e.g., PD disaggregation KV transfer).
+		Returns whether the retrieve has completed.
+		"""
+		return True
 
+	@abstractmethod
+	def admit(self, step: ResourceStep):
+		...
 
-@dataclass(frozen=True)
-class SequenceView:
-    """What a pool holds for one segment's stream, after admission: the
-    storage the page table indexes into (by pool reference), the page table
-    itself, and the logical extent it covers. The extent is the positions
-    ``[start, start + length)``, not necessarily a prefix from zero."""
-    pool: "KVCachePool"
-    page_indices: tuple[int, ...]
-    start: int
-    length: int
+	@abstractmethod
+	def plan(self, key: str, step: ResourceStep) -> None:
+		...
 
+	@abstractmethod
+	def commit(self, step: ResourceStep) -> None:
+		...
 
-@dataclass(frozen=True)
-class PositionPlan:
-    """A positional embedder's output for one step: position identifiers in
-    segment order (in whatever shape the scheme requires), and the amount by
-    which each segment's position counter advances at commit."""
-    pos_ids: torch.Tensor
-    advance: tuple[int, ...]
+	@abstractmethod
+	def publish(self, request_id: str) -> object | None:
+		...

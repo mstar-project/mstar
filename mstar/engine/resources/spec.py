@@ -7,12 +7,22 @@ configs unchanged, so a model only overrides it to add resources beyond
 what those configs already describe.
 """
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import IntEnum
 
 import torch
 
 from mstar.engine.kv_store import KVCacheConfig
+from mstar.utils.sampling import SamplingConfig
 
+
+class ResourceType(IntEnum):
+    KV_CACHE = 0
+    SCRATCH_KV = 1
+    SAMPLER = 2
+    ATTENTION = 3
+    
 
 @dataclass(frozen=True)
 class ScratchKVSpec:
@@ -24,13 +34,70 @@ class ScratchKVSpec:
 
 
 @dataclass
-class NodeResourceSpec:
-    """One KV cache group's resource declaration.
+class NodeResourceSpec(ABC):
+    label: str
+    nodes: set[str]
 
-    The cache config derives the self-attention pool, the attention
-    backend, the rope embedder, and the cross-attention pools, exactly as
-    it always has. ``scratch`` adds keyed fixed-shape caches built
-    alongside them (resource key to spec).
-    """
-    kv_cache_config: KVCacheConfig
-    scratch: dict[str, ScratchKVSpec] = field(default_factory=dict)
+    def __post_init__(self):
+        if not isinstance(self.nodes, set):
+            self.nodes = set(self.nodes)
+
+    @property
+    @abstractmethod
+    def resource_type(self) -> ResourceType:
+        pass
+
+
+@dataclass
+class ScratchKVSpec(NodeResourceSpec):
+    config: ScratchKVSpec
+
+    @property
+    def resource_type(self):
+        return ResourceType.SCRATCH_KV
+
+
+@dataclass
+class SamplerSpec(NodeResourceSpec):
+    config: SamplingConfig
+
+    @property
+    def resource_type(self):
+        return ResourceType.SAMPLER
+
+
+
+class ResourceReqConfig(ABC):
+    @property
+    @abstractmethod
+    def resource_type(self) -> ResourceType:
+        pass
+
+    @abstractmethod
+    def apply_conductor_config(self, **kwargs):
+        pass
+
+
+@dataclass
+class SamplingReqConfig(ResourceReqConfig):
+    temperature: float = 0.6
+    top_k: int = 0
+    top_p: float = 1
+    ignore_eos: bool = False # used for benchmark parity
+    repetition_penalty: float = 1
+    _seed: int = 0 # set by the conductor
+
+    @property
+    def resource_type(self):
+        return ResourceType.SAMPLER
+
+    def apply_conductor_config(
+        self, seed: int=0,
+        **kwargs
+    ):
+        self._seed = seed
+
+    @property
+    def seed(self):
+        return self._seed
+

@@ -15,7 +15,7 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import KVSpec, NodeResourceSpec, SamplerSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -360,6 +360,10 @@ class Model(ABC):
         share the same config, e.g., Bagel's LLM / LLM_cfg_text / LLM_cfg_img).
         """
         pass
+
+    @property
+    def nodes(self):
+        return list(self.get_node_engine_types().keys())
 
     def get_node_resources(
         self, kv_cache_config: list[KVCacheConfig],
