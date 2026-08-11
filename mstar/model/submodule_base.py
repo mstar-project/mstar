@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -29,6 +30,28 @@ class NodeInputs:
 
 def _clone_or_none(tensor):
     return tensor.clone() if tensor is not None else None
+
+
+def _clone_tensor_input(value):
+    """Clone a ``tensor_inputs`` value, tolerating non-tensor entries.
+
+    ``tensor_inputs`` is overwhelmingly tensor-valued, but some submodules
+    stash auxiliary structure there (e.g. a list-of-tensors deepstack stack,
+    or a scalar side-channel). A plain ``value.clone()`` throws on those
+    (``'list' object has no attribute 'clone'``). Recurse into lists/tuples
+    and clone their tensors; pass scalars / other values through unchanged.
+    """
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, (list, tuple)):
+        return type(value)(_clone_tensor_input(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _clone_tensor_input(v) for k, v in value.items()}
+    # Scalars / immutables pass through; anything else mutable would alias the
+    # original, so copy it defensively rather than sharing state across a clone.
+    return copy.copy(value)
 
 
 class StackingMethod(Enum):
@@ -125,7 +148,7 @@ class ARNodeInputs(NodeInputs):
             input_ids=_clone_or_none(self.input_ids),
             input_embeds=_clone_or_none(self.input_embeds),
             custom_pos_ids=custom_pos_ids,
-            tensor_inputs={k: _clone_or_none(t) for k, t in self.tensor_inputs.items()},
+            tensor_inputs={k: _clone_tensor_input(t) for k, t in self.tensor_inputs.items()},
             kwargs=self.kwargs.copy()
         )
 

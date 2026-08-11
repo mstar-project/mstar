@@ -97,6 +97,9 @@ class PiecewiseGraphData:
     static_cache_manager: BatchedCacheManager | None
     dummy_rids: list[str]
     shape: PiecewiseCaptureShape
+    # Per-bucket no-KV attention wrapper, replanned outside the graph per replay.
+    # None for KV-cache configs, which plan through static_cache_manager.
+    attn_state: Any = None
 
 @dataclass
 class CudaGraphData:
@@ -2511,6 +2514,13 @@ class PiecewiseCudaGraphRunner:
     def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
         static_inputs = self.config.make_static_inputs(shape)
         static_cm, dummy_rids = self._setup_cache_manager(shape)
+        # Built once so the graph captures its index buffers; replanned, never
+        # rebuilt, per replay.
+        attn_state = (
+            self.config.make_attn_state(shape)
+            if static_cm is None and self.config.make_attn_state is not None
+            else None
+        )
 
         fn = self.config.capture_fn
         if self.config.compile:
@@ -2531,9 +2541,11 @@ class PiecewiseCudaGraphRunner:
             )
 
         def run_fn():
+            extra = {} if attn_state is None else {"attn_state": attn_state}
             return fn(
                 static_inputs=static_inputs,
                 static_cm=static_cm,
+                **extra,
                 **self.config.forward_kwargs,
                 **extra_kwargs
             )
@@ -2541,6 +2553,10 @@ class PiecewiseCudaGraphRunner:
         def plan():
             if static_cm is not None:
                 self._plan(static_cm, shape)
+            elif attn_state is not None and self.config.plan_attn_fn is not None:
+                # Bucket's own partition sums to total_tokens, so capture sees the
+                # widest indptr any replay can ask for.
+                self.config.plan_attn_fn(attn_state, shape, list(shape.seq_lens))
 
         plan()
 
@@ -2572,6 +2588,7 @@ class PiecewiseCudaGraphRunner:
             static_cache_manager=static_cm,
             dummy_rids=dummy_rids,
             shape=shape,
+            attn_state=attn_state,
         )
 
     def _setup_cache_manager(
@@ -2802,6 +2819,15 @@ class PiecewiseCudaGraphRunner:
                 static_cm,
                 data.shape,
                 seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
+            )
+        elif data.attn_state is not None and self.config.plan_attn_fn is not None:
+            # _replay_seq_lens zero-pads to shape.bs, so the indptr sums to the
+            # real token count and the pad tail lands in no segment; ragged
+            # attention is block-diagonal, so it cannot leak into real segments.
+            self.config.plan_attn_fn(
+                data.attn_state,
+                data.shape,
+                self._replay_seq_lens(data.shape, seq_lens, real_bs),
             )
 
         if self.sampler_buffer is not None and request_ids is not None:
