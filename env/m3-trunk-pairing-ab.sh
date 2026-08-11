@@ -62,9 +62,21 @@ PROV=$D/bench-mtp-b1-k$K.provenance
 
 ARMS=${ARMS:-"A B C"}
 WAIT_MAX_H=${WAIT_MAX_H:-12}
-FREE_FOR_MIN=${FREE_FOR_MIN:-30}
 SKIP_WAIT=${SKIP_WAIT:-0}
 DRAIN_MAX_S=${DRAIN_MAX_S:-180}
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-4}
+
+# 10, not 30. The 30-minute sustained-clear rule assumes contention means
+# someone's LONG job, where landing in their gap is the hazard. Measured over
+# 2h14m on 2026-08-10/11, this box's steady state is the opposite: a stream of
+# 1-4 minute jobs from kanzhu and garv901, most under the 1000 MiB threshold.
+# The longest quiet stretch in that whole window was 28 minutes and the median
+# was 2, so a 30-minute bar is unsatisfiable — the run waited all night and
+# measured nothing. The bar is also guarding something cheap: mstar-glm-serve
+# aborts on a busy GPU within ~10 s, and m3-sweep2.sh breaks its health poll
+# as soon as that process dies, so a raced launch costs seconds rather than
+# the 50-minute readiness timeout. Retrying a cheap race beats never starting.
+FREE_FOR_MIN=${FREE_FOR_MIN:-10}
 
 WANT_TOKENS=3264                                   # k=2, 20 prompts, invariant
 VLLM_REF="104.71 text tok/s (p1=0.866 p2=0.614)"   # same checkpoint, k=2
@@ -156,18 +168,19 @@ cp -p "$P/mstar/env/coriander-venv-freeze.txt" "$RUN/" 2>/dev/null
 say "arms: $ARMS"
 
 # ------------------------------------------------------------------- waiter
-# A momentary blip to zero is usually someone between jobs. Three arms is
-# ~95 min of load, so landing in a gap costs more than it did for one arm.
-# Any occupancy resets the clock.
-if [ "$SKIP_WAIT" != "1" ]; then
-  announced=0; clear_since=""; last_report=0
+# Any occupancy resets the clock. Called before every arm, not just the first:
+# an arm that loses the box to a racing job goes back to waiting instead of
+# abandoning the measurement.
+wait_for_box() {
+  [ "$SKIP_WAIT" = "1" ] && return 0
+  local announced=0 clear_since="" last_report=0 now held deadline
   deadline=$(( $(date +%s) + WAIT_MAX_H * 3600 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     now=$(date +%s)
     if [ "$(busy_gpus)" -eq 0 ] && ! others_on_gpus > /dev/null; then
       [ -z "$clear_since" ] && { clear_since=$now; say "box went clear — need ${FREE_FOR_MIN}m of quiet"; }
       held=$(( (now - clear_since) / 60 ))
-      [ "$held" -ge "$FREE_FOR_MIN" ] && { say "box clear ${held}m — taking it"; break; }
+      [ "$held" -ge "$FREE_FOR_MIN" ] && { say "box clear ${held}m — taking it"; return 0; }
       if [ $(( now - last_report )) -ge 600 ]; then
         say "box clear ${held}/${FREE_FOR_MIN}m"; last_report=$now
       fi
@@ -181,11 +194,9 @@ if [ "$SKIP_WAIT" != "1" ]; then
     fi
     sleep 60
   done
-  if [ -z "$clear_since" ] || [ $(( ($(date +%s) - clear_since) / 60 )) -lt "$FREE_FOR_MIN" ]; then
-    say "gave up after ${WAIT_MAX_H}h without a ${FREE_FOR_MIN}m clear window"
-    echo "TIMEOUT $(date -u)" > "$RUN/ab.done"; exit 1
-  fi
-fi
+  say "gave up after ${WAIT_MAX_H}h without a ${FREE_FOR_MIN}m clear window"
+  return 1
+}
 
 # ---------------------------------------------------------------- one arm
 run_arm() {
@@ -224,7 +235,14 @@ run_arm() {
 
   local start; start=$(date +%s)
   LAUNCHED=1
-  say "arm $arm ($label) launching, k=$K"
+  say "arm $arm ($label) launching, k=$K${2:+ (attempt $2)}"
+  # Sample who else lands on the GPUs for the duration of the arm. With
+  # FREE_FOR_MIN at 10 a short job CAN arrive mid-run; a number measured while
+  # someone else shared the SMs is not necessarily wrong, but it is not
+  # comparable to a clean one, so it gets attributed instead of silently
+  # trusted. Not a tripwire: withholding it would lose real data.
+  ( while :; do others_on_gpus >> "$out/contention.txt" 2>/dev/null; sleep 30; done ) &
+  local sampler=$!
   (
     unset MSTAR_GLM52_MTP_PAIR_POSTNORM MSTAR_GLM52_MTP_CAPTURE_SYNC \
           MSTAR_GLM52_MTP_PREFILL_DRAFTS
@@ -235,8 +253,15 @@ run_arm() {
     env | grep -E '^MSTAR_GLM52' | sort > "$out/env.txt"
     HOLD_MIN=0 bash "$D/m3-sweep2.sh" "$K"
   )
+  kill "$sampler" 2>/dev/null
   local sweep; sweep=$(cat "$D/m3-sweep.done" 2>/dev/null || echo MISSING)
   say "arm $arm sweep marker: $sweep"
+  local shared="none"
+  if [ -s "$out/contention.txt" ]; then
+    shared=$(sort -u "$out/contention.txt" | cut -d' ' -f1 | sort -u | tr '\n' ' ')
+    touch "$out/contended"
+    say "arm $arm CONTENDED: shared the box with $shared during this arm"
+  fi
 
   # The sweep leaves the server UP on bench failure, by design. Take the box
   # back before the next arm reads our own server as contention.
@@ -290,6 +315,7 @@ run_arm() {
     echo "EAGER hits: $eager (want 0)"
     echo "pairing   : ${tag:-MISSING} (want $want_tag)"
     echo "sweep     : $sweep"
+    echo "shared box: $shared"
   } > "$out/summary.txt"
 
   local bad=0
@@ -323,8 +349,34 @@ run_arm() {
 }
 
 # ------------------------------------------------------------------- run
+# An arm that never got the box, or lost it, is RETRIED after re-waiting. An
+# arm that actually ran and failed a correctness tripwire is NOT retried —
+# that is a real result about the code, and re-running it just burns the box.
+# Without this the 08-10/11 attempt waited all night and measured nothing:
+# one racing job at the wrong moment ended the whole run.
+had_box=0
 for arm in $ARMS; do
-  run_arm "$arm"
+  attempt=1
+  while :; do
+    if [ "$had_box" != 1 ]; then
+      if ! wait_for_box; then
+        mkdir -p "$RUN/arm$arm"; echo "NO-WINDOW" > "$RUN/arm$arm/verdict.txt"
+        say "arm $arm: no ${FREE_FOR_MIN}m window inside ${WAIT_MAX_H}h"; break
+      fi
+    fi
+    had_box=0
+    if run_arm "$arm" "$attempt"; then had_box=1; break; fi
+    case "$(cat "$RUN/arm$arm/verdict.txt" 2>/dev/null)" in
+      RACED*|NO-ARTIFACT*|NO-SERVE-LOG*|STALE-ARTIFACT*)
+        if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+          say "arm $arm: lost the box on all $MAX_ATTEMPTS attempts — moving on"; break
+        fi
+        say "arm $arm: attempt $attempt lost the box — re-waiting"
+        mv "$RUN/arm$arm" "$RUN/arm$arm-lost$attempt"
+        attempt=$(( attempt + 1 )) ;;
+      *) break ;;   # TREE-*, BAD-CONFIG, TRIPWIRE — real, do not retry
+    esac
+  done
 done
 
 # ---------------------------------------------------------------- report
@@ -345,8 +397,11 @@ if [ -f "$RUN/armA/tokps.txt" ]; then
   for arm in $ARMS; do
     [ "$arm" = "A" ] && continue
     if [ -f "$RUN/arm$arm/tokps.txt" ]; then
+      note=""
+      { [ -f "$RUN/armA/contended" ] || [ -f "$RUN/arm$arm/contended" ]; } \
+        && note="  [CONTENDED — one or both arms shared the box; treat as indicative]"
       say "  DELTA arm$arm - armA: $(awk -v a="$A_T" -v b="$(cat "$RUN/arm$arm/tokps.txt")" \
-            'BEGIN{printf "%+.2f tok/s", b-a}')"
+            'BEGIN{printf "%+.2f tok/s", b-a}')$note"
     else
       say "  DELTA arm$arm - armA: unavailable ($(cat "$RUN/arm$arm/verdict.txt" 2>/dev/null || echo 'did not run'))"
     fi
@@ -366,12 +421,13 @@ fi
 # in before the EAGER/token/tag tripwires run, so a diverged or eager arm A
 # has a bench.txt too. Promoting that to the canonical name would republish a
 # number the gates just rejected.
-if [ "$(cat "$RUN/armA/verdict.txt" 2>/dev/null)" = OK ] && [ -f "$RUN/armA/bench.txt" ]; then
+if [ "$(cat "$RUN/armA/verdict.txt" 2>/dev/null)" = OK ] && [ -f "$RUN/armA/bench.txt" ] \
+   && [ ! -f "$RUN/armA/contended" ]; then
   cp -p "$RUN/armA/bench.txt" "$BENCH"
   [ -f "$RUN/armA/provenance.txt" ] && cp -p "$RUN/armA/provenance.txt" "$PROV"
   say "canonical $BENCH restored to arm A (defaults)"
 else
-  say "canonical $BENCH left ABSENT — no clean arm A; nothing may be read as the k=$K number"
+  say "canonical $BENCH left ABSENT — arm A was not clean-and-uncontended; nothing here is the k=$K number"
 fi
 
 release_box "final"

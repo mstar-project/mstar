@@ -37,12 +37,15 @@ mkfake() {           # scenario -> builds a fresh $SB/P tree + fake bins
   printf '#!/bin/sh\necho "pkg==1.0"\n' > "$SB/P/mstar/.venv/bin/pip"; chmod +x "$SB/P/mstar/.venv/bin/pip"
   git -C "$SB/P/mstar" add -A >/dev/null; git -C "$SB/P/mstar" commit -qm init
 
-  # fake nvidia-smi: 8 idle GPUs, no compute apps
+  # fake nvidia-smi: 8 idle GPUs, no compute apps. With FAKE_BUSY=1 it reports
+  # pid 1 (root, i.e. not kirill) holding a GPU, which is how the driver sees
+  # another user's job.
   cat > "$SB/bin/nvidia-smi" <<'EOF'
 #!/bin/sh
 case "$*" in
-  *compute-apps*) exit 0 ;;
-  *memory.used*)  for i in 1 2 3 4 5 6 7 8; do echo 4; done ;;
+  *compute-apps*) [ "${FAKE_BUSY:-0}" = 1 ] && echo 1; exit 0 ;;   # pid only, as the real query returns
+  *memory.used*)  if [ "${FAKE_BUSY:-0}" = 1 ]; then echo 5000; else echo 4; fi
+                  for i in 2 3 4 5 6 7 8; do echo 4; done ;;
 esac
 EOF
   printf '#!/bin/sh\nexit 1\n' > "$SB/bin/pkill"
@@ -88,11 +91,11 @@ EOF
   chmod +x "$SB/P/glm-m3/m3-sweep2.sh"
 }
 
-run() {  # $1 scenario name, $2 SWEEP_MODE, $3 ARMS
+run() {  # $1 scenario name, $2 SWEEP_MODE, $3 ARMS, $4 FAKE_BUSY
   mkfake; mksweep
-  echo "════════ $1 (mode=$2 arms=$3)"
+  echo "════════ $1 (mode=$2 arms=$3 busy=${4:-0})"
   PATH="$SB/bin:$PATH" P="$SB/P" SKIP_WAIT=1 ARMS="$3" SWEEP_MODE="$2" \
-    DRAIN_MAX_S=1 bash "$DRIVER"
+    FAKE_BUSY="${4:-0}" MAX_ATTEMPTS=3 DRAIN_MAX_S=1 bash "$DRIVER"
   local rd; rd=$(ls -td "$SB"/P/glm-m3/perf-ab-* | head -1)
   sed 's/^/   /' "$rd/run.log"
   echo "   --- marker: $(cat "$rd/ab.done" 2>/dev/null || echo MISSING)"
@@ -104,4 +107,5 @@ run "bench fails (server leak)"   benchfail "A B"
 run "stream diverged (3192)"      diverged  "A"
 run "eager warning present"       eager     "A"
 run "sweep yields, no artifact"   yield     "A B"
+run "box never free (retry cap)"  ok        "A"      1
 echo "sandbox: $SB"
