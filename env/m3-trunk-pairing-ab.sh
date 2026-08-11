@@ -244,8 +244,11 @@ run_arm() {
   ( while :; do others_on_gpus >> "$out/contention.txt" 2>/dev/null; sleep 30; done ) &
   local sampler=$!
   (
-    unset MSTAR_GLM52_MTP_PAIR_POSTNORM MSTAR_GLM52_MTP_CAPTURE_SYNC \
-          MSTAR_GLM52_MTP_PREFILL_DRAFTS
+    # Pin the baseline OFF explicitly (not `unset`): as of 2026-08-11 the code
+    # default for both flags is ON, so arm A must force them off to measure the
+    # pre-norm / eager-sync baseline rather than the shipped combined path.
+    export MSTAR_GLM52_MTP_PAIR_POSTNORM=0 MSTAR_GLM52_MTP_CAPTURE_SYNC=0 \
+           MSTAR_GLM52_MTP_PREFILL_DRAFTS=0
     case "$arm" in
       B) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 ;;
       C) export MSTAR_GLM52_MTP_CAPTURE_SYNC=1 ;;

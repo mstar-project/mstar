@@ -511,9 +511,10 @@ def test_mtp_trunk_piecewise_config_shapes():
 
     cfg = _mtp_cfg(2)  # rows per request = 3
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
-    # The sync capture is opt-in (measured 33.02 tok/s / p1 0.18 on
-    # 2026-08-10 vs the eager path's 49.65 / 0.76), so the default set is
-    # the two validated graphs.
+    # Sync capture is env-default-ON as of 2026-08-11 (measured clean, 3264
+    # bit-exact, arm C). Pin it OFF here to check the trunk+draft-only set,
+    # then ON below for the sync-included set.
+    sub._mtp_capture_sync = False
     assert set(sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
             "mtp_trunk", "mtp_draft"}

@@ -223,8 +223,20 @@ def test_captured_mtp_step_matches_eager_bit_identically():
     model = _build(cfg)
     prompts = _prompts(1)
 
-    eager, _ = _drive(cfg, model, prompts, steps=6, use_graphs=False)
-    replay, runners = _drive(cfg, model, prompts, steps=6, use_graphs=True)
+    # Sync capture is env-default-ON as of 2026-08-11; pin it OFF here so this
+    # test isolates the trunk + draft-chain graphs (and covers the
+    # CAPTURE_SYNC=0 escape-hatch path). test_sync_capture_matches_eager and
+    # test_batch_padding_replay cover the sync-on path (bs=1 and bs=3).
+    prev = os.environ.get("MSTAR_GLM52_MTP_CAPTURE_SYNC")
+    os.environ["MSTAR_GLM52_MTP_CAPTURE_SYNC"] = "0"
+    try:
+        eager, _ = _drive(cfg, model, prompts, steps=6, use_graphs=False)
+        replay, runners = _drive(cfg, model, prompts, steps=6, use_graphs=True)
+    finally:
+        if prev is None:
+            os.environ.pop("MSTAR_GLM52_MTP_CAPTURE_SYNC", None)
+        else:
+            os.environ["MSTAR_GLM52_MTP_CAPTURE_SYNC"] = prev
 
     assert MTP_TRUNK_LABEL in runners, (
         "the trunk graph did not capture — a benchmark would have reported "

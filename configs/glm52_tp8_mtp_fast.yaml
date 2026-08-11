@@ -10,10 +10,12 @@ model_kwargs:
   checkpoint_path: /m-coriander/coriander/hf/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541
   tokenizer_mode: hf
   moe_quant_kernel: triton
-  # k=2 is the measured optimum (49.65 tok/s; k=1 47.95, k=3 47.99 on the
-  # 08-09/10 sweep). m3-sweep2.sh seds this line for per-k copies, so the
-  # sweep is unaffected; this default is what a direct launch gets.
-  mtp_num_draft_tokens: 2
+  # k=3 is the measured optimum for the combined default (post-norm + sync
+  # capture): 66.97 tok/s at k=3 vs 64.30 k=2, 63.31 k=4, all 3264 bit-exact
+  # (2026-08-11). The old pre-combined regime peaked at k=2/49.65 (k=3 was then
+  # 47.99, before post-norm fixed p2). m3-sweep2.sh seds this line for per-k
+  # copies, so the sweep is unaffected; this default is what a direct launch gets.
+  mtp_num_draft_tokens: 3
 kv_cache:
   max_num_pages: 512
   page_size: 128

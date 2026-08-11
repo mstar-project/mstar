@@ -149,22 +149,28 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
         # Which trunk stream the MTP plane pairs drafts against — see
-        # ``_mtp_pair_rows``. Default keeps today's pre-final-norm behaviour;
-        # MSTAR_GLM52_MTP_PAIR_POSTNORM=1 selects vLLM's convention for the A/B.
+        # ``_mtp_pair_rows``. DEFAULT ON [2026-08-11]: post-final-norm is vLLM's
+        # convention; it recovers p1/p2 to 0.89/0.74 (from pre-norm's 0.77/0.33)
+        # and, combined with capture below, measures 66.97 tok/s at k=3, 3264
+        # bit-exact. Set MSTAR_GLM52_MTP_PAIR_POSTNORM=0 to restore pre-norm
+        # pairing (whose only known cost was an eager-sync FP near-tie forking
+        # ~0.25% of the stream; the captured path holds bit-identity).
         self._mtp_pair_postnorm = (
-            os.environ.get("MSTAR_GLM52_MTP_PAIR_POSTNORM", "0") == "1"
+            os.environ.get("MSTAR_GLM52_MTP_PAIR_POSTNORM", "1") == "1"
         )
         # Capture the decode sync pass as a padded (bs, k+1) piecewise graph.
-        # DEFAULT OFF: measured 2026-08-10 at 33.02 tok/s with p1 acceptance
-        # 0.18 vs the eager path's 49.65 / 0.76 — the padded replay is
-        # producing a wrong draft 1 somewhere the CPU seam test cannot see
-        # (its stub runner plans and runs eagerly on the real handle; the
-        # real one replays a captured graph through static buffers and
-        # aliased dummy states). An unvalidated capture must not be the
-        # default path: the whole point of this switch is that a graph which
-        # lowers acceptance looks exactly like a modelling problem.
+        # DEFAULT ON [2026-08-11]: measured clean at 53.58 tok/s, 3264 bit-exact,
+        # 0 eager (arm C, TP8), and 66.97 combined with post-norm at k=3. The
+        # 08-10 33.02/0.18 scare was the text_inputs bug measured jointly, not
+        # this — the padded replay is bit-identical, pinned by
+        # test_sync_capture_matches_eager_bit_identically and confirmed at TP8.
+        # Set MSTAR_GLM52_MTP_CAPTURE_SYNC=0 to fall back to the eager sync pass
+        # — but with post-norm also default-on, that alone lands on post-norm's
+        # eager-sync ~0.25% fork; recovering strict bit-identity to plain decode
+        # needs MSTAR_GLM52_MTP_PAIR_POSTNORM=0 as well.
+        # bs>1 is covered by the reduced-dims GPU test only, not yet at scale.
         self._mtp_capture_sync = (
-            os.environ.get("MSTAR_GLM52_MTP_CAPTURE_SYNC", "0") == "1"
+            os.environ.get("MSTAR_GLM52_MTP_CAPTURE_SYNC", "1") == "1"
         )
         # One-shot flag: warn the first time an MTP decode trunk runs eager
         # (no captured piecewise bucket) — the 2026-08-09 bench showed that
