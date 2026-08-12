@@ -33,11 +33,26 @@ class Layout:
     def base(self) -> Path:
         return self.root / ".vibesys"
 
+    def instance_dir(self, task: str, instance: str) -> Path:
+        """Everything for one port lives under .vibesys/<task>/<instance>/."""
+        return self.base / task / instance
+
     def bundle_dir(self, task: str, instance: str) -> Path:
-        return self.base / "bundles" / task / instance
+        return self.instance_dir(task, instance) / "bundle"
 
     def seed_dir(self, task: str, instance: str) -> Path:
-        return self.base / "seed" / task / instance
+        # Named to match vibesys's --input-workspace-seed: this is the immutable
+        # per-run *input* the run copies into the mutable runs/<run>/workspace.
+        return self.instance_dir(task, instance) / "workspace-seed"
+
+    def runs_dir(self, task: str, instance: str) -> Path:
+        """vibesys's runtime store (exp_env) for this instance (--runs-dir)."""
+        return self.instance_dir(task, instance) / "runs"
+
+    @property
+    def hf_cache(self) -> Path:
+        """Shared weight cache across instances (checkpoints are large)."""
+        return self.base / "hf_cache"
 
     def image_tag(self, task: str, instance: str) -> str:
         return f"mstar-vibesys/{task}:{instance}"

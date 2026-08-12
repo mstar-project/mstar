@@ -132,9 +132,16 @@ class AddModelTask(TaskType):
         return SynthesisInputs(
             domain=self.domain,
             objective_file=bundle_dir / "OBJECTIVE.md",
-            accuracy_command=f"python vibeval/checker.py --url http://localhost:{spec.port} --{spec.accuracy_mode}",
+            # Run the gate via uv so it has a self-contained Python + httpx/numpy
+            # regardless of the container's system Python (--no-project skips the
+            # workspace's own dep resolution, so it starts instantly).
+            accuracy_command=(
+                f"uv run --no-project --with httpx --with numpy python vibeval/checker.py "
+                f"--url http://localhost:{spec.port} --{spec.accuracy_mode}"
+            ),
             benchmark_command=(
-                f"python vibeval/benchmark.py --url http://localhost:{spec.port} {spec.result_arg} result.json"
+                f"uv run --no-project --with httpx --with numpy python vibeval/benchmark.py "
+                f"--url http://localhost:{spec.port} {spec.result_arg} result.json"
             ),
             reference_dir=bundle_dir / "reference",
             evaluator_dir=bundle_dir / "evaluator",
@@ -162,10 +169,9 @@ class AddModelTask(TaskType):
         return opts
 
     def image(self, spec: Spec) -> ImageSpec:
-        return ImageSpec(
-            dockerfile=self.dir.parents[1] / "Dockerfile",
-            build_args={"MSTAR_EXTRA": spec.extra},
-        )
+        # The image is a minimal CUDA+uv env; mstar and its deps resolve at run
+        # time from the candidate's own pyproject via `uv run` (see Dockerfile).
+        return ImageSpec(dockerfile=self.dir.parents[1] / "Dockerfile", build_args={})
 
     # ---- helpers ------------------------------------------------------------
     def _ctx(self, spec: Spec) -> dict:

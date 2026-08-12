@@ -55,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     layout = default_layout()
     bundle_dir = layout.bundle_dir(task.name, args.instance)
     seed_dir = layout.seed_dir(task.name, args.instance)
+    runs_dir = layout.runs_dir(task.name, args.instance)
     image_tag = layout.image_tag(task.name, args.instance)
 
     if args.action == "show":
@@ -63,13 +64,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"spec     : {spec}")
         print(f"bundle   : {bundle_dir}")
         print(f"seed     : {seed_dir}")
+        print(f"runs     : {runs_dir}")
         print(f"image    : {image_tag}")
         return 0
 
     if args.action == "clean":
-        seed_mod.remove_seed(seed_dir)
-        shutil.rmtree(bundle_dir, ignore_errors=True)
-        print(f"removed {seed_dir} and {bundle_dir}")
+        inst_dir = layout.instance_dir(task.name, args.instance)
+        shutil.rmtree(inst_dir, ignore_errors=True)
+        print(f"removed {inst_dir} (bundle + workspace-seed + runs)")
         return 0
 
     if args.action == "build-image":
@@ -77,8 +79,10 @@ def main(argv: list[str] | None = None) -> int:
         if spec_img is None:
             print("this task declares no image; nothing to build")
             return 0
+        # Context = the Dockerfile's dir (small); the minimal image copies nothing
+        # from the repo, so sending the whole repo root as context is wasteful.
         image_mod.build_image(
-            spec_img.dockerfile, layout.root, image_tag,
+            spec_img.dockerfile, spec_img.dockerfile.parent, image_tag,
             build_args=spec_img.build_args, no_cache=args.no_cache,
         )
         print(f"built {image_tag}")
@@ -91,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         seed_mod.create_seed(layout.root, commit, seed_dir, force=args.force)
         task.render_bundle(spec, bundle_dir)
         task.seed_files(spec, seed_dir)
-        print(f"seeded worktree @ {commit[:12]} -> {seed_dir}")
+        print(f"seeded workspace @ {commit[:12]} -> {seed_dir}")
         print(f"rendered bundle -> {bundle_dir}")
         if args.action == "build":
             return 0
@@ -100,14 +104,17 @@ def main(argv: list[str] | None = None) -> int:
         docker_image = image_tag if (docker and image_mod.image_exists(image_tag)) else None
         if docker and docker_image is None:
             print(f"note: image {image_tag} not built; run `build-image` first or pass --no-docker", file=sys.stderr)
+        # vibesys refuses to overwrite a prior run's synthesized-input dir; clear
+        # it so re-runs of the same instance don't need a manual cleanup.
+        shutil.rmtree(runs_dir / "_inputs" / f"{task.name}-{args.instance}", ignore_errors=True)
+
         inputs = task.synthesis_inputs(spec, bundle_dir, seed_dir)
-        # A persistent HF cache so the ~12GB checkpoint downloads once and is
-        # reused across runs (the candidate loads weights by HF id in local mode).
-        hf_cache = layout.base / "hf_cache"
+        # A persistent (shared) HF cache so the ~12GB checkpoint downloads once and
+        # is reused across runs; vibesys's runtime store lands under this instance.
         opts = task.run_options(
             spec, exp_name=f"{task.name}-{args.instance}", docker_image=docker_image or "",
             rounds=args.rounds, backend=args.backend, docker=docker, cli_provider=args.cli_provider,
-            extra_env={"HF_HOME": str(hf_cache)}, runs_dir=layout.base / "exp_env",
+            extra_env={"HF_HOME": str(layout.hf_cache)}, runs_dir=runs_dir,
         )
         argv_out = runner_mod.build_argv(inputs, opts)
         return runner_mod.exec_vibesys(argv_out, dry_run=args.dry_run, extra_env=opts.extra_env)
