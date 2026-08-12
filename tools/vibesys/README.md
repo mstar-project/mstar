@@ -1,7 +1,7 @@
 # mstar-vibesys
 
-mstar-side glue that drives **VibeSys** (the agentic build/optimize loop under
-`3rd_party/vibesys`, `pip install vibesys`) against the mstar repo. VibeSys is
+mstar-side glue that drives **VibeSys** (the agentic build/optimize loop;
+`pip install vibesys`) against the mstar repo. VibeSys is
 generic; this package is the thin mstar adapter that, for a given *task*, renders
 a VibeSys input bundle, prepares an isolated seed of mstar plus a GPU eval image,
 hands off to the `vibesys` CLI, and keeps all generated state under one gitignored
@@ -240,11 +240,9 @@ as the oracle. Only `render_bundle` changes; `core/` is untouched.
   each run.
 - Docker build context is `tools/vibesys/` (small), not the repo root.
 
-## Keeping VibeSys in sync
+## Requirements
 
-`3rd_party/vibesys` is a clone of `uw-syfi/vibesys`, installed editable into the
-env, so upstream sync is:
-
-```bash
-git -C 3rd_party/vibesys pull        # + `uv pip install -e 3rd_party/vibesys` only if entry points/deps changed
-```
+VibeSys must be installed in the active environment (`pip install vibesys`) so
+the `vibesys` CLI is on `PATH`; the tool shells out to it. A coding-agent CLI
+(e.g. Codex or Claude Code) must also be installed and authenticated. Upgrade
+VibeSys the usual way — `pip install --upgrade vibesys`.
