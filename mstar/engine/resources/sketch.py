@@ -59,6 +59,12 @@ the bottom of this file.
 #
 # self.attn / self.rope resolve once at load from node_resources[key].
 # (slot is iffy here; see H.)
+# 
+# NOTE @nsagan: I had envisioned the attn, rope, sampler, etc. being passed in through
+# the ModelInputsFromEngine as a dict[str, Resource] instead of having the submodule
+# hold a reference to the resource---I think it works either way and this _would_ mean
+# not passing in arguments everywhere; I guess I'm just used to the resources being
+# passed in as arguments.
 #
 # how to unify capture v eager:
 #
@@ -116,6 +122,37 @@ the bottom of this file.
 #     kv.plan(step["kv"])                          -> views
 #     rope.plan(step["rope"], deps={"kv": views})  -> pos_ids + advance
 #     attn.plan(step["attn"], deps={"kv": views})  -> indptrs, planned wrapper
+# 
+# NOTE @nsagan: we need to figure out how this intercts with the 
+# speculatve pre-planning. Tentative notes below:
+# I. Current Implementation:
+#    1. engine.reserve_replay_slot(batch): currently assumes BASIC_BATCHED cuda graph
+#       config, and then tries to find a replay slot. If we do prepare_inputs first,
+#       then we will have the relevant sequence length information  (probably preferable
+#       as long as there is no perf downside)
+#    2. Waits for prev_advance_event, which happens after runner.commit
+#    3. engine.pre_plan_for_batch -> basically calls plan_attention on a separate stream
+#       and sets a cuda event for the worker to wait on. There is also reset_pre_plan_for_batch,
+#       which resets the slot (e.g., frees pages for dummy rids)
+
+# II. Most aggressive plan:
+#     - Split batch execution into two parts: First, prepare_inputs through plan,
+#       which can happen speculatively. Second, the forward pass through the end.
+#     - Some implications of this: (1) prepare_inputs is forced to be async-friendly,
+#       i.e., no .cpu or .item, etc. (2) more resources have to be double-buffered, not
+#       just attention (sampler and rope will have to be; KV cache is ok as long as it's
+#       thread safe, which it should already be). (3) this is more wasted work in the
+#       case of failed speculation. (4) future resources will be forced to work with the
+#       async worker.
+#     - However,this means that speculation happens "for free" in this design; also, gathering
+#       of sampler parameters is also happening asynchronously (whether that is useful or not).
+#       Also feels cleaner abstraction-wise.
+
+# III. Less aggressive (but "feels hackier" plan):
+#     - We add a function onto the Resource class called pre_plan (that is a no-op for
+#       anything but attention for now)
+#     - We also keep the restriction to batches under the BASIC_BATCHED cuda graph config
+# 
 
 from __future__ import annotations
 
