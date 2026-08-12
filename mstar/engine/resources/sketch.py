@@ -148,7 +148,7 @@ the bottom of this file.
 #       of sampler parameters is also happening asynchronously (whether that is useful or not).
 #       Also feels cleaner abstraction-wise.
 
-# III. Less aggressive (but "feels hackier" plan):
+# III. Less aggressive (but "feels hackier") plan:
 #     - We add a function onto the Resource class called pre_plan (that is a no-op for
 #       anything but attention for now)
 #     - We also keep the restriction to batches under the BASIC_BATCHED cuda graph config
@@ -263,9 +263,13 @@ class PagedKVCacheResource(Resource):
     _arena: PageArena
     _config: KVCacheConfig
     _storage: PagedStorage
+    # NOTE @nsagan: would prefer {rid -> {label -> CacheStream}} so that upon cleanup
+    # we can just directly clean up all labels for a request
     _streams: dict[tuple[str, str], CacheStream]
     _cpu: CPUPagePool | None
     _transfer: KVTransferEngine | None
+    # NOTE @nsagan: _write_policy has been dead code, so I might prefer to not add it
+    # at the moment
     _write_policy: StoreWritePolicy
 
     @classmethod
@@ -286,8 +290,6 @@ class PagedKVCacheResource(Resource):
     def _stream(self, rid: str, label: str) -> CacheStream:
         ...
 
-
-
     def admit(self, step: KVStep, *, ctx: StepContext) -> AdmitOutcome:
         """reserve pages for each segment's span
 
@@ -295,7 +297,8 @@ class PagedKVCacheResource(Resource):
 
     def narrow(self, step: KVStep, outcome: AdmitOutcome) -> KVStep:
         """cut down span to `to_compute`. not sure if necessary. would have to
-        run before attention `admit`. see E."""
+        run before attention `admit`. see E.
+        """
 
     def plan(self, key: str, step: KVStep, *, ctx: StepContext) -> dict[tuple[str, str], SequenceView]:
         """SequenceView per segment in segment order.

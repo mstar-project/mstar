@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
 import queue
@@ -5,8 +6,11 @@ import threading
 
 import torch
 
+from mstar.engine.kv_store import TransferEngineInfo
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.spec import KVSpec, NodeResourceSpec, ResourceType
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
+from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec
+from mstar.engine.v1.kv_transfer import KVTransferManager
 
 
 class PageAllocator:
@@ -55,84 +59,89 @@ class PageAllocator:
 
 
 @dataclass
-class KVRequestState:
-    """Per-request KV cache state for the AR engine."""
+class PageArena:
+    """physical storage and free list management"""
+    kv_cache: KVCache
+    allocator: PageAllocator
+
+    def acquire(self, n: int) -> list[int] | None:
+        return self.allocator.try_allocate(n)
+
+    def release(self, pages: list[int]) -> None:
+        return self.allocator.free(pages)
+
+    def copy_pages(self, src: list[int], dst: list[int]) -> None:
+        self.kv_cache.copy_pages(src, dst)
+    
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """fifo retention of `context_budget`"""
+    context_budget: int
+
+
+@dataclass
+class CacheStream:
+    """(request, label) cache stream metadata"""
     page_indices: list[int] = field(default_factory=list)
-    seq_len: int = 0 # includes read in progress
-    read_in_progress: bool = False
-
-    # sequence length of the in-distributed-store KV cache
-    is_paused: bool = False
-
-
-class KVLayout(Enum):
-    NHD = "NHD"
-    # TODO: can add more, like HND, MLA
-
-@dataclass
-class KVConfig:
-    num_layers: int
-    num_kv_heads: int
-    head_dim: int
-    max_seq_len: int
-    max_num_pages: int = 2048
-    page_size: int = 128
-    layout: KVLayout=KVLayout.NHD
-
-@dataclass
-class KVSpec(NodeResourceSpec):
-    config: KVConfig
-
-    @property
-    def resource_type(self):
-        return ResourceType.KV_CACHE
+    stored_len: int = 0
+    position: int = 0
+    released: int = 0
+    retention: RetentionPolicy | None = None
+    read_pending: bool = False
+    read_future: Future | None = None
+    offloaded: bool = False
 
 
-LabelToState = dict[str, KVRequestState]
+LabelToStream = dict[str, CacheStream]
 
 class KVManager(Resource):
     def __init__(
         self,
         cfg: KVConfig,
+        transfer_engine_info: TransferEngineInfo,
         device: torch.device,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
     ):
         self.config = cfg
-        if cfg.layout == KVLayout.NHD:
-            self.kv_cache = torch.zeros(
-                cfg.num_layers, cfg.max_num_pages, 2,
-                cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
-                dtype=dtype, device=device,
-            ).contiguous()
-        else:
-            raise NotImplementedError(
-                f"KV layout {cfg.layout} is not recognized."
-            )
-        self.allocator = PageAllocator(cfg.max_num_pages)
-        self.request_states: dict[str, LabelToState] = {}
+        self.kv_cache = KVCache(
+            cfg, device, dtype
+        )
+        
+        self._arena = PageArena(
+            kv_cache=self.kv_cache,
+            allocator=PageAllocator(cfg.max_num_pages)
+        )
+        self._transfer = KVTransferManager(
+            transfer_engine_info, self.kv_cache
+        )
+        self._streams: dict[str, LabelToStream] = {}
 
 
     @classmethod
     def build(
         cls, spec: KVSpec,
         device: torch.device,
+        transfer_engine_info: TransferEngineInfo,
         dtype=torch.bfloat16,
         **kwargs
     ):
         return cls(
             cfg=spec.config,
             device=device,
+            transfer_engine_info=transfer_engine_info,
             dtype=dtype
         )
 
     def ingest_request(self, rid, overrides=None):
         del overrides # claude always does this for type checking...
-        self.request_states[rid] = {
-            "main": KVRequestState()
+        self._streams[rid] = {
+            "main": CacheStream()
         }
 
-    def admit_retrieve(self, rid: str, per_label_seq_info):
+    def admit_retrieve(self, rid: str, per_label_seq_info) -> bool:
         # TODO: retrieve, return whether ready
+        # alloc -> call self._transfer -> set stream -> check if ready
         ...
     
     def remove_request(self, rid: str):
