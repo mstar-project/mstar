@@ -112,6 +112,7 @@ class AddModelTask(TaskType):
         ev = bundle_dir / "evaluator" / "vibeval"
         render.render_to(t / "checker.py.tmpl", ev / "checker.py", ctx)
         render.render_to(t / "benchmark.py.tmpl", ev / "benchmark.py", ctx)
+        render.render_to(t / "serve_and_eval.sh.tmpl", ev / "serve_and_eval.sh", ctx)
         ref_py = ev / "reference.py"
         render.render_to(t / "reference.py.tmpl", ref_py, ctx)
         override = self.dir / "instances" / f"{spec.model}.reference.py"
@@ -135,11 +136,16 @@ class AddModelTask(TaskType):
             # Run the gate via uv so it has a self-contained Python + httpx/numpy
             # regardless of the container's system Python (--no-project skips the
             # workspace's own dep resolution, so it starts instantly).
+            # serve_and_eval.sh brings the server up on the fixed port + waits for
+            # /health, then runs the gate (nothing else starts the server for the
+            # framework-owned official accuracy/benchmark commands).
             accuracy_command=(
+                f"bash vibeval/serve_and_eval.sh "
                 f"uv run --no-project --with httpx --with numpy python vibeval/checker.py "
                 f"--url http://localhost:{spec.port} --{spec.accuracy_mode}"
             ),
             benchmark_command=(
+                f"bash vibeval/serve_and_eval.sh "
                 f"uv run --no-project --with httpx --with numpy python vibeval/benchmark.py "
                 f"--url http://localhost:{spec.port} {spec.result_arg} result.json"
             ),

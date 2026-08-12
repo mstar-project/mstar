@@ -215,6 +215,10 @@ as the oracle. Only `render_bundle` changes; `core/` is untouched.
 
 ## Notes / gotchas the runner handles
 
+- The official accuracy/benchmark run through `vibeval/serve_and_eval.sh`, which
+  brings `run.sh` up on the fixed port and waits for `/health` before running the
+  gate, then tears it down. The framework-owned eval commands are pure HTTP
+  clients — nothing else starts the candidate server for them.
 - Candidate launch uses `uv run mstar-serve … --tensor-comm-protocol SHM`:
   `uv run` gives a self-contained Python, and SHM avoids `mstar-serve`'s RDMA
   default (which needs the optional `mooncake-transfer-engine`; `mstar serve`
