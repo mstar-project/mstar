@@ -1,0 +1,64 @@
+"""Reference oracle for the ${model} port (framework-owned, read-only).
+
+This is the ground truth the accuracy gate compares mstar against. It holds ALL
+model-specific logic: loading the upstream (HF/official) ${model}, producing the
+oracle output per walk, and mapping each walk onto a request/response against the
+candidate mstar server.
+
+Weights are mounted at ``/model`` (downloaded from ``reference/meta.json``).
+
+FILL IN the four hooks below for ${hf_id}. Until then the checker fails with a
+clear NotImplementedError, which is the correct state for an unfinished port.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+MODEL_DIR = "/model"
+_MODEL: Any = None
+
+
+def load() -> None:
+    """Load the upstream reference model once (called by --strict checker)."""
+    global _MODEL
+    if _MODEL is not None:
+        return
+    # TODO(${model}): construct the upstream model from MODEL_DIR in eval mode,
+    # matching the checkpoint dtype. e.g.
+    #   from transformers import AutoModelForCausalLM, AutoProcessor
+    #   _MODEL = {"model": AutoModelForCausalLM.from_pretrained(MODEL_DIR).eval().cuda(),
+    #             "processor": AutoProcessor.from_pretrained(MODEL_DIR)}
+    raise NotImplementedError("reference.load: wire up the upstream ${model} model")
+
+
+def sample_input(walk: str) -> dict:
+    """A fixed, deterministic input payload for ``walk`` (same for oracle + candidate)."""
+    # TODO(${model}): return the canonical probe input for each walk, e.g.
+    #   {"messages": [{"role": "user", "content": "..."}], "seed": 0}
+    raise NotImplementedError(f"reference.sample_input: define a probe for walk {walk!r}")
+
+
+def to_request(walk: str, sample: dict) -> tuple[str, str, dict]:
+    """Map ``walk`` to a (method, path, json_body) against the mstar server.
+
+    Drive exact-match walks greedily: set temperature 0 and a fixed seed here.
+    """
+    # TODO(${model}): e.g.
+    #   return "POST", "${endpoint}", {"model": "${served_model_name}", "temperature": 0,
+    #                                   "seed": 0, **sample}
+    raise NotImplementedError(f"reference.to_request: map walk {walk!r} to a request")
+
+
+def from_response(walk: str, response) -> Any:
+    """Parse the candidate mstar HTTP response into the artifact ``oracle`` returns
+    (token-id list / logits array / audio samples / image array)."""
+    # TODO(${model}): parse response.json() / response.content for this walk.
+    raise NotImplementedError(f"reference.from_response: parse walk {walk!r} output")
+
+
+def oracle(walk: str, sample: dict) -> Any:
+    """Reference output for ``walk`` from the upstream model, same artifact type
+    as ``from_response``."""
+    # TODO(${model}): run _MODEL on sample and return the ground-truth artifact.
+    raise NotImplementedError(f"reference.oracle: compute reference output for walk {walk!r}")

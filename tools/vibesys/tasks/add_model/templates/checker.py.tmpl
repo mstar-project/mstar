@@ -1,0 +1,144 @@
+"""Correctness gate for the ${model} mstar port (framework-owned, read-only).
+
+For each Walk it sends a deterministic request to the running mstar server and
+compares the candidate output to the reference oracle in ``reference/reference.py``
+under a per-walk tolerance. ``--smoke`` skips the oracle (validity only) for
+first bring-up; ``--strict`` (default) enforces numerical fidelity.
+
+Transport + comparators live here; everything model-specific (oracle outputs and
+how to ask the candidate for a walk) lives in ``reference/reference.py``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+import httpx
+import numpy as np
+
+WALKS = ${walks_literal}
+
+
+# --- comparators: return (ok, distance) ------------------------------------
+def _cosine(cand, oracle, tol):
+    a, b = np.asarray(cand, float).ravel(), np.asarray(oracle, float).ravel()
+    d = 1.0 - float(a @ b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)
+    return d <= tol, d
+
+
+def _exact_tokens(cand, oracle, tol):
+    return list(cand) == list(oracle), 0.0 if list(cand) == list(oracle) else 1.0
+
+
+def _logit_kl(cand, oracle, tol):
+    p = np.asarray(oracle, float).ravel()
+    q = np.asarray(cand, float).ravel()
+    p = p / p.sum()
+    q = q / q.sum()
+    d = float(np.sum(p * np.log((p + 1e-12) / (q + 1e-12))))
+    return d <= tol, d
+
+
+def _audio_mse(cand, oracle, tol):
+    a, b = np.asarray(cand, float).ravel(), np.asarray(oracle, float).ravel()
+    n = min(a.size, b.size)
+    d = float(np.mean((a[:n] - b[:n]) ** 2))
+    return d <= tol, d
+
+
+def _ssim(cand, oracle, tol):
+    a, b = np.asarray(cand, float), np.asarray(oracle, float)
+    mu_a, mu_b = a.mean(), b.mean()
+    va, vb = a.var(), b.var()
+    cov = ((a - mu_a) * (b - mu_b)).mean()
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    ssim = ((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / ((mu_a**2 + mu_b**2 + c1) * (va + vb + c2))
+    return (1.0 - ssim) <= tol, 1.0 - float(ssim)
+
+
+COMPARATORS = {
+    "cosine": _cosine,
+    "exact_tokens": _exact_tokens,
+    "logit_kl": _logit_kl,
+    "audio_mse": _audio_mse,
+    "ssim": _ssim,
+}
+
+
+def _load_reference():
+    here = Path(__file__).resolve()
+    candidates = [Path("reference.py").resolve(), here.parents[1] / "reference.py", here.parent / "reference.py"]
+    ref = next((c for c in candidates if c.exists()), candidates[0])
+    spec = importlib.util.spec_from_file_location("mstar_vibesys_reference", ref)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def wait_for_health(client, base_url, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if client.get(f"{base_url}/health").status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(2.0)
+    raise SystemExit(f"FAIL: server never became healthy at {base_url}/health")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="http://localhost:${port}")
+    ap.add_argument("--timeout", type=float, default=600.0)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--strict", action="store_true", default=True)
+    mode.add_argument("--smoke", dest="strict", action="store_false")
+    args = ap.parse_args()
+
+    base = args.url.rstrip("/")
+    client = httpx.Client(timeout=args.timeout)
+    wait_for_health(client, base, args.timeout)
+
+    ref = _load_reference()
+    if args.strict:
+        ref.load()
+
+    failures = []
+    for walk in WALKS:
+        name, compare, tol = walk["name"], walk["compare"], walk["tol"]
+        sample = ref.sample_input(name)
+        method, path, body = ref.to_request(name, sample)
+        try:
+            resp = client.request(method, f"{base}{path}", json=body)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            print(f"FAIL {name}: request to {path} failed: {exc}")
+            failures.append(f"{name}: {exc}")
+            continue
+        candidate = ref.from_response(name, resp)
+        if candidate is None or (hasattr(candidate, "__len__") and len(candidate) == 0):
+            failures.append(f"{name}: empty candidate output")
+            continue
+        if not args.strict:
+            print(f"PASS[smoke] {name}: got output")
+            continue
+        oracle = ref.oracle(name, sample)
+        ok, dist = COMPARATORS[compare](candidate, oracle, tol)
+        status = "PASS" if ok else "FAIL"
+        print(f"{status} {name}: {compare} distance={dist:.5g} tol={tol}")
+        if not ok:
+            failures.append(f"{name}: {compare} distance {dist:.5g} > tol {tol}")
+
+    if failures:
+        print("FAIL: " + "; ".join(failures), file=sys.stderr)
+        raise SystemExit(1)
+    print("PASS: all walks within tolerance")
+
+
+if __name__ == "__main__":
+    main()
