@@ -14,9 +14,12 @@ WS="$(cd "$HERE/.." && pwd)"                             # workspace root (has r
 
 healthy() { curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; }
 
+# Log to /tmp, never the workspace: some framework gates reject any workspace
+# mutation, and it keeps server logs out of the candidate's git history.
+SVLOG="/tmp/vibeval-server-$PORT.log"
 SVPID=""
 if ! healthy; then
-  ( cd "$WS" && exec bash run.sh "$PORT" ) >"$HERE/server.log" 2>&1 &
+  ( cd "$WS" && exec bash run.sh "$PORT" ) >"$SVLOG" 2>&1 &
   SVPID=$!
 fi
 cleanup() { [ -n "$SVPID" ] && kill "$SVPID" 2>/dev/null; pkill -P "$SVPID" 2>/dev/null || true; }
