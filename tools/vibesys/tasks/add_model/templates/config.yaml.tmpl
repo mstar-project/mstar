@@ -1,0 +1,11 @@
+# Starter serving config for ${model} (seeded by mstar-vibesys; refine me).
+#
+# node_groups maps graph node names -> GPU ranks. This starter colocates every
+# walk node on rank 0 for a single-GPU bring-up. Split across ranks / add
+# tp_size / graph_walks scoping once the port is correct and you profile it.
+model: "${model}"
+max_seq_len: 32768
+
+node_groups:
+  - node_names: [${node_names}]
+    ranks: [0]

@@ -1,0 +1,83 @@
+"""Headline benchmark for the ${model} mstar port (framework-owned).
+
+Drives the ${headline_walk} walk against a running mstar server and emits
+``${headline_metric}`` as the scalar VibeSys optimizes. The request shape is
+taken from ``reference.py`` so it always matches the correctness gate.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import statistics
+import time
+from pathlib import Path
+
+import httpx
+
+HEADLINE_WALK = "${headline_walk}"
+
+
+def _load_reference():
+    here = Path(__file__).resolve()
+    candidates = [Path("reference.py").resolve(), here.parents[1] / "reference.py", here.parent / "reference.py"]
+    ref = next((c for c in candidates if c.exists()), candidates[0])
+    spec = importlib.util.spec_from_file_location("mstar_vibesys_reference", ref)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def percentile(values, q):
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * q
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="http://localhost:${port}")
+    ap.add_argument("--num-requests", type=int, default=10)
+    ap.add_argument("--warmup-requests", type=int, default=2)
+    ap.add_argument("--timeout", type=float, default=600.0)
+    ap.add_argument("${result_arg}", dest="output_json", default=None)
+    args = ap.parse_args()
+
+    base = args.url.rstrip("/")
+    ref = _load_reference()
+    method, path, body = ref.to_request(HEADLINE_WALK, ref.sample_input(HEADLINE_WALK))
+    client = httpx.Client(timeout=args.timeout)
+
+    for _ in range(args.warmup_requests):
+        client.request(method, f"{base}{path}", json=body)
+
+    latencies_ms = []
+    for _ in range(args.num_requests):
+        t0 = time.perf_counter()
+        resp = client.request(method, f"{base}{path}", json=body)
+        resp.raise_for_status()
+        latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    total_s = sum(latencies_ms) / 1000.0
+    result = {
+        "${headline_metric}": percentile(latencies_ms, 0.50),
+        "latency_p50_ms": percentile(latencies_ms, 0.50),
+        "latency_p99_ms": percentile(latencies_ms, 0.99),
+        "latency_mean_ms": statistics.fmean(latencies_ms),
+        "request_throughput": args.num_requests / total_s if total_s else 0.0,
+        "num_requests": args.num_requests,
+    }
+    print("PERF_METRIC:", result["${headline_metric}"])
+    print(json.dumps(result, indent=2))
+    if args.output_json:
+        with open(args.output_json, "w") as fh:
+            json.dump(result, fh, indent=2)
+
+
+if __name__ == "__main__":
+    main()

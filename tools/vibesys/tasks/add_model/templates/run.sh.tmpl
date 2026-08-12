@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Candidate launch contract used by the VibeSys evaluator: start mstar serving
+# ${model} on the given port and block until /health is green.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="${1:-${port}}"
+
+# mstar may be editable-installed from a *different* checkout; prepend this
+# candidate workspace so its edited mstar/ package wins over the installed one.
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+
+cd "$HERE"
+# `mstar-serve` defaults --tensor-comm-protocol to RDMA (needs the optional
+# mooncake-transfer-engine); SHM is the safe single-node default that
+# `mstar serve` already uses. Pin it so startup never depends on mooncake.
+exec mstar-serve --config "configs/${model}.yaml" --port "$PORT" --tensor-comm-protocol SHM
