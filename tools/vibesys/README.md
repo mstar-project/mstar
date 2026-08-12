@@ -56,9 +56,9 @@ tools/vibesys/
         │   ├── reference.py.tmpl    #   generic oracle stub (→ bundle vibeval/)
         │   ├── config.yaml.tmpl     #   starter mstar config (→ workspace-seed)
         │   └── run.sh.tmpl          #   launch contract: `uv run mstar-serve … --tensor-comm-protocol SHM`
-        └── instances/
-            ├── lingbot.toml          # the per-model spec (the only file you write per model)
-            └── lingbot.reference.py   # optional concrete oracle, overrides reference.py.tmpl
+        └── instances/          # per-model inputs; real <model>.* are gitignored (local)
+            ├── example.toml           # tracked template: the per-model spec
+            └── example.reference.py    # tracked template: the optional oracle override
 ```
 
 ## Generated runtime layout (`.vibesys/` — gitignored)
@@ -136,9 +136,22 @@ not carry across separate runs (only within a run, or via `--resume`).
 
 ## The `add-model` task
 
+### What you provide per model
+
+Two files under `instances/` (both gitignored — copy the tracked `example.*`):
+
+- **`<model>.toml`** — the declarative spec (below). Required.
+- **`<model>.reference.py`** — the oracle + server I/O hooks (`sample_input`,
+  `to_request`, `from_response`, `oracle`). Optional but needed for `strict`;
+  overrides `templates/reference.py.tmpl`.
+
+`checker.py` and `benchmark.py` are **generic** — rendered from the toml and
+driven by the reference hooks, identical for every model — so you don't write
+them (there's no per-instance override for those yet).
+
 ### Instance spec (`tasks/add_model/instances/<model>.toml`)
 
-The only file you write per model. See `lingbot.toml` for a worked example.
+See `example.toml` for the tracked template.
 
 ```toml
 [model]

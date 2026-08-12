@@ -1,0 +1,38 @@
+# Example add-model instance spec (a TEMPLATE — copy to <model>.toml and edit).
+#
+# Real per-model instances (e.g. lingbot.toml) are local working files and are
+# gitignored (see .gitignore here); only this example is tracked. Run one with:
+#   python -m tools.vibesys add-model <model> {show,build-image,build,run}
+#
+# For an optional concrete oracle, add <model>.reference.py next to <model>.toml
+# implementing sample_input / to_request / from_response / oracle (it overrides
+# templates/reference.py.tmpl). See README.md for the contract.
+
+[model]
+name = "mymodel"                     # instance key; also the mstar model/config name
+hf_id = "org/my-model"               # HF checkpoint id (weights + reference)
+revision = ""                        # optional: pin a revision
+reference_model = "wan22"            # closest mstar model to copy from (e.g. wan22, qwen3_omni, orpheus)
+served_model_name = "mymodel"        # the "model" field clients send
+endpoint = "/v1/chat/completions"    # mstar OpenAI route the walk serves
+port = 8000
+modality = "text_generation"         # vibesys --modality (text_generation | video_generation | text_to_speech | ...)
+accuracy_mode = "smoke"              # smoke (valid output) | strict (numeric vs oracle)
+
+[headline]
+metric = "latency_p50_ms"            # scalar vibesys optimizes (lower is better for latency)
+walk = "generate"                    # the walk whose latency is measured
+result_arg = "--output-json"
+
+# One [[walk]] per observable Walk. compare ∈ {exact_tokens, logit_kl, cosine, audio_mse, ssim}.
+[[walk]]
+name = "generate"
+kind = "generative"                  # documentation/grouping: encoder | ar | generative
+compare = "ssim"
+tol = 0.25
+
+# Optional: pin an official (non-transformers) source for reference.py to import.
+# [official_source]
+# repo = "https://github.com/org/my-model"
+# subdir = ""
+# revision = ""
