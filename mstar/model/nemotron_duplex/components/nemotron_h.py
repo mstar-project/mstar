@@ -31,7 +31,7 @@ TODO(verify): numeric parity of the scan against the HF NemotronHMamba2Mixer.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -85,6 +85,37 @@ class MambaStateAccessor:
 
 
 # ---------------------------------------------------------------------------
+# Cached decode state (engine-free O(T) path; additive to offline_forward)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NemotronHCache:
+    """Per-layer decode cache for the O(T) cached path (single sequence).
+
+    Populated by :meth:`NemotronHLLM.prefill` and mutated in place by
+    :meth:`NemotronHLLM.decode_step`. Only the layer kinds that carry state
+    have entries:
+
+        * ``attn[layer_idx]``  -> ``[k, v]``, each ``(Lh, num_kv_heads, head_dim)``
+          — the running key/value history for a ``*`` attention layer (NoPE, so
+          no per-position rotation to reconcile: entries are position-agnostic).
+        * ``conv[layer_idx]``  -> ``(conv_dim, conv_kernel-1)`` — the rolling
+          buffer of the last ``conv_kernel-1`` *raw* (pre-conv, pre-silu) xBC
+          inputs for an ``M`` mamba layer. FIXED length, left-zero-padded when
+          fewer than ``conv_kernel-1`` tokens have been seen.
+        * ``ssm[layer_idx]``   -> ``(nheads, head_dim, d_state)`` — the SSM
+          recurrent state for an ``M`` mamba layer (fp32).
+
+    ``-`` MLP layers are stateless and appear in none of the dicts.
+    """
+
+    attn: dict[int, list[torch.Tensor]] = field(default_factory=dict)
+    conv: dict[int, torch.Tensor] = field(default_factory=dict)
+    ssm: dict[int, torch.Tensor] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # Mixers
 # ---------------------------------------------------------------------------
 
@@ -119,6 +150,45 @@ class NemotronHAttention(Attention):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (heads, L, hd)
         out = out.transpose(0, 1).reshape(L, self.num_heads * self.head_dim)
         return self.o_proj(out)
+
+    def prefill(self, hidden_states: torch.Tensor):
+        """Cached-path prefill: same math as :meth:`offline_forward`, but also
+        returns the per-token ``k`` / ``v`` (pre-GQA-expansion) to seed the cache.
+
+        Returns ``(out (L, H), k (L, num_kv_heads, head_dim), v (...))``.
+        """
+        L = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).view(L, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(L, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(L, self.num_kv_heads, self.head_dim)
+        n_rep = self.num_heads // self.num_kv_heads
+        kh = k.transpose(0, 1).repeat_interleave(n_rep, dim=0)
+        vh = v.transpose(0, 1).repeat_interleave(n_rep, dim=0)
+        out = F.scaled_dot_product_attention(q.transpose(0, 1), kh, vh, is_causal=True)
+        out = out.transpose(0, 1).reshape(L, self.num_heads * self.head_dim)
+        return self.o_proj(out), k.detach(), v.detach()
+
+    def decode_forward(self, x: torch.Tensor, kv_cache_for_layer):
+        """Single-token cached decode.
+
+        ``x``: ``(1, H)`` — the new token. ``kv_cache_for_layer``: ``[k, v]``,
+        each ``(Lh, num_kv_heads, head_dim)`` — the cached history. Appends the
+        new token's k/v and attends over all cached keys (NoPE; no causal mask
+        is needed since the query is the last position). Returns
+        ``(out (1, H), (k_all, v_all))``.
+        """
+        k_cache, v_cache = kv_cache_for_layer
+        q = self.q_proj(x).view(1, self.num_heads, self.head_dim)
+        k_new = self.k_proj(x).view(1, self.num_kv_heads, self.head_dim)
+        v_new = self.v_proj(x).view(1, self.num_kv_heads, self.head_dim)
+        k_all = torch.cat([k_cache, k_new], dim=0)  # (Lh+1, num_kv_heads, hd)
+        v_all = torch.cat([v_cache, v_new], dim=0)
+        n_rep = self.num_heads // self.num_kv_heads
+        kh = k_all.transpose(0, 1).repeat_interleave(n_rep, dim=0)  # (heads, Lh+1, hd)
+        vh = v_all.transpose(0, 1).repeat_interleave(n_rep, dim=0)
+        out = F.scaled_dot_product_attention(q.transpose(0, 1), kh, vh, is_causal=False)
+        out = out.transpose(0, 1).reshape(1, self.num_heads * self.head_dim)
+        return self.o_proj(out), (k_all.detach(), v_all.detach())
 
 
 class NemotronHMLP(nn.Module):
@@ -284,6 +354,91 @@ class Mamba2Mixer(nn.Module):
         y = self.norm(y, z)
         return self.out_proj(y)
 
+    # -- cached O(T) decode path -----------------------------------------
+
+    def prefill(self, hidden_states: torch.Tensor):
+        """Cached-path prefill: numerically identical to ``forward`` with no
+        prior state, but also returns the recurrent state to seed the cache.
+
+        Returns ``(out (L, H), conv_state (conv_dim, conv_kernel-1), ssm_state)``.
+        The conv state is the last ``conv_kernel-1`` *raw* xBC inputs, a FIXED
+        length buffer left-zero-padded when ``L < conv_kernel-1``.
+        """
+        L = hidden_states.shape[0]
+        z, xBC, dt = self._split_in_proj(self.in_proj(hidden_states))
+
+        # causal depthwise conv over (x|B|C) — no prior conv state at prefill
+        xBC_t = xBC.transpose(0, 1).unsqueeze(0)  # (1, conv_dim, L)
+        conv_out = self.conv1d(xBC_t)[..., :L]
+        xBC_c = F.silu(conv_out.squeeze(0).transpose(0, 1))  # (L, conv_dim)
+
+        # fixed-length rolling conv buffer of raw (pre-conv) xBC inputs
+        k1 = self.conv_kernel - 1
+        raw = xBC_t.squeeze(0)  # (conv_dim, L)
+        if L >= k1:
+            conv_state = raw[:, -k1:].contiguous()
+        else:
+            pad = raw.new_zeros(self.conv_dim, k1 - L)
+            conv_state = torch.cat([pad, raw], dim=-1)
+
+        x, B, C = torch.split(
+            xBC_c,
+            [self.d_inner, self.n_groups * self.d_state, self.n_groups * self.d_state],
+            dim=-1,
+        )
+        x = x.view(L, self.nheads, self.head_dim)
+        B = B.view(L, self.n_groups, self.d_state)
+        C = C.view(L, self.n_groups, self.d_state)
+
+        A = -torch.exp(self.A_log.float())
+        dt = F.softplus(dt.float() + self.dt_bias.float())
+
+        y, new_ssm = self._ssd_scan(x.float(), dt, A, B.float(), C.float(), h0=None)
+        y = y.reshape(L, self.d_inner).to(hidden_states.dtype)
+        y = self.norm(y, z)
+        return self.out_proj(y), conv_state.detach(), new_ssm.detach()
+
+    def decode_step(self, hidden_state: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor):
+        """Single-token Mamba recurrence from cached conv/ssm state.
+
+        ``hidden_state``: ``(1, H)``. ``conv_state``: ``(conv_dim, conv_kernel-1)``
+        rolling buffer of raw xBC inputs. ``ssm_state``: ``(nheads, head_dim,
+        d_state)``. Returns ``(out (1, H), new_conv_state, new_ssm_state)``.
+
+        The conv step is an explicit dot product over a fixed window rather than
+        the padded ``conv1d`` used at prefill: window = [buffer(k-1) | new(1)],
+        which reproduces the causal conv at the new position exactly, and the
+        buffer rolls forward by dropping its oldest column.
+        """
+        z, xBC, dt = self._split_in_proj(self.in_proj(hidden_state))
+
+        # rolling conv: append the new raw xBC, take the last conv_kernel window
+        xBC_new = xBC.transpose(0, 1)  # (conv_dim, 1)
+        window = torch.cat([conv_state, xBC_new], dim=-1)  # (conv_dim, conv_kernel)
+        w = self.conv1d.weight[:, 0, :]  # (conv_dim, conv_kernel)
+        conv_out = (window * w).sum(-1)  # (conv_dim,)
+        if self.conv1d.bias is not None:
+            conv_out = conv_out + self.conv1d.bias
+        new_conv_state = window[:, 1:].contiguous()  # (conv_dim, conv_kernel-1)
+        xBC_c = F.silu(conv_out).unsqueeze(0)  # (1, conv_dim)
+
+        x, B, C = torch.split(
+            xBC_c,
+            [self.d_inner, self.n_groups * self.d_state, self.n_groups * self.d_state],
+            dim=-1,
+        )
+        x = x.view(1, self.nheads, self.head_dim)
+        B = B.view(1, self.n_groups, self.d_state)
+        C = C.view(1, self.n_groups, self.d_state)
+
+        A = -torch.exp(self.A_log.float())
+        dt = F.softplus(dt.float() + self.dt_bias.float())
+
+        y, new_ssm = self._ssd_scan(x.float(), dt, A, B.float(), C.float(), h0=ssm_state)
+        y = y.reshape(1, self.d_inner).to(hidden_state.dtype)
+        y = self.norm(y, z)
+        return self.out_proj(y), new_conv_state.detach(), new_ssm.detach()
+
 
 # ---------------------------------------------------------------------------
 # Block + model
@@ -334,6 +489,40 @@ class NemotronHBlock(nn.Module):
             out = self.mixer(normed, cache_handle=None, mamba_state=None)
         return hidden_states + out
 
+    def prefill(self, hidden_states: torch.Tensor, cache: NemotronHCache) -> torch.Tensor:
+        """Cached-path prefill for one block; populates ``cache`` in place.
+
+        Same residual/norm math as :meth:`offline_forward`; differs only in that
+        stateful mixers hand back their state to seed the cache.
+        """
+        normed = _rms_fp32(hidden_states, self.norm.weight, self.norm.variance_epsilon)
+        if self.kind == "attention":
+            out, k, v = self.mixer.prefill(normed)
+            cache.attn[self.layer_idx] = [k, v]
+        elif self.kind == "mamba":
+            out, conv_state, ssm_state = self.mixer.prefill(normed)
+            cache.conv[self.layer_idx] = conv_state
+            cache.ssm[self.layer_idx] = ssm_state
+        else:  # mlp — stateless
+            out = self.mixer(normed, cache_handle=None, mamba_state=None)
+        return hidden_states + out
+
+    def decode_step(self, hidden_state: torch.Tensor, cache: NemotronHCache) -> torch.Tensor:
+        """Cached-path single-token decode for one block; mutates ``cache``."""
+        normed = _rms_fp32(hidden_state, self.norm.weight, self.norm.variance_epsilon)
+        if self.kind == "attention":
+            out, new_kv = self.mixer.decode_forward(normed, cache.attn[self.layer_idx])
+            cache.attn[self.layer_idx] = [new_kv[0], new_kv[1]]
+        elif self.kind == "mamba":
+            out, new_conv, new_ssm = self.mixer.decode_step(
+                normed, cache.conv[self.layer_idx], cache.ssm[self.layer_idx]
+            )
+            cache.conv[self.layer_idx] = new_conv
+            cache.ssm[self.layer_idx] = new_ssm
+        else:  # mlp — stateless
+            out = self.mixer(normed, cache_handle=None, mamba_state=None)
+        return hidden_state + out
+
 
 class NemotronHLLM(nn.Module):
     """The ``llm`` container: hybrid layer stack + final norm (no embeddings)."""
@@ -371,6 +560,28 @@ class NemotronHLLM(nn.Module):
             hidden = block.offline_forward(hidden)
         return _rms_fp32(hidden, self.norm_f.weight, self.norm_f.variance_epsilon)
 
+    def prefill(self, input_embeds: torch.Tensor):
+        """Cached O(T) prefill. ``input_embeds`` ``(L, H)`` -> ``(hidden (L, H),
+        cache)``. Runs the full-sequence offline math while populating a fresh
+        :class:`NemotronHCache` for subsequent single-token decode.
+        """
+        cache = NemotronHCache()
+        hidden = input_embeds
+        for block in self.layers:
+            hidden = block.prefill(hidden, cache)
+        hidden = _rms_fp32(hidden, self.norm_f.weight, self.norm_f.variance_epsilon)
+        return hidden, cache
+
+    def decode_step(self, input_embed: torch.Tensor, cache: NemotronHCache) -> torch.Tensor:
+        """Cached O(T) decode of one new token. ``input_embed`` ``(1, H)`` ->
+        ``hidden (1, H)``; mutates ``cache`` in place (appends attention k/v,
+        rolls conv buffers, advances ssm state).
+        """
+        hidden = input_embed
+        for block in self.layers:
+            hidden = block.decode_step(hidden, cache)
+        return _rms_fp32(hidden, self.norm_f.weight, self.norm_f.variance_epsilon)
+
 
 class NemotronHForCausalLM(nn.Module):
     def __init__(self, config: NanoConfig):
@@ -395,6 +606,19 @@ class NemotronHForCausalLM(nn.Module):
         hidden = self.embed_tokens(input_ids)
         hidden = self.llm.offline_forward(hidden)
         return self.lm_head(hidden)
+
+    def prefill(self, input_embeds: torch.Tensor):
+        """Cached O(T) prefill over embeddings. ``input_embeds`` ``(L, H)`` ->
+        ``(hidden (L, H), cache)`` (post final-norm hidden; apply ``lm_head`` for
+        logits). Additive to :meth:`offline_forward` — leaves it unchanged.
+        """
+        return self.llm.prefill(input_embeds)
+
+    def decode_step(self, input_embed: torch.Tensor, cache: NemotronHCache) -> torch.Tensor:
+        """Cached O(T) decode of one token. ``input_embed`` ``(1, H)`` ->
+        ``hidden (1, H)``; mutates ``cache`` in place.
+        """
+        return self.llm.decode_step(input_embed, cache)
 
     @staticmethod
     def remap(name: str) -> str | None:
