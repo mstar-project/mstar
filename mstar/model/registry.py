@@ -8,6 +8,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
@@ -35,6 +36,10 @@ HF_MODELS: dict[str, dict] = {
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # NVIDIA NemotronLabs VoiceChat-11B: full-duplex S2S -- Fast-Conformer STT
+    # encoder + Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B) + EarTTS
+    # (Gemma3 talker + RVQ codec). Single composite ``model.safetensors``.
+    "nemotron_duplex": {"model_path_hf": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"},
     # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).
