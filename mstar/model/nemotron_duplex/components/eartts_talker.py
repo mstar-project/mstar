@@ -75,6 +75,30 @@ def _masking_rate(rate: torch.Tensor, exponent: float) -> torch.Tensor:
     return (1.0 - rate.pow(exponent)).pow(1.0 / exponent)
 
 
+def build_char_vocab(tokenizer) -> dict[str, int]:
+    """Character vocabulary derived from the subword tokenizer (port of NeMo
+    ``build_vocabs._build_char_vocab``): every single-character token in
+    ``tokenizer.tokenizer.vocab``, densely re-indexed in ascending original-id
+    order. ``char_vocab[char] -> dense index in [0, num_chars)``."""
+    vocab = tokenizer.tokenizer.vocab                       # {token_str: id}
+    single = {s: i for s, i in vocab.items() if len(s) == 1}
+    ordered = sorted(single.keys(), key=lambda s: single[s])
+    return {c: i for i, c in enumerate(ordered)}
+
+
+def subword_to_char_ids(tokenizer, char_vocab: dict[str, int]) -> tuple[dict[int, tuple[int, ...]], int]:
+    """Map each subword id to the tuple of its in-vocab character ids (port of
+    NeMo ``build_vocabs`` steps 2-3). Subwords with no representable characters
+    are dropped; a padding subword id ``len(tokenizer.vocab)`` maps to the char
+    padding id ``len(char_vocab)``. Returns ``(map, subword_padding_idx)``."""
+    vocab = tokenizer.tokenizer.vocab
+    s2c = {sid: tuple(char_vocab[c] for c in s if c in char_vocab) for s, sid in vocab.items()}
+    s2c = {k: v for k, v in s2c.items() if v}
+    pad_idx = len(tokenizer.vocab)
+    s2c[pad_idx] = (len(char_vocab),)
+    return s2c, pad_idx
+
+
 class _Attn(nn.Module):
     """q/k/v/o projections (no bias); optional Gemma3 per-head QK-norm.
 
@@ -724,6 +748,95 @@ class EarTTSTalker(nn.Module):
         mog_input = self.embed_code(self.depthsum_embedding(code)) + hidden_states
         mog_logits, mog_mus, mog_mu_res, mog_logs = self.mog_head(mog_input)
         return hidden_states, mog_logits, mog_mus, mog_mu_res, mog_logs
+
+    def _prepare_char_inputs(
+        self,
+        subword_ids: torch.Tensor,
+        subword_mask: torch.Tensor,
+        subword_id_to_char_ids: dict,
+        char_pad_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Turn the valid (masked) subword ids into a padded char-id batch, in
+        the row-major order ``embed_subword`` expects (port of NeMo
+        ``CharAwareSubwordEncoder.prepare_inputs``)."""
+        device = subword_ids.device
+        sel = torch.masked_select(subword_ids, subword_mask).cpu().tolist()
+        char_lists = [subword_id_to_char_ids.get(int(x), ()) for x in sel]
+        lengths = torch.tensor([len(c) for c in char_lists], dtype=torch.long, device=device)
+        n = lengths.numel()
+        max_len = int(lengths.max().item()) if n > 0 else 0
+        char_ids = torch.full((n, max_len), char_pad_idx, dtype=torch.long, device=device)
+        for i, c in enumerate(char_lists):
+            if c:
+                char_ids[i, : len(c)] = torch.tensor(c, dtype=torch.long, device=device)
+        return char_ids, lengths
+
+    def text_conditioning(
+        self,
+        subword_ids: torch.Tensor,
+        subword_mask: torch.Tensor | None,
+        subword_id_to_char_ids: dict,
+        char_pad_idx: int,
+    ) -> torch.Tensor:
+        """Per-frame text conditioning ``cond`` [B, T, H] (port of the NeMo
+        ``_prepare_conditioning`` path for ``context_hidden_size is None``):
+        run ``embed_subword`` on the subwords' char ids and add the subword-flag
+        and BOS/EOS embeddings. Positions outside ``subword_mask`` stay zero."""
+        if subword_mask is None:
+            subword_mask = torch.ones_like(subword_ids, dtype=torch.bool)
+        cond = self.embed_code.weight.new_zeros((*subword_ids.shape, self.config.hidden_size))
+        if not bool(subword_mask.any()):
+            return cond
+        char_ids, char_lengths = self._prepare_char_inputs(
+            subword_ids, subword_mask, subword_id_to_char_ids, char_pad_idx
+        )
+        return self.embed_subword(char_ids, char_lengths, subword_ids, subword_mask)
+
+    @torch.no_grad()
+    def generate_codes(
+        self,
+        subword_stream: torch.Tensor,
+        tokenizer,
+        speaker: str = "Aria",
+        temperature: float = 0.0,
+        num_iter: int = 8,
+        text_eos_id: int | None = None,
+        prev_codes: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Full autoregressive TTS: turn a subword/text-token stream ``[B, T]``
+        into RVQ codes ``[B, T, num_quantizers]``.
+
+        Builds the char-vocab maps from ``tokenizer`` once, warms the KV cache
+        from the speaker prompt (``init_state``), then per frame computes the
+        text conditioning from the current subword id and runs one
+        ``infer_codes_one_step`` (greedy + deterministic by default). If
+        ``text_eos_id`` is given, an EOS text token forces a codec-silence frame.
+        """
+        b, t = subword_stream.shape
+        device = subword_stream.device
+        dtype = self.embed_code.weight.dtype
+        char_vocab = build_char_vocab(tokenizer)
+        s2c, _ = subword_to_char_ids(tokenizer, char_vocab)
+        char_pad_idx = len(char_vocab)
+
+        state = self.init_state(b, speaker=speaker, device=device, dtype=dtype)
+        if prev_codes is None:
+            prev_codes = self.initial_prev_codes(b, device=device)
+
+        all_codes = []
+        for i in range(t):
+            cur = subword_stream[:, i: i + 1]
+            prev = subword_stream[:, i - 1: i] if i > 0 else cur
+            mask = torch.ones_like(cur, dtype=torch.bool)
+            cond = self.text_conditioning(cur, mask, s2c, char_pad_idx)
+            codes, state = self.infer_codes_one_step(
+                state, cur, prev, prev_codes, cond=cond, text_eos_id=text_eos_id,
+                num_iter=num_iter, temperature=temperature, generator=generator,
+            )
+            all_codes.append(codes)
+            prev_codes = codes
+        return torch.stack(all_codes, dim=1)
 
     @staticmethod
     def remap(name: str) -> str | None:
