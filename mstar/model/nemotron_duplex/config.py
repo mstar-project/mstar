@@ -158,6 +158,12 @@ class EarTTSConfig:
     # constant-code RNG states that an uncontrolled global RNG occasionally hits.
     inference_seed: int = 0
 
+    # Streaming codec chunking (engine Talker->Codec connection): decode `chunk` new
+    # code frames with `left_context` prior frames so the causal codec has enough
+    # receptive field, emitting only the new tail (see AudioCodecDecoderSubmodule).
+    codec_chunk_frames: int = 5
+    codec_left_context_frames: int = 15
+
     sample_rate: int = 22050
 
 
