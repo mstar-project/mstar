@@ -245,19 +245,79 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     loaded (verified); forward is Phase 5 (audio-out).
     """
 
-    def __init__(self, talker: nn.Module, config: NemotronDuplexConfig):
+    # Eager: the MoG/MaskGIT/CFG sampling is internal (not the engine's categorical
+    # sampler), and the talker keeps its own KV + CFG-uncond state per request in
+    # PerRequestState — not compile/capture-safe, like the nano's Mamba state.
+    disable_torch_compile = True
+
+    def __init__(self, talker: nn.Module, config: NemotronDuplexConfig,
+                 subword_to_char: dict | None = None, char_pad_idx: int | None = None):
         super().__init__()
         self.talker = talker
         self.config = config
+        self._s2c = subword_to_char
+        self._char_pad = char_pad_idx
+
+    def _step(self, state, text_tok: int, device, generator):
+        """One talker frame: agent text token -> ``num_quantizers`` RVQ codes.
+        ``state`` is the per-request talker state (``None`` warms up from the speaker
+        prompt). Returns ``(codes (num_q,), new_state)``. Same math as
+        DuplexStream._talker_codec_frame (the verified streaming path)."""
+        cfg, talker = self.config, self.talker
+        if state is None:
+            state = talker.init_state(
+                1, speaker="Aria", device=device,
+                subword_id_to_char_ids=self._s2c, char_pad_idx=self._char_pad,
+                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id,
+                speech_pad_id=cfg.eartts.codebook_size,
+            )
+            prev = state.get("prev_codes")
+            state["_prev_codes"] = prev if prev is not None else talker.initial_prev_codes(1, device=device)
+        cur = torch.tensor([[text_tok]], device=device)
+        cond = talker.text_conditioning(cur, torch.ones_like(cur, dtype=torch.bool), self._s2c, self._char_pad)
+        codes, new_state = talker.infer_codes_one_step(
+            state, cur, cur, state["_prev_codes"], cond=cond, text_eos_id=cfg.text_eos_id,
+            num_iter=cfg.eartts.inference_num_iter, guidance_scale=cfg.eartts.inference_guidance_scale,
+            noise_scale=cfg.eartts.inference_noise_scale, top_p=cfg.eartts.inference_top_p,
+            generator=generator,
+        )
+        new_state["_prev_codes"] = codes
+        return codes.squeeze(0), new_state
+
+    def _request_step(self, st, text_tok: int, device) -> torch.Tensor:
+        """Advance one request (state carried in its PerRequestState) -> codes."""
+        state = st.get("talker_state")
+        gen = st.get("talker_gen")
+        if gen is None:
+            gen = torch.Generator(device=device).manual_seed(self.config.eartts.inference_seed)
+            st.add("talker_gen", gen)
+        codes, state = self._step(state, text_tok, device, gen)
+        st.add("talker_state", state)
+        return codes
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, seen_token_mask=None, pos_info={}, **kwargs):  # noqa: B006
-        raise NotImplementedError("EarTTSTalkerSubmodule.forward — Phase 5 (audio-out).")
+        tok = inputs["agent_token"][0]
+        return ARNodeInputs(input_ids=tok.reshape(1), input_seq_len=1)
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
-        raise NotImplementedError("EarTTSTalkerSubmodule.forward — Phase 5 (audio-out).")
+        return {"tokens": [int(inp.input_ids.reshape(-1)[0].item()) for inp in inputs]}
 
-    def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        raise NotImplementedError("EarTTSTalkerSubmodule.forward — Phase 5 (audio-out).")
+    def can_batch(self, batch, model_inputs) -> bool:
+        return len(model_inputs) > 1
+
+    def forward(self, graph_walk, engine_inputs, tokens=None, **kwargs) -> NameToTensorList:
+        rid = engine_inputs.request_ids[0]
+        st = engine_inputs.per_request_states[rid]
+        codes = self._request_step(st, tokens[0], self.talker.embed_code.weight.device)
+        return {"codec_tokens": [codes]}
+
+    def forward_batched(self, graph_walk, engine_inputs, tokens=None, **kwargs) -> dict[str, NameToTensorList]:
+        dev = self.talker.embed_code.weight.device
+        out: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(engine_inputs.request_ids):
+            codes = self._request_step(engine_inputs.per_request_states[rid], tokens[i], dev)
+            out[rid] = {"codec_tokens": [codes]}
+        return out
 
 
 class AudioCodecDecoderSubmodule(NodeSubmodule):

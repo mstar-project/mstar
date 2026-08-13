@@ -855,7 +855,13 @@ class NemotronDuplexModel(Model):
         with torch.device("meta"):
             talker = EarTTSTalker(cfg.eartts)
         talker = self._build_and_load(talker, device, autocast_dtype, local_dir)
-        return EarTTSTalkerSubmodule(talker=talker, config=self.config)
+        from mstar.model.nemotron_duplex.components.eartts_talker import build_char_vocab, subword_to_char_ids
+        tok = self._talker_tokenizer()
+        cv = build_char_vocab(tok)
+        s2c, _ = subword_to_char_ids(tok, cv)
+        return EarTTSTalkerSubmodule(
+            talker=talker, config=self.config, subword_to_char=s2c, char_pad_idx=len(cv),
+        )
 
     def _create_codec_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
