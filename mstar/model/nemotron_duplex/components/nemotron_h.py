@@ -49,34 +49,44 @@ from mstar.model.nemotron_duplex.config import NanoConfig
 
 @dataclass
 class MambaStateAccessor:
-    """Read/write view over one batch's Mamba conv+ssm state.
+    """Batched read/write view over one batch's Mamba conv+ssm state.
 
-    Built by the submodule from ``engine_inputs.per_request_states`` and the
-    current walk. Correctness draft is bs=1 (one request); kept indexable so the
-    batched Option-B pool can drop in later. State tensors live in each request's
-    ``PerRequestState.tensors`` under ``mamba{layer}.conv`` / ``.ssm``.
+    Built by the submodule from ``engine_inputs.per_request_states``, the batch's
+    ``request_ids``, the current walk (``is_prefill``), and the per-request token
+    counts ``seq_lens`` (how the packed ``hidden_states`` [sum(seq_lens), H] splits
+    into requests). Each request's state lives in its ``PerRequestState.tensors``
+    under ``mamba{layer}.conv`` / ``.ssm`` — one Option-A slot per request, so B>1
+    requests advance in a single fused forward (true batched inference). The
+    CUDA-graph-capturable fixed-buffer pool (Option B) can replace the dict without
+    touching the mixer, which only calls ``read``/``write`` by batch position.
     """
 
     request_states: dict
     request_ids: list
     is_prefill: bool
+    # Per-request token counts splitting the packed rows. ``None`` => treat the whole
+    # packed input as one request's sequence (the single-sequence / bs=1 path); the
+    # submodule passes real seq_lens to enable batched (B>1) stepping.
+    seq_lens: list | None = None
 
     def _keys(self, layer_idx: int):
         return f"mamba{layer_idx}.conv", f"mamba{layer_idx}.ssm"
 
-    def read(self, layer_idx: int):
+    def read(self, layer_idx: int, req_idx: int = 0):
+        """Return ``(conv, ssm)`` for the request at batch position ``req_idx``
+        (``(None, None)`` on prefill or a fresh request → the mixer seeds zeros)."""
         if self.is_prefill or not self.request_ids or self.request_states is None:
             return None, None
-        st = self.request_states.get(self.request_ids[0])
+        st = self.request_states.get(self.request_ids[req_idx])
         if st is None:
             return None, None
         ck, sk = self._keys(layer_idx)
         return st.get(ck), st.get(sk)
 
-    def write(self, layer_idx: int, conv_state: torch.Tensor, ssm_state: torch.Tensor):
+    def write(self, layer_idx: int, conv_state: torch.Tensor, ssm_state: torch.Tensor, req_idx: int = 0):
         if not self.request_ids or self.request_states is None:
             return
-        st = self.request_states.get(self.request_ids[0])
+        st = self.request_states.get(self.request_ids[req_idx])
         if st is None:
             return
         ck, sk = self._keys(layer_idx)
@@ -316,22 +326,67 @@ class Mamba2Mixer(nn.Module):
         cache_handle: BatchedCacheManager | None = None,  # noqa: ARG002
         mamba_state: MambaStateAccessor | None = None,
     ) -> torch.Tensor:
+        """Engine forward over a packed batch ``hidden_states`` [sum(seq_lens), H].
+
+        ``mamba_state.seq_lens`` says how the packed rows split into requests, each
+        carrying its own conv/ssm state. True batched inference: all-decode batches
+        (1 token/request) run one fused tensor step over B; varlen prefill segments
+        per request (each still one engine step). ``mamba_state=None`` is the
+        single-sequence path (offline / bs=1)."""
+        if mamba_state is None:
+            out, _, _ = self._forward_seq(hidden_states, None, None)
+            return out
+
+        seq_lens = mamba_state.seq_lens or [hidden_states.shape[0]]
+        li = self.layer_idx
+
+        # Fast path: every request contributes exactly one token -> fused batch step.
+        if len(seq_lens) > 1 and all(s == 1 for s in seq_lens):
+            B = len(seq_lens)
+            conv_b, ssm_b = [], []
+            for i in range(B):
+                c, s = mamba_state.read(li, i)
+                conv_b.append(c if c is not None else hidden_states.new_zeros(self.conv_dim, self.conv_kernel - 1))
+                ssm_b.append(s if s is not None else hidden_states.new_zeros(self.nheads, self.head_dim, self.d_state))
+            out, new_conv, new_ssm = self._decode_batched(
+                hidden_states, torch.stack(conv_b, 0), torch.stack(ssm_b, 0).float()
+            )
+            for i in range(B):
+                mamba_state.write(li, new_conv[i], new_ssm[i], i)
+            return out
+
+        # General path: segment the packed rows by request and run each sequence.
+        outs, off = [], 0
+        for i, s in enumerate(seq_lens):
+            prev_conv, prev_ssm = mamba_state.read(li, i)
+            out, new_conv, new_ssm = self._forward_seq(hidden_states[off:off + s], prev_conv, prev_ssm)
+            mamba_state.write(li, new_conv, new_ssm, i)
+            outs.append(out)
+            off += s
+        return torch.cat(outs, dim=0)
+
+    def _forward_seq(self, hidden_states, prev_conv, prev_ssm):
+        """One request's full-sequence Mamba over ``hidden_states`` [L, H] with its
+        incoming ``prev_conv`` [conv_dim, k-1] / ``prev_ssm`` [nheads, head_dim,
+        d_state] (or ``None`` to seed fresh). Returns ``(out [L,H], new_conv, new_ssm)``,
+        the conv state left-zero-padded to a fixed [conv_dim, k-1] for decode."""
         L = hidden_states.shape[0]
         z, xBC, dt = self._split_in_proj(self.in_proj(hidden_states))
 
-        prev_conv, prev_ssm = (None, None)
-        if mamba_state is not None:
-            prev_conv, prev_ssm = mamba_state.read(self.layer_idx)
-
-        # --- causal depthwise conv over (x|B|C) ---
         xBC_t = xBC.transpose(0, 1).unsqueeze(0)  # (1, conv_dim, L)
         if prev_conv is not None:
-            xBC_t = torch.cat([prev_conv, xBC_t], dim=-1)
+            xBC_t = torch.cat([prev_conv.unsqueeze(0), xBC_t], dim=-1)
         conv_out = self.conv1d(xBC_t)[..., : xBC_t.shape[-1]]
         conv_out = conv_out[..., -L:]  # keep the L new positions
         xBC = F.silu(conv_out.squeeze(0).transpose(0, 1))  # (L, conv_dim)
-        # conv state = last (conv_kernel-1) inputs, for the next step
-        new_conv_state = xBC_t[..., -(self.conv_kernel - 1):].detach()
+        # fixed [conv_dim, k-1] rolling buffer of raw inputs (left-pad when short)
+        raw = xBC_t.squeeze(0)  # (conv_dim, seen)
+        k1 = self.conv_kernel - 1
+        if raw.shape[-1] >= k1:
+            new_conv = raw[:, -k1:].contiguous()
+        else:
+            pad = raw.new_zeros(self.conv_dim, k1 - raw.shape[-1])
+            new_conv = torch.cat([pad, raw], dim=-1)
 
         x, B, C = torch.split(
             xBC,
@@ -347,12 +402,44 @@ class Mamba2Mixer(nn.Module):
 
         y, new_ssm = self._ssd_scan(x.float(), dt, A, B.float(), C.float(), h0=prev_ssm)
         y = y.reshape(L, self.d_inner).to(hidden_states.dtype)
-
-        if mamba_state is not None:
-            mamba_state.write(self.layer_idx, new_conv_state, new_ssm)
-
         y = self.norm(y, z)
-        return self.out_proj(y)
+        return self.out_proj(y), new_conv.detach(), new_ssm.detach()
+
+    def _decode_batched(self, hidden, conv_b, ssm_b):
+        """Fused single-token decode over a batch. ``hidden`` [B, H], ``conv_b``
+        [B, conv_dim, k-1], ``ssm_b`` [B, nheads, head_dim, d_state]. Batched form of
+        :meth:`decode_step`: rolling conv + one SSD step, all requests in parallel.
+        Returns ``(out [B, H], new_conv [B, conv_dim, k-1], new_ssm [B, ...])``."""
+        Bn = hidden.shape[0]
+        z, xBC, dt = self._split_in_proj(self.in_proj(hidden))     # each (B, ·)
+        window = torch.cat([conv_b, xBC.unsqueeze(-1)], dim=-1)     # (B, conv_dim, k)
+        w = self.conv1d.weight[:, 0, :]                            # (conv_dim, k)
+        conv_out = (window * w).sum(-1)                           # (B, conv_dim)
+        if self.conv1d.bias is not None:
+            conv_out = conv_out + self.conv1d.bias
+        new_conv = window[:, :, 1:].contiguous()                  # (B, conv_dim, k-1)
+        xBC = F.silu(conv_out)
+
+        x, B, C = torch.split(
+            xBC, [self.d_inner, self.n_groups * self.d_state, self.n_groups * self.d_state], dim=-1
+        )
+        x = x.view(Bn, self.nheads, self.head_dim)
+        B = B.view(Bn, self.n_groups, self.d_state)
+        C = C.view(Bn, self.n_groups, self.d_state)
+        A = -torch.exp(self.A_log.float())
+        dt = F.softplus(dt.float() + self.dt_bias.float())        # (B, nheads)
+
+        hpg = self.nheads // self.n_groups
+        Bx = B.repeat_interleave(hpg, dim=1).float()              # (B, nheads, d_state)
+        Cx = C.repeat_interleave(hpg, dim=1).float()
+        dA = torch.exp(dt * A)                                    # (B, nheads)
+        dBx = (dt.unsqueeze(-1) * x.float()).unsqueeze(-1) * Bx.unsqueeze(2)  # (B, nh, hd, ds)
+        h = dA.view(Bn, self.nheads, 1, 1) * ssm_b + dBx
+        y = torch.einsum("bhpn,bhn->bhp", h, Cx)                  # (B, nh, hd)
+        y = y + self.D.view(1, -1, 1) * x.float()
+        y = y.reshape(Bn, self.d_inner).to(hidden.dtype)
+        y = self.norm(y, z)
+        return self.out_proj(y), new_conv.detach(), h.detach()
 
     # -- cached O(T) decode path -----------------------------------------
 
