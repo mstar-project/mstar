@@ -315,32 +315,76 @@ class NemotronDuplexModel(Model):
     ) -> NodeSubmodule | None:
         if node_name == "nano_llm":
             return self._create_nano_submodule(device, autocast_dtype=autocast_dtype)
-        # Audio nodes: Phase 4/5 — dummy mode (None) keeps the text path runnable.
-        if node_name in ("conformer_encoder", "eartts_talker", "audio_codec"):
-            logger.warning("Submodule %s not implemented yet (Phase 4/5) — dummy mode.", node_name)
-            return None
+        if node_name == "conformer_encoder":
+            return self._create_conformer_submodule(device, autocast_dtype=autocast_dtype)
+        if node_name == "eartts_talker":
+            return self._create_talker_submodule(device, autocast_dtype=autocast_dtype)
+        if node_name == "audio_codec":
+            return self._create_codec_submodule(device, autocast_dtype=autocast_dtype)
         return None
+
+    def _build_and_load(self, module: torch.nn.Module, device: str, autocast_dtype, local_dir: str):
+        """meta-build -> cast -> materialize -> load the module's checkpoint subtree.
+
+        Each component's ``load_weights`` streams the single composite
+        ``model.safetensors`` and keeps only its own subtree (verified: every
+        checkpoint tensor maps to exactly one component param).
+        """
+        from mstar.model.loader import load_weights
+
+        if autocast_dtype is not None:
+            module = module.to(autocast_dtype)
+        module.to_empty(device=device)
+        load_weights(module, local_dir, device=device)
+        return module.eval()
 
     def _create_nano_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule:
-        from mstar.model.loader import load_weights
         from mstar.model.nemotron_duplex.components.nemotron_h import NemotronHForCausalLM
         from mstar.model.nemotron_duplex.submodules import NemotronHLLMSubmodule
 
         local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
-
         with torch.device("meta"):
             language_model = NemotronHForCausalLM(self.config.nano)
-        if autocast_dtype is not None:
-            language_model = language_model.to(autocast_dtype)
-        language_model.to_empty(device=device)
-
-        # TODO(verify): the base checkpoint is a single composite ``model.safetensors``;
-        # confirm the weight-name prefix for the nano stage (e.g. ``nano.`` /
-        # ``model.``) and extend the component's name_remapper accordingly before
-        # this load succeeds.
-        load_weights(language_model, local_dir, device=device)
-        language_model.eval()
-
+        language_model = self._build_and_load(language_model, device, autocast_dtype, local_dir)
         return NemotronHLLMSubmodule(language_model=language_model, config=self.config)
+
+    def _create_conformer_submodule(
+        self, device: str, autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule:
+        from mstar.model.nemotron_duplex.components.conformer import Perception
+        from mstar.model.nemotron_duplex.components.rnnt import RnntDecoder, RnntJoint
+        from mstar.model.nemotron_duplex.submodules import ConformerEncoderSubmodule
+
+        local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        with torch.device("meta"):
+            perception, rnnt_dec, rnnt_joint = Perception(), RnntDecoder(), RnntJoint()
+        perception = self._build_and_load(perception, device, autocast_dtype, local_dir)
+        rnnt_dec = self._build_and_load(rnnt_dec, device, autocast_dtype, local_dir)
+        rnnt_joint = self._build_and_load(rnnt_joint, device, autocast_dtype, local_dir)
+        return ConformerEncoderSubmodule(perception, rnnt_dec, rnnt_joint, config=self.config)
+
+    def _create_talker_submodule(
+        self, device: str, autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule:
+        from mstar.model.nemotron_duplex.components.eartts_talker import EarTTSTalker
+        from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
+
+        local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        with torch.device("meta"):
+            talker = EarTTSTalker(self.config.eartts)
+        talker = self._build_and_load(talker, device, autocast_dtype, local_dir)
+        return EarTTSTalkerSubmodule(talker=talker, config=self.config)
+
+    def _create_codec_submodule(
+        self, device: str, autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule:
+        from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
+        from mstar.model.nemotron_duplex.submodules import AudioCodecDecoderSubmodule
+
+        local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        with torch.device("meta"):
+            codec = AudioCodec()
+        codec = self._build_and_load(codec, device, autocast_dtype, local_dir)
+        return AudioCodecDecoderSubmodule(codec=codec, config=self.config)
