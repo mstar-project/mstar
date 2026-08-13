@@ -162,10 +162,10 @@ class OpenAIAdapter:
     """
 
     # Each flag gates exactly one OpenAI surface:
-    supports_chat: bool = False     # POST /v1/chat/completions
-    supports_speech: bool = False   # POST /v1/audio/speech
-    supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
-    supports_videos: bool = False   # POST /v1/videos/generations
+    supports_chat: bool = False  # POST /v1/chat/completions
+    supports_speech: bool = False  # POST /v1/audio/speech
+    supports_images: bool = False  # POST /v1/images/generations and /v1/images/edits
+    supports_videos: bool = False  # POST /v1/videos/generations
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
@@ -428,6 +428,41 @@ class Wan22Adapter(OpenAIAdapter):
         )
 
 
+class LingBotAdapter(OpenAIAdapter):
+    """LingBot dense text-to-video generation.
+
+    ``size`` ("WxH") maps to ``width`` / ``height``. ``seed`` and any extra
+    diffusion knobs (``guidance_scale``, ``num_inference_steps``,
+    ``negative_prompt``, optional ``init_latents``) pass through as model kwargs.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        if getattr(req, "size", None):
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '832x480'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        if getattr(req, "num_frames", None) is not None:
+            mk.setdefault("num_frames", req.num_frames)
+        if getattr(req, "fps", None) is not None:
+            mk.setdefault("fps", req.fps)
+        if getattr(req, "image", None) or getattr(req, "video", None):
+            raise ValueError("LingBot dense supports text-to-video only in this native port.")
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video"],
+            model_kwargs=mk,
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
@@ -438,6 +473,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "lingbot": LingBotAdapter(),
 }
 
 

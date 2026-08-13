@@ -145,6 +145,19 @@ wan22 = [
     "av",
 ]
 
+lingbot = [
+    # LingBot-Video dense 1.3B (native mstar port). diffusers supplies the
+    # scheduler/DiT base mixins and Wan-VAE config; transformers supplies the
+    # Qwen3-VL config + processor. accelerate is used by the HF loaders.
+    "accelerate",
+    "diffusers>=0.37",
+    "huggingface-hub",
+    "transformers>=4.57.3",
+    "safetensors",
+    # mp4 encode for the video output (PyAV bundles its own FFmpeg libs).
+    "av",
+]
+
 vjepa2_ac = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
