@@ -1,0 +1,22 @@
+# NVIDIA NemotronLabs VoiceChat-11B — single-GPU draft (text path first).
+#
+# Node -> rank map. The audio nodes (conformer_encoder, eartts_talker,
+# audio_codec) are declared for the full duplex layout but are Phase 4/5 stubs;
+# on rank 0 they load in dummy mode until implemented. Once the audio stages
+# land, split them onto their own ranks and add async partitions (see the
+# duplex design note in nemotron_duplex_model.py).
+model: "nemotron_duplex"
+max_seq_len: 12288  # config: voicechat streaming_max_len / vllm_max_model_len
+
+node_groups:
+  - node_names:
+      - nano_llm
+    ranks:
+      - 0
+
+  - node_names:
+      - conformer_encoder
+      - eartts_talker
+      - audio_codec
+    ranks:
+      - 0
