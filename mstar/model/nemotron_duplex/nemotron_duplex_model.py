@@ -115,7 +115,8 @@ class DuplexStream:
     Produces the SAME result as ``offline_inference`` on the concatenated audio.
     """
 
-    def __init__(self, model, device: str, voice: str, temperature: float, top_p: float, repetition_penalty: float):
+    def __init__(self, model, device: str, voice: str, temperature: float, top_p: float,
+                 repetition_penalty: float, prompt_tokens: torch.Tensor | None = None):
         self.m = model
         self.cfg = model.config
         self.device = device
@@ -124,6 +125,9 @@ class DuplexStream:
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
         self.special_ids = {self.cfg.text_pad_id, self.cfg.text_bos_id, self.cfg.text_eos_id}
+        # System-prompt tokens (fed via the audio channel, gen_text held at PAD,
+        # exactly as offline_inference prepends the prompt). Primes the nano cache.
+        self.prompt_tokens = None if prompt_tokens is None else prompt_tokens.to(device).view(-1)
 
         self.perception = model.get_submodule("conformer_encoder", device=device).perception
         self.nano = model.get_submodule("nano_llm", device=device).language_model
@@ -150,6 +154,28 @@ class DuplexStream:
         self._codes_hist = None                # (1, n, num_q) accumulated RVQ codes
         self._emitted = 0                      # waveform samples already emitted
         self._t = 0
+        self._prime_prompt()                   # feed the system prompt (if any) first
+
+    @torch.no_grad()
+    def _prime_prompt(self):
+        """Prime the nano cache with the system prompt, mirroring how
+        ``_infer_one`` prepends ``prompt_emb`` to the audio channel and holds
+        ``gen_text`` at PAD across the prompt region (no sampling, no talker).
+        Frame 0's agent channel is BOS; later prompt frames use PAD."""
+        if self.prompt_tokens is None or self.prompt_tokens.numel() == 0:
+            return
+        nano, cfg = self.nano, self.cfg
+        embed_tokens = nano.embed_tokens
+        prompt_emb = embed_tokens(self.prompt_tokens)          # (P, H)
+        for i in range(prompt_emb.shape[0]):
+            prev_text = cfg.text_bos_id if i == 0 else cfg.text_pad_id
+            agent_emb = embed_tokens(torch.tensor([prev_text], device=self.device))
+            func_emb = embed_tokens(torch.tensor([cfg.text_pad_id], device=self.device))
+            fused = agent_emb * cfg.agent_text_weight + prompt_emb[i].unsqueeze(0) * cfg.user_audio_weight
+            if cfg.use_function_head:
+                fused = fused + func_emb * cfg.function_weight
+            self._nano_hidden(fused)                           # primes cache; no sampling
+            self._gen_text.append(cfg.text_pad_id)             # prompt region held at PAD
 
     def append_audio(self, pcm_int16: bytes) -> list[_StreamOutput]:
         chunk = torch.frombuffer(bytearray(pcm_int16), dtype=torch.int16).float() / 32768.0
@@ -172,7 +198,10 @@ class DuplexStream:
         outs: list[_StreamOutput] = []
 
         for t in range(self._processed, T):
-            prev_text = cfg.text_bos_id if t == 0 else self._gen_text[t - 1]
+            # Global position — with a primed system prompt, gen_text already holds
+            # `prompt_len` PADs, so the first audio frame's prev is the last prompt
+            # PAD (not BOS). BOS applies only at true global frame 0 (no prompt).
+            prev_text = cfg.text_bos_id if len(self._gen_text) == 0 else self._gen_text[-1]
             agent_emb = embed_tokens(torch.tensor([prev_text], device=self.device))
             func_emb = embed_tokens(torch.tensor([self._prev_func], device=self.device))
             fused = agent_emb * cfg.agent_text_weight + audio_embeds[0, t].unsqueeze(0) * cfg.user_audio_weight
@@ -490,12 +519,29 @@ class NemotronDuplexModel(Model):
         for node in ("conformer_encoder", "nano_llm", "eartts_talker", "audio_codec"):
             self.get_submodule(node, device=device)
 
+    def encode_prompt(self, system_prompt: str, device: str = "cuda") -> torch.Tensor | None:
+        """Tokenize a system prompt to nano text-token ids: ``[bos] + ids + [eos]``
+        (mirrors the reference ``encode_system_prompt``). Returns ``(1, P)`` or None."""
+        if not system_prompt or not system_prompt.strip():
+            return None
+        tok = self.tokenizer
+        ids = tok.encode(system_prompt, add_special_tokens=False)
+        ids = [tok.bos_token_id] + ids + [tok.eos_token_id]
+        return torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+
     def create_stream(
         self, device: str = "cuda", voice: str = "Aria",
         temperature: float = 0.0, top_p: float = 1.0, repetition_penalty: float = 1.0,
+        prompt_tokens: torch.Tensor | None = None, system_prompt: str | None = None,
     ) -> DuplexStream:
-        """Open an online duplex streaming session (see ``DuplexStream``)."""
-        return DuplexStream(self, device, voice, temperature, top_p, repetition_penalty)
+        """Open an online duplex streaming session (see ``DuplexStream``).
+
+        A system prompt may be passed either pre-tokenized (``prompt_tokens``,
+        ``(1, P)`` nano text ids) or as raw text (``system_prompt``); it primes
+        the nano cache before any audio, exactly as offline prepends it."""
+        if prompt_tokens is None and system_prompt is not None:
+            prompt_tokens = self.encode_prompt(system_prompt, device=device)
+        return DuplexStream(self, device, voice, temperature, top_p, repetition_penalty, prompt_tokens)
 
     # -------------------------------------------------------------------
     # Standalone offline inference (Phase A — mirrors the reference
