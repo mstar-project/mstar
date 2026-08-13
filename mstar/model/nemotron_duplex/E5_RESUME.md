@@ -39,6 +39,24 @@ Three real integration bugs were found + fixed live (commit `bf3fe346`):
 
 ## The open bug (resume here)
 
+### Attempted fix applied (UNVERIFIED — run on ptc to confirm)
+
+Mechanistic root cause pinned by static analysis: the `decode` loop node's
+`input_names = [audio_frame, prev_text, prev_func]` are ALL required for the node to be
+"ready", but on **frame 0** of an audio-only request there is no prior sampled token, so
+`prev_text`/`prev_func` are never delivered → the node never runs → hang (matches the
+observed "submitted then nothing"). qwen3 avoids this: its `talker_prefill` seeds
+`talker_input_embeds` before the decode loop.
+
+Fix applied (commit after this doc): `process_prompt` now emits `prev_text=[BOS]` and
+`prev_func=[PAD]`, and `get_initial_forward_pass_args` (LLM, audio-only → `decode`)
+provides them as frame-0 inputs; iterations ≥1 get them from the loop-back edges.
+**Not run yet** — verify on ptc: serve, send an audio request, and check the `NDTRACE`
+lines now show `nano.prepare_inputs walk=decode` firing repeatedly (one per frame). If it
+still hangs, fall through to the gating/termination analysis below.
+
+### If the seeding fix isn't enough
+
 An audio request **hangs** (no crash, no error) after `Request … submitted`. The stall
 is in the **frame-synchronous Encoder→LLM streaming loop** — the deepest runtime piece.
 Note this is an unusual shape: no reference model streams an encoder *frame-by-frame*
