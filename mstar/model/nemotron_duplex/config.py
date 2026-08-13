@@ -157,12 +157,91 @@ class ConformerSTTConfig:
 
 
 @dataclass
+class CodecConfig:
+    """RVQ audio codec (``config.json`` -> ``model.speech_generation.model.codec_config``).
+
+    The encoder/decoder conv+ConvNeXt-block stacks are *derived* from these
+    fields (channel schedule from ``base_hidden_size`` * ``channel_mult``,
+    strides from ``rates``, ``num_blocks`` blocks per stage) rather than
+    hardcoded — see ``encoder_layers`` / ``decoder_layers``.
+    """
+
+    base_hidden_size: int = 384
+    channel_mult: tuple[int, ...] = (1, 2, 4)
+    codebook_size: int = 1024
+    groups: int = 1
+    hop_length: int = 4
+    kernel_size: int = 7
+    latent_size: int = 512
+    n_fft: int = 16
+    num_blocks: int = 3
+    num_quantizers: int = 31
+    rates: tuple[int, ...] = (7, 7, 9)
+    wav_to_token_ratio: int = 1764
+    # Fixed NeMo codec constant (magnitude ceiling); not present in config.json.
+    max_magnitude: float = 100.0
+
+    @property
+    def spec_channels(self) -> int:
+        """Encoder input channels = (n_fft/2 + 1) real + imag = 2*(n_fft/2+1)."""
+        return 2 * (self.n_fft // 2 + 1)
+
+    @property
+    def channels(self) -> list[int]:
+        return [self.base_hidden_size * m for m in self.channel_mult]
+
+    def encoder_layers(self) -> list[tuple]:
+        """(kind, weight_shape, stride, transpose) per encoder layer."""
+        ch = self.channels
+        spec: list[tuple] = [("conv", (ch[0], self.spec_channels, 1), 1, False)]
+        for i in range(len(ch)):
+            spec += [("block", ch[i])] * self.num_blocks
+            out = ch[i + 1] if i + 1 < len(ch) else self.latent_size
+            spec.append(("conv", (out, ch[i], self.rates[i]), self.rates[i], False))
+        return spec
+
+    def decoder_layers(self) -> list[tuple]:
+        ch = self.channels
+        spec: list[tuple] = []
+        prev = self.latent_size
+        for i in reversed(range(len(ch))):
+            spec.append(("conv", (prev, ch[i], self.rates[i]), self.rates[i], True))
+            spec += [("block", ch[i])] * self.num_blocks
+            prev = ch[i]
+        spec.append(("conv", (self.spec_channels, ch[0], 1), 1, False))
+        return spec
+
+
+@dataclass
+class RnntConfig:
+    """RNN-T transcription head (``config.json`` -> ``_rnnt_merge_info``)."""
+
+    pred_hidden: int = 640
+    pred_rnn_layers: int = 2
+    encoder_hidden: int = 1024
+    joint_hidden: int = 640
+    vocab_size: int = 1024        # excludes the RNN-T blank
+    activation: str = "relu"
+
+    @property
+    def num_classes(self) -> int:
+        return self.vocab_size + 1  # + blank
+
+
+@dataclass
 class NemotronDuplexConfig:
-    """Top-level config bundling the three stages plus generation defaults."""
+    """Top-level config bundling the stages plus generation defaults.
+
+    Use :meth:`from_pretrained` to populate every sub-config from the
+    checkpoint's ``config.json``; the dataclass defaults mirror that file so
+    dummy-mode / weightless construction still works.
+    """
 
     nano: NanoConfig = field(default_factory=NanoConfig)
     eartts: EarTTSConfig = field(default_factory=EarTTSConfig)
     stt: ConformerSTTConfig = field(default_factory=ConformerSTTConfig)
+    codec: CodecConfig = field(default_factory=CodecConfig)
+    rnnt: RnntConfig = field(default_factory=RnntConfig)
 
     # generation defaults (text path). TODO(verify) against the model's
     # recommended sampling for the voicechat contract.
@@ -180,3 +259,46 @@ class NemotronDuplexConfig:
     @property
     def eos_token_id(self) -> int:
         return self.nano.eos_token_id
+
+    @classmethod
+    def from_pretrained(cls, ckpt_dir: str) -> NemotronDuplexConfig:
+        """Build from the checkpoint's ``config.json`` (NeMo VoiceChat layout).
+
+        Only the stages whose components read from config are populated here;
+        the rest fall back to dataclass defaults. Extend as modules migrate to
+        config-driven construction.
+        """
+        import json
+        import os
+
+        with open(os.path.join(ckpt_dir, "config.json")) as f:
+            raw = json.load(f)
+        cfg = cls()
+
+        cc = raw["model"]["speech_generation"]["model"]["codec_config"]
+        cfg.codec = CodecConfig(
+            base_hidden_size=cc["base_hidden_size"],
+            channel_mult=tuple(cc["channel_mult"]),
+            codebook_size=cc["codebook_size"],
+            groups=cc["groups"],
+            hop_length=cc["hop_length"],
+            kernel_size=cc["kernel_size"],
+            latent_size=cc["latent_size"],
+            n_fft=cc["n_fft"],
+            num_blocks=cc["num_blocks"],
+            num_quantizers=cc["num_quantizers"],
+            rates=tuple(cc["rates"]),
+            wav_to_token_ratio=cc["wav_to_token_ratio"],
+        )
+
+        ri = raw["_rnnt_merge_info"]
+        dc, jc = ri["decoder_config"], ri["joint_config"]
+        cfg.rnnt = RnntConfig(
+            pred_hidden=dc["prednet"]["pred_hidden"],
+            pred_rnn_layers=dc["prednet"]["pred_rnn_layers"],
+            encoder_hidden=jc["jointnet"]["encoder_hidden"],
+            joint_hidden=jc["jointnet"]["joint_hidden"],
+            vocab_size=dc["vocab_size"],
+            activation=jc["jointnet"]["activation"],
+        )
+        return cfg

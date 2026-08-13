@@ -323,6 +323,20 @@ class NemotronDuplexModel(Model):
             return self._create_codec_submodule(device, autocast_dtype=autocast_dtype)
         return None
 
+    def _json_config(self, local_dir: str) -> NemotronDuplexConfig:
+        """Config populated from the checkpoint's ``config.json`` (cached).
+
+        Falls back to dataclass defaults if the file is absent (e.g. when
+        ``local_dir`` is an unresolved repo id).
+        """
+        if getattr(self, "_json_config_cache", None) is None:
+            try:
+                self._json_config_cache = NemotronDuplexConfig.from_pretrained(local_dir)
+            except (FileNotFoundError, KeyError) as e:
+                logger.warning("Could not read config.json (%s); using config defaults.", e)
+                self._json_config_cache = self.config
+        return self._json_config_cache
+
     def _build_and_load(self, module: torch.nn.Module, device: str, autocast_dtype, local_dir: str):
         """meta-build -> cast -> materialize -> load the module's checkpoint subtree.
 
@@ -358,8 +372,10 @@ class NemotronDuplexModel(Model):
         from mstar.model.nemotron_duplex.submodules import ConformerEncoderSubmodule
 
         local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        cfg = self._json_config(local_dir)
         with torch.device("meta"):
-            perception, rnnt_dec, rnnt_joint = Perception(), RnntDecoder(), RnntJoint()
+            perception = Perception()
+            rnnt_dec, rnnt_joint = RnntDecoder(cfg.rnnt), RnntJoint(cfg.rnnt)
         perception = self._build_and_load(perception, device, autocast_dtype, local_dir)
         rnnt_dec = self._build_and_load(rnnt_dec, device, autocast_dtype, local_dir)
         rnnt_joint = self._build_and_load(rnnt_joint, device, autocast_dtype, local_dir)
@@ -384,7 +400,8 @@ class NemotronDuplexModel(Model):
         from mstar.model.nemotron_duplex.submodules import AudioCodecDecoderSubmodule
 
         local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        cfg = self._json_config(local_dir)
         with torch.device("meta"):
-            codec = AudioCodec()
+            codec = AudioCodec(cfg.codec)
         codec = self._build_and_load(codec, device, autocast_dtype, local_dir)
         return AudioCodecDecoderSubmodule(codec=codec, config=self.config)

@@ -217,7 +217,10 @@ class Mamba2Mixer(nn.Module):
         """
         L = x.shape[0]
         heads_per_group = self.nheads // self.n_groups
-        # expand groups -> heads
+        # expand groups -> heads (contiguous: head i uses group i // heads_per_group).
+        # This matches the mamba_ssm kernel / reference decode path (the deployed
+        # behavior). NOTE: the reference's *naive prefill* uses .repeat (tile,
+        # i % n_groups) instead — an HF fallback quirk we intentionally do NOT copy.
         B = B.repeat_interleave(heads_per_group, dim=1)  # (L, nheads, d_state)
         C = C.repeat_interleave(heads_per_group, dim=1)
         dA = torch.exp(dt * A)  # (L, nheads)
