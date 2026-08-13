@@ -67,28 +67,49 @@ class RealtimeConnection:
         }
         self.stream = None
         self._response_open = False
+        self._consumed_audio = False           # any user audio fed yet?
 
-    async def start(self):
+    def _open_stream(self):
+        """(Re)create the duplex stream, priming the current system prompt."""
         self.stream = self.model.create_stream(
             voice=self.cfg["voice"], temperature=self.cfg["temperature"],
+            system_prompt=self.cfg.get("instructions"),
         )
+        self._consumed_audio = False
+
+    async def start(self):
+        self._open_stream()
         await self.send_json({"type": "session.created", "session": self.cfg})
 
     async def handle(self, event: dict):
         et = event.get("type")
         if et == "session.update":
+            prev = (self.cfg.get("instructions"), self.cfg.get("voice"), self.cfg.get("temperature"))
             self.cfg.update(event.get("session", {}))
+            now = (self.cfg.get("instructions"), self.cfg.get("voice"), self.cfg.get("temperature"))
+            # The system prompt / voice must be primed before audio; if it changed
+            # and nothing has been fed yet, rebuild the stream. Changing it mid-turn
+            # is not supported (would need a fresh turn) — warn instead of silently
+            # dropping it.
+            if now != prev:
+                if not self._consumed_audio:
+                    self._open_stream()
+                else:
+                    await self.send_json({"type": "error", "error": {"message":
+                        "session.update to instructions/voice/temperature after audio "
+                        "started is applied on the next input_audio_buffer.clear"}})
             await self.send_json({"type": "session.updated", "session": self.cfg})
         elif et == "input_audio_buffer.append":
             pcm = base64.b64decode(event["audio"])
+            self._consumed_audio = True
             await self._consume(self.stream.append_audio(pcm))
         elif et == "input_audio_buffer.commit":
             await self._consume(self.stream.flush())
             await self._finish_response()
         elif et == "input_audio_buffer.clear":
-            self.stream.reset()
+            self._open_stream()  # fresh turn — re-prime the current system prompt
         elif et == "response.cancel":
-            self.stream.reset()
+            self._open_stream()
             await self._finish_response()
         elif et in ("response.create", "session.close"):
             pass  # continuous mode: responses stream as audio arrives
