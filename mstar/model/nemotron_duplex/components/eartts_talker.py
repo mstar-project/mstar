@@ -69,6 +69,12 @@ def _rope_cos_sin(positions: torch.Tensor, theta: float, dim: int) -> tuple[torc
     return emb.cos(), emb.sin()
 
 
+def _masking_rate(rate: torch.Tensor, exponent: float) -> torch.Tensor:
+    """MaskGIT keep-rate -> masking-rate schedule: ``(1 - rate**e) ** (1/e)``
+    (its own inverse). Matches NeMo ``get_masking_rate``."""
+    return (1.0 - rate.pow(exponent)).pow(1.0 / exponent)
+
+
 class _Attn(nn.Module):
     """q/k/v/o projections (no bias); optional Gemma3 per-head QK-norm.
 
@@ -98,12 +104,20 @@ class _Attn(nn.Module):
         sin: torch.Tensor | None = None,
         causal: bool = True,
         attn_bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        return_kv: bool = False,
+    ):
         """Multi-head self-attention. Gemma3-style: optional per-head QK-norm
         (applied before rope), rope on the full head dim, and query scaling by
         ``query_pre_attn_scalar ** -0.5``. ``causal`` adds a triangular mask
         (talker); ``attn_bias`` is an additive mask broadcastable to
-        ``[b, nh, tq, tk]`` (encoder key padding)."""
+        ``[b, nh, tq, tk]`` (encoder key padding).
+
+        For autoregressive decoding, ``past_kv`` (rope-applied ``(k, v)`` from
+        earlier positions) is concatenated with the new keys/values and, when
+        ``return_kv`` is set, the updated cache is returned. rope on the new
+        query/key uses their absolute positions via ``cos``/``sin``; the causal
+        mask offsets so the new queries attend all cached keys plus themselves."""
         b, t, _ = x.shape
         nh, hd = self.num_heads, self.head_dim
         q = F.linear(x, self.q_proj.weight).view(b, t, nh, hd)
@@ -120,15 +134,24 @@ class _Attn(nn.Module):
             sin_b = sin[None, None, :, :]
             q = q * cos_b + _rotate_half(q) * sin_b
             k = k * cos_b + _rotate_half(k) * sin_b
+        if past_kv is not None:
+            k = torch.cat((past_kv[0], k), dim=2)
+            v = torch.cat((past_kv[1], v), dim=2)
+        new_kv = (k, v) if return_kv else None
+        t_tot = k.shape[2]
         scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling
         if causal:
-            neg = torch.full((t, t), float("-inf"), device=x.device, dtype=scores.dtype)
-            scores = scores + torch.triu(neg, diagonal=1)
+            offset = t_tot - t   # absolute index of the first query position
+            neg = torch.full((t, t_tot), float("-inf"), device=x.device, dtype=scores.dtype)
+            scores = scores + torch.triu(neg, diagonal=offset + 1)
         if attn_bias is not None:
             scores = scores + attn_bias
         attn = torch.softmax(scores.float(), dim=-1).to(v.dtype)
         out = torch.matmul(attn, v).transpose(1, 2).reshape(b, t, nh * hd)
-        return F.linear(out, self.o_proj.weight)
+        out = F.linear(out, self.o_proj.weight)
+        if return_kv:
+            return out, new_kv
+        return out
 
 
 class TalkerLayer(nn.Module):
@@ -145,12 +168,24 @@ class TalkerLayer(nn.Module):
         self.mlp = GatedMLP(h, config.intermediate_size, activation="gelu_tanh", bias=False)
         self.post_feedforward_layernorm = RMSNorm(h)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        return_kv: bool = False,
+    ):
         """Gemma3 decoder layer with its 4 RMSNorms (input / post-attn /
-        pre-ff / post-ff), each ``(1 + w)`` in fp32."""
+        pre-ff / post-ff), each ``(1 + w)`` in fp32. Optionally reads/updates a
+        per-layer ``(k, v)`` cache for autoregressive decoding."""
         residual = x
         h = _gemma_rmsnorm(x, self.input_layernorm.weight, self.eps)
-        h = self.self_attn(h, cos, sin, causal=True)
+        attn_out = self.self_attn(h, cos, sin, causal=True, past_kv=past_kv, return_kv=return_kv)
+        if return_kv:
+            h, new_kv = attn_out
+        else:
+            h, new_kv = attn_out, None
         h = _gemma_rmsnorm(h, self.post_attention_layernorm.weight, self.eps)
         x = residual + h
 
@@ -159,6 +194,8 @@ class TalkerLayer(nn.Module):
         h = self.mlp(h)
         h = _gemma_rmsnorm(h, self.post_feedforward_layernorm.weight, self.eps)
         x = residual + h
+        if return_kv:
+            return x, new_kv
         return x
 
 
@@ -360,6 +397,16 @@ class MogHead(nn.Module):
         self.proj_logs = nn.Linear(h, 1, bias=False)
         self.proj_mus = nn.Linear(h, self.num_predictions * self.low_rank, bias=False)
 
+    def _trunk(self, x: torch.Tensor) -> torch.Tensor:
+        """``mlp_stack``: ``num_layers`` residual MLPLayers (pre_norm -> mlp ->
+        post_norm) followed by a final RMSNorm."""
+        for block in self.mlp_stack[: self.num_layers]:
+            y = _gemma_rmsnorm(x, block.pre_norm.weight, self.eps)
+            y = block.mlp(y)
+            y = _gemma_rmsnorm(y, block.post_norm.weight, self.eps)
+            x = x + y
+        return _gemma_rmsnorm(x, self.mlp_stack[self.num_layers].weight, self.eps)
+
     def forward(self, x: torch.Tensor):
         """Deterministic (training-style) MoG head forward.
 
@@ -370,19 +417,49 @@ class MogHead(nn.Module):
           * ``logs``   [b, t, 1] log std, clamped to ``mog_min_log_std``
         """
         b, t, _ = x.shape
-        # mlp_stack: residual MLPLayers (pre_norm -> mlp -> post_norm) then a final RMSNorm.
-        for block in self.mlp_stack[: self.num_layers]:
-            y = _gemma_rmsnorm(x, block.pre_norm.weight, self.eps)
-            y = block.mlp(y)
-            y = _gemma_rmsnorm(y, block.post_norm.weight, self.eps)
-            x = x + y
-        x = _gemma_rmsnorm(x, self.mlp_stack[self.num_layers].weight, self.eps)
-
+        x = self._trunk(x)
         logits = F.linear(x, self.proj_logits.weight)
         mus = F.linear(x, self.proj_mus.weight).view(b, t, self.num_predictions, self.low_rank)
         logs = F.linear(x, self.proj_logs.weight).clamp_min(self.min_log_std)
         mu_res = F.linear(x, self.proj_else.weight)
         return logits, mus, mu_res, logs
+
+    def infer(
+        self,
+        x: torch.Tensor,
+        temperature: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample a mixture component and return its target latent mean + log-std.
+
+        Greedy (``temperature == 0``, the offline default) picks the component
+        by ``argmax(logits)``; ``temperature > 0`` uses the Gumbel-max trick over
+        ``log_softmax(logits) / temperature``. The chosen component's low-rank
+        mean ``mu`` is projected up through the component-specific ``low_mat``,
+        scaled by ``exp(logs)`` and offset by the residual mean ``mu_res``:
+        returns ``(mu * exp(logs) + mu_res, logs)`` — the mean of the Gaussian
+        that the RVQ residual-quantizer then encodes."""
+        b, t, _ = x.shape
+        x = self._trunk(x)
+        logits = F.linear(x, self.proj_logits.weight)                       # [b, t, n]
+        if temperature and temperature > 0.0:
+            logp = F.log_softmax(logits, dim=-1) / temperature
+            u = torch.rand(logp.shape, device=logp.device, dtype=logp.dtype, generator=generator)
+            gumbel = -torch.log(-torch.log(u + 1e-8) + 1e-8)
+            idx = (logp + gumbel).argmax(-1)                                # [b, t]
+        else:
+            idx = logits.argmax(-1)                                        # [b, t]
+
+        mus = F.linear(x, self.proj_mus.weight).view(b, t, self.num_predictions, self.low_rank)
+        sel = idx[..., None, None].expand(b, t, 1, self.low_rank)
+        mu = mus.gather(2, sel).squeeze(2)                                  # [b, t, low_rank]
+
+        low_mat_sel = self.low_mat[idx]                                    # [b, t, out_size, low_rank]
+        mu = torch.matmul(low_mat_sel, mu.unsqueeze(-1)).squeeze(-1)        # [b, t, out_size]
+
+        mu_res = F.linear(x, self.proj_else.weight)                        # [b, t, out_size]
+        logs = F.linear(x, self.proj_logs.weight).clamp_min(self.min_log_std)  # [b, t, 1]
+        return mu * torch.exp(logs) + mu_res, logs
 
 
 class _Backbone(nn.Module):
@@ -426,27 +503,197 @@ class EarTTSTalker(nn.Module):
             ret = ret + F.embedding(code[..., i], embs[i])
         return ret
 
-    def backbone_forward(self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def backbone_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        kv_cache: list | None = None,
+        start_pos: int = 0,
+        return_cache: bool = False,
+    ):
         """Gemma3-text decoder stack over ``inputs_embeds`` [b, t, H].
 
         Full-attention layers (``(i+1) % sliding_window_pattern == 0``) use
         ``rope_theta_full``; the rest (sliding-attention) use
         ``rope_theta_local``. For sequences shorter than the sliding window the
         two mask identically (plain causal), so only the rope base differs.
+
+        For autoregressive decoding, pass the per-layer ``kv_cache`` list and the
+        absolute ``start_pos`` of the new tokens; with ``return_cache`` the
+        updated per-layer ``(k, v)`` list is returned alongside the hidden state.
         """
         cfg = self.config
         b, t, _ = inputs_embeds.shape
         if position_ids is None:
-            position_ids = torch.arange(t, device=inputs_embeds.device)
+            position_ids = torch.arange(start_pos, start_pos + t, device=inputs_embeds.device)
         cos_g, sin_g = _rope_cos_sin(position_ids, cfg.rope_theta_full, cfg.head_dim)
         cos_l, sin_l = _rope_cos_sin(position_ids, cfg.rope_theta_local, cfg.head_dim)
+        new_cache = [] if return_cache else None
         x = inputs_embeds
         for i, layer in enumerate(self.backbone.layers):
             full = (i + 1) % cfg.sliding_window_pattern == 0
             cos, sin = (cos_g, sin_g) if full else (cos_l, sin_l)
-            x = layer(x, cos, sin)
+            past = kv_cache[i] if kv_cache is not None else None
+            out = layer(x, cos, sin, past_kv=past, return_kv=return_cache)
+            if return_cache:
+                x, kv = out
+                new_cache.append(kv)
+            else:
+                x = out
         x = _gemma_rmsnorm(x, self.backbone.norm.weight, cfg.rms_norm_eps)
+        if return_cache:
+            return x, new_cache
         return x
+
+    def _rvq_quantize(self, z: torch.Tensor, code: torch.Tensor, depth_str: int, k: int) -> torch.Tensor:
+        """Residual vector quantization of latent ``z`` [b, t, code_dim] into
+        codebooks ``[depth_str, depth_str + k)``. Faithful port of NeMo
+        ``depthsum_encoding_step``: nearest RVQ entry per codebook (minimising
+        ``||e||^2 - 2<r, e>``), subtracting the chosen entry from the running
+        residual ``r`` (which starts at ``z``)."""
+        code = code.clone()
+        r = z
+        for i in range(depth_str, depth_str + k):
+            ei = self.rvq_embs[i]                                            # [codebook_size, code_dim]
+            dist = ei.pow(2).sum(-1) - 2.0 * torch.matmul(r, ei.transpose(-1, -2))  # [b, t, codebook_size]
+            idx = dist.argmin(-1)                                            # [b, t]
+            r = r - F.embedding(idx, ei)
+            code[..., i] = idx
+        return code
+
+    @torch.no_grad()
+    def generate_step(
+        self,
+        hidden_states: torch.Tensor,
+        num_iter: int = 8,
+        exponent: float = 3.0,
+        temperature: float = 0.0,
+        noise_scale: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Iterative MoG-conditioned RVQ decode of one (or more) frame(s).
+
+        Given the backbone hidden state ``[b, t, H]``, fills the
+        ``num_quantizers`` RVQ codebooks over ``num_iter`` MaskGIT-style
+        iterations. Each iteration re-embeds the current partial code, adds the
+        hidden state, samples the MoG target latent ``z`` (greedy +
+        deterministic by default: ``temperature=0``, ``noise_scale=0``), then
+        residual-quantizes the next block of codebooks. Returns ``[b, t,
+        num_quantizers]`` long codes in ``[0, codebook_size)``. CFG guidance is
+        not implemented (single, conditional stream).
+        """
+        cfg = self.config
+        b, t, _ = hidden_states.shape
+        d = cfg.num_quantizers
+        device = hidden_states.device
+        code = torch.full((b, t, d), cfg.codebook_size, dtype=torch.long, device=device)
+
+        rates = torch.linspace(0.0, 1.0, num_iter + 1, device=device)[:-1].unsqueeze(-1)
+        num_maskings = torch.ceil(_masking_rate(rates, exponent) * d).long()
+        ks = num_maskings - F.pad(num_maskings[1:], [0, 0, 0, 1])           # per-iter codebook counts, sum == d
+        cnt = 0
+        for i in range(num_iter):
+            k = int(ks[i, 0].item())
+            if k == 0:
+                continue
+            mog_input = self.embed_code(self.depthsum_embedding(code)) + hidden_states
+            mu, logs = self.mog_head.infer(mog_input, temperature=temperature, generator=generator)
+            z = mu
+            if noise_scale:
+                eps = torch.randn(mu.shape, device=device, dtype=mu.dtype, generator=generator)
+                z = z + torch.exp(logs) * eps * noise_scale
+            code = self._rvq_quantize(z, code, cnt, k)
+            cnt += k
+        return code
+
+    @torch.no_grad()
+    def init_state(self, batch_size: int, speaker: str = "Aria", device=None, dtype=None) -> dict:
+        """Warm up the autoregressive KV cache from a pre-baked speaker prompt.
+
+        Uses the cached ``audio_prompt_latents[speaker]`` [1, P, H] as the
+        pre-BOS audio-prompt frames (already in model hidden space), adds
+        ``bos_emb`` to the final prompt frame to mark the generation boundary,
+        runs the block through the gated fusion (zero text conditioning) and the
+        backbone, and returns the populated per-layer cache plus the next
+        absolute position. NOTE: this is a self-contained faithful setup — it
+        uses the pre-baked latent directly rather than re-encoding prompt audio
+        with the codec, and omits any text/system-prompt prefix.
+        """
+        latent = self.audio_prompt_latents[speaker]
+        if device is not None:
+            latent = latent.to(device)
+        if dtype is not None:
+            latent = latent.to(dtype)
+        prompt = latent.expand(batch_size, -1, -1).clone()                  # [B, P, H]
+        prompt[:, -1] = prompt[:, -1] + self.bos_emb.to(prompt)
+        cond = prompt.new_zeros((1, 1, self.config.hidden_size))
+        inputs_embeds = self.gated_fusion_audio_text(prompt, cond)
+        _, cache = self.backbone_forward(inputs_embeds, start_pos=0, kv_cache=None, return_cache=True)
+        return {"kv": cache, "pos": prompt.shape[1]}
+
+    def initial_prev_codes(self, batch_size: int, device=None) -> torch.Tensor:
+        """The frame-0 ``prev_codes`` [B, num_quantizers]: the codec silence
+        frame (the natural carry-in after the audio prompt)."""
+        silence = self.codec_silence_tokens
+        if device is not None:
+            silence = silence.to(device)
+        return silence.view(1, -1).expand(batch_size, -1).contiguous()
+
+    @torch.no_grad()
+    def infer_codes_one_step(
+        self,
+        state: dict,
+        current_subword_id: torch.Tensor,
+        prev_subword_id: torch.Tensor | None,
+        prev_codes: torch.Tensor,
+        cond: torch.Tensor | None = None,
+        current_subword_mask: torch.Tensor | None = None,
+        text_eos_id: int | None = None,
+        num_iter: int = 8,
+        temperature: float = 0.0,
+        noise_scale: float = 0.0,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """One autoregressive frame step.
+
+        Args:
+            state: cache dict from ``init_state`` / a previous step
+                (``{"kv", "pos"}``).
+            current_subword_id: [B, 1] nano text token id conditioning this frame
+                (used only to force a codec-silence frame on text-EOS).
+            prev_subword_id: [B, 1] previous text id — unused in this
+                configuration (``context_hidden_size`` is ``None``); accepted for
+                signature parity.
+            prev_codes: [B, num_quantizers] codes emitted for the previous frame.
+            cond: optional [B, 1, H] (or [1, 1, H]) precomputed text/subword
+                conditioning (the caller runs ``embed_subword`` to build it, as
+                that needs the tokenizer's subword->char map). ``None`` -> zero
+                conditioning.
+            text_eos_id: if given and ``current_subword_id == text_eos_id``,
+                ``prev_codes`` is replaced by the codec silence frame before
+                embedding (``inference_force_speech_silence_on_eos``).
+
+        Returns:
+            ``(codes [B, num_quantizers], new_state)`` — greedy + deterministic
+            by default (``temperature == 0``, ``noise_scale == 0``).
+        """
+        if text_eos_id is not None:
+            silence = self.codec_silence_tokens.view(1, -1).to(prev_codes.device).expand_as(prev_codes)
+            prev_codes = torch.where(current_subword_id == text_eos_id, silence, prev_codes)
+
+        code_embeds = self.embed_code(self.depthsum_embedding(prev_codes.unsqueeze(1)))  # [B, 1, H]
+        if cond is None:
+            cond = code_embeds.new_zeros((1, 1, self.config.hidden_size))
+        inputs_embeds = self.gated_fusion_audio_text(code_embeds, cond)
+
+        hidden, new_cache = self.backbone_forward(
+            inputs_embeds, kv_cache=state["kv"], start_pos=state["pos"], return_cache=True
+        )
+        codes = self.generate_step(
+            hidden, num_iter=num_iter, temperature=temperature, noise_scale=noise_scale, generator=generator,
+        )
+        new_state = {"kv": new_cache, "pos": state["pos"] + 1}
+        return codes.squeeze(1), new_state
 
     def forward(
         self,
