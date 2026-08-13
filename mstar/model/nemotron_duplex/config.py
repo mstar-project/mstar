@@ -109,51 +109,99 @@ class NanoConfig:
 
 @dataclass
 class EarTTSConfig:
-    """Audio-output stage (``eartts/config.json``).
+    """Audio-output stage (``config.json`` -> ``model.speech_generation.model.tts_config``).
 
     A Gemma3-text "talker" transformer autoregressively emits RVQ codec codes
-    (``num_quantizers`` codebooks of ``codebook_size``), which the codec decoder
-    turns into a 22.05 kHz waveform.
+    (``num_quantizers`` codebooks of ``codebook_size``), then a mixture-of-
+    gaussians (MoG) head over the ``code_dim`` RVQ latent space.
     """
 
-    # talker transformer (backbone_type == "gemma3_text")
+    # --- Gemma3-text backbone (``tts_config.backbone_config``) ---
     hidden_size: int = 1152
+    intermediate_size: int = 4608
     num_hidden_layers: int = 28
     num_attention_heads: int = 16
     num_key_value_heads: int = 16
     head_dim: int = 72
+    sliding_window: int = 7500
+    rms_norm_eps: float = 1e-6
+    # Gemma3TextConfig defaults (not in the checkpoint's backbone_config subset).
+    query_pre_attn_scalar: float = 256.0
+    rope_theta_full: float = 1_000_000.0     # full-attention layers
+    rope_theta_local: float = 10_000.0       # sliding-attention layers
+    sliding_window_pattern: int = 6          # layer i is full-attn iff (i+1) % 6 == 0
 
-    # RVQ codec
+    # --- RVQ code space (``tts_config``) ---
     num_quantizers: int = 31          # codebooks emitted per audio frame
     codebook_size: int = 1024
-    codec_hidden_size: int = 384
-    codec_latent_size: int = 512
+    code_dim: int = 512               # RVQ latent dim (``latent_size``)
+
+    # --- MoG head (``tts_config.mog_head_config``) ---
+    mog_num_predictions: int = 1024   # mixture components
+    mog_low_rank: int = 64
+    mog_min_log_std: float = -4.0
+    mog_num_layers: int = 3
+    mog_intermediate_size: int = 4608
+    mog_eps: float = 1e-6
 
     sample_rate: int = 22050
-
-    # TODO(verify): talker rope/eps, exact code-frame layout, and how the nano
-    # LLM hidden state conditions the talker — confirm against the NeMo ref.
 
 
 @dataclass
 class ConformerSTTConfig:
-    """Audio-input stage: Fast-Conformer streaming encoder + RNN-T head.
+    """Audio-input stage (``config.json`` -> ``model.stt.model.perception``).
 
-    From Nemotron-Speech-Streaming-En-0.6b. Encodes 16 kHz speech into
-    LLM-space embeddings and emits a streaming user transcription (RNN-T,
-    ``rnnt_vocab_size`` tokens; tokenizer in the base repo's ``rnnt_tokenizer/``).
+    Fast-Conformer streaming encoder + mel preprocessor. Encodes 16 kHz speech
+    into LLM-space embeddings (``output_dim``); the RNN-T head (``RnntConfig``)
+    emits the streaming user transcription.
     """
 
+    # --- encoder (``perception.encoder``) ---
     d_model: int = 1024
     num_heads: int = 8
     num_layers: int = 24
-    feat_in: int = 128               # log-mel bins
-    input_sample_rate: int = 16000
-    rnnt_vocab_size: int = 1024
+    feat_in: int = 128                       # log-mel bins
+    ff_expansion_factor: int = 4
+    conv_kernel_size: int = 9
+    subsampling_conv_channels: int = 256
+    subsampling_factor: int = 8
+    att_context_size: tuple[int, int] = (70, 0)
+    output_dim: int = 4480                   # projection into the nano hidden size
 
-    # 1500-position sliding window (model card). TODO(verify): subsampling
-    # factor, conv kernel sizes, and projection into the nano hidden space.
-    sliding_window: int = 1500
+    # --- mel preprocessor (``perception.preprocessor``) ---
+    sample_rate: int = 16000
+    n_fft: int = 512
+    window_size: float = 0.025               # seconds -> win_length = round(sr*window_size)
+    window_stride: float = 0.01              # seconds -> hop_length = round(sr*window_stride)
+    n_mels: int = 128
+    preemph: float = 0.97
+    mag_power: float = 2.0
+
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.num_heads
+
+    @property
+    def ff_dim(self) -> int:
+        return self.ff_expansion_factor * self.d_model
+
+    @property
+    def win_length(self) -> int:
+        return round(self.sample_rate * self.window_size)
+
+    @property
+    def hop_length(self) -> int:
+        return round(self.sample_rate * self.window_stride)
+
+    @property
+    def subsampling_flat(self) -> int:
+        # Freq after log2(factor) causal stride-2 conv stages (kernel 3, causal
+        # pad k-1 + stride-1): out = in // 2 + 1 per stage (128->65->33->17).
+        import math
+        freq = self.n_mels
+        for _ in range(int(math.log2(self.subsampling_factor))):
+            freq = freq // 2 + 1
+        return self.subsampling_conv_channels * freq
 
 
 @dataclass
@@ -300,5 +348,46 @@ class NemotronDuplexConfig:
             joint_hidden=jc["jointnet"]["joint_hidden"],
             vocab_size=dc["vocab_size"],
             activation=jc["jointnet"]["activation"],
+        )
+
+        tts = raw["model"]["speech_generation"]["model"]["tts_config"]
+        bb, mog = tts["backbone_config"], tts["mog_head_config"]
+        cfg.eartts = EarTTSConfig(
+            hidden_size=bb["hidden_size"],
+            intermediate_size=bb["intermediate_size"],
+            num_hidden_layers=bb["num_hidden_layers"],
+            num_attention_heads=bb["num_attention_heads"],
+            num_key_value_heads=bb["num_key_value_heads"],
+            head_dim=bb["head_dim"],
+            sliding_window=bb["sliding_window"],
+            num_quantizers=tts["num_quantizers"],
+            codebook_size=tts["codebook_size"],
+            code_dim=tts["latent_size"],
+            mog_num_predictions=mog["num_predictions"],
+            mog_low_rank=mog["low_rank"],
+            mog_min_log_std=mog["min_log_std"],
+            mog_num_layers=mog["num_layers"],
+            mog_intermediate_size=mog["intermediate_size"],
+            mog_eps=mog["eps"],
+        )
+
+        enc = raw["model"]["stt"]["model"]["perception"]["encoder"]
+        pre = raw["model"]["stt"]["model"]["perception"]["preprocessor"]
+        cfg.stt = ConformerSTTConfig(
+            d_model=enc["d_model"],
+            num_heads=enc["n_heads"],
+            num_layers=enc["n_layers"],
+            feat_in=enc["feat_in"],
+            ff_expansion_factor=enc["ff_expansion_factor"],
+            conv_kernel_size=enc["conv_kernel_size"],
+            subsampling_conv_channels=enc["subsampling_conv_channels"],
+            subsampling_factor=enc["subsampling_factor"],
+            att_context_size=tuple(enc["att_context_size"]),
+            output_dim=raw["model"]["stt"]["model"]["perception"]["output_dim"],
+            sample_rate=pre["sample_rate"],
+            n_fft=pre["n_fft"],
+            window_size=pre["window_size"],
+            window_stride=pre["window_stride"],
+            n_mels=pre["features"],
         )
         return cfg
