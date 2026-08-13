@@ -78,13 +78,34 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         pos_info: dict[str, PositionInfo] = {},  # noqa: B006 - matches base signature
         **kwargs,
     ) -> ARNodeInputs:
-        # ``combined_embeds`` (fused audio+text) takes precedence over token ids
-        # on the voicechat audio path; the text path supplies ``text_inputs``.
+        # Frame-synchronous decode: AddFusion of one streamed audio frame with the
+        # fed-back previous agent-text + function tokens (the duplex input per frame).
+        if "audio_frame" in inputs:
+            return self._fuse_frame(inputs)
+        # ``combined_embeds`` (pre-fused) or ``text_inputs`` (system-prompt prefill).
         if "combined_embeds" in inputs:
             emb = inputs["combined_embeds"][0]
             return ARNodeInputs(input_embeds=emb, input_seq_len=emb.shape[0])
         ids = inputs["text_inputs"][0]
         return ARNodeInputs(input_ids=ids, input_seq_len=ids.shape[0])
+
+    def _fuse_frame(self, inputs: NameToTensorList) -> ARNodeInputs:
+        cfg = self.config
+        audio = inputs["audio_frame"][0]
+        audio = audio.unsqueeze(0) if audio.dim() == 1 else audio          # (1, H)
+        dev = audio.device
+
+        def _tok(name, default):
+            if name in inputs and inputs[name]:
+                return inputs[name][0].reshape(-1)[:1].to(dev)
+            return torch.tensor([default], device=dev, dtype=torch.long)
+
+        prev_text = _tok("prev_text", cfg.text_bos_id)                     # carry-in BOS
+        prev_func = _tok("prev_func", cfg.text_pad_id)
+        fused = self.embeddings(prev_text) * cfg.agent_text_weight + audio * cfg.user_audio_weight
+        if cfg.use_function_head:
+            fused = fused + self.embeddings(prev_func) * cfg.function_weight
+        return ARNodeInputs(input_embeds=fused, input_seq_len=1)
 
     def preprocess(
         self,
@@ -128,8 +149,17 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             cache_handle=cache_handle,
             mamba_state=self._mamba_state(graph_walk, engine_inputs, seq_lens),
         )
-        logits = self.lm_head(hidden[-1:])
-        return {"logits": [logits]}
+        return self._token_outputs(graph_walk, hidden[-1:], engine_inputs, engine_inputs.request_ids[0])
+
+    def _token_outputs(self, graph_walk, last_hidden, engine_inputs, rid) -> NameToTensorList:
+        """Text logits (engine samples -> new_token) plus, on the frame-synchronous
+        decode walk, the greedily-sampled function token (aux channel) that is fed
+        back into the next frame's AddFusion."""
+        out: NameToTensorList = {"logits": [self.lm_head(last_hidden)]}
+        if graph_walk == "decode" and self.config.use_function_head:
+            func_logits = self.language_model.function_head(last_hidden)
+            out["new_func"] = [engine_inputs.sampler.sample_aux("function", [rid], func_logits)]
+        return out
 
     def forward_batched(
         self,
@@ -158,7 +188,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         result: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(engine_inputs.request_ids):
             last = hidden[ends[i] - 1: ends[i]]              # (1, H) request i's last token
-            result[rid] = {"logits": [self.lm_head(last)]}
+            result[rid] = self._token_outputs(graph_walk, last, engine_inputs, rid)
         return result
 
     def postprocess(
@@ -168,9 +198,12 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs,
     ):
-        # Rebind the sampled token for loop-back routing (metadata only).
+        # Feed the sampled agent-text + function tokens back into the next frame's
+        # AddFusion (the decode-loop loop-back edges prev_text / prev_func).
         if "new_token" in outputs:
-            outputs["text_inputs"] = outputs["new_token"]
+            outputs["prev_text"] = outputs["new_token"]
+        if "new_func" in outputs:
+            outputs["prev_func"] = outputs["new_func"]
 
     def check_stop(
         self,
