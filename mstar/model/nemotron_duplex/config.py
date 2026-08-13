@@ -299,6 +299,21 @@ class NemotronDuplexConfig:
     ignore_eos: bool = False
     max_new_tokens: int = 2048
 
+    # --- duplex fusion (AddFusion, parameter-free) + special tokens ---
+    # Per-channel weights (config.json -> model.stt.model.duplex_*_channel_weight).
+    # fuse_method is absent -> AddFusion: agent_text*w + user_audio*w + function*w.
+    agent_text_weight: float = 1.0
+    user_audio_weight: float = 1.0
+    function_weight: float = 2.0
+    use_function_head: bool = True
+    predict_user_text: bool = False
+    # Text-channel special tokens. TODO(verify) against the nano tokenizer
+    # (base repo ships only rnnt_tokenizer/; the text tokenizer is in the Spark
+    # nano/ folder). Defaults are the nano config's bos/eos/pad.
+    text_pad_id: int = 0
+    text_bos_id: int = 1
+    text_eos_id: int = 12
+
     # convenience passthroughs used by the Model glue
     @property
     def vocab_size(self) -> int:
@@ -390,4 +405,11 @@ class NemotronDuplexConfig:
             window_stride=pre["window_stride"],
             n_mels=pre["features"],
         )
+
+        sm = raw["model"]["stt"]["model"]
+        cfg.agent_text_weight = sm.get("duplex_text_channel_weight", cfg.agent_text_weight)
+        cfg.user_audio_weight = sm.get("duplex_user_channel_weight", cfg.user_audio_weight)
+        cfg.function_weight = sm.get("duplex_function_channel_weight", cfg.function_weight)
+        cfg.use_function_head = sm.get("use_function_head", cfg.use_function_head)
+        cfg.predict_user_text = sm.get("predict_user_text", cfg.predict_user_text)
         return cfg
