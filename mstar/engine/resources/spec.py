@@ -101,3 +101,24 @@ class SamplingReqConfig(ResourceReqConfig):
     def seed(self):
         return self._seed
 
+
+@dataclass
+class KVReqConfig(ResourceReqConfig):
+    # NOTE: this may need to be refined
+    needed_labels: list[str] | None = None
+    needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
+    needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+
+    @property
+    def resource_type(self):
+        return ResourceType.KV_CACHE
+
+    def get_labels(self, node: str, walk: str):
+        if (node, walk) in self.needed_labels_per_node_walk:
+            return self.needed_labels_per_node_walk[(node, walk)]
+        if node in self.needed_labels_per_node:
+            return self.needed_labels_per_node[node]
+        if self.needed_labels is not None:
+            return self.needed_labels
+        return ["main"]
+

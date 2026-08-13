@@ -4,8 +4,9 @@ from typing import Any
 
 import torch
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.step import AdmitOutcome, ResourceStep
 
 
 class Resource(ABC):
@@ -14,6 +15,8 @@ class Resource(ABC):
 	def build(
 		cls, spec: NodeResourceSpec,
 		device: torch.device,
+		parallel_rank: int,
+		world_size: int,
 		**engine_kwargs
 	) -> "Resource":
 		...
@@ -26,16 +29,21 @@ class Resource(ABC):
 	def remove_request(self, rid: str):
 		...
 
-	def admit_retrieve(self, rid: str, published: Any) -> bool:
+	def admit_retrieve(
+		self, rid: str,
+		node_name: str,
+		graph_walk: str,
+		published: "PublishedInfo | None"
+	) -> AdmitOutcome:
 		"""
 		Takes the output of publish, possibly from another device, and kicks
 		of a retrieval if needed (e.g., PD disaggregation KV transfer).
 		Returns whether the retrieve has completed.
 		"""
-		return True
+		return AdmitOutcome(ok=True, ready=True)
 
 	@abstractmethod
-	def admit(self, step: ResourceStep):
+	def admit(self, step: ResourceStep) -> AdmitOutcome:
 		...
 
 	@abstractmethod
@@ -46,6 +54,11 @@ class Resource(ABC):
 	def commit(self, step: ResourceStep) -> None:
 		...
 
+	def publish(self, request_id: str) -> "PublishedInfo" | None:
+		return
+
+
+class PublishedInfo(ABC):
 	@abstractmethod
-	def publish(self, request_id: str) -> object | None:
+	def update(self, other: "PublishedInfo") -> None:
 		...
