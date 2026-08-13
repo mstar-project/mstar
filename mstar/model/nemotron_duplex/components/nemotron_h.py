@@ -89,11 +89,36 @@ class MambaStateAccessor:
 # ---------------------------------------------------------------------------
 
 
+def _rms_fp32(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Llama-style RMSNorm in fp32 (offline path — avoids the bf16 fused kernel)."""
+    dtype = x.dtype
+    x = x.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    return (x * weight.float()).to(dtype)
+
+
 class NemotronHAttention(Attention):
     """GQA self-attention with NoPE (Nemotron-H applies no positional encoding)."""
 
     def _apply_rope(self, q, k, cache_handle):  # noqa: ARG002 - override to disable RoPE
         return q, k
+
+    def offline_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Eager full-sequence causal self-attention for offline inference.
+
+        ``hidden_states``: ``(L, H)`` (single sequence). Mirrors the reference
+        ``NemotronHAttention`` (GQA, NoPE, SDPA default scale, causal).
+        """
+        L = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).view(L, self.num_heads, self.head_dim).transpose(0, 1)
+        k = self.k_proj(hidden_states).view(L, self.num_kv_heads, self.head_dim).transpose(0, 1)
+        v = self.v_proj(hidden_states).view(L, self.num_kv_heads, self.head_dim).transpose(0, 1)
+        n_rep = self.num_heads // self.num_kv_heads
+        k = k.repeat_interleave(n_rep, dim=0)
+        v = v.repeat_interleave(n_rep, dim=0)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (heads, L, hd)
+        out = out.transpose(0, 1).reshape(L, self.num_heads * self.head_dim)
+        return self.o_proj(out)
 
 
 class NemotronHMLP(nn.Module):
@@ -109,17 +134,29 @@ class NemotronHMLP(nn.Module):
 
 
 class _RMSNormGated(nn.Module):
-    """Mamba-2 gated RMSNorm: ``rmsnorm(y * silu(z)) * weight``."""
+    """Mamba-2 gated RMSNorm (grouped): gate, then per-group RMS-normalize.
 
-    def __init__(self, dim: int, eps: float):
+    Matches the reference ``MambaRMSNormGated`` with ``norm_before_gate=False``:
+    ``x = x * silu(z)`` first, then RMS-normalize *within each group* of
+    ``group_size`` channels (group_size = intermediate / n_groups), then scale by
+    the per-channel weight. Computed in fp32.
+    """
+
+    def __init__(self, dim: int, eps: float, group_size: int):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.group_size = group_size
+        self.n_groups = dim // group_size
 
     def forward(self, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        y = y * F.silu(z)
+        dtype = y.dtype
+        y = y.float() * F.silu(z.float())
+        shape = y.shape
+        y = y.reshape(*shape[:-1], self.n_groups, self.group_size)
         y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        return y * self.weight
+        y = y.reshape(shape)
+        return (y * self.weight.float()).to(dtype)
 
 
 class Mamba2Mixer(nn.Module):
@@ -156,7 +193,9 @@ class Mamba2Mixer(nn.Module):
         self.A_log = nn.Parameter(torch.empty(self.nheads))
         self.D = nn.Parameter(torch.empty(self.nheads))
         self.dt_bias = nn.Parameter(torch.empty(self.nheads))
-        self.norm = _RMSNormGated(self.d_inner, eps=config.rms_norm_eps)
+        self.norm = _RMSNormGated(
+            self.d_inner, eps=config.rms_norm_eps, group_size=self.d_inner // self.n_groups
+        )
         self.out_proj = nn.Linear(self.d_inner, config.hidden_size, bias=config.mamba_proj_bias)
 
     # -- helpers ---------------------------------------------------------
@@ -283,6 +322,15 @@ class NemotronHBlock(nn.Module):
         out = self.mixer(normed, cache_handle=cache_handle, mamba_state=mamba_state)
         return residual + out
 
+    def offline_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Engine-free block for offline inference; ``hidden_states`` is ``(L, H)``."""
+        normed = _rms_fp32(hidden_states, self.norm.weight, self.norm.variance_epsilon)
+        if self.kind == "attention":
+            out = self.mixer.offline_forward(normed)
+        else:  # mamba (full-seq scan) / mlp — both run engine-free with no state
+            out = self.mixer(normed, cache_handle=None, mamba_state=None)
+        return hidden_states + out
+
 
 class NemotronHLLM(nn.Module):
     """The ``llm`` container: hybrid layer stack + final norm (no embeddings)."""
@@ -313,6 +361,13 @@ class NemotronHLLM(nn.Module):
         cache_handle.advance_seq_lens()
         return self.norm_f(hidden)
 
+    def offline_forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        """Engine-free full-sequence forward; ``input_embeds`` is ``(L, H)``."""
+        hidden = input_embeds
+        for block in self.layers:
+            hidden = block.offline_forward(hidden)
+        return _rms_fp32(hidden, self.norm_f.weight, self.norm_f.variance_epsilon)
+
 
 class NemotronHForCausalLM(nn.Module):
     def __init__(self, config: NanoConfig):
@@ -331,6 +386,12 @@ class NemotronHForCausalLM(nn.Module):
 
     def forward(self, input_embeds, cache_handle, mamba_state=None) -> torch.Tensor:
         return self.llm(input_embeds, cache_handle=cache_handle, mamba_state=mamba_state)
+
+    def offline_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Full-sequence offline forward: ``input_ids`` (L,) -> logits (L, vocab)."""
+        hidden = self.embed_tokens(input_ids)
+        hidden = self.llm.offline_forward(hidden)
+        return self.lm_head(hidden)
 
     @staticmethod
     def remap(name: str) -> str | None:
