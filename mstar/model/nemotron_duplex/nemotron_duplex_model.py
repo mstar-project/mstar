@@ -91,6 +91,157 @@ def _sample_text_token(
     return sampled
 
 
+class _StreamOutput:
+    """One streaming step's agent output: an int16 PCM audio chunk and/or a text delta."""
+
+    __slots__ = ("audio", "text")
+
+    def __init__(self, audio: bytes | None = None, text: str | None = None):
+        self.audio = audio
+        self.text = text
+
+
+class DuplexStream:
+    """Online (streaming) duplex inference session — the Phase-B/C path.
+
+    Audio is fed in chunks via ``append_audio``; each new ~80 ms perception frame
+    runs one duplex step (fuse -> nano cached-decode step -> sample text/function
+    -> talker frame -> codec frame) and yields agent audio + text deltas. The
+    nano attention-KV + Mamba conv/ssm state and the talker KV state persist
+    across the whole stream (O(1) per frame). Perception is re-encoded over a
+    growing buffer each chunk — correct because the Conformer is causal
+    (att_context [70,0]); a true streaming Conformer cache is a later perf item.
+
+    Produces the SAME result as ``offline_inference`` on the concatenated audio.
+    """
+
+    def __init__(self, model, device: str, voice: str, temperature: float, top_p: float, repetition_penalty: float):
+        self.m = model
+        self.cfg = model.config
+        self.device = device
+        self.voice = voice
+        self.temperature = temperature
+        self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
+        self.special_ids = {self.cfg.text_pad_id, self.cfg.text_bos_id, self.cfg.text_eos_id}
+
+        self.perception = model.get_submodule("conformer_encoder", device=device).perception
+        self.nano = model.get_submodule("nano_llm", device=device).language_model
+        self.talker = model.get_submodule("eartts_talker", device=device).talker
+        self.codec = model.get_submodule("audio_codec", device=device).codec
+
+        # talker char-vocab conditioning maps (built once)
+        tok = model._talker_tokenizer()
+        from mstar.model.nemotron_duplex.components.eartts_talker import build_char_vocab, subword_to_char_ids
+        cv = build_char_vocab(tok)
+        self._s2c, _ = subword_to_char_ids(tok, cv)
+        self._char_pad = len(cv)
+
+        self.reset()
+
+    def reset(self):
+        self._wav = torch.zeros(0)
+        self._processed = 0                    # perception frames already stepped
+        self._nano_cache = None                # nano decode cache (B.1)
+        self._gen_text = []                    # sampled agent text tokens (all frames)
+        self._prev_func = self.cfg.text_pad_id
+        self._talker_state = None
+        self._prev_codes = None
+        self._codes_hist = None                # (1, n, num_q) accumulated RVQ codes
+        self._emitted = 0                      # waveform samples already emitted
+        self._t = 0
+
+    def append_audio(self, pcm_int16: bytes) -> list[_StreamOutput]:
+        chunk = torch.frombuffer(bytearray(pcm_int16), dtype=torch.int16).float() / 32768.0
+        self._wav = torch.cat([self._wav, chunk])
+        return self._step_new_frames()
+
+    def flush(self) -> list[_StreamOutput]:
+        return self._step_new_frames()
+
+    @torch.no_grad()
+    def _step_new_frames(self) -> list[_StreamOutput]:
+        if self._wav.numel() < self.cfg.stt.hop_length:
+            return []
+        sig = self._wav.unsqueeze(0).to(self.device)
+        lens = torch.tensor([self._wav.shape[0]], device=self.device)
+        audio_embeds, _ = self.perception(sig, lens)   # (1, T, H) — causal, re-encoded
+        T = audio_embeds.shape[1]
+        nano, cfg = self.nano, self.cfg
+        embed_tokens = nano.embed_tokens
+        outs: list[_StreamOutput] = []
+
+        for t in range(self._processed, T):
+            prev_text = cfg.text_bos_id if t == 0 else self._gen_text[t - 1]
+            agent_emb = embed_tokens(torch.tensor([prev_text], device=self.device))
+            func_emb = embed_tokens(torch.tensor([self._prev_func], device=self.device))
+            fused = agent_emb * cfg.agent_text_weight + audio_embeds[0, t].unsqueeze(0) * cfg.user_audio_weight
+            if cfg.use_function_head:
+                fused = fused + func_emb * cfg.function_weight   # (1, H) == (L=1, H)
+
+            hidden = self._nano_hidden(fused)           # (1, H)
+            text_logits = nano.lm_head(hidden)          # (1, vocab)
+            func_logits = nano.function_head(hidden)
+            gt = torch.tensor(self._gen_text, device=self.device).view(1, -1)
+            text_tok = int(_sample_text_token(
+                text_logits, gt, len(self._gen_text), self.temperature, self.top_p,
+                self.repetition_penalty, special_ids=self.special_ids,
+            )[0])
+            self._gen_text.append(text_tok)
+            self._prev_func = int(func_logits.argmax(-1)[0])
+
+            outs.append(self._talker_codec_frame(text_tok))
+            self._t += 1
+        self._processed = T
+        return outs
+
+    def _nano_hidden(self, fused: torch.Tensor) -> torch.Tensor:
+        """One nano step with persistent cache (B.1 cached decode; re-prefill fallback)."""
+        if hasattr(self.nano.llm, "decode_step") and hasattr(self.nano.llm, "prefill"):
+            if self._nano_cache is None:
+                h, self._nano_cache = self.nano.llm.prefill(fused)
+                return h[-1:]
+            return self.nano.llm.decode_step(fused, self._nano_cache)
+        # Fallback (pre-B.1): accumulate fused embeds and re-prefill (O(T^2)).
+        self._fused_hist = fused if self._nano_cache is None else torch.cat([self._nano_cache, fused], 0)
+        self._nano_cache = self._fused_hist
+        return self.nano.llm.offline_forward(self._fused_hist)[-1:]
+
+    def _talker_codec_frame(self, text_tok: int) -> _StreamOutput:
+        talker, cfg = self.talker, self.cfg
+        if self._talker_state is None:
+            self._talker_state = talker.init_state(
+                1, speaker=self.voice, device=self.device,
+                subword_id_to_char_ids=self._s2c, char_pad_idx=self._char_pad,
+                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id,
+                speech_pad_id=cfg.eartts.codebook_size,
+            )
+            self._prev_codes = self._talker_state.get("prev_codes")
+            if self._prev_codes is None:
+                self._prev_codes = talker.initial_prev_codes(1, device=self.device)
+        cur = torch.tensor([[text_tok]], device=self.device)
+        mask = torch.ones_like(cur, dtype=torch.bool)
+        cond = talker.text_conditioning(cur, mask, self._s2c, self._char_pad)
+        codes, self._talker_state = talker.infer_codes_one_step(
+            self._talker_state, cur, cur, self._prev_codes, cond=cond,
+            text_eos_id=cfg.text_eos_id, temperature=self.temperature,
+        )
+        self._prev_codes = codes
+        # Codec has a multi-frame (causal) receptive field, so decode the full code
+        # history and emit only the newly-produced tail (matches offline decode).
+        frame = codes.unsqueeze(1)                                      # (1, 1, num_q)
+        self._codes_hist = frame if self._codes_hist is None else torch.cat([self._codes_hist, frame], dim=1)
+        with torch.autocast(device_type="cuda", enabled=False):
+            audio, _ = self.codec.decode(
+                self._codes_hist, torch.tensor([self._codes_hist.shape[1]], device=self.device),
+            )                                                          # (1, 1, samples)
+        wav = audio.squeeze(1)[0]                                       # (samples,)
+        new = wav[self._emitted:]
+        self._emitted = wav.shape[0]
+        pcm = (new.clamp(-1, 1) * 32767).to(torch.int16).cpu().numpy().tobytes()
+        return _StreamOutput(audio=pcm, text=self.m.tokenizer.decode([text_tok]))
+
+
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
     from huggingface_hub import snapshot_download
 
@@ -331,6 +482,22 @@ class NemotronDuplexModel(Model):
         return self.config.eartts.sample_rate
 
     # -------------------------------------------------------------------
+    # Online (streaming) duplex inference — Phase B/C.
+    # -------------------------------------------------------------------
+
+    def prepare_streaming(self, device: str = "cuda"):
+        """Warm (build + load) all four submodules so streaming starts promptly."""
+        for node in ("conformer_encoder", "nano_llm", "eartts_talker", "audio_codec"):
+            self.get_submodule(node, device=device)
+
+    def create_stream(
+        self, device: str = "cuda", voice: str = "Aria",
+        temperature: float = 0.0, top_p: float = 1.0, repetition_penalty: float = 1.0,
+    ) -> DuplexStream:
+        """Open an online duplex streaming session (see ``DuplexStream``)."""
+        return DuplexStream(self, device, voice, temperature, top_p, repetition_penalty)
+
+    # -------------------------------------------------------------------
     # Standalone offline inference (Phase A — mirrors the reference
     # NemotronVoiceChat.offline_inference; bypasses the M* serving engine).
     # -------------------------------------------------------------------
@@ -480,8 +647,9 @@ class NemotronDuplexModel(Model):
         text_stream = gen_text[:, prompt_len:]                 # (1, T') agent text per frame
 
         gen_codes = talker.generate_codes(
-            text_stream, self._talker_tokenizer(),
-            speaker="Aria", temperature=temperature, text_eos_id=self.config.text_eos_id,
+            text_stream, self._talker_tokenizer(), speaker="Aria", temperature=temperature,
+            text_eos_id=self.config.text_eos_id, text_pad_id=self.config.text_pad_id,
+            speech_pad_id=self.config.eartts.codebook_size,   # speech-pad frame == all codebook_size
         )                                                       # (1, T', num_q)
         code_len = torch.tensor([gen_codes.shape[1]], device=device)
         with torch.autocast(device_type="cuda", enabled=False):
