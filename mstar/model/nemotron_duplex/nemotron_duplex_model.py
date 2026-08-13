@@ -374,7 +374,7 @@ class NemotronDuplexModel(Model):
         local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
         cfg = self._json_config(local_dir)
         with torch.device("meta"):
-            perception = Perception()
+            perception = Perception(cfg.stt)
             rnnt_dec, rnnt_joint = RnntDecoder(cfg.rnnt), RnntJoint(cfg.rnnt)
         perception = self._build_and_load(perception, device, autocast_dtype, local_dir)
         rnnt_dec = self._build_and_load(rnnt_dec, device, autocast_dtype, local_dir)
@@ -388,8 +388,9 @@ class NemotronDuplexModel(Model):
         from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
 
         local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        cfg = self._json_config(local_dir)
         with torch.device("meta"):
-            talker = EarTTSTalker(self.config.eartts)
+            talker = EarTTSTalker(cfg.eartts)
         talker = self._build_and_load(talker, device, autocast_dtype, local_dir)
         return EarTTSTalkerSubmodule(talker=talker, config=self.config)
 
