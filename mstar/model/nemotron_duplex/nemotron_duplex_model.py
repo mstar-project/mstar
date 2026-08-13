@@ -513,18 +513,35 @@ class NemotronDuplexModel(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        # Phase 4: when audio is in ``input_modalities``, run the conformer
-        # encoder path to derive ``combined_embeds`` from ``audio_inputs``.
-        if "audio" in input_modalities:
-            raise NotImplementedError("Audio input (conformer encoder) — Phase 4.")
-        if prompt is None:
-            return {}
-        ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0].to(torch.long)
-        return {"text_inputs": [ids]}
+        # Duplex request: raw user audio (-> Encoder partition) plus an optional
+        # system-prompt text that primes the nano cache (prefill_text).
+        out: NameToTensorList = {}
+        if prompt:
+            ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0].to(torch.long)
+            out["text_inputs"] = [ids]
+        if tensors and "audio_features" in tensors:
+            out["audio_features"] = tensors["audio_features"]
+        return out
 
     # -------------------------------------------------------------------
-    # Forward-pass-args state machine (single "default" partition, text path)
+    # Forward-pass-args state machines — one per async partition
+    # (Encoder -> LLM -> Talker -> Codec), mirroring qwen3_omni.
     # -------------------------------------------------------------------
+
+    def _meta(self, imod, omod, walk, is_prefill):
+        return CurrentForwardConductorMetadata(
+            input_modalities=imod, output_modalities=omod, graph_walk=walk, is_prefill=is_prefill,
+        )
+
+    @staticmethod
+    def _stream_exhausted(incoming_connections, edge_name: str) -> bool:
+        """A consumer partition is done once its upstream producer is finished and
+        every streamed token has been consumed."""
+        for c in incoming_connections or []:
+            if getattr(c, "edge_name", None) == edge_name:
+                return bool(getattr(c, "producer_done", False)) and \
+                    getattr(c, "consumed_count", 0) >= getattr(c, "token_count", 0)
+        return False
 
     def get_initial_forward_pass_args(
         self,
@@ -534,21 +551,37 @@ class NemotronDuplexModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill_text",
-            is_prefill=True,
-        )
-        graph_edge = GraphEdge(next_node="nano_llm", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
-        )
+        audio_out = "audio" in output_modalities
+
+        if partition_name == "Encoder":
+            edge = GraphEdge(next_node="conformer_encoder", name="audio_features")
+            edge.tensor_info = input_signals.get("audio_features", [])
+            return ForwardPassArgs(
+                full_metadata=self._meta(input_modalities, output_modalities, "encode", True),
+                inputs=[edge], unpersist_tensors=list(edge.tensor_info), step_metadata={},
+            )
+        if partition_name == "LLM":
+            # System prompt (if any) primes the cache first; else jump straight into
+            # the frame-synchronous decode loop, self-triggered by the audio stream.
+            has_prompt = bool(input_signals.get("text_inputs"))
+            walk = "prefill_text" if has_prompt else "decode"
+            edges = []
+            if has_prompt:
+                e = GraphEdge(next_node="nano_llm", name="text_inputs")
+                e.tensor_info = input_signals.get("text_inputs", [])
+                edges = [e]
+            return ForwardPassArgs(
+                full_metadata=self._meta(input_modalities, output_modalities, walk, has_prompt),
+                inputs=edges, unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
+                step_metadata={"is_prefill": has_prompt},
+            )
+        if partition_name in ("Talker", "Codec"):
+            walk = "talker_decode" if partition_name == "Talker" else "codec_chunk"
+            return ForwardPassArgs(
+                full_metadata=self._meta(input_modalities, output_modalities, walk, False),
+                inputs=[], unpersist_tensors=[], request_done=not audio_out,
+            )
+        raise ValueError(f"Unknown partition: {partition_name!r}")
 
     def get_partition_forward_pass_args(
         self,
@@ -557,29 +590,34 @@ class NemotronDuplexModel(Model):
         persist_signals: dict[str, list[TensorPointerInfo]],
         incoming_connections=None,
     ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
+        m = partition_metadata
 
-        if request_done:
+        if partition_name == "Encoder":                    # runs once, then done producing
+            return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=True)
+
+        if partition_name == "LLM":
+            if m.is_prefill:                               # prefill_text -> decode
+                m.is_prefill = False
+                m.graph_walk = "decode"
+            done = self._stream_exhausted(incoming_connections, "audio_frame")
+            edges = []
+            for name in ("prev_text", "prev_func"):        # fed-back tokens for AddFusion
+                e = GraphEdge(next_node="nano_llm", name=name)
+                e.tensor_info = persist_signals.get(name, [])
+                edges.append(e)
             return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True,
+                full_metadata=m, inputs=edges,
+                unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
+                request_done=done, step_metadata={"is_prefill": False},
             )
 
-        graph_edge = GraphEdge(next_node="nano_llm", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        inputs = [graph_edge]
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": metadata.is_prefill},
-        )
+        if partition_name in ("Talker", "Codec"):          # self-triggered by the upstream stream
+            stream = "new_token" if partition_name == "Talker" else "codec_tokens"
+            return ForwardPassArgs(
+                full_metadata=m, inputs=[], unpersist_tensors=[],
+                request_done=self._stream_exhausted(incoming_connections, stream),
+            )
+        raise ValueError(f"Unknown partition: {partition_name!r}")
 
     # -------------------------------------------------------------------
     # Sampling
