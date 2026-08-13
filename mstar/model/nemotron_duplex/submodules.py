@@ -162,28 +162,34 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
 class ConformerEncoderSubmodule(NodeSubmodule):
     """Fast-Conformer streaming STT encoder (audio in → fused embeds + transcript).
 
-    STATELESS node. Produces ``combined_embeds`` for the nano LLM and a
-    streaming ``transcript_token`` (RNN-T) emitted to the client.
+    STATELESS node. Holds the perception stack plus the RNN-T decoder/joint —
+    all three checkpoint subtrees are loaded (weight loading verified). Produces
+    ``combined_embeds`` for the nano LLM and a streaming ``transcript_token``.
+    Forward is Phase 4 (audio-in).
     """
 
-    def __init__(self, encoder: nn.Module, config: NemotronDuplexConfig):
+    def __init__(self, perception: nn.Module, rnnt_decoder: nn.Module, rnnt_joint: nn.Module,
+                 config: NemotronDuplexConfig):
         super().__init__()
-        self.encoder = encoder
+        self.perception = perception
+        self.rnnt_decoder = rnnt_decoder
+        self.rnnt_joint = rnnt_joint
         self.config = config
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-        raise NotImplementedError("ConformerEncoderSubmodule — Phase 4 (audio-in).")
+        raise NotImplementedError("ConformerEncoderSubmodule.forward — Phase 4 (audio-in).")
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        raise NotImplementedError("ConformerEncoderSubmodule — Phase 4 (audio-in).")
+        raise NotImplementedError("ConformerEncoderSubmodule.forward — Phase 4 (audio-in).")
 
 
 class EarTTSTalkerSubmodule(ARNodeSubmodule):
     """Gemma3-text talker: nano hidden/text → RVQ codec codes (autoregressive).
 
     KV_CACHE node. Emits ``num_quantizers`` codebooks per frame; the extra
-    codebooks (1..N-1) sample from a ``code_predictor`` aux sampling config
-    (see Model.get_aux_sampling_configs), mirroring Qwen3-Omni's Talker.
+    codebooks sample from a ``code_predictor`` aux config (see
+    Model.get_aux_sampling_configs), mirroring Qwen3-Omni's Talker. Weights
+    loaded (verified); forward is Phase 5 (audio-out).
     """
 
     def __init__(self, talker: nn.Module, config: NemotronDuplexConfig):
@@ -192,17 +198,20 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         self.config = config
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, seen_token_mask=None, pos_info={}, **kwargs):  # noqa: B006
-        raise NotImplementedError("EarTTSTalkerSubmodule — Phase 5 (audio-out).")
+        raise NotImplementedError("EarTTSTalkerSubmodule.forward — Phase 5 (audio-out).")
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
-        raise NotImplementedError("EarTTSTalkerSubmodule — Phase 5 (audio-out).")
+        raise NotImplementedError("EarTTSTalkerSubmodule.forward — Phase 5 (audio-out).")
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        raise NotImplementedError("EarTTSTalkerSubmodule — Phase 5 (audio-out).")
+        raise NotImplementedError("EarTTSTalkerSubmodule.forward — Phase 5 (audio-out).")
 
 
 class AudioCodecDecoderSubmodule(NodeSubmodule):
-    """RVQ codec decoder: talker codes → 22.05 kHz PCM (sliding-window stream)."""
+    """RVQ codec decoder: talker codes → 22.05 kHz PCM (sliding-window stream).
+
+    Weights loaded (verified); forward is Phase 5 (audio-out).
+    """
 
     def __init__(self, codec: nn.Module, config: NemotronDuplexConfig):
         super().__init__()
@@ -213,7 +222,7 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         return "audio_codec"
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-        raise NotImplementedError("AudioCodecDecoderSubmodule — Phase 5 (audio-out).")
+        raise NotImplementedError("AudioCodecDecoderSubmodule.forward — Phase 5 (audio-out).")
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        raise NotImplementedError("AudioCodecDecoderSubmodule — Phase 5 (audio-out).")
+        raise NotImplementedError("AudioCodecDecoderSubmodule.forward — Phase 5 (audio-out).")
