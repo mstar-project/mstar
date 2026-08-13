@@ -525,6 +525,12 @@ class NemotronDuplexModel(Model):
             wav = tensors.get("audio_inputs") or tensors.get("audio_features")
             if wav:
                 out["audio_features"] = wav
+        # Seed the first decode frame's fed-back tokens (BOS / PAD): the decode-loop
+        # node requires prev_text + prev_func, but frame 0 has no prior sampled token,
+        # so without a seed it never becomes ready (the hang). [UNVERIFIED — pending a
+        # live GPU run; see E5_RESUME.md.]
+        out["prev_text"] = [torch.tensor([self.config.text_bos_id], dtype=torch.long)]
+        out["prev_func"] = [torch.tensor([self.config.text_pad_id], dtype=torch.long)]
         return out
 
     def load_audio(self, filepath: str, device: str):
@@ -532,6 +538,7 @@ class NemotronDuplexModel(Model):
         torchcodec, whose native libs aren't always available). Returns the same
         ``TensorAndMetadata`` shape the data worker expects."""
         import soundfile as sf
+
         from mstar.model.base import TensorAndMetadata
 
         data, sr = sf.read(filepath, dtype="float32")
@@ -592,6 +599,14 @@ class NemotronDuplexModel(Model):
                 e = GraphEdge(next_node="nano_llm", name="text_inputs")
                 e.tensor_info = input_signals.get("text_inputs", [])
                 edges = [e]
+            else:
+                # Audio-only: start the decode loop directly, seeding frame 0's fed-back
+                # prev_text / prev_func so the node's input_names are satisfied on the
+                # first iteration (later iterations get them from the loop-back edges).
+                for name in ("prev_text", "prev_func"):
+                    e = GraphEdge(next_node="nano_llm", name=name)
+                    e.tensor_info = input_signals.get(name, [])
+                    edges.append(e)
             return ForwardPassArgs(
                 full_metadata=self._meta(input_modalities, output_modalities, walk, has_prompt),
                 inputs=edges, unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
