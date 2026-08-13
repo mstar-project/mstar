@@ -631,29 +631,83 @@ class EarTTSTalker(nn.Module):
         return code
 
     @torch.no_grad()
-    def init_state(self, batch_size: int, speaker: str = "Aria", device=None, dtype=None) -> dict:
-        """Warm up the autoregressive KV cache from a pre-baked speaker prompt.
+    def init_state(
+        self,
+        batch_size: int,
+        speaker: str = "Aria",
+        device=None,
+        dtype=None,
+        subword_id_to_char_ids: dict | None = None,
+        char_pad_idx: int | None = None,
+        text_pad_id: int | None = None,
+        text_eos_id: int | None = None,
+        speech_pad_id: int | None = None,
+    ) -> dict:
+        """Warm up the autoregressive KV cache from a pre-baked speaker prompt,
+        replicating the NeMo ``set_init_inputs(speaker_name=...)`` -> warmup path.
 
-        Uses the cached ``audio_prompt_latents[speaker]`` [1, P, H] as the
-        pre-BOS audio-prompt frames (already in model hidden space), adds
-        ``bos_emb`` to the final prompt frame to mark the generation boundary,
-        runs the block through the gated fusion (zero text conditioning) and the
-        backbone, and returns the populated per-layer cache plus the next
-        absolute position. NOTE: this is a self-contained faithful setup — it
-        uses the pre-baked latent directly rather than re-encoding prompt audio
-        with the codec, and omits any text/system-prompt prefix.
+        The prompt is ``P`` frames (``P == len(audio_prompt_latents[speaker])``,
+        37 for Aria). The reference builds a silent-carrier audio prompt whose
+        codec codes are all the codec-silence frame; the pre-baked latent then
+        *replaces* the code embedding at every pre-BOS position, so no codec
+        encode is needed. The layout of the ``P`` warmup positions is:
+
+          * positions ``0 .. P-2``: the audio-prompt latent frames (pre-BOS);
+          * position ``P-1`` (the BOS frame): ``embed_code(depthsum(silence))``
+            (the shifted last silence code) ``+ bos_emb``.
+
+        Text conditioning during warmup is the shifted prompt text — pad tokens
+        with the trailing EOS — active only on the last two positions
+        (``subword_mask`` = ``[.., P-2, P-1]``), matching the reference.
+
+        When the token-id args (``text_pad_id`` / ``text_eos_id`` /
+        ``speech_pad_id``) and char maps are supplied, the warmup is exact and
+        the returned ``prev_codes`` is the ``speech_pad`` frame the reference
+        carries in. Otherwise a simplified latent-only warmup is used (BOS added
+        to the last latent frame, zero text conditioning) and ``prev_codes``
+        falls back to the codec-silence frame.
         """
         latent = self.audio_prompt_latents[speaker]
         if device is not None:
             latent = latent.to(device)
         if dtype is not None:
             latent = latent.to(dtype)
-        prompt = latent.expand(batch_size, -1, -1).clone()                  # [B, P, H]
-        prompt[:, -1] = prompt[:, -1] + self.bos_emb.to(prompt)
-        cond = prompt.new_zeros((1, 1, self.config.hidden_size))
-        inputs_embeds = self.gated_fusion_audio_text(prompt, cond)
+        b = batch_size
+        h = self.config.hidden_size
+        p = latent.shape[1]
+        latent = latent.expand(b, -1, -1)
+        dev = latent.device
+
+        faithful = (
+            subword_id_to_char_ids is not None
+            and char_pad_idx is not None
+            and text_pad_id is not None
+            and text_eos_id is not None
+            and speech_pad_id is not None
+        )
+
+        if faithful:
+            # position P-1 code embed: embed_code(depthsum(last silence code)).
+            silence = self.codec_silence_tokens.to(dev).view(1, 1, -1).expand(b, 1, -1)
+            bos_frame = self.embed_code(self.depthsum_embedding(silence)) + self.bos_emb.to(latent)
+            code_embeds = torch.cat([latent[:, : p - 1], bos_frame], dim=1)     # [B, P, H]
+
+            # warmup text: [pad ... pad, eos] with mask on the last two positions.
+            subword_ids = torch.full((b, p), int(text_pad_id), dtype=torch.long, device=dev)
+            subword_ids[:, p - 1] = int(text_eos_id)
+            subword_mask = torch.zeros((b, p), dtype=torch.bool, device=dev)
+            subword_mask[:, p - 2:] = True
+            cond = self.text_conditioning(subword_ids, subword_mask, subword_id_to_char_ids, char_pad_idx)
+            prev_codes = torch.full((b, self.config.num_quantizers), int(speech_pad_id), dtype=torch.long, device=dev)
+        else:
+            code_embeds = latent.clone()
+            code_embeds[:, -1] = code_embeds[:, -1] + self.bos_emb.to(latent)
+            cond = latent.new_zeros((1, 1, h))
+            prev_codes = self.initial_prev_codes(b, device=dev)
+
+        inputs_embeds = self.gated_fusion_audio_text(code_embeds, cond)
         _, cache = self.backbone_forward(inputs_embeds, start_pos=0, kv_cache=None, return_cache=True)
-        return {"kv": cache, "pos": prompt.shape[1]}
+        return {"kv": cache, "pos": p, "prev_codes": prev_codes}
 
     def initial_prev_codes(self, batch_size: int, device=None) -> torch.Tensor:
         """The frame-0 ``prev_codes`` [B, num_quantizers]: the codec silence
@@ -801,6 +855,8 @@ class EarTTSTalker(nn.Module):
         temperature: float = 0.0,
         num_iter: int = 8,
         text_eos_id: int | None = None,
+        text_pad_id: int | None = None,
+        speech_pad_id: int | None = None,
         prev_codes: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
@@ -812,6 +868,10 @@ class EarTTSTalker(nn.Module):
         text conditioning from the current subword id and runs one
         ``infer_codes_one_step`` (greedy + deterministic by default). If
         ``text_eos_id`` is given, an EOS text token forces a codec-silence frame.
+
+        Passing ``text_pad_id`` / ``text_eos_id`` / ``speech_pad_id`` enables the
+        exact NeMo warmup (see ``init_state``); otherwise the simplified
+        latent-only warmup is used.
         """
         b, t = subword_stream.shape
         device = subword_stream.device
@@ -820,9 +880,15 @@ class EarTTSTalker(nn.Module):
         s2c, _ = subword_to_char_ids(tokenizer, char_vocab)
         char_pad_idx = len(char_vocab)
 
-        state = self.init_state(b, speaker=speaker, device=device, dtype=dtype)
+        state = self.init_state(
+            b, speaker=speaker, device=device, dtype=dtype,
+            subword_id_to_char_ids=s2c, char_pad_idx=char_pad_idx,
+            text_pad_id=text_pad_id, text_eos_id=text_eos_id, speech_pad_id=speech_pad_id,
+        )
         if prev_codes is None:
-            prev_codes = self.initial_prev_codes(b, device=device)
+            prev_codes = state.get("prev_codes")
+            if prev_codes is None:
+                prev_codes = self.initial_prev_codes(b, device=device)
 
         all_codes = []
         for i in range(t):
