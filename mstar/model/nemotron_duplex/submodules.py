@@ -59,11 +59,14 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    def _mamba_state(self, graph_walk: str, engine_inputs: ModelInputsFromEngine) -> MambaStateAccessor:
+    def _mamba_state(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, seq_lens: list | None = None,
+    ) -> MambaStateAccessor:
         return MambaStateAccessor(
             request_states=engine_inputs.per_request_states or {},
             request_ids=list(engine_inputs.request_ids),
             is_prefill=graph_walk in PREFILL_WALKS,
+            seq_lens=seq_lens,
         )
 
     def prepare_inputs(
@@ -95,12 +98,17 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         # apply no positional encoding).
         cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
 
-        out: dict[str, torch.Tensor | Any] = {}
+        out: dict[str, torch.Tensor | Any] = {"seq_lens": seq_lens}
         if inputs[0].input_embeds is not None:
             out["input_embeds"] = torch.cat([inp.input_embeds for inp in inputs], dim=0)
         else:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
         return out
+
+    def can_batch(self, batch, model_inputs) -> bool:
+        # Eager (disable_torch_compile) batched decode/prefill: attention batches via
+        # the paged-KV pool, Mamba conv/ssm state via the per-request MambaStateAccessor.
+        return len(model_inputs) > 1
 
     def forward(
         self,
@@ -108,6 +116,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
+        seq_lens: list | None = None,
         **kwargs,
     ) -> NameToTensorList:
         cache_handle = engine_inputs.cache_manager
@@ -116,10 +125,40 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         hidden = self.language_model(
             input_embeds,
             cache_handle=cache_handle,
-            mamba_state=self._mamba_state(graph_walk, engine_inputs),
+            mamba_state=self._mamba_state(graph_walk, engine_inputs, seq_lens),
         )
         logits = self.lm_head(hidden[-1:])
         return {"logits": [logits]}
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
+        seq_lens: list | None = None,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        """One fused forward advancing every request in the batch. Attention uses the
+        planned paged-KV layout; Mamba conv/ssm state is stepped per request from the
+        packed rows (see ``Mamba2Mixer.forward`` / ``MambaStateAccessor``). Per-request
+        next-token logits are read at each request's last packed position."""
+        import itertools
+
+        cache_handle = engine_inputs.cache_manager
+        if input_embeds is None:
+            input_embeds = self.embeddings(input_ids)
+        hidden = self.language_model(
+            input_embeds,
+            cache_handle=cache_handle,
+            mamba_state=self._mamba_state(graph_walk, engine_inputs, seq_lens),
+        )
+        ends = list(itertools.accumulate(seq_lens))          # last index+1 per request
+        result: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(engine_inputs.request_ids):
+            last = hidden[ends[i] - 1: ends[i]]              # (1, H) request i's last token
+            result[rid] = {"logits": [self.lm_head(last)]}
+        return result
 
     def postprocess(
         self,
