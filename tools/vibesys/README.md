@@ -9,8 +9,10 @@ directory.
 
 It is a **registry of task types** over shared machinery. Adding a task type is a
 new module under `tasks/`; `core/` does not change. The first (and currently
-only) task type is **`add-model`**: port a new model into mstar under a
-correctness gate, then optimize its serving.
+only) task type is **`add-model`**: implement a new model natively in mstar
+(submodule nodes, walk graph, engine types, weight loading — not a wrapper around
+the upstream pipeline), verified against the reference implementation, at
+reasonable performance.
 
 ## Quickstart
 
@@ -50,12 +52,14 @@ tools/vibesys/
     └── add_model/
         ├── task.py        # AddModelTask: spec parsing, bundle render, seed files, vibesys wiring
         ├── templates/     # rendered per instance:
-        │   ├── OBJECTIVE.md.tmpl    #   the goal + correctness contract (→ bundle)
-        │   ├── checker.py.tmpl      #   accuracy gate (→ bundle vibeval/)
-        │   ├── benchmark.py.tmpl    #   perf driver (→ bundle vibeval/)
+        │   ├── OBJECTIVE.md.tmpl    #   implement-it-yourself contract (→ bundle)
         │   ├── reference.py.tmpl    #   generic oracle stub (→ bundle vibeval/)
         │   ├── config.yaml.tmpl     #   starter mstar config (→ workspace-seed)
-        │   └── run.sh.tmpl          #   launch contract: `uv run mstar-serve … --tensor-comm-protocol SHM`
+        │   ├── run.sh.tmpl          #   launch contract (uv run mstar-serve … SHM)
+        │   ├── serve_and_eval.sh.tmpl  # brings the server up for the official gate
+        │   └── modalities/<modality>/  # MODALITY-specific eval (selected by spec.modality)
+        │       ├── checker.py.tmpl  #     e.g. video_generation: SSIM vs the reference
+        │       └── benchmark.py.tmpl
         └── instances/          # per-model inputs; real <model>.* are gitignored (local)
             ├── example.toml           # tracked template: the per-model spec
             └── example.reference.py    # tracked template: the optional oracle override
@@ -136,18 +140,21 @@ not carry across separate runs (only within a run, or via `--resume`).
 
 ## The `add-model` task
 
-### What you provide per model
-
-Two files under `instances/` (both gitignored — copy the tracked `example.*`):
+The agent must **implement the model natively** in mstar (submodule nodes, walk
+graph, engine types, weight loading) — *not* wrap the upstream pipeline. The task
+is described by client-facing **modalities** (input/output), never by walks
+(those are the agent's internal design). You provide two gitignored files under
+`instances/` (copy the tracked `example.*`):
 
 - **`<model>.toml`** — the declarative spec (below). Required.
-- **`<model>.reference.py`** — the oracle + server I/O hooks (`sample_input`,
-  `to_request`, `from_response`, `oracle`). Optional but needed for `strict`;
-  overrides `templates/reference.py.tmpl`.
+- **`<model>.reference.py`** — the oracle + client I/O hooks (`sample_input`,
+  `to_request`, `from_response`, `load`, `oracle`). Needed for the default
+  `strict` gate; overrides `templates/reference.py.tmpl`. The oracle is the
+  independent *upstream* model — it must not reuse the candidate's mstar code.
 
-`checker.py` and `benchmark.py` are **generic** — rendered from the toml and
-driven by the reference hooks, identical for every model — so you don't write
-them (there's no per-instance override for those yet).
+`checker.py` / `benchmark.py` are **modality-specific** (from
+`templates/modalities/<modality>/`, selected by `spec.modality`) and reused
+across models of that modality; the model specifics live in `reference.py`.
 
 ### Instance spec (`tasks/add_model/instances/<model>.toml`)
 
@@ -157,36 +164,33 @@ See `example.toml` for the tracked template.
 [model]
 name = "lingbot"
 hf_id = "robbyant/lingbot-video-dense-1.3b"
-revision = ""
-reference_model = "wan22"          # closest mstar model to copy from
+reference_model = "wan22"           # mstar model to copy STRUCTURE from
 served_model_name = "lingbot"
 endpoint = "/v1/videos/generations"
-port = 8000
-modality = "video_generation"      # vibesys --modality
-accuracy_mode = "smoke"            # smoke (valid output) | strict (numeric vs oracle)
+modality = "video_generation"       # selects the vibeval templates + vibesys --modality
+input_modalities = ["text"]         # client-facing — what the walks are is up to the agent
+output_modalities = ["video"]
+accuracy_mode = "strict"            # strict (fidelity vs oracle) | smoke (validity only)
+
+[accuracy]
+compare = "ssim"                    # output-level metric: ssim | audio_mse | cosine | ...
+tol = 0.2
 
 [headline]
-metric = "latency_p50_ms"
-walk = "t2v_generate"
+metric = "latency_p50_ms"           # reasonable-latency target (not an optimization goal)
 result_arg = "--output-json"
-
-[[walk]]                           # one per observable Walk; compare ∈
-name = "t2v_generate"              # {exact_tokens, logit_kl, cosine, audio_mse, ssim}
-kind = "generative"
-compare = "ssim"
-tol = 0.25
 ```
 
-- **`<model>.reference.py`** (optional) replaces `reference.py.tmpl` with a
-  concrete oracle. It holds *all* model-specific logic — `sample_input`,
-  `to_request` (how to ask the mstar server), `from_response` (parse candidate
-  output), and `oracle` (the reference ground truth for strict mode). The
-  generic `checker.py`/`benchmark.py` drive it, so they never change per model.
-- **`accuracy_mode`**: `smoke` asserts a valid, non-empty response (fast bring-up);
-  `strict` additionally compares to the oracle under the per-walk tolerance.
+- **Goal = correct implementation at reasonable perf, then stop** — the objective
+  tells the agent this is not a latency-optimization task.
+- **`accuracy_mode`**: `strict` (default) compares the served output to the
+  reference oracle via `compare`/`tol`; `smoke` only asserts a valid non-empty
+  response (fast bring-up). The strict checker runs in the candidate env
+  (`uv run --extra <model>`) so it can execute the oracle.
 - **Weights** load through mstar's `HF_MODELS` mapping. Under `--docker` they are
   bind-mounted at `/model`; the shared `HF_HOME` (`.vibesys/hf_cache`) means the
   checkpoint downloads once and is reused.
+- **New modality?** Add `templates/modalities/<modality>/{checker,benchmark}.py.tmpl`.
 
 ### Adding a new task type
 
