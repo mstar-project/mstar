@@ -519,9 +519,29 @@ class NemotronDuplexModel(Model):
         if prompt:
             ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0].to(torch.long)
             out["text_inputs"] = [ids]
-        if tensors and "audio_features" in tensors:
-            out["audio_features"] = tensors["audio_features"]
+        # The data worker loads audio files under ``audio_inputs`` (f"{modality}_inputs");
+        # expose them as ``audio_features`` — the conformer_encoder node's input.
+        if tensors:
+            wav = tensors.get("audio_inputs") or tensors.get("audio_features")
+            if wav:
+                out["audio_features"] = wav
         return out
+
+    def load_audio(self, filepath: str, device: str):
+        """Decode an uploaded audio file to 16 kHz mono via soundfile (the base uses
+        torchcodec, whose native libs aren't always available). Returns the same
+        ``TensorAndMetadata`` shape the data worker expects."""
+        import soundfile as sf
+        from mstar.model.base import TensorAndMetadata
+
+        data, sr = sf.read(filepath, dtype="float32")
+        audio = torch.from_numpy(data)
+        if audio.dim() == 2:                       # stereo -> mono
+            audio = audio.mean(dim=-1)
+        if sr != 16000:
+            import torchaudio.functional as AF
+            audio = AF.resample(audio, sr, 16000)
+        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     # -------------------------------------------------------------------
     # Forward-pass-args state machines — one per async partition
@@ -552,6 +572,8 @@ class NemotronDuplexModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         audio_out = "audio" in output_modalities
+        logger.warning("NDTRACE initial_fpa partition=%s signals=%s audio_out=%s",
+                       partition_name, list(input_signals.keys()), audio_out)
 
         if partition_name == "Encoder":
             edge = GraphEdge(next_node="conformer_encoder", name="audio_features")
@@ -591,6 +613,8 @@ class NemotronDuplexModel(Model):
         incoming_connections=None,
     ) -> ForwardPassArgs:
         m = partition_metadata
+        logger.warning("NDTRACE partition_fpa partition=%s walk=%s is_prefill=%s",
+                       partition_name, m.graph_walk, m.is_prefill)
 
         if partition_name == "Encoder":                    # runs once, then done producing
             return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=True)
