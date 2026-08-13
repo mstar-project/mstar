@@ -65,15 +65,29 @@ class NemotronDuplexModel(Model):
 
     @property
     def tokenizer(self):
-        # TODO(verify): confirm the text tokenizer source. The Spark repo ships
-        # it under ``nano/``; the base repo ships only ``rnnt_tokenizer/`` (the
-        # ASR head). Loaded lazily so dummy-mode tests never touch the network.
+        # The text tokenizer lives in the Spark repo's ``nano/`` folder (the base
+        # repo ships only ``rnnt_tokenizer/``). 131072-token vocab; 256 single-
+        # char tokens -> the talker's char vocab. Loaded lazily.
         if self._tokenizer is None:
+            import os
+
+            from huggingface_hub import hf_hub_download
             from transformers import AutoTokenizer
 
-            src = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
-            self._tokenizer = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
+            repo = "pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark"
+            local_dir = None
+            for f in ("nano/tokenizer.json", "nano/tokenizer_config.json", "nano/special_tokens_map.json"):
+                local_dir = os.path.dirname(hf_hub_download(repo, f, cache_dir=self.cache_dir))
+            self._tokenizer = AutoTokenizer.from_pretrained(local_dir, trust_remote_code=True)
         return self._tokenizer
+
+    def _talker_tokenizer(self):
+        """Adapter exposing the NeMo-tokenizer interface (``.tokenizer.vocab`` /
+        ``.vocab``) the talker's char-vocab builder expects, over the HF tokenizer."""
+        import types
+
+        v = self.tokenizer.get_vocab()
+        return types.SimpleNamespace(tokenizer=types.SimpleNamespace(vocab=v), vocab=v)
 
     # -------------------------------------------------------------------
     # KV cache config — nano_llm (attention layers only) + eartts_talker
@@ -364,29 +378,16 @@ class NemotronDuplexModel(Model):
         return result
 
     def _decode_audio_path(self, gen_text, prompt_len, device, temperature):
-        """Talker (autoregressive RVQ codes) -> codec (waveform). Talker sampling
-        loop is being finalised in EarTTSTalker.infer_codes_one_step."""
+        """Talker (autoregressive RVQ codes with char-vocab text conditioning) ->
+        codec (waveform)."""
         talker = self.get_submodule("eartts_talker", device=device).talker
         codec = self.get_submodule("audio_codec", device=device).codec
         text_stream = gen_text[:, prompt_len:]                 # (1, T') agent text per frame
-        num_q = self.config.eartts.num_quantizers
 
-        if not hasattr(talker, "infer_codes_one_step"):
-            return {}  # talker sampling loop not yet available
-
-        state = talker.init_state(batch_size=text_stream.shape[0], device=device)
-        codes = []
-        prev_codes = None
-        prev_subword = text_stream[:, 0:1]
-        for t in range(text_stream.shape[1]):
-            cur_subword = text_stream[:, t : t + 1]
-            frame_codes, state = talker.infer_codes_one_step(
-                state, cur_subword, prev_subword, prev_codes, temperature=temperature,
-            )
-            codes.append(frame_codes)
-            prev_codes, prev_subword = frame_codes, cur_subword
-        gen_codes = torch.stack(codes, dim=1)                  # (1, T', num_q)
-        assert gen_codes.shape[-1] == num_q
+        gen_codes = talker.generate_codes(
+            text_stream, self._talker_tokenizer(),
+            speaker="Aria", temperature=temperature, text_eos_id=self.config.text_eos_id,
+        )                                                       # (1, T', num_q)
         code_len = torch.tensor([gen_codes.shape[1]], device=device)
         with torch.autocast(device_type="cuda", enabled=False):
             audio, audio_len = codec.decode(gen_codes, code_len)
