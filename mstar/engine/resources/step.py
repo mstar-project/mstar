@@ -1,8 +1,10 @@
 
+from collections.abc import KeysView
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -48,7 +50,7 @@ class StepContext:
     graph_walk: str
     slot: int
     capture: bool
-    # will get populated with the output of plan as previous steps 
+    # will get populated with the output of plan as previous steps
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
     slot_lease: SlotLease | None = None
@@ -61,7 +63,40 @@ class SubmoduleStep:
     segments: tuple[Segment, ...] # authoritative ordering
     steps: dict[str, ResourceStep] # resource key -> step within cumulative
 
-    def get(self, key: str) -> ResourceStep | None: ...
+    def get(self, key: str) -> ResourceStep | None:
+        return self.steps.get(key)
+
+    def keys(self) -> KeysView[str]:
+        return self.steps.keys()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.steps
+
+    def segments_for(self, key: str) -> tuple[Segment, ...]:
+        """segments covered by one resource's step
+
+        `segments=None` means whole batch layout"""
+        step = self.steps.get(key)
+        if step is None or step.segments is None:
+            return self.segments
+        return step.segments
+
+    def validate(self) -> None:
+        """assert each resource step's sgement are order preserving
+        subsequence of total batch layout
+
+        strictly debug; to ensure no reordering occurss"""
+        for key, step in self.steps.items():
+            if step.segments is None:
+                continue
+            it = iter(self.segments)
+            for segment in step.segments:
+                if not any(candidate == segment for candidate in it):
+                    raise ValueError(
+                        f"resource step {key!r} declares segment {segment} "
+                        "which is not an order-preserving subsequence of the "
+                        f"batch layout {self.segments}"
+                    )
 
 
 """perhaaps move below to distinct files/location per resource kind"""
@@ -69,7 +104,7 @@ class SubmoduleStep:
 @dataclass(frozen=True)
 class KVStep(ResourceStep):
     # write: bool # @nsagan: opting to remove this for now bc it's dead code
-    commit: bool
+    commit: bool = True
 
     # e.g., for batched CFG
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
@@ -79,19 +114,19 @@ class KVStep(ResourceStep):
 
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
-    causal: bool
-    batched_key: str | None
+    causal: bool = True
+    batched_key: str | None = None
 
 
 @dataclass(frozen=True)
 class PositionStep(ResourceStep):
-    pos_ids: torch.Tensor | None
-    advance: tuple[int, ...]
+    pos_ids: torch.Tensor | None = None  # None = derive from counters
+    advance: tuple[int, ...] | None = None  # None = each segment's span
 
 
 @dataclass(frozen=True)
 class SamplerStep(ResourceStep):
-    apply_penalty: bool
+    apply_penalty: bool = True
 
 
 @dataclass

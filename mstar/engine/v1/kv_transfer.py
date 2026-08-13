@@ -1,14 +1,30 @@
+"""KV transfer: moving one request's pages between engines.
+
+``mstar.communication.tensors`` is imported lazily, inside the two places
+that genuinely need it at runtime (the transfer-engine ``isinstance``
+dispatch and the Mooncake read). It pulls in the conductor and the
+sampling kernels behind it, and this module is otherwise free of both —
+keeping the import deferred is what lets the KV layer be built and tested
+without a GPU toolchain present.
+"""
+
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-from mstar.communication.tensors import LocalTransferEngine, MooncakeTransferEngine, TensorTransferEngine, TransferReadInfo
-from mstar.conductor.request_info import SequenceInfo
 from mstar.engine.v1.kv_cache import KVCache, KVLayout
+
+if TYPE_CHECKING:
+    from mstar.communication.tensors import (
+        MooncakeTransferEngine,
+        TensorTransferEngine,
+    )
 
 
 
@@ -79,6 +95,8 @@ class MooncakeKVTransferEngine(KVTransferEngine):
             f"remote KV layout {remote_kv_info.layout} != "
             f"local layout {self._kv_cache.layout}"
         )
+        from mstar.communication.tensors import TransferReadInfo
+
         mooncake_read_info: list[TransferReadInfo] = []
         for info in read_info:
             local_ptrs, nbytes = self._kv_cache.chunk_ptrs(
@@ -234,6 +252,11 @@ class KVTransferManager:
         self, transfer_engine_info: TransferEngineInfo,
         kv_cache: KVCache
     ):
+        from mstar.communication.tensors import (
+            LocalTransferEngine,
+            MooncakeTransferEngine,
+        )
+
         self._page_size = kv_cache.page_size
         self._num_layers = kv_cache.num_layers
 
@@ -303,8 +326,8 @@ class KVTransferManager:
             remote_kv_info=kv_transfer_info,
             read_info=read_info
         )
-        
-    
+
+
     def get_kv_transfer_info(self):
         """Descriptor another process needs to read this cache remotely.
         ``KVCachePool.publish`` stamps it onto every ``SequenceInfo``."""

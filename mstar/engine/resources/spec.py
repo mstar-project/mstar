@@ -13,16 +13,13 @@ from enum import IntEnum
 
 import torch
 
-from mstar.engine.kv_store import KVCacheConfig
-from mstar.utils.sampling import SamplingConfig
-
 
 class ResourceType(IntEnum):
     KV_CACHE = 0
     SCRATCH_KV = 1
     SAMPLER = 2
     ATTENTION = 3
-    
+
 
 @dataclass(frozen=True)
 class ScratchKVSpec:

@@ -8,12 +8,11 @@ from typing import Any
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.kv_store import TransferEngineInfo
 from mstar.engine.resources.base import PublishedInfo, Resource
 from mstar.engine.resources.spec import KVReqConfig
 from mstar.engine.resources.step import AdmitOutcome, AllocationFailed, KVStep, Segment, StepContext
 from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec
-from mstar.engine.v1.kv_transfer import KVTransferManager
+from mstar.engine.v1.kv_transfer import KVTransferManager, TransferEngineInfo
 
 
 class PageAllocator:
@@ -189,8 +188,7 @@ class KVManager(Resource):
     def build(
         cls, spec: KVSpec,
         device: torch.device,
-        parallel_rank: int,
-        world_size: int,
+        comm_group: CommGroup | None,
         transfer_engine_info: TransferEngineInfo,
         dtype=torch.bfloat16,
         **kwargs
@@ -198,8 +196,7 @@ class KVManager(Resource):
         return cls(
             cfg=spec.config,
             device=device,
-            parallel_rank=parallel_rank,
-            world_size=world_size,
+            comm_group=comm_group,
             transfer_engine_info=transfer_engine_info,
             dtype=dtype
         )

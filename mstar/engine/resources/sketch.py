@@ -59,7 +59,7 @@ the bottom of this file.
 #
 # self.attn / self.rope resolve once at load from node_resources[key].
 # (slot is iffy here; see H.)
-# 
+#
 # NOTE @nsagan: I had envisioned the attn, rope, sampler, etc. being passed in through
 # the ModelInputsFromEngine as a dict[str, Resource] instead of having the submodule
 # hold a reference to the resource---I think it works either way and this _would_ mean
@@ -122,8 +122,8 @@ the bottom of this file.
 #     kv.plan(step["kv"])                          -> views
 #     rope.plan(step["rope"], deps={"kv": views})  -> pos_ids + advance
 #     attn.plan(step["attn"], deps={"kv": views})  -> indptrs, planned wrapper
-# 
-# NOTE @nsagan: we need to figure out how this intercts with the 
+#
+# NOTE @nsagan: we need to figure out how this intercts with the
 # speculatve pre-planning. Tentative notes below:
 # I. Current Implementation:
 #    1. engine.reserve_replay_slot(batch): currently assumes BASIC_BATCHED cuda graph
@@ -152,7 +152,7 @@ the bottom of this file.
 #     - We add a function onto the Resource class called pre_plan (that is a no-op for
 #       anything but attention for now)
 #     - We also keep the restriction to batches under the BASIC_BATCHED cuda graph config
-# 
+#
 
 from __future__ import annotations
 
