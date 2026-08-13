@@ -268,6 +268,131 @@ class NemotronDuplexModel(Model):
         return self.config.eartts.sample_rate
 
     # -------------------------------------------------------------------
+    # Standalone offline inference (Phase A — mirrors the reference
+    # NemotronVoiceChat.offline_inference; bypasses the M* serving engine).
+    # -------------------------------------------------------------------
+
+    @torch.no_grad()
+    def offline_inference(
+        self,
+        input_signal: torch.Tensor,       # (1, num_samples) 16 kHz mono
+        input_signal_lens: torch.Tensor,  # (1,)
+        prompt_tokens: torch.Tensor | None = None,  # (1, P) text token ids
+        device: str = "cuda",
+        temperature: float = 0.0,
+        decode_audio: bool = True,
+    ) -> dict:
+        """Duplex speech-to-speech offline inference (batch size 1, fp32, greedy).
+
+        Frame-synchronous loop mirroring the reference: perception -> per-frame
+        [AddFusion(prev agent text, audio, prev function) -> nano step -> sample
+        text/function] -> talker emits RVQ codes -> codec -> waveform.
+
+        The nano uses the reference's Nemotron no-cache path: full re-prefill over
+        [0:t+1] each frame (reuses the verified ``offline_forward``).
+
+        Returns ``{tokens_text, tokens_function, tokens_audio, audio, audio_len}``.
+        TODO: talker sampling loop (``EarTTSTalker.infer_codes_one_step``) and the
+        text tokenizer (for detokenised ``text``) are being finalised; this method
+        returns token ids and — once those land — audio. Verify vs the NeMo ref.
+        """
+        cfg = self.config
+        # --- build the component modules (loads real weights) ---
+        conf_sub = self.get_submodule("conformer_encoder", device=device)
+        nano_sub = self.get_submodule("nano_llm", device=device)
+        perception = conf_sub.perception
+        nano = nano_sub.language_model
+        embed_tokens = nano.embed_tokens
+
+        # --- perception: audio -> per-frame embeddings (B, T, H) ---
+        audio_embeds, lengths = perception(input_signal.to(device), input_signal_lens.to(device))
+        B, T, H = audio_embeds.shape
+
+        # --- prepend the system prompt embeddings, if any ---
+        prompt_len = 0
+        if prompt_tokens is not None and prompt_tokens.numel() > 0:
+            prompt_len = prompt_tokens.shape[1]
+            prompt_emb = embed_tokens(prompt_tokens.to(device))            # (1, P, H)
+            audio_embeds = torch.cat([prompt_emb, audio_embeds], dim=1)    # (1, P+T, H)
+            T = audio_embeds.shape[1]
+
+        gen_text = torch.full((B, T), cfg.text_pad_id, device=device, dtype=torch.long)
+        gen_function = torch.full((B, T), cfg.text_pad_id, device=device, dtype=torch.long)
+        input_embeds = torch.zeros_like(audio_embeds)
+
+        def fuse(agent_emb, audio_emb, function_emb):
+            out = agent_emb * cfg.agent_text_weight + audio_emb * cfg.user_audio_weight
+            if cfg.use_function_head:
+                out = out + function_emb * cfg.function_weight
+            return out
+
+        def nano_step(seq_embeds):
+            # seq_embeds: (L, H) fused embeddings for frames [0:t+1]; returns the
+            # last position's text + function logits (non-cache re-prefill).
+            hidden = nano.llm.offline_forward(seq_embeds)      # (L, H)
+            last = hidden[-1:]                                  # (1, H)
+            return nano.lm_head(last)[0], nano.function_head(last)[0]
+
+        # frame 0: agent channel is BOS
+        bos_emb = embed_tokens(torch.tensor([cfg.text_bos_id], device=device))  # (1, H)
+        input_embeds[:, 0] = fuse(bos_emb, audio_embeds[:, 0], embed_tokens(gen_function[:, 0]))
+        text_logits, function_logits = nano_step(input_embeds[0, :1])
+        if prompt_len == 0:
+            gen_text[:, 0] = text_logits.argmax(-1)
+            gen_function[:, 0] = function_logits.argmax(-1)
+
+        for t in range(1, T):
+            agent_emb = embed_tokens(gen_text[:, t - 1])
+            function_emb = embed_tokens(gen_function[:, t - 1])
+            input_embeds[:, t] = fuse(agent_emb, audio_embeds[:, t], function_emb)
+            if t < prompt_len:
+                continue  # prompt region: teacher-forced, no sampling
+            text_logits, function_logits = nano_step(input_embeds[0, : t + 1])
+            # greedy (temperature==0). TODO: top-p / repetition-penalty sampling.
+            gen_text[:, t] = text_logits.argmax(-1)
+            gen_function[:, t] = function_logits.argmax(-1)
+
+        result = {
+            "tokens_text": gen_text,
+            "tokens_function": gen_function,
+            "prompt_len": prompt_len,
+        }
+
+        # --- audio-out: talker -> RVQ codes -> codec -> waveform ---
+        if decode_audio:
+            result.update(self._decode_audio_path(gen_text, prompt_len, device, temperature))
+        return result
+
+    def _decode_audio_path(self, gen_text, prompt_len, device, temperature):
+        """Talker (autoregressive RVQ codes) -> codec (waveform). Talker sampling
+        loop is being finalised in EarTTSTalker.infer_codes_one_step."""
+        talker = self.get_submodule("eartts_talker", device=device).talker
+        codec = self.get_submodule("audio_codec", device=device).codec
+        text_stream = gen_text[:, prompt_len:]                 # (1, T') agent text per frame
+        num_q = self.config.eartts.num_quantizers
+
+        if not hasattr(talker, "infer_codes_one_step"):
+            return {}  # talker sampling loop not yet available
+
+        state = talker.init_state(batch_size=text_stream.shape[0], device=device)
+        codes = []
+        prev_codes = None
+        prev_subword = text_stream[:, 0:1]
+        for t in range(text_stream.shape[1]):
+            cur_subword = text_stream[:, t : t + 1]
+            frame_codes, state = talker.infer_codes_one_step(
+                state, cur_subword, prev_subword, prev_codes, temperature=temperature,
+            )
+            codes.append(frame_codes)
+            prev_codes, prev_subword = frame_codes, cur_subword
+        gen_codes = torch.stack(codes, dim=1)                  # (1, T', num_q)
+        assert gen_codes.shape[-1] == num_q
+        code_len = torch.tensor([gen_codes.shape[1]], device=device)
+        with torch.autocast(device_type="cuda", enabled=False):
+            audio, audio_len = codec.decode(gen_codes, code_len)
+        return {"tokens_audio": gen_codes, "audio": audio.squeeze(1), "audio_len": audio_len}
+
+    # -------------------------------------------------------------------
     # Postprocess
     # -------------------------------------------------------------------
 
