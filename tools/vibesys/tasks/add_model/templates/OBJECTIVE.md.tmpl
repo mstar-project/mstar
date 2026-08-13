@@ -1,56 +1,62 @@
-# Objective — add `${model}` to mstar (strict fidelity to reference)
+# Objective — implement `${model}` natively in mstar
 
-Add support for `${hf_id}` to the mstar serving system so that a running
-`mstar-serve` instance reproduces the reference implementation's outputs within
-the per-walk tolerances below, then optimize its serving performance.
+Add support for `${hf_id}` to the mstar serving system by **implementing the
+model yourself** in mstar's Walk-Graph contract, then verifying it against the
+reference implementation. The goal is a **correct implementation at reasonable
+performance** — not the fastest possible one.
 
-This is a **correctness-first port**. A candidate that serves fast but does not
-match the reference on every walk is a failure, not a trade-off.
+## Client contract (what is observed)
 
-## What to build (inside the mstar workspace)
+The model is served by `./run.sh <port>` → `mstar-serve --config
+configs/${model}.yaml`, answering `/health` with 200 and serving on
+`${endpoint}`:
 
-1. A model package `mstar/model/${model}/` following mstar's Walk-Graph contract
-   (see `docs/adding_models.rst`). Copy the closest reference model,
-   **`mstar/model/${reference_model}/`**, and adapt it.
-2. Registry wiring in `mstar/model/registry.py`: add `${model}` to
-   `MODEL_REGISTRY` and `HF_MODELS`.
-3. A serving config `configs/${model}.yaml` (a starter is seeded for you; refine
-   its `node_groups` for this GPU).
-4. If serving over an OpenAI route, the adapter entry in
-   `mstar/api_server/openai/adapters.py` (`supports_*` flags).
+- **input modalities:** ${input_modalities}
+- **output modalities:** ${output_modalities}
 
-The server is started by `./run.sh <port>` →
-`mstar-serve --config configs/${model}.yaml --port <port>`, and must answer
-`/health` with 200 once ready and serve on `${endpoint}`.
+Only this client-facing behavior is graded. How you decompose the model
+internally (walks, nodes, engines) is your design decision, not part of the
+contract.
 
-## Weights
+## What "implement it yourself" means (required)
 
-Load weights through mstar's `HF_MODELS` mapping for the `${hf_id}` checkpoint.
-In this **local** run the weights are already in the HF cache (`$HF_HOME`), so
-`from_pretrained("${hf_id}")` resolves without a download; the `/model` bind
-mount exists only under `--docker`. Do not hard-code `/model` as the only source
-— fall back to the HF id (the reference oracle already does).
+Port `${hf_id}` into `mstar/model/${model}/` following `docs/adding_models.rst`,
+using **`mstar/model/${reference_model}/`** as the structural template:
 
-## Correctness contract (the accuracy gate)
+1. Decompose the model into **submodule nodes** (`NodeSubmodule` /
+   `ARNodeSubmodule`), one per graph node — encoders, backbone, diffusion/flow
+   head, decoder, etc. — writing the actual compute yourself.
+2. Define the **walk graph** (`get_graph_walk_graphs`) connecting those nodes for
+   the request path(s).
+3. Choose an **engine type** per node (`KV_CACHE` vs `STATELESS`).
+4. Load weights via mstar's loader (`load_weights` / `load_hf_weights`), building
+   on `meta` and `to_empty`, so the same code loads single-GPU and TP shards.
+5. Wire it up: `mstar/model/registry.py` (`MODEL_REGISTRY` + `HF_MODELS`),
+   `configs/${model}.yaml` (`node_groups`), and the OpenAI adapter in
+   `mstar/api_server/openai/adapters.py`.
+6. Declare a **`${model}` pip extra** in `pyproject.toml` with your model's
+   runtime deps (the framework runs `run.sh` and the strict checker via
+   `uv run --extra ${model}`).
 
-`vibeval/checker.py` exercises each Walk and compares mstar's output to the
-reference oracle in `vibeval/reference.py` (weights at `/model` or the HF id):
+**Do not import or serve the upstream package/pipeline as the implementation.**
+Reading the upstream repo (e.g. via `official_source` in `reference/meta.json`)
+to understand the architecture is expected; wrapping its
+`Pipeline.from_pretrained(...)(...)` and calling it end-to-end is **not** a port
+and will not satisfy this objective. The reference implementation exists for the
+*checker* to compare against — your served path must be mstar-native compute.
 
-${walk_table}
+## Correctness gate (the target)
 
-`exact_tokens` walks are compared bit-exact and therefore must be driven
-**greedily**: the checker sends `temperature=0` and a fixed seed. Generative
-(diffusion/flow) walks cannot be bit-exact; they pass on a tight similarity
-threshold with a fixed seed. Do not weaken a comparison to pass — the checker
-and reference are framework-owned and mounted read-only.
+`vibeval/checker.py` sends a client request to your server and compares the
+output to the reference implementation's output (run by `vibeval/reference.py`,
+weights at `/model` or the HF id) using **${compare}** within tolerance
+**${tol}**. Drive it deterministically (fixed seed; greedy where applicable).
+Do not weaken the checker or reference — they are framework-owned and read-only.
 
-Determinism knobs live in the *request* (temperature/seed), not the weights, so
-keep `configs/${model}.yaml` faithful to the checkpoint (no lossy dtype/kernel
-substitutions until fidelity holds).
+## Performance (secondary — do not over-optimize)
 
-## Headline metric
-
-Optimize `${headline_metric}` from `vibeval/benchmark.py` (lower is better for
-latency) on the `${headline_walk}` walk, only once the accuracy gate passes.
-Useful directions once correct: CUDA-graph capture, `tp_size`/`node_groups`
-placement, prefill/decode disaggregation — all config-only in mstar.
+Once the output is correct, get to **reasonable** serving latency
+(`${headline_metric}` from `vibeval/benchmark.py`) and stop. A correct,
+reasonably-fast implementation is a complete success; do **not** spend rounds
+chasing further speedups (CUDA graphs, extra compile, placement tuning) beyond
+what a straightforward implementation needs.

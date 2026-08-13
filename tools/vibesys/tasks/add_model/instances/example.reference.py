@@ -1,54 +1,73 @@
-"""Example oracle override (a TEMPLATE — copy to <model>.reference.py and fill in).
+"""Example oracle + client I/O (a TEMPLATE — copy to <model>.reference.py).
 
-This is the ONE model-specific Python file a user writes. If present next to
-<model>.toml, it replaces the rendered templates/reference.py.tmpl. The generic
-checker.py / benchmark.py drive these four hooks, so they never change per model.
+The ONE model-specific eval file. The modality checker/benchmark call these
+hooks. It defines a single client request/response and the reference oracle;
+it must NOT reuse the candidate's mstar code (the oracle is the independent
+upstream model). Real <model>.reference.py files are gitignored.
 
-- sample_input(walk): the fixed, deterministic probe input for a walk.
-- to_request(walk, sample): (method, path, json_body) to call the mstar server.
-- from_response(walk, response): parse the candidate output into a comparable
-  artifact (token-id list / logits array / audio samples / image|video array).
-- oracle(walk, sample): the reference ground truth (same artifact type), used
-  only in strict mode. Weights are at /model (docker) or the HF id.
-
-Real <model>.reference.py files are gitignored; only this example is tracked.
+This example targets text->video (mp4 over /v1/videos/generations).
 """
 
 from __future__ import annotations
 
+import base64
+import io
+import os
 from typing import Any
 
+MODEL_DIR = "/model"
+HF_ID = "org/my-model"
 SERVED = "mymodel"
-_MODEL: Any = None
+# Small, fixed, deterministic probe.
+PROMPT, SEED, H, W, NF, STEPS, GUID = "a fixed probe prompt", 0, 480, 832, 9, 8, 3.0
+_PIPE: Any = None
 
 
-def sample_input(walk: str) -> dict:
-    return {"prompt": "a fixed probe prompt", "seed": 0}
+def sample_input() -> dict:
+    return {"prompt": PROMPT, "seed": SEED, "height": H, "width": W,
+            "num_frames": NF, "num_inference_steps": STEPS, "guidance_scale": GUID}
 
 
-def to_request(walk: str, s: dict) -> tuple[str, str, dict]:
-    # Drive exact-match walks greedily (temperature 0 + fixed seed).
-    return "POST", "/v1/chat/completions", {
-        "model": SERVED,
-        "messages": [{"role": "user", "content": s["prompt"]}],
-        "temperature": 0,
-        "seed": s["seed"],
+def to_request(s: dict) -> tuple[str, str, dict]:
+    return "POST", "/v1/videos/generations", {
+        "model": SERVED, "prompt": s["prompt"], "size": f"{s['width']}x{s['height']}",
+        "num_frames": s["num_frames"], "num_inference_steps": s["num_inference_steps"],
+        "guidance_scale": s["guidance_scale"], "seed": s["seed"], "response_format": "b64_json",
     }
 
 
-def from_response(walk: str, response) -> Any:
-    return response.json()["choices"][0]["message"]["content"]
+def _decode_mp4(blob: bytes):
+    import av
+    import numpy as np
+    container = av.open(io.BytesIO(blob))
+    return np.stack([np.asarray(f.to_image()) for f in container.decode(video=0)])
 
 
-# --- strict-mode oracle (wire up once you capture/derive a reference) --------
+def from_response(response) -> Any:
+    data = (response.json().get("data") or [{}])[0]
+    if not data.get("b64_json"):
+        return None
+    blob = base64.b64decode(data["b64_json"])
+    if b"ftyp" not in blob[:64]:
+        return None
+    return _decode_mp4(blob)
+
+
 def load() -> None:
-    global _MODEL
-    if _MODEL is not None:
+    global _PIPE
+    if _PIPE is not None:
         return
-    # e.g. AutoModelForCausalLM.from_pretrained("/model" or HF id).eval().cuda()
-    raise NotImplementedError("reference.load: construct the upstream model")
+    import torch
+    from diffusers import DiffusionPipeline  # or the upstream package's pipeline
+    src = MODEL_DIR if os.path.isdir(MODEL_DIR) else HF_ID
+    _PIPE = DiffusionPipeline.from_pretrained(src, trust_remote_code=True, torch_dtype=torch.bfloat16).to("cuda")
 
 
-def oracle(walk: str, s: dict) -> Any:
+def oracle(s: dict) -> Any:
+    import numpy as np
+    import torch
     load()
-    raise NotImplementedError("reference.oracle: return the reference output")
+    out = _PIPE(prompt=s["prompt"], height=s["height"], width=s["width"], num_frames=s["num_frames"],
+                num_inference_steps=s["num_inference_steps"], guidance_scale=s["guidance_scale"],
+                generator=torch.Generator(device="cuda").manual_seed(s["seed"]))
+    return np.asarray(out.frames[0])
