@@ -5,10 +5,18 @@ video to the reference implementation's video:
 
 - ``--smoke``: validity only (a real, non-empty mp4). No oracle, no weights.
 - ``--strict`` (default): decode both clips and compare frames with SSIM within
-  tolerance ${tol}. The reference video comes from ``reference.py`` (the upstream
-  model); the candidate must be mstar-native compute, not the upstream pipeline.
+  tolerance ${tol}.
 
-Model specifics (request shape, mp4 decode, the oracle) live in reference.py.
+Diffusion/flow video is chaotic in its initial noise: two *correct*
+implementations that start from different noise produce different (each valid)
+clips, so an output-vs-output metric is only meaningful when both denoise the
+**same** starting latent. This gate therefore generates one shared initial
+latent (``reference.initial_latent``) and feeds it to *both* the candidate (via
+``init_latents`` in the request) and the reference oracle. The candidate must be
+mstar-native compute, not the upstream pipeline.
+
+Model specifics (request shape, mp4 decode, the oracle, the latent) live in
+reference.py.
 """
 
 from __future__ import annotations
@@ -82,7 +90,16 @@ def main() -> None:
     ref = _load_reference()
 
     sample = ref.sample_input()
-    method, path, body = ref.to_request(sample)
+
+    # Strict: build the shared starting latent up front and hand it to both the
+    # candidate (in the request) and the oracle, so any output difference is
+    # attributable to compute, not to a different noise draw. Smoke sends none.
+    latents = None
+    if args.strict:
+        ref.load()
+        latents = ref.initial_latent(sample)
+
+    method, path, body = ref.to_request(sample, latents)
     try:
         resp = client.request(method, f"{base}{path}", json=body)
         resp.raise_for_status()
@@ -99,8 +116,7 @@ def main() -> None:
         print(f"PASS[smoke]: server returned a valid video ({len(candidate)} frames)")
         return
 
-    ref.load()
-    reference = ref.oracle(sample)
+    reference = ref.oracle(sample, latents)
     score = _mean_ssim(candidate, reference)
     distance = 1.0 - score
     ok = distance <= TOL

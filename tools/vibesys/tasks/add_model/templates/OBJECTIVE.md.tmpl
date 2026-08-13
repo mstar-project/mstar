@@ -53,6 +53,21 @@ weights at `/model` or the HF id) using **${compare}** within tolerance
 **${tol}**. Drive it deterministically (fixed seed; greedy where applicable).
 Do not weaken the checker or reference — they are framework-owned and read-only.
 
+### Shared starting state for generative models (required if you sample noise)
+
+Diffusion/flow models are chaotic in their initial noise: two *correct*
+implementations that draw different starting noise produce different (each
+valid) outputs, so an output-vs-output metric can only pass when both denoise
+the **same** starting latent. The strict checker supplies one. Your served
+endpoint **must accept an optional `init_latents` field** (a base64-encoded
+`.npy` ndarray of the model's initial-noise latent shape, e.g. `[B, C, T, H,
+W]`) and use it **verbatim** as the starting latent — skip your own noise
+sampling when it is present, and match its layout/scaling to the reference's
+latent convention. When `init_latents` is absent (smoke, benchmark) sample
+normally from `seed`. The reference oracle denoises the identical latent, so a
+faithful port lands within tolerance; a mismatch (wrong latent shape, scaling,
+or channel order) shows up as a low score and points at a real bug.
+
 ## Performance (secondary — do not over-optimize)
 
 Once the output is correct, get to **reasonable** serving latency
