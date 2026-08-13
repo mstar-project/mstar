@@ -78,6 +78,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         pos_info: dict[str, PositionInfo] = {},  # noqa: B006 - matches base signature
         **kwargs,
     ) -> ARNodeInputs:
+        logger.warning("NDTRACE nano.prepare_inputs walk=%s keys=%s", graph_walk, list(inputs.keys()))
         # Frame-synchronous decode: AddFusion of one streamed audio frame with the
         # fed-back previous agent-text + function tokens (the duplex input per frame).
         if "audio_frame" in inputs:
@@ -263,10 +264,12 @@ class ConformerEncoderSubmodule(NodeSubmodule):
 
     def forward(self, graph_walk, engine_inputs, wav=None, lens=None, **kwargs) -> NameToTensorList:
         # audio -> per-frame LLM-space embeddings (T, H). These are the *user-audio*
-        # channel; the nano node fuses them per frame with its own fed-back previous
-        # text/function tokens (AddFusion) before stepping — see the decode walk.
+        # channel; streamed as ``audio_frame`` (the LLM decode edge name) and sliced
+        # one frame per nano step by the FixedChunkPolicy, where the nano node fuses
+        # each with its fed-back previous text/function tokens (AddFusion).
         audio_embeds, _ = self.perception(wav, lens)                  # (1, T, H)
-        return {"audio_embeds": [audio_embeds[0]]}                    # (T, H)
+        logger.warning("NDTRACE encoder.forward: produced audio_frame T=%d", audio_embeds.shape[1])
+        return {"audio_frame": [audio_embeds[0]]}                     # (T, H)
 
 
 class EarTTSTalkerSubmodule(ARNodeSubmodule):
