@@ -62,12 +62,48 @@ Decision tree from the traces:
   (verify the `StreamingConnectionState` fields `producer_done`/`consumed_count`/
   `token_count` are the right names/semantics).
 
-**Likely fix direction** (if the stream doesn't deliver): reshape the Encoder→LLM
-coupling to a supported pattern — e.g. make the encoder the first node of a
-`prefill_audio` `Sequential` in the LLM partition that emits the whole `audio_frame`
-stream, rather than a standalone producer partition. Compare to
-`mstar/model/qwen3_omni` `get_graph_walk_graphs` / `get_partitions` /
-`get_partition_topology` and its conductor `_get_*_forward` state machines.
+**Confident diagnosis (static, from comparing to qwen3_omni's Thinker→Talker — a
+proven stream-consuming KV-cache decode loop):**
+
+The LLM `decode` loop lacks the **consumer-gating** qwen3's Talker has. Specifics:
+
+1. qwen3's Talker (the consumer of the `thinker_states` stream) does NOT start in its
+   decode loop. It starts in `talker_prefill` (input_names include the streamed
+   `thinker_states`/`thinker_mask` **and** a conductor `talker_trigger`), counts
+   `num_thinker_prefill_steps`, transitions `talker_prefill → talker_last_prefill →
+   talker_decode`. Only then does the decode Loop run. This gating is what
+   synchronizes the consumer with the producer and prevents the loop from starting on
+   an empty stream. **Our LLM `decode` is the *initial* walk with no gating** — on a
+   single worker the decode Loop can start before the Encoder has produced frames, then
+   block on the empty `audio_frame` StreamBuffer, and since it holds the worker's GPU
+   thread the Encoder never runs → deadlock. This matches the observed hang (request
+   accepted, then nothing).
+2. The streamed tensor arrives via the **StreamBuffer**, not via forward-pass-args
+   `inputs`; the conductor only supplies non-streamed / self-fed inputs (qwen3 supplies
+   `talker_trigger` then `talker_input_embeds`). Our `get_partition_forward_pass_args`
+   for the LLM correctly supplies `prev_text`/`prev_func`, but **loop termination should
+   not hinge on `_stream_exhausted`** — qwen3's decode loop ends via its own
+   `check_stop`/`max_iters` (worker-side Loop), and the conductor sets `request_done`
+   only when the Loop returns control (see qwen3 `_get_talker_forward`, `talker_decode`
+   branch: it just returns `request_done=True`).
+
+**Fix plan (apply on a box with a GPU and iterate against the NDTRACE trace):**
+- Add an LLM consumer-gating walk analogous to `talker_prefill`: an `encode_gate` (or
+  reuse `prefill_audio`) `GraphNode(name="nano_llm", input_names=["audio_frame", ...,
+  "llm_trigger"])` that the conductor drives while the Encoder streams, then transition
+  into `decode`. Give the LLM partition `initial_walk` that walk (not `decode`
+  directly), and count encoder frames like qwen3 counts prefill steps.
+- Make `_get_llm_forward` mirror `_get_talker_forward`: gate → transition → in the
+  `decode` branch just return `request_done=True` (let the worker-side Loop's
+  `check_stop` end it). Drop the `_stream_exhausted`-based termination.
+- Alternatively (simpler, less reference-aligned): fold the encoder into a
+  `prefill_audio` `Sequential([conformer_encoder, nano_llm])` in the LLM partition so
+  the encoder runs first within the same partition step, emitting the whole
+  `audio_frame` stream before the decode Loop consumes it.
+
+Reference to copy verbatim: `mstar/model/qwen3_omni/qwen3_omni_model.py`
+`_get_talker_forward` / `_get_code2wav_forward` + the `talker_prefill`/`talker_decode`
+walks + `get_partitions` (`producer_partitions`) + `get_partition_topology`.
 
 Strip the `NDTRACE` lines once E5 is green.
 
