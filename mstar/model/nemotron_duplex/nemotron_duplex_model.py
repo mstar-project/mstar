@@ -1,21 +1,31 @@
 """NemotronDuplexModel — NVIDIA NemotronLabs VoiceChat-11B in M*.
 
-A half-duplex speech-to-speech model with three stages:
+A full-duplex speech-to-speech model with three stages:
 
     conformer_encoder (STATELESS) — 16 kHz speech → fused embeds + RNN-T transcript
     nano_llm          (KV_CACHE)  — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B)
     eartts_talker     (KV_CACHE)  — Gemma3 talker → 31-codebook RVQ codes
     audio_codec       (STATELESS) — RVQ codes → 22.05 kHz PCM
 
-Input:  text prompt + user speech.  Output: agent text + agent speech +
-streaming user transcription.
+Full-duplex: the model consumes user speech continuously and emits agent text +
+agent speech as it generates, frame-synchronously in one backbone, so it handles
+natural turn-taking and barge-in/interruptions.
 
-PHASING (agreed): this draft wires the **text path** end-to-end
-(``prefill_text`` → ``decode``) so the Nemotron-H backbone can be brought up and
-verified against the HF reference first. The audio nodes are declared and their
-submodules stubbed; the full duplex graph + async partitions (encoder →
-nano_llm → talker → codec, with ``StreamingGraphEdge`` fan-out of transcript /
-text / audio) is the Phase 6 extension sketched in ``_duplex_design`` below.
+Input:  optional system prompt + user speech.  Output: agent text + agent speech
+(+ streaming user transcription, RNN-T channel implemented but not yet wired).
+
+INFERENCE PATHS (all live, verified vs the NeMo reference):
+    * ``offline_inference`` — batched offline S2S (frame-synchronous perception →
+      AddFusion → nano no-cache re-prefill → sample → talker RVQ → codec).
+    * ``create_stream`` / ``DuplexStream`` — online streaming duplex with a
+      persistent nano cache (attn KV + Mamba conv/ssm state) and per-frame talker;
+      matches the offline text path and vocalizes with CFG + noise sampling.
+    * ``realtime_api`` — OpenAI Realtime-API WebSocket server over ``DuplexStream``.
+
+The M*-serving-engine graph path (``prefill_text`` → ``decode`` walk graphs, async
+partitions with ``StreamingGraphEdge`` fan-out of transcript / text / audio) is
+sketched in ``_duplex_design`` below and is the remaining engine-integration work;
+the standalone paths above are what run today.
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,
@@ -183,10 +193,12 @@ class DuplexStream:
         return self._step_new_frames()
 
     def flush(self) -> list[_StreamOutput]:
-        return self._step_new_frames()
+        # End of input: no more audio will arrive, so the held-back trailing frames
+        # are now final — consume them too (matches offline's zero-padded tail).
+        return self._step_new_frames(final=True)
 
     @torch.no_grad()
-    def _step_new_frames(self) -> list[_StreamOutput]:
+    def _step_new_frames(self, final: bool = False) -> list[_StreamOutput]:
         if self._wav.numel() < self.cfg.stt.hop_length:
             return []
         sig = self._wav.unsqueeze(0).to(self.device)
@@ -197,7 +209,12 @@ class DuplexStream:
         embed_tokens = nano.embed_tokens
         outs: list[_StreamOutput] = []
 
-        for t in range(self._processed, T):
+        # Hold back the encoder's right-context lookahead frames: the newest
+        # `streaming_lookahead_frames` are not yet final (they change as more audio
+        # arrives), so consuming them now would permanently diverge from offline.
+        # At `final` (flush) there is no future audio, so consume everything.
+        limit = T if final else max(self._processed, T - cfg.stt.streaming_lookahead_frames)
+        for t in range(self._processed, limit):
             # Global position — with a primed system prompt, gen_text already holds
             # `prompt_len` PADs, so the first audio frame's prev is the last prompt
             # PAD (not BOS). BOS applies only at true global frame 0 (no prompt).
@@ -221,7 +238,7 @@ class DuplexStream:
 
             outs.append(self._talker_codec_frame(text_tok))
             self._t += 1
-        self._processed = T
+        self._processed = limit   # held-back frames stay unconsumed until finalized
         return outs
 
     def _nano_hidden(self, fused: torch.Tensor) -> torch.Tensor:
@@ -254,6 +271,10 @@ class DuplexStream:
         codes, self._talker_state = talker.infer_codes_one_step(
             self._talker_state, cur, cur, self._prev_codes, cond=cond,
             text_eos_id=cfg.text_eos_id, temperature=self.temperature,
+            num_iter=cfg.eartts.inference_num_iter,
+            guidance_scale=cfg.eartts.inference_guidance_scale,
+            noise_scale=cfg.eartts.inference_noise_scale,
+            top_p=cfg.eartts.inference_top_p,
         )
         self._prev_codes = codes
         # Codec has a multi-frame (causal) receptive field, so decode the full code

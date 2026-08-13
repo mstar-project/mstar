@@ -56,6 +56,18 @@ def _gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
     return out.to(dtype)
 
 
+def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Nucleus (top-p) filter over the last dim: mask out the low-probability tail
+    beyond cumulative ``top_p`` with ``-inf`` (keeps at least the top token).
+    Mirrors HF ``TopPLogitsWarper`` used by the reference MoG sampler."""
+    sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+    cum = sorted_logits.softmax(-1).cumsum(-1)
+    remove = cum - sorted_logits.softmax(-1) > top_p          # keep tokens whose left-cum <= top_p
+    remove[..., 0] = False                                     # always keep the top token
+    mask = torch.zeros_like(remove).scatter(-1, sorted_idx, remove)
+    return logits.masked_fill(mask, float("-inf"))
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
@@ -452,22 +464,31 @@ class MogHead(nn.Module):
         self,
         x: torch.Tensor,
         temperature: float = 0.0,
+        guidance_scale: float = 0.0,
+        top_p: float | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample a mixture component and return its target latent mean + log-std.
 
-        Greedy (``temperature == 0``, the offline default) picks the component
-        by ``argmax(logits)``; ``temperature > 0`` uses the Gumbel-max trick over
-        ``log_softmax(logits) / temperature``. The chosen component's low-rank
-        mean ``mu`` is projected up through the component-specific ``low_mat``,
-        scaled by ``exp(logs)`` and offset by the residual mean ``mu_res``:
-        returns ``(mu * exp(logs) + mu_res, logs)`` — the mean of the Gaussian
-        that the RVQ residual-quantizer then encodes."""
-        b, t, _ = x.shape
+        Port of the reference ``MogHead.infer``. When ``guidance_scale > 0`` the
+        input ``x`` is the stacked ``[cond; uncond]`` batch; after the trunk it is
+        combined as ``x_cond + guidance_scale * (x_cond - x_uncond)`` (classifier-
+        free guidance). ``top_p`` applies nucleus filtering to the mixture logits.
+        The component is drawn by Gumbel-max (stochastic) when ``top_p`` is set or
+        ``temperature > 0``; otherwise greedy ``argmax``. The chosen component's
+        low-rank mean is projected up through ``low_mat``, scaled by ``exp(logs)``
+        and offset by ``mu_res``: returns ``(mu * exp(logs) + mu_res, logs)``."""
         x = self._trunk(x)
+        if guidance_scale and guidance_scale > 0.0:
+            x_cond, x_uncond = x.chunk(2, dim=0)
+            x = x_cond + guidance_scale * (x_cond - x_uncond)
+        b, t, _ = x.shape
         logits = F.linear(x, self.proj_logits.weight)                       # [b, t, n]
-        if temperature and temperature > 0.0:
-            logp = F.log_softmax(logits, dim=-1) / temperature
+        if top_p is not None and 0.0 < top_p < 1.0:
+            logits = _top_p_filter(logits, top_p)
+        if (top_p is not None and top_p < 1.0) or (temperature and temperature > 0.0):
+            temp = temperature if (temperature and temperature > 0.0) else 1.0
+            logp = F.log_softmax(logits, dim=-1) / temp
             u = torch.rand(logp.shape, device=logp.device, dtype=logp.dtype, generator=generator)
             gumbel = -torch.log(-torch.log(u + 1e-8) + 1e-8)
             idx = (logp + gumbel).argmax(-1)                                # [b, t]
@@ -589,28 +610,33 @@ class EarTTSTalker(nn.Module):
     def generate_step(
         self,
         hidden_states: torch.Tensor,
+        hidden_uncond: torch.Tensor | None = None,
         num_iter: int = 8,
         exponent: float = 3.0,
         temperature: float = 0.0,
+        guidance_scale: float = 0.0,
         noise_scale: float = 0.0,
+        top_p: float | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        """Iterative MoG-conditioned RVQ decode of one (or more) frame(s).
+        """Iterative MoG-conditioned RVQ decode of one (or more) frame(s) — port
+        of the reference ``generate_step``.
 
-        Given the backbone hidden state ``[b, t, H]``, fills the
-        ``num_quantizers`` RVQ codebooks over ``num_iter`` MaskGIT-style
-        iterations. Each iteration re-embeds the current partial code, adds the
-        hidden state, samples the MoG target latent ``z`` (greedy +
-        deterministic by default: ``temperature=0``, ``noise_scale=0``), then
-        residual-quantizes the next block of codebooks. Returns ``[b, t,
-        num_quantizers]`` long codes in ``[0, codebook_size)``. CFG guidance is
-        not implemented (single, conditional stream).
+        Given the conditional backbone hidden state ``[b, t, H]`` (and, for
+        classifier-free guidance, the unconditional ``hidden_uncond``), fills the
+        ``num_quantizers`` RVQ codebooks over ``num_iter`` MaskGIT iterations.
+        Each iteration re-embeds the current partial code, adds the hidden state,
+        samples the MoG latent ``z = mu + exp(logs)*eps*noise_scale`` (mixture
+        component drawn by Gumbel-top-p; guidance applied inside ``mog_head.infer``
+        on the stacked ``[cond; uncond]`` batch), then residual-quantizes the next
+        block of codebooks. Returns ``[b, t, num_quantizers]`` in ``[0, codebook_size)``.
         """
         cfg = self.config
         b, t, _ = hidden_states.shape
         d = cfg.num_quantizers
         device = hidden_states.device
         code = torch.full((b, t, d), cfg.codebook_size, dtype=torch.long, device=device)
+        guided = guidance_scale and guidance_scale > 0.0 and hidden_uncond is not None
 
         rates = torch.linspace(0.0, 1.0, num_iter + 1, device=device)[:-1].unsqueeze(-1)
         num_maskings = torch.ceil(_masking_rate(rates, exponent) * d).long()
@@ -620,8 +646,18 @@ class EarTTSTalker(nn.Module):
             k = int(ks[i, 0].item())
             if k == 0:
                 continue
-            mog_input = self.embed_code(self.depthsum_embedding(code)) + hidden_states
-            mu, logs = self.mog_head.infer(mog_input, temperature=temperature, generator=generator)
+            code_embed = self.embed_code(self.depthsum_embedding(code))
+            if guided:
+                mog_input = torch.cat([code_embed + hidden_states, code_embed + hidden_uncond], dim=0)
+                mu, logs = self.mog_head.infer(
+                    mog_input, temperature=temperature, guidance_scale=guidance_scale,
+                    top_p=top_p, generator=generator,
+                )
+            else:
+                mog_input = code_embed + hidden_states
+                mu, logs = self.mog_head.infer(
+                    mog_input, temperature=temperature, top_p=top_p, generator=generator,
+                )
             z = mu
             if noise_scale:
                 eps = torch.randn(mu.shape, device=device, dtype=mu.dtype, generator=generator)
@@ -707,7 +743,13 @@ class EarTTSTalker(nn.Module):
 
         inputs_embeds = self.gated_fusion_audio_text(code_embeds, cond)
         _, cache = self.backbone_forward(inputs_embeds, start_pos=0, kv_cache=None, return_cache=True)
-        return {"kv": cache, "pos": p, "prev_codes": prev_codes}
+        # Unconditional stream for classifier-free guidance: same code (speaker)
+        # embeddings, but the text conditioning replaced by the learned null embed
+        # at every warmup position (reference ``uncond_dec_flag`` -> ``null_emb``).
+        null_cond = self.null_emb.to(code_embeds).view(1, 1, h).expand(b, code_embeds.shape[1], h)
+        inputs_uncond = self.gated_fusion_audio_text(code_embeds, null_cond)
+        _, cache_uncond = self.backbone_forward(inputs_uncond, start_pos=0, kv_cache=None, return_cache=True)
+        return {"kv": cache, "kv_uncond": cache_uncond, "pos": p, "prev_codes": prev_codes}
 
     def initial_prev_codes(self, batch_size: int, device=None) -> torch.Tensor:
         """The frame-0 ``prev_codes`` [B, num_quantizers]: the codec silence
@@ -729,7 +771,9 @@ class EarTTSTalker(nn.Module):
         text_eos_id: int | None = None,
         num_iter: int = 8,
         temperature: float = 0.0,
+        guidance_scale: float = 0.0,
         noise_scale: float = 0.0,
+        top_p: float | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """One autoregressive frame step.
@@ -767,10 +811,23 @@ class EarTTSTalker(nn.Module):
         hidden, new_cache = self.backbone_forward(
             inputs_embeds, kv_cache=state["kv"], start_pos=state["pos"], return_cache=True
         )
+        # Unconditional stream (classifier-free guidance): same code embeds, text
+        # conditioning replaced by the learned null embedding, own KV cache.
+        hidden_uncond, new_uncond = None, None
+        guided = guidance_scale and guidance_scale > 0.0 and state.get("kv_uncond") is not None
+        if guided:
+            h = self.config.hidden_size
+            null_cond = self.null_emb.to(code_embeds).view(1, 1, h).expand_as(code_embeds)
+            inputs_uncond = self.gated_fusion_audio_text(code_embeds, null_cond)
+            hidden_uncond, new_uncond = self.backbone_forward(
+                inputs_uncond, kv_cache=state["kv_uncond"], start_pos=state["pos"], return_cache=True
+            )
         codes = self.generate_step(
-            hidden, num_iter=num_iter, temperature=temperature, noise_scale=noise_scale, generator=generator,
+            hidden, hidden_uncond=hidden_uncond, num_iter=num_iter, temperature=temperature,
+            guidance_scale=guidance_scale if guided else 0.0, noise_scale=noise_scale,
+            top_p=top_p, generator=generator,
         )
-        new_state = {"kv": new_cache, "pos": state["pos"] + 1}
+        new_state = {"kv": new_cache, "kv_uncond": new_uncond, "pos": state["pos"] + 1}
         return codes.squeeze(1), new_state
 
     def forward(
@@ -853,7 +910,10 @@ class EarTTSTalker(nn.Module):
         tokenizer,
         speaker: str = "Aria",
         temperature: float = 0.0,
-        num_iter: int = 8,
+        num_iter: int | None = None,
+        guidance_scale: float | None = None,
+        noise_scale: float | None = None,
+        top_p: float | None = None,
         text_eos_id: int | None = None,
         text_pad_id: int | None = None,
         speech_pad_id: int | None = None,
@@ -873,6 +933,17 @@ class EarTTSTalker(nn.Module):
         exact NeMo warmup (see ``init_state``); otherwise the simplified
         latent-only warmup is used.
         """
+        # Inference sampling defaults from config (real speech needs CFG + noise +
+        # top-p; without them the MoG head collapses to near-silence).
+        if num_iter is None:
+            num_iter = self.config.inference_num_iter
+        if guidance_scale is None:
+            guidance_scale = self.config.inference_guidance_scale
+        if noise_scale is None:
+            noise_scale = self.config.inference_noise_scale
+        if top_p is None:
+            top_p = self.config.inference_top_p
+
         b, t = subword_stream.shape
         device = subword_stream.device
         dtype = self.embed_code.weight.dtype
@@ -898,7 +969,8 @@ class EarTTSTalker(nn.Module):
             cond = self.text_conditioning(cur, mask, s2c, char_pad_idx)
             codes, state = self.infer_codes_one_step(
                 state, cur, prev, prev_codes, cond=cond, text_eos_id=text_eos_id,
-                num_iter=num_iter, temperature=temperature, generator=generator,
+                num_iter=num_iter, temperature=temperature, guidance_scale=guidance_scale,
+                noise_scale=noise_scale, top_p=top_p, generator=generator,
             )
             all_codes.append(codes)
             prev_codes = codes
