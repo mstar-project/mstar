@@ -7,6 +7,13 @@ QK-norm; a 1-layer subword encoder; the MoG head; and the bespoke embedding
 tables). The three top-level ``tts_model.*`` buffers (control codes, codec
 silence tokens, per-voice audio-prompt latents) load here too.
 
+Every architecture dimension / hyperparameter is read from ``EarTTSConfig``
+(populated from the checkpoint's ``config.json``) and threaded down into the
+submodules — there are no hardcoded model hyperparameters here. The only bare
+literals are fixed table cardinalities that are not part of ``EarTTSConfig``
+(the char-embedding vocab, the flag-embedding categories, and the
+tokenizer-sized flag buffers).
+
 The teacher-forced forward (backbone + gated fusion + MoG head) and the
 char-aware subword encoder are numerically verified in fp32 against the NeMo
 ``RVQEARTTSModel`` reference (transformers Gemma3TextModel / T5GemmaEncoderModel
@@ -26,27 +33,17 @@ from mstar.model.components.mlp import GatedMLP
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
 from mstar.model.nemotron_duplex.config import EarTTSConfig
 
-H = 1152          # talker hidden
-FF = 4608         # talker mlp intermediate
-HEAD_DIM = 72
-NUM_HEADS = 16
-NUM_LAYERS = 28
-CODE_DIM = 512    # rvq latent dim
-NUM_QUANTIZERS = 31
-CODEBOOK = 1024
-NUM_PREDICTIONS = 1024   # MoG mixture components
-LOW_RANK = 64            # MoG low-rank mean dim
-MIN_LOG_STD = -4.0
-RMS_EPS = 1e-6
-
-# Gemma3-text backbone specifics (from HF Gemma3TextConfig defaults + checkpoint).
-QUERY_PRE_ATTN_SCALAR = 256.0     # attention scaling = QUERY_PRE_ATTN_SCALAR ** -0.5
-ROPE_THETA_GLOBAL = 1_000_000.0   # full-attention layers
-ROPE_THETA_LOCAL = 10_000.0       # sliding-attention layers
-SLIDING_WINDOW_PATTERN = 6        # layer i is full attention iff (i + 1) % 6 == 0
+# Fixed table cardinalities that are NOT model hyperparameters in EarTTSConfig
+# (tokenizer / vocabulary sizes baked into the checkpoint's flag tables).
+_CHAR_VOCAB = 257            # embed_tokens rows: 256 chars + 1 padding slot
+_SPECIAL_FLAG_CATS = 3       # BOS/EOS flag categories (0=regular, 1=BOS, 2=EOS)
+_CONT_FLAG_CATS = 2          # continuation flag categories (0=word-start, 1=cont)
+_SPECIAL_FLAGS_LEN = 131072  # bos/eos flag buffer length (text vocab size)
+_CONT_FLAGS_LEN = 131073     # continuation flag buffer length (text vocab + pad)
+_AUDIO_PROMPT_FRAMES = 37     # per-voice cached audio-prompt latent length
 
 
-def _gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = RMS_EPS) -> torch.Tensor:
+def _gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Gemma3 RMSNorm computed in fp32: ``(x * rsqrt(mean(x^2)+eps)) * (1 + w)``.
 
     Done manually (not via the shared fused ``RMSNorm`` kernel, which runs in
@@ -73,17 +70,26 @@ def _rope_cos_sin(positions: torch.Tensor, theta: float, dim: int) -> tuple[torc
 
 
 class _Attn(nn.Module):
-    """q/k/v/o projections (no bias); optional Gemma3 per-head QK-norm."""
+    """q/k/v/o projections (no bias); optional Gemma3 per-head QK-norm.
 
-    def __init__(self, qk_norm: bool):
+    All dims (hidden size, head count/dim, query scaling, norm eps) come from
+    ``EarTTSConfig``.
+    """
+
+    def __init__(self, config: EarTTSConfig, qk_norm: bool):
         super().__init__()
-        self.q_proj = nn.Linear(H, H, bias=False)
-        self.k_proj = nn.Linear(H, H, bias=False)
-        self.v_proj = nn.Linear(H, H, bias=False)
-        self.o_proj = nn.Linear(H, H, bias=False)
+        h = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.scaling = config.query_pre_attn_scalar ** -0.5
+        self.eps = config.rms_norm_eps
+        self.q_proj = nn.Linear(h, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(h, self.num_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(h, self.num_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, h, bias=False)
         if qk_norm:
-            self.q_norm = RMSNorm(HEAD_DIM)
-            self.k_norm = RMSNorm(HEAD_DIM)
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
 
     def forward(
         self,
@@ -95,16 +101,17 @@ class _Attn(nn.Module):
     ) -> torch.Tensor:
         """Multi-head self-attention. Gemma3-style: optional per-head QK-norm
         (applied before rope), rope on the full head dim, and query scaling by
-        ``QUERY_PRE_ATTN_SCALAR ** -0.5``. ``causal`` adds a triangular mask
+        ``query_pre_attn_scalar ** -0.5``. ``causal`` adds a triangular mask
         (talker); ``attn_bias`` is an additive mask broadcastable to
         ``[b, nh, tq, tk]`` (encoder key padding)."""
         b, t, _ = x.shape
-        q = F.linear(x, self.q_proj.weight).view(b, t, NUM_HEADS, HEAD_DIM)
-        k = F.linear(x, self.k_proj.weight).view(b, t, NUM_HEADS, HEAD_DIM)
-        v = F.linear(x, self.v_proj.weight).view(b, t, NUM_HEADS, HEAD_DIM)
+        nh, hd = self.num_heads, self.head_dim
+        q = F.linear(x, self.q_proj.weight).view(b, t, nh, hd)
+        k = F.linear(x, self.k_proj.weight).view(b, t, nh, hd)
+        v = F.linear(x, self.v_proj.weight).view(b, t, nh, hd)
         if hasattr(self, "q_norm"):
-            q = _gemma_rmsnorm(q, self.q_norm.weight)
-            k = _gemma_rmsnorm(k, self.k_norm.weight)
+            q = _gemma_rmsnorm(q, self.q_norm.weight, self.eps)
+            k = _gemma_rmsnorm(k, self.k_norm.weight, self.eps)
         q = q.transpose(1, 2)   # [b, nh, t, hd]
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -113,43 +120,44 @@ class _Attn(nn.Module):
             sin_b = sin[None, None, :, :]
             q = q * cos_b + _rotate_half(q) * sin_b
             k = k * cos_b + _rotate_half(k) * sin_b
-        scaling = QUERY_PRE_ATTN_SCALAR ** -0.5
-        scores = torch.matmul(q, k.transpose(-1, -2)) * scaling
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scaling
         if causal:
             neg = torch.full((t, t), float("-inf"), device=x.device, dtype=scores.dtype)
             scores = scores + torch.triu(neg, diagonal=1)
         if attn_bias is not None:
             scores = scores + attn_bias
         attn = torch.softmax(scores.float(), dim=-1).to(v.dtype)
-        out = torch.matmul(attn, v).transpose(1, 2).reshape(b, t, NUM_HEADS * HEAD_DIM)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(b, t, nh * hd)
         return F.linear(out, self.o_proj.weight)
 
 
 class TalkerLayer(nn.Module):
     """Gemma3 decoder layer: input/post-attn/pre-ff/post-ff norms + QK-norm attn + gated MLP."""
 
-    def __init__(self):
+    def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.input_layernorm = RMSNorm(H)
-        self.self_attn = _Attn(qk_norm=True)
-        self.post_attention_layernorm = RMSNorm(H)
-        self.pre_feedforward_layernorm = RMSNorm(H)
-        self.mlp = GatedMLP(H, FF, activation="gelu_tanh", bias=False)
-        self.post_feedforward_layernorm = RMSNorm(H)
+        h = config.hidden_size
+        self.eps = config.rms_norm_eps
+        self.input_layernorm = RMSNorm(h)
+        self.self_attn = _Attn(config, qk_norm=True)
+        self.post_attention_layernorm = RMSNorm(h)
+        self.pre_feedforward_layernorm = RMSNorm(h)
+        self.mlp = GatedMLP(h, config.intermediate_size, activation="gelu_tanh", bias=False)
+        self.post_feedforward_layernorm = RMSNorm(h)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Gemma3 decoder layer with its 4 RMSNorms (input / post-attn /
         pre-ff / post-ff), each ``(1 + w)`` in fp32."""
         residual = x
-        h = _gemma_rmsnorm(x, self.input_layernorm.weight)
+        h = _gemma_rmsnorm(x, self.input_layernorm.weight, self.eps)
         h = self.self_attn(h, cos, sin, causal=True)
-        h = _gemma_rmsnorm(h, self.post_attention_layernorm.weight)
+        h = _gemma_rmsnorm(h, self.post_attention_layernorm.weight, self.eps)
         x = residual + h
 
         residual = x
-        h = _gemma_rmsnorm(x, self.pre_feedforward_layernorm.weight)
+        h = _gemma_rmsnorm(x, self.pre_feedforward_layernorm.weight, self.eps)
         h = self.mlp(h)
-        h = _gemma_rmsnorm(h, self.post_feedforward_layernorm.weight)
+        h = _gemma_rmsnorm(h, self.post_feedforward_layernorm.weight, self.eps)
         x = residual + h
         return x
 
@@ -157,88 +165,97 @@ class TalkerLayer(nn.Module):
 class _EncoderLayer(nn.Module):
     """Subword-encoder layer: pre/post self-attn + pre/post ff norms (no QK-norm)."""
 
-    def __init__(self):
+    def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.self_attn = _Attn(qk_norm=False)
-        self.pre_self_attn_layernorm = RMSNorm(H)
-        self.post_self_attn_layernorm = RMSNorm(H)
-        self.pre_feedforward_layernorm = RMSNorm(H)
-        self.post_feedforward_layernorm = RMSNorm(H)
-        self.mlp = GatedMLP(H, FF, activation="gelu_tanh", bias=False)
+        h = config.hidden_size
+        self.eps = config.rms_norm_eps
+        self.self_attn = _Attn(config, qk_norm=False)
+        self.pre_self_attn_layernorm = RMSNorm(h)
+        self.post_self_attn_layernorm = RMSNorm(h)
+        self.pre_feedforward_layernorm = RMSNorm(h)
+        self.post_feedforward_layernorm = RMSNorm(h)
+        self.mlp = GatedMLP(h, config.intermediate_size, activation="gelu_tanh", bias=False)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attn_bias: torch.Tensor) -> torch.Tensor:
         """T5Gemma encoder layer: bidirectional attention (no QK-norm) with
         pre/post self-attn and pre/post ff RMSNorms."""
         residual = x
-        h = _gemma_rmsnorm(x, self.pre_self_attn_layernorm.weight)
+        h = _gemma_rmsnorm(x, self.pre_self_attn_layernorm.weight, self.eps)
         h = self.self_attn(h, cos, sin, causal=False, attn_bias=attn_bias)
-        h = _gemma_rmsnorm(h, self.post_self_attn_layernorm.weight)
+        h = _gemma_rmsnorm(h, self.post_self_attn_layernorm.weight, self.eps)
         x = residual + h
 
         residual = x
-        h = _gemma_rmsnorm(x, self.pre_feedforward_layernorm.weight)
+        h = _gemma_rmsnorm(x, self.pre_feedforward_layernorm.weight, self.eps)
         h = self.mlp(h)
-        h = _gemma_rmsnorm(h, self.post_feedforward_layernorm.weight)
+        h = _gemma_rmsnorm(h, self.post_feedforward_layernorm.weight, self.eps)
         x = residual + h
         return x
 
 
 class _EncoderBackbone(nn.Module):
-    def __init__(self, n_layers: int = 1):
+    def __init__(self, config: EarTTSConfig, n_layers: int = 1):
         super().__init__()
-        self.encoder = _Encoder(n_layers)
+        self.encoder = _Encoder(config, n_layers)
 
 
 class _Encoder(nn.Module):
-    def __init__(self, n_layers: int):
+    def __init__(self, config: EarTTSConfig, n_layers: int):
         super().__init__()
-        self.layers = nn.ModuleList([_EncoderLayer() for _ in range(n_layers)])
-        self.norm = RMSNorm(H)
+        self.layers = nn.ModuleList([_EncoderLayer(config) for _ in range(n_layers)])
+        self.norm = RMSNorm(config.hidden_size)
 
 
 class _BosEosEmb(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_size: int):
         super().__init__()
-        self.special_emb = nn.Embedding(3, H)
-        self.special_flags = param(131072, dtype=torch.int64)
+        self.special_emb = nn.Embedding(_SPECIAL_FLAG_CATS, hidden_size)
+        self.special_flags = param(_SPECIAL_FLAGS_LEN, dtype=torch.int64)
         self.pad_tensor = param(dtype=torch.int64)
 
 
 class _SubwordFlagEmb(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_size: int):
         super().__init__()
-        self.cont_emb = nn.Embedding(2, H)
-        self.is_continuation = param(131073, dtype=torch.int64)
+        self.cont_emb = nn.Embedding(_CONT_FLAG_CATS, hidden_size)
+        self.is_continuation = param(_CONT_FLAGS_LEN, dtype=torch.int64)
         self.pad_tensor = param(dtype=torch.int64)
 
 
 class EmbedSubword(nn.Module):
-    def __init__(self):
+    def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.backbone = _EncoderBackbone(n_layers=1)
-        self.embed_tokens = nn.Embedding(257, H)
-        self.proj_embedding = nn.Linear(H, H, bias=False)
-        self.bos_eos_emb = _BosEosEmb()
-        self.subword_flag_emb = _SubwordFlagEmb()
+        h = config.hidden_size
+        self.hidden_size = h
+        self.head_dim = config.head_dim
+        self.rope_theta_local = config.rope_theta_local
+        self.eps = config.rms_norm_eps
+        self.backbone = _EncoderBackbone(config, n_layers=1)
+        self.embed_tokens = nn.Embedding(_CHAR_VOCAB, h)
+        self.proj_embedding = nn.Linear(h, h, bias=False)
+        self.bos_eos_emb = _BosEosEmb(h)
+        self.subword_flag_emb = _SubwordFlagEmb(h)
 
     def encode_chars(self, char_ids: torch.Tensor, char_lengths: torch.Tensor) -> torch.Tensor:
         """Char-aware subword pooling: embed char ids, run the T5Gemma encoder
-        (bidirectional, rope theta 10000) with a key-padding mask, mean-pool over
-        valid chars, and project. ``char_ids`` [N, Lc], ``char_lengths`` [N] ->
-        ``[N, H]``."""
+        (bidirectional, rope ``rope_theta_local``) with a key-padding mask,
+        mean-pool over valid chars, and project. ``char_ids`` [N, Lc],
+        ``char_lengths`` [N] -> ``[N, H]``."""
         n, lc = char_ids.shape
         char_mask = torch.arange(lc, device=char_ids.device)[None, :] < char_lengths[:, None]  # [N, Lc]
         char_embeds = self.embed_tokens(char_ids)  # [N, Lc, H]
 
-        cos, sin = _rope_cos_sin(torch.arange(lc, device=char_ids.device), ROPE_THETA_LOCAL, HEAD_DIM)
+        cos, sin = _rope_cos_sin(
+            torch.arange(lc, device=char_ids.device), self.rope_theta_local, self.head_dim
+        )
         neg = torch.finfo(char_embeds.dtype).min
         attn_bias = torch.where(char_mask[:, None, None, :], 0.0, neg).to(char_embeds.dtype)  # [N,1,1,Lc]
 
         # T5Gemma encoder scales the input embeddings by sqrt(hidden_size).
-        x = char_embeds * (H ** 0.5)
+        x = char_embeds * (self.hidden_size ** 0.5)
         for layer in self.backbone.encoder.layers:
             x = layer(x, cos, sin, attn_bias)
-        x = _gemma_rmsnorm(x, self.backbone.encoder.norm.weight)
+        x = _gemma_rmsnorm(x, self.backbone.encoder.norm.weight, self.eps)
 
         masked_sum = (x * char_mask.unsqueeze(-1)).sum(dim=1)
         mean_emb = masked_sum / char_lengths.unsqueeze(-1).clamp(min=1)
@@ -260,12 +277,12 @@ class EmbedSubword(nn.Module):
         tokenizer). ``subword_ids``/``subword_mask`` are [B, T]."""
         out_emb = self.encode_chars(char_ids, char_lengths)  # [N, H]
         subword_embeds = torch.zeros(
-            subword_ids.shape + (H,), device=subword_ids.device, dtype=out_emb.dtype
+            subword_ids.shape + (self.hidden_size,), device=subword_ids.device, dtype=out_emb.dtype
         )
         subword_embeds[subword_mask] = out_emb
 
         # continuation-flag embedding (index 0 forced to zero in the checkpoint)
-        vocab = self.subword_flag_emb.cont_emb.num_embeddings  # 2
+        vocab = self.subword_flag_emb.cont_emb.num_embeddings
         pad = self.subword_flag_emb.is_continuation.numel() - 1
         safe = torch.where(subword_ids >= pad, torch.full_like(subword_ids, pad), subword_ids)
         cont_flags = self.subword_flag_emb.is_continuation[safe]
@@ -280,12 +297,15 @@ class EmbedSubword(nn.Module):
 
 
 class GatedFusion(nn.Module):
-    def __init__(self):
+    def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.audio_proj = nn.Linear(H, H, bias=True)
-        self.text_proj = nn.Linear(H, H, bias=True)
-        self.final_norm = RMSNorm(H)
-        self.gate = param(H)
+        h = config.hidden_size
+        self.num_quantizers = config.num_quantizers
+        self.eps = config.rms_norm_eps
+        self.audio_proj = nn.Linear(h, h, bias=True)
+        self.text_proj = nn.Linear(h, h, bias=True)
+        self.final_norm = RMSNorm(h)
+        self.gate = param(h)
         self.residual_scale = param()  # scalar
 
     def forward(self, audio_emb: torch.Tensor, text_emb: torch.Tensor) -> torch.Tensor:
@@ -295,40 +315,50 @@ class GatedFusion(nn.Module):
         ``gate`` and scalar ``residual_scale`` are sigmoided in fp32.
         """
         dtype = audio_emb.dtype
-        audio_emb = audio_emb / NUM_QUANTIZERS
+        audio_emb = audio_emb / self.num_quantizers
         audio_h = F.linear(audio_emb, self.audio_proj.weight, self.audio_proj.bias)
         text_h = F.linear(text_emb, self.text_proj.weight, self.text_proj.bias)
         gate = torch.sigmoid(self.gate.float())
         res = torch.sigmoid(self.residual_scale.float())
         h = gate.to(dtype) * audio_h + (1.0 - gate).to(dtype) * text_h
         h = res.to(dtype) * h
-        h = _gemma_rmsnorm(h.float(), self.final_norm.weight).to(dtype)
+        h = _gemma_rmsnorm(h.float(), self.final_norm.weight, self.eps).to(dtype)
         return h
 
 
 class _MogMLP(nn.Module):
-    def __init__(self):
+    def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.mlp = GatedMLP(H, FF, activation="gelu_tanh", bias=False)
-        self.pre_norm = RMSNorm(H)
-        self.post_norm = RMSNorm(H)
+        h = config.hidden_size
+        self.mlp = GatedMLP(h, config.mog_intermediate_size, activation="gelu_tanh", bias=False)
+        self.pre_norm = RMSNorm(h)
+        self.post_norm = RMSNorm(h)
 
 
 class MogHead(nn.Module):
     """Mixture-of-gaussians output head over the RVQ latent space.
 
-    ``mlp_stack`` is 3 gated-MLP blocks followed by a bare scale vector
-    (index 3, ``mlp_stack.3.weight`` [H]).
+    ``mlp_stack`` is ``mog_num_layers`` gated-MLP blocks followed by a bare
+    scale vector (final index, ``mlp_stack.<n>.weight`` [H]).
     """
 
-    def __init__(self, n_mlp: int = 3):
+    def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.low_mat = param(CODEBOOK, CODE_DIM, 64)
-        self.mlp_stack = nn.ModuleList([_MogMLP() for _ in range(n_mlp)] + [RawWeight(H)])
-        self.proj_else = nn.Linear(H, CODE_DIM, bias=False)
-        self.proj_logits = nn.Linear(H, CODEBOOK, bias=False)
-        self.proj_logs = nn.Linear(H, 1, bias=False)
-        self.proj_mus = nn.Linear(H, 65536, bias=False)
+        h = config.hidden_size
+        self.num_predictions = config.mog_num_predictions
+        self.low_rank = config.mog_low_rank
+        self.out_size = config.code_dim
+        self.min_log_std = config.mog_min_log_std
+        self.eps = config.mog_eps
+        self.num_layers = config.mog_num_layers
+        self.low_mat = param(self.num_predictions, self.out_size, self.low_rank)
+        self.mlp_stack = nn.ModuleList(
+            [_MogMLP(config) for _ in range(self.num_layers)] + [RawWeight(h)]
+        )
+        self.proj_else = nn.Linear(h, self.out_size, bias=False)
+        self.proj_logits = nn.Linear(h, self.num_predictions, bias=False)
+        self.proj_logs = nn.Linear(h, 1, bias=False)
+        self.proj_mus = nn.Linear(h, self.num_predictions * self.low_rank, bias=False)
 
     def forward(self, x: torch.Tensor):
         """Deterministic (training-style) MoG head forward.
@@ -337,50 +367,51 @@ class MogHead(nn.Module):
           * ``logits`` [b, t, num_predictions] mixture weights
           * ``mus``    [b, t, num_predictions, low_rank] low-rank means
           * ``mu_res`` [b, t, out_size] residual mean
-          * ``logs``   [b, t, 1] log std, clamped to ``MIN_LOG_STD``
+          * ``logs``   [b, t, 1] log std, clamped to ``mog_min_log_std``
         """
         b, t, _ = x.shape
-        # mlp_stack: 3 residual MLPLayers (pre_norm -> mlp -> post_norm) then a final RMSNorm.
-        for block in self.mlp_stack[:3]:
-            y = _gemma_rmsnorm(x, block.pre_norm.weight)
+        # mlp_stack: residual MLPLayers (pre_norm -> mlp -> post_norm) then a final RMSNorm.
+        for block in self.mlp_stack[: self.num_layers]:
+            y = _gemma_rmsnorm(x, block.pre_norm.weight, self.eps)
             y = block.mlp(y)
-            y = _gemma_rmsnorm(y, block.post_norm.weight)
+            y = _gemma_rmsnorm(y, block.post_norm.weight, self.eps)
             x = x + y
-        x = _gemma_rmsnorm(x, self.mlp_stack[3].weight)
+        x = _gemma_rmsnorm(x, self.mlp_stack[self.num_layers].weight, self.eps)
 
         logits = F.linear(x, self.proj_logits.weight)
-        mus = F.linear(x, self.proj_mus.weight).view(b, t, NUM_PREDICTIONS, LOW_RANK)
-        logs = F.linear(x, self.proj_logs.weight).clamp_min(MIN_LOG_STD)
+        mus = F.linear(x, self.proj_mus.weight).view(b, t, self.num_predictions, self.low_rank)
+        logs = F.linear(x, self.proj_logs.weight).clamp_min(self.min_log_std)
         mu_res = F.linear(x, self.proj_else.weight)
         return logits, mus, mu_res, logs
 
 
 class _Backbone(nn.Module):
-    def __init__(self):
+    def __init__(self, config: EarTTSConfig):
         super().__init__()
-        self.layers = nn.ModuleList([TalkerLayer() for _ in range(NUM_LAYERS)])
-        self.norm = RMSNorm(H)
+        self.layers = nn.ModuleList([TalkerLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size)
 
 
 class EarTTSTalker(nn.Module):
     def __init__(self, config: EarTTSConfig, voices=("Aria",)):
         super().__init__()
         self.config = config
-        self.embed_code = nn.Linear(CODE_DIM, H, bias=False)
-        self.backbone = _Backbone()
-        self.embed_subword = EmbedSubword()
-        self.gated_fusion_audio_text = GatedFusion()
-        self.mog_head = MogHead()
+        h = config.hidden_size
+        self.embed_code = nn.Linear(config.code_dim, h, bias=False)
+        self.backbone = _Backbone(config)
+        self.embed_subword = EmbedSubword(config)
+        self.gated_fusion_audio_text = GatedFusion(config)
+        self.mog_head = MogHead(config)
         # bespoke embeddings / tables
-        self.bos_emb = param(H)
-        self.null_emb = param(H)
-        self.audio_prompt_projection_W = param(H, H)
-        self.rvq_embs = param(NUM_QUANTIZERS, CODEBOOK, CODE_DIM)
+        self.bos_emb = param(h)
+        self.null_emb = param(h)
+        self.audio_prompt_projection_W = param(h, h)
+        self.rvq_embs = param(config.num_quantizers, config.codebook_size, config.code_dim)
         # top-level tts_model.* buffers (loaded via the talker node)
         self._control_codes = param(3, dtype=torch.int64)
-        self.codec_silence_tokens = param(NUM_QUANTIZERS, dtype=torch.int64)
+        self.codec_silence_tokens = param(config.num_quantizers, dtype=torch.int64)
         self.audio_prompt_latents = nn.ParameterDict(
-            {v: param(1, 37, H) for v in voices}
+            {v: param(1, _AUDIO_PROMPT_FRAMES, h) for v in voices}
         )
 
     def depthsum_embedding(self, code: torch.Tensor) -> torch.Tensor:
@@ -398,22 +429,23 @@ class EarTTSTalker(nn.Module):
     def backbone_forward(self, inputs_embeds: torch.Tensor, position_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Gemma3-text decoder stack over ``inputs_embeds`` [b, t, H].
 
-        Full-attention layers (``(i+1) % 6 == 0``) use rope_theta 1e6; the rest
-        (sliding-attention) use rope_local_base_freq 1e4. For sequences shorter
-        than the 7500 sliding window the two mask identically (plain causal), so
-        only the rope base differs between layer types.
+        Full-attention layers (``(i+1) % sliding_window_pattern == 0``) use
+        ``rope_theta_full``; the rest (sliding-attention) use
+        ``rope_theta_local``. For sequences shorter than the sliding window the
+        two mask identically (plain causal), so only the rope base differs.
         """
+        cfg = self.config
         b, t, _ = inputs_embeds.shape
         if position_ids is None:
             position_ids = torch.arange(t, device=inputs_embeds.device)
-        cos_g, sin_g = _rope_cos_sin(position_ids, ROPE_THETA_GLOBAL, HEAD_DIM)
-        cos_l, sin_l = _rope_cos_sin(position_ids, ROPE_THETA_LOCAL, HEAD_DIM)
+        cos_g, sin_g = _rope_cos_sin(position_ids, cfg.rope_theta_full, cfg.head_dim)
+        cos_l, sin_l = _rope_cos_sin(position_ids, cfg.rope_theta_local, cfg.head_dim)
         x = inputs_embeds
         for i, layer in enumerate(self.backbone.layers):
-            full = (i + 1) % SLIDING_WINDOW_PATTERN == 0
+            full = (i + 1) % cfg.sliding_window_pattern == 0
             cos, sin = (cos_g, sin_g) if full else (cos_l, sin_l)
             x = layer(x, cos, sin)
-        x = _gemma_rmsnorm(x, self.backbone.norm.weight)
+        x = _gemma_rmsnorm(x, self.backbone.norm.weight, cfg.rms_norm_eps)
         return x
 
     def forward(
@@ -438,7 +470,7 @@ class EarTTSTalker(nn.Module):
         """
         code_embeds = self.embed_code(self.depthsum_embedding(code))
         if cond is None:
-            cond = code_embeds.new_zeros((1, 1, H))
+            cond = code_embeds.new_zeros((1, 1, self.config.hidden_size))
         inputs_embeds = self.gated_fusion_audio_text(code_embeds, cond)
         hidden_states = self.backbone_forward(inputs_embeds, position_ids)
 
