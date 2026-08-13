@@ -152,6 +152,11 @@ class EarTTSConfig:
     inference_guidance_scale: float = 0.5     # classifier-free guidance weight
     inference_noise_scale: float = 0.8        # MoG latent noise (z = mu + exp(logs)*eps*ns)
     inference_top_p: float = 0.8              # nucleus filter on the mixture logits
+    # The MoG/MaskGIT sampler is stochastic (noise + Gumbel). Draw it from a
+    # dedicated seeded generator (the reference does ``torch.manual_seed(0)`` before
+    # generation) so audio is reproducible AND does not land on rare collapse-to-
+    # constant-code RNG states that an uncontrolled global RNG occasionally hits.
+    inference_seed: int = 0
 
     sample_rate: int = 22050
 

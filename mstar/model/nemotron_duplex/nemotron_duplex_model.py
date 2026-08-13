@@ -164,6 +164,10 @@ class DuplexStream:
         self._codes_hist = None                # (1, n, num_q) accumulated RVQ codes
         self._emitted = 0                      # waveform samples already emitted
         self._t = 0
+        # Dedicated seeded RNG for the talker's stochastic MoG sampling — keeps the
+        # audio reproducible and off the rare collapse-to-constant-code states an
+        # uncontrolled global RNG hits (mirrors the reference's manual_seed).
+        self._talker_gen = torch.Generator(device=self.device).manual_seed(self.cfg.eartts.inference_seed)
         self._prime_prompt()                   # feed the system prompt (if any) first
 
     @torch.no_grad()
@@ -275,6 +279,7 @@ class DuplexStream:
             guidance_scale=cfg.eartts.inference_guidance_scale,
             noise_scale=cfg.eartts.inference_noise_scale,
             top_p=cfg.eartts.inference_top_p,
+            generator=self._talker_gen,
         )
         self._prev_codes = codes
         # Codec has a multi-frame (causal) receptive field, so decode the full code
@@ -713,10 +718,12 @@ class NemotronDuplexModel(Model):
         codec = self.get_submodule("audio_codec", device=device).codec
         text_stream = gen_text[:, prompt_len:]                 # (1, T') agent text per frame
 
+        gen = torch.Generator(device=device).manual_seed(self.config.eartts.inference_seed)
         gen_codes = talker.generate_codes(
             text_stream, self._talker_tokenizer(), speaker="Aria", temperature=temperature,
             text_eos_id=self.config.text_eos_id, text_pad_id=self.config.text_pad_id,
             speech_pad_id=self.config.eartts.codebook_size,   # speech-pad frame == all codebook_size
+            generator=gen,
         )                                                       # (1, T', num_q)
         code_len = torch.tensor([gen_codes.shape[1]], device=device)
         with torch.autocast(device_type="cuda", enabled=False):
