@@ -40,7 +40,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
 from mstar.engine.base import EngineType
 from mstar.engine.kv_cache_engine import KVCacheConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
@@ -48,6 +48,8 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.nemotron_duplex.config import NemotronDuplexConfig
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
+from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
@@ -388,58 +390,116 @@ class NemotronDuplexModel(Model):
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
+        """Full-duplex S2S pipeline as four async partitions (frame-synchronous):
+
+            Encoder --[audio_frame, FixedChunk(1)]--> LLM
+            LLM     --[new_token,   FixedChunk(1)]--> Talker
+            Talker  --[codec_tokens, LeftContext ]--> Codec
+
+        The LLM (nano) is a frame-driven decode loop: each iteration fuses one
+        streamed audio frame with the fed-back previous agent-text/function tokens
+        (AddFusion), samples the next agent text (main) + function (aux) token, emits
+        the text to the client, streams it to the talker, and feeds both back. An
+        optional system-prompt ``prefill_text`` primes the nano cache first.
+        """
+        # Encoder: audio chunk -> per-frame embeds, streamed one frame per LLM step.
+        encode = GraphNode(
+            name="conformer_encoder",
+            input_names=["audio_features"],
+            outputs=[StreamingGraphEdge(next_node="nano_llm", name="audio_frame", target_partition="LLM")],
+        )
+        # LLM: optional bulk system-prompt prefill (primes cache; persists the carry-in
+        # prev_text / prev_func), then the frame-synchronous decode loop.
         prefill_text = GraphNode(
             name="nano_llm",
             input_names=["text_inputs"],
             outputs=[
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="new_token",
-                    conductor_new_token=True,
-                    persist=True,
-                ),
+                GraphEdge(next_node=EMPTY_DESTINATION, name="prev_text", persist=True),
+                GraphEdge(next_node=EMPTY_DESTINATION, name="prev_func", persist=True),
             ],
         )
         decode = Loop(
             name="decode_loop",
             section=GraphNode(
                 name="nano_llm",
-                input_names=["text_inputs"],
+                input_names=["audio_frame", "prev_text", "prev_func"],
+                consumes_stream=True,
                 outputs=[
-                    GraphEdge(next_node="nano_llm", name="text_inputs"),
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="new_token",
-                        output_modality="text",
-                        conductor_new_token=True,
-                    ),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
+                              output_modality="text", conductor_new_token=True),
+                    GraphEdge(next_node="nano_llm", name="prev_text"),   # fed-back agent text
+                    GraphEdge(next_node="nano_llm", name="prev_func"),   # fed-back function
+                    StreamingGraphEdge(next_node="eartts_talker", name="new_token",
+                                       target_partition="Talker"),
                 ],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
         )
-        return dict(prefill_text=prefill_text, decode=decode)
+        # Talker: each streamed agent token -> RVQ codes, streamed to the codec.
+        talker_decode = Loop(
+            name="talker_decode_loop",
+            section=GraphNode(
+                name="eartts_talker",
+                input_names=["new_token"],
+                consumes_stream=True,
+                outputs=[StreamingGraphEdge(next_node="audio_codec", name="codec_tokens",
+                                            target_partition="Codec")],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
+        )
+        # Codec: code window -> 22.05 kHz PCM chunk -> client.
+        codec_chunk = GraphNode(
+            name="audio_codec",
+            input_names=["codec_tokens"],
+            consumes_stream=True,
+            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
+        )
+        return dict(encode=encode, prefill_text=prefill_text, decode=decode,
+                    talker_decode=talker_decode, codec_chunk=codec_chunk)
 
-    @staticmethod
-    def _duplex_design() -> str:
-        """Phase 6 target (documentation only).
+    def get_partitions(self) -> list[PartitionDefinition]:
+        return [
+            PartitionDefinition(
+                name="Encoder", graph_walks={"encode"}, initial_walk="encode",
+                producer_partitions=[],
+            ),
+            PartitionDefinition(
+                name="LLM", graph_walks={"prefill_text", "decode"}, initial_walk="prefill_text",
+                producer_partitions=["Encoder"],
+            ),
+            PartitionDefinition(
+                name="Talker", graph_walks={"talker_decode"}, initial_walk="talker_decode",
+                producer_partitions=["LLM"],
+            ),
+            PartitionDefinition(
+                name="Codec", graph_walks={"codec_chunk"}, initial_walk="codec_chunk",
+                producer_partitions=["Talker"],
+            ),
+        ]
 
-        Nodes/partitions:
-            ENC  partition: conformer_encoder  (prefill_audio) — emits
-                 ``combined_embeds`` -> nano_llm and streaming ``transcript_token``
-                 -> EMIT_TO_CLIENT (modality "text").
-            LLM  partition: nano_llm (prefill_text | prefill_audio | decode) —
-                 streams ``new_token`` (agent text) to the client and a talker
-                 conditioning signal to the TTS partition via StreamingGraphEdge.
-            TTS  partition: eartts_talker (tts_decode Loop) -> audio_codec
-                 (codec_chunk) -> EMIT_TO_CLIENT (modality "audio"), with a
-                 SlidingWindowChunkPolicy on the talker->codec connection
-                 (Orpheus pattern) for low-latency 22.05 kHz output.
+    def get_partition_topology(self) -> PartitionTopology:
+        eartts = self.config.eartts
+        return PartitionTopology(partitions=["Encoder", "LLM", "Talker", "Codec"], connections=[
+            # one audio frame per nano decode step
+            Connection(from_partition="Encoder", to_partition="LLM", edge_name="audio_frame",
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True)),
+            # one agent token per talker step
+            Connection(from_partition="LLM", to_partition="Talker", edge_name="new_token",
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True)),
+            # codec needs left context for its causal receptive field
+            Connection(from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
+                       chunk_policy_factory=lambda: LeftContextChunkPolicy(
+                           chunk=eartts.codec_chunk_frames, left_context=eartts.codec_left_context_frames)),
+        ])
 
-        Requires overriding get_partition_topology / get_partitions and routing
-        cross-partition tensors with StreamingGraphEdge (target_partition=...).
-        """
-        return "see docstring"
+    def get_aux_sampling_configs(self, node_name: str, model_kwargs: dict | None = None) -> dict:
+        # The nano samples a second (function) token per frame alongside agent text;
+        # it is fed back into the next frame's AddFusion. Greedy (like the reference).
+        if node_name == "nano_llm":
+            return {"function": SamplingConfig(temperature=0.0)}
+        return {}
 
     # -------------------------------------------------------------------
     # Prompt processing
