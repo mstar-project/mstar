@@ -144,6 +144,15 @@ class EarTTSConfig:
     mog_intermediate_size: int = 4608
     mog_eps: float = 1e-6
 
+    # --- MaskGIT / MoG inference sampling (reference ``_get_generation_config``) ---
+    # Real speech needs classifier-free guidance + injected noise + top-p mixture
+    # sampling; without them the MoG head collapses to (near-)silent codes.
+    mog_exponent: float = 3.0                 # masking-schedule exponent
+    inference_num_iter: int = 8               # MaskGIT unmasking iterations
+    inference_guidance_scale: float = 0.5     # classifier-free guidance weight
+    inference_noise_scale: float = 0.8        # MoG latent noise (z = mu + exp(logs)*eps*ns)
+    inference_top_p: float = 0.8              # nucleus filter on the mixture logits
+
     sample_rate: int = 22050
 
 
@@ -167,6 +176,13 @@ class ConformerSTTConfig:
     subsampling_factor: int = 8
     att_context_size: tuple[int, int] = (70, 0)
     output_dim: int = 4480                   # projection into the nano hidden size
+    # Right-context lookahead of the encoder, in output frames: the newest output
+    # frame is not final until this many more input frames arrive (the striding-conv
+    # subsampling has a small future receptive field even though attention is causal
+    # [70,0]). The streaming path holds back this many trailing frames so its
+    # re-encoded embeddings match the offline (full-clip) encoding exactly. Measured
+    # structurally as 1 frame (~80 ms) for this Fast-Conformer.
+    streaming_lookahead_frames: int = 1
 
     # --- mel preprocessor (``perception.preprocessor``) ---
     sample_rate: int = 16000
@@ -384,6 +400,11 @@ class NemotronDuplexConfig:
             mog_num_layers=mog["num_layers"],
             mog_intermediate_size=mog["intermediate_size"],
             mog_eps=mog["eps"],
+            mog_exponent=mog.get("exponent", 3.0),
+            inference_num_iter=tts.get("inference_num_iter", 8),
+            inference_guidance_scale=tts.get("inference_guidance_scale", 0.5),
+            inference_noise_scale=tts.get("inference_noise_scale", 0.8),
+            inference_top_p=tts.get("inference_top_p_or_k", 0.8),
         )
 
         enc = raw["model"]["stt"]["model"]["perception"]["encoder"]
