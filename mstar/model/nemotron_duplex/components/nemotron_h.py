@@ -332,24 +332,23 @@ class NemotronHForCausalLM(nn.Module):
     def forward(self, input_embeds, cache_handle, mamba_state=None) -> torch.Tensor:
         return self.llm(input_embeds, cache_handle=cache_handle, mamba_state=mamba_state)
 
-    def load_weights(self, weights):
-        """Load the nano subtree from the composite checkpoint.
+    @staticmethod
+    def remap(name: str) -> str | None:
+        """Map a composite-checkpoint key to a nano param path, or ``None`` to skip.
 
         The checkpoint bundles every stage under ``stt_model.`` / ``tts_model.``;
-        the remapper keeps only the LLM tensors (embed_tokens / lm_head /
-        function_head / llm.*) and drops the rest (perception, rnnt, tts) so the
-        stream loads cleanly into this module alone.
+        keep only the LLM tensors (embed_tokens / lm_head / function_head / llm.*)
+        and drop the rest (perception, rnnt, tts) so the stream loads cleanly
+        into this module alone.
         """
+        if not name.startswith("stt_model."):
+            return None
+        rest = name[len("stt_model."):]
+        if rest.startswith(("embed_tokens.", "lm_head.", "function_head.", "llm.")):
+            return rest
+        return None
+
+    def load_weights(self, weights):
         from mstar.model.loader import load_hf_weights
 
-        keep_after_stt = ("embed_tokens.", "lm_head.", "function_head.", "llm.")
-
-        def name_remapper(name: str) -> str | None:
-            if not name.startswith("stt_model."):
-                return None
-            rest = name[len("stt_model."):]
-            if rest.startswith(keep_after_stt):
-                return rest
-            return None
-
-        return load_hf_weights(self, weights, stacked_params=[], name_remapper=name_remapper)
+        return load_hf_weights(self, weights, stacked_params=[], name_remapper=self.remap)
