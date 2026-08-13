@@ -31,6 +31,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     ModelInputsFromEngine,
+    NodeInputs,
     NodeSubmodule,
 )
 
@@ -260,8 +261,25 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     def get_stateless_flavor(self) -> str:
         return "audio_codec"
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-        raise NotImplementedError("AudioCodecDecoderSubmodule.forward — Phase 5 (audio-out).")
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        # ``codec_tokens`` is the streamed RVQ code window (T, num_q) — under a
+        # LeftContextChunkPolicy it carries `left_context` prior frames + the new
+        # `chunk` frames; we decode the whole window and emit only the new tail so
+        # the causal codec has enough left context (mirrors the standalone
+        # DuplexStream "decode history, emit tail" and Orpheus/Qwen streaming codec).
+        codes = inputs["codec_tokens"][0]
+        n_new = int(inputs["codec_tokens"][1].item()) if len(inputs["codec_tokens"]) > 1 else codes.shape[-2]
+        return NodeInputs(tensor_inputs={"codes": codes}, kwargs={"n_new": n_new})
 
-    def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        raise NotImplementedError("AudioCodecDecoderSubmodule.forward — Phase 5 (audio-out).")
+    def forward(self, graph_walk, engine_inputs, codes=None, n_new=None, **kwargs) -> NameToTensorList:
+        if codes.dim() == 2:
+            codes = codes.unsqueeze(0)                                  # (1, T, num_q)
+        T = codes.shape[1]
+        code_len = torch.tensor([T], device=codes.device)
+        with torch.autocast(device_type="cuda", enabled=False):
+            audio, _ = self.codec.decode(codes.long(), code_len)        # (1, 1, samples)
+        wav = audio.squeeze(1)[0]                                       # (samples,)
+        if n_new is not None and n_new < T:                            # emit only the new tail
+            spf = wav.shape[0] // T
+            wav = wav[-n_new * spf:]
+        return {"audio_chunk": [(wav.clamp(-1, 1) * 32767).to(torch.int16)]}
