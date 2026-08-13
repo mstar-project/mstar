@@ -7,11 +7,10 @@ from typing import Any
 
 import torch
 
-from mstar.conductor.request_info import PerLabelSeqInfo
 from mstar.engine.kv_store import TransferEngineInfo
 from mstar.engine.resources.base import PublishedInfo, Resource
-from mstar.engine.resources.spec import KVReqConfig, NodeResourceSpec, ResourceType
-from mstar.engine.resources.step import AdmitOutcome, AllocationFailed, KVStep, StepContext
+from mstar.engine.resources.spec import KVReqConfig
+from mstar.engine.resources.step import AdmitOutcome, AllocationFailed, KVStep, Segment, StepContext
 from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec
 from mstar.engine.v1.kv_transfer import KVTransferManager
 
@@ -116,6 +115,16 @@ class PublishedKVInfo(PublishedInfo):
     info: dict[int, dict[str, KVSequenceInfo]] = field(default_factory=dict)
     world_size: int = 1
 
+    @classmethod
+    def build_for_rank(
+        cls, rank: int, world_size: int, 
+        seq_info: dict[str, KVSequenceInfo]
+    ):
+        return cls(
+            info={rank: seq_info},
+            world_size=world_size
+        )
+
     def update(self, other: "PublishedKVInfo"):
         for key, val in other.info.items():
             if key not in self.info:
@@ -134,6 +143,17 @@ class PublishedKVInfo(PublishedInfo):
 class AllocResult:
     success: bool = True
     error: AllocationFailed | None = None
+
+
+@dataclass
+class SequenceView:
+    label: str
+    page_idxs: list[int]
+    length: int
+    start: int = 0
+
+    def last_page_len(self, page_size: int) -> int:
+        return (self.start + self.length)  % page_size
 
 
 class KVManager(Resource):
@@ -164,7 +184,6 @@ class KVManager(Resource):
         self._rank = parallel_rank
         self._world_size = world_size
         self._lock = threading.RLock()
-
 
     @classmethod
     def build(
@@ -269,9 +288,58 @@ class KVManager(Resource):
 
         return AdmitOutcome(ok=True)
 
-    # TODO: plan
+    def _sequence_views(self, segments: list[Segment]) -> list[SequenceView]:
+        views = []
+        for s in segments:
+            stream = self._streams[s.request_id][s.label]
+            views.append(SequenceView(
+                label=s.label, page_idxs=stream.page_indices,
+                length=s.span + stream.stored_len
+            ))
+        return views
 
-    # TODO: commit
+    def plan(self, step: KVStep, ctx: StepContext) -> dict[str, list[SequenceView]]:
+        """
+        Returns list of sequence views per plan label
+        """
+        label_to_segments: dict[str, list[Segment]] = {}
+        combined_labels = sum(step.combined_labels.keys(), start=set())
+        standalone_labels = set()
+
+        res = {}
+        for segment in step.segments:
+            label_to_segments.setdefault(segment.label, []).append(segment)
+            if segment.label not in combined_labels:
+                standalone_labels.add(segment.label)
+
+        for source_labels, plan_label in step.combined_labels.items():
+            views = []
+            for label in source_labels:
+                views.extend(self._sequence_views(label_to_segments[label]))
+            res[plan_label] = views
+
+        for label in standalone_labels:
+            res[label] = self._sequence_views(label_to_segments[label])
+        return res
+
+    def commit(self, step: KVStep):
+        for segment in step.segments:
+            if step.commit and segment.span > 0:
+                stream = self._streams[segment.request_id][segment.label]
+                stream.stored_len += segment.span
+        # TODO: handle retention policy, free pages if not commit
+    
+    def publish(self, request_id: str):
+        return PublishedKVInfo.build_for_rank(
+            rank=self._rank, world_size=self._world_size,
+            seq_info={
+                label: KVSequenceInfo(
+                    seq_len=stream.stored_len,
+                    latest_kv_transfer_info=self._transfer.get_kv_transfer_info(),
+                    page_indices=stream.page_indices
+                ) for label, stream in self._streams[request_id].items()
+            }
+        )
 
     def remove_request(self, rid: str):
         if rid in self._streams:

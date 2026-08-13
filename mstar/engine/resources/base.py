@@ -4,9 +4,8 @@ from typing import Any
 
 import torch
 
-from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import AdmitOutcome, ResourceStep
+from mstar.engine.resources.step import AdmitOutcome, ResourceStep, StepContext
 
 
 class Resource(ABC):
@@ -43,11 +42,11 @@ class Resource(ABC):
 		return AdmitOutcome(ok=True, ready=True)
 
 	@abstractmethod
-	def admit(self, step: ResourceStep) -> AdmitOutcome:
+	def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
 		...
 
 	@abstractmethod
-	def plan(self, key: str, step: ResourceStep) -> None:
+	def plan(self, key: str, step: ResourceStep, ctx: StepContext) -> None:
 		...
 
 	@abstractmethod

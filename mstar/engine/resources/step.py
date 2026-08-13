@@ -1,5 +1,6 @@
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 
@@ -23,12 +24,34 @@ class ResourceStep:
 
 
 @dataclass(frozen=True)
+class BucketKey:
+    graph_walk: str
+    requires_cfg: bool
+    bs: int
+    num_tokens: int
+
+
+@dataclass(frozen=True)
+class SlotLease:
+    """attention `admit` gives to inform which slot to plan and replay
+
+    has no clean channel to plan/commit/release. see O."""
+    slot: int
+    bucket: BucketKey | None # None -> eagre
+    filler: tuple[Segment, ...]
+
+
+@dataclass(frozen=True)
 class StepContext:
     # engine-only
     request_ids: tuple[str, ...]
     graph_walk: str
     slot: int
-    capture: bool # default true or false? @nsagan: no default needed
+    capture: bool
+    # will get populated with the output of plan as previous steps 
+    # complete their plan stages
+    plan_results: dict[str, Any] = field(default_factory=dict)
+    slot_lease: SlotLease | None = None
 
 
 @dataclass(frozen=True)
@@ -45,8 +68,11 @@ class SubmoduleStep:
 
 @dataclass(frozen=True)
 class KVStep(ResourceStep):
-    write: bool
+    # write: bool # @nsagan: opting to remove this for now bc it's dead code
     commit: bool
+
+    # e.g., for batched CFG
+    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
 
