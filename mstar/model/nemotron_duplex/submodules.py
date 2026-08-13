@@ -216,11 +216,24 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         self.rnnt_joint = rnnt_joint
         self.config = config
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs):
-        raise NotImplementedError("ConformerEncoderSubmodule.forward — Phase 4 (audio-in).")
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        # ``audio_features`` is the raw 16 kHz mono waveform for this chunk; the
+        # Fast-Conformer perception does mel + subsampling + encoder internally.
+        wav = inputs["audio_features"][0]
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)                                     # (1, N)
+        if "audio_seqlens" in inputs:
+            lens = inputs["audio_seqlens"][0].to(wav.device)
+        else:
+            lens = torch.tensor([wav.shape[-1]], device=wav.device)
+        return NodeInputs(tensor_inputs={"wav": wav, "lens": lens})
 
-    def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        raise NotImplementedError("ConformerEncoderSubmodule.forward — Phase 4 (audio-in).")
+    def forward(self, graph_walk, engine_inputs, wav=None, lens=None, **kwargs) -> NameToTensorList:
+        # audio -> per-frame LLM-space embeddings (T, H). These are the *user-audio*
+        # channel; the nano node fuses them per frame with its own fed-back previous
+        # text/function tokens (AddFusion) before stepping — see the decode walk.
+        audio_embeds, _ = self.perception(wav, lens)                  # (1, T, H)
+        return {"audio_embeds": [audio_embeds[0]]}                    # (T, H)
 
 
 class EarTTSTalkerSubmodule(ARNodeSubmodule):
