@@ -57,15 +57,6 @@ class ScratchKVSpec(NodeResourceSpec):
         return ResourceType.SCRATCH_KV
 
 
-@dataclass
-class SamplerSpec(NodeResourceSpec):
-    config: SamplingConfig
-
-    @property
-    def resource_type(self):
-        return ResourceType.SAMPLER
-
-
 
 class ResourceReqConfig(ABC):
     @property
@@ -77,29 +68,6 @@ class ResourceReqConfig(ABC):
     def apply_conductor_config(self, **kwargs):
         pass
 
-
-@dataclass
-class SamplingReqConfig(ResourceReqConfig):
-    temperature: float = 0.6
-    top_k: int = 0
-    top_p: float = 1
-    ignore_eos: bool = False # used for benchmark parity
-    repetition_penalty: float = 1
-    _seed: int = 0 # set by the conductor
-
-    @property
-    def resource_type(self):
-        return ResourceType.SAMPLER
-
-    def apply_conductor_config(
-        self, seed: int=0,
-        **kwargs
-    ):
-        self._seed = seed
-
-    @property
-    def seed(self):
-        return self._seed
 
 
 @dataclass

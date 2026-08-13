@@ -1,11 +1,19 @@
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import AdmitOutcome, ResourceStep, StepContext
+from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
+
+
+@dataclass
+class CGSlotSpec:
+	bucket: BucketKey
+	slot: int
 
 
 class Resource(ABC):
@@ -14,8 +22,7 @@ class Resource(ABC):
 	def build(
 		cls, spec: NodeResourceSpec,
 		device: torch.device,
-		parallel_rank: int,
-		world_size: int,
+		comm_group: CommGroup | None,
 		**engine_kwargs
 	) -> "Resource":
 		...
@@ -46,14 +53,22 @@ class Resource(ABC):
 		...
 
 	@abstractmethod
-	def plan(self, key: str, step: ResourceStep, ctx: StepContext) -> None:
+	def plan(self, step: ResourceStep, ctx: StepContext) -> None:
 		...
 
 	@abstractmethod
-	def commit(self, step: ResourceStep) -> None:
+	def commit(self, step: ResourceStep, ctx: StepContext) -> None:
 		...
 
 	def publish(self, request_id: str) -> "PublishedInfo" | None:
+		return
+
+	def build_cuda_graph_buffers(
+		self, slots: list[CGSlotSpec],
+		max_bs: int, max_seq_len: int
+	) -> None:
+		# NOTE @nsagan: this should probably be refined; it was just the first
+		# thing that came to mind
 		return
 
 

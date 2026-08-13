@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from mstar.distributed.communication import CommGroup
 from mstar.engine.kv_store import TransferEngineInfo
 from mstar.engine.resources.base import PublishedInfo, Resource
 from mstar.engine.resources.spec import KVReqConfig
@@ -160,8 +161,7 @@ class KVManager(Resource):
     def __init__(
         self,
         cfg: KVConfig,
-        parallel_rank: int,
-        world_size: int,
+        comm_group: CommGroup | None,
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
@@ -181,8 +181,8 @@ class KVManager(Resource):
         # TODO: CPU page pool
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        self._rank = parallel_rank
-        self._world_size = world_size
+        self._rank = comm_group.rank if comm_group is not None else 0
+        self._world_size = comm_group.world_size if comm_group is not None else 1
         self._lock = threading.RLock()
 
     @classmethod
@@ -322,7 +322,7 @@ class KVManager(Resource):
             res[label] = self._sequence_views(label_to_segments[label])
         return res
 
-    def commit(self, step: KVStep):
+    def commit(self, step: KVStep, ctx: StepContext):
         for segment in step.segments:
             if step.commit and segment.span > 0:
                 stream = self._streams[segment.request_id][segment.label]

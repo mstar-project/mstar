@@ -337,6 +337,8 @@ class PagedKVCacheResource(Resource):
 
 
     def positions(self, request_id: str, label: str) -> int:
+        # NOTE @nsagan: I think we can pull out PE into a differet resource;
+        # I don't think it needs to ride on the paged KV resource
         """gets positions for PE planning. read only"""
 
     def labels(self, request_id: str) -> list[str]:
