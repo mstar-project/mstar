@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
@@ -40,6 +41,54 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _sample_text_token(
+    logits: torch.Tensor,          # (B, vocab)
+    generated: torch.Tensor,       # (B, T) tokens so far
+    step: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    special_ids: set | None = None,
+) -> torch.Tensor:
+    """Text-channel sampler — exact port of the reference ``_sample_text_token``.
+
+    Greedy when ``temperature==0``. Order: repetition/presence penalty ->
+    temperature -> top-p -> softmax + multinomial. If a row's argmax is a
+    special id, that row stays greedy. Function/ASR channels use plain argmax.
+    """
+    special_ids = special_ids or set()
+    if temperature == 0.0:
+        return logits.argmax(dim=-1)
+    sampled = logits.argmax(dim=-1).clone()
+    for b in range(logits.shape[0]):
+        if logits[b].argmax().item() in special_ids:
+            continue
+        lg = logits[b].clone()
+        if (repetition_penalty != 1.0 or presence_penalty != 0.0) and step > 0:
+            prev = generated[b, :step].unique()
+            if special_ids:
+                st = torch.tensor(list(special_ids), device=prev.device)
+                prev = prev[~torch.isin(prev, st)]
+            for tok in prev:
+                tid = tok.item()
+                if repetition_penalty != 1.0:
+                    lg[tid] = lg[tid] / repetition_penalty if lg[tid] > 0 else lg[tid] * repetition_penalty
+                if presence_penalty != 0.0:
+                    lg[tid] -= presence_penalty
+        if temperature != 1.0:
+            lg = lg / temperature
+        if top_p < 1.0:
+            s_lg, s_idx = torch.sort(lg, descending=True)
+            cum = torch.cumsum(torch.softmax(s_lg, dim=-1), dim=-1)
+            rm = cum > top_p
+            rm[1:] = rm[:-1].clone()
+            rm[0] = False
+            lg[s_idx[rm]] = float("-inf")
+        sampled[b] = torch.multinomial(torch.softmax(lg, dim=-1), num_samples=1).item()
+    return sampled
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -289,28 +338,49 @@ class NemotronDuplexModel(Model):
     @torch.no_grad()
     def offline_inference(
         self,
-        input_signal: torch.Tensor,       # (1, num_samples) 16 kHz mono
-        input_signal_lens: torch.Tensor,  # (1,)
-        prompt_tokens: torch.Tensor | None = None,  # (1, P) text token ids
+        input_signal: torch.Tensor,       # (B, num_samples) 16 kHz mono
+        input_signal_lens: torch.Tensor,  # (B,)
+        prompt_tokens: torch.Tensor | None = None,      # (B, P) text token ids, or None
+        prompt_token_lens: torch.Tensor | None = None,  # (B,)
         device: str = "cuda",
         temperature: float = 0.0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
         decode_audio: bool = True,
     ) -> dict:
-        """Duplex speech-to-speech offline inference (batch size 1, fp32, greedy).
+        """Duplex speech-to-speech offline inference (fp32).
 
         Frame-synchronous loop mirroring the reference: perception -> per-frame
-        [AddFusion(prev agent text, audio, prev function) -> nano step -> sample
-        text/function] -> talker emits RVQ codes -> codec -> waveform.
+        [AddFusion(prev agent text, audio, prev function) -> nano no-cache re-prefill
+        step -> sample text/function] -> talker RVQ codes -> codec -> waveform.
 
-        The nano uses the reference's Nemotron no-cache path: full re-prefill over
-        [0:t+1] each frame (reuses the verified ``offline_forward``).
-
-        Returns ``{tokens_text, tokens_function, tokens_audio, audio, audio_len}``.
-        TODO: talker sampling loop (``EarTTSTalker.infer_codes_one_step``) and the
-        text tokenizer (for detokenised ``text``) are being finalised; this method
-        returns token ids and — once those land — audio. Verify vs the NeMo ref.
+        Batched via a per-utterance loop — correct results for B>1; true continuous
+        batching is the Phase-B engine path. Greedy when temperature==0, else
+        temperature/top-p/repetition-penalty on the text channel (function/ASR
+        channels are always greedy). Returns
+        ``{tokens_text, tokens_function, tokens_audio, audio, audio_len, text}``.
         """
+        B = input_signal.shape[0]
+        outs = []
+        for b in range(B):
+            p = None
+            if prompt_tokens is not None:
+                pl = int(prompt_token_lens[b]) if prompt_token_lens is not None else prompt_tokens.shape[1]
+                p = prompt_tokens[b : b + 1, :pl]
+            outs.append(self._infer_one(
+                input_signal[b : b + 1], input_signal_lens[b : b + 1], p, device,
+                temperature, top_p, repetition_penalty, decode_audio,
+            ))
+        return self._collate(outs, decode_audio)
+
+    @torch.no_grad()
+    def _infer_one(
+        self, input_signal, input_signal_lens, prompt_tokens, device,
+        temperature, top_p, repetition_penalty, decode_audio,
+    ) -> dict:
+        """Single-utterance (B==1) duplex inference; see ``offline_inference``."""
         cfg = self.config
+        special_ids = {cfg.text_pad_id, cfg.text_bos_id, cfg.text_eos_id}
         # --- build the component modules (loads real weights) ---
         conf_sub = self.get_submodule("conformer_encoder", device=device)
         nano_sub = self.get_submodule("nano_llm", device=device)
@@ -345,14 +415,19 @@ class NemotronDuplexModel(Model):
             # last position's text + function logits (non-cache re-prefill).
             hidden = nano.llm.offline_forward(seq_embeds)      # (L, H)
             last = hidden[-1:]                                  # (1, H)
-            return nano.lm_head(last)[0], nano.function_head(last)[0]
+            return nano.lm_head(last), nano.function_head(last)  # (1, vocab) each
+
+        def sample_text(text_logits, step):
+            return _sample_text_token(
+                text_logits, gen_text, step, temperature, top_p, repetition_penalty, special_ids=special_ids,
+            )
 
         # frame 0: agent channel is BOS
         bos_emb = embed_tokens(torch.tensor([cfg.text_bos_id], device=device))  # (1, H)
         input_embeds[:, 0] = fuse(bos_emb, audio_embeds[:, 0], embed_tokens(gen_function[:, 0]))
         text_logits, function_logits = nano_step(input_embeds[0, :1])
         if prompt_len == 0:
-            gen_text[:, 0] = text_logits.argmax(-1)
+            gen_text[:, 0] = sample_text(text_logits, 0)
             gen_function[:, 0] = function_logits.argmax(-1)
 
         for t in range(1, T):
@@ -362,8 +437,7 @@ class NemotronDuplexModel(Model):
             if t < prompt_len:
                 continue  # prompt region: teacher-forced, no sampling
             text_logits, function_logits = nano_step(input_embeds[0, : t + 1])
-            # greedy (temperature==0). TODO: top-p / repetition-penalty sampling.
-            gen_text[:, t] = text_logits.argmax(-1)
+            gen_text[:, t] = sample_text(text_logits, t)
             gen_function[:, t] = function_logits.argmax(-1)
 
         result = {
@@ -371,11 +445,32 @@ class NemotronDuplexModel(Model):
             "tokens_function": gen_function,
             "prompt_len": prompt_len,
         }
-
-        # --- audio-out: talker -> RVQ codes -> codec -> waveform ---
         if decode_audio:
             result.update(self._decode_audio_path(gen_text, prompt_len, device, temperature))
         return result
+
+    def _collate(self, outs: list[dict], decode_audio: bool) -> dict:
+        """Pad + stack per-utterance results into batched tensors."""
+        pad_id = self.config.text_pad_id
+
+        def pad_last(x, n, value=0):
+            return F.pad(x, (0, n - x.shape[1]), value=value) if x.shape[1] < n else x
+
+        tmax = max(o["tokens_text"].shape[1] for o in outs)
+        res = {
+            "tokens_text": torch.cat([pad_last(o["tokens_text"], tmax, pad_id) for o in outs], dim=0),
+            "tokens_function": torch.cat([pad_last(o["tokens_function"], tmax, pad_id) for o in outs], dim=0),
+            "text": [self.tokenizer.decode(o["tokens_text"][0].tolist()) for o in outs],
+        }
+        if decode_audio and outs and "audio" in outs[0]:
+            cmax = max(o["tokens_audio"].shape[1] for o in outs)
+            res["tokens_audio"] = torch.cat(
+                [F.pad(o["tokens_audio"], (0, 0, 0, cmax - o["tokens_audio"].shape[1])) for o in outs], dim=0,
+            )
+            amax = max(o["audio"].shape[1] for o in outs)
+            res["audio"] = torch.cat([pad_last(o["audio"], amax) for o in outs], dim=0)
+            res["audio_len"] = torch.cat([o["audio_len"] for o in outs], dim=0)
+        return res
 
     def _decode_audio_path(self, gen_text, prompt_len, device, temperature):
         """Talker (autoregressive RVQ codes with char-vocab text conditioning) ->
