@@ -120,6 +120,15 @@ def _worker_process_target(
     )
     quiet_noisy_loggers()
 
+    # Some environments ship a cuDNN whose fused-attention (SDPA) backend cannot
+    # build execution plans for otherwise-standard shapes — observed with a mixed
+    # cu12/cu13 CUDA wheel set — and every attention forward then dies with
+    # "cuDNN Frontend error: No valid execution plans built". Opt in to dropping the
+    # cuDNN SDPA backend so torch falls back to Flash / memory-efficient / math.
+    if os.environ.get("MSTAR_DISABLE_CUDNN_SDPA", "").lower() in ("1", "true", "yes", "on"):
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        logger.info("Worker %s: disabled cuDNN SDPA backend (MSTAR_DISABLE_CUDNN_SDPA)", worker_id)
+
     from mstar.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
         [set(wg.section.get_nodes()) for wg in my_worker_graphs]
