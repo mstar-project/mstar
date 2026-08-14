@@ -78,7 +78,6 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         pos_info: dict[str, PositionInfo] = {},  # noqa: B006 - matches base signature
         **kwargs,
     ) -> ARNodeInputs:
-        logger.warning("NDTRACE nano.prepare_inputs walk=%s keys=%s", graph_walk, list(inputs.keys()))
         # Frame-synchronous decode: AddFusion of one streamed audio frame with the
         # fed-back previous agent-text + function tokens (the duplex input per frame).
         if "audio_frame" in inputs:
@@ -92,9 +91,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
 
     def _fuse_frame(self, inputs: NameToTensorList) -> ARNodeInputs:
         cfg = self.config
-        audio = inputs["audio_frame"][0]
-        audio = audio.unsqueeze(0) if audio.dim() == 1 else audio          # (1, H)
-        dev = audio.device
+        dev = self.embeddings.weight.device
 
         def _tok(name, default):
             if name in inputs and inputs[name]:
@@ -103,7 +100,15 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
 
         prev_text = _tok("prev_text", cfg.text_bos_id)                     # carry-in BOS
         prev_func = _tok("prev_func", cfg.text_pad_id)
-        fused = self.embeddings(prev_text) * cfg.agent_text_weight + audio * cfg.user_audio_weight
+        fused = self.embeddings(prev_text) * cfg.agent_text_weight
+        # ``audio_frame`` is normally this frame's encoder embedding; the terminal
+        # stream chunk (producer_done race) can arrive empty — run a no-audio step
+        # (the decode loop stops this iteration via the final-stream-chunk signal).
+        af = inputs.get("audio_frame") or []
+        if af:
+            audio = af[0]
+            audio = audio.unsqueeze(0) if audio.dim() == 1 else audio      # (1, H)
+            fused = fused + audio.to(dev) * cfg.user_audio_weight
         if cfg.use_function_head:
             fused = fused + self.embeddings(prev_func) * cfg.function_weight
         return ARNodeInputs(input_embeds=fused, input_seq_len=1)
@@ -212,17 +217,17 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        ignore_eos = request_info.sampling_config["nano_llm"].ignore_eos
+        # Frame-synchronous duplex: the nano emits exactly one agent-text token
+        # per audio frame, and text EOS (eos_token_id) is a NORMAL per-frame
+        # token (silence / agent-turn boundary), NOT end-of-generation. The
+        # decode loop therefore terminates when the audio_frame stream is
+        # exhausted (the final chunk carries is_final), NOT on EOS. Only the
+        # max-tokens backstop force-stops here.
         at_max = (
             request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
             >= request_info.max_tokens
         )
-        if (not ignore_eos and token == self.config.eos_token_id) or at_max:
-            return {"decode_loop"}
-        return set()
+        return {"decode_loop"} if at_max else set()
 
     def cleanup_request(self, request_id: str):
         # Drop this request's Mamba conv/ssm state (base clears request_states).
@@ -241,6 +246,13 @@ class ConformerEncoderSubmodule(NodeSubmodule):
     ``combined_embeds`` for the nano LLM and a streaming ``transcript_token``.
     Forward is Phase 4 (audio-in).
     """
+
+    # Run eager: the Fast-Conformer forward is variable-length (per-utterance
+    # audio), so torch.compile recompiles per shape, and the inductor/triton
+    # backend in this env raises ``cuda_utils has no attribute PyKernelArg`` on
+    # some shapes. The encoder runs once per request (not a hot decode loop), so
+    # eager is fine for correctness; revisit under the E6 perf pass.
+    disable_torch_compile = True
 
     def __init__(self, perception: nn.Module, rnnt_decoder: nn.Module, rnnt_joint: nn.Module,
                  config: NemotronDuplexConfig):
@@ -268,8 +280,11 @@ class ConformerEncoderSubmodule(NodeSubmodule):
         # one frame per nano step by the FixedChunkPolicy, where the nano node fuses
         # each with its fed-back previous text/function tokens (AddFusion).
         audio_embeds, _ = self.perception(wav, lens)                  # (1, T, H)
-        logger.warning("NDTRACE encoder.forward: produced audio_frame T=%d", audio_embeds.shape[1])
-        return {"audio_frame": [audio_embeds[0]]}                     # (T, H)
+        # Emit each frame as its own stream item so the LLM partition's
+        # FixedChunkPolicy(chunk=1) releases exactly one frame per nano decode
+        # step. Returning a single (T, H) tensor would be ONE stream item (the
+        # whole utterance), which the chunk policy could not slice per frame.
+        return {"audio_frame": list(audio_embeds[0])}                # T × (H,)
 
 
 class EarTTSTalkerSubmodule(ARNodeSubmodule):
@@ -332,7 +347,9 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         return codes
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, seen_token_mask=None, pos_info={}, **kwargs):  # noqa: B006
-        tok = inputs["agent_token"][0]
+        # The LLM streams the sampled agent text token under the edge name
+        # "new_token" (see the decode Loop's StreamingGraphEdge → eartts_talker).
+        tok = inputs["new_token"][0]
         return ARNodeInputs(input_ids=tok.reshape(1), input_seq_len=1)
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
@@ -357,38 +374,58 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
 
 class AudioCodecDecoderSubmodule(NodeSubmodule):
-    """RVQ codec decoder: talker codes → 22.05 kHz PCM (sliding-window stream).
+    """RVQ codec decoder: talker codes → 22.05 kHz PCM (streaming, left-context).
 
-    Weights loaded (verified); forward is Phase 5 (audio-out).
+    The codec is causal with a multi-frame receptive field, so decoding each
+    chunk in isolation clicks at the boundaries. Instead we keep a per-request
+    rolling context of the previous ``codec_left_context_frames`` code frames,
+    prepend it to each chunk of NEW frames, decode ``context + new``, and emit
+    ONLY the new frames' audio (trimming the context's samples). This is the
+    same "decode with left context, emit the new tail" math as the verified
+    standalone ``DuplexStream._talker_codec_frame`` / offline decode, but O(1)
+    per chunk instead of re-decoding the whole history.
     """
+
+    # Per-request context is a plain dict keyed by request id (like the nano /
+    # talker Option-A state) — not compile/capture-safe, so run eager.
+    disable_torch_compile = True
 
     def __init__(self, codec: nn.Module, config: NemotronDuplexConfig):
         super().__init__()
         self.codec = codec
         self.config = config
+        self._ctx: dict[str, torch.Tensor] = {}  # rid -> last left_context code frames (Lc, num_q)
 
     def get_stateless_flavor(self) -> str:
         return "audio_codec"
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
-        # ``codec_tokens`` is the streamed RVQ code window (T, num_q) — under a
-        # LeftContextChunkPolicy it carries `left_context` prior frames + the new
-        # `chunk` frames; we decode the whole window and emit only the new tail so
-        # the causal codec has enough left context (mirrors the standalone
-        # DuplexStream "decode history, emit tail" and Orpheus/Qwen streaming codec).
+        # ``codec_tokens`` is this chunk's NEW RVQ frames (T_new, num_q); the
+        # Talker→Codec connection uses a non-overlapping FixedChunkPolicy, so
+        # left context is supplied here from per-request state, not the stream.
         codes = inputs["codec_tokens"][0]
-        n_new = int(inputs["codec_tokens"][1].item()) if len(inputs["codec_tokens"]) > 1 else codes.shape[-2]
-        return NodeInputs(tensor_inputs={"codes": codes}, kwargs={"n_new": n_new})
+        return NodeInputs(tensor_inputs={"codes": codes})
 
-    def forward(self, graph_walk, engine_inputs, codes=None, n_new=None, **kwargs) -> NameToTensorList:
-        if codes.dim() == 2:
-            codes = codes.unsqueeze(0)                                  # (1, T, num_q)
-        T = codes.shape[1]
-        code_len = torch.tensor([T], device=codes.device)
+    def forward(self, graph_walk, engine_inputs, codes=None, **kwargs) -> NameToTensorList:
+        rid = engine_inputs.request_ids[0]
+        lc = self.config.eartts.codec_left_context_frames
+        if codes.dim() == 3:
+            codes = codes[0]                                            # (T_new, num_q)
+        elif codes.dim() == 1:
+            codes = codes.unsqueeze(0)                                  # single frame -> (1, num_q)
+        prev = self._ctx.get(rid)                                       # (n_ctx, num_q) or None
+        n_ctx = 0 if prev is None else prev.shape[0]
+        full = codes if prev is None else torch.cat([prev, codes], dim=0)
+        Tf = full.shape[0]
+        code_len = torch.tensor([Tf], device=full.device)
         with torch.autocast(device_type="cuda", enabled=False):
-            audio, _ = self.codec.decode(codes.long(), code_len)        # (1, 1, samples)
+            audio, _ = self.codec.decode(full.long().unsqueeze(0), code_len)  # (1, 1, samples)
         wav = audio.squeeze(1)[0]                                       # (samples,)
-        if n_new is not None and n_new < T:                            # emit only the new tail
-            spf = wav.shape[0] // T
-            wav = wav[-n_new * spf:]
-        return {"audio_chunk": [(wav.clamp(-1, 1) * 32767).to(torch.int16)]}
+        spf = wav.shape[0] // Tf                                        # samples per frame
+        new_wav = wav[n_ctx * spf:]                                     # emit only the new frames
+        self._ctx[rid] = full[-lc:].detach()                           # roll the context forward
+        return {"audio_chunk": [(new_wav.clamp(-1, 1) * 32767).to(torch.int16)]}
+
+    def cleanup_request(self, request_id: str):
+        self._ctx.pop(request_id, None)
+        super().cleanup_request(request_id)
