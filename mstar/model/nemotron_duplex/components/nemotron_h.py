@@ -564,7 +564,14 @@ class NemotronHBlock(nn.Module):
     def forward(self, hidden_states, cache_handle, mamba_state):
         residual = hidden_states
         normed = self.norm(hidden_states)
-        out = self.mixer(normed, cache_handle=cache_handle, mamba_state=mamba_state)
+        # Only the Mamba mixer consumes mamba_state; the attention mixer
+        # (paged KV via cache_handle) and the stateless MLP inherit the base
+        # Attention.forward(hidden_states, cache_handle) signature, which has no
+        # mamba_state parameter — passing it there is a TypeError.
+        if self.kind == "mamba":
+            out = self.mixer(normed, cache_handle=cache_handle, mamba_state=mamba_state)
+        else:  # attention / mlp
+            out = self.mixer(normed, cache_handle=cache_handle)
         return residual + out
 
     def offline_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
