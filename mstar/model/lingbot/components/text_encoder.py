@@ -22,6 +22,25 @@ class LingBotQwen3VLRMSNorm(nn.Module):
         return self.weight * hidden_states.to(dtype)
 
 
+def _resolve_rope_theta(config: Any) -> float:
+    """RoPE base, robust across transformers versions.
+
+    transformers <5 exposes ``Qwen3VLTextConfig.rope_theta`` directly; >=5 nests it
+    under the ``rope_parameters`` / ``rope_scaling`` dict. Prefer the flat attr, then
+    fall back to the nested dicts.
+    """
+    theta = getattr(config, "rope_theta", None)
+    if theta is None:
+        for attr in ("rope_parameters", "rope_scaling"):
+            params = getattr(config, attr, None)
+            if isinstance(params, dict) and params.get("rope_theta") is not None:
+                theta = params["rope_theta"]
+                break
+    if theta is None:
+        raise AttributeError("could not resolve rope_theta from the text config")
+    return float(theta)
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -51,7 +70,7 @@ class LingBotQwen3VLRotaryEmbedding(nn.Module):
         self.attention_scaling = 1.0
 
     def _make_inv_freq(self) -> torch.Tensor:
-        theta = float(self.config.rope_theta)
+        theta = _resolve_rope_theta(self.config)
         return 1.0 / (theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
 
     def reset_inv_freq(self, device: torch.device | str | None = None) -> None:
