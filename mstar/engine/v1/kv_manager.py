@@ -1,14 +1,14 @@
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-from enum import Enum
+import itertools
 import queue
 import threading
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.base import PublishedInfo, Resource
+from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import KVReqConfig
 from mstar.engine.resources.step import AdmitOutcome, AllocationFailed, KVStep, Segment, StepContext
 from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec
@@ -149,11 +149,88 @@ class AllocResult:
 class SequenceView:
     label: str
     page_idxs: list[int]
-    length: int
+    length: int # already resident + to_compute
+    to_compute: int # new for this step
     start: int = 0
 
     def last_page_len(self, page_size: int) -> int:
         return (self.start + self.length)  % page_size
+
+
+class PagedIndptrs(NamedTuple):
+    """The four int32 index tensors a FlashInfer prefill/decode wrapper's
+    ``plan`` consumes, built on CPU (so wrapper.plan's ``.to("cpu")`` is a
+    no-op — see ``FlashInferAttentionManager.plan``)."""
+
+    # TODO: qo_indptr is only needed for prefill; we should avoid computing it
+    # (+ doing the H2D) if possible during decode
+    qo_indptr: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_last_page_len: torch.Tensor
+
+    def to_device(self, device: torch.device):
+        return PagedIndptrs(
+            qo_indptr=self.qo_indptr.to(device, non_blocking=True),
+            paged_kv_indptr=self.paged_kv_indptr.to(device, non_blocking=True),
+            paged_kv_indices=self.paged_kv_indices.to(device, non_blocking=True),
+            paged_kv_last_page_len=self.paged_kv_last_page_len.to(device, non_blocking=True),
+        )
+
+    def to_kwargs_dict(self):
+        return dict(
+            qo_indptr=self.qo_indptr,
+            paged_kv_indptr=self.paged_kv_indptr,
+            paged_kv_indices=self.paged_kv_indices,
+            paged_kv_last_page_len=self.paged_kv_last_page_len
+        )
+
+
+def build_paged_indptrs(
+    segments: list[SequenceView],
+    page_size: int,
+) -> PagedIndptrs:
+    qo_indptr = [0]
+    kv_indptr = [0]
+    all_pages: list[int] = []
+    last_page_lens: list[int] = []
+    for s in segments:
+        qo_indptr.append(qo_indptr[-1] + s.to_compute)
+        all_pages.extend(s.page_idxs)
+        kv_indptr.append(kv_indptr[-1] + len(s.page_idxs))
+        last_page_lens.append(s.last_page_len(page_size) or page_size)
+    return PagedIndptrs(
+        qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
+        paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
+        paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),
+    )
+
+
+@dataclass
+class KVPlanOutput:
+    """
+    Output of KVManager.plan for a single label
+    """
+    cpu_indptrs: PagedIndptrs
+    cuda_indptrs: PagedIndptrs
+
+    def get_total_len(self):
+        lens = (self.cpu_indptrs.qo_indptr[1:] - self.cpu_indptrs.qo_indptr[:-1]).to(torch.int32)
+        return int(lens.sum().item())
+
+
+@dataclass
+class KVPlanState:
+    token_to_page: torch.Tensor
+    token_to_cache: torch.Tensor
+    total_tokens: int | None = None
+
+    def copy_(self, other: "KVPlanState"):
+        assert other.total_tokens is not None
+        self.token_to_cache[:other.total_tokens].copy_(other.token_to_cache)
+        self.token_to_page[:other.total_tokens].copy_(other.token_to_page)
+        self.total_tokens = other.total_tokens
 
 
 class KVManager(Resource):
@@ -182,7 +259,12 @@ class KVManager(Resource):
         self._overrides: dict[str, KVReqConfig] = {}
         self._rank = comm_group.rank if comm_group is not None else 0
         self._world_size = comm_group.world_size if comm_group is not None else 1
+        self._device = device
         self._lock = threading.RLock()
+
+        # (slot, label) -> KVPlanState
+        self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
+        self._current_plan_states: dict[str, KVPlanState] = {}
 
     @classmethod
     def build(
@@ -201,11 +283,28 @@ class KVManager(Resource):
             dtype=dtype
         )
 
+    def build_cuda_graph_buffers(
+        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+    ):
+        del max_bs
+        slot_numbers = {
+            s.slot for s in slots
+        }
+        labels = set(itertools.chain.from_iterable(
+            s.config.labels for s in slots
+        ))
+        for idx in slot_numbers:
+            for label in labels:
+                self._static_plan_states[(idx, label)] = KVPlanState(
+                    token_to_cache=torch.zeros(max_seq_len, dtype=torch.long, device=self._device),
+                    token_to_page=torch.zeros(max_seq_len, dtype=torch.long, device=self._device),
+                )
+
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
         self._streams[rid] = {
             "main": CacheStream()
         }
-        if overrides is not None:
+        if overrides is None:
             overrides = KVReqConfig()
         self._overrides[rid] = overrides
 
@@ -215,7 +314,6 @@ class KVManager(Resource):
         graph_walk: str,
         published: PublishedKVInfo
     ) -> AdmitOutcome:
-        del graph_walk
         # TODO: reload from CPU
 
         if published.world_size != self._world_size:
@@ -227,7 +325,8 @@ class KVManager(Resource):
             if label not in needed_labels:
                 continue
             if not self._check_ready(rid, label):
-                return False # read already in progress
+                # read already in progress: admitted, just not ready yet
+                return AdmitOutcome(ok=True, ready=False)
 
             stream = self._ensure_label(rid, label)
             new_len = seq_info.seq_len
@@ -235,7 +334,8 @@ class KVManager(Resource):
             if new_len <= old_len:
                 continue
 
-            alloc_res = self._alloc(rid, label, new_len - old_len)
+            # _alloc takes a total length, not a delta
+            alloc_res = self._alloc(rid, label, new_len)
             if not alloc_res.success:
                 return AdmitOutcome(
                     ok=False,
@@ -252,7 +352,7 @@ class KVManager(Resource):
             stream.read_pending = fut is not None
             stream.stored_len = new_len
 
-        ready = all((self._ensure_label(rid, label) for label in needed_labels))
+        ready = all(self._check_ready(rid, label) for label in needed_labels)
         return AdmitOutcome(
             ok=True, ready=ready
         )
@@ -268,9 +368,9 @@ class KVManager(Resource):
                     )
 
         for segment in step.segments:
-            stream = self._ensure_label(rid, segment.label)
             if segment.span == 0:
                 continue
+            stream = self._ensure_label(segment.request_id, segment.label)
             alloc_res = self._alloc(
                 segment.request_id,
                 segment.label,
@@ -291,16 +391,91 @@ class KVManager(Resource):
             stream = self._streams[s.request_id][s.label]
             views.append(SequenceView(
                 label=s.label, page_idxs=stream.page_indices,
-                length=s.span + stream.stored_len
+                length=s.span + stream.stored_len,
+                to_compute=s.span
             ))
         return views
 
-    def plan(self, step: KVStep, ctx: StepContext) -> dict[str, list[SequenceView]]:
+    def _compute_plan_state(
+        self, cuda_indptrs: PagedIndptrs,
+        total_tokens: int
+    ) -> KVPlanState:
+        qo_indptr = cuda_indptrs.qo_indptr
+        paged_kv_indptr = cuda_indptrs.paged_kv_indptr
+        paged_kv_last_page_len = cuda_indptrs.paged_kv_last_page_len
+        paged_kv_indices = cuda_indptrs.paged_kv_indices
+
+        # Compute per-token page and offset for vectorized KV writes
+        n_req = qo_indptr.shape[0] - 1
+        starts = qo_indptr[:-1].to(torch.int32)
+        lens = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)
+
+        # Pages/lengths AFTER append
+        num_pages_after = (
+            paged_kv_indptr[1:] - paged_kv_indptr[:-1]
+        ).to(torch.int32)
+        kv_len_after = (
+            (num_pages_after - 1) * self.kv_cache.page_size + paged_kv_last_page_len
+        )
+
+        # Flatten to per-token indices
+        # output_size keeps repeat_interleave from syncing to read `lens`
+        seg = torch.repeat_interleave(
+            torch.arange(n_req, dtype=torch.int32, device=self._device), lens,
+            output_size=total_tokens
+        )
+        intra = torch.arange(
+            total_tokens, dtype=torch.int32, device=self._device
+        ) - torch.repeat_interleave(starts, lens, output_size=total_tokens)
+
+        # Absolute KV position per token
+        start_new = kv_len_after[seg] - lens[seg]
+        g = start_new + intra
+
+        # Map to page + offset
+        page_off = torch.div(g, self.kv_cache.page_size, rounding_mode="floor").to(
+            torch.int32
+        )
+        off_in_page = (g - page_off * self.kv_cache.page_size).to(torch.int32)
+        abs_page_ptr = paged_kv_indptr[:-1][seg] + page_off
+
+        return KVPlanState(
+            token_to_page=paged_kv_indices[abs_page_ptr].to(torch.long),
+            token_to_cache=off_in_page.to(torch.long),
+            total_tokens=total_tokens
+        )
+
+    def _setup_plan_states(
+        self, plan_output: dict[str, KVPlanOutput],
+        ctx: StepContext
+    ):
+        for label, indptrs in plan_output.items():
+            plan_state = self._compute_plan_state(
+                indptrs.cuda_indptrs,
+                total_tokens=indptrs.get_total_len()
+            )
+            if ctx.slot_lease is not None:
+                static_state = self._static_plan_states[(ctx.slot_lease.slot, label)]
+                static_state.copy_(plan_state)
+                plan_state = static_state
+            self._current_plan_states[label] = plan_state
+
+
+    def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
+        indptrs = build_paged_indptrs(views, self.kv_cache.page_size)
+        return KVPlanOutput(
+            cpu_indptrs=indptrs,
+            cuda_indptrs=indptrs.to_device(self._device)
+        )
+
+    def plan(self, step: KVStep, ctx: StepContext) -> dict[str, KVPlanOutput]:
         """
         Returns list of sequence views per plan label
         """
         label_to_segments: dict[str, list[Segment]] = {}
-        combined_labels = sum(step.combined_labels.keys(), start=set())
+        combined_labels = set(itertools.chain.from_iterable(
+            step.combined_labels.keys()
+        ))
         standalone_labels = set()
 
         res = {}
@@ -313,10 +488,14 @@ class KVManager(Resource):
             views = []
             for label in source_labels:
                 views.extend(self._sequence_views(label_to_segments[label]))
-            res[plan_label] = views
+            res[plan_label] = self._plan_output(views)
 
         for label in standalone_labels:
-            res[label] = self._sequence_views(label_to_segments[label])
+            res[label] = self._plan_output(
+                self._sequence_views(label_to_segments[label])
+            )
+
+        self._setup_plan_states(res, ctx)
         return res
 
     def commit(self, step: KVStep, ctx: StepContext):
@@ -341,6 +520,10 @@ class KVManager(Resource):
     def remove_request(self, rid: str):
         if rid in self._streams:
             for stream in self._streams[rid].values():
+                if stream.read_future is not None:
+                    # the read's result is irrelevant here, but its pages
+                    # must not be reused until it finishes writing
+                    wait([stream.read_future])
                 self._arena.release(stream.page_indices)
 
         self._streams.pop(rid, None)
@@ -356,6 +539,7 @@ class KVManager(Resource):
             return True
         stream = self._streams[rid][label]
         if stream.read_future is not None and stream.read_future.done():
+            stream.read_future.result()
             stream.read_future = None
             stream.read_pending = False
         return not stream.read_pending
@@ -366,13 +550,19 @@ class KVManager(Resource):
     ) -> AllocResult:
         # TODO: handle realloc
         if from_label not in self._streams[rid]:
-            return
+            return AllocResult()
         from_stream = self._streams[rid][from_label]
         to_stream = self._ensure_label(rid, to_label)
         alloc_res = self._alloc(rid, to_label, from_stream.stored_len)
         if alloc_res.success:
             # TODO: only copy necessary pages
-            self._arena.copy_pages(from_stream.page_indices, to_stream.page_indices)
+            # the source can hold more pages than the fork needs (pages
+            # reserved for an uncommitted span), so copy only the prefix
+            self._arena.copy_pages(
+                from_stream.page_indices[:len(to_stream.page_indices)],
+                to_stream.page_indices
+            )
+            to_stream.stored_len = from_stream.stored_len
         return alloc_res
 
     def _alloc(
@@ -400,3 +590,33 @@ class KVManager(Resource):
                     )
                 stream.page_indices.extend(new_pages)
         return AllocResult()
+
+    ### Submodule-level functionality
+    def read_kv(self, layer_idx: int, plan_label: str) -> torch.Tensor:
+        """
+        The slots this step's plan writes, e.g. for NHD:
+        [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1).
+        """
+        plan_state = self._current_plan_states[plan_label]
+        n = plan_state.total_tokens
+        return self.kv_cache.read_tokens(
+            layer_idx=layer_idx,
+            page_idx=plan_state.token_to_page[:n],
+            cache_idx=plan_state.token_to_cache[:n],
+        )
+
+    def write_kv(
+        self, k: torch.Tensor, v: torch.Tensor,
+        layer_idx: int, label: str
+    ) -> torch.Tensor:
+        """Write K, V. Returns the slice of the KV cache that was just written.
+        """
+        plan_state = self._current_plan_states[label]
+        n = plan_state.total_tokens
+        return self.kv_cache.write_tokens(
+            layer_idx=layer_idx,
+            k=k[:n], v=v[:n],
+            page_idx=plan_state.token_to_page[:n],
+            cache_idx=plan_state.token_to_cache[:n],
+            return_tensor=True
+        )

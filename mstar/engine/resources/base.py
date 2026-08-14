@@ -5,14 +5,16 @@ from typing import Any
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.cuda_graph_config import CudaGraphConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 
-@dataclass
+@dataclass(frozen=True)
 class CGSlotSpec:
     bucket: BucketKey
     slot: int
+    config: CudaGraphConfig
 
 
 class Resource(ABC):
@@ -57,7 +59,7 @@ class Resource(ABC):
         return None
 
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
-        """record cstep consumption"""
+        """record step consumption"""
         return
 
     def publish(self, request_id: str) -> "PublishedInfo | None":

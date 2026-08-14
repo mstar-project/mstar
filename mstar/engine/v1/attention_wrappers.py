@@ -22,51 +22,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-@torch.compiler.disable
-def run_rms_norm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-06,
-    rms_norm_dtype=None
-):
-    orig_dtype = input.dtype
-    if rms_norm_dtype is not None:
-        input = input.to(rms_norm_dtype)
-    elif torch.is_autocast_enabled():
-        dtype = torch.get_autocast_dtype("cuda")
-        input = input.to(dtype)
-    elif input.dtype == torch.float32:
-        # Unsupported dtype; must recast
-        input = input.to(torch.bfloat16)
-
-    # flashinfer.norm.rmsnorm requires matching input/weight dtypes; cast weight
-    # to match whatever input ended up as.
-    if weight.dtype != input.dtype:
-        weight = weight.to(input.dtype)
-
-    import flashinfer
-    return flashinfer.norm.rmsnorm(
-        input, weight, eps=eps
-    ).to(orig_dtype)
-
-
-def run_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    scale: float=1.0,
-    causal: bool=True,
-):
-    import flashinfer
-    return flashinfer.single_prefill_with_kv_cache(
-        q,
-        k,
-        v,
-        causal=causal,
-        sm_scale=scale,
-    )
-
-
 class FlashInferPrefillWrapper:
     """Batched prefill attention with paged KV cache.
 
@@ -171,6 +126,7 @@ class FlashInferPrefillWrapper:
         paged_kv_last_page_len: torch.Tensor,
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
+        **kwargs
     ):
         """Plan attention and compute KV write indices.
 
@@ -199,64 +155,13 @@ class FlashInferPrefillWrapper:
             q_data_type=dtype,
         )
 
-        # Async H2D for the GPU-side per-token bookkeeping that follows.
-        if qo_indptr.device.type != "cuda":
-            qo_indptr = qo_indptr.to(self.device, non_blocking=True)
-            paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
-            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
-            paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
-
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
         # even if we're not in a cuda graph
         if not self.use_cuda_graph:
+            # TODO: take the cuda version as a kwarg
+            if qo_indptr.device.type != "cuda":
+                qo_indptr = qo_indptr.to(self.device, non_blocking=True)
             self._qo_indptr_buf = qo_indptr
-
-        # Compute per-token page and offset for vectorized KV writes
-        n_req = qo_indptr.shape[0] - 1
-        starts = qo_indptr[:-1].to(torch.int32)
-        lens = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)
-        total_tokens = int(lens.sum().item())
-        self._total_tokens = total_tokens
-
-        # Pages/lengths AFTER append
-        num_pages_after = (
-            paged_kv_indptr[1:] - paged_kv_indptr[:-1]
-        ).to(torch.int32)
-        kv_len_after = (
-            (num_pages_after - 1) * self.page_size + paged_kv_last_page_len
-        )
-
-        # Flatten to per-token indices
-        seg = torch.repeat_interleave(
-            torch.arange(n_req, dtype=torch.int32, device=self.device), lens
-        )
-        intra = torch.arange(
-            total_tokens, dtype=torch.int32, device=self.device
-        ) - torch.repeat_interleave(starts, lens)
-
-        # Absolute KV position per token
-        start_new = kv_len_after[seg] - lens[seg]
-        g = start_new + intra
-
-        # Map to page + offset
-        page_off = torch.div(g, self.page_size, rounding_mode="floor").to(
-            torch.int32
-        )
-        off_in_page = (g - page_off * self.page_size).to(torch.int32)
-        abs_page_ptr = paged_kv_indptr[:-1][seg] + page_off
-
-        token_to_page = paged_kv_indices[abs_page_ptr].to(torch.long)
-        token_to_cache = off_in_page.to(torch.long)
-
-        if self.use_cuda_graph:
-            self.token_to_page[:total_tokens].copy_(token_to_page)
-            self.token_to_cache[:total_tokens].copy_(token_to_cache)
-            if total_tokens < self.max_total_tokens:
-                self.token_to_page[total_tokens:] = 0
-                self.token_to_cache[total_tokens:] = 0
-        else:
-            self.token_to_page = token_to_page
-            self.token_to_cache = token_to_cache
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -270,25 +175,6 @@ class FlashInferPrefillWrapper:
             output: [total_tokens, num_qo_heads, head_dim]
         """
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
-
-    def set_kv_cache(
-        self,
-        kv_cache_layer: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ):
-        """Write K, V to the paged KV cache at pre-computed positions.
-
-        Args:
-            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
-            k: [total_tokens, num_kv_heads, head_dim]
-            v: [total_tokens, num_kv_heads, head_dim]
-        """
-        n = self._total_tokens
-        page_idx = self.token_to_page[:n]
-        cache_idx = self.token_to_cache[:n]
-        kv_cache_layer[page_idx, 0, cache_idx] = k[:n].to(self.dtype)
-        kv_cache_layer[page_idx, 1, cache_idx] = v[:n].to(self.dtype)
 
 
 class FlashInferDecodeWrapper:
@@ -359,26 +245,20 @@ class FlashInferDecodeWrapper:
                 paged_kv_last_page_len_buffer=self._paged_kv_last_page_len_buf,
                 backend=backend,
             )
-
-            # Static buffer for KV write locations: [batch_size, 2] = (page_idx, pos_idx)
-            self.kv_cache_locations = torch.zeros(
-                batch_size, 2, dtype=torch.long, device=device
-            )
         else:
             self.attn_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer, "NHD",
                 use_tensor_cores=True,
                 backend=backend,
             )
-            self.kv_cache_locations = None
 
     def plan(
         self,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
-        kv_cache_locations: torch.Tensor | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        **kwargs
     ):
         """Plan decode attention and compute KV write locations.
 
@@ -409,52 +289,6 @@ class FlashInferDecodeWrapper:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
-        # Async H2D before our own per-rid bookkeeping.
-        if paged_kv_indptr.device.type != "cuda":
-            if self.enable_nvtx:
-                range_push("flashinfer.decode.metadata_h2d", synchronize=False)
-            try:
-                paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
-                paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
-                paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
-            finally:
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
-
-        if kv_cache_locations is not None:
-            locations = kv_cache_locations
-            if locations.device.type != "cuda":
-                if self.enable_nvtx:
-                    range_push("flashinfer.decode.kv_location_h2d", synchronize=False)
-                try:
-                    locations = locations.to(self.device, non_blocking=True)
-                finally:
-                    if self.enable_nvtx:
-                        range_pop(synchronize=False)
-        else:
-            # Compute KV write locations: page and position for each request's new token
-            if self.enable_nvtx:
-                range_push("flashinfer.decode.kv_location_compute", synchronize=False)
-            try:
-                page_idx = paged_kv_indices[paged_kv_indptr[1:] - 1]
-                pos_idx = paged_kv_last_page_len - 1
-
-                locations = torch.stack([page_idx.to(torch.long), pos_idx.to(torch.long)], dim=1)
-            finally:
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
-
-        if self.use_cuda_graph:
-            if self.enable_nvtx:
-                range_push("flashinfer.decode.kv_location_copy", synchronize=False)
-            try:
-                self.kv_cache_locations[:n_req].copy_(locations)
-            finally:
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
-        else:
-            self.kv_cache_locations = locations
-
         self._n_req = n_req
         self.dtype = dtype
 
@@ -469,22 +303,3 @@ class FlashInferDecodeWrapper:
             output: [n_req, num_qo_heads, head_dim]
         """
         return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
-
-    def set_kv_cache(
-        self,
-        kv_cache_layer: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ):
-        """Write K, V for decode (1 token per request).
-
-        Args:
-            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
-            k: [n_req, num_kv_heads, head_dim]
-            v: [n_req, num_kv_heads, head_dim]
-        """
-        n = self._n_req
-        pages = self.kv_cache_locations[:n, 0]
-        positions = self.kv_cache_locations[:n, 1]
-        kv_cache_layer[pages, 0, positions] = k[:n].to(self.dtype)
-        kv_cache_layer[pages, 1, positions] = v[:n].to(self.dtype)

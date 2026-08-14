@@ -20,7 +20,13 @@ class KVConfig:
     max_seq_len: int
     max_num_pages: int = 2048
     page_size: int = 128
+    num_qo_heads: int = None
     layout: KVLayout=KVLayout.NHD
+
+    def __post_init__(self):
+        if self.num_qo_heads is None:
+            self.num_qo_heads = self.num_kv_heads
+
 
 @dataclass
 class KVSpec(NodeResourceSpec):
@@ -115,6 +121,48 @@ class KVCache:
             ) * element_size for kv_idx in [0, 1]
         ]
         return ptrs, nbytes
+
+    def layer_view(self, layer_idx: int) -> torch.Tensor:
+        """One layer's pages, in this cache's layout — what an attention
+        kernel consumes. NHD: [max_num_pages, 2, page_size, num_kv_heads,
+        head_dim]."""
+        if self.layout != KVLayout.NHD:
+            raise NotImplementedError(
+                f"layer_view is not implemented for layout {self.layout}."
+            )
+        return self.tensor[layer_idx]
+
+    def read_tokens(
+        self, layer_idx: int,
+        page_idx: torch.Tensor, cache_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather the (page, offset-in-page) slots written by ``write_tokens``.
+        Returns [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1);
+        it is a gather, so a copy rather than a view."""
+        if self.layout != KVLayout.NHD:
+            raise NotImplementedError(
+                f"read_tokens is not implemented for layout {self.layout}."
+            )
+        return self.tensor[layer_idx][page_idx, :, cache_idx]
+
+    def write_tokens(
+        self, layer_idx: int,
+        k: torch.Tensor, v: torch.Tensor,
+        page_idx: torch.Tensor, cache_idx: torch.Tensor,
+        return_tensor: bool=False
+    ) -> None:
+        """Scatter per-token K/V ([num_tokens, num_kv_heads, head_dim]) into
+        the (page, offset-in-page) slots given by ``page_idx``/``cache_idx``."""
+        if self.layout != KVLayout.NHD:
+            raise NotImplementedError(
+                f"write_tokens is not implemented for layout {self.layout}."
+            )
+        layer = self.tensor[layer_idx]
+        layer[page_idx, 0, cache_idx] = k.to(self.dtype)
+        layer[page_idx, 1, cache_idx] = v.to(self.dtype)
+
+        if return_tensor:
+            return layer[page_idx, :, cache_idx]
 
     def copy_pages(self, src_pages: list[int], dst_pages: list[int]) -> None:
         """Copy whole pages (every layer, both K and V, all tokens) within

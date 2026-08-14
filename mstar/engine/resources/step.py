@@ -115,7 +115,6 @@ class KVStep(ResourceStep):
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
     causal: bool = True
-    batched_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +126,8 @@ class PositionStep(ResourceStep):
 @dataclass(frozen=True)
 class SamplerStep(ResourceStep):
     apply_penalty: bool = True
+    # rid -> prefill tokens for the repetition penalty
+    prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory={})
 
 
 @dataclass

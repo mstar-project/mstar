@@ -61,6 +61,7 @@ class SamplerResource(Resource):
             device=device,
             tp_group=comm_group
         )
+        self._apply_penalty_this_step: bool = enable_repetion_penalty
         self._device = device
         self._comm_group = comm_group
         self._cg_buffers: SamplerBuffers | None = None
@@ -110,13 +111,17 @@ class SamplerResource(Resource):
             self._cg_buffers.unregister_request(rid)
 
     def admit(self, step, ctx):
-        del step, ctx
+        del ctx, step
         return AdmitOutcome(ok=True)
 
     def plan(self, step: SamplerStep, ctx: StepContext):
-        if self._cg_buffers is None:
+        for rid, tokens in step.prefill_tracked_tokens.items():
+            self._sampler.get_token_mask(rid).add_tokens(tokens)
+        self._apply_penalty_this_step = step.apply_penalty
+
+        if self._cg_buffers is None or ctx.slot_lease is None:
             return
-        if step.apply_penalty and self._track_seen_tokens:
+        if self._apply_penalty_this_step:
             self._cg_buffers.stage_seen_token_masks(
                 request_ids=ctx.request_ids,
                 seen_masks=[self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
@@ -128,10 +133,23 @@ class SamplerResource(Resource):
         )
 
     def commit(self, step: SamplerStep, ctx: StepContext):
+        self._cg_sampler = None # invalidate sampler for next step
         if self._cg_buffers is None:
             return
         self._cg_buffers.scatter_offset()
         self._cg_buffers.stage_seen_token_masks(
             [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
         )
+
+    ### Submodule-level functionality
+
+    def sample(
+        self, request_ids: list[str], logits: torch.Tensor, **kwargs
+    ):
+        if self._cg_sampler is not None:
+            return self._cg_sampler.sample(
+                request_ids, logits,
+                apply_penalty=self._apply_penalty_this_step
+            )
+        return self._sampler.sample(request_ids, logits)
         
