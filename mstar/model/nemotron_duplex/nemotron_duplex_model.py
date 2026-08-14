@@ -48,7 +48,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.nemotron_duplex.config import NemotronDuplexConfig
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
+from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mstar.utils.sampling import SamplingConfig
 
@@ -482,16 +482,28 @@ class NemotronDuplexModel(Model):
     def get_partition_topology(self) -> PartitionTopology:
         eartts = self.config.eartts
         return PartitionTopology(partitions=["Encoder", "LLM", "Talker", "Codec"], connections=[
-            # one audio frame per nano decode step
+            # one audio frame per nano decode step. continue_after_done=False:
+            # the duplex nano text loop is 1:1 with audio frames, so when the
+            # encoder's frames are exhausted the decode loop must terminate
+            # (the final empty chunk carries is_final). continue_after_done is
+            # only for the LLM→Talker leg, where the talker keeps going past
+            # the last text token.
             Connection(from_partition="Encoder", to_partition="LLM", edge_name="audio_frame",
-                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True)),
-            # one agent token per talker step
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=False)),
+            # one agent token per talker step. continue_after_done=False: the
+            # duplex talker emits exactly one RVQ frame per agent-text token
+            # (T tokens → T frames), so when the LLM's token stream ends the
+            # talker loop terminates via its final chunk (unlike qwen3_omni,
+            # whose talker outlives the thinker and self-stops on codec EOS).
             Connection(from_partition="LLM", to_partition="Talker", edge_name="new_token",
-                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=True)),
-            # codec needs left context for its causal receptive field
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1, continue_after_done=False)),
+            # Non-overlapping chunks of NEW codec frames; the codec keeps its
+            # own left-context (AudioCodecDecoderSubmodule), so the stream must
+            # NOT re-deliver overlap (a LeftContextChunkPolicy here re-emits the
+            # overlap every chunk and balloons the audio, and is anyway
+            # ill-defined when chunk < left_context).
             Connection(from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
-                       chunk_policy_factory=lambda: LeftContextChunkPolicy(
-                           chunk=eartts.codec_chunk_frames, left_context=eartts.codec_left_context_frames)),
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=eartts.codec_chunk_frames)),
         ])
 
     def get_aux_sampling_configs(self, node_name: str, model_kwargs: dict | None = None) -> dict:
@@ -525,10 +537,11 @@ class NemotronDuplexModel(Model):
             wav = tensors.get("audio_inputs") or tensors.get("audio_features")
             if wav:
                 out["audio_features"] = wav
-        # Seed the first decode frame's fed-back tokens (BOS / PAD): the decode-loop
-        # node requires prev_text + prev_func, but frame 0 has no prior sampled token,
-        # so without a seed it never becomes ready (the hang). [UNVERIFIED — pending a
-        # live GPU run; see E5_RESUME.md.]
+        # Seed the decode loop's iteration-0 fed-back tokens (agent-text BOS,
+        # function PAD). The frame-synchronous nano step lists prev_text /
+        # prev_func as inputs, so without these the readiness gate never fires
+        # on the first frame (no loop-back exists yet) and the decode loop
+        # hangs. Later iterations overwrite them via the loop-back edges.
         out["prev_text"] = [torch.tensor([self.config.text_bos_id], dtype=torch.long)]
         out["prev_func"] = [torch.tensor([self.config.text_pad_id], dtype=torch.long)]
         return out
@@ -579,8 +592,6 @@ class NemotronDuplexModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         audio_out = "audio" in output_modalities
-        logger.warning("NDTRACE initial_fpa partition=%s signals=%s audio_out=%s",
-                       partition_name, list(input_signals.keys()), audio_out)
 
         if partition_name == "Encoder":
             edge = GraphEdge(next_node="conformer_encoder", name="audio_features")
@@ -600,9 +611,10 @@ class NemotronDuplexModel(Model):
                 e.tensor_info = input_signals.get("text_inputs", [])
                 edges = [e]
             else:
-                # Audio-only: start the decode loop directly, seeding frame 0's fed-back
-                # prev_text / prev_func so the node's input_names are satisfied on the
-                # first iteration (later iterations get them from the loop-back edges).
+                # No system prompt: jump straight into the frame-synchronous
+                # decode loop. Seed iteration-0's fed-back tokens (BOS / PAD)
+                # so the node is ready before any loop-back exists; the audio
+                # frames then self-trigger it via the StreamBuffer.
                 for name in ("prev_text", "prev_func"):
                     e = GraphEdge(next_node="nano_llm", name=name)
                     e.tensor_info = input_signals.get(name, [])
@@ -628,8 +640,6 @@ class NemotronDuplexModel(Model):
         incoming_connections=None,
     ) -> ForwardPassArgs:
         m = partition_metadata
-        logger.warning("NDTRACE partition_fpa partition=%s walk=%s is_prefill=%s",
-                       partition_name, m.graph_walk, m.is_prefill)
 
         if partition_name == "Encoder":                    # runs once, then done producing
             return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=True)
