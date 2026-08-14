@@ -1,6 +1,7 @@
 
 from collections.abc import KeysView
 from dataclasses import dataclass, field
+import itertools
 from typing import Any
 
 import torch
@@ -102,6 +103,28 @@ class SubmoduleStep:
 """perhaaps move below to distinct files/location per resource kind"""
 
 @dataclass(frozen=True)
+class AttentionStep(ResourceStep):
+    causal: bool = True
+
+
+@dataclass(frozen=True)
+class PositionStep(ResourceStep):
+    # `pos_ids=None` derives from stream counters; otherwise
+    # label -> ids for one step
+    pos_ids: "dict[str, torch.Tensor] | torch.Tensor | None" = None
+    advance: tuple[int, ...] | None = None  #`advance=None` means own rule
+    # no combined_labels: positions take the packing off KV's plan output,
+    # so the step declares the grouping once, on KVStep
+
+
+@dataclass(frozen=True)
+class SamplerStep(ResourceStep):
+    apply_penalty: bool = True
+    # rid -> prefill tokens for the repetition penalty
+    prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory={})
+
+
+@dataclass(frozen=True)
 class KVStep(ResourceStep):
     # write: bool # @nsagan: opting to remove this for now bc it's dead code
     commit: bool = True
@@ -111,23 +134,39 @@ class KVStep(ResourceStep):
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
 
+# moved here
+def group_by_plan_label(
+    segments: tuple[Segment, ...],
+    combined_labels: dict[tuple[str, ...], str],
+) -> dict[str, list[Segment]]:
+    """Segments per plan label in order of packed forward view
 
-@dataclass(frozen=True)
-class AttentionStep(ResourceStep):
-    causal: bool = True
+    combined plan concats source labels in label major order. standalone keeps
+    og batch order. KV should be sole producer of this ordering and eveyrone else
+    will read `plan` output of KV
 
+    NOTE: combined key with a source label with no segments in step will cause KeyError
+    """
+    label_to_segments: dict[str, list[Segment]] = {}
+    for segment in segments:
+        label_to_segments.setdefault(segment.label, []).append(segment)
 
-@dataclass(frozen=True)
-class PositionStep(ResourceStep):
-    pos_ids: torch.Tensor | None = None  # None = derive from counters
-    advance: tuple[int, ...] | None = None  # None = each segment's span
+    sources = set(itertools.chain.from_iterable(combined_labels))
+    grouped: dict[str, list[Segment]] = {
+        plan_label: [
+            segment
+            for label in source_labels
+            for segment in label_to_segments[label]
+        ]
+        for source_labels, plan_label in combined_labels.items()
+    }
 
-
-@dataclass(frozen=True)
-class SamplerStep(ResourceStep):
-    apply_penalty: bool = True
-    # rid -> prefill tokens for the repetition penalty
-    prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory={})
+    grouped.update(
+        (label, label_segments)
+        for label, label_segments in label_to_segments.items()
+        if label not in sources
+    )
+    return grouped
 
 
 @dataclass

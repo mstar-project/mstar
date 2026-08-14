@@ -17,6 +17,13 @@ class CGSlotSpec:
     config: CudaGraphConfig
 
 
+@dataclass(frozen=True)
+class CGSlotKey:
+    bucket: BucketKey
+    slot: int
+    label: str
+
+
 class Resource(ABC):
     @classmethod
     @abstractmethod

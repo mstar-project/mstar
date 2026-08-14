@@ -7,9 +7,9 @@ from typing import NamedTuple
 
 import torch
 
-from mstar.engine.resources.base import CGSlotSpec, Resource
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
-from mstar.engine.resources.step import AttentionStep, BucketKey, StepContext
+from mstar.engine.resources.step import AttentionStep, StepContext
 from mstar.engine.v1.kv_cache import KVConfig
 from mstar.engine.v1.kv_manager import KVManager, KVPlanOutput, SequenceView
 from mstar.engine.v1.attention_wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
@@ -20,8 +20,8 @@ class AttnBackend(Enum):
 
 @dataclass
 class AttentionConfig:
-    backend: AttnBackend=AttnBackend.FLASHINFER
     kv_cache: str # name of the KV cache
+    backend: AttnBackend=AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
 
 
@@ -64,13 +64,6 @@ class PlanCacheKey(NamedTuple):
     last_page_lens: tuple
 
 
-@dataclass(frozen=True)
-class CGSlotKey:
-    bucket: BucketKey
-    slot: int
-    label: str
-
-
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
 
 
@@ -109,7 +102,7 @@ class FlashInferManager(AttentionManager):
         self._workspace_buffers: dict[str, torch.Tensor] = {}
 
     def depends_on(self):
-        return self._kv_cache_name
+        return {self._kv_cache_name}
 
     def _get_workspace_buffer(
         self, label: str, cg_slot: int | None=None
@@ -152,7 +145,7 @@ class FlashInferManager(AttentionManager):
                     label=label
                 )] = wrapper
 
-    
+
     def plan(self, step: AttentionStep, ctx: StepContext):
         plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
@@ -193,12 +186,12 @@ class FlashInferManager(AttentionManager):
         if label not in self._current_plan_states:
             return
         return self._current_plan_states[label]._qo_indptr_buf
-    
+
     def run(
         self, q: torch.Tensor, label: str,
         kv_cache_layer: torch.Tensor
     ) -> torch.Tensor:
         return self._current_plan_states[label].run(q, kv_cache_layer)
 
-        
+
 # TODO: cross attention, dense attention

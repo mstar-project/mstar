@@ -10,7 +10,14 @@ import torch
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import KVReqConfig
-from mstar.engine.resources.step import AdmitOutcome, AllocationFailed, KVStep, Segment, StepContext
+from mstar.engine.resources.step import (
+    AdmitOutcome,
+    AllocationFailed,
+    KVStep,
+    Segment,
+    StepContext,
+    group_by_plan_label,
+)
 from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec
 from mstar.engine.v1.kv_transfer import KVTransferManager, TransferEngineInfo
 
@@ -78,7 +85,7 @@ class PageArena:
     @property
     def num_free(self):
         return self.allocator.num_free
-    
+
 
 @dataclass(frozen=True)
 class RetentionPolicy:
@@ -117,7 +124,7 @@ class PublishedKVInfo(PublishedInfo):
 
     @classmethod
     def build_for_rank(
-        cls, rank: int, world_size: int, 
+        cls, rank: int, world_size: int,
         seq_info: dict[str, KVSequenceInfo]
     ):
         return cls(
@@ -147,6 +154,7 @@ class AllocResult:
 
 @dataclass
 class SequenceView:
+    request_id: str
     label: str
     page_idxs: list[int]
     length: int # already resident + to_compute
@@ -214,6 +222,8 @@ class KVPlanOutput:
     """
     cpu_indptrs: PagedIndptrs
     cuda_indptrs: PagedIndptrs
+    # packing in plan order w/h 1 view per segment covered by plan
+    views: list[SequenceView]
 
     def get_total_len(self):
         lens = (self.cpu_indptrs.qo_indptr[1:] - self.cpu_indptrs.qo_indptr[:-1]).to(torch.int32)
@@ -246,7 +256,7 @@ class KVManager(Resource):
         self.kv_cache = KVCache(
             cfg, device, dtype
         )
-        
+
         self._arena = PageArena(
             kv_cache=self.kv_cache,
             allocator=PageAllocator(cfg.max_num_pages)
@@ -341,7 +351,7 @@ class KVManager(Resource):
                     ok=False,
                     reason=alloc_res.error
                 )
-            
+
             fut = self._transfer.start_async_retrieve(
                 start_len=old_len, end_len=new_len,
                 local_page_indices=stream.page_indices,
@@ -390,6 +400,7 @@ class KVManager(Resource):
         for s in segments:
             stream = self._streams[s.request_id][s.label]
             views.append(SequenceView(
+                request_id=s.request_id,
                 label=s.label, page_idxs=stream.page_indices,
                 length=s.span + stream.stored_len,
                 to_compute=s.span
@@ -465,36 +476,20 @@ class KVManager(Resource):
         indptrs = build_paged_indptrs(views, self.kv_cache.page_size)
         return KVPlanOutput(
             cpu_indptrs=indptrs,
-            cuda_indptrs=indptrs.to_device(self._device)
+            cuda_indptrs=indptrs.to_device(self._device),
+            views=views,
         )
 
     def plan(self, step: KVStep, ctx: StepContext) -> dict[str, KVPlanOutput]:
         """
         Returns list of sequence views per plan label
         """
-        label_to_segments: dict[str, list[Segment]] = {}
-        combined_labels = set(itertools.chain.from_iterable(
-            step.combined_labels.keys()
-        ))
-        standalone_labels = set()
-
-        res = {}
-        for segment in step.segments:
-            label_to_segments.setdefault(segment.label, []).append(segment)
-            if segment.label not in combined_labels:
-                standalone_labels.add(segment.label)
-
-        for source_labels, plan_label in step.combined_labels.items():
-            views = []
-            for label in source_labels:
-                views.extend(self._sequence_views(label_to_segments[label]))
-            res[plan_label] = self._plan_output(views)
-
-        for label in standalone_labels:
-            res[label] = self._plan_output(
-                self._sequence_views(label_to_segments[label])
-            )
-
+        res = {
+            plan_label: self._plan_output(self._sequence_views(segments))
+            for plan_label, segments in group_by_plan_label(
+                step.segments, step.combined_labels
+            ).items()
+        }
         self._setup_plan_states(res, ctx)
         return res
 
@@ -504,7 +499,7 @@ class KVManager(Resource):
                 stream = self._streams[segment.request_id][segment.label]
                 stream.stored_len += segment.span
         # TODO: handle retention policy, free pages if not commit
-    
+
     def publish(self, request_id: str):
         return PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size,

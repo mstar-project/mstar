@@ -19,6 +19,7 @@ class ResourceType(IntEnum):
     SCRATCH_KV = 1
     SAMPLER = 2
     ATTENTION = 3
+    POSITIONS = 4
 
 
 @dataclass(frozen=True)

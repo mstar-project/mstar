@@ -24,7 +24,16 @@ class CudaGraphConfig(ABC):
         capture_graph_walk: str,  # "decode"
         replay_graph_walks: list[str] | None = None, # set to None to be just capture_graph_walk
         requires_cfg: bool = False,
-        labels: list[str]  = None,  # cache labels used: ["main"] or ["main", "cfg_img"]
+        # cache labels used: ["main"] or ["main", "cfg_img"].
+        #
+        # NOTE: these are *cache* labels, but the v1 resources key their
+        # per-slot static state by *plan* label, and the two namespaces
+        # are not same when a step has KVStep.combined_labels. A batched
+        # CFG step plans its labels together under a combined key
+        # ("_cfg_batched"), which appears in no config's `labels`. So
+        # `build_cuda_graph_buffers`, which iterates this list, allocates
+        # nothing for that key, and plan then fails looking it up.
+        labels: list[str]  = None,
         compile: bool = True, # whether to run torch.compile on the submodule before cuda graph capture
         # Per-config override for the set of batch sizes to capture. None → use the
         # runner's default (AR engine default: DEFAULT_AR_CAPTURE_BATCH_SIZES;
