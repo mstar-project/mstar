@@ -51,6 +51,9 @@ class StepContext:
     graph_walk: str
     slot: int
     capture: bool
+
+    # Preplan
+    is_preplan: bool = False
     # will get populated with the output of plan as previous steps
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
@@ -61,6 +64,10 @@ class StepContext:
 class SubmoduleStep:
     # cumulative step over submodule::forward for all resoures
     ctx: StepContext
+
+    # NOTE @naomi: I think this is only used for validation and can maybe be
+    # removed? Not sure if keeping it is just extra work for the model author
+    # without added benefit
     segments: tuple[Segment, ...] # authoritative ordering
     steps: dict[str, ResourceStep] # resource key -> step within cumulative
 
@@ -121,7 +128,7 @@ class PositionStep(ResourceStep):
 class SamplerStep(ResourceStep):
     apply_penalty: bool = True
     # rid -> prefill tokens for the repetition penalty
-    prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory={})
+    prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

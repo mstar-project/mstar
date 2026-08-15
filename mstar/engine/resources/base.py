@@ -80,6 +80,14 @@ class Resource(ABC):
         # thing that came to mind
         return
 
+    # Pre-planning
+    @property
+    def supports_preplan(self):
+        return False
+
+    def clear_preplan(self):
+        return
+
 
 class PublishedInfo(ABC):
     @abstractmethod

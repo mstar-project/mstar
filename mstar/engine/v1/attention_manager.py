@@ -85,6 +85,9 @@ class FlashInferManager(AttentionManager):
 
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
+        self._preplan_states: dict[str, AttentionWrapper] = {}
+        self._preplanned = False
+
         self._kv_config = kv_config
         self._wrapper_kv_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
@@ -107,7 +110,7 @@ class FlashInferManager(AttentionManager):
     def _get_workspace_buffer(
         self, label: str, cg_slot: int | None=None
     ):
-        key = label if cg_slot is not None else f"{label}_{cg_slot}"
+        key = label if cg_slot is None else f"{label}_{cg_slot}"
         if key not in self._workspace_buffers:
             self._workspace_buffers[key] = torch.empty(
                 self._buffer_size, dtype=torch.uint8, device=self._device
@@ -146,11 +149,35 @@ class FlashInferManager(AttentionManager):
                 )] = wrapper
 
 
+    @property
+    def supports_preplan(self):
+        return True
+
     def plan(self, step: AttentionStep, ctx: StepContext):
+        assert not ctx.is_preplan or ctx.slot_lease is not None, (
+            "preplan requires a cuda graph step: eager wrappers share one "
+            "workspace per label with the forward still in flight"
+        )
+        assert not (self._preplanned and ctx.is_preplan), (
+            "attention preplan is already pending; clear_preplan before "
+            "planning a different step ahead"
+        )
+        if self._preplanned:
+            # the wrappers were planned a step early against this same step's
+            # KV plan; nothing left to do but promote them
+            self._current_plan_states = self._preplan_states
+            self._preplan_states = {}
+            self._preplanned = False
+            return
+
         plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
 
-        self._current_plan_states.clear()
+        # a preplan leases a different cg slot, so its wrappers and workspaces
+        # are disjoint from the ones the in-flight forward reads
+        plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
+
+        plan_states.clear()
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             if ctx.slot_lease is not None:
@@ -179,13 +206,21 @@ class FlashInferManager(AttentionManager):
                 dtype=self._dtype,
                 **indptrs.to_kwargs_dict()
             )
-            self._current_plan_states[label] = wrapper
+            plan_states[label] = wrapper
+
+        self._preplanned = ctx.is_preplan
+
+    def clear_preplan(self):
+        # rebind rather than clear: a consumed preplan dict is the live one
+        self._preplanned = False
+        self._preplan_states = {}
 
     ### Submodule-level functionality
     def qo_indptr_buf(self, label: str) -> torch.Tensor | None:
         if label not in self._current_plan_states:
             return
-        return self._current_plan_states[label]._qo_indptr_buf
+        # decode wrappers never set one
+        return getattr(self._current_plan_states[label], "_qo_indptr_buf", None)
 
     def run(
         self, q: torch.Tensor, label: str,
@@ -281,6 +316,9 @@ class FlashInferCrossManager(CrossAttentionManager):
         # persistent wrappers [we can keep eager ones]
         self._eager_plan_states: dict[str, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
+
+        self._preplan_states: dict[str, AttentionWrapper] = {}
+        self._preplanned = False
         # wrapper key (plan label, or CGSlotKey under capture) -> fingerprint
         # of the last plan call made on that wrapper
         # NOTE: a little bit (very) sketchy should be refined; goal is to avoid
@@ -335,11 +373,32 @@ class FlashInferCrossManager(CrossAttentionManager):
                     **self._wrapper_kv_kwargs,
                 )
 
+    @property
+    def supports_preplan(self):
+        return True
+
     def plan(self, step: AttentionStep, ctx: StepContext):
         del step  # non-causal
-        context_views = self._context_views(ctx)
+        assert not ctx.is_preplan or ctx.slot_lease is not None, (
+            "preplan requires a cuda graph step: the eager wrapper for a label "
+            "persists and would be replanned under the in-flight forward"
+        )
+        assert not (self._preplanned and ctx.is_preplan), (
+            "cross attention preplan is already pending; clear_preplan before "
+            "planning a different step ahead"
+        )
+        if self._preplanned:
+            self._current_plan_states = self._preplan_states
+            self._preplan_states = {}
+            self._preplanned = False
+            return
 
-        self._current_plan_states.clear()
+        context_views = self._context_views(ctx)
+        # a preplan leases a different cg slot, so its wrappers and workspaces
+        # are disjoint from the ones the in-flight forward reads
+        plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
+
+        plan_states.clear()
         for plan_label, kv_out in self._query_plan_outputs(ctx).items():
             indptrs = self._build_indptrs(kv_out, context_views, plan_label)
             state_key, wrapper = self._wrapper_for(plan_label, ctx)
@@ -363,7 +422,14 @@ class FlashInferCrossManager(CrossAttentionManager):
                     **indptrs.to_kwargs_dict()
                 )
                 self._plan_keys[state_key] = plan_key
-            self._current_plan_states[plan_label] = wrapper
+            plan_states[plan_label] = wrapper
+
+        self._preplanned = ctx.is_preplan
+
+    def clear_preplan(self):
+        # rebind rather than clear: a consumed preplan dict is the live one
+        self._preplanned = False
+        self._preplan_states = {}
 
     def _context_views(self, ctx: StepContext) -> dict[str, SequenceView]:
         """context stream of each request in batch by request id

@@ -276,6 +276,10 @@ class KVManager(Resource):
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
         self._current_plan_states: dict[str, KVPlanState] = {}
 
+        self._preplan_states: dict[str, KVPlanState] = {}
+        self._preplanned = False
+        self._cached_plan_output: dict[str, KVPlanOutput] | None = None
+
     @classmethod
     def build(
         cls, spec: KVSpec,
@@ -368,6 +372,9 @@ class KVManager(Resource):
         )
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
+        if self._preplanned:
+            # pages were already reserved by the preplan pass
+            return AdmitOutcome(ok=True)
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.request_ids:
                 alloc_res = self._fork(rid, from_label, to_label)
@@ -469,7 +476,10 @@ class KVManager(Resource):
                 static_state = self._static_plan_states[(ctx.slot_lease.slot, label)]
                 static_state.copy_(plan_state)
                 plan_state = static_state
-            self._current_plan_states[label] = plan_state
+            if ctx.is_preplan:
+                self._preplan_states[label] = plan_state
+            else:
+                self._current_plan_states[label] = plan_state
 
 
     def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
@@ -484,6 +494,17 @@ class KVManager(Resource):
         """
         Returns list of sequence views per plan label
         """
+        assert not (self._preplanned and ctx.is_preplan), (
+            "KV preplan is already pending; clear_preplan before planning a "
+            "different step ahead"
+        )
+        if self._preplanned:
+            self._current_plan_states = self._preplan_states
+            res = self._cached_plan_output
+            # must reset here: otherwise the *next* step's admit still sees
+            # `_preplanned` and skips its allocation
+            self.clear_preplan()
+            return res
         res = {
             plan_label: self._plan_output(self._sequence_views(segments))
             for plan_label, segments in group_by_plan_label(
@@ -491,7 +512,20 @@ class KVManager(Resource):
             ).items()
         }
         self._setup_plan_states(res, ctx)
+        if ctx.is_preplan:
+            self._preplanned = True
+            self._cached_plan_output = res
         return res
+
+    @property
+    def supports_preplan(self):
+        return True
+
+    def clear_preplan(self):
+        # rebind rather than clear: a consumed preplan dict is the live one
+        self._preplanned = False
+        self._preplan_states = {}
+        self._cached_plan_output = None
 
     def commit(self, step: KVStep, ctx: StepContext):
         for segment in step.segments:
