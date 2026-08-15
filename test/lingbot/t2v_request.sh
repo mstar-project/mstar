@@ -4,14 +4,17 @@
 # returned mp4 (POST /v1/videos/generations; the response mp4 is data[0].b64_json).
 #
 # LingBot-Video consumes STRUCTURED-JSON prompts (rewriter output), NOT raw text —
-# a raw prompt garbles the video on the reference model too. Provide one of:
+# a raw prompt garbles the video on the reference model too. Prompt precedence:
 #   PROMPT_JSON=/path/to/prompt.json   structured caption; its "caption" field is
 #                                      serialized and sent as the prompt (recommended)
 #   PROMPT="...raw text..."            raw string (smoke only; expect poor output)
+#   (neither set)                      a built-in structured default caption is used,
+#                                      so the script produces a good clip out of the box
 #
 # Usage:
+#   PORT=8200 bash test/lingbot/t2v_request.sh                                # default caption
 #   PORT=8200 PROMPT_JSON=assets/cases/t2v/example_1/prompt.json bash test/lingbot/t2v_request.sh
-#   PORT=8200 PROMPT="a red fox running" bash test/lingbot/t2v_request.sh    # smoke
+#   PORT=8200 PROMPT="a red fox running" bash test/lingbot/t2v_request.sh    # raw smoke
 #
 # Env: HOST, PORT, PROMPT_JSON | PROMPT, NEG, SIZE (WxH), FRAMES, STEPS, GUIDANCE,
 #      SHIFT, FPS, SEED, OUT. Omit NEG to use the model's built-in default negative.
@@ -21,7 +24,7 @@ set -euo pipefail
 export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-8200}"
 export PROMPT_JSON="${PROMPT_JSON:-}"
-export PROMPT="${PROMPT:-a red fox trotting across fresh snow at dawn, cinematic}"
+export PROMPT="${PROMPT:-}"
 export NEG="${NEG:-}"
 export SIZE="${SIZE:-832x480}"          # WxH
 export FRAMES="${FRAMES:-81}"           # 1 or 4n+1
@@ -41,15 +44,39 @@ import base64, json, os, urllib.request
 
 host, port = os.environ["HOST"], os.environ["PORT"]
 size = os.environ["SIZE"]
+
+# Sent when neither PROMPT_JSON nor PROMPT is provided. LingBot needs a structured
+# caption, so the out-of-the-box default is one (not raw text, which garbles).
+DEFAULT_CAPTION = {
+    "comprehensive_description": {
+        "scene_content_description": (
+            "A red fox trots across fresh snow at dawn in a quiet forest clearing, its "
+            "breath visible in the crisp cold air. Soft golden morning light filters "
+            "through tall pine trees and casts long shadows over the untouched snow. The "
+            "fox moves with alert, graceful steps, ears perked and bushy tail held low. "
+            "Photorealistic, cinematic, highly detailed, natural colors."
+        ),
+        "camera_movement_description": (
+            "The camera tracks the fox smoothly from the side at eye level in a medium "
+            "shot, keeping it in sharp focus with a shallow depth of field while the "
+            "snowy background stays softly blurred."
+        ),
+    }
+}
+
 prompt_json = os.environ.get("PROMPT_JSON", "")
+raw_prompt = os.environ.get("PROMPT", "")
 if prompt_json:
     doc = json.load(open(prompt_json))
     caption = doc.get("caption", doc)  # accept a full prompt.json or a bare caption
     prompt = json.dumps(caption, ensure_ascii=False, separators=(",", ":"))
     src = f"PROMPT_JSON={prompt_json}"
-else:
-    prompt = os.environ["PROMPT"]
+elif raw_prompt:
+    prompt = raw_prompt
     src = "raw PROMPT (smoke; structured JSON recommended)"
+else:
+    prompt = json.dumps(DEFAULT_CAPTION, ensure_ascii=False, separators=(",", ":"))
+    src = "built-in default structured caption"
 
 body = {
     "prompt": prompt,
