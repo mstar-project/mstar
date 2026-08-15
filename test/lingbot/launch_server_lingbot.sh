@@ -40,6 +40,18 @@ STATS_FILE="${STATS_FILE:-}"
 TENSOR_PROTOCOL="${TENSOR_PROTOCOL:-SHM}"
 WHO="${USER:-mstar}"
 
+# Serving must not block on the network. The text-encoder processor / config loads
+# lazily on the first request via HuggingFace ``from_pretrained``, which pings the
+# Hub — that hangs on offline/restricted networks and is throttled when
+# unauthenticated (the request then appears to "never finish"). When the checkpoint
+# is already cached (CACHE_DIR given) force HF offline so those loads use the local
+# cache only. First-ever download: run once with ``HF_HUB_OFFLINE=0`` (and no
+# CACHE_DIR, or an empty one) to populate the cache, or set ``HF_TOKEN``.
+if [ -n "$CACHE_DIR" ]; then
+  export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+  export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+fi
+
 # The socket/upload namespace MUST include the port. Two servers that share a
 # socket-path prefix share one SHM/ZMQ namespace and silently cross-deliver each
 # other's messages ("Message for unknown request <id>") while both clients hang.
@@ -71,8 +83,16 @@ fi
 
 # Match the reference pipeline's attention backend (its inference scripts export
 # DIFFUSERS_ATTN_BACKEND=_native_flash); the diffusers default "native" (SDPA)
-# drifts the denoise trajectory slightly vs the upstream baseline.
+# drifts the denoise trajectory slightly vs the upstream baseline. Fall back to the
+# default if this diffusers build doesn't know the name (an invalid value raises at
+# import — the server would never start and requests would hang).
+ATTN_BACKEND="${DIFFUSERS_ATTN_BACKEND:-_native_flash}"
+if ! python -c "from diffusers.models.attention_dispatch import AttentionBackendName as B; B('$ATTN_BACKEND')" >/dev/null 2>&1; then
+  echo "[lingbot] attention backend '$ATTN_BACKEND' not available in this diffusers build; using the default" >&2
+  ATTN_BACKEND=""
+fi
+[ -n "$ATTN_BACKEND" ] && export DIFFUSERS_ATTN_BACKEND="$ATTN_BACKEND"
+
 CUDA_VISIBLE_DEVICES="$DEVICES" \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  DIFFUSERS_ATTN_BACKEND="${DIFFUSERS_ATTN_BACKEND:-_native_flash}" \
   python "$REPO_ROOT/mstar/api_server/entrypoint.py" "${ARGS[@]}"
