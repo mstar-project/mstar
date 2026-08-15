@@ -11,6 +11,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.lingbot.components.scheduling_flow_unipc import FlowUniPCMultistepScheduler
 from mstar.model.lingbot.config import LingBotConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.wan22.components.unipc import (
@@ -37,11 +38,13 @@ def decode_init_latents(encoded: str) -> torch.Tensor:
 
 
 def make_flow_unipc_tables(num_inference_steps: int, shift: float) -> tuple[torch.Tensor, torch.Tensor]:
-    sigmas = np.linspace(1, 1 / 1000, num_inference_steps + 1).copy()[:-1]
-    sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-    timesteps = torch.from_numpy((sigmas * 1000).copy()).to(torch.int64)
-    sigmas = torch.from_numpy(np.concatenate([sigmas, [0.0]]).astype(np.float32))
-    return sigmas, timesteps
+    # Derive the sigma/timestep schedule from LingBot's own FlowUniPC scheduler so
+    # it matches the upstream pipeline exactly. A hand-rolled linspace(1, 1/1000)
+    # here started at sigma=1.0 / t=1000 instead of the scheduler's 0.9997 / t=999
+    # (and diverged in the tail), which drifted the whole denoise trajectory.
+    scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000)
+    scheduler.set_timesteps(num_inference_steps, device="cpu", shift=shift)
+    return scheduler.sigmas.to(torch.float32), scheduler.timesteps.to(torch.int64)
 
 
 def _module_dtype(module: nn.Module) -> torch.dtype:

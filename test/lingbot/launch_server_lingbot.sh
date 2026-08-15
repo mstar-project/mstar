@@ -69,6 +69,10 @@ if [ -n "$STATS_FILE" ]; then
   echo "  stats:     $STATS_FILE"
 fi
 
+# Match the reference pipeline's attention backend (its inference scripts export
+# DIFFUSERS_ATTN_BACKEND=_native_flash); the diffusers default "native" (SDPA)
+# drifts the denoise trajectory slightly vs the upstream baseline.
 CUDA_VISIBLE_DEVICES="$DEVICES" \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  DIFFUSERS_ATTN_BACKEND="${DIFFUSERS_ATTN_BACKEND:-_native_flash}" \
   python "$REPO_ROOT/mstar/api_server/entrypoint.py" "${ARGS[@]}"
