@@ -38,14 +38,16 @@ bash test/nemotron_duplex/launch_server.sh disagg   # 3-GPU pipeline (nemotron_d
 Both layouts produce identical text + audio. The first request compiles kernels
 (cold, ~90 s); the talker is eager MaskGIT (~2 s/frame), so prefer short clips.
 
-Send a request (the base VoiceChat-11B HF repo ships `turn_taking.wav`,
-`interruptions.wav`, `tool_call.wav`):
+Send a request. With no `--audio`, a sample input is auto-resolved from the base
+VoiceChat-11B HF repo (which ships `turn_taking.wav`, `interruptions.wav`,
+`tool_call.wav`):
 
 ```bash
 cd test/nemotron_duplex
+python duplex_request.py                                 # default sample -> agent_out.wav
 python duplex_request.py --audio /path/to/user.wav --output agent.wav
-python duplex_request.py --audio /path/to/user.wav --text-only          # skip talker/codec
-python duplex_request.py --audio /path/to/user.wav -n 3                  # 3 concurrent (batching)
+python duplex_request.py --text-only                     # skip talker/codec
+python duplex_request.py -n 3                             # 3 concurrent (batching)
 ```
 
 ## Validate against the oracle
