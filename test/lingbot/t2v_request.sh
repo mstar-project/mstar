@@ -25,6 +25,9 @@ export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-8200}"
 export PROMPT_JSON="${PROMPT_JSON:-}"
 export PROMPT="${PROMPT:-}"
+# Bundled default structured caption, used when neither PROMPT_JSON nor PROMPT is set.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export DEFAULT_PROMPT_JSON="${DEFAULT_PROMPT_JSON:-$_SCRIPT_DIR/default_prompt.json}"
 export NEG="${NEG:-}"
 export SIZE="${SIZE:-832x480}"          # WxH
 export FRAMES="${FRAMES:-81}"           # 1 or 4n+1
@@ -45,38 +48,23 @@ import base64, json, os, urllib.request
 host, port = os.environ["HOST"], os.environ["PORT"]
 size = os.environ["SIZE"]
 
-# Sent when neither PROMPT_JSON nor PROMPT is provided. LingBot needs a structured
-# caption, so the out-of-the-box default is one (not raw text, which garbles).
-DEFAULT_CAPTION = {
-    "comprehensive_description": {
-        "scene_content_description": (
-            "A red fox trots across fresh snow at dawn in a quiet forest clearing, its "
-            "breath visible in the crisp cold air. Soft golden morning light filters "
-            "through tall pine trees and casts long shadows over the untouched snow. The "
-            "fox moves with alert, graceful steps, ears perked and bushy tail held low. "
-            "Photorealistic, cinematic, highly detailed, natural colors."
-        ),
-        "camera_movement_description": (
-            "The camera tracks the fox smoothly from the side at eye level in a medium "
-            "shot, keeping it in sharp focus with a shallow depth of field while the "
-            "snowy background stays softly blurred."
-        ),
-    }
-}
-
+# Prompt precedence: PROMPT_JSON (file) > PROMPT (raw text) > bundled default file.
+# LingBot needs a structured caption, so with no input we load the bundled default
+# prompt.json rather than sending raw text (which garbles).
 prompt_json = os.environ.get("PROMPT_JSON", "")
 raw_prompt = os.environ.get("PROMPT", "")
+using_default = not prompt_json and not raw_prompt
+if using_default:
+    prompt_json = os.environ["DEFAULT_PROMPT_JSON"]
+
 if prompt_json:
     doc = json.load(open(prompt_json))
     caption = doc.get("caption", doc)  # accept a full prompt.json or a bare caption
     prompt = json.dumps(caption, ensure_ascii=False, separators=(",", ":"))
-    src = f"PROMPT_JSON={prompt_json}"
-elif raw_prompt:
+    src = ("default " if using_default else "") + f"PROMPT_JSON={prompt_json}"
+else:
     prompt = raw_prompt
     src = "raw PROMPT (smoke; structured JSON recommended)"
-else:
-    prompt = json.dumps(DEFAULT_CAPTION, ensure_ascii=False, separators=(",", ":"))
-    src = "built-in default structured caption"
 
 body = {
     "prompt": prompt,
