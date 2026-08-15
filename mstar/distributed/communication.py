@@ -163,6 +163,30 @@ class CommGroup:
 
 
 @dataclass
+class JointGroups:
+    tp_group: CommGroup
+    sp_group: CommGroup
+
+    @property
+    def rank(self):
+        """This worker's rank within ``node``'s lockstep instance — the
+        TP x SP block, row-major [sp][tp] to match
+        ``WorkerGraph._instance_ranks``. 0 iff this worker leads the
+        instance (it is rank 0 in both its TP and SP comm groups)."""
+        return self.sp_group.rank * self.tp_group.world_size + self.tp_group.rank
+
+    @property
+    def world_size(self):
+        """Total ranks in ``node``'s lockstep instance (tp_size * sp_size)."""
+        return  self.tp_group.world_size * self.sp_group.world_size
+
+    def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        tensor = self.tp_group.broadcast(tensor, src)
+        return self.sp_group.broadcast(tensor, src)
+                
+
+
+@dataclass
 class WorkerParallelGroups:
     """Per-worker view of the parallelism comm groups in the run.
 
@@ -192,6 +216,8 @@ class WorkerParallelGroups:
     # projections).
     node_to_tp_group: dict[str, CommGroup] = field(default_factory=dict)
     node_to_sp_group: dict[str, CommGroup] = field(default_factory=dict)
+
+    node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
 
     def add(self, node: str, comm_group: CommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -272,21 +298,32 @@ class WorkerParallelGroups:
             self.node_to_sp_group[node] = CommGroup.trivial()
         return self.node_to_sp_group[node]
 
+    def get_joint_group_for_node(self, node: str) -> JointGroups:
+        if node not in self.node_to_joint_group:
+            self.node_to_joint_group[node] = JointGroups(
+                tp_group=self.get_tp_config_for_node(node),
+                sp_group=self.get_sp_config_for_node(node)
+            )
+        return self.node_to_joint_group[node]
+
     def get_instance_rank_for_node(self, node: str) -> int:
-        """This worker's rank within ``node``'s lockstep instance — the
-        TP x SP block, row-major [sp][tp] to match
-        ``WorkerGraph._instance_ranks``. 0 iff this worker leads the
-        instance (it is rank 0 in both its TP and SP comm groups)."""
-        tp = self.get_tp_config_for_node(node)
-        sp = self.get_sp_config_for_node(node)
-        return sp.rank * tp.world_size + tp.rank
+        return self.get_joint_group_for_node(node).rank
 
     def get_instance_world_size_for_node(self, node: str) -> int:
-        """Total ranks in ``node``'s lockstep instance (tp_size * sp_size)."""
-        return (
-            self.get_tp_config_for_node(node).world_size
-            * self.get_sp_config_for_node(node).world_size
-        )
+        return self.get_joint_group_for_node(node).world_size
+
+    def all_in_same_group(self, nodes: list[str]) -> bool:
+        if all((
+            self.get_instance_world_size_for_node(node) == 1  \
+                for node in nodes
+        )): # all nodes have no parallelism
+            return True 
+        return len({
+            (
+                id(self.get_tp_config_for_node(node)),
+                id(self.get_sp_config_for_node(node))
+            ) for node in nodes
+        }) == 1
 
     def barrier_all(self) -> None:
         """Global barrier across every worker process in the run.

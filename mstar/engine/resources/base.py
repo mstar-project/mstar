@@ -1,13 +1,17 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from mstar.distributed.communication import CommGroup
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.cuda_graph_config import CudaGraphConfig
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
+
+if TYPE_CHECKING:   
+    from mstar.engine.kv_store import TransferEngineInfo
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,8 @@ class Resource(ABC):
         return set()
 
 
+    # Request lifecycle
+
     def ingest_request(self, rid: str, overrides: ResourceReqConfig | None):
         return
 
@@ -58,6 +64,8 @@ class Resource(ABC):
         """
         return AdmitOutcome(ok=True, ready=True)
 
+    # Step lifecycle
+
     def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
         return AdmitOutcome(ok=True)
 
@@ -72,6 +80,17 @@ class Resource(ABC):
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None
 
+    # Pre-planning
+
+    @property
+    def supports_preplan(self):
+        return False
+
+    def clear_preplan(self):
+        return
+
+    # Engine lifecycle
+
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
@@ -80,12 +99,16 @@ class Resource(ABC):
         # thing that came to mind
         return
 
-    # Pre-planning
-    @property
-    def supports_preplan(self):
-        return False
+    def post_warmup_validate(self):
+        """
+        For, e.g., the KV cache to check that num_free_pages is identical
+        across TP ranks after cuda graph capture.
 
-    def clear_preplan(self):
+        Raises an error (fails loudly) if invalid.
+        """
+        return
+
+    def cleanup(self):
         return
 
 
@@ -93,3 +116,47 @@ class PublishedInfo(ABC):
     @abstractmethod
     def update(self, other: "PublishedInfo") -> None:
         ...
+
+
+def build_resource(
+    spec: NodeResourceSpec,
+    device: torch.device,
+    joint_comm_group: JointGroups,
+    transfer_engine_info: TransferEngineInfo,
+    kv_dtype: torch.dtype
+) -> Resource:
+    if spec.resource_type == ResourceType.KV_CACHE:
+        from mstar.engine.v1.kv_manager import KVManager
+        return KVManager.build(
+            spec=spec,
+            device=device,
+            comm_group=joint_comm_group,
+            transfer_engine_info=transfer_engine_info,
+            dtype=kv_dtype
+        )
+    if spec.resource_type == ResourceType.SAMPLER:
+        from mstar.engine.v1.sampler import SamplerResource
+        return SamplerResource.build(
+            spec=spec,
+            device=device,
+            comm_group=joint_comm_group
+        )
+    if spec.resource_type == ResourceType.ATTENTION:
+        from mstar.engine.v1.attention_manager import AttentionManager
+        return AttentionManager.build(
+            spec=spec,
+            device=device,
+            dtype=kv_dtype
+        )
+    if spec.resource_type == ResourceType.CROSS_ATTENTION:
+        from mstar.engine.v1.attention_manager import CrossAttentionManager
+        return CrossAttentionManager.build(
+            spec=spec,
+            device=device,
+            dtype=kv_dtype
+        )
+    if spec.resource_type == ResourceType.POSITIONS:
+        from mstar.engine.v1.position_manager import PositionManager
+        return PositionManager.build(
+            spec=spec, device=device
+        )

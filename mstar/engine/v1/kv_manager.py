@@ -7,9 +7,9 @@ from typing import Any, NamedTuple
 
 import torch
 
-from mstar.distributed.communication import CommGroup
+from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
-from mstar.engine.resources.spec import KVReqConfig
+from mstar.engine.resources.spec import ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import (
     AdmitOutcome,
     AllocationFailed,
@@ -243,11 +243,33 @@ class KVPlanState:
         self.total_tokens = other.total_tokens
 
 
+@dataclass
+class KVReqConfig(ResourceReqConfig):
+    # NOTE: this may need to be refined
+    needed_labels: list[str] | None = None
+    needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
+    needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+
+    @property
+    def resource_type(self):
+        return ResourceType.KV_CACHE
+
+    def get_labels(self, node: str, walk: str):
+        if (node, walk) in self.needed_labels_per_node_walk:
+            return self.needed_labels_per_node_walk[(node, walk)]
+        if node in self.needed_labels_per_node:
+            return self.needed_labels_per_node[node]
+        if self.needed_labels is not None:
+            return self.needed_labels
+        return ["main"]
+
+
 class KVManager(Resource):
     def __init__(
         self,
         cfg: KVConfig,
-        comm_group: CommGroup | None,
+        name: str,
+        joint_comm_group: JointGroups | None,
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
@@ -256,6 +278,7 @@ class KVManager(Resource):
         self.kv_cache = KVCache(
             cfg, device, dtype
         )
+        self.name = name
 
         self._arena = PageArena(
             kv_cache=self.kv_cache,
@@ -267,8 +290,9 @@ class KVManager(Resource):
         # TODO: CPU page pool
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        self._rank = comm_group.rank if comm_group is not None else 0
-        self._world_size = comm_group.world_size if comm_group is not None else 1
+        self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
+        self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
+        self._comm_group = joint_comm_group
         self._device = device
         self._lock = threading.RLock()
 
@@ -284,15 +308,16 @@ class KVManager(Resource):
     def build(
         cls, spec: KVSpec,
         device: torch.device,
-        comm_group: CommGroup | None,
+        joint_comm_group: JointGroups | None,
         transfer_engine_info: TransferEngineInfo,
         dtype=torch.bfloat16,
         **kwargs
     ):
         return cls(
             cfg=spec.config,
+            name=spec.label,
             device=device,
-            comm_group=comm_group,
+            joint_comm_group=joint_comm_group,
             transfer_engine_info=transfer_engine_info,
             dtype=dtype
         )
@@ -557,6 +582,39 @@ class KVManager(Resource):
 
         self._streams.pop(rid, None)
         self._overrides.pop(rid, None)
+    
+    def post_warmup_validate(self):
+        """Assert ``num_free_pages`` is identical across every TP rank
+
+        Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
+        but not another), allocator-init bugs, and any future code path
+        that adds requests asymmetrically before ``warmup`` returns. The
+        ``all_gather`` itself is synchronizing, so no extra barrier is
+        needed on the success path.
+        """
+        if self._comm_group.world_size == 1:
+            return
+        local_free = self._arena.num_free
+        local_t = torch.tensor(
+            [local_free], dtype=torch.int64, device=self._device,
+        )
+
+        for group in [
+            self._comm_group.tp_group, self._comm_group.sp_group
+        ]:
+            gathered = group.all_gather(local_t, dim=0)
+            values = gathered.cpu().tolist()
+            if any(v != values[0] for v in values):
+                raise RuntimeError(
+                    f"KV cache {self.name!r} has asymmetric num_free_pages "
+                    f"across TP ranks: {values}. v1 requires symmetric "
+                    "allocator state; check the YAML for per-rank-divergent "
+                    "max_num_pages / cpu_offload_pages, and any model code "
+                    "that calls add_request before warmup completes."
+                )
+
+    def cleanup(self):
+        self._transfer.cleanup()
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:

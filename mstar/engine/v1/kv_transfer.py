@@ -327,6 +327,8 @@ class KVTransferManager:
             read_info=read_info
         )
 
+    def cleaup(self):
+        self._kv_transfer_engine.shutdown()
 
     def get_kv_transfer_info(self):
         """Descriptor another process needs to read this cache remotely.

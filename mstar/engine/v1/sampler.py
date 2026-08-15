@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 
-from mstar.distributed.communication import CommGroup
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import AdmitOutcome, SamplerStep, StepContext
@@ -53,7 +53,7 @@ class SamplerResource(Resource):
         vocab_size: int | None,
         enable_repetion_penalty: bool,
         device: torch.device,
-        comm_group: CommGroup | None=None
+        comm_group: JointGroups | None=None
     ):
         self._track_seen_tokens = enable_repetion_penalty
         self._vocab_size = vocab_size if self._track_seen_tokens else None
@@ -73,14 +73,14 @@ class SamplerResource(Resource):
     def build(
         cls, spec: SamplerSpec,
         device: torch.device,
-        comm_group: CommGroup | None,
+        joint_comm_group: JointGroups | None,
         **engine_kwargs
     ):
         return cls(
             vocab_size=spec.vocab_size,
             enable_repetion_penalty=spec.enable_repetion_penalty,
             device=device,
-            comm_group=comm_group
+            comm_group=joint_comm_group
         )
 
     def build_cuda_graph_buffers(

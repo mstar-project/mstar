@@ -255,9 +255,7 @@ class CrossAttentionSpec(NodeResourceSpec):
 
     @property
     def resource_type(self):
-        # same kind as self-attention: the two differ in where the key side
-        # comes from, which is a spec/build concern, not a kind
-        return ResourceType.ATTENTION
+        return ResourceType.CROSS_ATTENTION
 
 
 class CrossAttentionManager(Resource):
