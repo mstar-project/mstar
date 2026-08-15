@@ -129,9 +129,14 @@ class LingBotModel(Model):
             return
         from transformers import AutoProcessor
 
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_path_hf, subfolder="processor", cache_dir=self.cache_dir, trust_remote_code=True
-        )
+        from mstar.model.lingbot.weight_loader import resolve_subfolder_dir
+
+        # Resolve the processor to a LOCAL directory first and load from that path.
+        # Passing the repo id makes transformers' tokenizer loader hit the Hub API
+        # (is_base_mistral -> model_info), which hangs on a restricted network and
+        # errors under HF_HUB_OFFLINE; a local path is treated as offline and skips it.
+        processor_dir = resolve_subfolder_dir(self.model_path_hf, "processor", self.cache_dir)
+        self.processor = AutoProcessor.from_pretrained(str(processor_dir), trust_remote_code=True)
         self._processor_initialized = True
 
     def _compute_crop_start(self) -> int:
