@@ -434,6 +434,15 @@ class LingBotAdapter(OpenAIAdapter):
     ``size`` ("WxH") maps to ``width`` / ``height``. ``seed`` and any extra
     diffusion knobs (``guidance_scale``, ``num_inference_steps``,
     ``negative_prompt``, optional ``init_latents``) pass through as model kwargs.
+
+    Prompting: LingBot-Video is trained on **structured-JSON captions**, not raw
+    natural language — the reference pipeline runs a separate prompt rewriter
+    (Qwen3-27B) that expands a plain prompt into a JSON caption, and *that*
+    conditions the DiT. Passing a raw prompt (e.g. "a red fox running") produces
+    degraded/garbled video on the reference model too. Send a structured-JSON
+    caption as ``prompt`` (see the upstream rewriter / ``docs/prompt_preparation``).
+    When ``negative_prompt`` is omitted the model's default structured negative is
+    used. (Serving the rewriter itself is out of scope for this port.)
     """
 
     supports_videos = True

@@ -303,8 +303,9 @@ class LingBotVaeDecoderSubmodule(NodeSubmodule):
             )
             vae_latents = latents.to(device=device, dtype=torch.float32) / std_inv + mean
             vae_latents = vae_latents.contiguous(memory_format=torch.channels_last_3d)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                decoded = vae.decode(vae_latents)
+            # Decode in fp32 (weights + activations); upstream inference uses --vae_dtype fp32.
+            # bf16 autocast here noticeably degrades the decoded frames.
+            decoded = vae.decode(vae_latents)
             video = decoded[0] if isinstance(decoded, tuple) else decoded.sample
             video = video.float().clamp(-1, 1)
             video = ((video + 1.0) / 2.0).mul(255).clamp(0, 255).to(torch.uint8)

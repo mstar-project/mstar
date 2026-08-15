@@ -166,7 +166,9 @@ def build_lingbot_vae_decoder(
     with torch.device("meta"):
         vae = LingBotWanVaeDecoder(config)
     vae.to_empty(device=device)
-    vae.to(dtype=torch.bfloat16)
+    # The Wan 3D-VAE decode is run in fp32 (upstream inference uses --vae_dtype fp32);
+    # bf16 here visibly degrades decoded frames, so keep VAE weights in fp32.
+    vae.to(dtype=torch.float32)
     _load_exact(
         vae,
         _iter_diffusers_safetensors(vae_dir, device),

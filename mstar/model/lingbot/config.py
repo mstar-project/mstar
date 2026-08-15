@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from mstar.model.lingbot.default_negative_prompt import DEFAULT_NEGATIVE_PROMPT
+
 
 @dataclass
 class LingBotConfig:
@@ -44,7 +46,7 @@ class LingBotConfig:
     default_num_inference_steps: int = 40
     default_guidance_scale: float = 6.0
     default_shift: float = 3.0
-    default_negative_prompt: str = ""
+    default_negative_prompt: str = DEFAULT_NEGATIVE_PROMPT
     video_fps: int = 24
     max_denoise_steps: int = 100
 
