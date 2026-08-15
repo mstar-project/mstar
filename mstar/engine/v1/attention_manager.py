@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import os
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 
@@ -11,7 +11,7 @@ from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
 from mstar.engine.resources.step import AttentionStep, StepContext
 from mstar.engine.v1.kv_cache import KVConfig
-from mstar.engine.v1.kv_manager import KVManager, KVPlanOutput, SequenceView
+from mstar.engine.v1.kv_manager import KVManager, KVPlanOutput, PagedIndptrs, SequenceView
 from mstar.engine.v1.attention_wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
 
 
@@ -194,4 +194,296 @@ class FlashInferManager(AttentionManager):
         return self._current_plan_states[label].run(q, kv_cache_layer)
 
 
-# TODO: cross attention, dense attention
+@dataclass
+class CrossAttentionConfig:
+    """Cross-attention against a context written once and never extended.
+
+    ``kv_cache`` names the KV resource holding the encoder context;
+    ``query_kv_cache`` names the decoder's KV resource, whose plan defines
+    this step's query packing. They may be the same resource when the
+    context shares the decoder's head config — the context then lives in it
+    under its own ``context_label``. They differ when it does not, which is
+    the usual case (an encoder's head count rarely matches the decoder's).
+    """
+    kv_cache: str  # name of the KV cache holding the context
+    query_kv_cache: str  # name of the KV cache driving the queries
+    context_label: str = "context"
+    backend: AttnBackend = AttnBackend.FLASHINFER
+    flashinfer_backend: str = "auto"
+
+
+@dataclass
+class CrossAttentionSpec(NodeResourceSpec):
+    config: CrossAttentionConfig
+    # head config of the *context* cache, which need not match the decoder's
+    kv_config: KVConfig
+
+    @property
+    def resource_type(self):
+        # same kind as self-attention: the two differ in where the key side
+        # comes from, which is a spec/build concern, not a kind
+        return ResourceType.ATTENTION
+
+
+class CrossAttentionManager(Resource):
+    # Remains abstract except for build; will build based
+    # on the attention backend
+
+    @classmethod
+    def build(
+        cls, spec: CrossAttentionSpec,
+        device: torch.device,
+        dtype=torch.bfloat16,
+        **engine_kwargs
+    ):
+        if spec.config.backend == AttnBackend.FLASHINFER:
+            return FlashInferCrossManager(
+                kv_cache=spec.config.kv_cache,
+                query_kv_cache=spec.config.query_kv_cache,
+                context_label=spec.config.context_label,
+                device=device,
+                dtype=dtype,
+                kv_config=spec.kv_config,
+                backend=spec.config.flashinfer_backend,
+            )
+
+
+class FlashInferCrossManager(CrossAttentionManager):
+    """non-causal paged attention over fixed encoder context
+
+    context is an ordinary kv stream so requires no additional storage
+    or allocation on part of attention manager
+
+    encode step writes context via normal `Segment` on cache, and later
+    steps use `span=0` on that label
+
+    wrapper is planned per decoder plan label and run is keyed on that label
+    a la `FlashInferManager`"""
+
+    def __init__(
+        self,
+        kv_cache: str,
+        query_kv_cache: str,
+        context_label: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        kv_config: KVConfig,
+        backend: str = "auto",
+    ):
+        self._kv_cache_name = kv_cache
+        self._query_kv_cache_name = query_kv_cache
+        self._context_label = context_label
+        self._device = device
+        self._dtype = dtype
+
+        # decoder plan label -> wrapper
+        self._current_plan_states: dict[str, AttentionWrapper] = {}
+        # persistent wrappers [we can keep eager ones]
+        self._eager_plan_states: dict[str, AttentionWrapper] = {}
+        self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
+        # wrapper key (plan label, or CGSlotKey under capture) -> fingerprint
+        # of the last plan call made on that wrapper
+        # NOTE: a little bit (very) sketchy should be refined; goal is to avoid
+        # redundant plan comp. how to do the mapping to track is another issue
+        self._plan_keys: dict[Any, PlanCacheKey] = {}
+
+        self._kv_config = kv_config
+        self._wrapper_kv_kwargs = dict(
+            num_qo_heads=kv_config.num_qo_heads,
+            num_kv_heads=kv_config.num_kv_heads,
+            head_dim=kv_config.head_dim,
+            page_size=kv_config.page_size,
+            max_num_pages=kv_config.max_num_pages,
+            device=device,
+            backend=backend
+        )
+
+        self._buffer_size = int(
+            os.environ.get("MSTAR_WORKSPACE_BUFFER_MB", "512")
+        ) * 1024 * 1024
+        self._workspace_buffers: dict[str, torch.Tensor] = {}
+
+    def depends_on(self):
+        return {self._kv_cache_name, self._query_kv_cache_name}
+
+    def _get_workspace_buffer(
+        self, label: str, cg_slot: int | None=None
+    ):
+        key = label if cg_slot is None else f"{label}_{cg_slot}"
+        if key not in self._workspace_buffers:
+            self._workspace_buffers[key] = torch.empty(
+                self._buffer_size, dtype=torch.uint8, device=self._device
+            )
+        return self._workspace_buffers[key]
+
+    def build_cuda_graph_buffers(
+        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+    ):
+        del max_bs, max_seq_len
+        for slot in slots:
+            bucket = slot.bucket
+            for label in slot.config.labels:
+                self._cg_plan_states[CGSlotKey(
+                    bucket=bucket,
+                    slot=slot.slot,
+                    label=label
+                )] = FlashInferPrefillWrapper(
+                    workspace_buffer=self._get_workspace_buffer(label, slot.slot),
+                    batch_size=bucket.bs,
+                    max_total_tokens=bucket.num_tokens,
+                    use_cuda_graph=True,
+                    **self._wrapper_kv_kwargs,
+                )
+
+    def plan(self, step: AttentionStep, ctx: StepContext):
+        del step  # non-causal
+        context_views = self._context_views(ctx)
+
+        self._current_plan_states.clear()
+        for plan_label, kv_out in self._query_plan_outputs(ctx).items():
+            indptrs = self._build_indptrs(kv_out, context_views, plan_label)
+            state_key, wrapper = self._wrapper_for(plan_label, ctx)
+
+            # The context pages are immutable once written, so between steps
+            # only the query side moves; when neither moved the whole plan is
+            # skippable. Every tensor here is on CPU, so `.tolist()` costs no
+            # sync.
+
+            # context is immutable; between step only q will change; when nothing
+            # changes we can skip plan (use old)
+            plan_key = PlanCacheKey(
+                q_seq_lens=tuple(indptrs.qo_indptr.tolist()),
+                page_indices=tuple(indptrs.paged_kv_indices.tolist()),
+                last_page_lens=tuple(indptrs.paged_kv_last_page_len.tolist()),
+            )
+            if self._plan_keys.get(state_key) != plan_key:
+                wrapper.plan(
+                    causal=False,
+                    dtype=self._dtype,
+                    **indptrs.to_kwargs_dict()
+                )
+                self._plan_keys[state_key] = plan_key
+            self._current_plan_states[plan_label] = wrapper
+
+    def _context_views(self, ctx: StepContext) -> dict[str, SequenceView]:
+        """context stream of each request in batch by request id
+
+        key by request rather than zip with query view because not
+        necessarily same length"""
+        plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(
+            self._kv_cache_name
+        )
+        assert plan_outputs is not None, (
+            f"Cross Attention Manager expected plan result from {self._kv_cache_name}"
+        )
+        kv_out = plan_outputs.get(self._context_label)
+        assert kv_out is not None, (
+            f"Cross Attention Manager found no plan for context label "
+            f"{self._context_label!r} in {self._kv_cache_name!r}; every step "
+            "that attends the context must declare a zero-span segment on "
+            f"that label. planned: {sorted(plan_outputs)}"
+        )
+        return {view.request_id: view for view in kv_out.views}
+
+    def _query_plan_outputs(self, ctx: StepContext) -> dict[str, KVPlanOutput]:
+        plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(
+            self._query_kv_cache_name
+        )
+        assert plan_outputs is not None, (
+            f"Cross Attention Manager expected plan result from "
+            f"{self._query_kv_cache_name}"
+        )
+        if self._query_kv_cache_name != self._kv_cache_name:
+            return plan_outputs
+
+        # cache holds both q, k. context is in k, not in own q stream
+        return {
+            label: kv_out for label, kv_out in plan_outputs.items()
+            if label != self._context_label
+        }
+
+    def _build_indptrs(
+        self,
+        query_out: KVPlanOutput,
+        context_views: dict[str, SequenceView],
+        plan_label: str,
+    ) -> PagedIndptrs:
+        """key off context, query off decoder
+
+        reuse of decoder `qo_indpter` keeps the label major order produced by
+        combined CFG plan."""
+        page_size = self._kv_config.page_size
+        kv_indptr = [0]
+        all_pages: list[int] = []
+        last_page_lens: list[int] = []
+
+        for view in query_out.views:
+            context = context_views.get(view.request_id)
+            assert context is not None, (
+                f"no cross attention context for request {view.request_id!r} "
+                f"under label {self._context_label!r}"
+            )
+            assert context.length > 0, (
+                f"cross attention context for request {view.request_id!r} is "
+                "empty; it must be written before the step that attends it"
+            )
+            # stream can have more pages than context needs takes only the prefix
+            # written length covers
+            n_pages = (context.length + page_size - 1) // page_size
+            all_pages.extend(context.page_idxs[:n_pages])
+            kv_indptr.append(kv_indptr[-1] + n_pages)
+            last_page_lens.append(context.last_page_len(page_size) or page_size)
+
+        # fork repeats pages, so batch can index more than held in cache.
+        assert len(all_pages) <= self._kv_config.max_num_pages, (
+            f"cross attention plan {plan_label!r} indexes {len(all_pages)} "
+            f"pages but the context cache holds {self._kv_config.max_num_pages}; "
+            "raise max_num_pages on the context cache's KVConfig"
+        )
+
+        return PagedIndptrs(
+            qo_indptr=query_out.cpu_indptrs.qo_indptr,
+            paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
+            paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),
+        )
+
+    def _wrapper_for(
+        self, plan_label: str, ctx: StepContext
+    ) -> tuple[Any, AttentionWrapper]:
+        if ctx.slot_lease is not None:
+            key = CGSlotKey(
+                bucket=ctx.slot_lease.bucket,
+                slot=ctx.slot_lease.slot,
+                label=plan_label
+            )
+            wrapper = self._cg_plan_states.get(key)
+            assert wrapper is not None, (
+                f"no captured cross attention wrapper for {key}; "
+                "build_cuda_graph_buffers makes one per label the capture "
+                "config declares, so a plan label absent from those labels "
+                "(a combined CFG key) has none"
+            )
+            return key, wrapper
+
+        wrapper = self._eager_plan_states.get(plan_label)
+        if wrapper is None:
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=self._get_workspace_buffer(plan_label),
+                **self._wrapper_kv_kwargs,
+            )
+            self._eager_plan_states[plan_label] = wrapper
+        return plan_label, wrapper
+
+
+
+    def run(
+        self, q: torch.Tensor, label: str,
+        kv_cache_layer: torch.Tensor
+    ) -> torch.Tensor:
+        """One layer's cross attention. ``kv_cache_layer`` is a layer of the
+        *context* cache; nothing is written to it here."""
+        return self._current_plan_states[label].run(q, kv_cache_layer)
+
+
+# TODO: dense attention
