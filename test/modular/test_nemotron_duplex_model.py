@@ -7,9 +7,12 @@ so a dangling edge name or unresolved partition fails loudly here.
 """
 from pathlib import Path
 
+import torch
+
 from mstar.engine.base import EngineType
 from mstar.model.nemotron_duplex.config import NemotronDuplexConfig
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+from mstar.streaming.chunk_policy import FixedChunkPolicy
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
 
@@ -90,3 +93,54 @@ def test_duplex_llm_prefill_to_decode_transition():
     fpa = model.get_partition_forward_pass_args("LLM", meta, {})
     assert fpa.full_metadata.graph_walk == "decode"
     assert fpa.full_metadata.is_prefill is False
+
+
+# --- regression tests for the E5 full-duplex serving fixes ------------------
+
+
+def test_duplex_stream_connection_policies():
+    """The duplex loops are 1:1 stream-driven and terminate on stream end:
+    Encoder→LLM and LLM→Talker release one item per step with
+    continue_after_done=False (else the loops would spin past their input);
+    Talker→Codec releases NON-overlapping chunks of ``codec_chunk_frames`` (the
+    codec keeps its own left-context, so re-delivering overlap balloons the
+    audio ~window/chunk×)."""
+    model = _make_model()
+    conns = {c.edge_name: c.chunk_policy_factory()
+             for c in model.get_partition_topology().connections}
+
+    for edge in ("audio_frame", "new_token"):
+        pol = conns[edge]
+        assert isinstance(pol, FixedChunkPolicy)
+        assert pol.next_chunk_size(10) == 1
+        assert pol.continue_after_producer_done() is False
+
+    codec = conns["codec_tokens"]
+    assert isinstance(codec, FixedChunkPolicy)
+    assert codec.next_chunk_size(100) == model.config.eartts.codec_chunk_frames
+    assert codec.continue_after_producer_done() is False
+
+
+def test_duplex_process_prompt_seeds_frame0_feedback():
+    """The frame-0 decode step lists prev_text / prev_func as inputs but has no
+    prior sampled token; process_prompt must seed them (BOS / PAD) or the decode
+    loop never becomes ready (the original hang)."""
+    model = _make_model()
+    out = model.process_prompt(
+        None, ["audio"], ["audio", "text"],
+        tensors={"audio_inputs": [torch.zeros(16000)]},
+    )
+    assert "audio_features" in out
+    assert int(out["prev_text"][0].item()) == model.config.text_bos_id
+    assert int(out["prev_func"][0].item()) == model.config.text_pad_id
+
+
+def test_duplex_no_prompt_seeds_initial_decode_inputs():
+    """Audio-only start (no system prompt): the LLM partition jumps straight to
+    the decode loop and its initial inputs carry the seeded prev_text / prev_func
+    so iteration 0's readiness gate fires."""
+    model = _make_model()
+    sig = {"audio_features": ["a"], "prev_text": ["pt"], "prev_func": ["pf"]}
+    fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], sig)
+    assert fpa.full_metadata.graph_walk == "decode"
+    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func"}
