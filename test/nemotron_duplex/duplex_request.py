@@ -7,12 +7,16 @@ Usage:
     python test/nemotron_duplex/duplex_request.py --text-only
     python test/nemotron_duplex/duplex_request.py --output agent.wav -n 3
 
-With no --audio, a sample input is resolved from the base VoiceChat-11B HF repo,
-which ships turn_taking.wav / interruptions.wav / tool_call.wav.
+With no --audio, a clean USER-only input is prepared from the base VoiceChat-11B
+demo (``turn_taking.wav``). Those demo wavs are 2-channel recordings of the WHOLE
+conversation (user on the left, agent on the right) meant for listening — feeding
+them as-is would let the model hear its own side, so we take the left (user)
+channel, isolate the first user turn, and resample to 16 kHz mono.
 """
 import argparse
 import os
 import sys
+import tempfile
 import threading
 import time
 
@@ -20,13 +24,52 @@ from _env import get_base_url, load_env
 
 from mstar.client.client import MStarClient
 
-# Sample inputs bundled in the base VoiceChat-11B HF repo, in preference order.
-_SAMPLE_WAVS = ("turn_taking.wav", "interruptions.wav", "tool_call.wav")
+_DEMO_WAV = "turn_taking.wav"     # base VoiceChat-11B repo; L=user, R=agent
+_PREPARED = os.path.join(tempfile.gettempdir(), "nemotron_duplex_default_user_turn.wav")
+
+
+def _first_user_turn(user, sr, trailing_s=6.0):
+    """First contiguous user utterance >= ~1.2 s (short gaps bridged), with 0.3 s
+    lead pad and ``trailing_s`` of trailing silence.
+
+    The trailing silence matters: this is a frame-synchronous model that stays
+    silent (EOS) *while* the user is speaking and only produces its reply in the
+    frames *after* — so a clip cut off right at the question yields an all-silent
+    agent. The user (left) channel is naturally silent while the agent replies,
+    so extending into it (zero-padded if the file ends) gives the reply room."""
+    import numpy as np
+
+    w = int(sr * 0.1)                                  # 100 ms frames
+    n = len(user) // w
+    e = np.sqrt((user[: n * w].reshape(n, w) ** 2).mean(1))
+    act = e > e.max() * 0.08
+    for i in range(1, n - 3):                          # bridge <0.3 s gaps
+        if not act[i] and act[i - 1] and act[i : i + 3].any():
+            act[i] = True
+    runs, i = [], 0
+    while i < n:
+        if act[i]:
+            j = i
+            while j < n and act[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        return user
+    s, ep = next((r for r in runs if (r[1] - r[0]) * 0.1 >= 1.2), runs[0])
+    a = max(0, s * w - int(sr * 0.3))
+    b = ep * w + int(sr * trailing_s)
+    clip = user[a : min(len(user), b)]
+    if b > len(user):                                  # pad reply room past EOF
+        clip = np.concatenate([clip, np.zeros(b - len(user), dtype=clip.dtype)])
+    return clip
 
 
 def default_audio() -> str:
-    """Resolve a bundled sample wav from the HF cache (downloads the small file
-    if the repo snapshot didn't already fetch it)."""
+    """Prepare (once) and return a clean 16 kHz-mono user-only clip from the
+    VoiceChat-11B demo. Falls back to the raw demo wav if audio libs are missing."""
     load_env()
     from huggingface_hub import hf_hub_download
 
@@ -34,16 +77,25 @@ def default_audio() -> str:
 
     repo = HF_MODELS["nemotron_duplex"]["model_path_hf"]
     cache_dir = os.environ.get("NEMOTRON_DUPLEX_CACHE_DIR")
-    last_err = None
-    for fname in _SAMPLE_WAVS:
-        try:
-            return hf_hub_download(repo, fname, cache_dir=cache_dir)
-        except Exception as e:  # noqa: BLE001 - try the next sample
-            last_err = e
-    raise SystemExit(
-        f"No --audio given and no sample wav could be resolved from {repo!r} "
-        f"(last error: {last_err}). Pass --audio /path/to/user.wav."
-    )
+    src = hf_hub_download(repo, _DEMO_WAV, cache_dir=cache_dir)
+
+    if os.path.exists(_PREPARED):
+        return _PREPARED
+    try:
+        import soundfile as sf
+        import torch
+        import torchaudio.functional as AF
+
+        d, sr = sf.read(src, dtype="float32")
+        user = d[:, 0] if d.ndim == 2 else d          # left channel = user
+        clip = _first_user_turn(user, sr)
+        clip16 = AF.resample(torch.from_numpy(clip.copy()), sr, 16000).numpy()
+        sf.write(_PREPARED, clip16, 16000)
+        print(f"prepared user-only input: {_PREPARED} ({len(clip16) / 16000:.1f}s @ 16 kHz)")
+        return _PREPARED
+    except Exception as e:  # noqa: BLE001 - degrade to the raw demo wav
+        print(f"warning: could not prepare user-only clip ({e}); using raw demo {src}")
+        return src
 
 
 def one_request(url: str, audio: str, modalities, temperature: float):

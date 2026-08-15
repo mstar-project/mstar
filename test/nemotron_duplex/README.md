@@ -38,17 +38,25 @@ bash test/nemotron_duplex/launch_server.sh disagg   # 3-GPU pipeline (nemotron_d
 Both layouts produce identical text + audio. The first request compiles kernels
 (cold, ~90 s); the talker is eager MaskGIT (~2 s/frame), so prefer short clips.
 
-Send a request. With no `--audio`, a sample input is auto-resolved from the base
-VoiceChat-11B HF repo (which ships `turn_taking.wav`, `interruptions.wav`,
-`tool_call.wav`):
+Send a request. With no `--audio`, a clean **user-only** input is prepared from
+the base VoiceChat-11B demo `turn_taking.wav` — those demo wavs are 2-channel
+recordings of the whole conversation (user left, agent right), so we take the
+user channel, isolate the first user turn, and append silence for the reply. On
+the default clip the agent answers *"Oh, I love cooking! How about this chocolate
+chip cookie recipe? …"*.
 
 ```bash
 cd test/nemotron_duplex
-python duplex_request.py                                 # default sample -> agent_out.wav
+python duplex_request.py                                 # default user clip -> agent_out.wav
 python duplex_request.py --audio /path/to/user.wav --output agent.wav
-python duplex_request.py --text-only                     # skip talker/codec
+python duplex_request.py --text-only                     # skip talker/codec (fast)
 python duplex_request.py -n 3                             # 3 concurrent (batching)
 ```
+
+Your own `--audio` should be **user speech only** (mono), with a few seconds of
+trailing silence — the model is frame-synchronous and replies in the frames
+*after* you stop talking. `--text-only` returns the transcript-style agent text
+in seconds; full audio takes a few minutes (the talker is eager MaskGIT).
 
 ## Validate against the oracle
 
