@@ -1,32 +1,60 @@
-from mstar.model.bagel.bagel_model import BagelModel
-from mstar.model.base import Model
-from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
-from mstar.model.lingbot.lingbot_model import LingBotModel
-from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
-from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
-from mstar.model.wan22.wan22_model import Wan22Model
-from mstar.model.whisper.whisper_model import WhisperModel
+import importlib
+from collections.abc import Mapping
 
-MODEL_REGISTRY: dict[str, type[Model]] = {
-    "bagel": BagelModel,
-    "cosmos3": Cosmos3Model,
-    "cosmos3_droid": Cosmos3Model,
-    "cosmos3_super": Cosmos3Model,
-    "higgs_audio": HiggsAudioModel,
-    "lingbot": LingBotModel,
-    "orpheus": OrpheusModel,
-    "pi05": Pi05Model,
-    "qwen3_omni": Qwen3OmniModel,
-    "qwen3_tts": Qwen3TTSModel,
-    "vjepa2": VJepa2Model,
-    "vjepa2_ac": VJepa2ACModel,
-    "wan22": Wan22Model,
-    "whisper_large": WhisperModel,
+from mstar.model.base import Model
+
+# name -> "module.path:ClassName". Kept as strings so importing the registry does
+# NOT import every model module. Eager imports pulled in every model's optional
+# heavy deps (e.g. qwen3_omni -> flashinfer), so serving ONE model required all of
+# them installed — and a missing/broken dep for any model broke the whole server.
+_MODEL_CLASS_PATHS: dict[str, str] = {
+    "bagel": "mstar.model.bagel.bagel_model:BagelModel",
+    "cosmos3": "mstar.model.cosmos3.cosmos3_model:Cosmos3Model",
+    "cosmos3_droid": "mstar.model.cosmos3.cosmos3_model:Cosmos3Model",
+    "cosmos3_super": "mstar.model.cosmos3.cosmos3_model:Cosmos3Model",
+    "higgs_audio": "mstar.model.higgs_audio.higgs_audio_model:HiggsAudioModel",
+    "lingbot": "mstar.model.lingbot.lingbot_model:LingBotModel",
+    "orpheus": "mstar.model.orpheus.orpheus_model:OrpheusModel",
+    "pi05": "mstar.model.pi05.pi05_model:Pi05Model",
+    "qwen3_omni": "mstar.model.qwen3_omni.qwen3_omni_model:Qwen3OmniModel",
+    "qwen3_tts": "mstar.model.qwen3_tts.qwen3_tts_model:Qwen3TTSModel",
+    "vjepa2": "mstar.model.vjepa2.vjepa2_model:VJepa2Model",
+    "vjepa2_ac": "mstar.model.vjepa2.vjepa2_model:VJepa2ACModel",
+    "wan22": "mstar.model.wan22.wan22_model:Wan22Model",
+    "whisper_large": "mstar.model.whisper.whisper_model:WhisperModel",
 }
+
+
+class _LazyModelRegistry(Mapping):
+    """Read-only name -> Model-subclass mapping that imports each model module
+    only on first item access. Membership (``in``) and key iteration never import,
+    so listing available models stays dependency-free; ``MODEL_REGISTRY[name]``
+    imports just that model (raising the real ImportError if its deps are absent).
+    """
+
+    def __init__(self, class_paths: dict[str, str]):
+        self._class_paths = class_paths
+        self._cache: dict[str, type[Model]] = {}
+
+    def __getitem__(self, name: str) -> type[Model]:
+        if name not in self._class_paths:
+            raise KeyError(name)
+        if name not in self._cache:
+            module_path, class_name = self._class_paths[name].split(":")
+            self._cache[name] = getattr(importlib.import_module(module_path), class_name)
+        return self._cache[name]
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._class_paths
+
+    def __iter__(self):
+        return iter(self._class_paths)
+
+    def __len__(self) -> int:
+        return len(self._class_paths)
+
+
+MODEL_REGISTRY: Mapping[str, type[Model]] = _LazyModelRegistry(_MODEL_CLASS_PATHS)
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
