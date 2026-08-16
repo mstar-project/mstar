@@ -27,7 +27,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: |
+            rust
+            rust/server
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -36,15 +38,18 @@ jobs:
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
         run: cargo test --release
+      - name: Build the Rust frontend (mstar-server)
+        working-directory: rust/server
+        run: cargo build --release
       - name: Build and install the extension
         working-directory: rust
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --release
           pip install target/wheels/*.whl
-      - name: Interop tests (transport + arena)
+      - name: Interop tests (transport + arena + frontend)
         run: |
-          pip install pytest pyzmq numpy
+          pip install pytest pyzmq msgpack numpy
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu
