@@ -7,7 +7,7 @@ from enum import Enum
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
+from mstar.engine.resources.base import CGSlotKey, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
 from mstar.engine.resources.step import PositionStep, StepContext
 from mstar.engine.v1.kv_manager import KVPlanOutput, SequenceView
@@ -91,17 +91,20 @@ class RopeManager(PositionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def build_cuda_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
-    ):
-        del max_bs, max_seq_len
-        for slot in slots:
-            for label in slot.config.labels:
-                self._static_pos_ids[CGSlotKey(
-                    bucket=slot.bucket, slot=slot.slot, label=label
-                )] = torch.zeros(
-                    slot.bucket.num_tokens, dtype=torch.long, device=self._device
-                )
+    def _static_buffer(self, key: CGSlotKey, num_tokens: int) -> torch.Tensor:
+        """The captured-graph pos_ids buffer for one (bucket, slot, label).
+
+        Built on the first plan for that key rather than up front: which labels
+        a walk plans under is the step's to declare, and the first plan for a
+        bucket runs during capture, before the graph is recorded, so the buffer
+        is just as persistent either way.
+        """
+        buffer = self._static_pos_ids.get(key)
+        if buffer is None:
+            buffer = self._static_pos_ids[key] = torch.zeros(
+                num_tokens, dtype=torch.long, device=self._device
+            )
+        return buffer
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides
@@ -187,12 +190,7 @@ class RopeManager(PositionManager):
         key = CGSlotKey(
             bucket=ctx.slot_lease.bucket, slot=ctx.slot_lease.slot, label=plan_label
         )
-        buffer = self._static_pos_ids.get(key)
-        assert buffer is not None, (
-            f"no static pos_ids buffer for {key}; build_cuda_graph_buffers "
-            "allocates one per label the capture config declares, so a plan "
-            "label absent from those labels (a combined CFG key) has none"
-        )
+        buffer = self._static_buffer(key, ctx.slot_lease.bucket.num_tokens)
         n = pos_ids.shape[0]
         assert n <= buffer.shape[0], (
             f"plan label {plan_label!r} carries {n} tokens but its captured "

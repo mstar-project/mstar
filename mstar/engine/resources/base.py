@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -5,13 +7,15 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.v1.cuda_graph_config import CudaGraphConfig
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
 
-if TYPE_CHECKING:   
+if TYPE_CHECKING:
     from mstar.engine.kv_store import TransferEngineInfo
+    # the config reaches back here through the submodule base, so keep the
+    # import out of module exec
+    from mstar.engine.v1.cuda_graph_config import CudaGraphConfig
 
 
 @dataclass(frozen=True)

@@ -7,9 +7,9 @@ from typing import Any, NamedTuple
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
+from mstar.engine.resources.base import CGSlotKey, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
-from mstar.engine.resources.step import AttentionStep, StepContext
+from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
 from mstar.engine.v1.kv_cache import KVConfig
 from mstar.engine.v1.kv_manager import KVManager, KVPlanOutput, PagedIndptrs, SequenceView
 from mstar.engine.v1.attention_wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
@@ -117,37 +117,38 @@ class FlashInferManager(AttentionManager):
             )
         return self._workspace_buffers[key]
 
-    def build_cuda_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
-    ):
-        del max_bs, max_seq_len
-        for slot in slots:
-            bucket = slot.bucket
-            is_decode = bucket.bs == bucket.num_tokens
+    def _cg_wrapper(self, lease: SlotLease, label: str) -> AttentionWrapper:
+        """The captured-graph wrapper for one (bucket, slot, label).
 
-            for label in slot.config.labels:
-                buffer = self._get_workspace_buffer(label, slot.slot)
-                if is_decode:
-                    wrapper = FlashInferDecodeWrapper(
-                        workspace_buffer=buffer,
-                        batch_size=bucket.bs,
-                        use_cuda_graph=True,
-                        **self._wrapper_kv_kwargs,
-                    )
-                else:
-                    wrapper = FlashInferPrefillWrapper(
-                        workspace_buffer=buffer,
-                        batch_size=bucket.bs,
-                        max_total_tokens=bucket.num_tokens,
-                        use_cuda_graph=True,
-                        **self._wrapper_kv_kwargs,
-                    )
-                self._cg_plan_states[CGSlotKey(
-                    bucket=slot.bucket,
-                    slot=slot.slot,
-                    label=label
-                )] = wrapper
+        Built on the first plan for that key rather than up front: which labels
+        a walk plans under is the step's to declare, and the first plan for a
+        bucket runs during capture, before the graph is recorded, so the wrapper
+        is just as persistent either way.
+        """
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        wrapper = self._cg_plan_states.get(key)
+        if wrapper is not None:
+            return wrapper
 
+        bucket = lease.bucket
+        buffer = self._get_workspace_buffer(label, lease.slot)
+        if bucket.bs == bucket.num_tokens:
+            wrapper = FlashInferDecodeWrapper(
+                workspace_buffer=buffer,
+                batch_size=bucket.bs,
+                use_cuda_graph=True,
+                **self._wrapper_kv_kwargs,
+            )
+        else:
+            wrapper = FlashInferPrefillWrapper(
+                workspace_buffer=buffer,
+                batch_size=bucket.bs,
+                max_total_tokens=bucket.num_tokens,
+                use_cuda_graph=True,
+                **self._wrapper_kv_kwargs,
+            )
+        self._cg_plan_states[key] = wrapper
+        return wrapper
 
     @property
     def supports_preplan(self):
@@ -181,11 +182,7 @@ class FlashInferManager(AttentionManager):
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             if ctx.slot_lease is not None:
-                wrapper = self._cg_plan_states[CGSlotKey(
-                    bucket=ctx.slot_lease.bucket,
-                    slot=ctx.slot_lease.slot,
-                    label=label
-                )]
+                wrapper = self._cg_wrapper(ctx.slot_lease, label)
             else:
                 is_decode = indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
                 buffer = self._get_workspace_buffer(label)
@@ -352,25 +349,6 @@ class FlashInferCrossManager(CrossAttentionManager):
             )
         return self._workspace_buffers[key]
 
-    def build_cuda_graph_buffers(
-        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
-    ):
-        del max_bs, max_seq_len
-        for slot in slots:
-            bucket = slot.bucket
-            for label in slot.config.labels:
-                self._cg_plan_states[CGSlotKey(
-                    bucket=bucket,
-                    slot=slot.slot,
-                    label=label
-                )] = FlashInferPrefillWrapper(
-                    workspace_buffer=self._get_workspace_buffer(label, slot.slot),
-                    batch_size=bucket.bs,
-                    max_total_tokens=bucket.num_tokens,
-                    use_cuda_graph=True,
-                    **self._wrapper_kv_kwargs,
-                )
-
     @property
     def supports_preplan(self):
         return True
@@ -516,18 +494,22 @@ class FlashInferCrossManager(CrossAttentionManager):
         self, plan_label: str, ctx: StepContext
     ) -> tuple[Any, AttentionWrapper]:
         if ctx.slot_lease is not None:
+            lease = ctx.slot_lease
             key = CGSlotKey(
-                bucket=ctx.slot_lease.bucket,
-                slot=ctx.slot_lease.slot,
-                label=plan_label
+                bucket=lease.bucket, slot=lease.slot, label=plan_label
             )
             wrapper = self._cg_plan_states.get(key)
-            assert wrapper is not None, (
-                f"no captured cross attention wrapper for {key}; "
-                "build_cuda_graph_buffers makes one per label the capture "
-                "config declares, so a plan label absent from those labels "
-                "(a combined CFG key) has none"
-            )
+            if wrapper is None:
+                # built on first plan for the key; see FlashInferManager._cg_wrapper
+                wrapper = self._cg_plan_states[key] = FlashInferPrefillWrapper(
+                    workspace_buffer=self._get_workspace_buffer(
+                        plan_label, lease.slot
+                    ),
+                    batch_size=lease.bucket.bs,
+                    max_total_tokens=lease.bucket.num_tokens,
+                    use_cuda_graph=True,
+                    **self._wrapper_kv_kwargs,
+                )
             return key, wrapper
 
         wrapper = self._eager_plan_states.get(plan_label)

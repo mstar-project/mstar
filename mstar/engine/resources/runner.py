@@ -53,6 +53,27 @@ class StepRunner:
     def __init__(self, resources: Mapping[str, Resource]):
         self._resources: dict[str, Resource] = dict(resources)
         self._order = topo_sort(self._resources) # only toposort once to minimize cpu time on python
+        self._preplan_order = [
+            res for res in self._order if self._resources[res].supports_preplan
+        ]
+        self._check_preplan_deps()
+
+    def _check_preplan_deps(self) -> None:
+        """A pre-planning resource's dependencies must pre-plan too.
+
+        A resource's `plan` reads its dependencies' output off
+        `ctx.plan_results`, so pre-planning one whose dependency stays behind
+        would read a result from the wrong (in-flight) step.
+        """
+        preplanned = set(self._preplan_order)
+        for key in self._preplan_order:
+            missing = sorted(self._resources[key].depends_on() - preplanned)
+            if missing:
+                raise ValueError(
+                    f"resource {key!r} pre-plans but its dependencies {missing} "
+                    "do not; a pre-planned step would read their plan output "
+                    "from the step still in flight"
+                )
 
     @property
     def order(self) -> tuple[str, ...]:
@@ -70,6 +91,9 @@ class StepRunner:
                 f"node does not have; available: {sorted(self._resources)}"
             )
         return [key for key in self._order if key in step]
+
+    def _preplan_keys_for(self, step: SubmoduleStep) -> list[str]:
+        return [key for key in self._preplan_order if key in step]
 
 
 
@@ -127,6 +151,30 @@ class StepRunner:
         results = step.ctx.plan_results
         results.clear()
         for key in self._keys_for(step):
+            results[key] = self._resources[key].plan(step.get(key), step.ctx)
+        return results
+
+    def pre_admit(self, step: SubmoduleStep) -> AdmitOutcome:
+        """admit over the pre-planning subset, a step ahead
+
+        the later full `admit` covers the rest; these resources see their own
+        state as already reserved and no-op"""
+        ready = True
+        for key in self._preplan_keys_for(step):
+            outcome = self._resources[key].admit(step.get(key), step.ctx)
+            if not outcome.ok:
+                return outcome
+            ready = ready and outcome.ready
+        return AdmitOutcome(ok=True, ready=ready)
+
+    def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:
+        """plan the pre-planning subset, a step ahead
+
+        `ctx.is_preplan` sends each one's output to its pending slot rather
+        than the live one; the later full `plan` promotes it. Results are left
+        in `ctx.plan_results` for the dependents in this same subset."""
+        results = step.ctx.plan_results
+        for key in self._preplan_keys_for(step):
             results[key] = self._resources[key].plan(step.get(key), step.ctx)
         return results
 

@@ -1,6 +1,5 @@
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-import itertools
 import queue
 import threading
 from typing import Any, NamedTuple
@@ -304,8 +303,9 @@ class KVManager(Resource):
         self._device = device
         self._lock = threading.RLock()
 
-        # (slot, label) -> KVPlanState
+        # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
+        self._cg_max_seq_len = 0
         self._current_plan_states: dict[str, KVPlanState] = {}
 
         self._preplan_states: dict[str, KVPlanState] = {}
@@ -333,19 +333,24 @@ class KVManager(Resource):
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ):
-        del max_bs
-        slot_numbers = {
-            s.slot for s in slots
-        }
-        labels = set(itertools.chain.from_iterable(
-            s.config.labels for s in slots
-        ))
-        for idx in slot_numbers:
-            for label in labels:
-                self._static_plan_states[(idx, label)] = KVPlanState(
-                    token_to_cache=torch.zeros(max_seq_len, dtype=torch.long, device=self._device),
-                    token_to_page=torch.zeros(max_seq_len, dtype=torch.long, device=self._device),
-                )
+        del slots, max_bs
+        # the per-(slot, label) buffers themselves are built on first plan for
+        # that key (which labels a walk plans under is the step's to declare),
+        # all at this one max length so they outlive any single bucket
+        self._cg_max_seq_len = max_seq_len
+
+    def _static_plan_state(self, slot: int, label: str) -> KVPlanState:
+        state = self._static_plan_states.get((slot, label))
+        if state is None:
+            state = self._static_plan_states[(slot, label)] = KVPlanState(
+                token_to_cache=torch.zeros(
+                    self._cg_max_seq_len, dtype=torch.long, device=self._device
+                ),
+                token_to_page=torch.zeros(
+                    self._cg_max_seq_len, dtype=torch.long, device=self._device
+                ),
+            )
+        return state
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
         self._streams[rid] = {
@@ -408,9 +413,21 @@ class KVManager(Resource):
         if self._preplanned:
             # pages were already reserved by the preplan pass
             return AdmitOutcome(ok=True)
-        for (from_label, to_label) in step.pre_forks:
+        # forks reserve here and copy later (plan for pre-, commit for post-),
+        # so a step that never runs leaves pages resident but no page contents
+        # moved — re-admitting it allocates nothing and re-copies nothing.
+        # A post-fork copies the source *after* this step's spans land, so its
+        # reservation covers them.
+        growth = self._label_growth(step) if step.commit else {}
+        forks = [(pre, 0) for pre in step.pre_forks] + [
+            (post, growth) for post in step.post_forks
+        ]
+        for (from_label, to_label), extra in forks:
             for rid in ctx.request_ids:
-                alloc_res = self._fork(rid, from_label, to_label)
+                alloc_res = self._reserve_fork(
+                    rid, from_label, to_label,
+                    extra=0 if not extra else extra.get((rid, from_label), 0),
+                )
                 if not alloc_res.success:
                     return AdmitOutcome(
                         ok=False,
@@ -506,7 +523,7 @@ class KVManager(Resource):
                 total_tokens=indptrs.get_total_len()
             )
             if ctx.slot_lease is not None:
-                static_state = self._static_plan_states[(ctx.slot_lease.slot, label)]
+                static_state = self._static_plan_state(ctx.slot_lease.slot, label)
                 static_state.copy_(plan_state)
                 plan_state = static_state
             if ctx.is_preplan:
@@ -538,6 +555,9 @@ class KVManager(Resource):
             # `_preplanned` and skips its allocation
             self.clear_preplan()
             return res
+        for (from_label, to_label) in step.pre_forks:
+            for rid in ctx.request_ids:
+                self._apply_fork(rid, from_label, to_label)
         res = {
             plan_label: self._plan_output(self._sequence_views(segments))
             for plan_label, segments in group_by_plan_label(
@@ -565,6 +585,11 @@ class KVManager(Resource):
             if step.commit and segment.span > 0:
                 stream = self._streams[segment.request_id][segment.label]
                 stream.stored_len += segment.span
+        # post-forks copy what this step just wrote, so they land after the
+        # spans above are counted
+        for (from_label, to_label) in step.post_forks:
+            for rid in ctx.request_ids:
+                self._apply_fork(rid, from_label, to_label)
         # TODO: handle retention policy, free pages if not commit
 
     def publish(self, request_id: str):
@@ -650,26 +675,45 @@ class KVManager(Resource):
             stream.read_pending = False
         return not stream.read_pending
 
-    def _fork(
+    @staticmethod
+    def _label_growth(step: KVStep) -> dict[tuple[str, str], int]:
+        """(rid, label) -> what this step's commit adds to that stream."""
+        growth: dict[tuple[str, str], int] = {}
+        for segment in step.segments:
+            key = (segment.request_id, segment.label)
+            growth[key] = growth.get(key, 0) + segment.span
+        return growth
+
+    def _reserve_fork(
         self, rid: str, from_label: str,
-        to_label: str, realloc: bool = False
+        to_label: str, extra: int = 0, realloc: bool = False
     ) -> AllocResult:
+        """Pages for a fork target, without moving anything into them.
+
+        ``extra`` is how much the source still grows before the copy runs.
+        """
         # TODO: handle realloc
         if from_label not in self._streams[rid]:
             return AllocResult()
+        self._ensure_label(rid, to_label)
+        return self._alloc(
+            rid, to_label, self._streams[rid][from_label].stored_len + extra
+        )
+
+    def _apply_fork(self, rid: str, from_label: str, to_label: str) -> None:
+        """Copy a stream onto its fork target, over pages `_reserve_fork` took."""
+        if from_label not in self._streams[rid]:
+            return
         from_stream = self._streams[rid][from_label]
         to_stream = self._ensure_label(rid, to_label)
-        alloc_res = self._alloc(rid, to_label, from_stream.stored_len)
-        if alloc_res.success:
-            # TODO: only copy necessary pages
-            # the source can hold more pages than the fork needs (pages
-            # reserved for an uncommitted span), so copy only the prefix
-            self._arena.copy_pages(
-                from_stream.page_indices[:len(to_stream.page_indices)],
-                to_stream.page_indices
-            )
-            to_stream.stored_len = from_stream.stored_len
-        return alloc_res
+        # TODO: only copy necessary pages
+        # the source can hold more pages than the fork needs (pages
+        # reserved for an uncommitted span), so copy only the prefix
+        self._arena.copy_pages(
+            from_stream.page_indices[:len(to_stream.page_indices)],
+            to_stream.page_indices
+        )
+        to_stream.stored_len = from_stream.stored_len
 
     def _alloc(
         self, request_id: str, label: str, seq_len: int

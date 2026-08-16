@@ -29,10 +29,10 @@ class ResourceStep:
 @dataclass(frozen=True)
 class BucketKey:
     graph_walk: str
-    # Matches additional_key_info in CudaGraphConfig
-    cg_key_info: Any | None = None
     bs: int
     num_tokens: int
+    # Matches additional_key_info in CudaGraphConfig
+    cg_key_info: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -47,9 +47,10 @@ class SlotLease:
     filler: tuple[Segment, ...] = field(default_factory=tuple)
 
 
-@dataclass(frozen=True)
+@dataclass
 class StepContext:
-    # engine-only
+    # engine-only. mutable: the engine pads `request_ids` and fills the lease
+    # in once a slot is chosen, on the context the batch already carries
     request_ids: tuple[str, ...]
     graph_walk: str
     slot: int
@@ -79,6 +80,11 @@ class SubmoduleStep:
     @property
     def ctx(self):
         return self._ctx
+
+    def set_ctx(self, ctx):
+        # the step is frozen so a submodule can't rewrite its own declaration;
+        # the engine still owns this one field
+        object.__setattr__(self, "_ctx", ctx)
 
     def get(self, key: str) -> ResourceStep | None:
         return self.steps.get(key)

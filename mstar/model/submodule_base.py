@@ -11,13 +11,15 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.engine.kv_store import PositionInfo
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.step import SubmoduleStep
 from mstar.utils.sampling import BaseSampler, SeenTokenMask
 
 if TYPE_CHECKING:
+    # deprecated, and importing it eagerly closes a cycle: the resources
+    # package reaches back here through the v1 cuda graph config
+    from mstar.engine.cache_manager import BatchedCacheManager
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 
@@ -295,6 +297,7 @@ class NodeSubmodule(torch.nn.Module):
     def declare_step(
         self,
         graph_walk: str,
+        request_ids: list[str],
         inputs: list[NodeInputs],
     ) -> "SubmoduleStep | None":
         """Declare this batch's step for the runner to drive: which cache
@@ -303,7 +306,11 @@ class NodeSubmodule(torch.nn.Module):
         drives the declaration before ``preprocess`` and commits it after
         the forward, so a declaring submodule keeps no plan or advance
         calls of its own. None means the submodule still plans and
-        advances through the facade itself."""
+        advances through the facade itself.
+
+        ``request_ids`` pairs positionally with ``inputs``. Under a captured
+        graph the batch is padded to the bucket's shape, so it carries the
+        padding rows' ids too — declare their segments like any other row."""
         return None
 
     @abstractmethod
@@ -338,6 +345,34 @@ class NodeSubmodule(torch.nn.Module):
         model_inputs: list[NodeInputs],
     ):
         return False # batching disabled by default
+
+    def filter_batched_output(
+        self,
+        request_info: CurrentForwardPassInfo,
+        outputs: dict[str, list[torch.Tensor]],
+    ) -> dict[str, list[torch.Tensor]]:
+        """Drop keys a real request shouldn't receive. A captured forward emits
+        a fixed key set for graph compat, so the filtering happens here."""
+        return outputs
+
+    def unpack_packed_outputs(
+        self,
+        static_output: dict,
+        request_ids: list[str],
+        real_seq_lens: list[int],
+        inputs: list[NodeInputs],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> dict[str, dict[str, list[torch.Tensor]]]:
+        """Per-rid slicing for packed sentinels emitted by the captured graph.
+
+        Decode-style submodules emit per-rid entries inside the captured
+        forward (one slice per request, fixed shape), so they don't need
+        this. Prefill-style submodules pack a (total_tokens, ...) tensor
+        whose per-request slice ends depend on real seq_lens — slicing has
+        to happen post-replay, outside the captured region. Default
+        no-ops; override and key off ``static_output`` sentinel names.
+        """
+        return {}
 
     def max_batch_size(self, graph_walk: str):
         return None
@@ -537,28 +572,3 @@ class ARNodeSubmodule(NodeSubmodule):
         """
         return None
 
-    def filter_batched_output(
-        self,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> dict[str, list[torch.Tensor]]:
-        return outputs
-
-    def unpack_packed_outputs(
-        self,
-        static_output: dict,
-        request_ids: list[str],
-        real_seq_lens: list[int],
-        inputs: list[ARNodeInputs],
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, dict[str, list[torch.Tensor]]]:
-        """Per-rid slicing for packed sentinels emitted by the captured graph.
-
-        Decode-style submodules emit per-rid entries inside the captured
-        forward (one slice per request, fixed shape), so they don't need
-        this. Prefill-style submodules pack a (total_tokens, ...) tensor
-        whose per-request slice ends depend on real seq_lens — slicing has
-        to happen post-replay, outside the captured region. Default
-        no-ops; override and key off ``static_output`` sentinel names.
-        """
-        return {}

@@ -1,7 +1,6 @@
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.runner import StepRunner, topo_sort
 from mstar.engine.resources.spec import (
-    KVReqConfig,
     NodeResourceSpec,
     ResourceReqConfig,
     ResourceType,
@@ -29,7 +28,6 @@ __all__ = [
     "AttentionStep",
     "BucketKey",
     "CGSlotSpec",
-    "KVReqConfig",
     "KVStep",
     "NodeResourceSpec",
     "PositionStep",
