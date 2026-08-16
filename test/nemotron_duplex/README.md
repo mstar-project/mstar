@@ -73,12 +73,15 @@ Behavior to expect / verify:
 - The agent stays silent while the user talks and starts replying a few frames
   after; with a longer `--silence` it will emit **more reply text** (it does not
   wait for the user — it fills silence with plausible follow-up turns).
-- The reply **audio is sparse** — the talker/codec voices only a fraction of the
-  dense text (e.g. ~1.5 s voiced per reply). This matches the standalone
-  `offline_inference` reference, so it's a model/reference characteristic, not a
-  serving-engine bug. (The transport is fixed-buffer input + streamed output; the
-  engine has no incremental-audio-input path — that lives in the model's
-  standalone `realtime_api.py` over `DuplexStream`.)
+- The reply is voiced as **real, intelligible speech**. On a long-context input
+  (a full ~53 s user channel) the agent produces a coherent multi-turn reply with
+  ~13 s of voiced audio (ASR-verifiable, e.g. "Hello! How can I help you today? …
+  a quick peanut butter cookie recipe … bake at three hundred fifty degrees …").
+  Very dense late sentences in a long reply can still thin out (the talker emits
+  ~1 code-frame per text token and the nano packs words densely) — a minor
+  remaining model-reimplementation tail, not a serving-engine bug. (The transport
+  is fixed-buffer input + streamed output; the engine has no incremental-audio-input
+  path — that lives in the model's standalone `realtime_api.py` over `DuplexStream`.)
 
 `--text-only` returns the agent text in seconds; full audio is slower.
 
@@ -96,8 +99,9 @@ python test/nemotron_duplex/webui.py --mstar-url http://127.0.0.1:8019 --port 85
 ```
 
 The mic needs a secure context (works on `http://localhost` / `127.0.0.1`; for
-remote access put it behind HTTPS). Same caveat as above applies — the agent
-replies with full text but only a short voiced burst of audio.
+remote access put it behind HTTPS). The agent replies with full text and voiced
+speech; on very dense late sentences of a long reply the audio can thin out (see
+the streaming-request note above).
 
 ## Validate against the oracle
 
