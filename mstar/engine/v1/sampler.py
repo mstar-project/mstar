@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 
-from mstar.distributed.communication import CommGroup, JointGroups
+from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import AdmitOutcome, SamplerStep, StepContext
@@ -65,6 +65,7 @@ class SamplerResource(Resource):
         self._device = device
         self._comm_group = comm_group
         self._cg_buffers: SamplerBuffers | None = None
+        self._cg_max_bs = 0
 
         # This is set during plan in the cuda graph case
         self._cg_sampler: CudaGraphableSampler | None = None
@@ -87,6 +88,11 @@ class SamplerResource(Resource):
         self, slots, max_bs: int, max_seq_len: int
     ):
         del slots, max_seq_len
+        # every runner capturing against this node calls in; reallocating would
+        # drop the rows already registered, so only grow
+        if self._cg_buffers is not None and max_bs <= self._cg_max_bs:
+            return
+        self._cg_max_bs = max_bs
         self._cg_buffers = SamplerBuffers.allocate(
             max_batch_size=max_bs, device=self._device,
             tp_group=self._comm_group,
@@ -152,4 +158,3 @@ class SamplerResource(Resource):
                 apply_penalty=self._apply_penalty_this_step
             )
         return self._sampler.sample(request_ids, logits)
-        

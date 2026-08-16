@@ -8,10 +8,8 @@ what those configs already describe.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
-
-import torch
 
 
 class ResourceType(IntEnum):

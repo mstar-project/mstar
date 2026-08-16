@@ -1,6 +1,6 @@
-from dataclasses import dataclass, field, replace
 import logging
 import os
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 import torch
@@ -10,13 +10,54 @@ from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotSpec, Resource
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
-from mstar.engine.v1.cuda_graph_config import CudaGraphConfig
+from mstar.engine.v1.cuda_graph_config import (
+    CudaGraphConfig,
+    PiecewiseCaptureShape,
+    PiecewiseConfigType,
+    PiecewiseCudaGraphConfig,
+)
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+
+
+class DummyRowPool:
+    """The padding rows captured replays pad onto.
+
+    Ingested once and kept for the runner's lifetime: a re-ingest would hand
+    the resources a fresh stream and orphan the pages the last capture left
+    resident, and keeping them resident is what lets a step's padding tail
+    allocate nothing.
+    """
+
+    def __init__(
+        self, prefix: str, step_runner: StepRunner,
+        resources: Mapping[str, Resource],
+    ):
+        self._prefix = prefix
+        self._step_runner = step_runner
+        self._resources = resources
+        self._held: dict[str, list[str]] = {}
+
+    def names(self, key: str, bs: int) -> list[str]:
+        return [f"__cg_{self._prefix}_{key}_{i}__" for i in range(bs)]
+
+    def ensure(self, key: str, bs: int) -> list[str]:
+        """``bs`` rows for ``key``, ingesting any this pool hasn't opened yet."""
+        held = self._held.setdefault(key, [])
+        names = self.names(key, bs)
+        for rid in names[len(held):]:
+            self._step_runner.ingest_request(rid)
+            held.append(rid)
+        return names
+
+    def reset(self, rids: list[str], free: bool=False) -> None:
+        for rid in rids:
+            for resource in self._resources.values():
+                resource.reset_request(rid, free=free)
 
 
 @dataclass
@@ -98,11 +139,11 @@ class CudaGraphRunner:
         # along dim 0) and inverts the move on return
         self._static_buffer_seq_dims: dict[tuple[int, str], int] = {}
 
-        # (config_idx, slot) → the padding rows' request ids, ingested once and
-        # kept for the runner's lifetime so their pages stay resident. Sized by
-        # the largest bucket (captures run largest-first); smaller buckets take
-        # a prefix.
-        self._dummy_rids: dict[tuple[int, int], list[str]] = {}
+        # padding rows, keyed "<config_idx>_slot<slot>". Sized by the largest
+        # bucket (captures run largest-first); smaller buckets take a prefix.
+        self._dummy_rows = DummyRowPool(
+            prefix=submodule_name, step_runner=step_runner, resources=resources,
+        )
 
         # Sum of bytes that WOULD have been allocated by per-capture clones
         # (one full tensor per call). For logging purposes.
@@ -231,7 +272,9 @@ class CudaGraphRunner:
     def _capture_one(self, spec: CGSlotSpec) -> CudaGraphSlot:
         walk = spec.bucket.graph_walk
         config = spec.config
-        dummy_rids = self._ensure_dummy_rids(spec.config_idx, spec.slot, spec.bs)
+        dummy_rids = self._dummy_rows.ensure(
+            f"{spec.config_idx}_slot{spec.slot}", spec.bs
+        )
         dummy_inputs = config.get_node_inputs(spec.bs, spec.num_tokens)
         engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
 
@@ -298,7 +341,7 @@ class CudaGraphRunner:
                     run_forward()
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
-                self._reset_dummy_rids(dummy_rids)
+                self._dummy_rows.reset(dummy_rids)
                 prepare()
             torch.cuda.synchronize()
 
@@ -320,30 +363,7 @@ class CudaGraphRunner:
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
-            self._reset_dummy_rids(dummy_rids)
-
-    def _dummy_rid_names(
-        self, config_idx: int, slot: int, bs: int,
-    ) -> list[str]:
-        return [
-            f"__cg_{self._submodule_name}_{config_idx}_slot{slot}_{i}__"
-            for i in range(bs)
-        ]
-
-    def _ensure_dummy_rids(
-        self, config_idx: int, slot: int, bs: int,
-    ) -> list[str]:
-        """The padding rows for one (config, slot), ingested once.
-
-        Re-ingesting would hand the resources a fresh stream and orphan the
-        pages the previous capture left resident, so existing ids are reused.
-        """
-        held = self._dummy_rids.setdefault((config_idx, slot), [])
-        names = self._dummy_rid_names(config_idx, slot, bs)
-        for rid in names[len(held):]:
-            self._step_runner.ingest_request(rid)
-            held.append(rid)
-        return names
+            self._dummy_rows.reset(dummy_rids)
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[str], graph_walk: str,
@@ -368,11 +388,6 @@ class CudaGraphRunner:
                 sampling_config={},
             ) for rid in dummy_rids
         }
-
-    def _reset_dummy_rids(self, dummy_rids: list[str], free: bool=False):
-        for rid in dummy_rids:
-            for resource in self._resources.values():
-                resource.reset_request(rid, free=free)
 
     @staticmethod
     def _seq_dim(value: torch.Tensor, seq_len: int) -> int:
@@ -551,7 +566,7 @@ class CudaGraphRunner:
         slot = self.slot_for(lease)
         slot.graph.replay()
         return slot.static_outputs
-    
+
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],
         plan_done_event: torch.cuda.Event | None = None,
@@ -574,7 +589,7 @@ class CudaGraphRunner:
         this slot allocates nothing for the tail.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
-        self._reset_dummy_rids(dummy_rids[real_bs:lease.bucket.bs])
+        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs])
 
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.
@@ -590,3 +605,368 @@ class CudaGraphRunner:
         if self._plan_stream is None:
             self._plan_stream = torch.cuda.Stream(device=self._device)
         return self._plan_stream
+
+
+# Piecewise buckets share the resources' (bucket, slot, label) buffer space
+# with the full-forward captures. They never coexist on one node — a forward
+# either replays whole or runs eager around captured regions — so the walk name
+# below plus the region's label is enough to keep the keys apart.
+PIECEWISE_WALK = "__piecewise__"
+
+
+@dataclass
+class PiecewiseGraphData:
+    """One captured region, for one (bs, total_tokens) bucket."""
+    graph: torch.cuda.CUDAGraph
+    static_inputs: dict[str, torch.Tensor]
+    static_outputs: dict[str, torch.Tensor]
+    dummy_rids: list[str]
+    shape: PiecewiseCaptureShape
+    bucket: BucketKey
+
+
+class PiecewiseOutput:
+    """Dict-like view over a captured region's output buffers.
+
+    The runner replays into persistent buffers sized for the padded bucket;
+    only the leading ``real_len`` rows are meaningful. Indexing and ``get``
+    return an owned CLONE of that leading slice — safe to keep past the next
+    replay. ``get_view`` returns the same slice WITHOUT copying.
+    """
+    __slots__ = ("_outputs", "_real_len")
+
+    def __init__(self, outputs: dict[str, torch.Tensor], real_len: int):
+        self._outputs = outputs
+        self._real_len = real_len
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._outputs
+
+    def keys(self):
+        return self._outputs.keys()
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        return self._outputs[key][:self._real_len].clone()
+
+    def get(self, key: str, default=None):
+        value = self._outputs.get(key)
+        if value is None:
+            return default
+        return value[:self._real_len].clone()
+
+    def get_view(self, key: str, default=None):
+        """The leading ``real_len`` slice WITHOUT copying.
+
+        The result aliases the runner-owned static output buffer and is
+        OVERWRITTEN by the next ``run``. Read it within the same step; use
+        ``get`` when you need something that outlives the step.
+        """
+        value = self._outputs.get(key)
+        if value is None:
+            return default
+        return value[:self._real_len]
+
+
+class PiecewiseCudaGraphRunner:
+    """Captures one inner callable of a submodule's forward as a CUDA graph.
+
+    Where ``CudaGraphRunner`` replays a whole ``forward_batched`` under engine
+    control, this captures a SUB-REGION — a transformer block loop, say —
+    while the surrounding preamble stays eager and the submodule invokes
+    ``run`` itself. The config supplies the callable, its static buffers, and
+    the region's own step declaration; the runner drives that step through the
+    same admit → plan → commit cycle the engine uses, so the region's
+    attention plan lands in the resources' per-(bucket, slot, label) buffers
+    and the captured graph reads them at fixed addresses.
+    """
+
+    CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
+    NUM_WARMUP = 2
+    # A region can't overlap itself, and there is no pre-plan path into one, so
+    # a single slot suffices.
+    SLOT = 0
+
+    def __init__(
+        self,
+        label: str,
+        config: PiecewiseCudaGraphConfig,
+        resources: Mapping[str, Resource],
+        step_runner: StepRunner,
+        device: torch.device,
+        autocast_dtype: torch.dtype,
+        joint_comm_group: JointGroups | None = None,
+    ):
+        self._label = label
+        self._config = config
+        self._resources = resources
+        self._step_runner = step_runner
+        self._device = device
+        self._autocast_dtype = autocast_dtype
+        self._comm_group = joint_comm_group
+
+        self._capture_batch_sizes = sorted(
+            config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+        )
+        self._graphs: dict[tuple[int, int], PiecewiseGraphData] = {}
+        self._memory_pool = None
+        self._dummy_rows = DummyRowPool(
+            prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
+        )
+
+    @property
+    def any_graphs(self) -> bool:
+        return bool(self._graphs)
+
+    def _bucket(self, shape: PiecewiseCaptureShape) -> BucketKey:
+        return BucketKey(
+            graph_walk=PIECEWISE_WALK,
+            bs=shape.bs,
+            num_tokens=shape.total_tokens,
+            cg_key_info=self._label,
+        )
+
+    # ── Capture ─────────────────────────────────────────────────────────
+
+    def warmup_and_capture(self) -> None:
+        if self._device is None or not torch.cuda.is_available():
+            logger.warning(
+                "CUDA not available, skipping piecewise capture for %s", self._label
+            )
+            return
+
+        torch.cuda.set_device(self._device)
+        self._memory_pool = torch.cuda.graphs.graph_pool_handle()
+
+        shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
+        if not shapes:
+            return
+        self._step_runner.build_cuda_graph_buffers(
+            [
+                CGSlotSpec(
+                    bucket=self._bucket(shape), slot=self.SLOT, config=self._config,
+                )
+                for shape in shapes
+            ],
+            max_bs=max(shape.bs for shape in shapes),
+            max_seq_len=max(shape.total_tokens for shape in shapes),
+        )
+
+        # largest bucket first, matching the full-forward runner
+        for shape in sorted(
+            shapes, key=lambda s: (s.bs, s.total_tokens), reverse=True
+        ):
+            # keep ranks in lockstep: the region may hold collectives, and a
+            # rank still in pre-capture setup would mismatch one already in the
+            # warmup forward
+            if self._comm_group is not None:
+                self._comm_group.tp_group.barrier()
+                self._comm_group.sp_group.barrier()
+            try:
+                self._capture_one(shape)
+                logger.info(
+                    "PiecewiseCudaGraphRunner[%s]: captured bs=%d total_tokens=%d",
+                    self._label, shape.bs, shape.total_tokens,
+                )
+            except Exception:
+                logger.warning(
+                    "PiecewiseCudaGraphRunner[%s]: failed to capture bs=%d "
+                    "total_tokens=%d", self._label, shape.bs, shape.total_tokens,
+                    exc_info=True,
+                )
+
+    def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
+        dummy_rids = self._dummy_rows.ensure(
+            f"{shape.bs}_{shape.total_tokens}", shape.bs
+        )
+        static_inputs = self._config.make_static_inputs(shape)
+        step = self._declare(
+            dummy_rids, shape.seq_lens, self._bucket(shape), capture=True,
+        )
+
+        fn = self._config.capture_fn
+        if self._config.compile:
+            fn = torch.compile(
+                fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
+            )
+
+        def run_fn():
+            return fn(static_inputs=static_inputs, **self._config.forward_kwargs)
+
+        try:
+            self._plan(step, shape)
+            torch.cuda.synchronize()
+            for _ in range(self.NUM_WARMUP):
+                with torch.amp.autocast("cuda", enabled=True, dtype=self._autocast_dtype):
+                    run_fn()
+                # back to a clean stream state so the re-plan below (and the
+                # capture after it) sees the shapes the first plan did
+                self._dummy_rows.reset(dummy_rids)
+                self._plan(step, shape)
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.amp.autocast("cuda", enabled=True, dtype=self._autocast_dtype):
+                with torch.cuda.graph(graph, pool=self._memory_pool):
+                    static_outputs = self._normalize_output(run_fn())
+            torch.cuda.synchronize()
+        finally:
+            # pages stay with the dummy streams: replay's padding rows address
+            # the same ids, so their plan finds the storage already resident
+            self._dummy_rows.reset(dummy_rids)
+
+        self._graphs[(shape.bs, shape.total_tokens)] = PiecewiseGraphData(
+            graph=graph,
+            static_inputs=static_inputs,
+            static_outputs=static_outputs,
+            dummy_rids=list(dummy_rids),
+            shape=shape,
+            bucket=self._bucket(shape),
+        )
+
+    def _declare(
+        self, request_ids: list[str], seq_lens: list[int],
+        bucket: BucketKey, capture: bool,
+    ):
+        """The region's step over the padded batch, addressed at its slot."""
+        if self._config.declare_step is None:
+            return None
+        step = self._config.declare_step(list(request_ids), list(seq_lens))
+        if step is None:
+            return None
+        step.set_ctx(StepContext(
+            request_ids=tuple(request_ids),
+            graph_walk=PIECEWISE_WALK,
+            slot=self.SLOT,
+            capture=capture,
+            slot_lease=SlotLease(slot=self.SLOT, bucket=bucket),
+        ))
+        return step
+
+    def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
+        if step is None:
+            return
+        outcome = self._step_runner.admit(step)
+        if not outcome.ok:
+            raise RuntimeError(
+                f"piecewise {self._label!r} admit failed for bs={shape.bs}, "
+                f"total_tokens={shape.total_tokens}: {outcome.reason}"
+            )
+        self._step_runner.plan(step)
+
+    @staticmethod
+    def _normalize_output(out) -> dict[str, torch.Tensor]:
+        """Coerce the captured callable's return into ``{name: Tensor}``.
+
+        The contract is a dict; a bare tensor is accepted (under ``"x"``) so a
+        single-output block loop can ``return x`` directly.
+        """
+        if isinstance(out, torch.Tensor):
+            return {"x": out}
+        if isinstance(out, dict):
+            return out
+        raise TypeError(
+            f"piecewise capture_fn must return a Tensor or dict[str, Tensor], "
+            f"got {type(out).__name__}"
+        )
+
+    # ── Replay ──────────────────────────────────────────────────────────
+
+    def _padded_bs(self, batch_size: int) -> int | None:
+        return next(
+            (bs for bs in self._capture_batch_sizes if bs >= batch_size), None
+        )
+
+    def _resolve(
+        self, batch_size: int, total_tokens: int | None,
+    ) -> PiecewiseGraphData | None:
+        """The captured bucket serving this call, or None for eager.
+
+        BATCHED buckets are fixed by the padded batch size; PACKED ones take
+        the smallest captured token bucket that fits.
+        """
+        padded_bs = self._padded_bs(batch_size)
+        if padded_bs is None:
+            return None
+        if self._config.get_config_type() == PiecewiseConfigType.BATCHED:
+            return self._graphs.get(
+                (padded_bs, self._config.seq_len * padded_bs)
+            )
+        if total_tokens is None:
+            return None
+        candidates = sorted(
+            tokens for (bs, tokens) in self._graphs
+            if bs == padded_bs and tokens >= total_tokens
+        )
+        if not candidates:
+            return None
+        return self._graphs[(padded_bs, candidates[0])]
+
+    def can_run(self, batch_size: int, total_tokens: int | None = None) -> bool:
+        return self._resolve(batch_size, total_tokens) is not None
+
+    def run(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[str] | None = None,
+        seq_lens: list[int] | None = None,
+        real_bs: int | None = None,
+    ) -> PiecewiseOutput:
+        """Replay the captured region for these real inputs.
+
+        Copies each real input into the runner-owned buffer of the same name,
+        declares and plans the region's step over the padded batch, replays,
+        then commits and returns the padded buffers behind a real-length view.
+        """
+        if real_bs is None:
+            if request_ids is not None:
+                real_bs = len(request_ids)
+            elif seq_lens is not None:
+                real_bs = len(seq_lens)
+            else:
+                raise ValueError(
+                    "piecewise run: pass real_bs, request_ids, or seq_lens to "
+                    "determine the batch size"
+                )
+
+        is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
+        real_total_tokens = sum(seq_lens) if seq_lens is not None else None
+        data = self._resolve(real_bs, real_total_tokens if is_packed else None)
+        if data is None:
+            raise RuntimeError(
+                f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
+                f"total_tokens={real_total_tokens}"
+            )
+
+        for name, value in static_inputs.items():
+            buffer = data.static_inputs.get(name)
+            if buffer is None or not isinstance(value, torch.Tensor):
+                continue
+            n = value.shape[0]
+            buffer[:n].copy_(value)
+            if n < buffer.shape[0]:
+                # the padded tail is real compute for a BATCHED capture, so it
+                # reads whatever is here; zero rather than last step's values
+                buffer[n:].zero_()
+
+        step = None
+        if request_ids is not None:
+            step_ids = [
+                *request_ids, *data.dummy_rids[real_bs:data.shape.bs]
+            ]
+            step = self._declare(
+                step_ids,
+                self._config.replay_seq_lens(data.shape, seq_lens, real_bs),
+                data.bucket,
+                capture=False,
+            )
+        try:
+            self._plan(step, data.shape)
+            data.graph.replay()
+            if step is not None:
+                self._step_runner.commit(step)
+        finally:
+            self._dummy_rows.reset(data.dummy_rids[real_bs:data.shape.bs])
+
+        return PiecewiseOutput(
+            data.static_outputs, real_total_tokens if is_packed else real_bs
+        )

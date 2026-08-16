@@ -1,7 +1,7 @@
 
 
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import torch
@@ -9,7 +9,6 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.base import NodeBatch
 from mstar.engine.kv_store import TransferEngineInfo
 from mstar.engine.resources.base import PublishedInfo, Resource, build_resource
 from mstar.engine.resources.runner import StepRunner
@@ -21,7 +20,10 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.engine.v1.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.v1.cuda_graph_runner import (
+    CudaGraphRunner,
+    PiecewiseCudaGraphRunner,
+)
 from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -35,10 +37,11 @@ class SubmoduleManagement:
     resources: dict[str, Resource]
     cuda_graph_runner: CudaGraphRunner | None = None
 
-    # TODO: PW cuda graph runner
-    # # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
-    # # ModelInputsFromEngine so the submodule's forward can look them up.
-    # piecewise_runners: dict[str, "PiecewiseCudaGraphRunner"] = field(default_factory=dict)
+    # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
+    # ModelInputsFromEngine so the submodule's forward can look them up
+    piecewise_runners: dict[str, PiecewiseCudaGraphRunner] = field(
+        default_factory=dict
+    )
 
     @property
     def sampler(self) -> SamplerResource | None:
@@ -114,7 +117,7 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
     ):
-        self.device = device
+        self._device = device
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype
 
@@ -207,13 +210,45 @@ class Engine:
             if runner.any_graphs:
                 submodule_mgmt.cuda_graph_runner = runner
 
-            # TODO: piecewise cuda graph capture
+            submodule_mgmt.piecewise_runners = self._build_piecewise_runners(
+                node_name, submodule_mgmt
+            )
 
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
         self._compile_submodules()
+
         for resource in self._resources.values():
             resource.post_warmup_validate()
+
+    def _build_piecewise_runners(
+        self, node_name: str, submodule_mgmt: SubmoduleManagement,
+    ) -> dict[str, PiecewiseCudaGraphRunner]:
+        """One runner per region the submodule declares, warmed up.
+
+        A region whose capture fails is left out, so its forward takes the
+        eager path for that label.
+        """
+        configs = submodule_mgmt.submodule.get_piecewise_cuda_graph_configs(
+            self._device,
+            self._autocast_dtype,
+            submodule_mgmt.joint_comm_group.world_size,
+        )
+        runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        for label, config in configs.items():
+            runner = PiecewiseCudaGraphRunner(
+                label=f"{node_name}_{label}",
+                config=config,
+                resources=submodule_mgmt.resources,
+                step_runner=self._runner,
+                device=self._device,
+                autocast_dtype=self._autocast_dtype,
+                joint_comm_group=submodule_mgmt.joint_comm_group,
+            )
+            runner.warmup_and_capture()
+            if runner.any_graphs:
+                runners[label] = runner
+        return runners
 
     def exec(
         self,
@@ -267,7 +302,7 @@ class Engine:
                 request_ids=rids,
                 per_request_info=req_info,
                 resources=submodule_mgmt.resources,
-                # TODO: piecewise runners (as resource??)
+                piecewise_runners=submodule_mgmt.piecewise_runners,
                 # TODO: per-request state
             )
             preprocessed = submodule.preprocess(
@@ -526,7 +561,7 @@ class Engine:
         self._runner.ingest_request(request_id, overrides)
 
     def remove_request(self, request_id: str) -> None:
-        self._runner.remove_request(request_id) 
+        self._runner.remove_request(request_id)
 
     def shutdown(self):
         for resource in self._resources.values():

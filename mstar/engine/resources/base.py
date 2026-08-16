@@ -7,22 +7,26 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
-
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
     from mstar.engine.kv_store import TransferEngineInfo
+
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
-    from mstar.engine.v1.cuda_graph_config import CudaGraphConfig
+    from mstar.engine.v1.cuda_graph_config import (
+        CudaGraphConfig,
+        PiecewiseCudaGraphConfig,
+    )
 
 
 @dataclass(frozen=True)
 class CGSlotSpec:
     bucket: BucketKey
     slot: int
-    config: CudaGraphConfig
+    # a whole forward's capture, or one piecewise region's
+    config: CudaGraphConfig | PiecewiseCudaGraphConfig
     config_idx: int | None = None
 
     @property
@@ -112,6 +116,13 @@ class Resource(ABC):
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:
+        """Size whatever the captured replays will read.
+
+        Called once per runner that captures against this node — the whole
+        forward's, and one per piecewise region — so it must tolerate repeated
+        calls: grow to the largest shape asked for, never clobber what an
+        earlier call already sized.
+        """
         # NOTE @nsagan: this should probably be refined; it was just the first
         # thing that came to mind
         return

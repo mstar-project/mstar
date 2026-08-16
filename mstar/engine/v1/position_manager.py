@@ -2,7 +2,7 @@
 
 has ownership of per-(request,label) position counter"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 import torch

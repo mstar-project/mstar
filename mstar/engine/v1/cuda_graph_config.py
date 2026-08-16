@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
 import torch
 
-from mstar.model.submodule_base import ARNodeInputs, NodeInputs
+from mstar.engine.resources.step import SubmoduleStep
+from mstar.model.submodule_base import ARNodeInputs
 
 
 class CudaGraphConfigType(Enum):
@@ -135,3 +136,136 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         return [
             self.make_node_input(n) for n in seq_lens
         ]
+
+class PiecewiseConfigType(Enum):
+    BATCHED = "batched"
+    PACKED = "packed"
+
+
+@dataclass
+class PiecewiseCaptureShape:
+    """One piecewise capture bucket.
+
+    Handed to the static-input factory and the step declaration so both
+    generalize across config types.
+    """
+    bs: int
+    seq_lens: list[int]  # per-request lengths (uniform for BATCHED, an
+                         # arbitrary partition of total_tokens for PACKED)
+    total_tokens: int    # sum(seq_lens); == bs * seq_len for BATCHED
+
+
+@dataclass(kw_only=True)
+class PiecewiseCudaGraphConfig(ABC):
+    """One inner callable of a submodule's forward, captured on its own.
+
+    Unlike ``CudaGraphConfig``, which describes a whole ``forward_batched``
+    the engine drives, this describes a SUB-REGION the submodule invokes
+    itself while the surrounding preamble stays eager.
+
+    ``kw_only`` so subclasses can add required fields (e.g. ``seq_len``)
+    without colliding with the defaulted ones here.
+    """
+    # The captured callable. It must READ tensors out of ``static_inputs``
+    # (never reassign them) so the runner-owned buffers stay the ones captured
+    # into the graph. Resources are reached the way the rest of the forward
+    # reaches them — the runner plans them right before capture and replay.
+    capture_fn: Callable[..., dict[str, torch.Tensor]]
+    # shape -> the static input buffers the runner owns and copies real inputs
+    # into before each replay
+    make_static_inputs: Callable[[PiecewiseCaptureShape], dict[str, torch.Tensor]]
+    # This region's own resource work, declared over the padded batch. Separate
+    # from the submodule's `declare_step` because the region's shape is its
+    # own: the runner admits, plans, and commits it per replay.
+    # TODO: a region whose step is identical to the outer forward's could reuse
+    # that plan and skip re-planning here (a `reuses_outer_plan` flag). It only
+    # holds when the outer step was planned over this same padded shape.
+    declare_step: Callable[[list[str], list[int]], SubmoduleStep | None] | None = None
+    # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
+    forward_kwargs: dict[str, Any] = field(default_factory=dict)
+    # None => defer to the runner's default batch-size buckets
+    capture_batch_sizes: list[int] | None = None
+    # Whether to torch.compile capture_fn before capture. Default off; the
+    # block loop already benefits from graph capture alone.
+    compile: bool = False
+
+    @abstractmethod
+    def get_config_type(self) -> PiecewiseConfigType:
+        ...
+
+    @abstractmethod
+    def get_capture_shapes(self, batch_sizes: list[int]) -> list[PiecewiseCaptureShape]:
+        """The (bs, seq_lens, total_tokens) buckets to capture.
+
+        ``batch_sizes`` is the resolved list the runner iterates
+        (``capture_batch_sizes`` or the runner default).
+        """
+        ...
+
+    @abstractmethod
+    def replay_seq_lens(
+        self, shape: PiecewiseCaptureShape, seq_lens: list[int] | None, real_bs: int,
+    ) -> list[int]:
+        """Per-request lengths to declare at replay, padded to ``shape.bs``."""
+        ...
+
+
+@dataclass(kw_only=True)
+class PiecewiseBatchedConfig(PiecewiseCudaGraphConfig):
+    """Equal-length batched capture: static input ``[bs, seq_len, D]``."""
+    seq_len: int  # tokens per request
+
+    def get_config_type(self) -> PiecewiseConfigType:
+        return PiecewiseConfigType.BATCHED
+
+    def get_capture_shapes(self, batch_sizes: list[int]) -> list[PiecewiseCaptureShape]:
+        return [
+            PiecewiseCaptureShape(
+                bs=bs,
+                seq_lens=[self.seq_len] * bs,
+                total_tokens=self.seq_len * bs,
+            )
+            for bs in batch_sizes
+        ]
+
+    def replay_seq_lens(
+        self, shape: PiecewiseCaptureShape, seq_lens: list[int] | None, real_bs: int,
+    ) -> list[int]:
+        # every row is capture-length, padding included: the captured shape is
+        # the batch axis, so the padding rows carry real spans
+        del seq_lens, real_bs
+        return list(shape.seq_lens)
+
+
+@dataclass(kw_only=True)
+class PiecewisePackedConfig(PiecewiseCudaGraphConfig):
+    """Packed variable-length capture: static input ``[total_tokens, D]``.
+
+    One graph per (bs, token bucket). Each bucket is partitioned across ``bs``
+    requests for the capture-time plan; real per-request lengths arrive at
+    replay.
+    """
+    total_tokens: list[int]  # token-count buckets to capture
+
+    def get_config_type(self) -> PiecewiseConfigType:
+        return PiecewiseConfigType.PACKED
+
+    def get_capture_shapes(self, batch_sizes: list[int]) -> list[PiecewiseCaptureShape]:
+        return [
+            PiecewiseCaptureShape(
+                bs=bs,
+                seq_lens=distribute_tokens(total, bs),
+                total_tokens=total,
+            )
+            for bs in batch_sizes
+            for total in self.total_tokens
+        ]
+
+    def replay_seq_lens(
+        self, shape: PiecewiseCaptureShape, seq_lens: list[int] | None, real_bs: int,
+    ) -> list[int]:
+        if seq_lens is None:
+            raise ValueError("packed piecewise replay requires seq_lens")
+        # zero-length padding rows keep the planned qo_indptr summing to the
+        # real token count, so attention skips the padded tail
+        return list(seq_lens) + [0] * (shape.bs - real_bs)

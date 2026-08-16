@@ -1,7 +1,7 @@
 
+import itertools
 from collections.abc import KeysView
 from dataclasses import dataclass, field
-import itertools
 from typing import Any
 
 import torch

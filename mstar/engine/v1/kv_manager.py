@@ -1,7 +1,7 @@
-from concurrent.futures import Future, wait
-from dataclasses import dataclass, field
 import queue
 import threading
+from concurrent.futures import Future, wait
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import torch
@@ -108,7 +108,7 @@ class CacheStream:
         self.stored_len = 0
         self.position = 0
         self.released = 0
-        
+
         if freed:
             self.page_indices.clear()
 
@@ -336,8 +336,9 @@ class KVManager(Resource):
         del slots, max_bs
         # the per-(slot, label) buffers themselves are built on first plan for
         # that key (which labels a walk plans under is the step's to declare),
-        # all at this one max length so they outlive any single bucket
-        self._cg_max_seq_len = max_seq_len
+        # all at this one max length so they outlive any single bucket. Every
+        # runner capturing against this node calls in, so keep the largest
+        self._cg_max_seq_len = max(self._cg_max_seq_len, max_seq_len)
 
     def _static_plan_state(self, slot: int, label: str) -> KVPlanState:
         state = self._static_plan_states.get((slot, label))
@@ -603,7 +604,7 @@ class KVManager(Resource):
                 ) for label, stream in self._streams[request_id].items()
             }
         )
-    
+
     def reset_request(self, rid: str, free: bool=False):
         if rid in self._streams:
             for stream in self._streams[rid].values():
@@ -626,7 +627,7 @@ class KVManager(Resource):
 
         self._streams.pop(rid, None)
         self._overrides.pop(rid, None)
-    
+
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
 
