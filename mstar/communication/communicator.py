@@ -1,6 +1,7 @@
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections import deque
 from enum import Enum
 
 import zmq
@@ -8,6 +9,17 @@ import zmq
 from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
+
+#: PUSH socket send high-water-mark. ZMQ's default (1000 messages) is small
+#: for the bursty control traffic between worker / conductor / api_server, so
+#: raising it lets the kernel + zmq absorb a burst before we have to queue
+#: in-process. Overridable for tuning.
+_SNDHWM = int(os.getenv("MSTAR_ZMQ_SNDHWM", "100000"))
+
+#: Cap on a blocking receive slice while an outbound backlog is pending, so a
+#: peer that drains while we are parked in ``poll`` doesn't wait a whole
+#: (possibly indefinite) wait for its queued messages.
+_BACKLOG_POLL_SLICE_MS = 50
 
 #: The ``mstar_rust`` extension version this tree expects (the vendored
 #: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching
@@ -85,6 +97,16 @@ class ZMQCommunicator(BaseCommunicator):
         # TODO: maybe only open sockets as we need them, and close sockets
         # when we no longer need them
         self.push_sockets: dict[str, zmq.SyncSocket] = {}
+        # Per-peer in-process backlog of messages that could not be handed to
+        # zmq immediately (the peer's receive buffer is full). Drained
+        # opportunistically by ``_flush_outbound`` before each send and on
+        # every poll. This is what makes ``send`` non-blocking, and that is
+        # what breaks the worker<->conductor PUSH/PULL deadlock: the two form
+        # a cycle where each drains its PULL in the same loop that issues its
+        # PUSH sends, so a blocking send stalls the sender's own drain loop
+        # and both peers can end up waiting on each other. With local
+        # queueing, a momentarily full peer never stops us servicing our PULL.
+        self.outbound: dict[str, deque] = {}
         self.my_id = my_id
         self.ipc_socket_path_prefix = ipc_socket_path_prefix
 
@@ -100,9 +122,7 @@ class ZMQCommunicator(BaseCommunicator):
         for id in push_ids:
             if id == my_id:
                 continue
-            self.push_sockets[id] = self.context.socket(zmq.PUSH)
-            self.push_sockets[id].connect(self._endpoint(id))
-            self.push_sockets[id].setsockopt(zmq.LINGER, 0)
+            self._socket_for(id)
         self.poller = zmq.Poller()
         self.poller.register(self.pull_socket, zmq.POLLIN)
         self.event = None
@@ -112,6 +132,9 @@ class ZMQCommunicator(BaseCommunicator):
         self.event = event
 
     def wait_for_work(self, timeout_ms=50):
+        # Idle poll point: push out anything we previously had to queue, so a
+        # backlog drains even when no new send() calls are happening.
+        self._flush_outbound()
         events = dict(self.poller.poll(timeout=timeout_ms))
         if self.event.fd in events:
             self.event.drain()
@@ -123,6 +146,7 @@ class ZMQCommunicator(BaseCommunicator):
         a wakeup ends the poll early with False (the event is drained,
         exactly as in ``wait_for_work``). Mirrors the Rust communicator's
         method so call sites work against either transport."""
+        self._flush_outbound()
         events = dict(self.poller.poll(timeout=timeout_ms))
         if self.event is not None and self.event.fd in events:
             self.event.drain()
@@ -131,20 +155,70 @@ class ZMQCommunicator(BaseCommunicator):
     # def get_session_id(self) -> str:
     #     return self.session_id
 
+    def _socket_for(self, entity_id: str) -> "zmq.SyncSocket":
+        """This peer's PUSH socket, created on first use."""
+        sock = self.push_sockets.get(entity_id)
+        if sock is None:
+            sock = self.context.socket(zmq.PUSH)
+            sock.setsockopt(zmq.SNDHWM, _SNDHWM)
+            sock.connect(self._endpoint(entity_id))
+            sock.setsockopt(zmq.LINGER, 0)
+            self.push_sockets[entity_id] = sock
+        return sock
+
+    def _flush_outbound(self, entity_id: str | None = None) -> None:
+        """Hand queued messages to zmq, as many as it will take.
+
+        Non-blocking: stops at the first message that would block (the peer is
+        still full) and leaves it plus the rest queued, so FIFO order per peer
+        is preserved. Called before each send and on every poll, so a backlog
+        drains as soon as the peer has room.
+        """
+        ids = [entity_id] if entity_id is not None else list(self.outbound.keys())
+        for eid in ids:
+            queued = self.outbound.get(eid)
+            if not queued:
+                continue
+            sock = self._socket_for(eid)
+            while queued:
+                try:
+                    sock.send_pyobj(queued[0], flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break  # peer still full; retry on a later flush
+                queued.popleft()
+
+    def _has_backlog(self) -> bool:
+        return any(self.outbound.values())
+
     def send(self, entity_id: str, msg):
         # TODO: maybe serialize to JSON instead if more efficient
         logger.debug(
             "%s to send a message %s to entity %s",
             self.my_id, str(msg), entity_id
         )
-        if entity_id not in self.push_sockets:
-            sock = self.context.socket(zmq.PUSH)
-            sock.connect(self._endpoint(entity_id))
-            sock.setsockopt(zmq.LINGER, 0)
-            self.push_sockets[entity_id] = sock
-        self.push_sockets[entity_id].send_pyobj(msg)
+        sock = self._socket_for(entity_id)
+        # Drain this peer's prior backlog first so ordering is preserved.
+        self._flush_outbound(entity_id)
+        queued = self.outbound.get(entity_id)
+        if queued:
+            # Still non-empty -> the peer is full; queue this one behind it
+            # rather than block (blocking is what deadlocks the cycle).
+            queued.append(msg)
+            return
+        try:
+            sock.send_pyobj(msg, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            # The peer's receive buffer is full. Queue locally and move on;
+            # delivery happens on a later flush once the peer drains.
+            self.outbound.setdefault(entity_id, deque()).append(msg)
+            logger.debug(
+                "%s deferring send to %s (peer buffer full, %d queued)",
+                self.my_id, entity_id, len(self.outbound[entity_id]),
+            )
 
     def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
+        # Opportunistically push out anything we previously had to queue.
+        self._flush_outbound()
         messages = []
         if blocking:
             # Wait until the pull socket is readable before draining. A
@@ -153,9 +227,17 @@ class ZMQCommunicator(BaseCommunicator):
             # future can interrupt a blocking receive. `timeout_s` bounds
             # the wait (None = indefinitely); on expiry, drain what's there.
             timeout_ms = None if timeout_s is None else int(timeout_s * 1000)
+            if self._has_backlog():
+                # Don't park past the next flush attempt: the peer may drain
+                # while we wait, and nothing else would retry the backlog.
+                timeout_ms = (
+                    _BACKLOG_POLL_SLICE_MS if timeout_ms is None
+                    else min(timeout_ms, _BACKLOG_POLL_SLICE_MS)
+                )
             events = dict(self.poller.poll(timeout=timeout_ms))
             if self.event is not None and self.event.fd in events:
                 self.event.drain()
+            self._flush_outbound()
         while True:
             try:
                 # zmq.NOBLOCK means zmq doesn't wait for a new message to be
