@@ -9,6 +9,9 @@ uv.lock
 *.sqlite
 *.prof
 *.json
+# ...except the offline-tuned fused-MoE kernel configs, which are source:
+# they are produced by perf_testing/tune_fused_moe.py and read at runtime.
+!mstar/utils/fused_moe/configs/*.json
 profiler/
 traces/
 

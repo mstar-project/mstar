@@ -202,9 +202,14 @@ where = ["."]
 include = ["mstar*"]
 exclude = ["tests*", "benchmark*", "examples*"]
 
-# Ship the vendored CUDA source so it can be JIT-compiled on first use.
+# Ship the vendored CUDA source so it can be JIT-compiled on first use, and the
+# offline-tuned kernel config tables so the fused MoE does not fall back to the
+# heuristic in an installed wheel.
 [tool.setuptools.package-data]
-"mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.utils.fused_moe" = [
+    "csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp",
+    "configs/*.json",
+]
 
 [tool.ruff]
 exclude = [".git", ".ruff_cache", ".venv", "ref"]

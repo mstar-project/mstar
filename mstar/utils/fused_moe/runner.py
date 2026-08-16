@@ -14,7 +14,7 @@ import triton.language as tl
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
     act_and_mul_triton,
-    get_default_config,
+    get_moe_configs,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
 )
@@ -90,11 +90,24 @@ def fused_experts(
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
 
-    config = get_default_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
+    # The two GEMMs have different shapes -- gate+up is (N, K) = (2*inter,
+    # hidden), down is (hidden, inter) -- and want different tiles, so they get
+    # separate configs.  They share BLOCK_SIZE_M because that is the alignment
+    # granularity of moe_align_block_size, which runs once for both.
+    config1, config2 = get_moe_configs(
+        M=num_tokens,
+        E=E,
+        hidden=hidden,
+        inter=inter,
+        top_k=top_k,
+        dtype=str(hidden_states.dtype).removeprefix("torch."),
+    )
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, config1["BLOCK_SIZE_M"], E
+    )
 
     # 2. Scratch buffers (all sized from static inputs -- no data-dependent shapes).
     m_topk = num_tokens * top_k
@@ -126,7 +139,7 @@ def fused_experts(
         num_tokens_post_padded=num_tokens_post_padded,
         mul_routed_weight=False,
         top_k=top_k,
-        config=config,
+        config=config1,
         compute_type=compute_type,
     )
 
@@ -147,7 +160,7 @@ def fused_experts(
         num_tokens_post_padded=num_tokens_post_padded,
         mul_routed_weight=True,
         top_k=1,
-        config=config,
+        config=config2,
         compute_type=compute_type,
     )
 

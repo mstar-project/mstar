@@ -22,11 +22,17 @@ grids and keep the Triton-specific boilerplate out of the runner.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import functools
+import json
+import logging
+import os
+from typing import Any, Dict, Optional
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Main grouped-GEMM kernel (used for both gate_up and down projections)
@@ -182,11 +188,33 @@ def invoke_fused_moe_kernel(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
+    num_valid = topk_ids.numel()
+    num_experts = B.shape[0]
+    block_m = config["BLOCK_SIZE_M"]
+
+    # ``sorted_token_ids`` is allocated for the worst case -- every expert
+    # holding one partially-filled block -- so sizing the grid from its length
+    # launches a mostly dead grid at decode.  The real block count is
+    # sum_e cdiv(count_e, BLOCK_SIZE_M) over the experts that actually received
+    # tokens, which is bounded above by
+    #     cdiv(num_valid, BLOCK_SIZE_M) + min(num_experts, num_valid)
+    # (at most one partial block per touched expert).  That bound depends only
+    # on shapes known on the host, not on the routing, so it is constant across
+    # CUDA-graph replays.  At M=1, top_k=8, E=128 it takes the M grid from 121
+    # blocks to 9.
+    #
+    # ``EM`` must shrink with the grid, not just the launch dimension: the
+    # kernel derives ``num_pid_m`` from it and uses that in the GROUP_SIZE_M
+    # swizzle, so leaving EM at the worst case would map the surviving programs
+    # onto the wrong (pid_m, pid_n) pairs and silently skip output tiles.
+    num_blocks_m = min(
+        triton.cdiv(sorted_token_ids.shape[0], block_m),
+        triton.cdiv(num_valid, block_m) + min(num_experts, num_valid),
+    )
+    EM = num_blocks_m * block_m
+
     def grid(META):
-        return (
-            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-            * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
-        )
+        return (num_blocks_m * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),)
 
     K = B.shape[2]
     even_Ks = (K % config["BLOCK_SIZE_K"]) == 0
@@ -201,8 +229,8 @@ def invoke_fused_moe_kernel(
         num_tokens_post_padded,
         B.shape[1],
         K,
-        sorted_token_ids.shape[0],
-        topk_ids.numel(),
+        EM,
+        num_valid,
         A.stride(0),
         A.stride(1),
         B.stride(0),
@@ -398,12 +426,12 @@ def moe_sum_reduce_triton(
 # ---------------------------------------------------------------------------
 
 
-def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, int]:
-    """Pick Triton tile sizes based on problem shape.
+def _heuristic_config(M: int, E: int) -> Dict[str, int]:
+    """sglang's two-branch fallback, used when no tuned table matches.
 
-    Mirrors sglang's ``get_default_config`` for the unquantized path.
     For decode batch sizes (``M`` on the order of 1--64) we always fall
-    into the ``M <= E`` branch since Qwen3-Omni has ``E == 128``.
+    into the ``M <= E`` branch since Qwen3-Omni has ``E == 128``.  Note it
+    sets no ``num_warps`` / ``num_stages``, so Triton's defaults apply.
     """
     if M <= E:
         return {
@@ -418,3 +446,78 @@ def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, 
         "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 8,
     }
+
+
+_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
+
+
+def _table_name(E: int, hidden: int, inter: int, dtype: str, device: str) -> str:
+    return f"E={E},hidden={hidden},inter={inter},dtype={dtype},device={device}.json"
+
+
+@functools.lru_cache(maxsize=8)
+def _load_table(E: int, hidden: int, inter: int, dtype: str) -> Optional[Dict[int, Dict]]:
+    """Load the offline-tuned config table for this shape and GPU, or None.
+
+    Tables are produced by ``perf_testing/tune_fused_moe.py --save``.  They
+    are keyed by token count and hold a shared ``BLOCK_SIZE_M`` plus a
+    per-GEMM tile, because ``BLOCK_SIZE_M`` is the alignment granularity of
+    :func:`moe_align_block_size` and both GEMMs in a dispatch consume the
+    same alignment.
+    """
+    try:
+        device = torch.cuda.get_device_name(0).replace(" ", "_")
+    except Exception:  # noqa: BLE001 -- no CUDA, caller falls back
+        return None
+    path = os.path.join(_CONFIG_DIR, _table_name(E, hidden, inter, dtype, device))
+    if not os.path.exists(path):
+        logger.debug("fused MoE: no tuned config at %s; using the heuristic", path)
+        return None
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+        return {int(k): v for k, v in raw.items()}
+    except Exception as e:  # noqa: BLE001 -- a bad table must not break inference
+        logger.warning("fused MoE: ignoring unreadable config table %s (%s)", path, e)
+        return None
+
+
+def get_moe_configs(
+    M: int,
+    E: int,
+    hidden: int,
+    inter: int,
+    top_k: int,
+    dtype: str = "bfloat16",
+    tuned: bool = True,
+) -> tuple[Dict[str, int], Dict[str, int]]:
+    """Return ``(gemm1_config, gemm2_config)`` for one fused-MoE dispatch.
+
+    Both configs carry the same ``BLOCK_SIZE_M``.  When a tuned table exists
+    for this ``(E, hidden, inter, dtype, gpu)`` we take the entry for the
+    largest tuned token count ``<= M`` (falling back to the smallest entry
+    when ``M`` is below every key), which keeps lookups exact under CUDA
+    graphs -- the choice depends only on the captured batch size.
+
+    ``tuned=False`` forces the legacy heuristic; used by the A/B benchmark.
+    """
+    if tuned:
+        table = _load_table(E, hidden, inter, dtype)
+        if table:
+            keys = sorted(table)
+            key = max((k for k in keys if k <= M), default=keys[0])
+            entry = table[key]
+            block_m = entry["BLOCK_SIZE_M"]
+            return (
+                {"BLOCK_SIZE_M": block_m, **entry["gemm1"]},
+                {"BLOCK_SIZE_M": block_m, **entry["gemm2"]},
+            )
+    cfg = _heuristic_config(M, E)
+    return cfg, dict(cfg)
+
+
+def get_default_config(
+    M: int, E: int, N: int, K: int, top_k: int, tuned: bool = False
+) -> Dict[str, int]:
+    """Back-compat single-config entry point (legacy heuristic only)."""
+    return _heuristic_config(M, E)
