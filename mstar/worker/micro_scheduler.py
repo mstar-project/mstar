@@ -68,6 +68,11 @@ class MicroScheduler:
         self.num_consec_tp_follower_batches = 0
         self.max_consec_tp_follower_batches = max_consec_tp_follower_batches
 
+        # Batches already assembled and waiting their turn: what is left of a
+        # ready set too big for one step. Taken before scanning the queues, so
+        # a split batch finishes before anything new starts.
+        self.backlog: deque[ScheduledBatch] = deque()
+
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[str, float] = {}
@@ -185,16 +190,24 @@ class MicroScheduler:
         exclude_target: tuple[str, str] | None = None,
     ) -> ScheduledBatch | None:
         """
-        Scans all worker graph queues for ready nodes.
-        Groups by node name. Returns highest-priority group.
+        Scans all worker graph queues for ready nodes, groups by node name,
+        and returns one step's worth.
+
+        A backlogged step — the remainder of a ready set too big for one
+        forward — takes precedence over a fresh scan, so a split set drains
+        before anything else starts.
 
         Args:
             max_batch_size: If set, limit the number of requests in the batch.
-                Useful for CUDA graph compatibility (must match captured sizes).
+                Defaults to the engine's cap for the (node, walk) it picks.
             target_node_name: If set, only schedule this node name.
             target_graph_walk: If set, only schedule this graph walk.
             exclude_target: If set, skip this (node_name, graph_walk) pair.
         """
+        backlogged = self._take_backlogged(target_node_name, target_graph_walk)
+        if backlogged is not None:
+            return backlogged
+
         # Collect all ready (node_name, request_id, graph_walk) tuples
         # grouped by node name
         node_name_to_requests: dict[str, list[ReadyNodeEntry]] = {}
@@ -269,39 +282,109 @@ class MicroScheduler:
         entries = [e for e in node_name_to_requests[best_node_name] \
                    if e.graph_walk == graph_walk]
 
-        # Limit batch size if requested (e.g., for CUDA graph compatibility)
-        if max_batch_size is not None and len(entries) > max_batch_size:
-            entries = entries[:max_batch_size]
+        if max_batch_size is None:
+            max_batch_size = self._max_batch_size(best_node_name, graph_walk)
 
+        batches = self._assemble_batches(
+            worker_graphs_manager, best_node_name, graph_walk,
+            entries, max_batch_size,
+        )
+        if not batches:
+            return None
+
+        # Everything past the first step is already popped off the queues, so
+        # it has to be remembered here or it would never run.
+        self.backlog.extend(batches[1:])
+        return batches[0]
+
+    def _take_backlogged(
+        self,
+        target_node_name: str | None,
+        target_graph_walk: str | None,
+    ) -> ScheduledBatch | None:
+        """The next backlogged step, if it fits what the caller asked for.
+
+        A caller targeting a specific (node, walk) — the TP-follow and
+        speculation paths — must get that one or nothing, so a backlog entry
+        for something else stays put. ``exclude_target`` is only a fairness
+        hint, and finishing a split set beats fairness.
+        """
+        if not self.backlog:
+            return None
+        head = self.backlog[0]
+        if target_node_name is not None and head.node_name != target_node_name:
+            return None
+        if target_graph_walk is not None and head.graph_walk != target_graph_walk:
+            return None
+        return self.backlog.popleft()
+
+    def _drop_backlogged_rid(self, rid: str) -> None:
+        """Take a request out of anything still queued for it.
+
+        Its node was popped off the ready queue when the batch was assembled,
+        so this is the only place holding it.
+        """
+        for batch in self.backlog:
+            batch.node_objects.pop(rid, None)
+            batch.request_to_worker_graph.pop(rid, None)
+        self.backlog = deque(b for b in self.backlog if b.node_objects)
+
+    def _max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
+        """The engine's cap for this (node, walk), if it has one."""
+        return self.engine_manager.get_engine(node_name).get_max_batch_size(
+            node_name, graph_walk
+        )
+
+    def _assemble_batches(
+        self,
+        worker_graphs_manager: WorkerGraphsManager,
+        node_name: str,
+        graph_walk: str,
+        entries: list[ReadyNodeEntry],
+        max_batch_size: int | None,
+    ) -> list[ScheduledBatch]:
+        """Pop these entries off their queues and cut them into steps.
+
+        More ready requests than one step takes becomes several steps rather
+        than a truncated one: the rest would otherwise wait for the next scan,
+        behind whatever else became ready meanwhile.
+        """
         node_objects = {}
         request_to_worker_graph = {}
-
         for entry in entries:
             queue = worker_graphs_manager.queues[entry.worker_graph_id]
-            popped = queue.pop_ready_nodes(entry.request_id, [best_node_name])
+            popped = queue.pop_ready_nodes(entry.request_id, [node_name])
             if popped:
                 assert len(popped) == 1
                 node_objects[entry.request_id] = popped[0]
                 request_to_worker_graph[entry.request_id] = entry.worker_graph_id
 
         if not node_objects:
-            return None
+            return []
 
-        logger.debug(
-            "MicroScheduler scheduling node %s with graph walk %s for %d requests",
-            best_node_name, graph_walk, len(node_objects)
-        )
-        self.batch_number += 1
+        rids = list(node_objects)
+        chunk = max_batch_size or len(rids)
+        batches = []
+        for start in range(0, len(rids), chunk):
+            chunk_rids = rids[start:start + chunk]
+            logger.debug(
+                "MicroScheduler scheduling node %s with graph walk %s for %d requests",
+                node_name, graph_walk, len(chunk_rids)
+            )
+            self.batch_number += 1
+            batches.append(ScheduledBatch(
+                node_name=node_name,
+                graph_walk=graph_walk,
+                node_objects={rid: node_objects[rid] for rid in chunk_rids},
+                request_to_worker_graph={
+                    rid: request_to_worker_graph[rid] for rid in chunk_rids
+                },
+            ))
         self.node_and_walk_to_last_batch_num[(
-            best_node_name, graph_walk
+            node_name, graph_walk
         )] = self.batch_number
 
-        return ScheduledBatch(
-            node_name=best_node_name,
-            graph_walk=graph_walk,
-            node_objects=node_objects,
-            request_to_worker_graph=request_to_worker_graph,
-        )
+        return batches
 
     def has_ready_excluding(
         self,
@@ -359,9 +442,12 @@ class MicroScheduler:
         """Stop scheduling new work for requests reported to the conductor as
         failed. Cleared by ``clear_rid`` when the removal comes back."""
         self.failed_rids.update(rids)
+        for rid in rids:
+            self._drop_backlogged_rid(rid)
 
     def clear_rid(self, rid: str) -> None:
         """Forget all per-request scheduler state; called on REMOVE_REQUEST."""
         self.failed_rids.discard(rid)
         self.held_until.pop(rid, None)
+        self._drop_backlogged_rid(rid)
 

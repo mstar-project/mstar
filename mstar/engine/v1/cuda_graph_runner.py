@@ -12,6 +12,7 @@ from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.engine.v1.cuda_graph_config import (
     CudaGraphConfig,
+    CudaGraphConfigType,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
@@ -482,6 +483,52 @@ class CudaGraphRunner:
                 best = key
         return best
 
+    def select_batched_bucket(
+        self, graph_walk: str, bs: int, cg_key_info: Any | None = None,
+    ) -> BucketKey | None:
+        """A bucket for a batch whose inputs aren't built yet.
+
+        Only a batched capture can answer this: its token count is a property
+        of the config (``bs`` rows of a fixed per-request length), so the
+        bucket follows from the batch size alone. A packed capture's token
+        count is a property of the *requests*, so it has to wait for
+        ``prepare_inputs`` and go through ``select_bucket``.
+
+        This is what lets pre-plan run before inputs exist. Lifting the
+        restriction means making ``prepare_inputs`` safe to run ahead of the
+        forward — see ``Engine.pre_plan_for_batch``.
+        """
+        best: BucketKey | None = None
+        for key, bucket in self._buckets.items():
+            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
+                continue
+            if key.bs < bs or not bucket.slots:
+                continue
+            if bucket.config.get_config_type() != CudaGraphConfigType.BASIC_BATCHED:
+                continue
+            # the config's own token count for this padded batch; a bucket
+            # whose num_tokens says otherwise belongs to a different capture
+            if key.num_tokens not in bucket.config.get_total_tokens(key.bs):
+                continue
+            if best is None or (key.bs, key.num_tokens) < (best.bs, best.num_tokens):
+                best = key
+        return best
+
+    def max_batch_size_for(self, graph_walk: str) -> int | None:
+        """Largest batch this walk was captured for, or None for no cap.
+
+        A config that opts out of capping captures only an acceleration subset
+        of batch sizes — larger batches run eager rather than being split — so
+        it does not constrain the batch. With every config for the walk opting
+        out, nothing here caps it.
+        """
+        capped = [
+            max(self._batch_sizes(config)) for config in self._capture_configs
+            if graph_walk in config.replay_graph_walks
+            and config.caps_eager_batch_size
+        ]
+        return max(capped) if capped else None
+
     def can_run(
         self, graph_walk: str, bs: int, num_tokens: int,
         cg_key_info: Any | None = None,
@@ -491,17 +538,24 @@ class CudaGraphRunner:
         ) is not None
 
     def lease_slot(
-        self, graph_walk: str, bs: int, num_tokens: int,
+        self, graph_walk: str, bs: int, num_tokens: int | None = None,
         cg_key_info: Any | None = None,
         slot: int | None = None,
     ) -> SlotLease | None:
         """Pick the bucket and double-buffer slot an upcoming step replays on.
 
+        ``num_tokens=None`` means the batch's inputs aren't built yet, so the
+        bucket comes from the batched-capture search instead.
+
         ``slot=None`` advances the bucket's counter so the next lease lands on
         the other slot; a caller that already reserved one (pre-plan) passes it
         back so both submissions target the same slot.
         """
-        key = self.select_bucket(graph_walk, bs, num_tokens, cg_key_info)
+        key = (
+            self.select_batched_bucket(graph_walk, bs, cg_key_info)
+            if num_tokens is None
+            else self.select_bucket(graph_walk, bs, num_tokens, cg_key_info)
+        )
         if key is None:
             return None
         bucket = self._buckets[key]

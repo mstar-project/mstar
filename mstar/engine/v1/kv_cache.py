@@ -85,6 +85,25 @@ class KVSpec(NodeResourceSpec):
     def resource_type(self):
         return ResourceType.KV_CACHE
 
+    def apply_yaml_overrides(
+        self,
+        max_num_pages: int | None = None,
+        page_size: int | None = None,
+        max_seq_len: int | None = None,
+        cpu_offload_pages: int | None = None,
+        **kwargs,
+    ):
+        """How much cache this deployment gets, and how it is cut up."""
+        del kwargs  # keys meant for other resources
+        for name, value in (
+            ("max_num_pages", max_num_pages),
+            ("page_size", page_size),
+            ("max_seq_len", max_seq_len),
+            ("cpu_offload_pages", cpu_offload_pages),
+        ):
+            if value is not None:
+                setattr(self.config, name, value)
+
 
 class KVCache:
     """Owns the KV storage and all layout-dependent addressing, so that
