@@ -14,88 +14,26 @@ them as-is would let the model hear its own side, so we take the left (user)
 channel, isolate the first user turn, and resample to 16 kHz mono.
 """
 import argparse
-import os
 import sys
-import tempfile
 import threading
 import time
 
+from _audio_prep import prepare_user_clip, resolve_demo
 from _env import get_base_url, load_env
 
 from mstar.client.client import MStarClient
 
-_DEMO_WAV = "turn_taking.wav"     # base VoiceChat-11B repo; L=user, R=agent
-_PREPARED = os.path.join(tempfile.gettempdir(), "nemotron_duplex_default_user_turn.wav")
-
-
-def _first_user_turn(user, sr, trailing_s=6.0):
-    """First contiguous user utterance >= ~1.2 s (short gaps bridged), with 0.3 s
-    lead pad and ``trailing_s`` of trailing silence.
-
-    The trailing silence matters: this is a frame-synchronous model that stays
-    silent (EOS) *while* the user is speaking and only produces its reply in the
-    frames *after* — so a clip cut off right at the question yields an all-silent
-    agent. The user (left) channel is naturally silent while the agent replies,
-    so extending into it (zero-padded if the file ends) gives the reply room."""
-    import numpy as np
-
-    w = int(sr * 0.1)                                  # 100 ms frames
-    n = len(user) // w
-    e = np.sqrt((user[: n * w].reshape(n, w) ** 2).mean(1))
-    act = e > e.max() * 0.08
-    for i in range(1, n - 3):                          # bridge <0.3 s gaps
-        if not act[i] and act[i - 1] and act[i : i + 3].any():
-            act[i] = True
-    runs, i = [], 0
-    while i < n:
-        if act[i]:
-            j = i
-            while j < n and act[j]:
-                j += 1
-            runs.append((i, j))
-            i = j
-        else:
-            i += 1
-    if not runs:
-        return user
-    s, ep = next((r for r in runs if (r[1] - r[0]) * 0.1 >= 1.2), runs[0])
-    a = max(0, s * w - int(sr * 0.3))
-    b = ep * w + int(sr * trailing_s)
-    clip = user[a : min(len(user), b)]
-    if b > len(user):                                  # pad reply room past EOF
-        clip = np.concatenate([clip, np.zeros(b - len(user), dtype=clip.dtype)])
-    return clip
-
 
 def default_audio() -> str:
-    """Prepare (once) and return a clean 16 kHz-mono user-only clip from the
-    VoiceChat-11B demo. Falls back to the raw demo wav if audio libs are missing."""
+    """A clean 16 kHz-mono user-only clip from the VoiceChat-11B demo (with 6 s of
+    trailing silence for the reply). Falls back to the raw demo wav if audio libs
+    are missing."""
     load_env()
-    from huggingface_hub import hf_hub_download
-
-    from mstar.model.registry import HF_MODELS
-
-    repo = HF_MODELS["nemotron_duplex"]["model_path_hf"]
-    cache_dir = os.environ.get("NEMOTRON_DUPLEX_CACHE_DIR")
-    src = hf_hub_download(repo, _DEMO_WAV, cache_dir=cache_dir)
-
-    if os.path.exists(_PREPARED):
-        return _PREPARED
     try:
-        import soundfile as sf
-        import torch
-        import torchaudio.functional as AF
-
-        d, sr = sf.read(src, dtype="float32")
-        user = d[:, 0] if d.ndim == 2 else d          # left channel = user
-        clip = _first_user_turn(user, sr)
-        clip16 = AF.resample(torch.from_numpy(clip.copy()), sr, 16000).numpy()
-        sf.write(_PREPARED, clip16, 16000)
-        print(f"prepared user-only input: {_PREPARED} ({len(clip16) / 16000:.1f}s @ 16 kHz)")
-        return _PREPARED
+        return prepare_user_clip(trailing_s=6.0)
     except Exception as e:  # noqa: BLE001 - degrade to the raw demo wav
-        print(f"warning: could not prepare user-only clip ({e}); using raw demo {src}")
-        return src
+        print(f"warning: could not prepare user-only clip ({e}); using raw demo")
+        return resolve_demo()
 
 
 def one_request(url: str, audio: str, modalities, temperature: float):
