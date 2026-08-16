@@ -32,4 +32,5 @@
    media_io
    openai
    request_types
+   rust_frontend
 

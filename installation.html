@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 10, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -525,6 +525,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
 </ul>
@@ -804,6 +805,20 @@ pytest<span class="w"> </span>test/rust/test_rust_communicator.py
 </pre></div>
 </div>
 </section>
+<section id="optional-the-rust-http-frontend">
+<h2>Optional: the Rust HTTP frontend<a class="headerlink" href="#optional-the-rust-http-frontend" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> (<code class="docutils literal notranslate"><span class="pre">rust/server/</span></code>) serves the HTTP surface — routes, OpenAI
+translation, SSE streaming, uploads — from Rust, with the Python process
+keeping preprocessing and the conductor protocol. Build and opt in:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--manifest-path<span class="w"> </span>rust/server/Cargo.toml
+mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class="w"> </span>--rust-frontend
+<span class="c1"># or, with an explicit config: mstar-serve --config &lt;model.yaml&gt; --rust-frontend</span>
+</pre></div>
+</div>
+<p>The binary is resolved via <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code> /
+<code class="docutils literal notranslate"><span class="pre">$PATH</span></code> / the in-repo build. Its knobs are listed in
+<a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>.</p>
+</section>
 <section id="troubleshooting">
 <h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading">#</a></h2>
 <section id="cudnn-status-sublibrary-version-mismatch">
@@ -888,6 +903,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
 </ul>
@@ -925,7 +941,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 10, 2026.
+  Last updated on Aug 16, 2026.
   <br/>
 </p>
   </div>

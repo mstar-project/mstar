@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 10, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -515,6 +515,10 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -647,6 +651,81 @@ free block, pinned bytes).</p></td>
 </table>
 </div>
 </section>
+<section id="serving-rust-frontend">
+<h2>Serving (Rust frontend)<a class="headerlink" href="#serving-rust-frontend" title="Link to this heading">#</a></h2>
+<p>Read by the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary and its bridge
+(<code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code>; see <a class="reference internal" href="installation.html"><span class="doc">Installation</span></a>).</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 28.0%" />
+<col style="width: 14.0%" />
+<col style="width: 58.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Path to the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary. Fallback order:
+<code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code>, this variable, <code class="docutils literal notranslate"><span class="pre">$PATH</span></code>, then the in-repo
+<code class="docutils literal notranslate"><span class="pre">rust/server/target/release</span></code> build.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUEST_TIMEOUT_S</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
+<td><p>Per-request budget in the Rust frontend; on expiry the client gets
+an error and the request is aborted in the backend.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLE_RATE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">24000</span></code></p></td>
+<td><p>Sample rate stamped on <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> WAV output.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Allow <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> media URLs in requests (fetched server-side,
+30 s timeout). Off by default.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
+<td><p>Admission cap on in-flight generation requests; beyond it clients
+get an immediate 503 instead of queueing into the request timeout.
+<code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code> bypass the cap.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">128</span></code></p></td>
+<td><p>Request body limit (multipart uploads included).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZER</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Path to a HuggingFace <code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code> enabling frontend
+tokenization. Leave unset with the Python backend — its preprocess
+worker owns tokenization, and the bridge rejects pre-tokenized
+ingest.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="rust-frontend-limitations">
+<h3>Rust frontend limitations<a class="headerlink" href="#rust-frontend-limitations" title="Link to this heading">#</a></h3>
+<p>The Rust frontend carries no audio encoder or media muxer (the Python frontend
+uses <code class="docutils literal notranslate"><span class="pre">soundfile</span></code> / <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code>), so two surfaces degrade:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> produces only <code class="docutils literal notranslate"><span class="pre">wav</span></code> and <code class="docutils literal notranslate"><span class="pre">pcm</span></code>. Any other
+<code class="docutils literal notranslate"><span class="pre">response_format</span></code> (<code class="docutils literal notranslate"><span class="pre">mp3</span></code>, <code class="docutils literal notranslate"><span class="pre">opus</span></code>, <code class="docutils literal notranslate"><span class="pre">flac</span></code>, …) is rejected with a 400
+rather than silently returned as WAV. Run the Python frontend for compressed
+containers.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/videos/generations</span></code> (Cosmos3) returns the <strong>video-only</strong> mp4. When a
+request sets <code class="docutils literal notranslate"><span class="pre">generate_sound</span></code>, Cosmos3 generates a separate audio track that
+mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
+the audio is dropped and a warning is logged. Do not set <code class="docutils literal notranslate"><span class="pre">generate_sound</span></code> on
+the Rust frontend (it spends compute on a track the client won’t receive), or
+run the Python frontend for sound video.</p></li>
+</ul>
+</section>
+</section>
 </section>
 
 
@@ -697,6 +776,10 @@ free block, pinned bytes).</p></td>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -730,7 +813,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 10, 2026.
+  Last updated on Aug 16, 2026.
   <br/>
 </p>
   </div>

@@ -408,7 +408,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 10, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -826,6 +826,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">io</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">wave</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">urllib.parse</span><span class="w"> </span><span class="kn">import</span> <span class="n">urlparse</span>
@@ -923,7 +924,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">upload_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">upload_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="n">raw</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">b64</span><span class="p">)</span>
-    <span class="n">ext</span> <span class="o">=</span> <span class="s2">&quot;.&quot;</span> <span class="o">+</span> <span class="n">fmt</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">fmt</span> <span class="k">else</span> <span class="s2">&quot;.bin&quot;</span>
+    <span class="c1"># Sanitize the client-controlled fmt: alphanumerics only, so it cannot</span>
+    <span class="c1"># inject path separators into the upload path.</span>
+    <span class="n">clean</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">fmt</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">isalnum</span><span class="p">())</span>
+    <span class="n">ext</span> <span class="o">=</span> <span class="s2">&quot;.&quot;</span> <span class="o">+</span> <span class="n">clean</span> <span class="k">if</span> <span class="n">clean</span> <span class="k">else</span> <span class="s2">&quot;.bin&quot;</span>
     <span class="n">path</span> <span class="o">=</span> <span class="n">upload_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">uuid4</span><span class="p">()</span><span class="si">}{</span><span class="n">ext</span><span class="si">}</span><span class="s2">&quot;</span>
     <span class="n">path</span><span class="o">.</span><span class="n">write_bytes</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">modality_hint</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span></div>
@@ -954,7 +958,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="resolve_media_ref">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.resolve_media_ref">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">resolve_media_ref</span><span class="p">(</span><span class="n">ref</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">allow_remote</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">resolve_media_ref</span><span class="p">(</span><span class="n">ref</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">allow_remote</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Resolve a media reference (data URL, http(s) URL, or local path).</span>
 
 <span class="sd">    Returns ``(modality, path)``. Local paths are passed through unchanged</span>
@@ -964,6 +968,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">save_data_url</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">scheme</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">scheme</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">scheme</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;http&quot;</span><span class="p">,</span> <span class="s2">&quot;https&quot;</span><span class="p">):</span>
+        <span class="n">allow_remote</span> <span class="o">=</span> <span class="n">allow_remote</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;MSTAR_ALLOW_REMOTE&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">allow_remote</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Remote media fetch is disabled on this server&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">save_remote_url</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
@@ -1147,7 +1152,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 10, 2026.
+  Last updated on Aug 16, 2026.
   <br/>
 </p>
   </div>
