@@ -11,14 +11,13 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, Res
 from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
-    from mstar.engine.v1.kv_transfer import TransferEngineInfo
-
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
     from mstar.engine.v1.cuda_graph_config import (
         CudaGraphConfig,
         PiecewiseCudaGraphConfig,
     )
+    from mstar.engine.v1.kv_transfer import TransferEngineInfo
 
 
 @dataclass(frozen=True)
@@ -109,6 +108,36 @@ class Resource(ABC):
 
     def clear_preplan(self):
         return
+
+    # Eviction
+    #
+    # A resource that holds enough per-request state to be worth reclaiming
+    # (the KV cache, today) opts in here; the worker picks victims and drives
+    # the move. Which requests exist and how recently they ran is the
+    # scheduler's knowledge, so the resource only answers for its own state.
+
+    @property
+    def supports_eviction(self):
+        return False
+
+    def is_offloaded(self, rid: str) -> bool:
+        return False
+
+    def offload(self, rid: str) -> int:
+        """Move the request's state off-device. Returns what was reclaimed."""
+        return 0
+
+    def reload(self, rid: str) -> bool:
+        """Bring it back. False when it doesn't fit on device yet."""
+        return True
+
+    def get_offload_priority(self, rid: str) -> float:
+        """How much this resource wants ``rid`` gone, higher being more.
+
+        Only consulted under a PRIORITY eviction policy, which names the
+        resource to ask; LRU never calls it.
+        """
+        return 0.0
 
     # Engine lifecycle
 

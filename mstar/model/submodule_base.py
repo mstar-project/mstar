@@ -10,18 +10,19 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
-from mstar.engine.kv_store import PositionInfo
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.step import SubmoduleStep
 from mstar.utils.sampling import BaseSampler, SeenTokenMask
 
 if TYPE_CHECKING:
-    # deprecated, and importing it eagerly closes a cycle: the resources
-    # package reaches back here through the v1 cuda graph config
+    # deprecated, and importing either eagerly drags the old engine onto the
+    # v1 import path (the resources package reaches back here through the v1
+    # cuda graph config)
+    from mstar.engine.base import NodeBatch
     from mstar.engine.cache_manager import BatchedCacheManager
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.engine.kv_store import PositionInfo
 
 
 @dataclass
