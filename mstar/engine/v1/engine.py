@@ -472,11 +472,15 @@ class Engine:
                 stops[rid] = rid_stops
         return stops
 
-    def publish(
+    def finalize_batch(
         self, batch: ExecutingBatch
-    ) -> dict[str, dict[str, PublishedInfo]]:
+    ):
         # Returns rid -> {resource label -> published info}
-        return self._runner.publish(batch.request_ids)
+        published = self._runner.publish(batch.request_ids)
+        for rid, info in batch.per_request_info.items():
+            if rid not in published:
+                continue
+            info.update_publish_info(published[rid])
 
     def _collect_outputs(
         self,
@@ -692,6 +696,58 @@ class Engine:
                 cg_runner.release(lease, len(batch.request_ids))
         for resource in self._resources.values():
             resource.clear_preplan()
+
+    # ── Eviction ────────────────────────────────────────────────────────
+    #
+    # Which requests exist, how recently each ran, and when to reclaim are the
+    # worker's; the resources only move their own state. A node's resources
+    # are reclaimed together, so a request is either resident or not.
+
+    def evictable(self, node_name: str) -> bool:
+        return any(
+            resource.supports_eviction
+            for resource in self._submodules[node_name].resources.values()
+        )
+
+    def is_offloaded(self, node_name: str, request_id: str) -> bool:
+        return any(
+            resource.is_offloaded(request_id)
+            for resource in self._submodules[node_name].resources.values()
+        )
+
+    def offload_request(self, node_name: str, request_id: str) -> int:
+        """Move the request off-device across this node's resources.
+
+        Returns what was reclaimed, in whatever each resource counts (pages,
+        today); 0 means nothing moved and the caller should pick another
+        victim.
+        """
+        return sum(
+            resource.offload(request_id)
+            for resource in self._submodules[node_name].resources.values()
+            if resource.supports_eviction
+        )
+
+    def reload_request(self, node_name: str, request_id: str) -> bool:
+        """Bring it back. False when any resource can't fit it yet, in which
+        case the request stays offloaded and the caller retries later."""
+        return all(
+            resource.reload(request_id)
+            for resource in self._submodules[node_name].resources.values()
+            if resource.supports_eviction and resource.is_offloaded(request_id)
+        )
+
+    def offload_priority(
+        self, node_name: str, request_id: str, resource_label: str,
+    ) -> float:
+        """How much one named resource wants this request gone.
+
+        Only the PRIORITY eviction policy asks; it names the resource to
+        consult, since "most worth reclaiming" means something different per
+        resource.
+        """
+        resource = self._submodules[node_name].resources.get(resource_label)
+        return 0.0 if resource is None else resource.get_offload_priority(request_id)
 
     def add_request(
         self, request_id: str,

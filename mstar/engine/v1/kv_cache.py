@@ -1,11 +1,58 @@
 
 
+import queue
+import threading
 from dataclasses import dataclass
 from enum import Enum
 
 import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
+
+
+class PageAllocator:
+    """Simple page allocator using a FIFO queue of free page indices.
+
+    Thread-safe: a ``threading.Lock`` makes the qsize-then-get sequence in
+    ``allocate``/``try_allocate`` atomic against concurrent ``free`` calls.
+    Required by the pre-plan path, where the plan thread runs
+    ``try_allocate`` while the GPU thread runs ``free`` from
+    ``reset_label`` — the unlocked qsize/get pair could false-negative
+    (return None when pages are about to be freed) or partially fill the
+    output list under multi-consumer contention.
+    """
+
+    def __init__(self, max_num_pages: int):
+        self.max_num_pages = max_num_pages
+        self.free_pages: queue.Queue[int] = queue.Queue()
+        self._lock = threading.Lock()
+        for i in range(max_num_pages):
+            self.free_pages.put(i)
+
+    def allocate(self, n: int) -> list[int]:
+        with self._lock:
+            if self.free_pages.qsize() < n:
+                raise RuntimeError(
+                    f"Not enough free pages: requested {n}, "
+                    f"available {self.free_pages.qsize()}"
+                )
+            return [self.free_pages.get() for _ in range(n)]
+
+    def try_allocate(self, n: int) -> list[int] | None:
+        """Like allocate() but returns None instead of raising on failure."""
+        with self._lock:
+            if self.free_pages.qsize() < n:
+                return None
+            return [self.free_pages.get() for _ in range(n)]
+
+    def free(self, pages: list[int]) -> None:
+        with self._lock:
+            for page in pages:
+                self.free_pages.put(page)
+
+    @property
+    def num_free(self) -> int:
+        return self.free_pages.qsize()
 
 
 class KVLayout(Enum):
@@ -22,6 +69,8 @@ class KVConfig:
     page_size: int = 128
     num_qo_heads: int = None
     layout: KVLayout=KVLayout.NHD
+    # pages of pinned host memory to keep for offloading; 0 disables it
+    cpu_offload_pages: int = 0
 
     def __post_init__(self):
         if self.num_qo_heads is None:

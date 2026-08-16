@@ -13,9 +13,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
-from mstar.engine.resources.spec import KVSpec, NodeResourceSpec, SamplerSpec
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -351,33 +349,35 @@ class Model(ABC):
             groups=[], tp_enabled_nodes=[], shard_dim={}
         ) # default: no sharding
 
-    @abstractmethod
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        """Return per-node KV cache configs.
+    @property
+    def nodes(self) -> list[str]:
+        return sorted({
+            node
+            for graph in self.get_graph_walk_graphs().values()
+            for node in graph.get_nodes()
+        })
 
-        Maps AR node name -> KVCacheConfig. Nodes not in the dict
-        fall back to the first config (for models where all AR nodes
-        share the same config, e.g., Bagel's LLM / LLM_cfg_text / LLM_cfg_img).
+    @abstractmethod
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """Declare the resources the engine builds, and which nodes share each.
+
+        The whole declaration: a KV cache's shape, the attention backend over
+        it, positions, samplers. The engine builds one resource per spec and
+        hands each node the subset naming it.
         """
         pass
 
-    @property
-    def nodes(self):
-        return list(self.get_node_engine_types().keys())
+    def get_request_resource_configs(
+        self, model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Per-resource config a new request is opened with, by resource label.
 
-    def get_node_resources(
-        self, kv_cache_config: list[KVCacheConfig],
-    ) -> list[NodeResourceSpec]:
-        """Declare the resources the engine builds per node group.
-
-        ``kv_cache_config`` is this model's config list after any
-        deployment overrides were applied. The default wraps each config
-        unchanged, so models that only define ``get_kv_cache_config``
-        need no change here. Models with resources those configs cannot
-        describe (e.g. a fixed-shape scratch cache) override this and
-        extend the returned specs.
+        Where a request's knobs live now: sampling params, whether it needs
+        CFG, retention. The conductor resolves this once per request and the
+        engine hands each config to its resource at ingest.
         """
-        return [NodeResourceSpec(kv_cache_config=cfg) for cfg in kv_cache_config]
+        del model_kwargs
+        return {}
 
     def get_sampling_config(
         self, node_name: str,
@@ -426,11 +426,6 @@ class Model(ABC):
 
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        pass
-
-    @abstractmethod
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        """Returns node_name -> EngineType enum."""
         pass
 
     @abstractmethod

@@ -1,4 +1,3 @@
-import queue
 import threading
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
@@ -17,53 +16,9 @@ from mstar.engine.resources.step import (
     StepContext,
     group_by_plan_label,
 )
-from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec
+from mstar.engine.v1.cpu_page_pool import CPUPagePool
+from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec, PageAllocator
 from mstar.engine.v1.kv_transfer import KVTransferManager, TransferEngineInfo
-
-
-class PageAllocator:
-    """Simple page allocator using a FIFO queue of free page indices.
-
-    Thread-safe: a ``threading.Lock`` makes the qsize-then-get sequence in
-    ``allocate``/``try_allocate`` atomic against concurrent ``free`` calls.
-    Required by the pre-plan path, where the plan thread runs
-    ``try_allocate`` while the GPU thread runs ``free`` from
-    ``reset_label`` — the unlocked qsize/get pair could false-negative
-    (return None when pages are about to be freed) or partially fill the
-    output list under multi-consumer contention.
-    """
-
-    def __init__(self, max_num_pages: int):
-        self.max_num_pages = max_num_pages
-        self.free_pages: queue.Queue[int] = queue.Queue()
-        self._lock = threading.Lock()
-        for i in range(max_num_pages):
-            self.free_pages.put(i)
-
-    def allocate(self, n: int) -> list[int]:
-        with self._lock:
-            if self.free_pages.qsize() < n:
-                raise RuntimeError(
-                    f"Not enough free pages: requested {n}, "
-                    f"available {self.free_pages.qsize()}"
-                )
-            return [self.free_pages.get() for _ in range(n)]
-
-    def try_allocate(self, n: int) -> list[int] | None:
-        """Like allocate() but returns None instead of raising on failure."""
-        with self._lock:
-            if self.free_pages.qsize() < n:
-                return None
-            return [self.free_pages.get() for _ in range(n)]
-
-    def free(self, pages: list[int]) -> None:
-        with self._lock:
-            for page in pages:
-                self.free_pages.put(page)
-
-    @property
-    def num_free(self) -> int:
-        return self.free_pages.qsize()
 
 
 @dataclass
@@ -301,7 +256,12 @@ class KVManager(Resource):
         self._transfer = KVTransferManager(
             transfer_engine_info, self.kv_cache
         )
-        # TODO: CPU page pool
+        self._cpu_pool: CPUPagePool | None = None
+        if cfg.cpu_offload_pages > 0:
+            self._cpu_pool = CPUPagePool(
+                config=cfg, kv_cache=self.kv_cache,
+                max_cpu_pages=cfg.cpu_offload_pages,
+            )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
@@ -601,6 +561,94 @@ class KVManager(Resource):
                 self._apply_fork(rid, from_label, to_label)
         # TODO: handle retention policy, free pages if not commit
 
+    # Eviction
+
+    @property
+    def supports_eviction(self):
+        return self._cpu_pool is not None
+
+    def is_offloaded(self, rid: str) -> bool:
+        return self._cpu_pool is not None and self._cpu_pool.is_offloaded(rid)
+
+    def offload(self, rid: str) -> int:
+        """Move every stream of ``rid`` to host memory. Returns pages freed.
+
+        A stream whose pages don't fit on the host keeps them, so a partial
+        offload still frees whatever did fit.
+        """
+        if self._cpu_pool is None or rid not in self._streams:
+            return 0
+        freed = 0
+        with self._lock:
+            for label, stream in self._streams[rid].items():
+                if stream.offloaded or not stream.page_indices:
+                    continue
+                if stream.read_future is not None:
+                    # its pages are still being written into
+                    wait([stream.read_future])
+                moved = self._cpu_pool.offload_stream(
+                    rid=rid, label=label,
+                    gpu_kv_cache=self.kv_cache.tensor,
+                    gpu_page_indices=stream.page_indices,
+                    stored_len=stream.stored_len,
+                    position=stream.position,
+                    released=stream.released,
+                )
+                if not moved:
+                    continue
+                # the copy runs on the pool's stream; order the release behind
+                # it so a later allocation can't write these pages first
+                self._cpu_pool.sync()
+                freed += len(stream.page_indices)
+                self._arena.release(stream.page_indices)
+                stream.page_indices = []
+                stream.offloaded = True
+                stream.reset()
+        return freed
+
+    def reload(self, rid: str) -> bool:
+        """Bring every offloaded stream of ``rid`` back on device.
+
+        False when the device can't fit them right now; nothing moves in that
+        case, so the caller can evict further and try again.
+        """
+        if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
+            return False
+        with self._lock:
+            labels = self._cpu_pool.labels(rid)
+            needed = sum(self._cpu_pool.num_pages(rid, label) for label in labels)
+            if needed > self._arena.num_free:
+                return False
+            for label in labels:
+                stream = self._ensure_label(rid, label)
+                pages = self._arena.acquire(
+                    self._cpu_pool.num_pages(rid, label)
+                )
+                if pages is None:
+                    # lost the race for pages against another consumer
+                    return False
+                state = self._cpu_pool.reload_stream(
+                    rid=rid, label=label,
+                    gpu_kv_cache=self.kv_cache.tensor,
+                    gpu_page_indices=pages,
+                )
+                stream.page_indices = pages
+                stream.stored_len = state.stored_len
+                stream.position = state.position
+                stream.released = state.released
+                stream.offloaded = False
+            # attention reads these pages on the compute stream
+            self._cpu_pool.sync()
+        return True
+
+    def get_offload_priority(self, rid: str) -> float:
+        """Device pages the request is holding — the most reclaimable first."""
+        if rid not in self._streams:
+            return 0.0
+        return float(sum(
+            len(stream.page_indices) for stream in self._streams[rid].values()
+        ))
+
     def publish(self, request_id: str):
         return PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size,
@@ -632,6 +680,8 @@ class KVManager(Resource):
                     # must not be reused until it finishes writing
                     wait([stream.read_future])
                 self._arena.release(stream.page_indices)
+        if self._cpu_pool is not None:
+            self._cpu_pool.remove_request(rid)
 
         self._streams.pop(rid, None)
         self._overrides.pop(rid, None)
