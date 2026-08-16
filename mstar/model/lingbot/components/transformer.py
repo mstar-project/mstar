@@ -28,6 +28,11 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 
+# Eager island for torch.compile: keep the attention dispatcher untraced so the
+# compiled model runs the exact same attention kernel as the eager path (dynamo
+# tracing through it re-lowers SDPA and changes numerics).
+_dispatch_attention_eager = torch._dynamo.disable(dispatch_attention_fn)
+
 try:
     from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
 except Exception:  # pragma: no cover - optional CUDA kernel.
@@ -159,8 +164,14 @@ class LingBotVideoRMSNorm(nn.Module):
         return (self.weight * hidden_states).to(input_dtype)
 
 
+@torch._dynamo.disable
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply complex RoPE to `(B, S, H, D)` attention tensors."""
+    """Apply complex RoPE to `(B, S, H, D)` attention tensors.
+
+    Eager island under torch.compile: inductor decomposes the complex64 multiply
+    into real arithmetic with different rounding than the eager complex kernels,
+    which shifts numerics; accuracy is held to the eager/upstream reference.
+    """
     with torch.amp.autocast("cuda", enabled=False):
         x_c = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
         out = torch.view_as_real(x_c * freqs_cis.unsqueeze(2)).flatten(3)
@@ -287,9 +298,13 @@ class LingBotVideoAttention(nn.Module):
             v = self.to_v(x).unflatten(2, (self.num_heads, self.head_dim))
         q = apply_rotary_emb(self.norm_q(q), rotary_emb)
         k = apply_rotary_emb(self.norm_k(k), rotary_emb)
-        # dispatch_attention_fn expects (B, S, H, D) in and out (same as the diffusers Wan processor)
+        # dispatch_attention_fn expects (B, S, H, D) in and out (same as the diffusers Wan processor).
+        # _dispatch_attention_eager: under torch.compile the dispatcher must stay an
+        # eager island — tracing through it re-lowers SDPA to a different attention
+        # kernel than the eager path, changing numerics (accuracy is held to the
+        # eager/upstream reference).
         if packed_indices is None:
-            out = dispatch_attention_fn(
+            out = _dispatch_attention_eager(
                 q,
                 k,
                 v,
@@ -1156,6 +1171,9 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states: torch.Tensor,  # (B, L, text_dim)
         encoder_attention_mask: Optional[torch.Tensor] = None,  # (B, L) 1=valid
         return_dict: bool = True,
+        text_len: Optional[int] = None,  # per-sample text length when known (B=1 fast path)
+        rotary: Optional[torch.Tensor] = None,  # precomputed (B,S,hd/2) rotary; must be
+        # built OUTSIDE any torch.compile/CUDA-graph region (see LingBotDitSubmodule)
     ):
         B, C, T, H, W = hidden_states.shape
         pF, pH, pW = self.config.patch_size
@@ -1163,11 +1181,18 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         n_video = gt * gh * gw
         L = encoder_hidden_states.shape[1]
         device = hidden_states.device
-        if encoder_attention_mask is not None:
-            text_lens = encoder_attention_mask.sum(dim=-1).long()
+        if text_len is not None and B == 1:
+            # Sync-free hot path: the caller knows the true text length (the serving
+            # path pre-crops embeds so text_len == L). Avoids the D2H .tolist()/.any()
+            # syncs below, which drain the CUDA pipe once per DiT forward.
+            text_lens = torch.full((B,), int(text_len), dtype=torch.long, device=device)
+            text_lens_list = [int(text_len)]
         else:
-            text_lens = torch.full((B,), L, dtype=torch.long, device=device)
-        text_lens_list = [int(v) for v in text_lens.detach().cpu().tolist()]
+            if encoder_attention_mask is not None:
+                text_lens = encoder_attention_mask.sum(dim=-1).long()
+            else:
+                text_lens = torch.full((B,), L, dtype=torch.long, device=device)
+            text_lens_list = [int(v) for v in text_lens.detach().cpu().tolist()]
         packed_batch = B > 1
 
         # patchify: token order (f h w), feature order (pf ph pw c) -- matches patchify_and_embed
@@ -1202,12 +1227,18 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             joint = torch.cat([x, text], dim=1)  # [video; text]
         joint_seq_len = joint.shape[1]
 
-        # Per-sample RoPE: video t-axis start = real text length of this sample + 1
-        rotary_parts = [self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device)) for i in range(B)]
-        if packed_batch:
-            rotary = torch.cat(rotary_parts, dim=0).unsqueeze(0)
-        else:
-            rotary = torch.stack(rotary_parts, dim=0)  # (B, S, head_dim/2) complex64
+        # Per-sample RoPE: video t-axis start = real text length of this sample + 1.
+        # The rotary tensor depends only on (text_len, grid) — constant across all
+        # denoise steps of a request — so the hot path precomputes it once and
+        # passes it in (`rotary=`). NOTE: do not cache tensors created here on the
+        # module — under torch.compile mode="reduce-overhead" they would live in
+        # CUDA-graph pool memory and be clobbered by the next replay.
+        if rotary is None:
+            rotary_parts = [self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device)) for i in range(B)]
+            if packed_batch:
+                rotary = torch.cat(rotary_parts, dim=0).unsqueeze(0)
+            else:
+                rotary = torch.stack(rotary_parts, dim=0)  # (B, S, head_dim/2) complex64
 
         parallel_config = getattr(self, "_parallel_config", None)
         use_packed_attention = parallel_config is not None
@@ -1215,7 +1246,10 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         attention_mask = None
         moe_padding_mask = None
         packed_indices = None
-        has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
+        if text_len is not None and B == 1:
+            has_padding = text_len < L  # python ints — no device sync
+        else:
+            has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
         if packed_batch or use_packed_attention:
             sample_seq_lens = [n_video + text_len for text_len in text_lens_list]
             cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.int32)
@@ -1345,8 +1379,8 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 projected = projected[:, :-padding_size, :]
         if packed_batch:
             split_lengths: list[int] = []
-            for text_len in text_lens_list:
-                split_lengths.extend([n_video, text_len])
+            for sample_text_len in text_lens_list:
+                split_lengths.extend([n_video, sample_text_len])
             parts = torch.split(projected, split_lengths, dim=1)
             x = torch.cat(parts[::2], dim=1).reshape(B, n_video, -1)
         else:

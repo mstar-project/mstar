@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import functools
 import io
 import logging
+import os
 from contextlib import nullcontext
 
 import numpy as np
@@ -12,16 +14,9 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.lingbot.components.scheduling_flow_unipc import FlowUniPCMultistepScheduler
+from mstar.model.lingbot.components.unipc_fast import SOLVER_ORDER, UniPCStepTable
 from mstar.model.lingbot.config import LingBotConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.components.unipc import (
-    SOLVER_ORDER,
-    UniPCState,
-    unipc_convert_model_output,
-    unipc_corrector_step,
-    unipc_effective_order,
-    unipc_predictor_step,
-)
 
 logger = logging.getLogger(__name__)
 DENOISE_LOOP_NAME = "denoise_loop"
@@ -37,14 +32,31 @@ def decode_init_latents(encoded: str) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
 
 
+@functools.lru_cache(maxsize=8)
 def make_flow_unipc_tables(num_inference_steps: int, shift: float) -> tuple[torch.Tensor, torch.Tensor]:
     # Derive the sigma/timestep schedule from LingBot's own FlowUniPC scheduler so
     # it matches the upstream pipeline exactly. A hand-rolled linspace(1, 1/1000)
     # here started at sigma=1.0 / t=1000 instead of the scheduler's 0.9997 / t=999
     # (and diverged in the tail), which drifted the whole denoise trajectory.
+    # lru_cache: the tables are per-(steps, shift) constants; callers must not
+    # mutate them (the unipc fns only read).
     scheduler = FlowUniPCMultistepScheduler(num_train_timesteps=1000)
     scheduler.set_timesteps(num_inference_steps, device="cpu", shift=shift)
     return scheduler.sigmas.to(torch.float32), scheduler.timesteps.to(torch.int64)
+
+
+@functools.lru_cache(maxsize=8)
+def _device_transformer_timesteps(
+    num_inference_steps: int, shift: float, dtype: torch.dtype, device_str: str
+) -> torch.Tensor:
+    """All per-step transformer timestep scalars, precomputed on device.
+
+    Indexing this by a python int per step is a free view — no per-step CPU
+    indexing, dtype round-trip, or H2D copy in the hot loop.
+    """
+    _, timesteps = make_flow_unipc_tables(num_inference_steps, shift)
+    vals = torch.stack([_transformer_timestep(timesteps[k], dtype) for k in range(num_inference_steps)])
+    return vals.to(torch.device(device_str))
 
 
 def _module_dtype(module: nn.Module) -> torch.dtype:
@@ -149,6 +161,52 @@ class LingBotDitSubmodule(NodeSubmodule):
         super().__init__()
         self.transformer = transformer
         self.config = config
+        # (num_steps, shift, device) -> UniPCStepTable of precomputed solver consts.
+        self._unipc_tables: dict = {}
+        # Lazily torch.compile'd transformer (mode="reduce-overhead": inductor
+        # fuses the eager elementwise soup and drives the forward through its own
+        # CUDA graphs). The compiled callable is used for the denoise hot loop;
+        # LINGBOT_COMPILE=0 opts out. First use pays one-time compile latency —
+        # consistent with mstar's documented lazy-compile-on-first-request.
+        self._transformer_fast = None
+        # (text_len, gt, gh, gw) -> precomputed rotary tensor. Built EAGERLY (outside
+        # the compiled/CUDA-graph region) and passed into the transformer — a cache
+        # inside the compiled forward would hand back graph-pool memory that the
+        # next replay overwrites.
+        self._rotary_cache: dict = {}
+
+    def _rotary_for(self, text_len: int, latents: torch.Tensor) -> torch.Tensor:
+        pF, pH, pW = self.config.patch_size
+        _, _, T, H, W = latents.shape
+        key = (int(text_len), T // pF, H // pH, W // pW)
+        rot = self._rotary_cache.get(key)
+        if rot is None:
+            from mstar.model.lingbot.components.transformer import make_joint_position_ids
+
+            gt, gh, gw = key[1], key[2], key[3]
+            rot = self.transformer.rope(make_joint_position_ids(int(text_len), gt, gh, gw, latents.device)).unsqueeze(0)
+            if len(self._rotary_cache) > 16:
+                self._rotary_cache.clear()
+            self._rotary_cache[key] = rot
+        return rot
+
+    def _transformer_callable(self) -> nn.Module:
+        if os.environ.get("LINGBOT_COMPILE", "1") == "0":
+            return self.transformer
+        if self._transformer_fast is None:
+            self._transformer_fast = torch.compile(self.transformer, mode="reduce-overhead", dynamic=False)
+        return self._transformer_fast
+
+    def _unipc_table(self, num_steps: int, shift: float, device: torch.device) -> UniPCStepTable:
+        key = (num_steps, float(shift), str(device))
+        table = self._unipc_tables.get(key)
+        if table is None:
+            sigmas, _ = make_flow_unipc_tables(num_steps, shift)
+            table = UniPCStepTable(sigmas, num_steps, device)
+            if len(self._unipc_tables) > 8:
+                self._unipc_tables.clear()
+            self._unipc_tables[key] = table
+        return table
 
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs
@@ -172,6 +230,14 @@ class LingBotDitSubmodule(NodeSubmodule):
             else:
                 generator = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
                 latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
+            # One-time invariant check (host sync OK here — once per request, off
+            # the GPU thread): the fast path passes text_len == embeds len to the
+            # transformer, which is only valid when masks arrive pre-cropped
+            # (all-ones) from the text-encoder node.
+            for mask_name in ("text_mask_pos", "text_mask_neg"):
+                m = tensor_inputs[mask_name]
+                if int(m.sum().item()) != m.numel():
+                    raise ValueError(f"{mask_name} must be pre-cropped (all ones) for the LingBot denoise fast path")
             tensor_inputs["latents"] = latents
             tensor_inputs["time_index"] = torch.zeros(1, dtype=torch.int64, device=device)
             tensor_inputs["unipc_model_outputs"] = torch.zeros(
@@ -179,13 +245,15 @@ class LingBotDitSubmodule(NodeSubmodule):
             )
             tensor_inputs["unipc_last_sample"] = torch.zeros(shape, dtype=torch.float32, device=device)
         else:
-            time_index = inputs["time_index"][0]
-            k = int(time_index.reshape(-1)[0].item())
+            # k comes from the engine's loop-iteration counter (same source
+            # check_stop uses) — reading the time_index tensor would force a
+            # D2H sync on the previous step's output.
+            k = int(fwd_info.dynamic_loop_iter_counts.get(DENOISE_LOOP_NAME, 0))
             num_steps = int(fwd_info.step_metadata["num_inference_steps"])
             if k >= num_steps:
                 return None
             tensor_inputs["latents"] = inputs["latents"][0]
-            tensor_inputs["time_index"] = time_index
+            tensor_inputs["time_index"] = inputs["time_index"][0]
             tensor_inputs["unipc_model_outputs"] = inputs["unipc_model_outputs"][0]
             tensor_inputs["unipc_last_sample"] = inputs["unipc_last_sample"][0]
         return NodeInputs(tensor_inputs=tensor_inputs)
@@ -204,38 +272,30 @@ class LingBotDitSubmodule(NodeSubmodule):
         text_mask_neg: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        step_metadata = engine_inputs.single_request_info.step_metadata
+        info = engine_inputs.single_request_info
+        step_metadata = info.step_metadata
         num_steps = int(step_metadata["num_inference_steps"])
         guidance_scale = float(step_metadata["guidance_scale"])
         shift = float(step_metadata["shift"])
-        k = int(time_index.item())
+        # Loop-iteration counter (no D2H sync; same source check_stop uses).
+        k = int(info.dynamic_loop_iter_counts.get(DENOISE_LOOP_NAME, 0))
         device = latents.device
         with _no_autocast():
-            sigmas, timesteps = make_flow_unipc_tables(num_steps, shift)
             dtype = _module_dtype(self.transformer)
-            timestep = _transformer_timestep(timesteps[k], dtype).expand(1).to(device)
+            timestep = _device_transformer_timesteps(num_steps, shift, dtype, str(device))[k].expand(1)
             noise_pred = self._noise_prediction(
                 latents, timestep, text_embeds_pos, text_mask_pos, text_embeds_neg, text_mask_neg, guidance_scale
             )
-            m_k = unipc_convert_model_output(noise_pred, latents, sigmas, k)
+            # Precomputed-constant UniPC (bit-identical to the wan22 reference; see
+            # components/unipc_fast.py). Removes the per-step linalg.solve D2H sync
+            # and the 0-dim scalar-op kernel soup from the hot loop.
+            table = self._unipc_table(num_steps, shift, device)
+            m_k = table.convert_model_output(noise_pred, latents, k)
             sample = latents
             if k > 0:
-                sample = unipc_corrector_step(
-                    UniPCState(model_outputs=unipc_model_outputs, last_sample=unipc_last_sample),
-                    this_model_output=m_k,
-                    this_sample=sample,
-                    sigmas=sigmas,
-                    step_index=k,
-                    order=unipc_effective_order(k - 1, num_steps),
-                )
+                sample = table.corrector_step(unipc_model_outputs, unipc_last_sample, m_k, sample, k)
             new_ring = torch.stack([unipc_model_outputs[1], m_k])
-            new_latents = unipc_predictor_step(
-                UniPCState(model_outputs=new_ring, last_sample=sample),
-                sample=sample,
-                sigmas=sigmas,
-                step_index=k,
-                order=unipc_effective_order(k, num_steps),
-            )
+            new_latents = table.predictor_step(new_ring, sample, k)
         return {
             "latents": [new_latents],
             "time_index": [time_index + 1],
@@ -254,22 +314,33 @@ class LingBotDitSubmodule(NodeSubmodule):
         guidance_scale: float,
     ) -> torch.Tensor:
         dtype = _module_dtype(self.transformer)
+        transformer = self._transformer_callable()
         latent_model_input = latents.to(dtype)
-        noise_pred = self.transformer(
+        # text_len passed explicitly (embeds arrive pre-cropped, so len == shape) —
+        # enables the transformer's sync-free path and its per-request RoPE cache.
+        # The .float() after each call also copies the result out of the compiled
+        # path's CUDA-graph static output buffer before the next replay.
+        len_pos = int(text_embeds_pos.shape[1])
+        len_neg = int(text_embeds_neg.shape[1])
+        noise_pred = transformer(
             latent_model_input,
             timestep,
             text_embeds_pos.to(dtype),
             encoder_attention_mask=text_mask_pos,
             return_dict=False,
+            text_len=len_pos,
+            rotary=self._rotary_for(len_pos, latents),
         )[0].float()
         if guidance_scale <= 1.0:
             return noise_pred
-        noise_uncond = self.transformer(
+        noise_uncond = transformer(
             latent_model_input,
             timestep,
             text_embeds_neg.to(dtype),
             encoder_attention_mask=text_mask_neg,
             return_dict=False,
+            text_len=len_neg,
+            rotary=self._rotary_for(len_neg, latents),
         )[0].float()
         return noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
@@ -288,6 +359,16 @@ class LingBotVaeDecoderSubmodule(NodeSubmodule):
         super().__init__()
         self.vae = vae
         self.config = config
+        # Lazily compiled decode (default inductor mode — the causal-conv cache
+        # lists graph-break, so no cudagraphs here; fusion alone is ~1.7x).
+        self._decode_fast = None
+
+    def _decode_callable(self):
+        if os.environ.get("LINGBOT_COMPILE", "1") == "0":
+            return self.vae.decode
+        if self._decode_fast is None:
+            self._decode_fast = torch.compile(self.vae.decode, dynamic=False)
+        return self._decode_fast
 
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs
@@ -308,7 +389,7 @@ class LingBotVaeDecoderSubmodule(NodeSubmodule):
             vae_latents = vae_latents.contiguous(memory_format=torch.channels_last_3d)
             # Decode in fp32 (weights + activations); upstream inference uses --vae_dtype fp32.
             # bf16 autocast here noticeably degrades the decoded frames.
-            decoded = vae.decode(vae_latents)
+            decoded = self._decode_callable()(vae_latents)
             video = decoded[0] if isinstance(decoded, tuple) else decoded.sample
             video = video.float().clamp(-1, 1)
             video = ((video + 1.0) / 2.0).mul(255).clamp(0, 255).to(torch.uint8)
