@@ -36,14 +36,14 @@ bash test/nemotron_duplex/launch_server.sh disagg   # 3-GPU pipeline (nemotron_d
 ```
 
 Both layouts produce identical text + audio. The first request compiles kernels
-(cold, ~90 s); the talker is eager MaskGIT (~2 s/frame), so prefer short clips.
+(cold, ~90 s); once warm the pipeline runs ~0.1 s/frame.
 
-Send a request. With no `--audio`, a clean **user-only** input is prepared from
-the base VoiceChat-11B demo `turn_taking.wav` — those demo wavs are 2-channel
-recordings of the whole conversation (user left, agent right), so we take the
-user channel, isolate the first user turn, and append silence for the reply. On
-the default clip the agent answers *"Oh, I love cooking! How about this chocolate
-chip cookie recipe? …"*.
+### One-shot request (`duplex_request.py`)
+
+With no `--audio`, a clean **user-only** input is prepared from the base
+VoiceChat-11B demo `turn_taking.wav` — those demo wavs are 2-channel recordings
+of the whole conversation (user left, agent right), so we take the user channel,
+isolate the first user turn, and append silence for the reply.
 
 ```bash
 cd test/nemotron_duplex
@@ -53,10 +53,34 @@ python duplex_request.py --text-only                     # skip talker/codec (fa
 python duplex_request.py -n 3                             # 3 concurrent (batching)
 ```
 
-Your own `--audio` should be **user speech only** (mono), with a few seconds of
-trailing silence — the model is frame-synchronous and replies in the frames
-*after* you stop talking. `--text-only` returns the transcript-style agent text
-in seconds; full audio takes a few minutes (the talker is eager MaskGIT).
+Your own `--audio` should be **user speech only** (mono), with trailing silence —
+the model is frame-synchronous and replies in the frames *after* you stop talking.
+
+### Duplex / streaming request (`duplex_stream_request.py`)
+
+Sends the user utterance followed by a window of no-sound frames (the "keep
+talking after the user stops" case) and consumes the reply as it streams back,
+reporting the turn boundary and how much of the reply was actually voiced:
+
+```bash
+cd test/nemotron_duplex
+python duplex_stream_request.py                          # 30 s reply window
+python duplex_stream_request.py --silence 15 --output agent.wav
+python duplex_stream_request.py --audio user.wav --silence 20
+```
+
+Behavior to expect / verify:
+- The agent stays silent while the user talks and starts replying a few frames
+  after; with a longer `--silence` it will emit **more reply text** (it does not
+  wait for the user — it fills silence with plausible follow-up turns).
+- The reply **audio is sparse** — the talker/codec voices only a fraction of the
+  dense text (e.g. ~1.5 s voiced per reply). This matches the standalone
+  `offline_inference` reference, so it's a model/reference characteristic, not a
+  serving-engine bug. (The transport is fixed-buffer input + streamed output; the
+  engine has no incremental-audio-input path — that lives in the model's
+  standalone `realtime_api.py` over `DuplexStream`.)
+
+`--text-only` returns the agent text in seconds; full audio is slower.
 
 ## Validate against the oracle
 
