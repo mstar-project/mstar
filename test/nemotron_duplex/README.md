@@ -82,6 +82,23 @@ Behavior to expect / verify:
 
 `--text-only` returns the agent text in seconds; full audio is slower.
 
+### Browser UI (`webui.py`)
+
+A tiny local web app to talk to the model from a browser (record from the mic or
+upload a wav). It's a small proxy: the page posts audio to it, it resamples to
+16 kHz mono, appends the silence reply window, forwards to the model server with
+streaming, and streams the agent's text + audio back to play.
+
+```bash
+# with the model server already running (e.g. on :8019):
+python test/nemotron_duplex/webui.py --mstar-url http://127.0.0.1:8019 --port 8500
+# then open http://127.0.0.1:8500/
+```
+
+The mic needs a secure context (works on `http://localhost` / `127.0.0.1`; for
+remote access put it behind HTTPS). Same caveat as above applies — the agent
+replies with full text but only a short voiced burst of audio.
+
 ## Validate against the oracle
 
 `offline_inference` is the verified ground truth (100% text-token match vs the
