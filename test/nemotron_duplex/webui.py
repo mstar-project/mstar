@@ -41,8 +41,8 @@ PAGE = """<!doctype html>
 </style></head><body>
 <h1>Nemotron-Duplex — voice chat</h1>
 <p class="muted">Speak a short question (or upload a wav), then the agent replies. The reply window
-appends silence so the agent has frames to answer in. Note: the model voices only a short burst per
-reply — see the README.</p>
+appends silence so the agent has frames to answer in. The agent replies with text and voiced
+speech; very dense late sentences of a long reply may thin out.</p>
 <div class="row">
  <button id="rec">● Record</button>
  <input type="file" id="file" accept="audio/*">
