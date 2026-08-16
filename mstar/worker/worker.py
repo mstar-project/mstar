@@ -1035,23 +1035,20 @@ class Worker:
     # for rids whose loop is still continuing.
     # ------------------------------------------------------------------
 
-    def _prepare_and_preplan_spec(
+    def _preplan_spec(
         self,
         pending: PendingBatch | None,
         speculation: Speculation,
     ) -> bool:
-        """Prepare and pre-plan the speculative batch on the plan thread.
+        """Pre-plan the speculative batch on the plan thread.
 
-        The two waits are different dependencies on batch N, which is why
-        this is one callable rather than two:
+        Waits on batch N's ``commit_done`` — its resource state has to be
+        committed before N+1 can admit and plan against it — and nothing else.
+        The batch is not prepared yet, so the plan runs against the capture
+        config's shape for the batch size; only a batched capture can serve
+        that. See ``Engine.pre_plan_for_batch`` for what moving
+        ``prepare_inputs`` ahead of the forward would take (and unlock).
 
-        * ``outputs_ready`` — N's output tensors exist (their values land
-          later). Enough to thread them into N+1's inputs and run
-          ``prepare_inputs``, which is the expensive Python.
-        * ``commit_done`` — N's resource state is committed, so N+1 can admit
-          and plan against it.
-
-        Everything here runs off the main thread, overlapping N's GPU work.
         Returns True when the batch was pre-planned; False means ``exec``
         plans it inline, which is always correct, just slower.
         """
@@ -1059,40 +1056,17 @@ class Worker:
         engine = self.engine_manager.get_engine(spec_batch.node_name)
         try:
             if pending is not None:
-                # Safety timeout — the engine releases both events even on its
-                # failure paths, so this should only fire if the GPU thread
-                # died. Bail out rather than block plan_executor forever.
-                if not pending.node_batch.outputs_ready.wait(timeout=10.0):
+                # Safety timeout — the engine releases this event even on its
+                # failure paths, so it should only fire if the GPU thread died.
+                # Bail out rather than block plan_executor forever.
+                if not pending.node_batch.commit_done.wait(timeout=10.0):
                     logger.warning(
                         "Worker %s: plan_executor timed out waiting for "
-                        "batch N outputs; skipping pre-plan", self.worker_id,
+                        "batch N commit; skipping pre-plan", self.worker_id,
                     )
                     return False
-                if not speculation.is_yield_away:
-                    self._thread_outputs_to_speculative(
-                        speculation, pending.node_batch.outputs
-                    )
-                if not spec_batch.request_ids:
-                    return False  # every rid dropped; nothing to prepare
-
-            # NOTE: this must not read a tensor value — N's kernels are still
-            # running, so an .item() here would serialize the pipeline.
-            engine.prepare_inputs(spec_batch)
-            if not spec_batch.request_ids:
-                return False
-
-            if pending is not None and not pending.node_batch.commit_done.wait(
-                timeout=10.0
-            ):
-                logger.warning(
-                    "Worker %s: plan_executor timed out waiting for "
-                    "batch N commit; skipping pre-plan", self.worker_id,
-                )
-                return False
-
-            # Reserved here rather than at spec-build time: the bucket depends
-            # on the real token count, which only prepare_inputs knows.
-            engine.reserve_replay_slot(spec_batch)
+            if engine.reserve_replay_slot(spec_batch) is None:
+                return False  # eager, or no batched capture for this shape
             return engine.pre_plan_for_batch(spec_batch)
         except Exception:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
@@ -2258,13 +2232,12 @@ class Worker:
                             # send messages to follower ranks if relevant
                             self.maybe_send_zmq_to_tp_followers(node_batch)
                     if speculation is not None and plan_executor is not None:
-                        # Hand N+1 to the plan thread NOW. It waits on N's own
-                        # events (outputs, then commit), threads N's outputs
-                        # in, runs prepare_inputs, reserves a slot and
-                        # pre-plans — all while the main thread sits in
-                        # await_gpu with the GIL released and N's kernels run.
+                        # Hand N+1 to the plan thread NOW. It waits on N's
+                        # commit event, then reserves a slot and pre-plans —
+                        # while the main thread sits in await_gpu with the GIL
+                        # released and N's kernels are still running.
                         speculation.plan_future = plan_executor.submit(
-                            self._prepare_and_preplan_spec, pending, speculation,
+                            self._preplan_spec, pending, speculation,
                         )
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
@@ -2336,14 +2309,19 @@ class Worker:
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
-                        # Inputs were threaded and prepared on the plan thread;
-                        # draining its future here settles which rids survived.
-                        # With no plan thread, do that work inline instead —
-                        # correct, just unoverlapped.
+                        # Promote per-rid speculative_signals → real inputs,
+                        # then prepare. Both stay on the main thread: a
+                        # submodule's prepare_inputs may read a token value,
+                        # which is only settled now that N has completed.
                         if speculation.plan_future is not None:
                             speculation.plan_future.result()
-                        else:
-                            self._prepare_and_preplan_spec(pending, speculation)
+                        if not speculation.is_yield_away:
+                            self._thread_outputs_to_speculative(speculation, outputs)
+                        engine = self.engine_manager.get_engine(
+                            spec_node_batch.node_name
+                        )
+                        if spec_node_batch.request_ids:
+                            engine.prepare_inputs(spec_node_batch)
                         # set node._speculatively_scheduled to true, so that it doesn't
                         # accidentally get put on the ready queue while already executing
                         for node in spec_batch.node_objects.values():
@@ -2354,11 +2332,11 @@ class Worker:
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
                             _t0 = _time.perf_counter() if phase_period else 0.0
-                            # If the spec batch's composition changed after it
-                            # was planned, that plan is stale — drop it and let
-                            # the GPU thread plan inline.
-                            if speculation.plan_future is not None and speculation.dropped:
-                                self._reset_skip_plan_flags(speculation.node_batch)
+                            # Threading outputs and preparing may have
+                            # dropped rids since the plan was staged, which
+                            # makes it stale — let the GPU thread plan inline.
+                            if engine.preplan_is_stale(spec_node_batch):
+                                self._reset_skip_plan_flags(spec_node_batch)
                                 speculation.plan_future = None
 
                             spec_future = gpu_executor.submit(

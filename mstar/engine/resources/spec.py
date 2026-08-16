@@ -34,6 +34,20 @@ class NodeResourceSpec(ABC):
     def resource_type(self) -> ResourceType:
         pass
 
+    def apply_yaml_overrides(self, **kwargs):
+        """Patch declared parameters from a deployment's YAML.
+
+        The model declares shapes that suit the model; a deployment tunes what
+        suits the box it runs on. Each spec takes the keys it recognizes and
+        ignores the rest, since one YAML block reaches every resource.
+
+        TODO: generalize. Matching YAML keys against the spec's (and its
+        config's) dataclass fields would remove these per-resource
+        implementations, at the cost of silently accepting anything named
+        alike.
+        """
+        return
+
 
 
 class ResourceReqConfig(ABC):
@@ -42,7 +56,6 @@ class ResourceReqConfig(ABC):
     def resource_type(self) -> ResourceType:
         pass
 
-    @abstractmethod
     def apply_conductor_config(self, **kwargs):
-        pass
+        return
 

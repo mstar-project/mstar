@@ -8,10 +8,11 @@ smaller once the worker knows exactly one engine.
 Everything the worker does for the OLD engine is being removed, not ported,
 unless named below.
 
-**Status**: Phase 0 and Phase 1 applied in one pass over the worker. What
-landed differs from the plan in two places, both noted inline below:
-`check_ready` now drives reload itself, and `prepare_inputs` for a
-non-speculated batch runs on the main thread before submission.
+**Status**: Phase 0 and Phase 1 applied in one pass over the worker. Three
+things landed differently from the plan, all noted inline below:
+`prepare_inputs` stays on the main thread (see Phase 1), `check_ready` drives
+reload itself, and `prepare_inputs` for a non-speculated batch runs on the
+main thread before submission.
 
 ---
 
@@ -57,9 +58,18 @@ The old engine split an oversized batch into minibatches internally
 back to back with no pipelining or async between them.
 
 Instead the microscheduler keeps a **backlog** of batches it should schedule in
-succession (reachable through a method on the scheduler). A non-empty backlog
-supersedes the usual speculation / scheduling path, so the minibatches flow
-through the same overlapped pipeline as any other batch.
+succession. A non-empty backlog supersedes the usual scheduling path, so the
+pieces flow through the same overlapped pipeline as any other batch.
+
+Landed as: `MicroScheduler.backlog`, filled by `_assemble_batches` (which pops
+the whole ready set off the queues and cuts it into steps) and drained by
+`_take_backlogged` at the top of `get_next_batch`. The cap comes from
+`Engine.get_max_batch_size(node, walk)` — the smaller of what the submodule
+says it can batch and the largest captured graph for the walk — so callers no
+longer pass one. A backlogged step is skipped when the caller targets a
+specific (node, walk) that doesn't match; `exclude_target` is only a fairness
+hint, so it doesn't hold back a split set. `fail_rids` / `clear_rid` excise a
+request from the backlog, which is the only place holding its popped node.
 
 ### 0.3 Eviction and offload
 
@@ -139,31 +149,55 @@ inputs yet, so use dummies and restrict pre-plan to BASIC_BATCHED":
 `declare_step` sits with the first group: spans come from `input_seq_len`, it
 reads no stream state.
 
-### Main thread never waits
+### What landed: pre-plan only, on the plan thread
 
-Steps 2–5 go in one callable on the existing single plan thread:
+Steps 2–3 did **not** move off the main thread. Speculative `prepare_inputs`
+would require every submodule's `prepare_inputs` to be async-safe, and some
+read a token value (`.item()`) — qwen3_tts, for one. Making them all safe is
+more churn than this migration should carry, so:
 
 ```
-_prepare_and_preplan_spec(batch_N, spec_batch):
-    batch_N.outputs_ready.wait(timeout)     # 2
-    thread_outputs(spec_batch, outputs_N)   # 3
-    engine.prepare_inputs(spec_batch)
+# plan thread
+_preplan_spec(batch_N, spec_batch):
     batch_N.commit_done.wait(timeout)       # 4
     engine.reserve_replay_slot(spec_batch)  # 5
     engine.pre_plan_for_batch(spec_batch)
+
+# main thread, after await_gpu(N)
+thread_outputs(spec_batch, outputs_N)       # 3
+engine.prepare_inputs(spec_batch)
 ```
 
-`reserve_replay_slot` moves from spec-build time to here. That's the payoff: it
-now runs after `prepare_inputs`, so `select_bucket` sees real `bs` and
-`num_tokens` instead of assuming `bs == num_tokens`. This is what lifts the
-BASIC_BATCHED-only restriction on pre-plan, and what chunked prefill will need.
+The batch therefore has no token count when it is pre-planned, so the bucket
+comes from `CudaGraphRunner.select_batched_bucket`: a batched capture's token
+count is a property of the config (`bs` rows of a fixed length), so the batch
+size alone determines it. A packed capture can't be pre-planned — its token
+count belongs to the requests. That is the same BASIC_BATCHED-only restriction
+the old worker had, kept deliberately.
+
+`pre_plan_for_batch` declares its step over `config.get_node_inputs(...)` for
+the leased bucket, and does **not** cache it: `exec` re-declares over the real
+inputs and the resources promote what was staged.
+
+**To lift this** (needed for chunked prefill): make `prepare_inputs`
+async-safe across submodules, then move steps 2–3 onto the plan thread ahead of
+`commit_done`. `ExecutingBatch.outputs_ready` already exists as the hook —
+`exec` sets it once N's output tensors are published, before commit. Then
+`reserve_replay_slot` sees a real `num_tokens` and `select_bucket` serves
+packed captures too.
+
+Because `prepare_inputs` now runs *after* the plan is staged, it can drop rids
+the plan covered. `Engine.preplan_is_stale` compares the staged rid tuple
+against the batch's current one; the worker drops the plan and lets the GPU
+thread plan inline when they diverge.
 
 ### Known hazards
 
-**Host syncs in `prepare_inputs`.** It now runs on the plan thread before
-GPU(N) completes, so any `.item()` / `.cpu()` / data-dependent Python branch
-serializes the pipeline — correct, but the overlap silently disappears. Worth
-`torch.cuda.set_sync_debug_mode("warn")` behind an env var while migrating.
+**Host syncs in `prepare_inputs`.** The reason it stayed on the main thread.
+If it moves, any `.item()` / `.cpu()` / data-dependent Python branch serializes
+the pipeline — correct, but the overlap silently disappears. Worth
+`torch.cuda.set_sync_debug_mode("warn")` behind an env var when that work
+starts.
 
 TODO: let a node opt out of speculative `prepare_inputs` + pre-plan, in which
 case its `prepare_inputs` is un-overlapped by design.

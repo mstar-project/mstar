@@ -72,6 +72,10 @@ class ExecutingBatch:
 
     # Populated on preplan
     preplan_event: torch.cuda.Event | None = None
+    # The rids the staged plan was built over. The plan is theirs exactly —
+    # order included — so it is stale the moment this stops matching
+    # ``request_ids`` (a request dropped while threading outputs or preparing).
+    preplanned_rids: tuple[str, ...] | None = None
 
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
@@ -647,6 +651,24 @@ class Engine:
             outputs.setdefault(rid, {}).update(rid_out)
 
 
+    def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
+        """Most requests this node will take in one step, or None for no cap.
+
+        Two sources: what the submodule says it can batch, and the largest
+        batch this walk captured a graph for — going past that would drop the
+        step to eager, so the scheduler splits instead. Splitting is the
+        scheduler's job, not the engine's: the pieces then pipeline like any
+        other batch instead of running back to back.
+        """
+        submodule_mgmt = self._submodules[node_name]
+        caps = [submodule_mgmt.submodule.max_batch_size(graph_walk)]
+        if submodule_mgmt.cuda_graph_runner is not None:
+            caps.append(
+                submodule_mgmt.cuda_graph_runner.max_batch_size_for(graph_walk)
+            )
+        capped = [cap for cap in caps if cap is not None]
+        return min(capped) if capped else None
+
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
@@ -676,14 +698,21 @@ class Engine:
         Reserving up front is what puts pre-plan(N+1) and replay(N) on
         different slots. No captured graph for the batch's shape leaves the
         lease unset, i.e. the step runs eager.
+
+        A batch that hasn't been through ``prepare_inputs`` has no token count
+        yet, so only a batched capture can serve it — see
+        ``CudaGraphRunner.select_batched_bucket``.
         """
         cg_runner = self._submodules[batch.node_name].cuda_graph_runner
-        if cg_runner is None or batch.inputs is None:
+        if cg_runner is None:
             return None
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,
             bs=len(batch.request_ids),
-            num_tokens=sum(inp.input_seq_len for inp in batch.inputs),
+            num_tokens=(
+                None if batch.inputs is None
+                else sum(inp.input_seq_len for inp in batch.inputs)
+            ),
             cg_key_info=batch.cg_key_info,
         )
         if lease is not None:
@@ -699,6 +728,18 @@ class Engine:
         where each pre-planned resource promotes what was staged here, and the
         replay waits on the event recorded here.
 
+        An unprepared batch declares its step over the capture config's inputs
+        for the leased bucket, which is why the lease had to come from a
+        batched capture. That step is not cached: ``exec`` re-declares it over
+        the real inputs.
+
+        TODO: pre-planning a packed capture (and chunked prefill) needs the
+        real token counts here, i.e. ``prepare_inputs`` run ahead of the
+        forward. That needs every submodule's ``prepare_inputs`` to be
+        async-safe — no ``.item()`` on a tensor the in-flight step is still
+        producing — which some are not (e.g. qwen3_tts).
+        ``ExecutingBatch.outputs_ready`` is the hook for it.
+
         Returns False when nothing was planned ahead, in which case ``exec``
         plans inline.
         """
@@ -708,15 +749,23 @@ class Engine:
         if cg_runner is None or lease is None:
             return False
 
-        inputs = cg_runner.pad_inputs(lease, batch.inputs)
+        inputs = (
+            cg_runner.config_for(lease).get_node_inputs(
+                lease.bucket.bs, lease.bucket.num_tokens
+            )
+            if batch.inputs is None
+            else cg_runner.pad_inputs(lease, batch.inputs)
+        )
         batch.step_context.request_ids = cg_runner.step_ids(lease, batch.request_ids)
-        step = batch.step = submodule_mgmt.submodule.declare_step(
+        step = submodule_mgmt.submodule.declare_step(
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.request_ids,
             inputs=inputs,
         )
         if step is None:
             return False
+        if batch.inputs is not None:
+            batch.step = step
 
         batch.step_context.is_preplan = True
         step.set_ctx(batch.step_context)
@@ -731,9 +780,17 @@ class Engine:
                 self._runner.pre_plan(step)
             batch.preplan_event = torch.cuda.Event()
             batch.preplan_event.record(stream)
+            batch.preplanned_rids = tuple(batch.request_ids)
         finally:
             batch.step_context.is_preplan = False
         return True
+
+    def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
+        """Whether the staged plan no longer describes this batch."""
+        return (
+            batch.preplanned_rids is not None
+            and batch.preplanned_rids != tuple(batch.request_ids)
+        )
 
     def reset_pre_plan_for_batch(self, batch: ExecutingBatch | None = None) -> None:
         """Drop planned-ahead state, e.g. when its batch never dispatched.
@@ -745,6 +802,7 @@ class Engine:
         """
         if batch is not None:
             batch.preplan_event = None
+            batch.preplanned_rids = None
             lease = batch.step_context.slot_lease
             cg_runner = self._submodules[batch.node_name].cuda_graph_runner
             if lease is not None and cg_runner is not None:

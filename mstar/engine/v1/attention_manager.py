@@ -34,6 +34,20 @@ class AttentionSpec(NodeResourceSpec):
     def resource_type(self):
         return ResourceType.ATTENTION
 
+    def apply_yaml_overrides(
+        self,
+        max_num_pages: int | None = None,
+        page_size: int | None = None,
+        **kwargs,
+    ):
+        """Track the cache's geometry: the wrappers are planned against it, so
+        a deployment that resizes the cache resizes these too."""
+        del kwargs  # keys meant for other resources
+        if max_num_pages is not None:
+            self.kv_config.max_num_pages = max_num_pages
+        if page_size is not None:
+            self.kv_config.page_size = page_size
+
 
 class AttentionManager(Resource):
     # Remains abstract except for build; will build based
@@ -253,6 +267,19 @@ class CrossAttentionSpec(NodeResourceSpec):
     @property
     def resource_type(self):
         return ResourceType.CROSS_ATTENTION
+
+    def apply_yaml_overrides(
+        self,
+        max_num_pages: int | None = None,
+        page_size: int | None = None,
+        **kwargs,
+    ):
+        """Track the context cache's geometry; see ``AttentionSpec``."""
+        del kwargs  # keys meant for other resources
+        if max_num_pages is not None:
+            self.kv_config.max_num_pages = max_num_pages
+        if page_size is not None:
+            self.kv_config.page_size = page_size
 
 
 class CrossAttentionManager(Resource):
