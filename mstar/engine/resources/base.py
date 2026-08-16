@@ -11,7 +11,7 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, Res
 from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
-    from mstar.engine.kv_store import TransferEngineInfo
+    from mstar.engine.v1.kv_transfer import TransferEngineInfo
 
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec

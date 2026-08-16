@@ -6,7 +6,7 @@ from typing import Any, Callable
 import torch
 
 from mstar.engine.resources.step import SubmoduleStep
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 
 class CudaGraphConfigType(Enum):
@@ -51,7 +51,7 @@ class CudaGraphConfig(ABC):
         pass
 
     @abstractmethod
-    def get_node_inputs(self, bs: int, num_tokens: int) -> list[ARNodeInputs]:
+    def get_node_inputs(self, bs: int, num_tokens: int) -> list[NodeInputs]:
         pass
 
 
@@ -59,7 +59,7 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
     def __init__(
         self,
         capture_graph_walk: str,  # "decode"
-        single_request_inputs: ARNodeInputs,
+        single_request_inputs: NodeInputs,
         replay_graph_walks: list[str] | None = None,
         additional_key_info: Any | None = None,
         compile: bool = True,
@@ -104,8 +104,8 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         self,
         capture_graph_walk: str,
         capture_token_lengths: list[int],
-        # seq len -> ARNodeInputs
-        make_node_input: Callable[[int], ARNodeInputs],
+        # seq len -> NodeInputs
+        make_node_input: Callable[[int], NodeInputs],
         replay_graph_walks: list[str] | None = None,
         additional_key_info: Any | None = None,
         compile: bool = True,
@@ -155,6 +155,28 @@ class PiecewiseCaptureShape:
     total_tokens: int    # sum(seq_lens); == bs * seq_len for BATCHED
 
 
+@dataclass
+class PiecewiseCallInputs:
+    """Everything a captured region is handed, at capture and at replay alike.
+
+    Both calls go through here so a region can't accidentally read something
+    that only exists on one of the two paths.
+    """
+    # The runner-owned buffers the graph was captured against. READ from them;
+    # reassigning an entry detaches the region from the address the graph holds.
+    static_inputs: dict[str, torch.Tensor]
+    # The region's own view of the batch: request ids and per-request info
+    # padded to the capture bucket, plus the node's resources. At capture the
+    # rows are the runner's padding ids.
+    engine_inputs: ModelInputsFromEngine
+    # ``config.forward_kwargs``, unchanged
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def resources(self) -> dict[str, Any]:
+        return self.engine_inputs.resources
+
+
 @dataclass(kw_only=True)
 class PiecewiseCudaGraphConfig(ABC):
     """One inner callable of a submodule's forward, captured on its own.
@@ -166,21 +188,23 @@ class PiecewiseCudaGraphConfig(ABC):
     ``kw_only`` so subclasses can add required fields (e.g. ``seq_len``)
     without colliding with the defaulted ones here.
     """
-    # The captured callable. It must READ tensors out of ``static_inputs``
-    # (never reassign them) so the runner-owned buffers stay the ones captured
-    # into the graph. Resources are reached the way the rest of the forward
-    # reaches them — the runner plans them right before capture and replay.
-    capture_fn: Callable[..., dict[str, torch.Tensor]]
+    # The captured callable, taking one PiecewiseCallInputs and returning the
+    # region's outputs by name (a bare tensor is accepted for a single output).
+    capture_fn: Callable[[PiecewiseCallInputs], dict[str, torch.Tensor]]
     # shape -> the static input buffers the runner owns and copies real inputs
     # into before each replay
     make_static_inputs: Callable[[PiecewiseCaptureShape], dict[str, torch.Tensor]]
     # This region's own resource work, declared over the padded batch. Separate
     # from the submodule's `declare_step` because the region's shape is its
     # own: the runner admits, plans, and commits it per replay.
-    # TODO: a region whose step is identical to the outer forward's could reuse
-    # that plan and skip re-planning here (a `reuses_outer_plan` flag). It only
-    # holds when the outer step was planned over this same padded shape.
     declare_step: Callable[[list[str], list[int]], SubmoduleStep | None] | None = None
+    # Set when the outer forward's step already planned this region's work over
+    # this same padded shape and lease; the runner then declares and plans only
+    # at capture, and each replay rides the live plan. Wrong here is silent: the
+    # region would read whatever plan the resources currently hold.
+    # TODO: the runner can't see the outer lease to check the two agree. Thread
+    # it through `run` once the forward carries its step context.
+    reuses_outer_plan: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
     # None => defer to the runner's default batch-size buckets

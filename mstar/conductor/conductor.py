@@ -21,6 +21,7 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     PartitionState,
     StreamingConnectionState,
+    merge_publish_info,
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
@@ -948,7 +949,9 @@ class Conductor:
         # Absorb-only fields are replicated across TP ranks; only the rank-0
         # message contributes.
         if body.is_first_tp_rank:
-            pstate.per_label_seq_info.update(body.per_label_seq_info)
+            merge_publish_info(
+                pstate.resource_publish_info, body.resource_publish_info
+            )
 
             if body.new_token_counts:
                 for name, count in body.new_token_counts.items():
@@ -1088,7 +1091,7 @@ class Conductor:
                         step_metadata=fwd_args.step_metadata,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
-                        per_label_seq_info=pstate.per_label_seq_info,
+                        resource_publish_info=pstate.resource_publish_info,
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,

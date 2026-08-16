@@ -9,7 +9,6 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.kv_store import TransferEngineInfo
 from mstar.engine.resources.base import PublishedInfo, Resource, build_resource
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -24,6 +23,7 @@ from mstar.engine.v1.cuda_graph_runner import (
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
 )
+from mstar.engine.v1.kv_transfer import TransferEngineInfo
 from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -75,14 +75,38 @@ class ExecutingBatch:
     # and driven from here on
     step: SubmoduleStep | None = None
 
+    # {request_id: {input_name: [tensor]}}, what prepare_inputs reads
+    per_request_input_tensors: Mapping[str, NameToTensorList] = field(
+        default_factory=dict
+    )
+
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
+    # rids the submodule declined this step — e.g. a speculatively scheduled
+    # flow step for a request already past its own max iters
+    skipped_rids: set[str] = field(default_factory=set)
+    # rid -> error, for per-rid stages that raised. The rid leaves the batch;
+    # the rest of it runs.
+    failed_requests: dict[str, str] = field(default_factory=dict)
 
     allocation_failed: AllocationFailed | None = None
     admit_error: AdmitFailedReason | None = None
 
     def register_prepare_batch(self, inputs: list[NodeInputs]):
         self.inputs = inputs
+
+    def register_failure(self, rid: str, error: Exception):
+        self.failed_requests[rid] = f"{type(error).__name__}: {error}"
+
+    def drop_rids(self, rids: set[str]):
+        """Take rids out of the step, leaving the rest of the batch intact."""
+        if not rids:
+            return
+        self.request_ids = [rid for rid in self.request_ids if rid not in rids]
+        self.per_request_info = {
+            rid: info for rid, info in self.per_request_info.items()
+            if rid not in rids
+        }
 
     def register_admit_error(self, reason: AdmitFailedReason):
         self.admit_error = reason
@@ -250,9 +274,40 @@ class Engine:
                 runners[label] = runner
         return runners
 
+    def prepare_inputs(self, batch: ExecutingBatch) -> None:
+        """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
+
+        Per-rid, so a raise is attributable to one request: record it and take
+        that rid out rather than losing the batch. A rid the submodule declines
+        (returns None) leaves the same way, without being an error.
+        """
+        submodule = self._submodules[batch.node_name].submodule
+        node_inputs: list[NodeInputs] = []
+        for rid in batch.request_ids:
+            try:
+                req_inputs = submodule.prepare_inputs(
+                    graph_walk=batch.step_context.graph_walk,
+                    fwd_info=batch.per_request_info[rid],
+                    inputs=batch.per_request_input_tensors.get(rid, {}),
+                    resources=self._submodules[batch.node_name].resources,
+                )
+            except Exception as error:
+                logger.exception(
+                    "prepare_inputs failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.step_context.graph_walk,
+                )
+                batch.register_failure(rid, error)
+                continue
+            if req_inputs is None:
+                batch.skipped_rids.add(rid)
+            else:
+                node_inputs.append(req_inputs)
+
+        batch.register_prepare_batch(node_inputs)
+        batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
+
     def exec(
-        self,
-        batch: ExecutingBatch
+        self, batch: ExecutingBatch
     ) -> dict[str, NameToTensorList]:
         """Run one step: declare → admit → plan → forward → commit.
 
@@ -303,7 +358,11 @@ class Engine:
                 per_request_info=req_info,
                 resources=submodule_mgmt.resources,
                 piecewise_runners=submodule_mgmt.piecewise_runners,
-                # TODO: per-request state
+                # padding rows get their own states, like their cache streams:
+                # the submodule indexes this by step id, not by real rid
+                per_request_states={
+                    rid: submodule.request_state(rid) for rid in rids
+                },
             )
             preprocessed = submodule.preprocess(
                 batch.step_context.graph_walk,
@@ -341,6 +400,83 @@ class Engine:
             batch.preplan_event = None
             if lease is not None:
                 cg_runner.release(lease, real_bs)
+
+    def postprocess_batch(
+        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+    ) -> None:
+        """Per-rid ``submodule.postprocess``, e.g. the non-capturable tail of a
+        walk whose graph covered only the forward.
+
+        Per-rid like ``prepare_inputs``: a raise fails that request and leaves
+        the rest of the batch to route normally.
+        """
+        submodule = self._submodules[batch.node_name].submodule
+        for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
+            try:
+                submodule.postprocess(
+                    request_id=rid,
+                    request_info=batch.per_request_info[rid],
+                    outputs=outputs.get(rid, {}),
+                    inputs=node_inputs,
+                )
+            except Exception as error:
+                logger.exception(
+                    "postprocess failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.step_context.graph_walk,
+                )
+                batch.register_failure(rid, error)
+
+    def exec_and_postprocess(
+        self, batch: ExecutingBatch
+    ) -> dict[str, NameToTensorList]:
+        """The forward and its per-rid tail, which belong to the same step: a
+        walk that captured only its forward finishes in ``postprocess``.
+
+        ``prepare_inputs`` and the stop check stay outside — the worker has to
+        place those itself.
+        """
+        outputs = self.exec(batch)
+        self.postprocess_batch(batch, outputs)
+        return outputs
+
+    def check_stop_for_batch(
+        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+    ) -> dict[str, set[str]]:
+        """Each rid's ``submodule.check_stop``, as rid -> loops that should stop.
+
+        Reads tensor values, so it belongs on the caller's slow-postprocess
+        path rather than in ``exec``, where the ``.item()`` / ``.cpu()`` would
+        block the GPU thread. Per-rid like the other stages: a raise fails that
+        request onto the batch, because letting it escape would abandon the
+        check for the rest of the batch and leave their loops running past
+        their stop condition.
+        """
+        submodule = self._submodules[batch.node_name].submodule
+        stops: dict[str, set[str]] = {}
+        for rid in batch.request_ids:
+            rid_outputs = outputs.get(rid)
+            if not rid_outputs:
+                continue
+            try:
+                rid_stops = submodule.check_stop(
+                    rid, batch.per_request_info[rid], rid_outputs
+                )
+            except Exception as error:
+                logger.exception(
+                    "check_stop failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.step_context.graph_walk,
+                )
+                batch.register_failure(rid, error)
+                continue
+            if rid_stops:
+                stops[rid] = rid_stops
+        return stops
+
+    def publish(
+        self, batch: ExecutingBatch
+    ) -> dict[str, dict[str, PublishedInfo]]:
+        # Returns rid -> {resource label -> published info}
+        return self._runner.publish(batch.request_ids)
 
     def _collect_outputs(
         self,
@@ -408,7 +544,11 @@ class Engine:
         sample_logits: bool,
     ) -> None:
         """Fold the forward's per-rid entries into ``outputs``, sampling the
-        logits the ``__batched_logits__`` fast path did not already cover."""
+        logits the ``__batched_logits__`` fast path did not already cover.
+
+        NOTE: the automatic sampling path is DEPRECATED; models should use
+        the injected sampler resource in forward pass.
+        """
         all_logits = []
         for rid, out_id in zip(request_ids, out_ids, strict=False):
             rid_out = raw_outputs.get(out_id)
@@ -458,7 +598,6 @@ class Engine:
         for rid, rid_out in unpacked.items():
             outputs.setdefault(rid, {}).update(rid_out)
 
-    # TODO: all running stuff / check stop
 
     def check_ready(
         self, node_name: str, request_id: str,

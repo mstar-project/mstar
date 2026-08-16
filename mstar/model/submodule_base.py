@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -34,9 +34,31 @@ class NodeInputs:
     # if CFG is required for diffusion/flow submodules
     resource_step_info: Any | None = None
 
+    # Tokens this row contributes to the batch. The engine sums it to pick a
+    # capture bucket and to size padding, and a step declares its spans from
+    # it. 0 for a submodule whose inputs aren't sequence-shaped.
+    input_seq_len: int = 0
 
-def _clone_or_none(tensor):
-    return tensor.clone() if tensor is not None else None
+    def clone(self):
+        """Copy with tensors cloned, so a capture template can be reused.
+
+        Goes through the fields rather than naming them, so a subclass gets
+        its own type back without restating this.
+        """
+        return replace(
+            self,
+            **{f.name: _clone_value(getattr(self, f.name)) for f in fields(self)},
+        )
+
+
+def _clone_value(value):
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, dict):
+        return {key: _clone_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_clone_value(item) for item in value)
+    return value
 
 
 class StackingMethod(Enum):
@@ -56,7 +78,6 @@ class ARNodeInputs(NodeInputs):
     inputs as needed; but the main LLM inputs should be provided in the given
     dedicated fields.
     """
-    input_seq_len: int = 0
     input_ids: torch.Tensor | None = None
     input_embeds: torch.Tensor | None = None
 
@@ -118,24 +139,6 @@ class ARNodeInputs(NodeInputs):
                     out[k] = maybe_stack(v, stacking_method)
 
         return dict(out)
-
-    def clone(self):
-        custom_pos_ids = self.custom_pos_ids
-        if isinstance(custom_pos_ids, torch.Tensor):
-            custom_pos_ids = _clone_or_none(custom_pos_ids)
-        elif isinstance(custom_pos_ids, dict):
-            custom_pos_ids = {
-                label: _clone_or_none(tensor) for label, tensor in custom_pos_ids.items()
-            }
-
-        return ARNodeInputs(
-            input_seq_len=self.input_seq_len,
-            input_ids=_clone_or_none(self.input_ids),
-            input_embeds=_clone_or_none(self.input_embeds),
-            custom_pos_ids=custom_pos_ids,
-            tensor_inputs={k: _clone_or_none(t) for k, t in self.tensor_inputs.items()},
-            kwargs=self.kwargs.copy()
-        )
 
 
 @dataclass

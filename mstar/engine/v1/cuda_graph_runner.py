@@ -12,16 +12,34 @@ from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.engine.v1.cuda_graph_config import (
     CudaGraphConfig,
+    PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
     PiecewiseCudaGraphConfig,
 )
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+
+
+def dummy_metadata(
+    rids: list[str], graph_walk: str,
+) -> dict[str, CurrentForwardPassInfo]:
+    """Stand-in request info for padding rows, which have no real request."""
+    return {
+        rid: CurrentForwardPassInfo(
+            request_id=rid,
+            graph_walk=graph_walk,
+            requires_cfg=False,
+            fwd_index=0,
+            random_seed=0,
+            max_tokens=1,
+            sampling_config={},
+        ) for rid in rids
+    }
 
 
 class DummyRowPool:
@@ -370,24 +388,9 @@ class CudaGraphRunner:
     ) -> ModelInputsFromEngine:
         return ModelInputsFromEngine(
             request_ids=list(dummy_rids),
-            per_request_info=self._dummy_metadata(dummy_rids, graph_walk),
+            per_request_info=dummy_metadata(dummy_rids, graph_walk),
             resources=dict(self._resources),
         )
-
-    def _dummy_metadata(
-        self, dummy_rids: list[str], graph_walk: str,
-    ) -> dict[str, CurrentForwardPassInfo]:
-        return {
-            rid: CurrentForwardPassInfo(
-                request_id=rid,
-                graph_walk=graph_walk,
-                requires_cfg=False,
-                fwd_index=0,
-                random_seed=0,
-                max_tokens=1,
-                sampling_config={},
-            ) for rid in dummy_rids
-        }
 
     @staticmethod
     def _seq_dim(value: torch.Tensor, seq_len: int) -> int:
@@ -515,7 +518,7 @@ class CudaGraphRunner:
         return self._buckets[lease.bucket].config
 
     def pad_inputs(
-        self, lease: SlotLease, inputs: list[ARNodeInputs],
+        self, lease: SlotLease, inputs: list[NodeInputs],
     ) -> list[NodeInputs]:
         """Real inputs plus the rows that bring the batch to capture shape.
         """
@@ -782,6 +785,7 @@ class PiecewiseCudaGraphRunner:
         step = self._declare(
             dummy_rids, shape.seq_lens, self._bucket(shape), capture=True,
         )
+        call = self._call_inputs(static_inputs, dummy_rids)
 
         fn = self._config.capture_fn
         if self._config.compile:
@@ -790,7 +794,7 @@ class PiecewiseCudaGraphRunner:
             )
 
         def run_fn():
-            return fn(static_inputs=static_inputs, **self._config.forward_kwargs)
+            return fn(call)
 
         try:
             self._plan(step, shape)
@@ -821,6 +825,27 @@ class PiecewiseCudaGraphRunner:
             dummy_rids=list(dummy_rids),
             shape=shape,
             bucket=self._bucket(shape),
+        )
+
+    def _call_inputs(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        step_ids: list[str],
+    ) -> PiecewiseCallInputs:
+        """What the region is handed, over the padded capture batch.
+
+        Built once, for the capture: the region's Python runs only there, so
+        the rows are the runner's padding ids and the only thing a replay
+        changes is the contents of the static buffers.
+        """
+        return PiecewiseCallInputs(
+            static_inputs=static_inputs,
+            engine_inputs=ModelInputsFromEngine(
+                request_ids=list(step_ids),
+                per_request_info=dummy_metadata(step_ids, PIECEWISE_WALK),
+                resources=dict(self._resources),
+            ),
+            kwargs=self._config.forward_kwargs,
         )
 
     def _declare(
@@ -916,6 +941,12 @@ class PiecewiseCudaGraphRunner:
         Copies each real input into the runner-owned buffer of the same name,
         declares and plans the region's step over the padded batch, replays,
         then commits and returns the padded buffers behind a real-length view.
+        Under ``reuses_outer_plan`` the middle three are the outer step's job
+        and this only stages and replays.
+
+        Only the static buffers carry data into a replay: the region's Python
+        ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
+        is baked into the graph.
         """
         if real_bs is None:
             if request_ids is not None:
@@ -947,6 +978,13 @@ class PiecewiseCudaGraphRunner:
                 # the padded tail is real compute for a BATCHED capture, so it
                 # reads whatever is here; zero rather than last step's values
                 buffer[n:].zero_()
+
+        if self._config.reuses_outer_plan:
+            # the outer step's plan is live and covers this region
+            data.graph.replay()
+            return PiecewiseOutput(
+                data.static_outputs, real_total_tokens if is_packed else real_bs
+            )
 
         step = None
         if request_ids is not None:

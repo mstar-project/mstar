@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
-from typing import Any
 
+from mstar.engine.resources.base import PublishedInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.utils.sampling import MultiSamplingConfig
 
@@ -19,42 +19,42 @@ class CurrentForwardConductorMetadata:
     kwargs: dict = field(default_factory=dict)
 
 
-@dataclass
-class SequenceInfo:
-    seq_len: int
-    pos_id: int
+# @dataclass
+# class SequenceInfo:
+#     seq_len: int
+#     pos_id: int
 
-    # for tracking KV cache
-    latest_kv_transfer_info: Any
-    page_indices: list[int] = field(default_factory=list)
+#     # for tracking KV cache
+#     latest_kv_transfer_info: Any
+#     page_indices: list[int] = field(default_factory=list)
 
 
-@dataclass
-class PerLabelSeqInfo:
-    # {(kv_cache_string,  rank) -> {label: SequenceInfo}}
-    info: dict[tuple[str, int], dict[str, SequenceInfo]] = field(default_factory=dict)
+# @dataclass
+# class PerLabelSeqInfo:
+#     # {(kv_cache_string,  rank) -> {label: SequenceInfo}}
+#     info: dict[tuple[str, int], dict[str, SequenceInfo]] = field(default_factory=dict)
 
-    # kv cache str -> TP world size
-    world_size: dict[str, int] = field(default_factory=dict)
+#     # kv cache str -> TP world size
+#     world_size: dict[str, int] = field(default_factory=dict)
 
-    def update(self, other: "PerLabelSeqInfo"):
-        for key, val in other.info.items():
-            if key not in self.info:
-                self.info[key] = val
-                continue
-            self.info[key] = {
-                **self.info[key],
-                **val
-            }
+#     def update(self, other: "PerLabelSeqInfo"):
+#         for key, val in other.info.items():
+#             if key not in self.info:
+#                 self.info[key] = val
+#                 continue
+#             self.info[key] = {
+#                 **self.info[key],
+#                 **val
+#             }
 
-    def get(self, kv_cache_str: str, rank: int) -> dict:
-        return self.info.get((kv_cache_str, rank), {})
+#     def get(self, kv_cache_str: str, rank: int) -> dict:
+#         return self.info.get((kv_cache_str, rank), {})
 
-    def add(self, kv_cache_str: str, rank: int, world_size: int, cache_info: dict[str, SequenceInfo]):
-        self.update(PerLabelSeqInfo(
-            info={(kv_cache_str, rank): cache_info}
-        ))
-        self.world_size[kv_cache_str] = world_size
+#     def add(self, kv_cache_str: str, rank: int, world_size: int, cache_info: dict[str, SequenceInfo]):
+#         self.update(PerLabelSeqInfo(
+#             info={(kv_cache_str, rank): cache_info}
+#         ))
+#         self.world_size[kv_cache_str] = world_size
 
 
 @dataclass
@@ -73,7 +73,12 @@ class CurrentForwardPassInfo:
     # node name to sampling config
     sampling_config: dict[str, MultiSamplingConfig | None]
     step_metadata: dict = field(default_factory=dict)
-    per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
+
+    # resource label -> PublishedInfo
+    resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
+
+    # per_label_seq_info DEPRECATED
+    # per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")
 
     # Per-loop stop indices; stop decisions come from each submodule's check_stop.
@@ -83,6 +88,26 @@ class CurrentForwardPassInfo:
     def clear_loop_stop_info(self):
         self.loop_stop_times.clear()
         self.dynamic_loop_iter_counts.clear()
+
+    def update_publish_info(self, other: dict[str, PublishedInfo]):
+        merge_publish_info(self.resource_publish_info, other)
+
+
+def merge_publish_info(
+    into: dict[str, PublishedInfo], other: dict[str, PublishedInfo],
+) -> None:
+    """Fold one resource's published state into what is already held.
+
+    Merging is the resource's own business (a KV cache folds in another rank's
+    shard rather than replacing it), so an existing entry gets ``update`` and
+    only a new key is taken wholesale.
+    """
+    for key, val in other.items():
+        if key not in into:
+            into[key] = val
+        else:
+            into[key].update(val)
+
 
 # ---------------------------------------------------------------------------
 # Partition types for async graph partitions
@@ -126,4 +151,6 @@ class PartitionState:
     wg_rank_completions: dict[str, int] = field(default_factory=dict)
     num_output_tokens: int = 0
     curr_forward_outputs: list[str] = field(default_factory=list)
-    per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
+    # resource label -> PublishedInfo, accumulated from the rank-0 worker's
+    # reports and handed back out on the next forward
+    resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)

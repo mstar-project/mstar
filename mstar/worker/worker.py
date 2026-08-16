@@ -1073,7 +1073,7 @@ class Worker:
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
                     new_token_counts=self.worker_graphs_manager.flush_new_token_counts(request_id),
                     output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
-                    per_label_seq_info=self.worker_graphs_manager.get_seq_info(request_id, partition_name),
+                    resource_publish_info=self.worker_graphs_manager.get_publish_info(request_id, partition_name),
                     partition_name=partition_name,
                     partition_done=p_done,
                     stream_tokens_consumed=stream_consumed,
