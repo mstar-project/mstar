@@ -2,6 +2,7 @@ from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import Model
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+from mstar.model.ming_flash_omni.ming_flash_omni_model import MingFlashOmniModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
@@ -16,6 +17,7 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
     "cosmos3_droid": Cosmos3Model,
     "cosmos3_super": Cosmos3Model,
     "higgs_audio": HiggsAudioModel,
+    "ming_flash_omni": MingFlashOmniModel,
     "orpheus": OrpheusModel,
     "pi05": Pi05Model,
     "qwen3_omni": Qwen3OmniModel,
@@ -42,6 +44,10 @@ HF_MODELS: dict[str, dict] = {
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # Ming-flash-omni-2.0 — Ling-2.0 sparse MoE thinker (100B total / 6B
+    # active) + vision/audio encoders + CFM talker; ~238 GB across 42
+    # safetensors shards.
+    "ming_flash_omni": {"model_path_hf": "inclusionAI/Ming-flash-omni-2.0"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
