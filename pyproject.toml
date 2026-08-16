@@ -145,6 +145,27 @@ wan22 = [
     "av",
 ]
 
+ming_flash_omni = [
+    # Ming-flash-omni-2.0 (native M* port). transformers supplies the
+    # BailingMM2 processor/tokenizer (trust_remote_code), the ByT5 encoder +
+    # T5 blocks of the ImageGen condition path and the Qwen2 talker LLM;
+    # diffusers supplies the Z-Image VAE and the flow-matching scheduler.
+    # accelerate is required by the HF loaders on those paths.
+    "accelerate",
+    "diffusers>=0.39",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "Pillow",          # PNG encode for the ImageGen output
+    "safetensors",
+    "transformers",
+    # Media ingestion for the omni inputs: images/video frames and audio
+    # clips handed to the vision / audio encoders.
+    "torchvision",
+    "torchcodec",
+    "soundfile",
+]
+
 vjepa2_ac = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",

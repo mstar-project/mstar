@@ -1,0 +1,30 @@
+# Ming-flash-omni-2.0 — full omni deploy PLUS image generation.
+#
+# Identical to configs/ming_flash_omni.yaml except that the ImageGen node
+# (ByT5 + T5 condition stack -> Z-Image DiT -> VAE decode) is declared, so
+# image-output requests are served instead of being skipped at worker-graph
+# division. The node only exists when the snapshot ships an imagegen
+# sub-config; on a checkpoint without one the model registers no ImageGen
+# node and this config degrades to the plain omni deploy.
+#
+# ImageGen is a stateless consumer partition: it self-triggers on the
+# thinker's hidden states at the image-query positions (see
+# MingFlashOmniModel.get_partition_topology) and runs its whole denoise loop
+# plus the VAE decode inside ImageGenSubmodule.forward.
+#
+# It colocates with the other stateless stacks on rank 0, which also holds
+# one ~40 GB Thinker shard. The DiT + ByT5 + VAE add a few GB on top of the
+# ~1.5 GB encoders/talker, so rank 0 stays the memory-tightest rank of the
+# deploy — move ImageGen to its own rank if rank 0 runs out.
+
+model: "ming_flash_omni"
+max_seq_len: 32768
+node_groups:
+  # Stateless encoders + the talker + the image-gen stack colocate on rank 0.
+  - node_names: [vision_encoder, audio_encoder, Talker, ImageGen]
+    ranks: [0]
+
+  # Thinker sharded across all 8 GPUs.
+  - node_names: [Thinker]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
