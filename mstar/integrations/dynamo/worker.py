@@ -3,9 +3,11 @@
 Launch plumbing mirrors the standalone entrypoint (lightweight model →
 APIServer → conductor process → SETUP_DONE gate); instead of binding
 uvicorn, the server registers with the Dynamo runtime and serves the
-bridge handler. The registered ModelType is derived from the model's
-OpenAI adapter capabilities (chat and/or images today; other surfaces
-need their wire formats mapped first).
+bridge handlers. Registration derives from the model's OpenAI adapter
+capabilities: chat, speech, and images share one endpoint (their bodies
+are distinguishable), video generation gets its own (a minimal video
+body looks like an image body). The realtime surface still needs its
+wire format mapped.
 """
 
 from __future__ import annotations
@@ -80,6 +82,8 @@ def _model_type(adapter):
     model_type = None
     if adapter.supports_chat:
         model_type = ModelType.Chat
+    if adapter.supports_speech:
+        model_type = ModelType.Audios if model_type is None else model_type | ModelType.Audios
     if adapter.supports_images:
         model_type = ModelType.Images if model_type is None else model_type | ModelType.Images
     return model_type
@@ -88,12 +92,13 @@ def _model_type(adapter):
 def serve(server: APIServer, model_name: str, args) -> None:
     """Register with the Dynamo runtime and serve until shutdown."""
     import uvloop
-    from dynamo.llm import ModelInput, WorkerType, register_model
+    from dynamo.llm import ModelInput, ModelType, WorkerType, register_model
     from dynamo.runtime import DistributedRuntime, dynamo_worker
 
     adapter = get_adapter(model_name)
     model_type = _model_type(adapter) if adapter is not None else None
-    if model_type is None:
+    supports_videos = adapter is not None and getattr(adapter, "supports_videos", False)
+    if model_type is None and not supports_videos:
         raise SystemExit(
             f"model {model_name!r} has no OpenAI adapter surface to register; "
             "models without one are served via the native /generate only"
@@ -104,21 +109,44 @@ def serve(server: APIServer, model_name: str, args) -> None:
 
     @dynamo_worker()
     async def _run(runtime: DistributedRuntime):
-        endpoint = runtime.endpoint(f"{args.namespace}.{args.component}.{args.endpoint}")
-        await register_model(
-            ModelInput.Text,
-            model_type,
-            endpoint,
-            args.model_path,
-            served,
-            worker_type=WorkerType.Aggregated,
-            needs=[],
-        )
+        surfaces = []
+        if model_type is not None:
+            endpoint = runtime.endpoint(f"{args.namespace}.{args.component}.{args.endpoint}")
+            await register_model(
+                ModelInput.Text,
+                model_type,
+                endpoint,
+                args.model_path,
+                served,
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+            )
+            surfaces.append((f"{args.endpoint}={model_type}",
+                             endpoint.serve_endpoint(bridge.generate, graceful_shutdown=True)))
+        if supports_videos:
+            # Registered under the same served name: the frontend keeps one
+            # worker set per (model, type), so the videos surface routes here
+            # while chat/images keep the endpoint above.
+            video_ep = runtime.endpoint(
+                f"{args.namespace}.{args.component}.{args.endpoint}_videos"
+            )
+            await register_model(
+                ModelInput.Text,
+                ModelType.Videos,
+                video_ep,
+                args.model_path,
+                served,
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+            )
+            surfaces.append((f"{args.endpoint}_videos={ModelType.Videos}",
+                             video_ep.serve_endpoint(bridge.videos, graceful_shutdown=True)))
         logger.info(
-            "MSTAR_DYNAMO_READY model=%s type=%s endpoint=%s.%s.%s",
-            served, model_type, args.namespace, args.component, args.endpoint,
+            "MSTAR_DYNAMO_READY model=%s component=%s.%s surfaces=%s",
+            served, args.namespace, args.component,
+            ", ".join(name for name, _ in surfaces),
         )
-        await endpoint.serve_endpoint(bridge.generate, graceful_shutdown=True)
+        await asyncio.gather(*(serve_coro for _, serve_coro in surfaces))
 
     uvloop.install()
     asyncio.run(_run())

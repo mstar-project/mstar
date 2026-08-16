@@ -9,7 +9,12 @@ the same per-model adapters the native ``/v1`` routes use, submitted via
 - chat: OpenAI ``chat.completion.chunk`` dicts, one per text delta
   (the envelope the frontend expects from Text/Chat backends);
 - images: a single ``{"created": ..., "data": [{"b64_json": ...}]}``
-  response after all image chunks arrive.
+  response after all image chunks arrive;
+- speech: a single ``NvAudioSpeechResponse``-shaped dict; the frontend
+  unwraps ``b64_json`` into a raw audio-bytes response;
+- videos: a single ``NvVideosResponse``-shaped dict carrying the mp4 as
+  ``b64_json``, served on its own endpoint (a minimal video body is not
+  distinguishable from an image body, so they can't share one).
 """
 
 from __future__ import annotations
@@ -21,7 +26,12 @@ import uuid
 
 from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
-from mstar.api_server.openai.protocol import ChatCompletionRequest, ImageGenerationRequest
+from mstar.api_server.openai.protocol import (
+    ChatCompletionRequest,
+    ImageGenerationRequest,
+    SpeechRequest,
+    VideoGenerationRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +54,66 @@ _STRIP_KEYS = {
 # flattened onto the adapter request so they pass through as model_kwargs.
 _IMAGE_NVEXT_KEYS = ("negative_prompt", "num_inference_steps", "guidance_scale", "seed")
 
+# Video-request fields that ride nvext (mirrors Dynamo's NvCreateVideoRequest).
+# fps / num_frames are first-class fields on the M* video request; the rest
+# pass through as model_kwargs.
+_VIDEO_NVEXT_KEYS = (
+    "negative_prompt", "num_inference_steps", "guidance_scale", "seed",
+    "fps", "num_frames",
+)
+
 
 def _clean(request: dict) -> dict:
     return {k: v for k, v in request.items() if k not in _STRIP_KEYS}
+
+
+def _image_body(request: dict) -> dict:
+    """NvCreateImageRequest -> body for the native image request model."""
+    if request.get("response_format") == "url":
+        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    body = _clean(request)
+    for key in _IMAGE_NVEXT_KEYS:
+        value = (request.get("nvext") or {}).get(key)
+        if value is not None:
+            body.setdefault(key, value)
+    return body
+
+
+def _video_body(request: dict) -> dict:
+    """NvCreateVideoRequest -> body for the native video request model."""
+    if request.get("response_format") == "url":
+        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    if request.get("output_format") not in (None, "mp4"):
+        raise ValueError(f"unsupported output_format {request['output_format']!r}; only 'mp4'")
+    body = _clean(request)
+    for key in _VIDEO_NVEXT_KEYS:
+        value = (request.get("nvext") or {}).get(key)
+        if value is not None:
+            body.setdefault(key, value)
+    # An explicit num_frames wins; otherwise derive it from fps * seconds
+    # when both are present. With neither, the model's defaults apply.
+    seconds = body.pop("seconds", None)
+    if body.get("num_frames") is None and seconds and body.get("fps"):
+        body["num_frames"] = int(round(body["fps"] * seconds))
+    body.pop("output_format", None)
+    body.pop("stream", None)
+    reference = body.pop("input_reference", None)
+    if reference:
+        body["image"] = reference  # image-to-video conditioning
+    return body
+
+
+def _speech_body(request: dict) -> dict:
+    """NvCreateAudioSpeechRequest -> body for the native speech request model."""
+    if request.get("data_source") == "url":
+        raise ValueError("data_source 'url' needs a media store; use 'b64_json'")
+    # For speech, response_format is the audio codec (wav/mp3/...), not the
+    # chat-style field _clean strips — reattach it after cleaning.
+    fmt = (request.get("response_format") or "wav").lower()
+    body = _clean(request)
+    body.pop("data_source", None)
+    body["response_format"] = fmt
+    return body
 
 
 class RequestBridge:
@@ -58,15 +125,20 @@ class RequestBridge:
         self.served_model_name = served_model_name
 
     async def generate(self, request: dict, context=None):
-        """Endpoint handler. Chat and image requests share the endpoint;
-        chat bodies carry ``messages``, image bodies carry ``prompt``."""
+        """Endpoint handler. Chat, speech, and image requests share the
+        endpoint; their bodies are distinguishable — chat carries
+        ``messages``, speech carries ``input``, images carry ``prompt``."""
         if "messages" in request:
             async for out in self._chat(request, context):
                 yield out
+        elif "input" in request:
+            yield await self._speech(request, context)
         elif "prompt" in request:
             yield await self._images(request, context)
         else:
-            raise ValueError("request has neither 'messages' (chat) nor 'prompt' (images)")
+            raise ValueError(
+                "request has none of 'messages' (chat), 'input' (speech), 'prompt' (images)"
+            )
 
     # ------------------------------------------------------------------
     # chat
@@ -113,14 +185,7 @@ class RequestBridge:
     # ------------------------------------------------------------------
 
     async def _images(self, request: dict, context) -> dict:
-        if request.get("response_format") == "url":
-            raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
-
-        body = _clean(request)
-        for key in _IMAGE_NVEXT_KEYS:
-            value = (request.get("nvext") or {}).get(key)
-            if value is not None:
-                body.setdefault(key, value)
+        body = _image_body(request)
         req = ImageGenerationRequest.model_validate(body)
 
         reference = body.get("input_reference")
@@ -151,6 +216,117 @@ class RequestBridge:
         return {
             "created": int(time.time()),
             "data": [{"b64_json": base64.b64encode(img).decode("ascii")} for img in images],
+        }
+
+    # ------------------------------------------------------------------
+    # speech
+    # ------------------------------------------------------------------
+
+    async def _speech(self, request: dict, context) -> dict:
+        """``/v1/audio/speech`` bodies (``NvCreateAudioSpeechRequest`` in, one
+        ``NvAudioSpeechResponse`` out; the frontend unwraps ``b64_json`` into
+        a raw audio-bytes response with the codec's content type)."""
+        started = time.monotonic()
+        body = _speech_body(request)
+        fmt = body["response_format"]
+        req = SpeechRequest.model_validate(body)
+        args = self.adapter.speech_to_request(req, self.server.upload_dir)
+
+        rid = self._submit(args, prefix="speech")
+        pcm = bytearray()
+        try:
+            async for chunk in self.server.iter_result_chunks(rid):
+                if context is not None and context.is_stopped():
+                    break
+                if chunk.modality == "audio":
+                    pcm.extend(chunk.data)
+                elif chunk.modality == "error":
+                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+        finally:
+            self.server.abort_request(rid)
+
+        if not pcm:
+            raise RuntimeError("no audio produced")
+        from mstar.api_server import media_io
+        model = self.server.model
+        sample_rate = model.get_output_sample_rate("audio") if model is not None else 24000
+        audio_bytes, _ = media_io.pcm16_to_container(bytes(pcm), sample_rate, fmt)
+        return {
+            "id": rid,
+            "object": "audio.speech",
+            "model": self.served_model_name,
+            "status": "completed",
+            "progress": 100,
+            "created": int(time.time()),
+            "data": [{
+                "output_format": fmt,
+                "b64_json": base64.b64encode(audio_bytes).decode("ascii"),
+            }],
+            "inference_time_s": round(time.monotonic() - started, 3),
+        }
+
+    # ------------------------------------------------------------------
+    # videos
+    # ------------------------------------------------------------------
+
+    async def videos(self, request: dict, context=None):
+        """Dedicated endpoint handler for ``/v1/videos`` bodies
+        (``NvCreateVideoRequest`` in, one ``NvVideosResponse`` out)."""
+        started = time.monotonic()
+        body = _video_body(request)
+        req = VideoGenerationRequest.model_validate(body)
+        args = self.adapter.video_to_request(req, self.server.upload_dir)
+
+        rid = self._submit(args, prefix="vid")
+        videos: list[bytes] = []
+        audios = []
+        try:
+            async for chunk in self.server.iter_result_chunks(rid):
+                if context is not None and context.is_stopped():
+                    break
+                if chunk.modality == "video":
+                    videos.append(chunk.data)
+                elif chunk.modality == "audio":
+                    audios.append(chunk)
+                elif chunk.modality == "error":
+                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+        finally:
+            self.server.abort_request(rid)
+
+        if not videos:
+            raise RuntimeError("no video produced")
+        # Mirror the native videos route: a sound request also emits a raw PCM
+        # chunk per video, muxed into the mp4 as an AAC track and rescaled to
+        # the request frame rate; a failed mux degrades to the plain video.
+        request_fps = args.model_kwargs.get("fps")
+        data = []
+        for i, video in enumerate(videos):
+            if i < len(audios):
+                from mstar.api_server import media_io
+                audio = audios[i]
+                try:
+                    video = media_io.mux_mp4_with_pcm16(
+                        video,
+                        audio.data,
+                        sample_rate=int((audio.metadata or {}).get("sample_rate", 48000)),
+                        num_channels=int((audio.metadata or {}).get("num_channels", 2)),
+                        video_fps=float(request_fps) if request_fps else None,
+                    )
+                except Exception:  # noqa: BLE001 — degrade to video-only, keep serving
+                    logger.exception("Muxing generated audio into the mp4 failed; returning video only")
+            data.append({
+                "output_format": "mp4",
+                "b64_json": base64.b64encode(video).decode("ascii"),
+            })
+        yield {
+            "id": rid,
+            "object": "video",
+            "model": self.served_model_name,
+            "status": "completed",
+            "progress": 100,
+            "created": int(time.time()),
+            "data": data,
+            "inference_time_s": round(time.monotonic() - started, 3),
         }
 
     # ------------------------------------------------------------------
