@@ -1,6 +1,7 @@
 
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -9,7 +10,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.resources.base import PublishedInfo, Resource, build_resource
+from mstar.engine.resources.base import Resource, build_resource
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import (
@@ -26,6 +27,7 @@ from mstar.engine.v1.cuda_graph_runner import (
 from mstar.engine.v1.kv_transfer import TransferEngineInfo
 from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.profile.worker import ExecTimings
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,9 @@ class ExecutingBatch:
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
         default_factory=dict
     )
+    # rids whose consumed streaming input was the final chunk — this step
+    # reports the partition done
+    final_stream_rids: set[str] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -92,8 +97,39 @@ class ExecutingBatch:
     allocation_failed: AllocationFailed | None = None
     admit_error: AdmitFailedReason | None = None
 
+    # This step's per-rid outputs, published as soon as the forward has been
+    # submitted — the tensors exist then, even though their values land later.
+    outputs: dict[str, NameToTensorList] = field(default_factory=dict)
+
+    # The next step reads N's outputs, and plans against N's committed state.
+    # Two separate dependencies, so two events: whoever prepares N+1 can start
+    # threading N's outputs while N is still committing.
+    outputs_ready: threading.Event = field(default_factory=threading.Event)
+    commit_done: threading.Event = field(default_factory=threading.Event)
+
+    # Recorded on the default stream once this step's GPU work is submitted;
+    # what a reader of the output values has to wait on.
+    completion_event: torch.cuda.Event | None = None
+
+    # Per-step wall-clock, for the worker's profiler
+    exec_timings: ExecTimings = field(default_factory=ExecTimings)
+
+    @property
+    def graph_walk(self) -> str:
+        return self.step_context.graph_walk
+
     def register_prepare_batch(self, inputs: list[NodeInputs]):
         self.inputs = inputs
+
+    def release_waiters(self):
+        """Let anything waiting on this step proceed.
+
+        Called on every exit from ``exec``, so a step that raised before
+        publishing outputs or committing doesn't strand the thread preparing
+        the next one.
+        """
+        self.outputs_ready.set()
+        self.commit_done.set()
 
     def register_failure(self, rid: str, error: Exception):
         self.failed_requests[rid] = f"{type(error).__name__}: {error}"
@@ -391,13 +427,21 @@ class Engine:
                     **preprocessed
                 )}
 
-            if step is not None:
-                self._runner.commit(step)
-            return self._collect_outputs(
+            # Collect before commit: the sampler's commit invalidates the
+            # gathered per-request sampler this step's logits are sampled
+            # with. Publishing here also lets whoever prepares the next step
+            # start threading these tensors while this one commits.
+            batch.outputs = self._collect_outputs(
                 batch, submodule_mgmt, lease, outputs, inputs, req_info,
             )
+            batch.outputs_ready.set()
+
+            if step is not None:
+                self._runner.commit(step)
+            return batch.outputs
         finally:
             batch.preplan_event = None
+            batch.release_waiters()
             if lease is not None:
                 cg_runner.release(lease, real_bs)
 
@@ -606,12 +650,23 @@ class Engine:
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
-        published_info: Mapping[str, PublishedInfo]
     ) -> bool:
+        """Whether this node can run the request now.
+
+        An offloaded request is brought back first; it stays not-ready until
+        that fits, which is the scheduler's cue to run something else (and,
+        on OOM, to evict). Then each resource takes in whatever the request
+        published elsewhere — a KV transfer from a prefill worker, say — and
+        reports whether that has landed.
+        """
+        if self.is_offloaded(node_name, request_id) and not self.reload_request(
+            node_name, request_id
+        ):
+            return False
         out = self._runner.admit_retrieve(
             rid=request_id, node_name=node_name,
             graph_walk=request_info.graph_walk,
-            published=published_info
+            published=request_info.resource_publish_info,
         )
         return out.ok and out.ready
 

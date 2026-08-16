@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 
 from mstar.engine.resources.base import PublishedInfo
+from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.utils.sampling import MultiSamplingConfig
 
 
 @dataclass
@@ -70,8 +70,10 @@ class CurrentForwardPassInfo:
     random_seed: int
     max_tokens: int
 
-    # node name to sampling config
-    sampling_config: dict[str, MultiSamplingConfig | None]
+    # resource label -> the config this request's resources were opened
+    # with. Sampling params, whether it needs CFG, retention: a request's
+    # knobs live here now, one entry per resource that has any.
+    resource_configs: dict[str, ResourceReqConfig] = field(default_factory=dict)
     step_metadata: dict = field(default_factory=dict)
 
     # resource label -> PublishedInfo

@@ -25,8 +25,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -46,7 +45,6 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.profiler import range_pop, range_push
-from mstar.utils.sampling import MultiSamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +82,6 @@ def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
     my_worker_graphs: list[WorkerGraph],
-    kv_config: list[KVCacheConfig],
     model_config: dict,
     all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
     all_worker_graph_ids_to_nodes: dict[str, set[str]],
@@ -131,7 +128,6 @@ def _worker_process_target(
             worker_ids=worker_ids,
             model=model,
             my_worker_graphs=my_worker_graphs,
-            kv_config=kv_config,
             model_config=model_config,
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
@@ -162,7 +158,8 @@ class RequestData:
     all_worker_graph_ids: set[str]
     max_output_tokens: int
     random_seed: int
-    sampling_config: dict[str, MultiSamplingConfig | None]
+    # resource label -> the config this request's resources were opened with
+    resource_configs: dict[str, ResourceReqConfig]
     sharding_config: ShardingConfig | None = None
 
     # Partition state (always populated — single-partition models use a "default" partition)
@@ -326,48 +323,22 @@ class Conductor:
             ipc_socket_path_prefix=socket_path_prefix,
         )
 
-    def _get_kv_config(self):
-        kv_cache_config = self.model.get_kv_cache_config()
-        # Apply any KV cache overrides from the YAML config
-        yaml_kv_overrides = self.model_config.get("kv_cache", {})
-        if yaml_kv_overrides:
-            from dataclasses import fields, replace
-            # cross_attn is a nested {source: CrossAttnKVConfig}; the YAML gives
-            # {source: {field: value}} and we patch each pool's fields (frozen
-            # dataclass -> dataclasses.replace). Everything else is a flat setattr.
-            cross_overrides = yaml_kv_overrides.get("cross_attn", {})
-            for kv_cfg in kv_cache_config:
-                for f in fields(kv_cfg):
-                    if f.name == "cross_attn":
-                        continue
-                    if f.name in yaml_kv_overrides:
-                        setattr(kv_cfg, f.name, yaml_kv_overrides[f.name])
-                if cross_overrides and kv_cfg.cross_attn:
-                    kv_cfg.cross_attn = {
-                        source: (
-                            replace(pool, **cross_overrides[source])
-                            if source in cross_overrides else pool
-                        )
-                        for source, pool in kv_cfg.cross_attn.items()
-                    }
-                logger.info("KV cache config after YAML overrides: %s", kv_cfg)
-        return kv_cache_config
+    def _get_resource_configs(
+        self, model_kwargs: dict
+    ) -> dict[str, ResourceReqConfig]:
+        """The per-resource config each new request is opened with.
 
-    def _get_sampling_configs(self, model_kwargs: dict) -> dict[str, MultiSamplingConfig]:
-        ar_nodes = [
-            node for (node, engine) in self.model.get_node_engine_types().items() \
-                if engine == EngineType.KV_CACHE
-        ]
-        return {
-            node: self.model.resolve_sampling_configs(
-                node, model_kwargs
-            ) for node in ar_nodes
-        }
+        Resolved once, here, and carried on the request: the worker hands each
+        config to its resource at ingest. KV shape is not part of this — that
+        is a deployment-wide property the model declares in its resource specs.
+
+        TODO: apply the YAML ``kv_cache`` overrides, which used to patch the
+        KVCacheConfig here. They belong on the specs the model declares now.
+        """
+        return self.model.get_request_resource_configs(model_kwargs)
 
     def _derive_worker_info(self):
-        """Derive per-rank worker info from worker graphs and model engine types."""
-        node_engine_types = self.model.get_node_engine_types()
-
+        """Derive per-rank worker info from the worker graphs."""
         # Collect unique ranks and per-rank worker graphs
         rank_to_worker_graphs: dict[int, list[WorkerGraph]] = defaultdict(list)
         for worker_graph in self.worker_graphs.values():
@@ -427,7 +398,6 @@ class Conductor:
                     "worker_id": worker_id,
                     "worker_ids": self.worker_ids,
                     "my_worker_graphs": self._per_worker_graphs[worker_id],
-                    "kv_config": self._get_kv_config(),
                     "model_config": self.model_config,
                     "all_worker_graph_ids_to_graph_walks": self._all_worker_graph_ids_to_graph_walks,
                     "all_worker_graph_ids_to_nodes": self._all_worker_graph_ids_to_nodes,
@@ -707,12 +677,12 @@ class Conductor:
             partition_states=partition_states,
             partition_definitions=partition_definitions,
             streaming_connections=streaming_connections,
-            sampling_config=self._get_sampling_configs(model_kwargs),
+            resource_configs=self._get_resource_configs(model_kwargs),
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
         )
-        for cfg in request_data.sampling_config.values():
-            cfg.set_seed(seed)
+        for cfg in request_data.resource_configs.values():
+            cfg.apply_conductor_config(seed=seed)
         self.requests[body.request_id] = request_data
 
         # Collect all worker_graph_ids per worker for the NewRequest
@@ -775,7 +745,7 @@ class Conductor:
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        sampling_config=request_data.sampling_config
+                        resource_configs=request_data.resource_configs
                     ),
                 )
                 self.communicator.send(
@@ -1055,8 +1025,8 @@ class Conductor:
         pstate.wg_rank_completions = {}
         pstate.fwd_pass_number += 1
         pstate.random_seed += 1
-        for cfg in request_data.sampling_config.values():
-            cfg.set_seed(pstate.random_seed)
+        for cfg in request_data.resource_configs.values():
+            cfg.apply_conductor_config(seed=pstate.random_seed)
 
         self._set_partition_worker_graph_ids(
             request_id, partition_name, fwd_args.full_metadata.graph_walk,
@@ -1095,7 +1065,7 @@ class Conductor:
                         requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        sampling_config=request_data.sampling_config,
+                        resource_configs=request_data.resource_configs,
                     ),
                     partition_name=partition_name
                 ),
@@ -1132,7 +1102,7 @@ class Conductor:
                         requires_cfg=False,
                         partition_name=consumer_partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        sampling_config=request_data.sampling_config
+                        resource_configs=request_data.resource_configs
                     ),
                     partition_name=consumer_partition_name,
                     producer_done=set([producer_partition]),
