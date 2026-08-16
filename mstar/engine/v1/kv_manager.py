@@ -103,11 +103,13 @@ class CacheStream:
     read_pending: bool = False
     read_future: Future | None = None
     offloaded: bool = False
+    generation: int = 0
 
     def reset(self, freed: bool=False):
         self.stored_len = 0
         self.position = 0
         self.released = 0
+        self.generation += 1
 
         if freed:
             self.page_indices.clear()
@@ -167,6 +169,7 @@ class SequenceView:
     length: int # already resident + to_compute
     to_compute: int # new for this step
     start: int = 0
+    generation: int = 0
 
     def last_page_len(self, page_size: int) -> int:
         return (self.start + self.length)  % page_size
@@ -260,6 +263,10 @@ class KVReqConfig(ResourceReqConfig):
     @property
     def resource_type(self):
         return ResourceType.KV_CACHE
+
+    def apply_conductor_config(self, **kwargs):
+        # does nothing rn; here because declaredb y abstract
+        del kwargs
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -461,7 +468,8 @@ class KVManager(Resource):
                 request_id=s.request_id,
                 label=s.label, page_idxs=stream.page_indices,
                 length=s.span + stream.stored_len,
-                to_compute=s.span
+                to_compute=s.span,
+                generation=stream.generation,
             ))
         return views
 
@@ -715,6 +723,7 @@ class KVManager(Resource):
             to_stream.page_indices
         )
         to_stream.stored_len = from_stream.stored_len
+        to_stream.generation += 1
 
     def _alloc(
         self, request_id: str, label: str, seq_len: int
@@ -740,6 +749,7 @@ class KVManager(Resource):
                         )
                     )
                 stream.page_indices.extend(new_pages)
+                stream.generation += 1
         return AllocResult()
 
     ### Submodule-level functionality
