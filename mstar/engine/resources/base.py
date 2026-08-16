@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.cuda_graph_config import CudaGraphConfig
+from mstar.engine.v1.cuda_graph_config import CudaGraphConfig
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
@@ -19,6 +19,15 @@ class CGSlotSpec:
     bucket: BucketKey
     slot: int
     config: CudaGraphConfig
+    config_idx: int | None = None
+
+    @property
+    def bs(self):
+        return self.bucket.bs
+
+    @property
+    def num_tokens(self):
+        return self.bucket.num_tokens
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,10 @@ class Resource(ABC):
 
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None
+
+    def reset_request(self, rid: str, free: bool=False):
+        """For clearing dummy RIDs during cuda graph capture"""
+        return
 
     # Pre-planning
 

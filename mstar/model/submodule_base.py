@@ -13,12 +13,13 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.engine.kv_store import PositionInfo
+from mstar.engine.resources.base import Resource
+from mstar.engine.resources.step import SubmoduleStep
 from mstar.utils.sampling import BaseSampler, SeenTokenMask
 
 if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
-    from mstar.engine.resources.declare import StepDeclaration
 
 
 @dataclass
@@ -26,6 +27,10 @@ class NodeInputs:
     tensor_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     # non-tensor kwargs
     kwargs: dict = field(default_factory=dict)
+
+    # Any additional information required for declare_step, e.g., like
+    # if CFG is required for diffusion/flow submodules
+    resource_step_info: Any | None = None
 
 
 def _clone_or_none(tensor):
@@ -189,14 +194,20 @@ class PerRequestState:
 class ModelInputsFromEngine:
     request_ids: list[str]
     per_request_info: dict[str, CurrentForwardPassInfo]
+    resources: dict[str, Resource] = field(default_factory=dict)
+
+    # DEPRECATED
     cache_manager: BatchedCacheManager | None = None
-    preallocated_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
+
+    # DEPRECATED
     sampler: BaseSampler | None = None
+
     # label -> warmed-up PiecewiseCudaGraphRunner for inner-loop capture. Owned
     # by the engine, spread in at execute time (like ``cache_manager`` /
     # ``sampler``). Empty when the submodule opts into no piecewise graphs or
     # capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.
     piecewise_runners: dict[str, "PiecewiseCudaGraphRunner"] = field(default_factory=dict)
+
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
     per_request_states: dict[str, PerRequestState] | None = None
@@ -284,9 +295,8 @@ class NodeSubmodule(torch.nn.Module):
     def declare_step(
         self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
-    ) -> "StepDeclaration | None":
+    ) -> "SubmoduleStep | None":
         """Declare this batch's step for the runner to drive: which cache
         streams it touches, what spans they grow by, which plans back it,
         which streams fork, and what commits when it lands. The runner

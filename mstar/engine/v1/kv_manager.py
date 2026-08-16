@@ -105,6 +105,14 @@ class CacheStream:
     read_future: Future | None = None
     offloaded: bool = False
 
+    def reset(self, freed: bool=False):
+        self.stored_len = 0
+        self.position = 0
+        self.released = 0
+        
+        if freed:
+            self.page_indices.clear()
+
 
 LabelToStream = dict[str, CacheStream]
 
@@ -570,6 +578,17 @@ class KVManager(Resource):
                 ) for label, stream in self._streams[request_id].items()
             }
         )
+    
+    def reset_request(self, rid: str, free: bool=False):
+        if rid in self._streams:
+            for stream in self._streams[rid].values():
+                if stream.read_future is not None:
+                    # the read's result is irrelevant here, but its pages
+                    # must not be reused until it finishes writing
+                    wait([stream.read_future])
+                if free:
+                    self._arena.release(stream.page_indices)
+                stream.reset(freed=free)
 
     def remove_request(self, rid: str):
         if rid in self._streams:
