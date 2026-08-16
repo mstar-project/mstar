@@ -37,7 +37,6 @@ def dummy_metadata(
             fwd_index=0,
             random_seed=0,
             max_tokens=1,
-            sampling_config={},
         ) for rid in rids
     }
 

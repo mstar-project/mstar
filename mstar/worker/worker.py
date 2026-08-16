@@ -1,7 +1,6 @@
 import logging
 import os
 import sys
-import threading
 import time
 import time as _time
 from collections import defaultdict
@@ -19,8 +18,9 @@ from mstar.communication.tensors import NameToTensorList, create_tensor_communic
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine.base import EngineType, NodeBatch, NodeOutput
-from mstar.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
+from mstar.engine.resources.step import StepContext
+from mstar.engine.v1.engine import ExecutingBatch
+from mstar.engine.v1.kv_transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PendingBatch:
     batch: ScheduledBatch
-    node_batch: NodeBatch
+    node_batch: ExecutingBatch
     node_name: str
     partition: str
     graph_walk: str
@@ -70,7 +70,7 @@ class PendingBatch:
 @dataclass
 class Speculation:
     scheduled_batch: ScheduledBatch
-    node_batch: NodeBatch
+    node_batch: ExecutingBatch
     # ``(name, next_node)`` pairs the spec batch consumed from batch_N's
     # outputs. Two cases:
     #   * Same-node loop-back (AR decode iter K → iter K+1): pairs are
@@ -103,8 +103,11 @@ class PendingLoopStop:
 
 class EvictionPolicy(Enum):
     """Strategy for choosing which request to offload to CPU on OOM."""
-    LRU = "lru"              # least-recently-used (by execution time)
-    MOST_PAGES = "most_pages"  # request holding the most GPU pages
+    LRU = "lru"  # least-recently-used (by execution time)
+    # TODO: PRIORITY — ask a named resource how much it wants each candidate
+    # gone (``Engine.offload_priority``), for cases where "least recently used"
+    # is the wrong question. Needs eviction-policy metadata naming which
+    # resource to consult.
 
 
 class Worker:
@@ -120,7 +123,6 @@ class Worker:
         worker_ids: list[str],
         model: Model,
         my_worker_graphs: list[WorkerGraph],
-        kv_config: dict[str, KVCacheConfig],
         model_config: dict,
         all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
         all_worker_graph_ids_to_nodes: dict[str, set[str]],
@@ -194,7 +196,6 @@ class Worker:
         self.engine_manager = EngineManager.build(
             node_names,
             device=device,
-            kv_config=kv_config,
             model_config=model_config,
             parallel_groups=self.parallel_groups,
             transfer_engine_info=TransferEngineInfo(
@@ -261,18 +262,6 @@ class Worker:
         self.scheduler = MicroScheduler(
             self.engine_manager,
             parallel_leader_nodes=self.parallel_leader_nodes
-        )
-
-        # Determine store write policy based on worker graph topology
-        node_engine_types = model.get_node_engine_types() if model is not None else {}
-        write_policy = self._compute_store_write_policy(
-            my_worker_graphs, all_worker_graph_ids_to_graph_walks,
-            all_worker_graph_ids_to_nodes,
-            node_engine_types=node_engine_types,
-        )
-        self.engine_manager.set_alloc_write_policies(write_policy)
-        logger.info(
-            "Worker %s: store write policy = %s", worker_id, write_policy.value
         )
 
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
@@ -360,56 +349,6 @@ class Worker:
                 return list(nodes)
         return []
 
-    def _compute_store_write_policy(
-        self,
-        my_worker_graphs: list[WorkerGraph],
-        all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-        all_worker_graph_ids_to_nodes: dict[str, set[str]],
-        node_engine_types: dict[str, EngineType] | None = None,
-    ) -> StoreWritePolicy:
-        """Determine whether this worker needs to write KV to the mooncake store.
-
-        If this worker handles ALL AR engine graph walks, no other worker
-        needs its KV cache — return NEVER. Otherwise return ALWAYS.
-        """
-        my_ar_walks_nodes: set[str] = set()
-        all_ar_walks_nodes: set[str] = set()
-
-        def _uses_kv_cache(node_name: str) -> bool:
-            # Local engine instance wins via declared capability; remote
-            # nodes fall back to the model's static type map.
-            engine = self.engine_manager.node_to_engine.get(node_name)
-            if engine is not None:
-                return engine.capabilities.requires_kv_cache
-            if node_engine_types and node_name in node_engine_types:
-                return node_engine_types[node_name] == EngineType.KV_CACHE
-            return False
-
-        # Collect this worker's AR graph walks
-        for wg in my_worker_graphs:
-            for node_name in wg.section.get_nodes():
-                if _uses_kv_cache(node_name):
-                    my_ar_walks_nodes.update([(walk, node_name) for walk in wg.graph_walks])
-
-        # Collect all workers' AR graph walks
-        for wg_id, walks in all_worker_graph_ids_to_graph_walks.items():
-            nodes = all_worker_graph_ids_to_nodes.get(wg_id, set())
-            for node_name in nodes:
-                if _uses_kv_cache(node_name):
-                    all_ar_walks_nodes.update([(walk, node_name) for walk in walks])
-
-        if not all_ar_walks_nodes:
-            return StoreWritePolicy.NEVER  # no AR engines at all
-
-        if my_ar_walks_nodes == all_ar_walks_nodes:
-            logger.info(
-                "No LLM disaggregation detected; my_ar_walks_nodes == all_ar_walks_nodes: %s",
-                str(my_ar_walks_nodes)
-            )
-            return StoreWritePolicy.NEVER  # all AR walks on this worker
-
-        return StoreWritePolicy.ALWAYS
-
     # ------------------------------------------------------------------
     # Message handling
     # ------------------------------------------------------------------
@@ -417,7 +356,7 @@ class Worker:
     def _add_new_request(self, body: NewRequest) -> None:
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         now = _time.monotonic()
-        for node_name in self.engine_manager.lru_tracked_nodes():
+        for node_name in self.engine_manager.evictable_nodes():
             self._last_active[(body.request_id, node_name)] = now
 
         self.worker_graphs_manager.add_request(
@@ -426,7 +365,9 @@ class Worker:
             worker_graph_to_workers=body.worker_graph_to_workers,
             current_fwd_info=body.request_info
         )
-        self.engine_manager.add_request(body.request_id)
+        self.engine_manager.add_request(
+            body.request_id, body.request_info.resource_configs,
+        )
         self.tensor_manager.register_request(
             body.request_id,
             self.worker_graphs_manager.per_request_info[body.request_id].sharding_config
@@ -508,7 +449,7 @@ class Worker:
         self.streaming_buffers.pop(body.request_id, None)
         self.scheduler.clear_rid(body.request_id)
 
-        for node_name in self.engine_manager.lru_tracked_nodes():
+        for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((body.request_id, node_name), None)
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
@@ -789,91 +730,55 @@ class Worker:
     def _try_offload_cold_request(
         self, node_name: str, batch_ids: set[str]
     ) -> str | None:
-        """Offload one request's KV pages to CPU using the configured eviction policy.
+        """Offload one request's state for ``node_name``, freeing room to retry.
 
-        Prefers requests outside *batch_ids*. If none exist, falls back to
-        picking a victim *within* the batch (the caller should then exclude
-        it from execution).
-
-        Returns the victim request_id, or None if offloading wasn't possible.
+        Prefers a victim outside *batch_ids*; falls back to one inside it (the
+        caller then excludes it from execution). Returns the victim, or None
+        when nothing could be reclaimed.
         """
-        pool = self.engine_manager.get_engine(node_name).node_resources(
-            node_name
-        ).get("kv")
-        if pool is None or not pool.supports_offload:
+        engine = self.engine_manager.get_engine(node_name)
+        if not engine.evictable(node_name):
             return None
 
-        candidates_raw = pool.offload_candidates()
-        if not candidates_raw:
-            return None
-
-        # Split candidates by whether they belong to the in-flight batch;
-        # we prefer evicting requests not currently being executed.
-        external: list[tuple[str, int]] = []
-        in_batch: list[tuple[str, int]] = []
-        for rid, total_pages in candidates_raw:
-            if rid in batch_ids:
-                in_batch.append((rid, total_pages))
-            else:
-                external.append((rid, total_pages))
-
-        candidates = external or in_batch
+        candidates = [
+            rid for (rid, node) in self._last_active
+            if node == node_name and not engine.is_offloaded(node_name, rid)
+        ]
         if not candidates:
             return None
 
-        victim_id = self._select_eviction_victim(node_name, candidates)
-        freed = pool.offload(victim_id)
+        # prefer evicting requests that aren't currently executing
+        external = [rid for rid in candidates if rid not in batch_ids]
+        victim_id = self._select_eviction_victim(node_name, external or candidates)
+        freed = engine.offload_request(node_name, victim_id)
+        if freed <= 0:
+            return None
         logger.info(
-            "Offloaded request %s to CPU (%d GPU pages freed, "
-            "policy=%s, in_batch=%s)",
-            victim_id, freed, self.eviction_policy.value,
+            "Offloaded request %s from %s (%d reclaimed, policy=%s, in_batch=%s)",
+            victim_id, node_name, freed, self.eviction_policy.value,
             victim_id in batch_ids,
         )
-        return victim_id if freed > 0 else None
+        return victim_id
 
     def _select_eviction_victim(
-        self, node_name: str, candidates: list[tuple[str, int]]
+        self, node_name: str, candidates: list[str]
     ) -> str:
-        """Pick a victim from *candidates* based on ``self.eviction_policy``.
-
-        Each candidate is ``(request_id, total_gpu_pages)``.
-        """
-        if self.eviction_policy == EvictionPolicy.MOST_PAGES:
-            return max(candidates, key=lambda x: x[1])[0]
-
-        # LRU: pick the request with the oldest last_active timestamp.
-        # Ties (or missing entries) broken by most pages.
+        """Pick a victim from *candidates* under ``self.eviction_policy``."""
+        # LRU: oldest last_active first. A candidate the worker has never run
+        # sorts oldest, which is what we want — it is holding state and idle.
         return min(
             candidates,
-            key=lambda x: (
-                self._last_active.get((x[0], node_name), 0.0),  # oldest first
-                -x[1],                               # then most pages
-            ),
-        )[0]
-
-    def _try_reload_request(self, node_name: str, request_id: str) -> bool:
-        """Reload an offloaded request back to GPU. Returns True if reloaded."""
-        pool = self.engine_manager.get_engine(node_name).node_resources(
-            node_name
-        ).get("kv")
-        if pool is None or not pool.is_offloaded(request_id):
-            return False
-        if pool.reload(request_id):
-            logger.info("Reloaded request %s from CPU to GPU", request_id)
-            return True
-        logger.debug(
-            "Cannot reload request %s yet (insufficient GPU pages)", request_id,
+            key=lambda rid: self._last_active.get((rid, node_name), 0.0),
         )
-        return False
 
     # ------------------------------------------------------------------
     # Batch building
     # ------------------------------------------------------------------
 
-    def _build_node_batch(self, batch: ScheduledBatch) -> NodeBatch:
+    def _build_executing_batch(self, batch: ScheduledBatch) -> ExecutingBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
         per_request_inputs: dict[str, NameToTensorList] = {}
-        per_request_info: dict[CurrentForwardPassInfo] = {}
+        per_request_info: dict[str, CurrentForwardPassInfo] = {}
         final_stream_rids: set[str] = set()
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
@@ -891,7 +796,7 @@ class Worker:
             per_request_inputs[request_id] = tensors
             per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
 
-        return NodeBatch(
+        return self._make_executing_batch(
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
             request_ids=list(batch.node_objects.keys()),
@@ -900,8 +805,37 @@ class Worker:
             final_stream_rids=final_stream_rids,
         )
 
+    def _make_executing_batch(
+        self,
+        node_name: str,
+        graph_walk: str,
+        request_ids: list[str],
+        per_request_input_tensors: dict[str, NameToTensorList],
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        final_stream_rids: set[str] | None = None,
+    ) -> ExecutingBatch:
+        """One step's batch, with the step context the engine drives it through.
+
+        The context starts unleased and eager; a slot is reserved later, once
+        the real token count is known.
+        """
+        return ExecutingBatch(
+            node_name=node_name,
+            request_ids=request_ids,
+            per_request_info=per_request_info,
+            per_request_input_tensors=per_request_input_tensors,
+            final_stream_rids=final_stream_rids or set(),
+            running_batched=True,
+            step_context=StepContext(
+                request_ids=tuple(request_ids),
+                graph_walk=graph_walk,
+                slot=0,
+                capture=False,
+            ),
+        )
+
     def maybe_send_zmq_to_tp_followers(
-        self, node_batch: NodeBatch
+        self, node_batch: ExecutingBatch
     ):
         if node_batch.node_name not in self.parallel_nodes or \
                 node_batch.node_name not in self.parallel_leader_nodes:
@@ -1101,66 +1035,77 @@ class Worker:
     # for rids whose loop is still continuing.
     # ------------------------------------------------------------------
 
-    def _pre_plan_for_speculative_batch(
+    def _prepare_and_preplan_spec(
         self,
-        engine,
-        spec_node_batch: NodeBatch,
-        prev_advance_event: "threading.Event | None",
+        pending: PendingBatch | None,
+        speculation: Speculation,
     ) -> bool:
-        """Dispatch entry point on the plan_executor for the speculative batch.
+        """Prepare and pre-plan the speculative batch on the plan thread.
 
-        Waits on ``prev_advance_event`` — set by the GPU thread RIGHT AFTER
-        ``advance_seq_lens(prev)`` runs (~tens of µs into prev replay) —
-        rather than on the full prev_future. This is the key to overlap:
-        plan(N+1) starts as soon as alloc_manager state is post-(N), which
-        is well before replay(N)'s GPU work finishes. plan(N+1) runs
-        concurrent with the rest of replay(N)'s GPU kernels on the disjoint
-        slot's wrapper buffers. await_plan on the GPU thread should drop
-        to ~0 because plan(N+1) has finished long before replay(N+1)
-        begins.
+        The two waits are different dependencies on batch N, which is why
+        this is one callable rather than two:
 
-        Returns True if pre-planning was applied; False otherwise — the
-        caller submits the spec batch with plan_future regardless, so a
-        False return means the GPU thread will plan inline (no skip).
+        * ``outputs_ready`` — N's output tensors exist (their values land
+          later). Enough to thread them into N+1's inputs and run
+          ``prepare_inputs``, which is the expensive Python.
+        * ``commit_done`` — N's resource state is committed, so N+1 can admit
+          and plan against it.
+
+        Everything here runs off the main thread, overlapping N's GPU work.
+        Returns True when the batch was pre-planned; False means ``exec``
+        plans it inline, which is always correct, just slower.
         """
+        spec_batch = speculation.node_batch
+        engine = self.engine_manager.get_engine(spec_batch.node_name)
         try:
-            if prev_advance_event is not None:
-                # Safety timeout — should fire well within 100ms in normal
-                # operation. If it doesn't (e.g., GPU thread crashed),
-                # bail out rather than block plan_executor forever.
-                if not prev_advance_event.wait(timeout=10.0):
+            if pending is not None:
+                # Safety timeout — the engine releases both events even on its
+                # failure paths, so this should only fire if the GPU thread
+                # died. Bail out rather than block plan_executor forever.
+                if not pending.node_batch.outputs_ready.wait(timeout=10.0):
                     logger.warning(
                         "Worker %s: plan_executor timed out waiting for "
-                        "prev advance_event; skipping pre-plan",
-                        self.worker_id,
+                        "batch N outputs; skipping pre-plan", self.worker_id,
                     )
-                    self._reset_skip_plan_flags(spec_node_batch)
                     return False
-            return engine.pre_plan_for_batch(
-                spec_node_batch,
-                prev_completion_event=None,
-            )
+                if not speculation.is_yield_away:
+                    self._thread_outputs_to_speculative(
+                        speculation, pending.node_batch.outputs
+                    )
+                if not spec_batch.request_ids:
+                    return False  # every rid dropped; nothing to prepare
+
+            # NOTE: this must not read a tensor value — N's kernels are still
+            # running, so an .item() here would serialize the pipeline.
+            engine.prepare_inputs(spec_batch)
+            if not spec_batch.request_ids:
+                return False
+
+            if pending is not None and not pending.node_batch.commit_done.wait(
+                timeout=10.0
+            ):
+                logger.warning(
+                    "Worker %s: plan_executor timed out waiting for "
+                    "batch N commit; skipping pre-plan", self.worker_id,
+                )
+                return False
+
+            # Reserved here rather than at spec-build time: the bucket depends
+            # on the real token count, which only prepare_inputs knows.
+            engine.reserve_replay_slot(spec_batch)
+            return engine.pre_plan_for_batch(spec_batch)
         except Exception:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
-            self._reset_skip_plan_flags(spec_node_batch)
+            self._reset_skip_plan_flags(spec_batch)
             return False
 
-    def _reset_skip_plan_flags(self, spec_node_batch: NodeBatch) -> None:
-        """Clear pre-plan state on the SPECIFIC slot that
-        ``pre_plan_for_batch`` targeted for ``spec_node_batch``.
+    def _reset_skip_plan_flags(self, spec_node_batch: ExecutingBatch) -> None:
+        """Drop the pre-plan staged for ``spec_node_batch``.
 
-        Used to recover from speculation drops / failures where the pre-
-        plan was dispatched but the spec batch never reached the GPU
-        thread — leaving entries in the slot's ``_pre_planned_labels``
-        would cause the next real plan_attention call on that slot to
-        short-circuit incorrectly.
-
-        Slot-targeted (not worker-global) so that any other slot's
-        valid in-flight pre-plan whose flags have not yet been consumed
-        by the matching replay isn't stomped. The engine's
-        ``reset_pre_plan_for_batch`` looks up the same (key, slot) the
-        pre-plan path used; engines without a pre-plan surface inherit
-        ``BaseEngine``'s no-op default.
+        Used when the pre-plan was dispatched but the batch never reached the
+        GPU thread: the resources would otherwise promote that stale plan into
+        the next step that leases the same slot. Targeted at this batch's own
+        lease, so a different slot's valid in-flight pre-plan isn't stomped.
         """
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
         engine.reset_pre_plan_for_batch(spec_node_batch)
@@ -1181,10 +1126,9 @@ class Worker:
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
-        node_batch: NodeBatch,
+        node_batch: ExecutingBatch,
         plan_future: Future | None = None,
-        advance_event: "threading.Event | None" = None,
-    ) -> NodeOutput:
+    ) -> dict[str, NameToTensorList]:
         """Run the engine on the GPU executor thread.
 
         The NVTX range bracketing this call is ``synchronize=False`` —
@@ -1192,25 +1136,18 @@ class Worker:
         drain the GPU on every iter and hide the overlap between
         post-processing and the next step's kernel execution.
 
-        After ``execute_with_max_batch_size`` returns we record a CUDA event
-        on the default stream and stash it on the output. Downstream sync
-        points on the main thread wait on this event.
+        Once the step's work is submitted we record a CUDA event on the
+        default stream; anything that reads the output VALUES waits on it.
         """
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
-        logger.debug(
-            "Executing batch for node %s on engine %s",
-            node_batch.node_name, str(type(engine))
-        )
+        logger.debug("Executing batch for node %s", node_batch.node_name)
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
-        # Wait for the plan_executor's pre-planned wrapper.plan() call to
-        # finish before running this batch — its results land on the captured
-        # graph's persistent wrappers, and the next plan_attention call(s)
-        # will see the matching label in _pre_planned_labels only because
-        # plan_executor populated it. Wait releases the GIL.
+        # The plan thread wrote this batch's plan into the resources; wait for
+        # it before the forward reads them. Waiting releases the GIL.
         if plan_future is not None:
             if self.enable_nvtx:
                 range_push("worker.gpu_thread.await_plan", synchronize=False)
@@ -1225,36 +1162,28 @@ class Worker:
                 synchronize=False,
             )
         try:
-            output = engine.execute_with_max_batch_size(node_batch)
+            outputs = engine.exec_and_postprocess(node_batch)
             if torch.cuda.is_available():
                 event = torch.cuda.Event()
                 event.record(torch.cuda.default_stream(self.device))
-                output.completion_event = event
-            return output
+                node_batch.completion_event = event
+            return outputs
         finally:
-            # Safety net: ensure advance_event fires even if the engine
-            # raised before reaching ``advance_seq_lens`` inside
-            # ``_run_basic_batched``. Without this, a plan_executor waiting
-            # on prev_advance_event would block forever on the failure path.
-            if advance_event is not None:
-                advance_event.set()
-            # Same idea for launch_started_event: if the engine raised
-            # before reaching the deep set site, release the main-thread
-            # waiter early instead of making it eat the full timeout.
-            launch_started_event = node_batch.metadata.get("launch_started_event")
-            if launch_started_event is not None:
-                launch_started_event.set()
-            # Mirror engine-internal state (e.g. KV-cache seq_info) back
-            # onto node_batch.per_request_info so the next iter's prep /
-            # routing sees the updated values. Runs regardless of success,
-            # allocation_failed, or an uncaught raise — finalize_batch
-            # reads whatever state the engine actually reached.
+            # Safety net: a step that raised before publishing outputs or
+            # committing would otherwise strand the plan thread preparing the
+            # next one. The engine does this too on its own paths; here covers
+            # a raise outside them.
+            node_batch.release_waiters()
+            # Publish each resource's durable state onto per_request_info so
+            # the next iter's prep and the conductor see it. Runs regardless
+            # of success, allocation failure, or an uncaught raise —
+            # finalize_batch reads whatever state the engine actually reached.
             engine.finalize_batch(node_batch)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
     def _handle_allocation_failure(
-        self, batch: ScheduledBatch, node_batch: NodeBatch
+        self, batch: ScheduledBatch, node_batch: ExecutingBatch
     ) -> None:
         """Push back nodes and hold the rids for backoff after KV OOM.
 
@@ -1351,7 +1280,7 @@ class Worker:
             after await by ``_thread_outputs_to_speculative``.
           * **fresh** rids — newly-arrived requests whose spec-target node
             is ready in the queue right now. Their inputs come from the
-            usual tensor_manager path (same as ``_build_node_batch``).
+            usual tensor_manager path (same as ``_build_executing_batch``).
             Without this merge, new rids have to wait for the entire
             current speculation chain to drain before they can be scheduled.
         """
@@ -1550,7 +1479,7 @@ class Worker:
         )
 
         request_ids = list(new_node_objects.keys())
-        spec_node_batch = NodeBatch(
+        spec_node_batch = self._make_executing_batch(
             node_name=spec_node_info.node_name,
             graph_walk=batch_N.graph_walk,
             request_ids=request_ids,
@@ -1581,14 +1510,21 @@ class Worker:
         )
 
     def _thread_outputs_to_speculative(
-        self, speculation: Speculation, output_N: NodeOutput
+        self, speculation: Speculation,
+        outputs_N: dict[str, NameToTensorList],
     ):
+        """Splice batch N's outputs into the spec batch's inputs.
+
+        Runs on the plan thread as soon as N's outputs are published, so it
+        must not read a tensor VALUE: it only moves tensor lists and tests
+        which keys are present. N's kernels may still be running.
+        """
         threaded_continuing: set[str] = set()
         dropped: set[str] = set()
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
                 continue  # fresh rid — inputs already gathered.
-            rid_outputs = output_N.per_request_output_tensors.get(rid, {})
+            rid_outputs = outputs_N.get(rid, {})
             ok = True
             for input_name, _ in speculation.consumed_edges:
                 tensors = rid_outputs.get(input_name, [])
@@ -1632,7 +1568,7 @@ class Worker:
 
     def _postprocess_batch(
         self, batch_N: PendingBatch,
-        output: NodeOutput,
+        outputs: dict[str, NameToTensorList],
     ):
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
@@ -1650,7 +1586,7 @@ class Worker:
                         or pending_stop.rid not in batch_N.node_batch.request_ids:
                     continue
                 stopped_rid = pending_stop.rid
-                output.per_request_output_tensors.pop(stopped_rid, None)
+                outputs.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
                 batch_N.batch.node_objects.pop(stopped_rid, None)
                 batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
@@ -1694,10 +1630,10 @@ class Worker:
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
         if torch.cuda.is_available() and batch_N.batch.node_objects:
-            if output.completion_event is not None:
+            if batch_N.node_batch.completion_event is not None:
                 if self.enable_nvtx:
                     range_push("worker.postprocess.completion_event_sync", synchronize=False)
-                output.completion_event.synchronize()
+                batch_N.node_batch.completion_event.synchronize()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
             else:
@@ -1718,16 +1654,18 @@ class Worker:
 
         # Check for stops
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        cpu_output = self._prematerialize_for_check_stop(output)
-        stop_result = engine.check_stop_for_batch(batch_N.node_batch, cpu_output)
-        if stop_result.failed_requests:
+        cpu_outputs = self._prematerialize_for_check_stop(
+            outputs, batch_N.node_batch.completion_event,
+        )
+        stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.
             # Fail it here and take it out of the batch before the routing
             # loops below touch it.
-            output.failed_requests.update(stop_result.failed_requests)
-            self._drop_failed_rids(batch_N, output)
-            self._fail_requests(stop_result.failed_requests)
+            failed = dict(batch_N.node_batch.failed_requests)
+            self._drop_failed_rids(batch_N, outputs, failed)
+            self._fail_requests(failed)
             if not batch_N.node_batch.request_ids:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
@@ -1738,7 +1676,7 @@ class Worker:
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
         # Stop loops, if applicable
-        for rid, loop_names in stop_result.stops.items():
+        for rid, loop_names in stops.items():
             loop_names = set([
                 ln for ln in loop_names if \
                     self.worker_graphs_manager.check_dyn_loop(rid, batch_N.partition, ln)
@@ -1791,7 +1729,7 @@ class Worker:
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.
-            req_output_tensors = output.per_request_output_tensors.get(rid)
+            req_output_tensors = outputs.get(rid)
             node = batch_N.batch.node_objects[rid]
             node.reset_outputs() # reset stale outputs
             if req_output_tensors:
@@ -1899,39 +1837,38 @@ class Worker:
 
     def _prematerialize_for_check_stop(
         self,
-        output: NodeOutput,
-    ) -> NodeOutput:
-        """Side-stream D→H of every CUDA tensor in
-        ``output.per_request_output_tensors`` so the subsequent
+        outputs: dict[str, NameToTensorList],
+        completion_event: torch.cuda.Event | None,
+    ) -> dict[str, NameToTensorList]:
+        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns a fresh ``NodeOutput`` with CPU tensors for the per-rid
-        outputs, sharing the original's allocation_failed / event fields.
-        Skipped (returns ``output`` unchanged) when there's no completion
-        event (CPU execution) or when CUDA is unavailable.
+        Returns per-rid outputs with the CUDA tensors replaced by CPU
+        copies. Skipped (returns ``outputs`` unchanged) when there's no
+        completion event (CPU execution) or when CUDA is unavailable.
 
         AR engines emit small per-rid output dicts (sampled token + maybe
         a code) so the cost is negligible. If a future engine emits large
         tensors here (e.g. activations), revisit.
         """
-        if not torch.cuda.is_available() or output.completion_event is None:
-            return output
-        if not output.per_request_output_tensors:
-            return output
+        if not torch.cuda.is_available() or completion_event is None:
+            return outputs
+        if not outputs:
+            return outputs
 
         if self._d2h_stream is None:
             self._d2h_stream = torch.cuda.Stream(device=self.device)
         side = self._d2h_stream
-        side.wait_event(output.completion_event)
+        side.wait_event(completion_event)
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
         with torch.cuda.stream(side):
-            for rid, name_to_list in output.per_request_output_tensors.items():
+            for rid, name_to_list in outputs.items():
                 if not isinstance(name_to_list, dict):
                     cpu_per_rid[rid] = name_to_list
                     continue
@@ -1956,13 +1893,7 @@ class Worker:
                     cpu_per_rid[rid][name] = new_list
         side.synchronize()
 
-        return NodeOutput(
-            per_request_output_tensors=cpu_per_rid,
-            allocation_failed=output.allocation_failed,
-            alloc_pages_short=output.alloc_pages_short,
-            alloc_failed_request_id=output.alloc_failed_request_id,
-            completion_event=output.completion_event,
-        )
+        return cpu_per_rid
 
     def _apply_pending_removes_safe_to_drop(
         self, in_flight_rids: set[str]
@@ -1976,9 +1907,11 @@ class Worker:
             self._remove_request(RemoveRequest(request_id=rid, source=MessageSource.SELF))
 
     def _drop_failed_rids(
-        self, pending: PendingBatch, output: NodeOutput
+        self, pending: PendingBatch,
+        outputs: dict[str, NameToTensorList],
+        failed_requests: dict[str, str],
     ) -> None:
-        """Excise ``output.failed_requests`` from a finished batch.
+        """Excise ``failed_requests`` from a finished batch.
 
         A rid that raised in ``postprocess`` is still carried in the batch (the
         engine only recorded the error), and one that raised in
@@ -1989,14 +1922,14 @@ class Worker:
         response. ``_postprocess_batch`` reconciles the remaining structures
         from ``node_batch.request_ids``.
         """
-        for rid in output.failed_requests:
-            output.per_request_output_tensors.pop(rid, None)
+        for rid in failed_requests:
+            outputs.pop(rid, None)
             pending.batch.node_objects.pop(rid, None)
             pending.batch.request_to_worker_graph.pop(rid, None)
             pending.node_batch.per_request_info.pop(rid, None)
         pending.node_batch.request_ids = [
             rid for rid in pending.node_batch.request_ids
-            if rid not in output.failed_requests
+            if rid not in failed_requests
         ]
 
     def _handle_main_loop_error(
@@ -2010,7 +1943,7 @@ class Worker:
         Attribution is batch-granular here: a raise out of the forward, the
         batch build, or output routing can't be pinned on one request (the
         stages that *can* attribute report through
-        ``NodeOutput.failed_requests`` instead), so every rid this iteration
+        ``ExecutingBatch.failed_requests`` instead), so every rid this iteration
         touched fails together. Sequential retry of the batch — see the design
         discussion on #123 — would go here; today a batch-level crash is
         terminal for its rids.
@@ -2308,7 +2241,7 @@ class Worker:
                             exclude_target=yield_away_from_target,
                         )
                         if batch is not None:
-                            node_batch = self._build_node_batch(batch)
+                            node_batch = self._build_executing_batch(batch)
                             batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
                             logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
                             speculation = Speculation(
@@ -2324,40 +2257,15 @@ class Worker:
 
                             # send messages to follower ranks if relevant
                             self.maybe_send_zmq_to_tp_followers(node_batch)
-                    if speculation is not None:
-                        # Reserve the double-buffer slot for batch_(N+1) NOW
-                        # so both pre-plan and replay (queued below) target
-                        # the SAME slot — and the OPPOSITE slot from
-                        # batch_N's in-flight replay. The reservation lives
-                        # on spec_node_batch.metadata['cuda_graph_slot'];
-                        # the engine forwards it to the runner.
-                        if speculation is not None:
-                            engine = self.engine_manager.get_engine(
-                                speculation.node_batch.node_name
-                            )
-                            engine.reserve_replay_slot(speculation.node_batch)
-
-                        # Kick off pre-planning on the plan_executor NOW —
-                        # its Python work runs while the main thread is in
-                        # await_gpu (releases GIL). plan_executor waits on
-                        # prev's advance_event so  plan(N+1) starts before
-                        # replay(N) finishes. replay(N) keeps running on
-                        # the active slot.
-                        if speculation is not None and plan_executor is not None:
-                            engine = self.engine_manager.get_engine(
-                                speculation.node_batch.node_name
-                            )
-                            prev_advance_event_for_plan: threading.Event | None = None
-                            if pending is not None:
-                                prev_advance_event_for_plan = (
-                                    pending.node_batch.metadata.get("advance_event")
-                                )
-                            speculation.plan_future = plan_executor.submit(
-                                self._pre_plan_for_speculative_batch,
-                                engine,
-                                speculation.node_batch,
-                                prev_advance_event_for_plan,
-                            )
+                    if speculation is not None and plan_executor is not None:
+                        # Hand N+1 to the plan thread NOW. It waits on N's own
+                        # events (outputs, then commit), threads N's outputs
+                        # in, runs prepare_inputs, reserves a slot and
+                        # pre-plans — all while the main thread sits in
+                        # await_gpu with the GIL released and N's kernels run.
+                        speculation.plan_future = plan_executor.submit(
+                            self._prepare_and_preplan_spec, pending, speculation,
+                        )
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
@@ -2367,7 +2275,7 @@ class Worker:
                     if self.enable_nvtx:
                         range_push("worker.await_gpu", synchronize=False)
                     _t0 = _time.perf_counter() if phase_period else 0.0
-                    output: NodeOutput = pending.future.result()
+                    outputs: dict[str, NameToTensorList] = pending.future.result()
                     if phase_period:
                         _phase_record("await_gpu", _time.perf_counter() - _t0)
                     if self.enable_nvtx:
@@ -2383,8 +2291,7 @@ class Worker:
                         # Speculation cleanup splits by kind:
                         #
                         # * Non-yield-away spec depended on pending's outputs
-                        #   (its inputs would be threaded from ``output`` below
-                        #   via ``_thread_outputs_to_speculative``). Pending's
+                        #   (the plan thread already threaded them in). Pending's
                         #   output is invalid, so the spec batch can't run.
                         #
                         # * Yield-away spec is independent of pending.
@@ -2404,7 +2311,7 @@ class Worker:
                                         self._return_speculative_streaming_edge(rid, edge)
                                 speculation = None
 
-                    if output.allocation_failed:
+                    if pending.node_batch.allocation_failed:
                         # KV-cache OOM on pending. ``_handle_allocation_failure``
                         # offloads or holds the failed rids and pushes their
                         # GraphNodes back to the scheduler queue.
@@ -2415,22 +2322,28 @@ class Worker:
                             node._speculatively_scheduled = False
                         _maybe_clear_spec()
 
-                    if output.failed_requests:
+                    if pending.node_batch.failed_requests:
                         # A per-rid stage (prepare_inputs / postprocess) blamed
                         # specific requests. Drop the speculation: it was built
                         # from pending's rids and may thread outputs that the
                         # failed rids never produced. The rest of the batch
                         # still post-processes and routes normally below.
                         _maybe_clear_spec()
-                        self._drop_failed_rids(pending, output)
-                        self._fail_requests(output.failed_requests)
+                        failed = dict(pending.node_batch.failed_requests)
+                        self._drop_failed_rids(pending, outputs, failed)
+                        self._fail_requests(failed)
 
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
-                        # Promote per-rid speculative_signals → real inputs
-                        if not speculation.is_yield_away:
-                            self._thread_outputs_to_speculative(speculation, output)
+                        # Inputs were threaded and prepared on the plan thread;
+                        # draining its future here settles which rids survived.
+                        # With no plan thread, do that work inline instead —
+                        # correct, just unoverlapped.
+                        if speculation.plan_future is not None:
+                            speculation.plan_future.result()
+                        else:
+                            self._prepare_and_preplan_spec(pending, speculation)
                         # set node._speculatively_scheduled to true, so that it doesn't
                         # accidentally get put on the ready queue while already executing
                         for node in spec_batch.node_objects.values():
@@ -2441,37 +2354,22 @@ class Worker:
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
                             _t0 = _time.perf_counter() if phase_period else 0.0
-                            # If pre-plan was dispatched but the spec_batch
-                            # composition changed, fall back to inline planning
+                            # If the spec batch's composition changed after it
+                            # was planned, that plan is stale — drop it and let
+                            # the GPU thread plan inline.
                             if speculation.plan_future is not None and speculation.dropped:
-                                speculation.plan_future.result()
                                 self._reset_skip_plan_flags(speculation.node_batch)
                                 speculation.plan_future = None
 
-                            # Attach a fresh advance_event to this batch so
-                            # the NEXT iter's plan_executor can gate on
-                            # advance_seq_lens(THIS batch).
-                            spec_advance_event = threading.Event()
-                            spec_node_batch.metadata["advance_event"] = spec_advance_event
-
-                            # Block the main thread until the GPU executor
-                            # thread is about to launch CUDA kernels (set
-                            # deep in the engine: before graph.replay() in
-                            # CudaGraphRunner, or before forward/forward_batched
-                            # in the eager AR path).
-                            spec_launch_started_event = threading.Event()
-                            spec_node_batch.metadata["launch_started_event"] = spec_launch_started_event
                             spec_future = gpu_executor.submit(
                                 self._execute_on_gpu_thread,
                                 spec_batch, spec_node_batch,
                                 speculation.plan_future,
-                                spec_advance_event,
                             )
                             self.wakeup_event.register_future(spec_future)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
-                            spec_launch_started_event.wait(timeout=0.005)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:
@@ -2487,13 +2385,10 @@ class Worker:
                                 loop_name=speculation.loop_name,
                             )
                         elif speculation.plan_future is not None:
-                            # All continuing rids were dropped post-thread,
-                            # so no spec batch was submitted. Drain the
-                            # orphaned pre-plan future and reset the engine's
-                            # skip flags so the next plan_attention call
-                            # recomputes from scratch instead of trusting
-                            # stale wrapper buffers from this aborted spec.
-                            speculation.plan_future.result()
+                            # All continuing rids were dropped, so no spec
+                            # batch was submitted. Drop the orphaned pre-plan
+                            # so the next step to lease that slot doesn't
+                            # promote it.
                             self._reset_skip_plan_flags(speculation.node_batch)
 
                     # Post-process N (routing stage) — runs concurrently with
@@ -2503,10 +2398,10 @@ class Worker:
                     # failed rids upstream.
                     _t0 = _time.perf_counter() if phase_period else 0.0
 
-                    if not output.allocation_failed:
+                    if not pending.node_batch.allocation_failed:
                         if self.enable_nvtx:
                             range_push("worker.postprocess_batch", synchronize=False)
-                        self._postprocess_batch(pending, output)
+                        self._postprocess_batch(pending, outputs)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
 
@@ -2549,7 +2444,7 @@ class Worker:
 
                 if self.enable_nvtx:
                     range_push("worker.build_node_batch", synchronize=False)
-                node_batch = self._build_node_batch(batch)
+                node_batch = self._build_executing_batch(batch)
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
                 for request_id, req_info in node_batch.per_request_info.items():
@@ -2561,25 +2456,17 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
-                # Reserve the double-buffer slot on the main thread before
-                # submission so the per-key counter advances in main-thread
-                # order. Without this, the GPU thread would advance the
-                # counter at run time and races with main-thread reservations
-                # from later iters.
+                # Nothing speculated this batch, so prepare it here. The GPU
+                # thread then admits, plans and runs it inline; the slot is
+                # leased inside exec, once the token count is known.
                 fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
-                fallthrough_engine.reserve_replay_slot(node_batch)
+                fallthrough_engine.prepare_inputs(node_batch)
 
                 # send messages to follower ranks if relevant
                 self.maybe_send_zmq_to_tp_followers(node_batch)
 
-                # Attach a fresh advance_event so the next iter's
-                # plan_executor (if it speculates) can wait on this batch's
-                # advance_seq_lens.
-                fallthrough_advance_event = threading.Event()
-                node_batch.metadata["advance_event"] = fallthrough_advance_event
                 future = gpu_executor.submit(
-                    self._execute_on_gpu_thread, batch, node_batch,
-                    None, fallthrough_advance_event,
+                    self._execute_on_gpu_thread, batch, node_batch, None,
                 )
                 self.wakeup_event.register_future(future)
                 logger.debug(f"Scheduling: {batch.node_name} {node_batch.request_ids}")

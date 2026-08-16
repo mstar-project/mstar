@@ -8,6 +8,11 @@ smaller once the worker knows exactly one engine.
 Everything the worker does for the OLD engine is being removed, not ported,
 unless named below.
 
+**Status**: Phase 0 and Phase 1 applied in one pass over the worker. What
+landed differs from the plan in two places, both noted inline below:
+`check_ready` now drives reload itself, and `prepare_inputs` for a
+non-speculated batch runs on the main thread before submission.
+
 ---
 
 ## Phase 0 — one engine
@@ -79,6 +84,10 @@ The worker/scheduler still tracks LRU. Two victim policies:
 `mstar/engine/cpu_page_pool.py` gets **ported** to v1 (it currently imports the
 old `kv_store`), and `KVManager` grows the offload/reload path that uses it —
 today it has only `# TODO: CPU page pool`.
+
+Reload is not the worker's to drive: `Engine.check_ready` brings an offloaded
+request back and reports not-ready until it fits, which is the scheduler's cue
+to run something else. Only victim selection stays on the worker.
 
 ### 0.4 Worker code to delete
 
