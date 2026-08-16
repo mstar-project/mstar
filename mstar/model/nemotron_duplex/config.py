@@ -334,12 +334,16 @@ class NemotronDuplexConfig:
     function_weight: float = 2.0
     use_function_head: bool = True
     predict_user_text: bool = False
-    # Text-channel special tokens. TODO(verify) against the nano tokenizer
-    # (base repo ships only rnnt_tokenizer/; the text tokenizer is in the Spark
-    # nano/ folder). Defaults are the nano config's bos/eos/pad.
-    text_pad_id: int = 0
+    # Text-channel special tokens, per the checkpoint config.json
+    # (model.speech_generation.model): bos_token=<s> (1), eos_token=</s> (2),
+    # pad_token=<SPECIAL_12> (12). The pad token is the frequent between-word /
+    # turn-taking "pad-pair" frame; ``inference_force_speech_silence_on_eos``
+    # must silence ONLY the true EOS (2), NOT the pad frames (12) — else the
+    # talker is forced silent between words and the spoken reply truncates after
+    # a few words (verified via ASR).
+    text_pad_id: int = 12
     text_bos_id: int = 1
-    text_eos_id: int = 12
+    text_eos_id: int = 2
 
     # convenience passthroughs used by the Model glue
     @property
