@@ -16,7 +16,6 @@ from mstar.communication.tensors import (
     TensorTransferEngine,
     TransferReadInfo,
 )
-from mstar.conductor.request_info import SequenceInfo
 from mstar.distributed.utils import divide
 
 logger = logging.getLogger(__name__)
@@ -179,6 +178,17 @@ class KVRequestState:
             full_seq_len=self.seq_len,
             position_id_start=self.position_id_start
         )
+
+
+@dataclass
+class SequenceInfo:
+    """here beause v0 still has some references"""
+    seq_len: int
+    pos_id: int
+
+    # for tracking KV cache
+    latest_kv_transfer_info: Any
+    page_indices: list[int] = field(default_factory=list)
 
 
 LabelToState = dict[str, KVRequestState]

@@ -803,6 +803,13 @@ class KVManager(Resource):
         return AllocResult()
 
     ### Submodule-level functionality
+    def layer_view(self, layer_idx: int) -> torch.Tensor:
+        """layer pages as needed by attention kernel
+
+        handed to `AttentionManager::run`. in `kv_manager` so storage mechanics
+        are opaque to layers"""
+        return self.kv_cache.layer_view(layer_idx)
+
     def read_kv(self, layer_idx: int, plan_label: str) -> torch.Tensor:
         """
         The slots this step's plan writes, e.g. for NHD:
