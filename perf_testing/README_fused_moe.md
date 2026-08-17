@@ -43,11 +43,33 @@ against a per-expert fp32 reference before it is written.
 ## Checking the result
 
 ```bash
-python perf_testing/bench_fused_moe.py --shape thinker
+python perf_testing/bench_fused_moe.py --shape thinker      # the two GEMMs alone
+python perf_testing/bench_fused_moe_e2e.py --shape thinker  # a whole dispatch
 ```
 
-A/Bs `legacy` (old grid + old heuristic) against `grid` and `tuned`, and prints
-each against the bandwidth roofline.
+The first A/Bs `legacy` (old grid + old heuristic) against `grid` and `tuned`
+with alignment memoised outside the timed region — the right view for tuning
+tiles. The second times everything a dispatch does (align, gate+up GEMM,
+SwiGLU, down GEMM, sum-reduce), which is where the alignment op and the launch
+overhead show up.
+
+End-to-end on H100, µs per dispatch. `legacy` is the pre-branch state
+reproduced in the benchmark: torch-fallback alignment, worst-case grid, one
+heuristic config for both GEMMs. It has no graph column by construction — the
+torch fallback cannot be captured.
+
+| M | thinker legacy | thinker graph | x | talker legacy | talker graph | x |
+|---|---|---|---|---|---|---|
+| 1 | 734 | 42 | 17.5 | 738 | 16 | 45.2 |
+| 8 | 772 | 182 | 4.3 | 745 | 59 | 12.7 |
+| 64 | 1010 | 412 | 2.5 | 757 | 119 | 6.4 |
+| 512 | 1201 | 458 | 2.6 | 765 | 137 | 5.6 |
+| 4096 | 2185 | 964 | 2.3 | 1057 | 326 | 3.2 |
+
+Comparing eager against eager the gain is a flat ~2.3–3.5x across both shapes
+and every token count. The rest — everything above ~3x, so most of the decode
+win — is the fused MoE becoming CUDA-graph capturable at all, which is a
+consequence of the alignment op building rather than of the tuning.
 
 ## Timing methodology
 
