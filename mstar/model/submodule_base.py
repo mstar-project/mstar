@@ -276,6 +276,28 @@ class NodeSubmodule(torch.nn.Module):
             if bind is not None and module is not self:
                 bind(resources)
 
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> Any:
+        """Which of this walk's capture buckets a batch belongs to.
+
+        A walk can be captured more than once when the batch's *shape* is not
+        the whole story — bagel captures decode twice, guidance on and off,
+        because the two declare different segments over the same token count.
+        The engine leases a slot before the step is declared, so it cannot read
+        the answer off the step; it asks here instead.
+
+        Must equal the ``additional_key_info`` on the config that captured the
+        bucket, and the ``cg_key_info`` this batch's ``declare_step`` puts on
+        its step. Disagreeing is not an error anywhere — it just misses the
+        capture and runs eager — so derive both from one place.
+
+        None (the default) means the walk has a single capture.
+        """
+        del graph_walk, per_request_info
+        return None
+
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""
         state = self.request_states.get(request_id)

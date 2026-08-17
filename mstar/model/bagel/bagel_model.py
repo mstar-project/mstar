@@ -42,7 +42,12 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.v1.attention_manager import AttentionConfig, AttentionSpec
+from mstar.engine.v1.kv_cache import KVConfig, KVSpec
+from mstar.engine.v1.kv_manager import KVReqConfig
+from mstar.engine.v1.position_manager import PositionConfig, PositionSpec
+from mstar.engine.v1.sampler import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -594,14 +599,94 @@ class BagelModel(Model):
             return img_byte_arr.getvalue()
         raise ValueError(f"Unsupported modality: {modality!r}")
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [KVCacheConfig(
+    # The three LLM nodes run the same weights over their own cache streams
+    # (CFG branches), so they share one set of resources.
+    _LLM_NODES = frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})
+
+    def _kv_config(self) -> KVConfig:
+        return KVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_attention_heads,
-        )]
+        )
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The KV cache, the attention over it, positions, and the sampler.
+
+        The labels here are the names the layers bind against
+        (``Attention(attn_key=..., kv_key=..., pos_key=...)``) and the names
+        ``declare_step`` keys its resource steps by, so they are one
+        declaration read from three places.
+        """
+        kv_config = self._kv_config()
+        nodes = set(self._LLM_NODES)
+        return [
+            KVSpec(label="kv", nodes=nodes, config=kv_config),
+            AttentionSpec(
+                label="attn", nodes=nodes,
+                config=AttentionConfig(kv_cache="kv"),
+                kv_config=kv_config,
+            ),
+            PositionSpec(
+                label="rope", nodes=nodes,
+                config=PositionConfig(
+                    kv_cache="kv", rope_theta=self.config.rope_theta,
+                ),
+            ),
+            SamplerSpec(
+                label="sampler", nodes=nodes,
+                vocab_size=self.config.vocab_size,
+            ),
+        ]
+
+    def get_request_resource_configs(
+        self, model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Per-resource knobs a new request is opened with.
+
+        Two things are per-request rather than per-deployment: which cache
+        labels the request will use (guidance doubles them, and it is a
+        property of the request's arguments), and its sampling parameters.
+        The conductor resolves this once and the engine hands each config to
+        its resource at ingest.
+        """
+        from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
+
+        model_kwargs = model_kwargs or {}
+        cfg = self._requires_cfg_for(model_kwargs)
+        sampling = self.get_sampling_config("LLM", model_kwargs)
+        return {
+            # The KV resource reads this in admit_retrieve, to know which of a
+            # published request's streams to pull in. Guidance-off requests
+            # name only "main", so a transfer never drags branches that this
+            # request will not attend.
+            "kv": KVReqConfig(needed_labels_per_node_walk={
+                (node, walk): active_labels(walk, cfg, node)
+                for node in self._LLM_NODES
+                for walk in LLM_GRAPH_WALKS
+            }),
+            "sampler": SamplingReqConfig(
+                temperature=sampling.temperature,
+                top_k=sampling.top_k,
+                top_p=sampling.top_p,
+                ignore_eos=sampling.ignore_eos,
+                repetition_penalty=sampling.repetition_penalty,
+            ),
+        }
+
+    def _requires_cfg_for(self, model_kwargs: dict) -> bool:
+        """``_requires_cfg`` over a partial kwargs dict.
+
+        ``get_request_resource_configs`` runs on whatever the caller supplied,
+        so the guidance keys may be absent; absent means off.
+        """
+        return self._requires_cfg(
+            target_output=model_kwargs.get("target_output"),
+            cfg_img_scale=model_kwargs.get("cfg_img_scale", 0.0),
+            cfg_text_scale=model_kwargs.get("cfg_text_scale", 0.0),
+        )
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

@@ -13,11 +13,18 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
-from mstar.engine.cache_manager import BatchedCacheManager
-from mstar.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
-from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
-from mstar.engine.kv_store import PositionInfo
-from mstar.engine.resources import PlanSpec, StepDeclaration
+from mstar.engine.resources.step import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SubmoduleStep,
+)
+from mstar.engine.v1.cuda_graph_config import (
+    BatchedCudaGraphConfig,
+    PackedCudaGraphConfig,
+)
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -37,9 +44,39 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StackingMethod,
 )
-from mstar.utils.sampling import SeenTokenMask
 
 logger = logging.getLogger(__name__)
+
+# The LLM nodes' walks, and the CFG branch each node owns. Module level
+# because both the submodule (per step) and the model (per request, in
+# get_request_resource_configs) have to answer the same question.
+LLM_GRAPH_WALKS = (
+    "prefill_text", "prefill_vit", "prefill_vae",
+    "decode", "image_gen", "image_gen_cfg",
+)
+NODE_TO_CFG_LABEL = {
+    "LLM": "main",
+    "LLM_cfg_text": "cfg_text",
+    "LLM_cfg_img": "cfg_img",
+}
+
+
+def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
+    """Cache labels a node touches on this walk.
+
+    Guidance adds a branch label on the walks that carry one; with guidance
+    off every walk is just "main". ``image_gen_cfg`` is the parallel variant,
+    where each LLM node owns exactly one branch.
+    """
+    if graph_walk in {"prefill_text", "decode"}:
+        if cfg:
+            return ["main", "cfg_img"]
+    elif graph_walk == "image_gen":
+        if cfg:
+            return ["main", "cfg_text", "cfg_img"]
+    elif graph_walk == "image_gen_cfg":
+        return [NODE_TO_CFG_LABEL.get(node_name, "main")]
+    return ["main"]
 
 
 class ViTEncoderSubmodule(NodeSubmodule):
@@ -407,11 +444,11 @@ class LLMSubmodule(ARNodeSubmodule):
     """
 
     # Node name → cache label mapping for image_gen_cfg
-    _NODE_TO_CFG_LABEL = {
-        "LLM": "main",
-        "LLM_cfg_text": "cfg_text",
-        "LLM_cfg_img": "cfg_img",
-    }
+    # Plan label the three CFG branches share when they run as one
+    # combined plan; see declare_step.
+    CFG_BATCHED_LABEL = "_cfg_batched"
+
+    _NODE_TO_CFG_LABEL = NODE_TO_CFG_LABEL
 
     def __init__(
         self,
@@ -444,14 +481,20 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _get_image_pos_ids(
         self, labels: list[str],
-        pos_info: dict[str, PositionInfo],
+        request_id: str,
         device: str,
         seq_len: int,
     ):
+        """Every token of an image block shares the stream's current position.
+
+        The starts come from the position resource, which owns the counters
+        (the old cache handle handed them in as a ``pos_info`` dict).
+        """
+        positions = self.node_resources["rope"]
         return {
             label: torch.zeros(
-                    seq_len, dtype=torch.int32, device=device
-                ) + pos_info.get(label, PositionInfo()).position_id_start \
+                seq_len, dtype=torch.int32, device=device,
+            ) + positions.position(request_id, label)
             for label in labels
         }
 
@@ -496,7 +539,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
+    ) -> list[BatchedCudaGraphConfig | PackedCudaGraphConfig]:
         """Declare CUDA graph captures for ``decode`` (cfg-off + cfg-on) and ``prefill_text`` (cfg-off only).
 
         cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
@@ -513,27 +556,30 @@ class LLMSubmodule(ARNodeSubmodule):
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
             input_seq_len=1
         )
-        prefill_text_packed = {
-            num_tokens: self._build_prefill_text_packed(num_tokens, device)
-            for num_tokens in self.PREFILL_TEXT_TOKEN_BUCKETS
-        }
+        # `additional_key_info` carries what `requires_cfg` / `labels` used to:
+        # the cfg-on and cfg-off decodes declare different segments, so they
+        # are different capture buckets. `declare_step` stamps the same value
+        # on the step (`cg_key_info`) so a replay lands on its own bucket.
         return [
-            BasicBatchedCudaGraphConfig(
-                capture_graph_walk="decode", requires_cfg=False, labels=["main"],
+            BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                additional_key_info=False,
                 single_request_inputs=dummy.clone(),
             ),
-            BasicBatchedCudaGraphConfig(
-                capture_graph_walk="decode", requires_cfg=True, labels=["main", "cfg_img"],
+            BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                additional_key_info=True,
                 single_request_inputs=dummy.clone(),
             ),
-            FlashInferPackedCudaGraphConfig(
+            PackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text"],
-                packed_seq_len_to_inputs=prefill_text_packed,
-                requires_cfg=False,
-                labels=["main"],
+                capture_token_lengths=list(self.PREFILL_TEXT_TOKEN_BUCKETS),
+                make_node_input=lambda num_tokens: self._build_prefill_text_packed(
+                    num_tokens, device,
+                ),
+                additional_key_info=False,
                 compile=True,
-                causal_attention=True,
                 capture_batch_sizes=self.PREFILL_TEXT_CAPTURE_BATCH_SIZES,
             ),
         ]
@@ -544,36 +590,37 @@ class LLMSubmodule(ARNodeSubmodule):
         cfg = any([info.requires_cfg for info in per_request_info.values()])
         return self._get_active_labels(graph_walk, cfg)
 
-    def _get_active_labels(
-        self, graph_walk: str, cfg: bool
+    def _get_active_labels(self, graph_walk: str, cfg: bool):
+        return active_labels(graph_walk, cfg, self.node_name)
+
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
     ):
-        if graph_walk in {"prefill_text", "decode"}:
-            if cfg:
-                return ["main", "cfg_img"]
-        elif graph_walk == "image_gen":
-            if cfg:
-                return ["main", "cfg_text", "cfg_img"]
-        elif graph_walk == "image_gen_cfg":
-            # Parallel CFG: each LLM node handles one label only
-            return [self._NODE_TO_CFG_LABEL.get(self.node_name, "main")]
-        return ["main"]
+        """Guidance on/off, which is what separates this walk's two decode
+        captures. Same fact `declare_step` stamps on the step, read from the
+        batch rather than from the prepared inputs because the lease can be
+        taken before `prepare_inputs` runs (the speculation path)."""
+        del graph_walk
+        return self._batch_get_requires_cfg(per_request_info)
 
     def prepare_inputs(
         self,
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        seen_token_mask: SeenTokenMask,
-        pos_info: dict[str, PositionInfo] = {},
         **kwargs
     ) -> ARNodeInputs:
 
         device = self.get_device()
         node_inputs = ARNodeInputs(input_seq_len=0)
+        # What `declare_step` needs but cannot see: whether this request runs
+        # the guidance branches. It is per-request, so it travels with the
+        # request's inputs rather than being read off the batch later.
+        node_inputs.resource_step_info = fwd_info.requires_cfg
 
         if graph_walk == "prefill_text":
             node_inputs.input_ids = inputs["text_inputs"][0]
-            seen_token_mask.add_tokens(node_inputs.input_ids)
             node_inputs.input_seq_len = node_inputs.input_ids.shape[0]
 
         elif graph_walk == "decode":
@@ -589,7 +636,7 @@ class LLMSubmodule(ARNodeSubmodule):
             labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
 
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, pos_info, device, seq_len
+                labels, fwd_info.request_id, device, seq_len
             )
 
         if graph_walk == "prefill_vae":
@@ -624,7 +671,7 @@ class LLMSubmodule(ARNodeSubmodule):
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, pos_info, device, seq_len
+                labels, fwd_info.request_id, device, seq_len
             )
             node_inputs.tensor_inputs = {
                 **tensor_inputs,
@@ -636,55 +683,69 @@ class LLMSubmodule(ARNodeSubmodule):
     def declare_step(
         self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
+        request_ids: list[str],
         inputs: list[ARNodeInputs],
-    ) -> StepDeclaration:
-        requires_cfg = self._batch_get_requires_cfg(
-            engine_inputs.per_request_info
-        )
+    ) -> SubmoduleStep | None:
+        """This batch's step: which cache streams it touches, by how much,
+        what backs them, and what commits.
+
+        The three CFG branches are three labels on the same cache. Which of
+        them are live is a per-request property, so it rides in on
+        ``NodeInputs.resource_step_info`` from ``prepare_inputs`` rather than
+        being read off the batch here.
+        """
+        requires_cfg = any(bool(inp.resource_step_info) for inp in inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
         spans = tuple(inp.input_seq_len for inp in inputs)
+
+        # Label-major, matching how a combined plan concatenates its sources;
+        # this tuple is the ordering authority for every per-token array.
+        segments = tuple(
+            Segment(rid, label, span)
+            for label in labels
+            for rid, span in zip(request_ids, spans, strict=True)
+        )
         per_label_pos_ids = {
             label: [
-                inp.custom_pos_ids[label] for inp in inputs \
-                    if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
+                inp.custom_pos_ids[label] for inp in inputs
+                if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
             ] for label in labels
         }
 
         if graph_walk == "image_gen" and requires_cfg:
-            # Batched CFG: one combined plan across all 3 labels so image_gen
-            # runs one forward pass instead of 3. The frozen caches never
-            # grow during flow matching, so nothing commits.
-            return StepDeclaration(plans=(PlanSpec(
-                labels=tuple(labels),
-                spans={label: spans for label in labels},
-                is_causal=False,
-                write_store=False,
-                rope=True,
-                rope_pos_ids=per_label_pos_ids,
-                combined=True,
-                commit=False,
-            ),))
+            # Batched CFG: one combined plan across all three labels so
+            # image_gen runs one forward instead of three. The frozen caches
+            # never grow during flow matching, so nothing commits.
+            pos_ids = [
+                tensor for label in labels for tensor in per_label_pos_ids[label]
+            ]
+            return SubmoduleStep(cg_key_info=requires_cfg, steps={
+                "kv": KVStep(
+                    segments=segments,
+                    commit=False,
+                    combined_labels={tuple(labels): self.CFG_BATCHED_LABEL},
+                ),
+                "attn": AttentionStep(segments=segments, causal=False),
+                "rope": PositionStep(
+                    segments=segments,
+                    # keyed by plan label: the combined plan is one label, and
+                    # its ids are concatenated in the same label-major order
+                    pos_ids={
+                        self.CFG_BATCHED_LABEL: torch.cat(pos_ids)
+                    } if pos_ids else None,
+                ),
+            })
 
         writes = graph_walk not in ("image_gen", "image_gen_cfg")
         # Image blocks occupy one position regardless of their token count.
         pos_advance = (
-            (1,) * len(inputs)
+            (1,) * len(segments)
             if graph_walk in ("prefill_vit", "prefill_vae") else None
         )
-        plans = []
-        for label in labels:
-            pos_list = per_label_pos_ids.get(label)
-            plans.append(PlanSpec(
-                labels=(label,),
-                spans={label: spans},
-                is_causal=graph_walk in ("prefill_text", "decode"),
-                write_store=writes,
-                rope=True,
-                rope_pos_ids=torch.cat(pos_list) if pos_list else None,
-                commit=writes,
-                pos_advance=pos_advance,
-            ))
+        pos_ids = {
+            label: torch.cat(tensors)
+            for label, tensors in per_label_pos_ids.items() if tensors
+        }
 
         pre_forks: tuple = ()
         post_forks: tuple = ()
@@ -697,9 +758,40 @@ class LLMSubmodule(ARNodeSubmodule):
                 # cfg_text tracks the context including this image, so it
                 # forks at commit, after the step's writes have landed.
                 post_forks = (("main", "cfg_text"),)
-        return StepDeclaration(
-            plans=tuple(plans), pre_forks=pre_forks, post_forks=post_forks,
-        )
+
+        # `cg_key_info` picks among the walk's capture buckets; it must match
+        # the `additional_key_info` on the configs in get_cuda_graph_configs.
+        steps: dict = {}
+        if graph_walk == "prefill_text":
+            # The prompt's tokens enter the repetition-penalty mask here; the
+            # sampler resource adds them at plan time. Only prefill carries
+            # them — a sampled token is tracked by the sampler itself.
+            steps["sampler"] = SamplerStep(prefill_tracked_tokens={
+                rid: inp.input_ids
+                for rid, inp in zip(request_ids, inputs, strict=True)
+                if inp.input_ids is not None
+            })
+        elif graph_walk == "decode":
+            steps["sampler"] = SamplerStep()
+
+        steps.update({
+            "kv": KVStep(
+                segments=segments,
+                commit=writes,
+                pre_forks=pre_forks,
+                post_forks=post_forks,
+            ),
+            "attn": AttentionStep(
+                segments=segments,
+                causal=graph_walk in ("prefill_text", "decode"),
+            ),
+            "rope": PositionStep(
+                segments=segments,
+                pos_ids=pos_ids or None,
+                advance=pos_advance,
+            ),
+        })
+        return SubmoduleStep(cg_key_info=requires_cfg, steps=steps)
 
     def preprocess(
         self,
@@ -732,29 +824,27 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> NameToTensorList:
 
         request_info = engine_inputs.single_request_info
-        cache_handle = engine_inputs.cache_manager
         kwargs.update(request_info.step_metadata)
 
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
 
         if graph_walk == "prefill_text":
-            return self._forward_prefill_text(cache_handle=cache_handle, **kwargs)
+            return self._forward_prefill_text(**kwargs)
         elif graph_walk == "prefill_vit":
-            return self._forward_prefill_vit(cache_handle=cache_handle, **kwargs)
+            return self._forward_prefill_vit(**kwargs)
         elif graph_walk == "prefill_vae":
-            return self._forward_prefill_vae(cache_handle=cache_handle, **kwargs)
+            return self._forward_prefill_vae(**kwargs)
         elif graph_walk == "decode":
-            return self._forward_decode(cache_handle=cache_handle, **kwargs)
+            return self._forward_decode(**kwargs)
         elif graph_walk == "image_gen":
-            return self._forward_image_gen(cache_handle=cache_handle, **kwargs)
+            return self._forward_image_gen(**kwargs)
         elif graph_walk == "image_gen_cfg":
-            return self._forward_image_gen_single_branch(cache_handle=cache_handle, **kwargs)
+            return self._forward_image_gen_single_branch(**kwargs)
         else:
             raise ValueError(f"Unknown LLM graph walk: {graph_walk!r}")
 
     def _forward_prefill_text(
         self, input_ids: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
@@ -770,21 +860,21 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
-        if requires_cfg and cache_handle is not None:
+        if requires_cfg:
             for label in ["main", "cfg_img"]:
                 out = self.language_model(
                     emb, mode="und",
-                    cache_handle=cache_handle, label=label, **kwargs
+                    label=label, **kwargs
                 )
                 if label == "main":
                     hidden = out
         else:
             hidden = self.language_model(
                 emb, mode="und",
-                cache_handle=cache_handle, label="main", **kwargs
+                label="main", **kwargs
             )
         if sample_token:
-            qo_indptr_buf = cache_handle.attention.qo_indptr_buf("main")
+            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
             assert qo_indptr_buf is not None
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
             last_hidden = hidden.index_select(0, last_token_indices)
@@ -796,7 +886,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _forward_prefill_vit(
         self, input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
         """Wrap img_emb with BOI/EOI tokens -> LLM forward (bidirectional).
@@ -812,11 +901,11 @@ class LLMSubmodule(ARNodeSubmodule):
 
         hidden = self.language_model(
             input_embeds, mode="und",
-            cache_handle=cache_handle, label="main", **kwargs
+            label="main", **kwargs
         )
 
         if sample_token:
-            qo_indptr_buf = cache_handle.attention.qo_indptr_buf("main")
+            qo_indptr_buf = self.node_resources["attn"].qo_indptr_buf("main")
             assert qo_indptr_buf is not None
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
             last_hidden = hidden.index_select(0, last_token_indices)
@@ -831,7 +920,6 @@ class LLMSubmodule(ARNodeSubmodule):
         vae_token_indexes: torch.Tensor,
         text_indexes: torch.Tensor,
         text_mask: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
         """VAE image emb -> LLM forward (bidirectional, gen mode).
@@ -846,7 +934,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
         self.language_model(
             input_embeds, mode="gen",
-            cache_handle=cache_handle,
             label="main",
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
@@ -860,7 +947,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _forward_decode(
         self, input_ids: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         **kwargs
     ) -> NameToTensorList:
         """embed_tokens -> LLM forward -> lm_head -> logits.
@@ -882,13 +968,13 @@ class LLMSubmodule(ARNodeSubmodule):
 
         hidden = self.language_model(
             emb, mode="und",
-            cache_handle=cache_handle, label="main", **kwargs
+            label="main", **kwargs
         )
 
-        if requires_cfg and cache_handle is not None:
+        if requires_cfg:
             self.language_model(
                 emb, mode="und",
-                cache_handle=cache_handle, label="cfg_img", **kwargs
+                label="cfg_img", **kwargs
             )
 
         logits = self.lm_head(hidden[-1:])
@@ -914,7 +1000,6 @@ class LLMSubmodule(ARNodeSubmodule):
         vae_token_indexes: torch.Tensor,
         text_mask: torch.Tensor,
         time_index: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         requires_cfg: bool = True,
         **kwargs,
     ) -> NameToTensorList:
@@ -999,7 +1084,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
             hidden = self.language_model(
                 batched_emb, mode="gen",
-                cache_handle=cache_handle, label="_cfg_batched",
+                label=self.CFG_BATCHED_LABEL,
                 vae_token_indexes=batched_vae_indexes,
                 text_indexes=batched_text_indexes,
                 text_mask=batched_text_mask,
@@ -1047,7 +1132,7 @@ class LLMSubmodule(ARNodeSubmodule):
             # No CFG: single forward pass over the declared plan
             hidden = self.language_model(
                 empty_combined_emb, mode="gen",
-                cache_handle=cache_handle, label="main",
+                label="main",
                 vae_token_indexes=vae_token_indexes,
                 text_indexes=text_indexes,
                 text_mask=text_mask,
@@ -1073,7 +1158,6 @@ class LLMSubmodule(ARNodeSubmodule):
         vae_token_indexes: torch.Tensor,
         text_mask: torch.Tensor,
         time_index: torch.Tensor,
-        cache_handle: "BatchedCacheManager",
         **kwargs,
     ) -> NameToTensorList:
         """Single-branch LLM forward for parallel CFG (image_gen_cfg walk).
@@ -1115,7 +1199,7 @@ class LLMSubmodule(ARNodeSubmodule):
         label = self._NODE_TO_CFG_LABEL.get(self.node_name, "main")
         hidden = self.language_model(
             empty_combined_emb, mode="gen",
-            cache_handle=cache_handle, label=label,
+            label=label,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
             text_mask=text_mask,
@@ -1156,21 +1240,18 @@ class LLMSubmodule(ARNodeSubmodule):
         """Batched forward pass for decode and prefill_text.
 
         Concatenates inputs across requests, runs a single LLM forward with
-        the BatchedCacheManager, then splits outputs back per-request.
+        one batched attention plan, then splits outputs back per-request.
         """
         request_ids = engine_inputs.request_ids
-        cache_manager = engine_inputs.cache_manager
 
         if graph_walk == "decode":
             return self._forward_decode_batched(
-                cache_manager=cache_manager,
                 request_ids=request_ids,
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
             )
         elif graph_walk == "prefill_text":
             out = self._forward_prefill_text(
-                cache_handle=cache_manager,
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
                 # sample for cuda graph compatibility
@@ -1184,7 +1265,6 @@ class LLMSubmodule(ARNodeSubmodule):
             return out
         elif graph_walk == "prefill_vit":
             out = self._forward_prefill_vit(
-                cache_handle=cache_manager,
                 input_embeds=input_embeds,
                 requires_cfg=requires_cfg,
                 sample_prefill_token=sample_token,
@@ -1200,7 +1280,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _forward_decode_batched(
         self,
-        cache_manager: BatchedCacheManager,
         request_ids: list[str],
         input_ids: torch.Tensor,
         requires_cfg: bool = False,
@@ -1208,7 +1287,7 @@ class LLMSubmodule(ARNodeSubmodule):
         """Batched decode: all requests generate 1 token each.
 
         1. Concatenate embeddings: [N, hidden] where N = num_requests
-        2. Single LLM forward with cache_manager (batched attention)
+        2. Single LLM forward over the batch (batched attention)
         3. If any request requires CFG, run a second pass for cfg_img
         4. Per-request lm_head -> logits
 
@@ -1221,14 +1300,14 @@ class LLMSubmodule(ARNodeSubmodule):
         # 2. Single LLM forward (main cache, already planned)
         hidden = self.language_model(
             embs, mode="und",
-            cache_handle=cache_manager, label="main",
+            label="main",
         )
 
         # 3. CFG sync pass for cfg_img if needed (already planned)
         if requires_cfg:
             self.language_model(
                 embs, mode="und",
-                cache_handle=cache_manager, label="cfg_img",
+                label="cfg_img",
             )
 
         # 4. Per-request lm_head -> logits (no sampling — done post-forward)
