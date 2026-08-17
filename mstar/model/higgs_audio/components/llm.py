@@ -17,7 +17,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -83,14 +82,14 @@ class HiggsAudioLLM(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = input_embeds
         for layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
-                hidden_states=hidden_states, cache_handle=cache_handle,
+                hidden_states=hidden_states, label=label, layer_idx=layer_idx,
             )
-        cache_handle.advance_seq_lens()
+        # the advance is the runner's now, off the step declaration
         return self.norm(hidden_states)

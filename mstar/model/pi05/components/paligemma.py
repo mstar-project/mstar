@@ -15,7 +15,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.pi05.config import Pi05Config
@@ -73,16 +72,14 @@ class Pi05PaliGemmaExpert(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        write_cache: bool = True,
+        *,
+        label: str,
     ) -> torch.Tensor:
         for layer_idx, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
             query_sequence = layer(
-                hidden_states=query_sequence, cache_handle=cache_handle,
+                hidden_states=query_sequence, label=label, layer_idx=layer_idx,
             )
 
-        if write_cache:
-            cache_handle.advance_seq_lens()
-
+        # `write_cache` and the advance that followed it are the step
+        # declaration's now: the runner commits the step after the forward.
         return self.norm(query_sequence)

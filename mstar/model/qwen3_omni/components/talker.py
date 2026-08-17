@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
@@ -102,7 +101,6 @@ class Qwen3OmniTalkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         layer_idx: int | None = None,
         label: str | None = None,
     ) -> torch.Tensor:
@@ -111,7 +109,6 @@ class Qwen3OmniTalkerLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
-            cache_handle=cache_handle,
             layer_idx=layer_idx,
             label=label,
         )
@@ -159,14 +156,12 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         label: str = "main",
     ) -> torch.Tensor:
         hidden_states = input_embeds
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 hidden_states=hidden_states,
-                cache_handle=cache_handle,
                 layer_idx=layer_idx,
                 label=label,
             )
@@ -234,7 +229,6 @@ class Qwen3OmniTalkerModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         label: str = "main",
     ) -> torch.Tensor:
         """Run the Talker backbone and return the final hidden states.
@@ -245,14 +239,13 @@ class Qwen3OmniTalkerModel(nn.Module):
         Args:
             input_embeds: [total_tokens, hidden_size] -- pre-embedded input
                 (may combine codec embeddings and projected Thinker states).
-            cache_handle: the step surface for paged KV attention.
             label: the plan key every layer runs against.
 
         Returns:
             hidden_states: [total_tokens, hidden_size] after final RMS norm.
         """
         return self.model(
-            input_embeds=input_embeds, cache_handle=cache_handle, label=label,
+            input_embeds=input_embeds, label=label,
         )
 
 
@@ -287,11 +280,11 @@ class Qwen3OmniCodePredictorLayer(nn.Module):
             activation="silu",
         )
 
-    def forward(self, hidden_states, cache_handle):
+    def forward(self, hidden_states, *, label: str, layer_idx: int):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
-            hidden_states=hidden_states, cache_handle=cache_handle,
+            hidden_states=hidden_states,
         )
         hidden_states = residual + hidden_states
 
@@ -334,18 +327,16 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
             for _ in range(num_residual)
         ])
 
-    def forward(self, hidden_states: torch.Tensor, cache_handle: BatchedCacheManager):
+    def forward(self, hidden_states: torch.Tensor, *, label: str):
         """
         Just runs the inner layers; does NOT run embedding.
         """
-        for _layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(_layer_idx)
+        for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
-                hidden_states,
-                cache_handle
+                hidden_states, label=label, layer_idx=layer_idx,
             )
         hidden_states = self.norm(hidden_states)
-        cache_handle.advance_seq_len()
+        # the advance is the runner's now, off the step declaration
         return hidden_states
 
     def get_input_embeddings(self):

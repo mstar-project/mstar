@@ -260,8 +260,21 @@ class NodeSubmodule(torch.nn.Module):
         self.node_resources: dict[str, Any] = {}
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
-        """Receive the engine-built resources for this submodule's node."""
+        """Receive the engine-built resources for this submodule's node, and
+        pass them down to every layer that calls one.
+
+        A layer body (attention, cross-attention) calls the resources
+        directly — ``attn.run``, ``kv.write_kv``, ``pos.apply_qk`` — so it
+        needs its own references. It resolves them here, once at load, by the
+        labels the model declared in ``get_node_resources``; a layer that
+        names a label this node doesn't have fails at bind rather than in the
+        middle of a forward.
+        """
         self.node_resources = resources
+        for module in self.modules():
+            bind = getattr(module, "bind_resources", None)
+            if bind is not None and module is not self:
+                bind(resources)
 
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""

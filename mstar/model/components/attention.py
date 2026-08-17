@@ -19,7 +19,7 @@ Variations supported:
     ``low_freq_factor``, etc.) for the cache-handle path.
 
 For non-standard RoPE schemes (e.g. qwen3's 3D MRoPE), subclass and
-override ``_apply_rope`` rather than going through ``cache_handle.apply_rope``.
+override ``_apply_rope`` rather than going through the position resource.
 """
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.norm import RMSNorm
 
 
@@ -49,8 +48,21 @@ class Attention(nn.Module):
         rope_high_freq_factor: float = 1.0,
         rope_old_context_len: int = 8192,
         input_hidden_size: int | None = None,
+        attn_key: str = "attn",
+        kv_key: str = "kv",
+        pos_key: str | None = "rope",
     ):
         super().__init__()
+        # Resource labels this layer calls, as the model declared them in
+        # ``get_node_resources``. Resolved to objects in ``bind_resources``;
+        # ``pos_key=None`` is a model whose positions are baked in elsewhere.
+        self._attn_key = attn_key
+        self._kv_key = kv_key
+        self._pos_key = pos_key
+        self.attn = None
+        self.kv = None
+        self.pos = None
+
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -127,17 +139,29 @@ class Attention(nn.Module):
         k = self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
         return q, k
 
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve the resources this layer calls. See
+        ``NodeSubmodule.bind_node_resources``."""
+        self.attn = resources[self._attn_key]
+        self.kv = resources[self._kv_key]
+        self.pos = None if self._pos_key is None else resources[self._pos_key]
+
     def _apply_rope(
         self,
-        q: torch.Tensor, k: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        q: torch.Tensor, k: torch.Tensor, label: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Standard 1D RoPE via ``cache_handle.apply_rope``.
+        """Standard 1D RoPE through the position resource.
 
         Override in subclasses for non-standard schemes (3D MRoPE, etc.).
         """
-        return cache_handle.apply_rope(
-            q, k,
+        if self.pos is None:
+            return q, k
+        # The llama31 kwargs go through unconditionally, as they did on the
+        # old cache-handle path — passing them at all selects flashinfer's
+        # llama31 kernel, so dropping them here would change the numerics of
+        # every model using this layer.
+        return self.pos.apply_qk(
+            q, k, label=label,
             rope_theta=self.rope_theta,
             rope_scale=self.rope_scale,
             low_freq_factor=self.rope_low_freq_factor,
@@ -148,13 +172,26 @@ class Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
+        """``label`` and ``layer_idx`` are what the old facade carried as a
+        cursor (``set_active_label`` / ``set_layer_idx``); the caller that set
+        the cursor passes them here instead."""
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self._apply_rope(q, k, cache_handle)
-        attn_output = cache_handle.run_attention(q=q, k=k, v=v)
+        q, k = self._apply_rope(q, k, label)
+        # the paged backends read K/V back out of the pages, so the write has
+        # to land before the attend; a backend that takes the fresh K/V
+        # straight into its kernel says so and skips it
+        if self.attn.requires_kv_write:
+            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
+        attn_output = self.attn.run(
+            q, label, self.kv.layer_view(layer_idx),
+            k=k, v=v, layer_idx=layer_idx,
+        )
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
@@ -191,11 +228,19 @@ class CrossAttention(nn.Module):
         v_bias: bool = True,
         o_bias: bool = True,
         source: str = "default",
+        cross_key: str | None = None,
+        context_kv_key: str | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
+        # ``source`` named a pool on the old facade; each source is its own
+        # cross-attention resource now, so it doubles as the default label.
         self.source = source
+        self._cross_key = cross_key or source
+        self._context_kv_key = context_kv_key
+        self.cross = None
+        self.context_kv = None
         inner = num_heads * head_dim
         self.q_proj = nn.Linear(hidden_size, inner, bias=q_bias)
         self.k_proj = nn.Linear(hidden_size, inner, bias=k_bias)
@@ -215,11 +260,22 @@ class CrossAttention(nn.Module):
         v = self.v_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
         return k, v
 
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve this source's cross-attention resource and the cache
+        holding its context. See ``NodeSubmodule.bind_node_resources``."""
+        self.cross = resources[self._cross_key]
+        key = self._context_kv_key
+        if key is None:
+            # the resource already names the cache it attends
+            key = self.cross.context_cache_key
+        self.context_kv = resources[key]
+
     def forward(
-        self, hidden_states: torch.Tensor, cache_handle: BatchedCacheManager,
+        self, hidden_states: torch.Tensor, *, label: str, layer_idx: int,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
-        attn = cache_handle.run_cross_attn(q, source=self.source)
+        # nothing is written here: the context was written once at encode time
+        attn = self.cross.run(q, label, self.context_kv.layer_view(layer_idx))
         attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.out_proj(attn)

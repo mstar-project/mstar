@@ -20,7 +20,6 @@ from typing import Optional, Tuple
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.distributed import ParallelAttention
 
 
@@ -61,11 +60,11 @@ class Qwen3OmniAttention(ParallelAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
-        layer_idx: int | None = None,
-        label: str | None = None,
+        *,
+        layer_idx: int,
+        label: str,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
@@ -76,18 +75,13 @@ class Qwen3OmniAttention(ParallelAttention):
             cos, sin = cos_sin_3d
             q, k = apply_interleaved_mrope(q, k, cos, sin)
         else:
-            q, k = cache_handle.apply_rope(
-                q, k,
-                rope_theta=self.rope_theta,
-                rope_scale=self.rope_scale,
-                low_freq_factor=self.rope_low_freq_factor,
-                high_freq_factor=self.rope_high_freq_factor,
-                old_context_len=self.rope_old_context_len,
-                label=label,
-            )
+            q, k = self._apply_rope(q, k, label)
 
-        attn_output = cache_handle.run_attention(
-            q=q, k=k, v=v, layer_idx=layer_idx, label=label,
+        if self.attn.requires_kv_write:
+            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
+        attn_output = self.attn.run(
+            q, label, self.kv.layer_view(layer_idx),
+            k=k, v=v, layer_idx=layer_idx,
         )
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

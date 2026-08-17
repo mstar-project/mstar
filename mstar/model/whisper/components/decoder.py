@@ -1,7 +1,7 @@
 """Whisper text decoder built on the shared mstar components.
 
 The decoder is a standard pre-norm transformer with three sublayers per
-block: causal self-attention (paged KV cache via ``cache_handle``),
+block: causal self-attention (paged KV cache via the engine resources),
 cross-attention over the audio encoder's output, and a plain GELU FFN.
 
 Whisper has no RoPE — positions come from a learned ``embed_positions``
@@ -11,8 +11,8 @@ self-attention subclass makes ``_apply_rope`` a no-op.
 Cross-attention K/V depend only on the (static) encoder output, so they
 are computed once per request at prefill (``compute_cross_kv``) and
 written into the engine's cross-attention context pool
-(``cache_handle.add_cross_attn_kv``); every step then runs the
-pre-planned ``cache_handle.run_cross_attn`` — see issue #160.
+(written once into the context cache); every step then runs the
+pre-planned cross-attention resource — see issue #160.
 
 HF checkpoint quirks handled here:
   * ``self_attn.out_proj`` → ``self_attn.o_proj`` (name_remapper in
@@ -27,7 +27,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.attention import Attention, CrossAttention
 from mstar.model.whisper.config import WhisperModelConfig
 
@@ -36,7 +35,7 @@ CrossKV = tuple[torch.Tensor, torch.Tensor]
 
 class WhisperSelfAttention(Attention):
     def _apply_rope(
-        self, q: torch.Tensor, k: torch.Tensor, cache_handle: BatchedCacheManager,
+        self, q: torch.Tensor, k: torch.Tensor, label: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Whisper uses learned absolute positions added at embedding time.
         return q, k
@@ -50,7 +49,7 @@ class WhisperCrossAttention(CrossAttention):
     contiguous per-layer encoder K/V (``cross_kv``), cross-attention runs as
     an inline ``scaled_dot_product_attention`` so it is *traced into the
     torch.compiled decoder graph* — avoiding the per-layer graph break and
-    eager FlashInfer wrapper of ``cache_handle.run_cross_attn``. When
+    eager FlashInfer wrapper of the cross-attention resource. When
     ``cross_kv`` is ``None`` it falls back to the engine cross-attention pool
     (batched / concurrent serving still uses that path).
 
@@ -63,11 +62,15 @@ class WhisperCrossAttention(CrossAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cross_kv: CrossKV | None = None,
+        *,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
         if cross_kv is None:
-            return super().forward(hidden_states, cache_handle)
+            return super().forward(
+                hidden_states, label=label, layer_idx=layer_idx,
+            )
         num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
         k, v = cross_kv  # each (enc_len, num_heads, head_dim), static per request
@@ -107,16 +110,22 @@ class WhisperDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cross_kv: CrossKV | None = None,
+        *,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = residual + self.self_attn(hidden_states, cache_handle)
+        hidden_states = residual + self.self_attn(
+            hidden_states, label=label, layer_idx=layer_idx,
+        )
 
         residual = hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
-        hidden_states = residual + self.encoder_attn(hidden_states, cache_handle, cross_kv)
+        hidden_states = residual + self.encoder_attn(
+            hidden_states, cross_kv, label=label, layer_idx=layer_idx,
+        )
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -164,9 +173,10 @@ class WhisperDecoderModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cross_k: torch.Tensor | None = None,
         cross_v: torch.Tensor | None = None,
+        *,
+        label: str,
     ) -> torch.Tensor:
         # cross_k/cross_v (when given): stacked contiguous encoder K/V,
         # (num_layers, enc_len, num_heads, head_dim). Supplying them routes
@@ -174,8 +184,9 @@ class WhisperDecoderModel(nn.Module):
         # #160 recovery) instead of the engine cross-attention pool.
         hidden_states = input_embeds
         for layer_idx, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
             cross_kv = None if cross_k is None else (cross_k[layer_idx], cross_v[layer_idx])
-            hidden_states = layer(hidden_states, cache_handle, cross_kv)
-        cache_handle.advance_seq_lens()
+            hidden_states = layer(
+                hidden_states, cross_kv, label=label, layer_idx=layer_idx,
+            )
+        # the advance is the runner's now, off the step declaration
         return self.layer_norm(hidden_states)

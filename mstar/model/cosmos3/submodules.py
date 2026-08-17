@@ -37,13 +37,13 @@ from mstar.engine.cuda_graph_config import (
     BasicBatchedCudaGraphConfig,
     FlashInferPackedCudaGraphConfig,
 )
+from mstar.engine.resources import PlanSpec, StepDeclaration
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
     build_static_inputs,
     vision_condition_frame_indexes,
 )
-from mstar.engine.resources import PlanSpec, StepDeclaration
 from mstar.model.cosmos3.constants import (
     ACTION_GEN_WALK,
     ACTION_VIDEO_GEN_WALK,

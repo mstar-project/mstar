@@ -18,7 +18,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import AdaRMSNorm, GatedDecoderLayer
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.pi05.config import Pi05Config
@@ -92,15 +91,16 @@ class Pi05ActionExpert(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         adarms_cond: torch.Tensor,
+        *,
+        label: str,
     ) -> torch.Tensor:
         for layer_idx, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
             query_sequence = layer(
                 hidden_states=query_sequence,
-                cache_handle=cache_handle,
                 adarms_cond=adarms_cond,
+                label=label,
+                layer_idx=layer_idx,
             )
         out, _ = self.norm(query_sequence, adarms_cond)
         return out

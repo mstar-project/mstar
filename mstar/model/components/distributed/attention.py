@@ -24,7 +24,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
@@ -51,8 +50,18 @@ class ParallelAttention(nn.Module):
         rope_high_freq_factor: float = 1.0,
         rope_old_context_len: int = 8192,
         input_hidden_size: int | None = None,
+        attn_key: str = "attn",
+        kv_key: str = "kv",
+        pos_key: str | None = "rope",
     ):
         super().__init__()
+        # resource labels this layer calls; see components/attention.py
+        self._attn_key = attn_key
+        self._kv_key = kv_key
+        self._pos_key = pos_key
+        self.attn = None
+        self.kv = None
+        self.pos = None
         if comm_group is None:
             comm_group = CommGroup.trivial()
         self.comm_group = comm_group
@@ -119,15 +128,26 @@ class ParallelAttention(nn.Module):
         k = self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
         return q, k
 
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve the resources this layer calls. See
+        ``NodeSubmodule.bind_node_resources``."""
+        self.attn = resources[self._attn_key]
+        self.kv = resources[self._kv_key]
+        self.pos = None if self._pos_key is None else resources[self._pos_key]
+
     def _apply_rope(
         self,
-        q: torch.Tensor, k: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        q: torch.Tensor, k: torch.Tensor, label: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Standard 1D RoPE via ``cache_handle.apply_rope``. Override for
-        non-standard schemes (3D MRoPE, etc.)."""
-        return cache_handle.apply_rope(
-            q, k,
+        """Standard 1D RoPE through the position resource. Override for
+        non-standard schemes (3D MRoPE, etc.).
+
+        The llama31 kwargs go through unconditionally, as they did on the old
+        cache-handle path — passing them selects flashinfer's llama31 kernel."""
+        if self.pos is None:
+            return q, k
+        return self.pos.apply_qk(
+            q, k, label=label,
             rope_theta=self.rope_theta,
             rope_scale=self.rope_scale,
             low_freq_factor=self.rope_low_freq_factor,
@@ -138,12 +158,19 @@ class ParallelAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self._apply_rope(q, k, cache_handle)
-        attn_output = cache_handle.run_attention(q=q, k=k, v=v)
+        q, k = self._apply_rope(q, k, label)
+        if self.attn.requires_kv_write:
+            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
+        attn_output = self.attn.run(
+            q, label, self.kv.layer_view(layer_idx),
+            k=k, v=v, layer_idx=layer_idx,
+        )
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

@@ -23,7 +23,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.vjepa2.components.rope_utils import rotate_queries_or_keys, rotate_queries_or_keys_BNHD
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
 
@@ -129,7 +128,8 @@ class ACRoPEAttention(nn.Module):
         w: int,
         action_tokens: int,
         t_0: int = 0,
-        cache_handle: BatchedCacheManager | None = None,
+        label: str | None = None,
+        layer_idx: int = 0,
         # Pre-computed position tensors for the cached path.  When provided
         # (CUDA-graph path), they are static GPU buffers already on device and
         # no torch.arange / torch.full calls happen inside the captured region.
@@ -139,7 +139,7 @@ class ACRoPEAttention(nn.Module):
         w_pos: torch.Tensor | None = None,
         time_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if cache_handle is not None:
+        if label is not None:
             if d_pos is None:
                 d_pos, h_pos, w_pos, time_pos = self._compute_positions(
                     t_0, h, w, action_tokens, x.device, x.dtype
@@ -148,7 +148,8 @@ class ACRoPEAttention(nn.Module):
                 x=x,
                 d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
                 action_tokens=action_tokens,
-                cache_handle=cache_handle,
+                label=label,
+                layer_idx=layer_idx,
             )
         b, n, c = x.size()
 
@@ -229,7 +230,8 @@ class ACRoPEAttention(nn.Module):
         w_pos: torch.Tensor,               # [H*W]  — width positions
         time_pos: torch.Tensor | None,     # [action_tokens] or None
         action_tokens: int,
-        cache_handle: BatchedCacheManager,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
         """Single-frame cached attention with pre-computed position tensors.
 
@@ -293,9 +295,18 @@ class ACRoPEAttention(nn.Module):
         k = k.reshape(b * n, self.num_heads, hd)
         v = v.reshape(b * n, self.num_heads, hd)
 
-        x = cache_handle.run_attention(q, k, v)
+        if self.attn.requires_kv_write:
+            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
+        x = self.attn.run(
+            q, label, self.kv.layer_view(layer_idx),
+            k=k, v=v, layer_idx=layer_idx,
+        )
         x = x.reshape(b, n, c)
         return self.proj(x)
+
+    def bind_resources(self, resources: dict) -> None:
+        self.attn = resources["attn"]
+        self.kv = resources["kv"]
 
 
 class ACBlock(nn.Module):
@@ -328,7 +339,8 @@ class ACBlock(nn.Module):
         w: int,
         action_tokens: int,
         t_0: int = 0,
-        cache_handle: BatchedCacheManager | None = None,
+        label: str | None = None,
+        layer_idx: int = 0,
         d_pos: torch.Tensor | None = None,
         h_pos: torch.Tensor | None = None,
         w_pos: torch.Tensor | None = None,
@@ -336,7 +348,8 @@ class ACBlock(nn.Module):
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x), attn_mask=attn_mask, t=t, h=h, w=w,
-            action_tokens=action_tokens, t_0=t_0, cache_handle=cache_handle,
+            action_tokens=action_tokens, t_0=t_0, label=label,
+            layer_idx=layer_idx,
             d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
         )
         x = x + self.mlp(self.norm2(x))
@@ -482,7 +495,7 @@ class VisionTransformerPredictorAC(nn.Module):
 
     def make_block_loop_fn(
         self,
-        static_cache_manager,           # BatchedCacheManager with persistent wrappers, or None
+        label: str | None,              # None runs the blocks without paged attention
         static_pos_bufs: dict,          # {"d_pos": Tensor, "h_pos": Tensor, ...}
         cond_tokens: int,
     ):
@@ -490,12 +503,11 @@ class VisionTransformerPredictorAC(nn.Module):
 
         The returned ``fn(x) -> x`` reads position tensors from
         ``static_pos_bufs`` (which the runner updates via ``.copy_()`` before
-        each replay) and uses ``static_cache_manager`` (whose FlashInfer
-        wrapper is re-planned outside the graph before each replay).
+        each replay) and attends under ``label``, whose plan the runner drives
+        outside the graph before each replay.
 
-        ``advance_seq_len`` is NOT called inside this closure — the runner
-        calls it after ``graph.replay()`` so it stays outside the captured
-        region.
+        The stream advance is NOT done inside this closure — the runner
+        commits the step after ``graph.replay()``, outside the captured region.
         """
         blocks = self.predictor_blocks
         gh, gw = self.grid_height, self.grid_width
@@ -506,15 +518,14 @@ class VisionTransformerPredictorAC(nn.Module):
             w_pos   = static_pos_bufs["w_pos"]
             time_pos = static_pos_bufs.get("time_pos")
             for blk_num, blk in enumerate(blocks):
-                if static_cache_manager is not None:
-                    static_cache_manager.set_layer_idx(blk_num)
                 x = blk(
                     x,
                     attn_mask=None,
                     t=1,                   # always 1 frame per step in rollout
                     h=gh, w=gw,
                     action_tokens=cond_tokens,
-                    cache_handle=static_cache_manager,
+                    label=label,
+                    layer_idx=blk_num,
                     d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
                 )
             return x
@@ -528,7 +539,7 @@ class VisionTransformerPredictorAC(nn.Module):
         states: torch.Tensor,
         extrinsics: torch.Tensor | None = None,
         t_0: int = 0,
-        cache_handle: BatchedCacheManager | None = None,
+        label: str | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -545,7 +556,7 @@ class VisionTransformerPredictorAC(nn.Module):
 
         assert self.config.is_frame_causal, "non-causal AC predictor is not implemented"
 
-        if cache_handle is None:
+        if label is None:
             attn_mask = self._get_attn_mask(x.device)[: x.size(1), : x.size(1)]
             d_pos = h_pos = w_pos = time_pos = None
         else:
@@ -557,8 +568,6 @@ class VisionTransformerPredictorAC(nn.Module):
             )
 
         for blk_num, blk in enumerate(self.predictor_blocks):
-            if cache_handle is not None:
-                cache_handle.set_layer_idx(blk_num)
             x = blk(
                 x,
                 attn_mask=attn_mask,
@@ -567,12 +576,12 @@ class VisionTransformerPredictorAC(nn.Module):
                 w=self.grid_width,
                 action_tokens=cond_tokens,
                 t_0=t_0,
-                cache_handle=cache_handle,
+                label=label,
+                layer_idx=blk_num,
                 d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
             )
 
-        if cache_handle is not None:
-            cache_handle.advance_seq_len()
+        # the advance is the runner's now, off the step declaration
 
         return self._decode_sequence(x, cond_tokens, b, t)
 

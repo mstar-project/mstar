@@ -27,7 +27,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import ParallelSparseMoeBlock, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
@@ -101,7 +100,6 @@ class Qwen3OmniThinkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
         layer_idx: int | None = None,
@@ -110,7 +108,6 @@ class Qwen3OmniThinkerLayer(nn.Module):
         """
         Args:
             hidden_states: [tokens, hidden_size]
-            cache_handle: step surface with pre-planned attention.
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE.
             layer_idx: this layer's index in the stack.
@@ -124,7 +121,6 @@ class Qwen3OmniThinkerLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states,
-            cache_handle=cache_handle,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
             layer_idx=layer_idx,
@@ -194,7 +190,6 @@ class Qwen3OmniThinkerModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
@@ -204,7 +199,6 @@ class Qwen3OmniThinkerModel(nn.Module):
         Args:
             input_embeds: [tokens, hidden_size] -- pre-embedded input
                 (token embeddings possibly merged with multimodal features).
-            cache_handle: step surface with pre-planned attention and RoPE.
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE,
                 e.g. [24, 20, 20].
@@ -228,7 +222,6 @@ class Qwen3OmniThinkerModel(nn.Module):
         for layer_idx, decoder_layer in enumerate(self.model.layers):
             hidden_states = decoder_layer(
                 hidden_states,
-                cache_handle=cache_handle,
                 cos_sin_3d=cos_sin_3d,
                 mrope_section=mrope_section,
                 layer_idx=layer_idx,

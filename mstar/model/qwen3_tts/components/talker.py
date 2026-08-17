@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
 from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
@@ -74,11 +73,15 @@ class Qwen3TTSTalkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cache_handle)
+        hidden_states = self.self_attn(
+            hidden_states, label=label, layer_idx=layer_idx,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -109,18 +112,18 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
     ) -> torch.Tensor:
         hidden_states = input_embeds
         for layer_idx, layer in enumerate(self.layers):
-            # One cache handle owns every layer's paged K/V tensor. Selecting
-            # the layer before attention keeps module code independent of the
-            # physical page allocator.
-            cache_handle.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states, cache_handle)
-        # Sequence lengths advance once per forward, after every layer wrote
-        # K/V for the same packed token range.
-        cache_handle.advance_seq_lens()
+            # The layer names which of the node's KV streams it is writing
+            # (`label`) and which layer of it (`layer_idx`); the resources it
+            # calls own the pages, so module code stays clear of the allocator.
+            hidden_states = layer(hidden_states, label=label, layer_idx=layer_idx)
+        # Sequence lengths still advance once per forward, after every layer
+        # wrote K/V for the same packed range — the runner does it now, on the
+        # step this forward was declared from.
         return self.norm(hidden_states)
 
 
@@ -147,9 +150,10 @@ class Qwen3TTSTalkerModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
     ) -> torch.Tensor:
-        return self.model(input_embeds, cache_handle)
+        return self.model(input_embeds, label=label)
 
 
 # ---------------------------------------------------------------------------

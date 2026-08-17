@@ -13,8 +13,6 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
-
 
 def _gated_residual(
     x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor | None,
@@ -35,8 +33,8 @@ class DecoderLayer(nn.Module):
         x = post_attention_layernorm(x); x = mlp(x); x = residual + x
 
     Args:
-        self_attn: attention module taking ``(hidden_states, cache_handle)``
-            and returning a tensor.
+        self_attn: attention module taking ``(hidden_states, label=,
+            layer_idx=)`` and returning a tensor.
         mlp: feedforward module taking and returning a tensor.
         input_layernorm: pre-attention norm.
         post_attention_layernorm: pre-FFN norm.
@@ -58,11 +56,15 @@ class DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cache_handle=cache_handle)
+        hidden_states = self.self_attn(
+            hidden_states, label=label, layer_idx=layer_idx,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -97,12 +99,14 @@ class GatedDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         adarms_cond: torch.Tensor,
+        *,
+        label: str,
+        layer_idx: int,
     ) -> torch.Tensor:
         residual = hidden_states
         normed, gate = self.input_layernorm(hidden_states, adarms_cond)
-        attn_out = self.self_attn(normed, cache_handle=cache_handle)
+        attn_out = self.self_attn(normed, label=label, layer_idx=layer_idx)
         hidden_states = _gated_residual(residual, attn_out, gate)
 
         residual = hidden_states
