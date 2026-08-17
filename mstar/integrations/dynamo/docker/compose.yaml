@@ -11,7 +11,7 @@
 
 services:
   etcd:
-    image: bitnamilegacy/etcd:3.6.1
+    image: docker.io/bitnamilegacy/etcd:3.6.1
     environment:
       - ALLOW_NONE_AUTHENTICATION=yes
 

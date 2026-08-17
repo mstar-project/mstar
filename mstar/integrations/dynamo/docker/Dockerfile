@@ -10,14 +10,15 @@
 # pyproject.toml only.
 #
 # For a CUDA 13 host, override the three build args together:
-#   --build-arg CUDA_IMAGE=nvidia/cuda:13.0.0-devel-ubuntu24.04
+#   --build-arg CUDA_IMAGE=docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
 #   --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu130
 #   --build-arg FLASH_ATTN_WHEEL=...cu13torch2.9...  (see docs/installation.rst)
 
 # A -devel base is required at runtime, not just at build time: the vendored
 # MoE align kernel and FlashInfer both JIT-compile CUDA kernels on first use
-# and need nvcc.
-ARG CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04
+# and need nvcc. Fully qualified so rootless podman/buildah builds don't trip
+# on short-name resolution.
+ARG CUDA_IMAGE=docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 FROM ${CUDA_IMAGE} AS serve
 
