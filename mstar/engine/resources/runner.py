@@ -132,8 +132,6 @@ class StepRunner:
 
     def admit(self, step: SubmoduleStep) -> AdmitOutcome:
         """reserve capacity for step"""
-        if __debug__:
-            step.validate()
         ready = True
         for key in self._keys_for(step):
             outcome = self._resources[key].admit(step.get(key), step.ctx)

@@ -703,9 +703,18 @@ class Engine:
         yet, so only a batched capture can serve it — see
         ``CudaGraphRunner.select_batched_bucket``.
         """
-        cg_runner = self._submodules[batch.node_name].cuda_graph_runner
+        submodule_mgmt = self._submodules[batch.node_name]
+        cg_runner = submodule_mgmt.cuda_graph_runner
         if cg_runner is None:
             return None
+        # Which of the walk's captures this batch belongs to. The engine can't
+        # derive it — what separates two captures of one walk is the model's
+        # business (bagel: guidance on/off) — and the lease is taken before the
+        # step is declared, so the submodule is asked directly. It answers from
+        # the same per-request facts its `declare_step` stamps on the step.
+        batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
+            batch.step_context.graph_walk, batch.per_request_info,
+        )
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,
             bs=len(batch.request_ids),

@@ -66,10 +66,11 @@ class StepContext:
 
 @dataclass(frozen=True)
 class SubmoduleStep:
-    # NOTE @naomi: I think this is only used for validation and can maybe be
-    # removed? Not sure if keeping it is just extra work for the model author
-    # without added benefit
-    # segments: tuple[Segment, ...] # authoritative ordering
+    # No batch-layout `segments` here: each ResourceStep carries the segments
+    # it covers, and KV's plan output is the packing authority everything
+    # downstream reads. The cross-check this used to enable (each resource
+    # step being an order-preserving subsequence of a batch layout) went with
+    # it — nothing reconstructed that layout.
     steps: dict[str, ResourceStep] # resource key -> step within cumulative
 
     # Matches additional_key_info in CudaGraphConfig
@@ -94,33 +95,6 @@ class SubmoduleStep:
 
     def __contains__(self, key: str) -> bool:
         return key in self.steps
-
-    def segments_for(self, key: str) -> tuple[Segment, ...]:
-        """segments covered by one resource's step
-
-        `segments=None` means whole batch layout"""
-        step = self.steps.get(key)
-        if step is None or step.segments is None:
-            return self.segments
-        return step.segments
-
-    def validate(self) -> None:
-        """assert each resource step's sgement are order preserving
-        subsequence of total batch layout
-
-        strictly debug; to ensure no reordering occurs"""
-        for key, step in self.steps.items():
-            if step.segments is None:
-                continue
-            it = iter(self.segments)
-            for segment in step.segments:
-                if not any(candidate == segment for candidate in it):
-                    raise ValueError(
-                        f"resource step {key!r} declares segment {segment} "
-                        "which is not an order-preserving subsequence of the "
-                        f"batch layout {self.segments}"
-                    )
-
 
 """perhaaps move below to distinct files/location per resource kind"""
 
