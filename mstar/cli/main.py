@@ -38,6 +38,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
+    "kimi_k2_7": "kimi_k2_7_code_tp8_shm.yaml",
 }
 
 
@@ -149,6 +150,8 @@ def _serve(args: argparse.Namespace) -> None:
     ]
     if args.cache_dir:
         argv += ["--cache-dir", args.cache_dir]
+    if args.model_path:
+        argv += ["--model-path", args.model_path]
     if args.log_stats:
         argv += ["--log-stats"]
     if args.log_stats_file:
@@ -178,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--gpus", default=None, help="CUDA_VISIBLE_DEVICES, e.g. '0' or '0,1,2'")
     serve.add_argument("--config", default=None, help="override the default config (path to YAML)")
     serve.add_argument("--cache-dir", default=None, help="HuggingFace weight cache directory")
+    serve.add_argument(
+        "--model-path", default=None,
+        help="local checkpoint directory or HF repo id to load weights from "
+             "(overrides the model's registry default)",
+    )
     serve.add_argument("--socket-path-prefix", default=None, help="ZMQ IPC socket prefix")
     serve.add_argument("--upload-dir", default=None, help="temp dir for uploaded media")
     serve.add_argument(

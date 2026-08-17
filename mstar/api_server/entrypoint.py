@@ -52,6 +52,19 @@ def _detect_modality(filename: str) -> str:
 # Conductor process target (top-level for picklability with spawn)
 # ------------------------------------------------------------------
 
+def _resolve_model_path(model_name: str, model_path: str | None) -> str:
+    """Where to load weights from: ``--model-path`` if given, else the registry default.
+
+    ``--model-path`` takes a local directory or an HF repo id and applies to any
+    model, so a deployment config never has to hardcode one machine's filesystem
+    layout. Both the API-server-side model instance and the conductor-side one
+    resolve through here, so they cannot diverge.
+    """
+    if model_path:
+        return model_path
+    return HF_MODELS.get(model_name, {}).get("model_path_hf", "")
+
+
 def _conductor_process_target(
     model_name: str,
     config_path: str,
@@ -61,7 +74,8 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     tensor_comm_protocol=CommProtocol.RDMA,
-    tcp_transfer_device=""
+    tcp_transfer_device="",
+    model_path: str | None = None,
 ):
     """Runs DummyConductor.run() in a spawned process."""
     logging.basicConfig(
@@ -93,7 +107,7 @@ def _conductor_process_target(
         )
 
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+        model_path_hf=_resolve_model_path(model_name, model_path),
         cache_dir=cache_dir,
         **yaml_model_kwargs,
     )
@@ -870,6 +884,12 @@ def main(argv: list[str] | None = None):
         help="Directory for caching downloaded HuggingFace model files",
     )
     parser.add_argument(
+        "--model-path", type=str, default=None,
+        help="Where to load weights from — a local checkpoint directory or an HF "
+             "repo id. Overrides the model's registry default so deployment "
+             "configs need not hardcode a filesystem path.",
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
@@ -914,7 +934,7 @@ def main(argv: list[str] | None = None):
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
+        model_path_hf=_resolve_model_path(model_name, args.model_path),
         cache_dir=args.cache_dir,
         **yaml_model_kwargs,
     )
@@ -946,7 +966,8 @@ def main(argv: list[str] | None = None):
             args.log_level,
             args.cache_dir,
             CommProtocol(args.tensor_comm_protocol),
-            args.tcp_transfer_device
+            args.tcp_transfer_device,
+            args.model_path,
         ),
     )
     conductor_proc.start()

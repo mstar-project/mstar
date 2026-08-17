@@ -138,6 +138,130 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+@triton.jit
+def fused_moe_kernel_w4a16(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    b_zp_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions (K is the LOGICAL contraction dim, not the packed width)
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bze,
+    stride_bzk,
+    stride_bzn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    group_size: tl.constexpr,
+    PACK_FACTOR: tl.constexpr,
+    HAS_ZP: tl.constexpr,
+    even_Ks: tl.constexpr,
+):
+    """Fused MoE tile for packed W4A16 weights.
+
+    ``K`` is logical; weights are int32-packed low-order-first along K. K tiles
+    must span whole int32s and whole quant groups.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+    # Packed B is indexed by logical K, then shifted to the right INT4 nibble.
+    b_ptrs = (
+        b_ptr + off_experts * stride_be
+        + (offs_k[:, None] // PACK_FACTOR) * stride_bk
+        + offs_bn[None, :] * stride_bn
+    )
+    b_shifter = (offs_k[:, None] % PACK_FACTOR) * 4
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        # Group scales are indexed by logical K, not packed K.
+        offs_ks = (offs_k[:, None] + k_start) // group_size
+        b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn + offs_ks * stride_bsk
+        if even_Ks:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b_packed = tl.load(b_ptrs)
+            b_scale = tl.load(b_scale_ptrs).to(tl.float32)
+        else:
+            k_mask = offs_k[:, None] < K - k_start
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k_start),
+                other=0.0,
+            )
+            b_packed = tl.load(b_ptrs, mask=k_mask, other=0)
+            b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=1.0).to(tl.float32)
+        # Mask after arithmetic shift so the top nibble is exact when bit 31 is set.
+        b_nib = ((b_packed >> b_shifter) & 0xF).to(tl.float32)
+        if HAS_ZP:
+            # Optional asymmetric zero point; Kimi uses symmetric INT4.
+            b_zp_ptrs = b_zp_ptr + off_experts * stride_bze + offs_bn[None, :] * stride_bzn + offs_ks * stride_bzk
+            if even_Ks:
+                b_zp = tl.load(b_zp_ptrs).to(tl.float32)
+            else:
+                b_zp = tl.load(b_zp_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0).to(tl.float32)
+            b = ((b_nib - b_zp) * b_scale).to(compute_type)
+        else:
+            b = ((b_nib - 8.0) * b_scale).to(compute_type)
+        accumulator += tl.dot(a, b)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += (BLOCK_SIZE_K // PACK_FACTOR) * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -213,6 +337,83 @@ def invoke_fused_moe_kernel(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
+        even_Ks=even_Ks,
+        **config,
+    )
+
+
+def invoke_fused_moe_kernel_w4a16(
+    A: torch.Tensor,
+    B_packed: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: Dict[str, Any],
+    compute_type: tl.dtype,
+    K: int,
+    pack_factor: int,
+    group_size: int,
+) -> None:
+    """Launch the packed-W4A16 MoE kernel.
+
+    ``K`` is logical, while ``B_packed.shape[2]`` is ``K // pack_factor``. When
+    ``B_zp`` is absent, ``HAS_ZP`` gates all loads from the stand-in tensor.
+    """
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    N = B_packed.shape[1]
+
+    def grid(META):
+        return (
+            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    even_Ks = (K % config["BLOCK_SIZE_K"]) == 0
+    has_zp = B_zp is not None
+    zp = B_zp if has_zp else B_scale  # stand-in; every zp load is gated by HAS_ZP
+
+    fused_moe_kernel_w4a16[grid](
+        A,
+        B_packed,
+        C,
+        B_scale,
+        zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        A.stride(0),
+        A.stride(1),
+        B_packed.stride(0),
+        B_packed.stride(2),
+        B_packed.stride(1),
+        C.stride(-2),
+        C.stride(-1),
+        B_scale.stride(0),
+        B_scale.stride(2),
+        B_scale.stride(1),
+        zp.stride(0),
+        zp.stride(2),
+        zp.stride(1),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        group_size=group_size,
+        PACK_FACTOR=pack_factor,
+        HAS_ZP=has_zp,
         even_Ks=even_Ks,
         **config,
     )
@@ -398,23 +599,44 @@ def moe_sum_reduce_triton(
 # ---------------------------------------------------------------------------
 
 
-def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, int]:
+def get_default_config(
+    M: int, E: int, N: int, K: int, top_k: int, group_size: int | None = None,
+) -> Dict[str, int]:
     """Pick Triton tile sizes based on problem shape.
 
     Mirrors sglang's ``get_default_config`` for the unquantized path.
     For decode batch sizes (``M`` on the order of 1--64) we always fall
     into the ``M <= E`` branch since Qwen3-Omni has ``E == 128``.
+
+    When ``group_size`` is set for W4A16, ``BLOCK_SIZE_K`` is clamped until it is
+    divisible by both INT4 pack factor and group size. ``None`` preserves the
+    historical config.
     """
     if M <= E:
-        return {
+        config = {
             "BLOCK_SIZE_M": 16,
             "BLOCK_SIZE_N": 32,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 1,
         }
-    return {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 8,
-    }
+    else:
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+        }
+    if group_size is not None:
+        pack_factor = 8  # INT4: 32 // 4
+        bk = config["BLOCK_SIZE_K"]
+        while bk % pack_factor != 0 or bk % group_size != 0:
+            bk //= 2
+            if bk < pack_factor:
+                raise ValueError(
+                    f"cannot pick a BLOCK_SIZE_K divisible by pack_factor={pack_factor} "
+                    f"and group_size={group_size}; got down to {bk}"
+                )
+        config["BLOCK_SIZE_K"] = bk
+        assert config["BLOCK_SIZE_K"] % pack_factor == 0
+        assert config["BLOCK_SIZE_K"] % group_size == 0
+    return config

@@ -44,6 +44,10 @@ mstar serve
    * - ``--cache-dir``
      - HF default
      - HuggingFace weight cache directory.
+   * - ``--model-path``
+     - registry default
+     - Local checkpoint directory or HF repo id to load weights from. Use this
+       instead of hardcoding a path in the config YAML.
    * - ``--tensor-comm-protocol``
      - ``SHM``
      - Tensor transport: ``SHM`` (safe single-node default), ``TCP``, or ``RDMA``.
@@ -122,6 +126,16 @@ mstar-serve
    * - ``--cache-dir``
      - HF default
      - HuggingFace weight cache directory.
+   * - ``--model-path``
+     - registry default
+     - Local checkpoint directory or HF repo id to load weights from. Applies to
+       any model and overrides the registry default, so a config YAML never has
+       to hardcode one machine's filesystem layout:
+
+       .. code-block:: bash
+
+          mstar-serve --config configs/kimi_k2_7_code_tp8_shm.yaml \
+                      --model-path /dev/shm/kimi_k2_7_code
    * - ``--socket-path-prefix``
      - ``/tmp/mstar``
      - ZMQ IPC socket prefix (shared with conductor/workers).
@@ -178,6 +192,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``dist_timeout_s``
+     - *(optional)* Timeout in seconds for the NCCL world group and its parallel
+       subgroups. Unset keeps PyTorch's default.
 
 Node names are model-specific — they are the keys of the model's
 ``get_node_engine_types`` (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``,
@@ -207,6 +224,11 @@ prefill, decode, and image generation on three GPUs:
 Because placement is config-only, the *same* model code runs single-GPU or fully
 disaggregated. ``configs/`` ships several layouts per model (``*_single_gpu``,
 ``*_colocated``, ``*_pd_disaggregated``, ``*_cfg_parallel``, …).
+
+``configs/synthetic/`` holds reduced, randomly-initialized deployments used to
+exercise the serving path without real weights (shape/plumbing checks, TP
+sanity). They are **not** production configs — they load a generated checkpoint
+and emit meaningless tokens.
 
 **Tensor parallelism.** Shard a node across GPUs with ``tp_size`` and that many ``ranks``:
 

@@ -206,6 +206,10 @@ exclude = ["tests*", "benchmark*", "examples*"]
 # Ship the vendored CUDA source so it can be JIT-compiled on first use.
 [tool.setuptools.package-data]
 "mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.utils.marlin" = [
+    "csrc/**/*.cu", "csrc/**/*.cuh", "csrc/**/*.h", "csrc/**/*.hpp",
+    "csrc/**/*.cpp", "csrc/**/*.py",
+]
 
 [tool.ruff]
 exclude = [".git", ".ruff_cache", ".venv", "ref"]
