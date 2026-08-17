@@ -35,6 +35,10 @@ import pytest
 # small via the env var below; RCVHWM stays at its 1000-message default, so the
 # burst has to comfortably exceed that.
 _TEST_SNDHWM = "50"
+# Over the pinned capacity (SNDHWM 50 + the receiver's 1000 RCVHWM) with room
+# to spare, and also over the *default* capacity (1000 + 1000) — so the same
+# reproduction works against a tree that predates MSTAR_ZMQ_SNDHWM, which is
+# how this test was checked to actually discriminate.
 _BURST = 3000
 _PAYLOAD = "x" * 1024
 
@@ -42,17 +46,24 @@ _PAYLOAD = "x" * 1024
 #: The peers park within ~0.2s of the barrier, so this only has to outlast
 #: process startup.
 _DEADLOCK_WINDOW_S = 5.0
-#: Budget for the fixed variant (it completes in ~1s). Generous: it fails only
-#: on a real hang.
+#: The peers' own budget for finishing (they complete in ~1s). Generous: it
+#: trips only on a real hang.
 _COMPLETION_BUDGET_S = 60.0
+#: The parent waits longer than the peers do, so a peer that gives up reports
+#: *where* it stopped (exit code + reason file) instead of being killed mid-way
+#: and looking like a deadlock.
+_PARENT_BUDGET_S = _COMPLETION_BUDGET_S + 20.0
 
 
-def _peer(my_id: str, peer_id: str, prefix: str, legacy: bool, barrier) -> None:
+def _peer(
+    my_id: str, peer_id: str, prefix: str, legacy: bool,
+    barrier, my_done, peer_done,
+) -> None:
     """One side of the cycle. Marker files report how far it got.
 
     Sequence: bind -> barrier -> send a burst at the peer -> drain until the
-    peer's burst has fully arrived -> ``fin`` handshake. The deadlock lands
-    between the barrier and ``<id>.burst_done``.
+    peer's burst has fully arrived -> keep draining until the peer is done
+    too. The deadlock lands between the barrier and ``<id>.burst_done``.
     """
     import mstar.communication.communicator as comm
     from mstar.communication.communicator import CommProtocol, ZMQCommunicator
@@ -96,20 +107,26 @@ def _peer(my_id: str, peer_id: str, prefix: str, legacy: bool, barrier) -> None:
         )
         time.sleep(0.001)
     if seen != _BURST:
-        raise SystemExit(f"{my_id}: received {seen}/{_BURST}")
-
-    # Don't exit while the peer still needs us: LINGER is 0, so anything left
-    # in our socket (or our backlog) dies with the process.
-    conn.send(peer_id, {"kind": "fin"})
-    peer_done = False
-    deadline = time.monotonic() + _COMPLETION_BUDGET_S
-    while not peer_done and time.monotonic() < deadline:
-        peer_done = any(
-            m.get("kind") == "fin" for m in conn.get_all_new_messages()
+        (marker / f"{my_id}.stalled").write_text(
+            f"received {seen}/{_BURST} bursts"
         )
+        raise SystemExit(1)
+
+    # Receiving everything is not the end: this peer's own backlog only moves
+    # while it keeps polling (the flush hangs off the receive path), and LINGER
+    # is 0 so whatever is still queued dies with the process. So keep polling
+    # until the peer reports it has everything — which is what the production
+    # loops do anyway. Out-of-band events, not a "fin" message: an in-band
+    # handshake has the same problem it is trying to solve, since a fin queued
+    # behind 1500 burst messages never arrives.
+    my_done.set()
+    deadline = time.monotonic() + _COMPLETION_BUDGET_S
+    while not peer_done.is_set() and time.monotonic() < deadline:
+        conn.get_all_new_messages()  # flushes our backlog toward the peer
         time.sleep(0.001)
-    if not peer_done:
-        raise SystemExit(f"{my_id}: peer never finished")
+    if not peer_done.is_set():
+        (marker / f"{my_id}.stalled").write_text("peer never finished receiving")
+        raise SystemExit(1)
     (marker / f"{my_id}.done").touch()
 
 
@@ -129,12 +146,15 @@ def _run_cycle(root: Path, legacy: bool, wait_s: float) -> list[mp.Process]:
     os.makedirs(prefix, exist_ok=True)
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(2)
+    done_a, done_b = ctx.Event(), ctx.Event()
     peers = [
         ctx.Process(
-            target=_peer, args=("peer_a", "peer_b", prefix, legacy, barrier),
+            target=_peer,
+            args=("peer_a", "peer_b", prefix, legacy, barrier, done_a, done_b),
         ),
         ctx.Process(
-            target=_peer, args=("peer_b", "peer_a", prefix, legacy, barrier),
+            target=_peer,
+            args=("peer_b", "peer_a", prefix, legacy, barrier, done_b, done_a),
         ),
     ]
     for p in peers:
@@ -176,14 +196,16 @@ def test_blocking_send_deadlocks_the_cycle(cycle_env):
 
 def test_non_blocking_send_completes_the_cycle(cycle_env):
     """The same cycle on the shipped send: both peers finish and deliver."""
-    peers = _run_cycle(cycle_env, legacy=False, wait_s=_COMPLETION_BUDGET_S)
+    peers = _run_cycle(cycle_env, legacy=False, wait_s=_PARENT_BUDGET_S)
     try:
+        stalls = {
+            f.name: f.read_text() for f in cycle_env.glob("*.stalled")
+        }
         assert not [p for p in peers if p.is_alive()], (
-            "cycle deadlocked with the non-blocking send"
+            f"cycle deadlocked with the non-blocking send; peer reports: {stalls}"
         )
         assert [p.exitcode for p in peers] == [0, 0], (
-            f"peers exited {[p.exitcode for p in peers]} "
-            "(non-zero = burst not fully received)"
+            f"peers exited {[p.exitcode for p in peers]}; reports: {stalls}"
         )
         for name in ("peer_a", "peer_b"):
             assert (cycle_env / f"{name}.burst_done").exists()

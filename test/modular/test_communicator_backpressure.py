@@ -122,3 +122,55 @@ def test_poll_points_flush_the_backlog(socket_dir, monkeypatch):
 def test_sndhwm_is_env_overridable():
     """Deployments tune the burst headroom without a code change."""
     assert comm._SNDHWM == int(os.getenv("MSTAR_ZMQ_SNDHWM", "100000"))
+
+
+def test_large_backlog_warns_once_and_rearms(socket_dir, monkeypatch, caplog):
+    """An unbounded queue must not grow silently.
+
+    Bounding it isn't an option (that reinstates the blocking, or drops control
+    messages), so a wedged peer is reported instead: one warning naming the
+    peer, and a fresh one if it wedges again after recovering.
+    """
+    monkeypatch.setattr(comm, "_SNDHWM", 10)
+    monkeypatch.setattr(comm, "_BACKLOG_WARN_AT", 50)
+
+    sender = comm.ZMQCommunicator(
+        "sender", ["peer"], protocol=CommProtocol.IPC,
+        ipc_socket_path_prefix=socket_dir,
+    )
+    with caplog.at_level("WARNING", logger=comm.__name__):
+        for i in range(400):
+            sender.send("peer", {"i": i, "pad": "x" * 5_000})
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1, "expected exactly one warning per stall"
+        assert "peer" in warnings[0].getMessage()
+
+        # Drain, then wedge it again: the second stall gets its own warning.
+        receiver = comm.ZMQCommunicator(
+            "peer", [], protocol=CommProtocol.IPC,
+            ipc_socket_path_prefix=socket_dir,
+        )
+        deadline = time.monotonic() + 30
+        while sender.outbound.get("peer") and time.monotonic() < deadline:
+            sender._flush_outbound()
+            receiver.get_all_new_messages()
+            time.sleep(0.01)
+        assert not sender.outbound.get("peer"), "backlog never drained"
+        assert "peer" not in sender._backlog_warned, "warning not re-armed"
+
+
+def test_small_backlog_does_not_warn(socket_dir, monkeypatch, caplog):
+    """A transient overflow is normal — it must stay quiet."""
+    monkeypatch.setattr(comm, "_SNDHWM", 10)
+    monkeypatch.setattr(comm, "_BACKLOG_WARN_AT", 10_000)
+
+    sender = comm.ZMQCommunicator(
+        "sender", ["peer"], protocol=CommProtocol.IPC,
+        ipc_socket_path_prefix=socket_dir,
+    )
+    with caplog.at_level("WARNING", logger=comm.__name__):
+        for i in range(400):
+            sender.send("peer", {"i": i, "pad": "x" * 5_000})
+    assert sender.outbound.get("peer"), "test needs an actual backlog"
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]

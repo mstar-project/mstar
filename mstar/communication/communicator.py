@@ -21,6 +21,15 @@ _SNDHWM = int(os.getenv("MSTAR_ZMQ_SNDHWM", "100000"))
 #: (possibly indefinite) wait for its queued messages.
 _BACKLOG_POLL_SLICE_MS = 50
 
+#: Backlog size (messages, per peer) that warrants a warning. The in-process
+#: queue is deliberately unbounded — bounding it would reintroduce the blocking
+#: (or start dropping control messages, which corrupts the mesh) — so a peer
+#: that has stopped draining for good grows it until the process runs out of
+#: memory. The threshold turns that silent growth into a diagnosable signal
+#: naming the peer. Well above any healthy transient: normal bursts drain
+#: within a poll or two, so crossing this means a peer is genuinely wedged.
+_BACKLOG_WARN_AT = int(os.getenv("MSTAR_ZMQ_BACKLOG_WARN", "10000"))
+
 #: The ``mstar_rust`` extension version this tree expects (the vendored
 #: ``rust/`` crate's version). Under ``MSTAR_RUST_ZMQ=AUTO`` a mismatching
 #: install - e.g. a stale wheel after an upgrade - takes over the mesh
@@ -107,6 +116,10 @@ class ZMQCommunicator(BaseCommunicator):
         # and both peers can end up waiting on each other. With local
         # queueing, a momentarily full peer never stops us servicing our PULL.
         self.outbound: dict[str, deque] = {}
+        # Peers already warned about an oversized backlog. Cleared when that
+        # peer's queue drains, so a peer that wedges again warns again while a
+        # single stall stays one line.
+        self._backlog_warned: set[str] = set()
         self.my_id = my_id
         self.ipc_socket_path_prefix = ipc_socket_path_prefix
 
@@ -186,9 +199,27 @@ class ZMQCommunicator(BaseCommunicator):
                 except zmq.Again:
                     break  # peer still full; retry on a later flush
                 queued.popleft()
+            if not queued:
+                # Drained: re-arm the warning so a later stall is reported.
+                self._backlog_warned.discard(eid)
 
     def _has_backlog(self) -> bool:
         return any(self.outbound.values())
+
+    def _warn_if_backlog_large(self, entity_id: str) -> None:
+        """Warn once per stall when a peer's queue passes the threshold."""
+        if entity_id in self._backlog_warned:
+            return
+        depth = len(self.outbound[entity_id])
+        if depth < _BACKLOG_WARN_AT:
+            return
+        self._backlog_warned.add(entity_id)
+        logger.warning(
+            "%s has %d messages queued for %s: the peer has not been draining. "
+            "The queue is unbounded, so it will grow until %s recovers "
+            "(threshold: MSTAR_ZMQ_BACKLOG_WARN).",
+            self.my_id, depth, entity_id, entity_id,
+        )
 
     def send(self, entity_id: str, msg):
         # TODO: maybe serialize to JSON instead if more efficient
@@ -204,6 +235,7 @@ class ZMQCommunicator(BaseCommunicator):
             # Still non-empty -> the peer is full; queue this one behind it
             # rather than block (blocking is what deadlocks the cycle).
             queued.append(msg)
+            self._warn_if_backlog_large(entity_id)
             return
         try:
             sock.send_pyobj(msg, flags=zmq.NOBLOCK)
@@ -215,6 +247,7 @@ class ZMQCommunicator(BaseCommunicator):
                 "%s deferring send to %s (peer buffer full, %d queued)",
                 self.my_id, entity_id, len(self.outbound[entity_id]),
             )
+            self._warn_if_backlog_large(entity_id)
 
     def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
         # Opportunistically push out anything we previously had to queue.

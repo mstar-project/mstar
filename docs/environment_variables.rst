@@ -28,6 +28,20 @@ Communication
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
        process, e.g. to run entities on separate hosts.
+   * - ``MSTAR_ZMQ_SNDHWM``
+     - ``100000``
+     - Send high-water mark (messages) on each PUSH socket of the pyzmq
+       communicator. Above it, ``send`` queues in-process instead of
+       handing the message to zmq — it never blocks, because a blocking
+       send stalls the caller's own drain loop and can deadlock the
+       worker↔conductor PUSH/PULL cycle. Raise it to absorb larger bursts
+       inside zmq; lower it to shift buffering into the process.
+   * - ``MSTAR_ZMQ_BACKLOG_WARN``
+     - ``10000``
+     - Per-peer in-process backlog (messages) that logs a warning naming
+       the peer. The queue is unbounded by design, so this is the signal
+       that a peer has stopped draining and memory is growing. One
+       warning per stall; it re-arms once that peer's queue drains.
    * - ``MSTAR_ZMQ_TCP_HOST``
      - ``127.0.0.1``
      - Host used to build peer endpoints when the protocol is ``TCP``.
