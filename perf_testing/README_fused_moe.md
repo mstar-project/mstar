@@ -74,6 +74,22 @@ Further decode gains have to come from moving less weight: fp8/int4 expert
 weights, keeping hot experts resident, or batching more tokens per dispatch.
 Not from tiles.
 
+## The align op
+
+`moe_align_block_size` JIT-compiles a vendored CUDA op and silently falls back
+to a torch implementation if the build fails. Check which one you are on:
+
+```bash
+python -c "from mstar.utils.fused_moe.align import _cuda_op_available as a; print(a())"
+python perf_testing/bench_moe_align.py     # CUDA op vs fallback, per token count
+```
+
+On H100 the fallback costs ~520 µs per MoE layer against 16 µs for the CUDA op,
+and it cannot be CUDA-graph captured (it syncs to size a `repeat_interleave`),
+so it also takes the fused MoE out of the graph. See
+`docs/installation.rst` → "Checking the MoE align kernel actually built" for the
+build failures and how `align.py` works around them.
+
 ## CuTe DSL comparison
 
 `perf_testing/compare_moe_cute.py` benchmarks CUTLASS's Hopper CuTe DSL

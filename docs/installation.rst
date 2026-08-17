@@ -239,6 +239,55 @@ Check your driver's CUDA version with ``nvidia-smi`` and pick the closest build 
 https://pytorch.org/get-started/locally/. Keep all three packages on the same ``2.9`` /
 ``0.24`` line — ``torchvision`` and ``torchaudio`` are versioned in lockstep with ``torch``.
 
+.. _moe-align-build:
+
+Checking the MoE align kernel actually built
+--------------------------------------------
+
+The vendored ``moe_align_block_size`` op JIT-compiles on first use and falls back
+to a pure-torch implementation if it can't. The fallback is **logged at WARNING
+and nothing else fails**, so it is easy to run on it indefinitely without
+noticing. It is worth checking, because the fallback:
+
+* costs about **520 µs per MoE layer per forward** against 16 µs for the CUDA op
+  (~32×, measured on H100 — see ``perf_testing/bench_moe_align.py``), and
+* **cannot be CUDA-graph captured** at all. It sizes a ``repeat_interleave`` from
+  a device tensor, which forces a device-to-host sync, so capture fails with
+  ``cudaErrorStreamCaptureInvalidated`` and the whole fused-MoE path drops out of
+  the graph.
+
+.. code-block:: bash
+
+   python -c "from mstar.utils.fused_moe.align import _cuda_op_available as a; print('CUDA align op:', a())"
+
+If that prints ``False``, run it again with logging on to see the compiler error::
+
+   python -c "import logging; logging.basicConfig(level=logging.WARNING); \
+       from mstar.utils.fused_moe.align import _cuda_op_available as a; a()"
+
+**CUDA installed from wheels.** When the toolkit comes from pip rather than a
+system install, headers and libraries are split one directory per component
+(``nvidia/cuda_cccl/include``, ``nvidia/cusparse/include``, …) and none of them
+live under ``CUDA_HOME``, which is all torch passes to ``nvcc``. ``align.py``
+adds those component directories itself, so this normally just works. Two
+related failures it also handles:
+
+* ``fatal error: nv/target``/``thrust/complex.h``/``cusparse.h`` — a component
+  include directory is missing. If ``CUDA_HOME`` points at a monolithic
+  ``nvidia/cu13`` tree, note that wheel ships **no CCCL headers**; the CUDA 12
+  component tree next to it is the one matching a cu128 torch.
+* ``cannot find -lcudart`` — wheel-installed CUDA ships only
+  ``libcudart.so.<major>``, with no unversioned dev symlink for ``-lcudart`` to
+  resolve. ``align.py`` builds a symlink shim pointing at the ``libcudart``
+  whose major matches ``torch.version.cuda``.
+
+One thing it cannot work around is a **CUDA major mismatch between nvcc and
+torch**. nvcc 13.x rejects torch 2.9's ``ATen/core/List_inl.h`` under C++17
+(``need 'typename' before … dependent scope``); ``align.py`` retries at C++20,
+which that construct was legalised by, but the right fix is a toolkit matching
+torch. Note that ``nvidia-cuda-nvcc-cu12`` on PyPI ships only ``ptxas``, not the
+``nvcc`` driver — for CUDA 12 you need a system toolkit install.
+
 Verify the install
 ------------------
 
