@@ -22,6 +22,91 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+# ── FlashInfer behind custom ops ────────────────────────────────────────
+#
+# Every kernel below reaches FlashInfer through a TVM-FFI call that dynamo
+# can't trace and that can't run on fake tensors. Called directly, each one
+# breaks the graph — and a break inside a decoder layer makes the layer body
+# its own frame, which dynamo then recompiles once per `layer_idx`. Behind an
+# op with a registered fake, the whole layer loop stays a single graph.
+
+
+@torch.library.custom_op("mstar::rope_apply_qk_inplace", mutates_args={"q", "k"})
+def rope_apply_qk_inplace(
+    q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    rotary_dim: int | None, interleave: bool,
+    rope_scale: float, rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    """Rotate q and k in place at ``pos_ids``."""
+    import flashinfer
+
+    rope_kwargs = dict(
+        rotary_dim=rotary_dim, interleave=interleave,
+        rope_scale=rope_scale, rope_theta=rope_theta,
+    )
+    llama31 = (
+        low_freq_factor is not None
+        and high_freq_factor is not None
+        and old_context_len is not None
+    )
+    if not llama31:
+        flashinfer.rope.apply_rope_pos_ids_inplace(q, k, pos_ids, **rope_kwargs)
+    else:
+        flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
+            q, k, pos_ids, **rope_kwargs,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+        )
+
+
+@rope_apply_qk_inplace.register_fake
+def _rope_apply_qk_inplace_fake(
+    q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    rotary_dim: int | None, interleave: bool,
+    rope_scale: float, rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    return None
+
+
+@torch.library.custom_op("mstar::flashinfer_rmsnorm", mutates_args=())
+def flashinfer_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float,
+    norm_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """RMS norm, returned in ``x``'s dtype whatever the kernel ran in."""
+    import flashinfer
+
+    orig_dtype = x.dtype
+    if norm_dtype is not None:
+        x = x.to(norm_dtype)
+    elif torch.is_autocast_enabled():
+        x = x.to(torch.get_autocast_dtype("cuda"))
+    elif x.dtype == torch.float32:
+        # unsupported dtype; must recast
+        x = x.to(torch.bfloat16)
+
+    # flashinfer.norm.rmsnorm requires matching input/weight dtypes
+    if weight.dtype != x.dtype:
+        weight = weight.to(x.dtype)
+    return flashinfer.norm.rmsnorm(x, weight, eps=eps).to(orig_dtype)
+
+
+@flashinfer_rmsnorm.register_fake
+def _flashinfer_rmsnorm_fake(
+    x: torch.Tensor, weight: torch.Tensor, eps: float,
+    norm_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+
 class FlashInferPrefillWrapper:
     """Batched prefill attention with paged KV cache.
 

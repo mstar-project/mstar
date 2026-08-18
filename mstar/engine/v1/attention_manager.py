@@ -122,6 +122,46 @@ class PlanCacheKey(NamedTuple):
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
 
 
+# Attention resources reachable from a custom op. A traced forward can't pass
+# the resource itself into an op (a schema takes tensors and scalars), so it
+# passes this handle. One entry per resource, fixed for the process, so dynamo
+# specializing on it costs nothing — a handle that varied per step or per slot
+# would reintroduce the recompiles this exists to avoid.
+_ATTENDERS: dict[int, "AttentionManager"] = {}
+
+
+def _register_attender(manager: "AttentionManager") -> int:
+    """Give an attention resource a handle its layers can pass into the op."""
+    handle = len(_ATTENDERS)
+    _ATTENDERS[handle] = manager
+    return handle
+
+
+@torch.library.custom_op("mstar::flashinfer_attend", mutates_args=())
+def flashinfer_attend(
+    handle: int, label: str, q: torch.Tensor, kv_cache_layer: torch.Tensor,
+) -> torch.Tensor:
+    """One layer's attention, planned by the resource behind ``handle``.
+
+    Behind an op because FlashInfer's kernel is a TVM-FFI call dynamo can't
+    trace and can't run on fake tensors: called directly it breaks the graph
+    once per layer, and each break makes the layer body a frame dynamo
+    recompiles per ``layer_idx``.
+    """
+    out = _ATTENDERS[handle].attend(q, label, kv_cache_layer)
+    # the planned wrapper runs in its own dtype; the fake below promises q's,
+    # and a mismatch there is silent corruption
+    return out.to(q.dtype)
+
+
+@flashinfer_attend.register_fake
+def _flashinfer_attend_fake(
+    handle: int, label: str, q: torch.Tensor, kv_cache_layer: torch.Tensor,
+) -> torch.Tensor:
+    # attention is shape-preserving on the query
+    return torch.empty_like(q)
+
+
 class FlashInferManager(AttentionManager):
     def __init__(
         self,
@@ -134,6 +174,7 @@ class FlashInferManager(AttentionManager):
         self._kv_cache_name = kv_cache
         self._device = device
         self._dtype = dtype
+        self._attend_handle = _register_attender(self)
 
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
@@ -297,6 +338,14 @@ class FlashInferManager(AttentionManager):
         # planned wrapper carries the layout. Accepted and ignored so one
         # layer body serves either backend — see `requires_kv_write`.
         del k, v, layer_idx
+        return torch.ops.mstar.flashinfer_attend(
+            self._attend_handle, label, q, kv_cache_layer,
+        )
+
+    def attend(
+        self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
+    ) -> torch.Tensor:
+        """The eager body of ``run``, called from inside the op."""
         return self._current_plan_states[label].run(q, kv_cache_layer)
 
 
@@ -392,6 +441,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._context_label = context_label
         self._device = device
         self._dtype = dtype
+        self._attend_handle = _register_attender(self)
 
         # decoder plan label -> wrapper
         self._current_plan_states: dict[str, AttentionWrapper] = {}
@@ -620,6 +670,14 @@ class FlashInferCrossManager(CrossAttentionManager):
     ) -> torch.Tensor:
         """One layer's cross attention. ``kv_cache_layer`` is a layer of the
         *context* cache; nothing is written to it here."""
+        return torch.ops.mstar.flashinfer_attend(
+            self._attend_handle, label, q, kv_cache_layer,
+        )
+
+    def attend(
+        self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
+    ) -> torch.Tensor:
+        """The eager body of ``run``, called from inside the op."""
         return self._current_plan_states[label].run(q, kv_cache_layer)
 
 

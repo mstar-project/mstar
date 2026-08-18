@@ -22,32 +22,23 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-@torch.compiler.disable
 def run_rms_norm(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-06,
     rms_norm_dtype=None
 ):
-    orig_dtype = input.dtype
-    if rms_norm_dtype is not None:
-        input = input.to(rms_norm_dtype)
-    elif torch.is_autocast_enabled():
-        dtype = torch.get_autocast_dtype("cuda")
-        input = input.to(dtype)
-    elif input.dtype == torch.float32:
-        # Unsupported dtype; must recast
-        input = input.to(torch.bfloat16)
+    """RMS norm through ``mstar::flashinfer_rmsnorm``.
 
-    # flashinfer.norm.rmsnorm requires matching input/weight dtypes; cast weight
-    # to match whatever input ended up as.
-    if weight.dtype != input.dtype:
-        weight = weight.to(input.dtype)
+    Behind an op rather than called directly: FlashInfer's kernel is a TVM-FFI
+    call dynamo can't trace, and a break here lands inside every decoder
+    layer's ``input_layernorm`` — which makes the layer body a frame dynamo
+    recompiles once per layer.
+    """
+    from mstar.engine.v1.attention_wrappers import flashinfer_rmsnorm
 
-    import flashinfer
-    return flashinfer.norm.rmsnorm(
-        input, weight, eps=eps
-    ).to(orig_dtype)
+    del flashinfer_rmsnorm  # imported for its registration side effect
+    return torch.ops.mstar.flashinfer_rmsnorm(input, weight, eps, rms_norm_dtype)
 
 
 def run_attention(
