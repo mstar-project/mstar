@@ -1,20 +1,15 @@
-"""TP async scheduling — the follower-side scheduler surface and the
-symmetric void verdict.
+"""TP async scheduling — the follower-side scheduler surface.
 
-Two things a follower needs beyond the serial TP-follow path, pinned here
-against the same fakes ``test_tp_follow_targeted_gate.py`` uses:
+What a follower needs beyond the serial TP-follow path, pinned here against
+the same fakes ``test_tp_follow_targeted_gate.py`` uses:
 
-1. ``MicroScheduler.pop_ready_rids`` — pop a named rid set for a node
-   *all-or-nothing*. The follower rebuilds the leader's speculative head from
-   the ids on the wire; if any fresh rid is not ready locally yet, NOTHING may
-   be popped (the head stays for the serial path, which waits for readiness
-   exactly as today). The FIFO accessors (peek / pop / replace head) keep
-   order and touch only the head.
-2. ``worker.tp_spec_survivors`` — the pure function behind
-   ``Worker._reconcile_tp_follow_head``: which rids of a broadcast head
-   survive step N's outputs. It must equal what
-   ``Worker._thread_outputs_to_speculative`` does on a rank that DID build the
-   head early, or two ranks of one TP group would run different compositions.
+``MicroScheduler.pop_ready_rids`` — pop a named rid set for a node
+*all-or-nothing*. The follower rebuilds the leader's speculative head from the
+ids on the wire; if any fresh rid is not ready locally yet, NOTHING may be
+popped (the caller retries once readiness has progressed). The FIFO accessors
+(peek / pop / replace head) keep order and touch only the head. The serial
+``_try_schedule_tp_follow`` path now goes through the same pop and stamps the
+head's seq on the batch it returns.
 """
 
 import sys
@@ -25,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mstar.graph.base import GraphNode  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
-from mstar.worker.worker import tp_spec_survivors  # noqa: E402
 
 NODE = "LLM"
 WALK = "decode"
@@ -192,42 +186,3 @@ def test_fifo_accessors_touch_only_the_head_and_keep_order():
     assert sched.peek_tp_follow() is None
 
 
-# ------------------------------------------------------- tp_spec_survivors
-
-def test_survivors_keeps_fresh_rids_and_continuing_rids_with_outputs():
-    head = ["r0", "f1", "r2"]
-    pending = {"r0", "r2"}
-    consumed = {"token", "kv_cache"}
-    outputs = {
-        "r0": {"token": ["t"], "kv_cache": ["k"]},
-        "r2": {"token": ["t"], "kv_cache": ["k"]},
-    }
-    assert tp_spec_survivors(head, pending, consumed, outputs) == ["r0", "f1", "r2"]
-
-
-def test_survivors_drops_continuing_rid_missing_any_consumed_output():
-    head = ["r0", "r1", "f2"]
-    pending = {"r0", "r1"}
-    consumed = {"token", "kv_cache"}
-    outputs = {
-        "r0": {"token": ["t"], "kv_cache": ["k"]},
-        "r1": {"token": ["t"]},  # no kv_cache loop-back → dropped, like threading
-    }
-    assert tp_spec_survivors(head, pending, consumed, outputs) == ["r0", "f2"]
-
-
-def test_survivors_empty_when_no_continuing_output_and_no_fresh():
-    assert tp_spec_survivors(["r0"], {"r0"}, {"token"}, {"r0": {}}) == []
-    assert tp_spec_survivors(["r0"], {"r0"}, {"token"}, {}) == []
-
-
-def test_survivors_matches_threading_semantics_on_empty_tensor_list():
-    """``_thread_outputs_to_speculative`` treats an empty tensor list as
-    'no output' (``if not tensors``); so must the pure verdict."""
-    assert tp_spec_survivors(["r0"], {"r0"}, {"token"}, {"r0": {"token": []}}) == []
-
-
-def test_survivors_preserves_wire_order():
-    head = ["c", "a", "b"]
-    outputs = {r: {"token": ["t"]} for r in head}
-    assert tp_spec_survivors(head, set(head), {"token"}, outputs) == ["c", "a", "b"]

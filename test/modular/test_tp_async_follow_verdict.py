@@ -1,29 +1,37 @@
-"""TP async scheduling — a follower's void verdict must reach a speculative
-head whether the head is already queued when step N completes OR arrives
-afterwards.
+"""TP async scheduling — a follower must always SETTLE the leader's decision
+about step N before it post-processes N, and it must never guess.
 
 The leader broadcasts its speculation DURING its forward N; a follower can
-finish N first (it is the faster rank, or the leader's build was slow). If the
-verdict were applied only to the head-at-await, a head landing later would go
-to the serial path with the leader's pre-verdict composition — and run a batch
-the leader will not (allocation failure on N → the leader clears its
-speculation), or with rids the leader dropped: a composition desync, the
-NCCL-hang class. So the verdict is recorded per step and applied both at
-await time (``_reconcile_tp_follow_head``) and on arrival
-(``_register_tp_follow``).
+finish N first (faster rank, slow leader build). If a follower went serial
+whenever the head had not arrived yet, a head landing later could reach the
+serial path with a continuing rid whose loop ended at N — a batch the serial
+readiness check can never build, while the leader runs it (one wasted
+forward) and then hangs in the collective. So:
 
-Drives the real ``Worker`` methods unbound on a minimal stub, with a real
+* the leader ALWAYS sends one of {speculative head from N, empty "no-spec"
+  marker for N} for every lockstep step it looked at speculating from;
+* the follower's ``_resolve_follow_speculation`` waits (bounded by that
+  send) for exactly one of them right after await(N): builds the head via the
+  speculation flow (from N's real outputs), or goes serial on the marker;
+  ``allocation_failed`` on N drops a head without building it (the verdict
+  the leader reaches before threading);
+* a step whose forward raised is closed (``_close_tp_follow_step``): its head
+  is dropped, queued or arriving.
+
+Drives the real ``Worker`` methods unbound on a minimal stub with a real
 ``MicroScheduler`` for the FIFO, the pattern ``test_worker_message_handling``
-uses.
+uses. ``_try_follow_speculation`` is stubbed per test — its own build logic
+is exercised against the graph API elsewhere; here we pin the protocol.
 """
 
 import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.graph.base import GraphEdge, GraphNode  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
@@ -37,47 +45,67 @@ class _FakeEngineManager:
         return types.SimpleNamespace(check_ready=lambda *a: True)
 
 
-def _node():
-    # AR decode: two loop-back outputs feed the same node next iter.
-    return GraphNode(
-        name=NODE, input_names={"token", "kv_cache"},
-        outputs=[
-            GraphEdge(name="token", next_node=NODE),
-            GraphEdge(name="kv_cache", next_node=NODE),
-        ],
-    )
+class _Communicator:
+    """wait_for_work delivers one queued message batch per call; the test
+    pushes messages via ``inbox``. Raises if the follower keeps waiting after
+    the inbox is dry — that would be a hang."""
+
+    def __init__(self, stub):
+        self.stub = stub
+        self.inbox = []
+        self.waits = 0
+        self.max_waits = 50
+
+    def wait_for_work(self, timeout_ms=50):
+        self.waits += 1
+        if self.waits > self.max_waits:
+            raise TimeoutError("follower waited too long — would hang")
 
 
 def _stub():
     stub = types.SimpleNamespace()
     stub.worker_id = "w1"
     stub.tp_async_sched = True
-    stub._tp_step_verdicts = {}
-    stub._TP_VERDICTS_KEEP = Worker._TP_VERDICTS_KEEP
+    stub._tp_nospec_from = set()
+    stub._tp_nospec_order = __import__("collections").deque()
+    stub._TP_NOSPEC_KEEP = Worker._TP_NOSPEC_KEEP
     stub.scheduler = MicroScheduler(
         engine_manager=_FakeEngineManager(), parallel_leader_nodes=set(),
     )
-    # bound-method plumbing for the unbound calls below
-    stub._apply_tp_step_verdict = lambda m: Worker._apply_tp_step_verdict(stub, m)
-    stub._record_tp_step_verdict = lambda p, o: Worker._record_tp_step_verdict(stub, p, o)
+    stub.communicator = _Communicator(stub)
+    stub._check_ready_tensors = lambda: None
+    stub._poll_stream_buffers = lambda: None
+    stub.build_results = []   # what _try_follow_speculation returns, in order
+
+    def _process_messages():
+        while stub.communicator.inbox:
+            stub._register_tp_follow(stub.communicator.inbox.pop(0))
+
+    def _try_follow(pending):
+        if stub.build_results:
+            return stub.build_results.pop(0)
+        return None
+
+    stub._process_messages = _process_messages
+    stub._try_follow_speculation = _try_follow
+    stub._note_tp_nospec = lambda s: Worker._note_tp_nospec(stub, s)
     stub._register_tp_follow = lambda m: Worker._register_tp_follow(stub, m)
-    stub._reconcile_tp_follow_head = lambda p, o: Worker._reconcile_tp_follow_head(stub, p, o)
+    stub._close_tp_follow_step = lambda p: Worker._close_tp_follow_step(stub, p)
+    stub._resolve_follow_speculation = (
+        lambda p, o, arm: Worker._resolve_follow_speculation(stub, p, o, arm)
+    )
     return stub
 
 
-def _pending(rids, tp_seq):
-    batch = types.SimpleNamespace(node_objects={r: _node() for r in rids})
-    return types.SimpleNamespace(batch=batch, node_name=NODE, graph_walk=WALK, tp_seq=tp_seq)
-
-
-def _output(ok_rids=(), allocation_failed=False, failed_requests=()):
+def _pending(tp_seq):
     return types.SimpleNamespace(
-        allocation_failed=allocation_failed,
-        failed_requests=list(failed_requests),
-        per_request_output_tensors={
-            r: {"token": ["t"], "kv_cache": ["k"]} for r in ok_rids
-        },
+        node_name=NODE, graph_walk=WALK, tp_seq=tp_seq,
+        batch=types.SimpleNamespace(node_objects={"r0": object()}),
     )
+
+
+def _output(allocation_failed=False):
+    return types.SimpleNamespace(allocation_failed=allocation_failed, failed_requests=[])
 
 
 def _head(rids, seq, from_seq):
@@ -87,102 +115,143 @@ def _head(rids, seq, from_seq):
     )
 
 
-# ---------------------------------------------------------- head already queued
+def _nospec(from_seq):
+    return ScheduleTPNode(
+        node_name=NODE, graph_walk=WALK, request_ids=[],
+        speculative=True, spec_seq=-1, spec_from_seq=from_seq,
+    )
 
-def test_queued_head_dropped_when_parent_step_allocation_failed():
+
+# ------------------------------------------------------------- registration
+
+def test_nospec_marker_is_recorded_and_never_queued():
     s = _stub()
-    s.scheduler.register_tp_follow(_head(["r0", "r1"], seq=5, from_seq=4))
-    s._reconcile_tp_follow_head(_pending(["r0", "r1"], 4), _output(allocation_failed=True))
+    s._register_tp_follow(_nospec(4))
+    assert 4 in s._tp_nospec_from
     assert s.scheduler.peek_tp_follow() is None
 
 
-def test_queued_head_dropped_when_parent_step_had_failed_requests():
+def test_head_for_a_closed_step_is_dropped_on_arrival():
     s = _stub()
+    s._close_tp_follow_step(_pending(4))
+    s._register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    assert s.scheduler.peek_tp_follow() is None
+
+
+def test_close_drops_an_already_queued_head_for_that_step_only():
+    s = _stub()
+    other = _head(["r9"], seq=9, from_seq=8)
     s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    s._reconcile_tp_follow_head(_pending(["r0"], 4), _output(ok_rids=["r0"], failed_requests=["r0"]))
-    assert s.scheduler.peek_tp_follow() is None
-
-
-def test_queued_head_shrinks_to_survivors_keeps_fresh_and_order():
-    s = _stub()
-    # r1 (continuing) emits no loop-back output; f2 is fresh (not in N)
-    s.scheduler.register_tp_follow(_head(["r0", "r1", "f2"], seq=5, from_seq=4))
-    s._reconcile_tp_follow_head(_pending(["r0", "r1"], 4), _output(ok_rids=["r0"]))
-    head = s.scheduler.peek_tp_follow()
-    assert head is not None
-    assert head.request_ids == ["r0", "f2"]
-    assert head.spec_seq == 5 and head.spec_from_seq == 4 and head.speculative
-
-
-def test_queued_head_untouched_when_everything_survives():
-    s = _stub()
-    original = _head(["r0", "r1"], seq=5, from_seq=4)
-    s.scheduler.register_tp_follow(original)
-    s._reconcile_tp_follow_head(_pending(["r0", "r1"], 4), _output(ok_rids=["r0", "r1"]))
-    assert s.scheduler.peek_tp_follow() is original
-
-
-def test_head_from_a_different_parent_is_left_alone_at_await():
-    s = _stub()
-    other = _head(["r0"], seq=9, from_seq=8)   # speculated from a later step
     s.scheduler.register_tp_follow(other)
-    s._reconcile_tp_follow_head(_pending(["r0"], 4), _output(allocation_failed=True))
+    s._close_tp_follow_step(_pending(4))
     assert s.scheduler.peek_tp_follow() is other
 
 
-# ------------------------------------------------- head arrives AFTER the await
-
-def test_late_head_dropped_on_arrival_when_parent_was_voided():
+def test_plain_and_unrelated_speculative_messages_queue_normally():
     s = _stub()
-    # Follower finished step 4 (alloc failed) before the leader's head landed.
-    s._reconcile_tp_follow_head(_pending(["r0"], 4), _output(allocation_failed=True))
-    assert s.scheduler.peek_tp_follow() is None
-    s._register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    assert s.scheduler.peek_tp_follow() is None, "voided head must never enter the FIFO"
-
-
-def test_late_head_shrunk_on_arrival_to_the_recorded_survivors():
-    s = _stub()
-    s._reconcile_tp_follow_head(_pending(["r0", "r1"], 4), _output(ok_rids=["r1"]))
-    s._register_tp_follow(_head(["r0", "r1", "f2"], seq=5, from_seq=4))
-    head = s.scheduler.peek_tp_follow()
-    assert head is not None and head.request_ids == ["r1", "f2"]
-
-
-def test_late_head_with_no_survivors_never_enters_fifo():
-    s = _stub()
-    s._reconcile_tp_follow_head(_pending(["r0"], 4), _output(ok_rids=[]))
-    s._register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    assert s.scheduler.peek_tp_follow() is None
-
-
-def test_head_for_an_in_flight_parent_registers_unchanged():
-    s = _stub()
-    h = _head(["r0"], seq=5, from_seq=4)   # step 4 has no verdict yet
-    s._register_tp_follow(h)
-    assert s.scheduler.peek_tp_follow() is h
-
-
-def test_non_speculative_message_never_touched_by_verdicts():
-    s = _stub()
-    s._reconcile_tp_follow_head(_pending(["r0"], 4), _output(allocation_failed=True))
-    plain = ScheduleTPNode(NODE, WALK, ["r0"], spec_seq=5)   # serial broadcast
+    plain = ScheduleTPNode(NODE, WALK, ["r0"], spec_seq=3)
+    h = _head(["r0"], seq=5, from_seq=4)
     s._register_tp_follow(plain)
-    assert s.scheduler.peek_tp_follow() is plain
+    s._register_tp_follow(h)
+    assert list(s.scheduler.tp_batches_pending_schedule) == [plain, h]
 
 
-def test_flag_off_registers_verbatim():
+def test_flag_off_still_swallows_empty_markers_but_queues_heads_verbatim():
+    """A rank running with the flag off must not crash on an empty marker
+    (the serial path indexes request_ids[0]) and must not second-guess."""
     s = _stub()
     s.tp_async_sched = False
-    s._tp_step_verdicts[4] = (frozenset({"r0"}), frozenset(), True)
+    s._register_tp_follow(_nospec(4))
     h = _head(["r0"], seq=5, from_seq=4)
     s._register_tp_follow(h)
     assert s.scheduler.peek_tp_follow() is h
 
 
-def test_verdict_store_is_bounded():
+def test_nospec_store_is_bounded():
     s = _stub()
-    for seq in range(Worker._TP_VERDICTS_KEEP + 40):
-        s._reconcile_tp_follow_head(_pending(["r0"], seq), _output(ok_rids=["r0"]))
-    assert len(s._tp_step_verdicts) == Worker._TP_VERDICTS_KEEP
-    assert min(s._tp_step_verdicts) == 40   # oldest evicted first
+    for i in range(Worker._TP_NOSPEC_KEEP + 10):
+        s._note_tp_nospec(i)
+    assert len(s._tp_nospec_from) == Worker._TP_NOSPEC_KEEP
+    assert 0 not in s._tp_nospec_from and 9 not in s._tp_nospec_from
+    assert Worker._TP_NOSPEC_KEEP + 9 in s._tp_nospec_from
+
+
+# ----------------------------------------------------------------- resolve
+
+def test_resolve_builds_a_queued_head_and_arms_it():
+    s = _stub()
+    spec = object()
+    s.build_results = [spec]
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    armed = []
+    got = s._resolve_follow_speculation(_pending(4), _output(), armed.append)
+    assert got is spec and armed == [spec]
+    assert s.communicator.waits == 0
+
+
+def test_resolve_goes_serial_on_the_marker_without_waiting():
+    s = _stub()
+    s._register_tp_follow(_nospec(4))
+    got = s._resolve_follow_speculation(_pending(4), _output(), lambda sp: None)
+    assert got is None
+    assert s.communicator.waits == 0
+
+
+def test_resolve_waits_for_a_late_head_then_builds_it():
+    s = _stub()
+    spec = object()
+    s.build_results = [spec]
+    s.communicator.inbox = [_head(["r0"], seq=5, from_seq=4)]   # arrives after await
+    got = s._resolve_follow_speculation(_pending(4), _output(), lambda sp: None)
+    assert got is spec
+    assert s.communicator.waits == 1
+    assert s.scheduler.peek_tp_follow() is None   # consumed by the build (stubbed pop)
+
+
+def test_resolve_waits_for_a_late_marker_then_goes_serial():
+    s = _stub()
+    s.communicator.inbox = [_nospec(4)]
+    got = s._resolve_follow_speculation(_pending(4), _output(), lambda sp: None)
+    assert got is None and s.communicator.waits == 1
+
+
+def test_resolve_drops_the_head_on_allocation_failure_without_building():
+    s = _stub()
+    s.build_results = [object()]   # would build if asked — it must not be
+    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    got = s._resolve_follow_speculation(
+        _pending(4), _output(allocation_failed=True), lambda sp: None,
+    )
+    assert got is None
+    assert s.scheduler.peek_tp_follow() is None
+    assert s.build_results, "head must be dropped, not built"
+
+
+def test_resolve_retries_until_the_head_is_buildable():
+    """Fresh rid not ready on this rank yet: keep polling readiness, do not
+    go serial (the leader will run that composition)."""
+    s = _stub()
+    spec = object()
+    s.build_results = [None, None, spec]
+    s.scheduler.register_tp_follow(_head(["r0", "f1"], seq=5, from_seq=4))
+    got = s._resolve_follow_speculation(_pending(4), _output(), lambda sp: None)
+    assert got is spec
+    assert s.communicator.waits == 2
+
+
+def test_resolve_ignores_a_head_from_another_step():
+    """A queued head speculated from a different step is neither built nor
+    dropped; the decision for THIS step still has to arrive."""
+    s = _stub()
+    other = _head(["r9"], seq=9, from_seq=8)
+    s.scheduler.register_tp_follow(other)
+    s.communicator.inbox = [_nospec(4)]
+    got = s._resolve_follow_speculation(_pending(4), _output(), lambda sp: None)
+    assert got is None
+    assert s.scheduler.peek_tp_follow() is other
+
+
+def test_resolve_never_returns_without_a_decision():
+    s = _stub()   # nothing ever arrives
+    with pytest.raises(TimeoutError):
+        s._resolve_follow_speculation(_pending(4), _output(), lambda sp: None)

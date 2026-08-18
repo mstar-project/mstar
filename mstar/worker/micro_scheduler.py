@@ -185,8 +185,11 @@ class MicroScheduler:
         queue = worker_graphs_manager.queues[wgid]
         engine = self.engine_manager.get_engine(node_name)
         for rid in request_ids:
-            wg = queue.per_request_queues[rid]
-            if node_name not in wg.ready_node_names:
+            # An unknown rid (removed on this rank, or not registered here
+            # yet) is "not ready", not an error: raising here would fail the
+            # caller's whole in-flight batch on this rank alone.
+            wg = queue.per_request_queues.get(rid)
+            if wg is None or node_name not in wg.ready_node_names:
                 return None
             fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
             if not engine.check_ready(node_name, rid, fwd_info):
