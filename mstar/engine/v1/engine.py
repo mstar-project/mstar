@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -28,6 +29,7 @@ from mstar.engine.v1.kv_transfer import TransferEngineInfo
 from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.profile.worker import ExecTimings
+from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +325,15 @@ class Engine:
         that rid out rather than losing the batch. A rid the submodule declines
         (returns None) leaves the same way, without being an error.
         """
+        if self._enable_nvtx:
+            range_push(f"engine.prepare_inputs.bs{len(batch.request_ids)}")
+        try:
+            self._prepare_inputs(batch)
+        finally:
+            if self._enable_nvtx:
+                range_pop()
+
+    def _prepare_inputs(self, batch: ExecutingBatch) -> None:
         submodule = self._submodules[batch.node_name].submodule
         node_inputs: list[NodeInputs] = []
         for rid in batch.request_ids:
@@ -358,6 +369,15 @@ class Engine:
         into the static buffers, and the launch is a replay; everything above
         the launch is identical.
         """
+        nvtx = self._enable_nvtx
+        if self._enable_profile and batch.exec_timings.start is None:
+            batch.exec_timings.start = time.perf_counter()
+        if nvtx:
+            range_push(
+                f"engine.{batch.node_name}.{batch.step_context.graph_walk}"
+                f".bs{len(batch.request_ids)}"
+            )
+
         submodule_mgmt = self._submodules[batch.node_name]
         cg_runner = submodule_mgmt.cuda_graph_runner
         submodule = submodule_mgmt.submodule
@@ -378,11 +398,17 @@ class Engine:
         try:
             step = batch.step
             if step is None:
-                step = batch.step = submodule.declare_step(
-                    graph_walk=batch.step_context.graph_walk,
-                    request_ids=rids,
-                    inputs=inputs
-                )
+                if nvtx:
+                    range_push("engine.declare_step")
+                try:
+                    step = batch.step = submodule.declare_step(
+                        graph_walk=batch.step_context.graph_walk,
+                        request_ids=rids,
+                        inputs=inputs
+                    )
+                finally:
+                    if nvtx:
+                        range_pop()
 
             if step is not None:
                 if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
@@ -399,11 +425,23 @@ class Engine:
                 # TODO: skip the resources a pre-plan already admitted and
                 # planned. They no-op (and promote) internally today, so this
                 # re-drives the whole sweep to get the rest.
-                admit_outcome = self._runner.admit(step)
+                if nvtx:
+                    range_push("engine.admit")
+                try:
+                    admit_outcome = self._runner.admit(step)
+                finally:
+                    if nvtx:
+                        range_pop()
                 if not admit_outcome.ok:
                     batch.register_admit_error(admit_outcome.reason)
                     return {rid: {} for rid in batch.request_ids}
-                self._runner.plan(step)
+                if nvtx:
+                    range_push("engine.plan")
+                try:
+                    self._runner.plan(step)
+                finally:
+                    if nvtx:
+                        range_pop()
 
             engine_inputs = ModelInputsFromEngine(
                 request_ids=rids,
@@ -418,50 +456,97 @@ class Engine:
                 captured=lease is not None,
                 step=step,
             )
-            preprocessed = submodule.preprocess(
-                batch.step_context.graph_walk,
-                engine_inputs=engine_inputs,
-                inputs=inputs
-            )
-
-            if lease is not None:
-                outputs = cg_runner.run_forward(
-                    lease, preprocessed, plan_done_event=batch.preplan_event,
-                )
-            elif batch.running_batched:
-                outputs = submodule.forward_batched(
+            if nvtx:
+                range_push("engine.preprocess")
+            try:
+                preprocessed = submodule.preprocess(
                     batch.step_context.graph_walk,
                     engine_inputs=engine_inputs,
-                    **preprocessed
+                    inputs=inputs
                 )
-            else:
-                assert real_bs == 1, (
-                    "the unbatched forward takes one request; batch of "
-                    f"{real_bs} needs running_batched"
-                )
-                outputs = {batch.request_ids[0]: submodule.forward(
-                    batch.step_context.graph_walk,
-                    engine_inputs=engine_inputs,
-                    **preprocessed
-                )}
+            finally:
+                if nvtx:
+                    range_pop()
 
-            # Collect before commit: the sampler's commit invalidates the
-            # gathered per-request sampler this step's logits are sampled
-            # with. Publishing here also lets whoever prepares the next step
-            # start threading these tensors while this one commits.
-            batch.outputs = self._collect_outputs(
-                batch, submodule_mgmt, lease, outputs, inputs, req_info,
-            )
+            if self._enable_profile and batch.exec_timings.fwd_start is None:
+                batch.exec_timings.fwd_start = time.perf_counter()
+            if nvtx:
+                # the launch/enqueue span, not the GPU work: `synchronize=True`
+                # here would drain the stream and destroy the overlap
+                range_push("engine.forward")
+            try:
+                outputs = self._forward(
+                    batch, submodule, submodule_mgmt, cg_runner,
+                    engine_inputs, preprocessed, lease, real_bs,
+                )
+            finally:
+                if nvtx:
+                    range_pop()
+
+            if nvtx:
+                range_push("engine.collect_outputs")
+            try:
+                # Collect before commit: the sampler's commit invalidates the
+                # gathered per-request sampler this step's logits are sampled
+                # with. Publishing here also lets whoever prepares the next step
+                # start threading these tensors while this one commits.
+                batch.outputs = self._collect_outputs(
+                    batch, submodule_mgmt, lease, outputs, inputs, req_info,
+                )
+            finally:
+                if nvtx:
+                    range_pop()
             batch.outputs_ready.set()
 
             if step is not None:
-                self._runner.commit(step)
+                if nvtx:
+                    range_push("engine.commit")
+                try:
+                    self._runner.commit(step)
+                finally:
+                    if nvtx:
+                        range_pop()
             return batch.outputs
         finally:
             batch.preplan_event = None
             batch.release_waiters()
             if lease is not None:
                 cg_runner.release(lease, real_bs)
+            if nvtx:
+                range_pop()
+
+    def _forward(
+        self,
+        batch: ExecutingBatch,
+        submodule: NodeSubmodule,
+        submodule_mgmt: SubmoduleManagement,
+        cg_runner,
+        engine_inputs: ModelInputsFromEngine,
+        preprocessed: dict[str, Any],
+        lease: SlotLease | None,
+        real_bs: int,
+    ) -> dict:
+        """Replay the leased slot, or run the eager forward."""
+        del submodule_mgmt
+        if lease is not None:
+            return cg_runner.run_forward(
+                lease, preprocessed, plan_done_event=batch.preplan_event,
+            )
+        if batch.running_batched:
+            return submodule.forward_batched(
+                batch.step_context.graph_walk,
+                engine_inputs=engine_inputs,
+                **preprocessed
+            )
+        assert real_bs == 1, (
+            "the unbatched forward takes one request; batch of "
+            f"{real_bs} needs running_batched"
+        )
+        return {batch.request_ids[0]: submodule.forward(
+            batch.step_context.graph_walk,
+            engine_inputs=engine_inputs,
+            **preprocessed
+        )}
 
     def postprocess_batch(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
@@ -472,6 +557,17 @@ class Engine:
         Per-rid like ``prepare_inputs``: a raise fails that request and leaves
         the rest of the batch to route normally.
         """
+        if self._enable_nvtx:
+            range_push("engine.postprocess")
+        try:
+            self._postprocess_batch(batch, outputs)
+        finally:
+            if self._enable_nvtx:
+                range_pop()
+
+    def _postprocess_batch(
+        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+    ) -> None:
         submodule = self._submodules[batch.node_name].submodule
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             try:
@@ -537,12 +633,18 @@ class Engine:
     def finalize_batch(
         self, batch: ExecutingBatch
     ):
-        # Returns rid -> {resource label -> published info}
-        published = self._runner.publish(batch.request_ids)
-        for rid, info in batch.per_request_info.items():
-            if rid not in published:
-                continue
-            info.update_publish_info(published[rid])
+        if self._enable_nvtx:
+            range_push("engine.finalize_batch")
+        try:
+            # Returns rid -> {resource label -> published info}
+            published = self._runner.publish(batch.request_ids)
+            for rid, info in batch.per_request_info.items():
+                if rid not in published:
+                    continue
+                info.update_publish_info(published[rid])
+        finally:
+            if self._enable_nvtx:
+                range_pop()
 
     def _collect_outputs(
         self,
@@ -771,6 +873,18 @@ class Engine:
         lease = batch.step_context.slot_lease
         if cg_runner is None or lease is None:
             return False
+        if self._enable_nvtx:
+            range_push(f"engine.pre_plan.bs{len(batch.request_ids)}")
+        try:
+            return self._pre_plan_for_batch(batch, submodule_mgmt, cg_runner, lease)
+        finally:
+            if self._enable_nvtx:
+                range_pop()
+
+    def _pre_plan_for_batch(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        cg_runner, lease: SlotLease,
+    ) -> bool:
 
         inputs = (
             cg_runner.config_for(lease).get_node_inputs(
