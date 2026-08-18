@@ -29,15 +29,20 @@ from __future__ import annotations
 import logging
 import math
 import os
+from dataclasses import dataclass
 
 import torch
 
-from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BasicBatchedCudaGraphConfig,
-    FlashInferPackedCudaGraphConfig,
+from mstar.engine.resources.step import (
+    AttentionStep,
+    KVStep,
+    Segment,
+    SubmoduleStep,
 )
-from mstar.engine.resources import PlanSpec, StepDeclaration
+from mstar.engine.v1.cuda_graph_config import (
+    BatchedCudaGraphConfig,
+    PackedCudaGraphConfig,
+)
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -100,9 +105,46 @@ SOUND_WALKS = (VIDEO_SOUND_GEN_WALK,)
 COND_LABEL = "main"
 UNCOND_LABEL = "uncond"
 
-# Combined plan key for the single FlashInfer plan that runs both guidance
-# branches in one forward (a combined PlanSpec in the step declaration).
+# Combined plan key for the single plan that runs both guidance branches in
+# one forward (``KVStep.combined_labels`` in the step declaration).
 CFG_BATCHED_LABEL = "_cfg_batched"
+
+# Resource labels the DiT node declares (Cosmos3Model.get_node_resources) and
+# keys its resource steps by. ATTN is the paged backend: the understanding
+# tower's prefill writes its K/V through it, and a captured denoise graph
+# replays against it. ATTN_GEN is the dense backend the eager denoise steps
+# use, where the paged path's per-step K/V write and wrapper plan are pure
+# overhead — the model declares it only when the config asks for it.
+KV_CACHE = "kv"
+ATTN = "attn"
+ATTN_GEN = "attn_gen"
+
+
+@dataclass(frozen=True)
+class GenStepInfo:
+    """What a denoise step's declaration needs and cannot read off the batch.
+
+    All three are per-request facts resolved in ``prepare_inputs`` (which has
+    the request's state and its step index) and carried to ``declare_step`` on
+    ``NodeInputs.resource_step_info``, since the declaration runs with only
+    the request ids and their prepared inputs.
+
+    ``capture_key`` is this request's half of ``cg_key_info`` — the capture
+    bucket its shape belongs to, or None for "no captured graph for this".
+    Agreeing with ``cg_key_info`` matters: the engine leases the slot from
+    that and then checks the declaration against the lease. What is left over
+    is the batch's size and token count, which no row knows, so a step every
+    row of which is capturable may still find no bucket and run eager.
+    Declaring the paged backend for such a step only costs the dense path's
+    speedup; declaring the dense one for a step that does get a slot would try
+    to capture an eager-only backend, so the safe direction over-declares.
+
+    ``cfg_active`` narrows the eager single-request declaration only. It is
+    deliberately not part of ``capture_key`` — see ``cg_key_info``.
+    """
+    cfg: bool                 # this request has an unconditional branch at all
+    cfg_active: bool          # ...and this step is inside its guidance interval
+    capture_key: object | None  # this request's capture bucket, if any
 
 
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
@@ -170,10 +212,75 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             te.float()
         return self
 
-    def get_needed_cache_labels(
-        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str] | None:
-        return [COND_LABEL, UNCOND_LABEL]
+    def cg_key_info(self, graph_walk: str, per_request_info: dict) -> object | None:
+        """Which of this walk's capture buckets the batch belongs to, or None
+        for "run eager".
+
+        The engine leases the replay slot before the step is declared, so this
+        answers from per-request state rather than from prepared inputs. It is
+        the sole gate on capture — the v1 engine has no ``can_use_cuda_graphs``
+        — so every condition the old gate checked lives here:
+
+        * only the two-branch guidance regime is captured (both the prefill's
+          combined cond+uncond pack and the denoise step's batched CFG);
+        * of the denoise walks only ``image_gen``, and only at a resolution a
+          graph was captured for (``_capture_layout``);
+        * a batch shares one captured (batch size, token count) bucket, so a
+          mixed-resolution batch falls back to the eager cross-request denoise.
+
+        Every fact this reads is fixed for a request's whole lifetime (its
+        guidance regime and its latent shape, both settled at prefill). That is
+        a requirement, not a coincidence: the speculative pre-plan path leases
+        a slot for step N+1 while step N is still in flight, before N+1 has
+        been through ``prepare_inputs``, so a key derived from anything that
+        advances per step (the denoise step index, say) would be read one
+        iteration stale and could lease a bucket the declaration then
+        contradicts. ``Engine.exec`` checks the two against each other.
+
+        The guidance interval is the fact this deliberately does not consult:
+        a captured step always runs both branches, so an out-of-interval step
+        gets the guidance combine where the eager path would run the
+        conditional branch alone (``postprocess`` combines unconditionally).
+        That predates the v1 migration and matches the fused reference
+        pipeline, which applies guidance on every step; honoring the interval
+        here instead would make the key step-dependent, which is exactly what
+        the pre-plan path cannot support.
+        """
+        rids = list(per_request_info)
+        states = [self.request_states.get(rid) for rid in rids]
+        if not states or any(
+            st is None or st.get("uncond") is None for st in states
+        ):
+            return None
+        if graph_walk in PREFILL_WALKS:
+            return True
+        if graph_walk != IMAGE_GEN_WALK:
+            return None
+        shapes = {tuple(st["latent_shape"]) for st in states}
+        if len(shapes) != 1:
+            return None
+        shape = shapes.pop()
+        if shape not in (getattr(self, "_capture_layout", None) or {}):
+            return None
+        return shape
+
+    def _step_info(self, graph_walk: str, st, step_index: int) -> GenStepInfo:
+        """The per-request facts ``declare_step`` needs, resolved here where
+        the request's state and its step index are both in hand."""
+        return GenStepInfo(
+            cfg=st.get("uncond") is not None,
+            cfg_active=self._cfg_active(st, step_index),
+            capture_key=self._capture_key(graph_walk, st),
+        )
+
+    def _capture_key(self, graph_walk: str, st) -> object | None:
+        """This one request's half of ``cg_key_info``: everything that does
+        not depend on the rest of the batch. See ``GenStepInfo.capture_key``."""
+        if graph_walk != IMAGE_GEN_WALK or st.get("uncond") is None:
+            return None
+        shape = tuple(st["latent_shape"])
+        layout = getattr(self, "_capture_layout", None) or {}
+        return shape if shape in layout else None
 
     # ------------------------------------------------------------------
     # Static packing + scheduler helpers
@@ -524,6 +631,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"],
             tensor_inputs=tensors,
+            resource_step_info=self._step_info(IMAGE_GEN_WALK, st, step_index),
         )
 
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
@@ -560,6 +668,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             tensor_inputs={
                 "latents": latents, "sound_latents": sound_latents, "time_index": time_index,
             },
+            resource_step_info=self._step_info(
+                VIDEO_SOUND_GEN_WALK, st, step_index
+            ),
         )
 
     def _prepare_action_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
@@ -598,6 +709,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"] + st["cond"]["num_action_tokens"],
             tensor_inputs={"latents": latents, "action_latents": action_latents, "time_index": time_index},
+            resource_step_info=self._step_info(ACTION_GEN_WALK, st, step_index),
         )
 
     # ------------------------------------------------------------------
@@ -606,31 +718,49 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def declare_step(
-        self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs,
-    ) -> StepDeclaration:
-        cm = engine_inputs.cache_manager
+        self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
+    ) -> SubmoduleStep:
+        """This batch's step: which cache streams it touches, by how much, and
+        which attention backend runs over them.
 
+        Two guidance branches are two labels on the one cache. Whether a
+        request has both, and whether this step uses both, is a per-request
+        fact that rides in on ``NodeInputs.resource_step_info`` from
+        ``prepare_inputs`` (see ``GenStepInfo``) rather than being read off
+        the batch here.
+
+        The attention key is the other half of the declaration. ``attn`` is
+        paged, ``attn_gen`` dense; a step that may replay from a captured
+        graph must name the paged one, because the dense backend's prefix
+        gather is shaped by the step and cannot be captured.
+        """
         if graph_walk in PREFILL_WALKS:
-            # The text prefix is written once and committed; both guidance
-            # branches prefill together as one combined plan when present.
-            if inputs[0].kwargs.get("cfg"):
-                labels = (COND_LABEL, UNCOND_LABEL)
-                return StepDeclaration(plans=(PlanSpec(
-                    labels=labels,
-                    spans={
-                        label: tuple(inp.kwargs["seq_lens"][label] for inp in inputs)
+            # The text prefix is written once and committed; the denoise steps
+            # read it frozen for the rest of the request. Both guidance
+            # branches prefill together under one combined plan when present.
+            # Always paged: the denoise steps read this K/V back out of the
+            # pages, which the dense backend never writes.
+            cfg = bool(inputs[0].kwargs.get("cfg"))
+            labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
+            return SubmoduleStep(
+                cg_key_info=cfg or None,
+                segments=self._segments(
+                    request_ids, labels,
+                    [
+                        tuple(inp.kwargs["seq_lens"][label] for inp in inputs)
                         for label in labels
-                    },
-                    is_causal=True,
-                    write_store=False,
-                    combined=True,
-                ),))
-            return StepDeclaration(plans=(PlanSpec(
-                labels=(COND_LABEL,),
-                spans={COND_LABEL: tuple(inp.input_seq_len for inp in inputs)},
-                is_causal=True,
-                write_store=False,
-            ),))
+                    ],
+                ),
+                steps={
+                    KV_CACHE: KVStep(
+                        commit=True,
+                        combined_labels=(
+                            {labels: CFG_BATCHED_LABEL} if cfg else {}
+                        ),
+                    ),
+                    ATTN: AttentionStep(causal=True),
+                },
+            )
 
         if (
             graph_walk not in GEN_WALKS
@@ -639,58 +769,108 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ):
             raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
-        # Denoise steps read the frozen prefix and overwrite the same
-        # generation span every step, so nothing commits.
+        # Denoise steps read the frozen prefix and recompute the same
+        # generation span every step, so nothing commits. The fresh tokens are
+        # still declared as ordinary spans: that is what gives the dense
+        # backend its query lengths, and it keeps the two backends drop-in for
+        # one declaration (see DenseAttentionManager).
         spans = tuple(inp.input_seq_len for inp in inputs)
+        infos = [self._gen_step_info(inp) for inp in inputs]
 
-        def gen_plan(labels, combined):
-            return PlanSpec(
-                labels=labels,
-                spans={label: spans for label in labels},
-                is_causal=False,
-                write_store=False,
-                dense_gen=True,
-                combined=combined,
-                commit=False,
+        # Mirrors cg_key_info: one capture bucket shared by every row. A lease
+        # implies this branch, so the ones below only ever see the real batch
+        # — under a lease the padding rows carry the bucket's own key, which
+        # keeps `keys` a singleton and returns here.
+        keys = {info.capture_key for info in infos}
+        capture_key = keys.pop() if len(keys) == 1 else None
+        attn_key = ATTN if capture_key is not None else self._eager_gen_attn_key()
+
+        if capture_key is not None:
+            # The captured denoise graph has a fixed shape and always runs both
+            # guidance branches — including outside a request's guidance
+            # interval, which the eager path below honors. See `cg_key_info`.
+            return self._gen_step(
+                request_ids, spans, (COND_LABEL, UNCOND_LABEL),
+                combined=True, attn_key=attn_key, cg_key_info=capture_key,
             )
 
-        if cm is not None and cm.is_captured:
-            # The captured denoise graph has a fixed shape and always runs
-            # both guidance branches; there is no per-request state here.
-            return StepDeclaration(plans=(
-                gen_plan((COND_LABEL, UNCOND_LABEL), combined=True),
-            ))
-
-        states = self._states(engine_inputs)
-        sts = [states[rid] for rid in engine_inputs.request_ids]
-        if len(sts) > 1:
+        if len(infos) > 1:
             # Cross-request batch: one combined plan over every request's
-            # guidance branches (a single branch when guidance is off).
+            # guidance branches (a single branch when guidance is off). The
+            # batched forward always applies guidance when the branch exists,
+            # so the interval does not narrow the batched declaration.
             labels = (
-                (COND_LABEL, UNCOND_LABEL)
-                if sts[0]["uncond"] is not None else (COND_LABEL,)
+                (COND_LABEL, UNCOND_LABEL) if infos[0].cfg else (COND_LABEL,)
             )
-            return StepDeclaration(plans=(gen_plan(labels, combined=True),))
+            return self._gen_step(
+                request_ids, spans, labels, combined=True, attn_key=attn_key,
+            )
 
-        st = sts[0]
-        cfg_active = True
-        if graph_walk in GEN_WALKS or graph_walk in SOUND_WALKS:
-            step_index = int(
-                inputs[0].tensor_inputs["time_index"].reshape(-1)[0].item()
-            )
-            cfg_active = self._cfg_active(st, step_index)
-        if st["uncond"] is None or not cfg_active:
+        if not infos[0].cfg_active:
             # Guidance off, or a guidance_interval out-of-interval step: the
             # conditional branch runs alone, so nothing else plans.
-            return StepDeclaration(plans=(gen_plan((COND_LABEL,), combined=False),))
-        if self.batched_cfg:
-            return StepDeclaration(plans=(
-                gen_plan((COND_LABEL, UNCOND_LABEL), combined=True),
-            ))
-        return StepDeclaration(plans=(
-            gen_plan((COND_LABEL,), combined=False),
-            gen_plan((UNCOND_LABEL,), combined=False),
-        ))
+            return self._gen_step(
+                request_ids, spans, (COND_LABEL,),
+                combined=False, attn_key=attn_key,
+            )
+        # Batched CFG packs both branches into one plan; the sequential path
+        # plans each branch on its own label and runs two forwards.
+        return self._gen_step(
+            request_ids, spans, (COND_LABEL, UNCOND_LABEL),
+            combined=self.batched_cfg, attn_key=attn_key,
+        )
+
+    @staticmethod
+    def _segments(
+        request_ids: list[str],
+        labels: tuple[str, ...],
+        spans_per_label: list[tuple[int, ...]],
+    ) -> list[Segment]:
+        """Label-major, matching how a combined plan concatenates its sources.
+        This ordering is what every per-token array in the forward is packed
+        in, so it is declared once, here."""
+        return [
+            Segment(rid, label, span)
+            for label, spans in zip(labels, spans_per_label, strict=True)
+            for rid, span in zip(request_ids, spans, strict=True)
+        ]
+
+    def _gen_step(
+        self, request_ids: list[str], spans: tuple[int, ...],
+        labels: tuple[str, ...], combined: bool, attn_key: str,
+        cg_key_info: object | None = None,
+    ) -> SubmoduleStep:
+        """A denoise step: the same span under each live label, nothing
+        committed, non-causal attention over [frozen prefix | fresh tokens]."""
+        return SubmoduleStep(
+            cg_key_info=cg_key_info,
+            segments=self._segments(
+                request_ids, labels, [spans] * len(labels)
+            ),
+            steps={
+                KV_CACHE: KVStep(
+                    commit=False,
+                    combined_labels=(
+                        {labels: CFG_BATCHED_LABEL} if combined else {}
+                    ),
+                ),
+                attn_key: AttentionStep(causal=False),
+            },
+        )
+
+    def _eager_gen_attn_key(self) -> str:
+        """The backend an eager denoise step runs on: the dense one when the
+        model declared it (``attention_backend="dense_gen"``), else paged."""
+        return ATTN_GEN if ATTN_GEN in self.node_resources else ATTN
+
+    @staticmethod
+    def _gen_step_info(inp: ARNodeInputs) -> GenStepInfo:
+        info = inp.resource_step_info
+        if isinstance(info, GenStepInfo):
+            return info
+        # A caller that built its own inputs (tests, direct harnesses) gets the
+        # single-branch eager declaration.
+        return GenStepInfo(cfg=False, cfg_active=False, capture_key=None)
 
     def _preprocess_image_gen_captured(self, inputs) -> dict:
         """Pack a denoise step's inputs for the CUDA-graph path.
@@ -716,10 +896,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs]
     ) -> dict:
-        if (
-            graph_walk == IMAGE_GEN_WALK
-            and engine_inputs.cache_manager.is_captured
-        ):
+        if graph_walk == IMAGE_GEN_WALK and engine_inputs.captured:
             return self._preprocess_image_gen_captured(inputs)
 
         if graph_walk in PREFILL_WALKS:
@@ -798,32 +975,43 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         states = engine_inputs.per_request_states
         return states if states is not None else self.request_states
 
+    def _gen_attn(self, engine_inputs: ModelInputsFromEngine):
+        """The attention resource this step's denoise was planned against.
+
+        Read off the step rather than re-derived: ``declare_step`` names the
+        dense backend or the paged one depending on whether the step could
+        land on a capture slot, and only the one it named was planned."""
+        step = engine_inputs.step
+        key = ATTN_GEN if step is not None and ATTN_GEN in step else ATTN
+        resources = engine_inputs.resources or self.node_resources
+        return resources[key]
+
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, **kwargs):
-        cm = engine_inputs.cache_manager
         rid = engine_inputs.request_ids[0]
         if graph_walk in PREFILL_WALKS:
-            return self._forward_prefill(cm, **kwargs)
+            return self._forward_prefill(**kwargs)
         states = self._states(engine_inputs)
+        attn = self._gen_attn(engine_inputs)
         if graph_walk in GEN_WALKS:
-            return self._forward_image_gen(cm, states[rid], **kwargs)
+            return self._forward_image_gen(attn, states[rid], **kwargs)
         if graph_walk in SOUND_WALKS:
-            return self._forward_video_sound_gen(cm, states[rid], **kwargs)
+            return self._forward_video_sound_gen(attn, states[rid], **kwargs)
         if graph_walk in ACTION_WALKS:
-            return self._forward_action_gen(cm, states[rid], **kwargs)
+            return self._forward_action_gen(attn, states[rid], **kwargs)
         raise ValueError(f"Unknown Cosmos3 DiT graph walk: {graph_walk!r}")
 
     def _forward_prefill(
-        self, cm,
+        self,
         input_ids: torch.Tensor,
         text_mrope_ids: torch.Tensor,
         cfg=False,
         **kwargs
     ) -> dict:
         label = CFG_BATCHED_LABEL if cfg else COND_LABEL
-        self.transformer.prefill_und(input_ids, text_mrope_ids, cm, label)
+        self.transformer.prefill_und(input_ids, text_mrope_ids, label)
         return {}
 
-    def _denoise(self, cm, static, latents, vision_timesteps, label):
+    def _denoise(self, attn, static, latents, vision_timesteps, label):
         return self.transformer.denoise_step(
             latents,
             vision_timesteps,
@@ -831,17 +1019,25 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             static["vision_token_shapes"],
             static["vision_noisy_frame_indexes"],
             static["mse_gen_indexes"],
-            cm,
             label,
+            attn,
         )
 
     def _cfg_active(self, st, step_index: int) -> bool:
-        """Whether this denoise step runs classifier-free guidance (both
+        """Whether this eager denoise step runs classifier-free guidance (both
         branches combined). False ⇒ the conditional branch runs alone — the
         guidance_scale==1 case and, for the t2i recipe, steps whose timestep
-        falls outside the guidance_interval [lo, hi]. ``preprocess`` and
-        ``_forward_image_gen`` both call this for the same step so the planned
-        attention (batched vs cond-only) matches the forward that runs."""
+        falls outside the guidance_interval [lo, hi].
+
+        ``prepare_inputs`` (through ``_step_info``) and ``_forward_image_gen``
+        call this for the same step, so the declared attention (batched vs
+        cond-only) matches the forward that runs.
+
+        The captured path does not consult it at all: its graph is fixed at
+        both branches and ``postprocess`` combines unconditionally, so an
+        out-of-interval step that lands on a capture slot gets guidance where
+        the eager one would not. See ``cg_key_info`` for why the interval
+        cannot be folded into the capture key."""
         if st["uncond"] is None:
             return False
         gi = st.get("guidance_interval")
@@ -853,7 +1049,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         t = float(sched.timesteps[step_index].item())
         return gi[0] <= t <= gi[1]
 
-    def _forward_image_gen(self, cm, st, latents, time_index, **kwargs) -> dict:
+    def _forward_image_gen(self, attn, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
@@ -870,7 +1066,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         cfg_active = self._cfg_active(st, step_index)
 
         if not cfg_active:
-            velocity = self._denoise(cm, st["cond"], latents, vision_timesteps, COND_LABEL)
+            velocity = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
         elif self.batched_cfg:
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents,
@@ -880,13 +1076,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 st["cond"]["vision_token_shapes"],
                 st["cond"]["vision_noisy_frame_indexes"],
                 st["cond"]["mse_gen_indexes"],
-                cm,
                 CFG_BATCHED_LABEL,
+                attn,
             )
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
         else:
-            cond_v = self._denoise(cm, st["cond"], latents, vision_timesteps, COND_LABEL)
-            uncond_v = self._denoise(cm, st["uncond"], latents, vision_timesteps, UNCOND_LABEL)
+            cond_v = self._denoise(attn, st["cond"], latents, vision_timesteps, COND_LABEL)
+            uncond_v = self._denoise(attn, st["uncond"], latents, vision_timesteps, UNCOND_LABEL)
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
 
         new_latents = scheduler.step(
@@ -923,7 +1119,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         new_sound = packed_next[:, nv:].reshape(sound_latents.shape)
         return new_latents, new_sound
 
-    def _forward_video_sound_gen(self, cm, st, latents, sound_latents, time_index, **kwargs) -> dict:
+    def _forward_video_sound_gen(self, attn, st, latents, sound_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
@@ -942,7 +1138,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             velocity, sound_v = self.transformer.denoise_step(
                 latents, vts, st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
                 st["cond"]["vision_token_shapes"], st["cond"]["vision_noisy_frame_indexes"],
-                st["cond"]["mse_gen_indexes"], cm, COND_LABEL,
+                st["cond"]["mse_gen_indexes"], COND_LABEL, attn,
                 **self._sound_kwargs(st["cond"], sound_latents, sts),
             )
         elif self.batched_cfg:
@@ -952,7 +1148,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
                 st["cond"]["vision_token_shapes"],
                 st["cond"]["vision_noisy_frame_indexes"],
-                st["cond"]["mse_gen_indexes"], cm, CFG_BATCHED_LABEL,
+                st["cond"]["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
                 **self._sound_kwargs(st["cond"], sound_latents, sts),
             )
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
@@ -961,13 +1157,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond_v, s_c = self.transformer.denoise_step(
                 latents, vts, st["cond"]["position_ids"][:, st["cond"]["und_len"]:],
                 st["cond"]["vision_token_shapes"], st["cond"]["vision_noisy_frame_indexes"],
-                st["cond"]["mse_gen_indexes"], cm, COND_LABEL,
+                st["cond"]["mse_gen_indexes"], COND_LABEL, attn,
                 **self._sound_kwargs(st["cond"], sound_latents, sts),
             )
             uncond_v, s_u = self.transformer.denoise_step(
                 latents, vts, st["uncond"]["position_ids"][:, st["uncond"]["und_len"]:],
                 st["uncond"]["vision_token_shapes"], st["uncond"]["vision_noisy_frame_indexes"],
-                st["uncond"]["mse_gen_indexes"], cm, UNCOND_LABEL,
+                st["uncond"]["mse_gen_indexes"], UNCOND_LABEL, attn,
                 **self._sound_kwargs(st["uncond"], sound_latents, sts),
             )
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
@@ -987,7 +1183,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "time_index": [time_index + 1],
         }
 
-    def _denoise_action(self, cm, static, latents, action_latents, vts, ats, domain, label):
+    def _denoise_action(self, attn, static, latents, action_latents, vts, ats, domain, label):
         und_len = static["und_len"]
         return self.transformer.denoise_step(
             latents,
@@ -996,8 +1192,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             static["vision_token_shapes"],
             static["vision_noisy_frame_indexes"],
             static["mse_gen_indexes"],
-            cm,
             label,
+            attn,
             action_latents=action_latents,
             action_token_shapes=static["action_token_shapes"],
             action_noisy_frame_indexes=static["action_noisy_frame_indexes"],
@@ -1031,7 +1227,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         new_action[..., raw:] = 0
         return new_latents, new_action
 
-    def _forward_action_gen(self, cm, st, latents, action_latents, time_index, **kwargs) -> dict:
+    def _forward_action_gen(self, attn, st, latents, action_latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
         if step_index >= len(scheduler.timesteps):
@@ -1049,7 +1245,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         if st["uncond"] is None:
             video_v, action_v = self._denoise_action(
-                cm, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
+                attn, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
             )
         elif self.batched_cfg:
             (video_v, action_v), (v_u, a_u) = self.transformer.denoise_step_batched_cfg(
@@ -1060,8 +1256,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 st["cond"]["vision_token_shapes"],
                 st["cond"]["vision_noisy_frame_indexes"],
                 st["cond"]["mse_gen_indexes"],
-                cm,
                 CFG_BATCHED_LABEL,
+                attn,
                 action_latents=action_latents,
                 action_token_shapes=st["cond"]["action_token_shapes"],
                 action_noisy_frame_indexes=st["cond"]["action_noisy_frame_indexes"],
@@ -1073,10 +1269,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             action_v = a_u + st["gs"] * (action_v - a_u)
         else:
             video_v, action_v = self._denoise_action(
-                cm, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
+                attn, st["cond"], latents, action_latents, vts, ats, domain, COND_LABEL
             )
             v_u, a_u = self._denoise_action(
-                cm, st["uncond"], latents, action_latents, vts, ats, domain, UNCOND_LABEL
+                attn, st["uncond"], latents, action_latents, vts, ats, domain, UNCOND_LABEL
             )
             video_v = v_u + st["gs"] * (video_v - v_u)
             action_v = a_u + st["gs"] * (action_v - a_u)
@@ -1136,10 +1332,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         latents=None, time_index=None, action_latents=None, sound_latents=None,
         input_ids=None, text_mrope_ids=None, **kwargs,
     ):
-        cm = engine_inputs.cache_manager
         if graph_walk in PREFILL_WALKS:
             label = CFG_BATCHED_LABEL if kwargs.get("cfg") else COND_LABEL
-            self.transformer.prefill_und(input_ids, text_mrope_ids, cm, label)
+            self.transformer.prefill_und(input_ids, text_mrope_ids, label)
             return {}
         if graph_walk in ACTION_WALKS:
             return self._forward_batched_action(engine_inputs, latents, action_latents, time_index)
@@ -1148,6 +1343,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if graph_walk not in GEN_WALKS:
             raise ValueError(f"Cosmos3 batched forward only supports generation walks, got {graph_walk!r}")
         states = self._states(engine_inputs)
+        attn = self._gen_attn(engine_inputs)
         reqs, meta = [], []
         for rid in engine_inputs.request_ids:
             st = states[rid]
@@ -1170,7 +1366,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             })
             meta.append((rid, st, lat, ti, t))
 
-        results = self.transformer.denoise_step_batched(reqs, cm, CFG_BATCHED_LABEL)
+        results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
 
         out = {}
         for (rid, st, lat, ti, t), (cond_v, uncond_v) in zip(meta, results, strict=True):
@@ -1190,8 +1386,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         forward. Mirrors the image batched path with per-request sound bands:
         one batched transformer pass, then per request the guidance combine and
         its own joint [video | sound] scheduler step."""
-        cm = engine_inputs.cache_manager
         states = self._states(engine_inputs)
+        attn = self._gen_attn(engine_inputs)
         reqs, meta = [], []
         for rid in engine_inputs.request_ids:
             st = states[rid]
@@ -1220,7 +1416,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             })
             meta.append((rid, st, lat, snd, ti, t))
 
-        results = self.transformer.denoise_step_batched(reqs, cm, CFG_BATCHED_LABEL)
+        results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
 
         out = {}
         for (rid, st, lat, snd, ti, t), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
@@ -1244,8 +1440,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         inputs (clamping a request that has run one step past its denoise count),
         run one batched transformer pass, then per request combine the guidance
         branches (when present) and apply its own joint scheduler step."""
-        cm = engine_inputs.cache_manager
         states = self._states(engine_inputs)
+        attn = self._gen_attn(engine_inputs)
         rids = engine_inputs.request_ids
         with_cfg = states[rids[0]]["uncond"] is not None
         reqs, meta = [], []
@@ -1282,7 +1478,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             meta.append((rid, st, lat, act, ti, t))
 
         results = self.transformer.denoise_step_action_batched(
-            reqs, cm, CFG_BATCHED_LABEL, with_cfg
+            reqs, CFG_BATCHED_LABEL, attn, with_cfg
         )
 
         out = {}
@@ -1383,14 +1579,23 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     "position_ids_cond": static["vision_mrope_ids"].clone(),
                     "position_ids_uncond": static["vision_mrope_ids"].clone(),
                 },
+                # What the capture's own `declare_step` reads: this bucket's
+                # step is the two-branch one, over the paged backend. Padding
+                # rows carry it too, so a partly-filled replay declares the
+                # same segments the capture did.
+                resource_step_info=GenStepInfo(
+                    cfg=True, cfg_active=True, capture_key=tuple(latent_shape),
+                ),
             )
-            configs.append(BasicBatchedCudaGraphConfig(
+            configs.append(BatchedCudaGraphConfig(
                 capture_graph_walk=IMAGE_GEN_WALK,
                 single_request_inputs=single,
-                requires_cfg=False,
-                labels=[COND_LABEL, UNCOND_LABEL],
+                # One bucket per resolution: the token layout is baked into the
+                # capture, so a request at another latent shape must not land
+                # here. `cg_key_info` returns this same latent shape, and
+                # `declare_step` stamps it on the step.
+                additional_key_info=tuple(latent_shape),
                 capture_forward_method="forward_captured",
-                advance_seq_lens=False,
                 compile=False,
                 capture_batch_sizes=capture_batch_sizes,
                 # The captured sizes (default bs=1; COSMOS3_GEN_CAPTURE_BS adds
@@ -1416,69 +1621,53 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
 
-            def _prefill_template(n):
-                return {
-                    "input_ids": torch.zeros(n, dtype=torch.long, device=device),
-                    "text_mrope_ids": torch.zeros((3, n), dtype=mrope_dtype, device=device),
-                    "cfg": True,
-                }
-
-            configs.append(FlashInferPackedCudaGraphConfig(
+            configs.append(PackedCudaGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
-                packed_seq_len_to_inputs={n: _prefill_template(n) for n in prefill_tokens},
-                requires_cfg=False,
-                labels=[COND_LABEL, UNCOND_LABEL],
-                batched_cfg=True,
-                causal_attention=True,
+                capture_token_lengths=prefill_tokens,
+                make_node_input=lambda n: self._prefill_capture_input(
+                    n, device, mrope_dtype,
+                ),
+                # Only the two-branch prefill is captured; `cg_key_info`
+                # answers True for exactly that case. A guidance-off prefill
+                # declares one label over a different token count and runs
+                # eager.
+                additional_key_info=True,
                 compile=False,
                 capture_batch_sizes=prefill_bs,
                 caps_eager_batch_size=False,
-                zero_padding_input=ARNodeInputs(
-                    input_seq_len=0,
-                    tensor_inputs={
-                        "input_ids_" + COND_LABEL: torch.zeros(0, dtype=torch.long, device=device),
-                        "input_ids_" + UNCOND_LABEL: torch.zeros(0, dtype=torch.long, device=device),
-                        "text_mrope_ids_" + COND_LABEL: torch.zeros((3, 0), dtype=mrope_dtype, device=device),
-                        "text_mrope_ids_" + UNCOND_LABEL: torch.zeros((3, 0), dtype=mrope_dtype, device=device),
-                    },
-                    kwargs=dict(
-                        cfg=True,
-                        seq_lens={COND_LABEL: 0, UNCOND_LABEL: 0},
-                    ),
-                ),
             ))
         return configs
 
-    def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
-        # Text prefill is captured only with two-branch guidance (the combined
-        # cond+uncond packed sequence); the runner's can_run picks the token
-        # bucket, so a prompt past the largest bucket falls back to eager here.
-        if batch.graph_walk in PREFILL_WALKS:
-            return all(
-                (st := self.request_states.get(rid)) is not None and st["uncond"] is not None
-                for rid in batch.request_ids
+    def _prefill_capture_input(
+        self, num_tokens: int, device, mrope_dtype,
+    ) -> ARNodeInputs:
+        """One row of the combined cond+uncond prefill pack, at capture shape.
+
+        ``num_tokens`` is the row's whole contribution — both branches — since
+        that is what the runner buckets on. How it splits between them is
+        arbitrary here: the capture only fixes the packed token count, and the
+        per-label spans a replay attends over come from the real request's
+        declaration, which is re-planned into the same buffers before the
+        replay. ``num_tokens == 0`` is the padding row.
+        """
+        lens = {
+            COND_LABEL: num_tokens - num_tokens // 2,
+            UNCOND_LABEL: num_tokens // 2,
+        }
+        tensors = {}
+        for label, n in lens.items():
+            tensors[f"input_ids_{label}"] = torch.zeros(
+                n, dtype=torch.long, device=device,
             )
-        # Only the image denoise step is captured, only with two-branch guidance,
-        # and only at a resolution we captured a graph for. A batched capture is a
-        # single fixed resolution, so a concurrent batch must be uniform-resolution
-        # to share one captured (batch size, token count) bucket; mixed-resolution
-        # batches fall back to the eager cross-request denoise.
-        if batch.graph_walk != IMAGE_GEN_WALK:
-            return False
-        layout = getattr(self, "_capture_layout", None)
-        if not layout:
-            return False
-        shapes = set()
-        for rid in batch.request_ids:
-            st = self.request_states.get(rid)
-            if st is None or st["uncond"] is None:
-                return False
-            shape = tuple(st["latent_shape"])
-            if shape not in layout:
-                return False
-            shapes.add(shape)
-        return len(shapes) == 1
+            tensors[f"text_mrope_ids_{label}"] = torch.zeros(
+                (3, n), dtype=mrope_dtype, device=device,
+            )
+        return ARNodeInputs(
+            input_seq_len=num_tokens,
+            tensor_inputs=tensors,
+            kwargs=dict(cfg=True, seq_lens=lens),
+        )
 
     def forward_captured(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
@@ -1491,7 +1680,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         keeps the two-branch path; a concurrent batch runs the per-request denoise
         (the same compute as the eager cross-request forward), one transformer pass
         over the whole batch."""
-        cm = engine_inputs.cache_manager
+        attn = self._gen_attn(engine_inputs)
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
@@ -1502,7 +1691,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
-                layout["mse_gen_indexes"], cm, CFG_BATCHED_LABEL, prefer_all_gather=True,
+                layout["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
+                prefer_all_gather=True,
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [
@@ -1517,7 +1707,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             }
             for i in range(latents.shape[0])
         ]
-        results = self.transformer.denoise_step_batched(reqs, cm, CFG_BATCHED_LABEL)
+        results = self.transformer.denoise_step_batched(reqs, CFG_BATCHED_LABEL, attn)
         return {
             rid: {"cond_v": [cond_v], "uncond_v": [uncond_v]}
             for rid, (cond_v, uncond_v) in zip(rids, results, strict=True)

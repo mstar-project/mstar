@@ -263,26 +263,36 @@ class Cosmos3PackedMoTAttention(nn.Module):
 
     # ------------------------------------------------------------------
     # Cached-attention variants: the two pathways run in separate passes and
-    # share their K/V through a paged cache handle instead of in-pass concat.
-    # The understanding pass writes its K/V (causal); the generation pass reads
+    # share their K/V through a paged cache instead of in-pass concat. The
+    # understanding pass writes its K/V (causal); the generation pass reads
     # that frozen K/V plus its own (non-causal) — causality is fixed by the
-    # handle's attention plan, not here.
+    # step's attention plan, not here.
+    #
+    # The two pathways do not have to run over the same attention resource.
+    # The understanding prefill must go through a paged backend, because the
+    # denoise steps read its K/V back out of the pages; the denoise steps
+    # themselves recompute their K/V every step and only reuse that frozen
+    # prefix, which is what the dense backend is for. So `forward_und` uses
+    # the paged resource it bound here, and `forward_gen` takes whichever one
+    # the step declared (see Cosmos3Model.get_node_resources and
+    # Cosmos3DiTSubmodule.declare_step).
     # ------------------------------------------------------------------
 
     def bind_resources(self, resources: dict) -> None:
         self.attn = resources["attn"]
         self.kv = resources["kv"]
 
-    def _attend_paged(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    def _attend_cached(
+        self, attn, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         *, layer_idx: int, label: str,
     ) -> torch.Tensor:
-        """One layer's paged attention. The dense backend takes the fresh
-        K/V straight into its kernel and writes no pages, which is the whole
-        point of it for denoise; the paged backends need the write first."""
-        if self.attn.requires_kv_write:
+        """One layer's cached attention over ``attn``. The dense backend takes
+        the fresh K/V straight into its kernel and writes no pages, which is
+        the whole point of it for denoise; the paged backends need the write
+        first."""
+        if attn.requires_kv_write:
             self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
-        return self.attn.run(
+        return attn.run(
             q, label, self.kv.layer_view(layer_idx),
             k=k, v=v, layer_idx=layer_idx,
         )
@@ -305,17 +315,19 @@ class Cosmos3PackedMoTAttention(nn.Module):
             q = sp_head_slice(self.sp_group, q)
             k = sp_head_slice(self.sp_group, k)
             v = sp_head_slice(self.sp_group, v)
-            out = self._attend_paged(q, k, v, layer_idx=layer_idx, label=label)
+            out = self._attend_cached(
+                self.attn, q, k, v, layer_idx=layer_idx, label=label,
+            )
             out = sp_head_gather(self.sp_group, out).reshape(-1, H * D)
         else:
-            out = self._attend_paged(
-                q, k, v, layer_idx=layer_idx, label=label,
+            out = self._attend_cached(
+                self.attn, q, k, v, layer_idx=layer_idx, label=label,
             ).reshape(-1, H * D)
         return self.to_out(out)
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        layer_idx: int, label: str,
+        layer_idx: int, label: str, attn,
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
@@ -334,7 +346,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
         out = ulysses_attention(
             self.sp_group, q, k, v,
             functools.partial(
-                self._attend_paged, layer_idx=layer_idx, label=label,
+                self._attend_cached, attn, layer_idx=layer_idx, label=label,
             ),
             seq_sizes,
             prefer_all_gather=prefer_all_gather,
@@ -409,13 +421,13 @@ class Cosmos3MoTDecoderLayer(nn.Module):
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        layer_idx: int, label: str,
+        layer_idx: int, label: str, attn,
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
         gen_norm = self.input_layernorm_moe_gen(gen_seq)
         attn_out = self.self_attn.forward_gen(
-            gen_norm, cos, sin, layer_idx, label,
+            gen_norm, cos, sin, layer_idx, label, attn,
             seq_sizes, prefer_all_gather
         )
         residual = gen_seq + attn_out
@@ -862,13 +874,16 @@ class Cosmos3OmniTransformer(nn.Module):
     ) -> None:
         """Run the understanding tower over the text prefix, writing per-layer
         K/V under ``label`` (the plan key the step declared). ``position_ids``
-        are the text segment's 3D mRoPE ids ([3, und_len])."""
+        are the text segment's 3D mRoPE ids ([3, und_len]).
+
+        Always runs over the paged attention resource: the denoise steps read
+        this K/V back out of the pages, so it has to land there."""
         und_seq = self.embed_tokens(input_ids)
         cos, sin = self._rotary(position_ids, und_seq.device, und_seq.dtype)
         for i, layer in enumerate(self.layers):
             und_seq = layer.forward_und(und_seq, cos, sin, i, label)
 
-    def _sp_run_gen_layers(self, gen_seq, cos, sin, label, prefer_all_gather=False):
+    def _sp_run_gen_layers(self, gen_seq, cos, sin, label, attn, prefer_all_gather=False):
         """Run the generation layer stack, sequence-parallel-sharded across the
         SP group when active. ``gen_seq``/``cos``/``sin`` are the FULL sequence
         (identical on every SP rank); returns the FULL post-layer sequence.
@@ -884,7 +899,7 @@ class Cosmos3OmniTransformer(nn.Module):
         sp = self.sp_group
         if sp.world_size == 1:
             for i, layer in enumerate(self.layers):
-                gen_seq = layer.forward_gen(gen_seq, cos, sin, i, label)
+                gen_seq = layer.forward_gen(gen_seq, cos, sin, i, label, attn)
             return gen_seq
         seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
         gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
@@ -892,7 +907,7 @@ class Cosmos3OmniTransformer(nn.Module):
         sin = scatter_sequence(sp, sin, seq_sizes)
         for i, layer in enumerate(self.layers):
             gen_seq = layer.forward_gen(
-                gen_seq, cos, sin, i, label, seq_sizes, prefer_all_gather
+                gen_seq, cos, sin, i, label, attn, seq_sizes, prefer_all_gather
             )
         return gather_sequence(sp, gen_seq, seq_sizes)
 
@@ -905,6 +920,7 @@ class Cosmos3OmniTransformer(nn.Module):
         vision_noisy_frame_indexes: list[torch.Tensor],
         vision_mse_loss_indexes: torch.Tensor,
         label: str,
+        attn,
         action_latents: torch.Tensor | None = None,
         action_token_shapes: list[tuple[int, int, int]] | None = None,
         action_noisy_frame_indexes: list[torch.Tensor] | None = None,
@@ -929,7 +945,11 @@ class Cosmos3OmniTransformer(nn.Module):
         generation token block. With an extra band the generation sequence is
         ``[vision tokens | action or sound tokens]`` and the call returns
         ``(video_velocity, action_velocity)`` / ``(video_velocity,
-        sound_velocity)``."""
+        sound_velocity)``.
+
+        ``attn`` is the attention resource this step was planned against — the
+        dense backend when running eager, the paged one under a captured graph.
+        The caller declared it; see ``Cosmos3DiTSubmodule.declare_step``."""
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
@@ -957,7 +977,7 @@ class Cosmos3OmniTransformer(nn.Module):
             gen_seq = torch.cat([gen_seq, sound_seq], dim=0)
 
         cos, sin = self._rotary(position_ids, gen_seq.device, gen_seq.dtype)
-        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, label)
+        gen_seq = self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(gen_seq)
         preds_packed = self.proj_out(gen_out[vision_mse_loss_indexes])
         preds = self._unpatchify_and_unpack_latents(
@@ -988,6 +1008,7 @@ class Cosmos3OmniTransformer(nn.Module):
         vision_noisy_frame_indexes: list[torch.Tensor],
         vision_mse_loss_indexes: torch.Tensor,
         label: str,
+        attn,
         action_latents: torch.Tensor | None = None,
         action_token_shapes: list[tuple[int, int, int]] | None = None,
         action_noisy_frame_indexes: list[torch.Tensor] | None = None,
@@ -1048,7 +1069,7 @@ class Cosmos3OmniTransformer(nn.Module):
         sin = torch.cat([sin_c, sin_u], dim=0)
 
         gen_seq = self._sp_run_gen_layers(
-            gen_seq, cos, sin, label,
+            gen_seq, cos, sin, label, attn,
             prefer_all_gather=prefer_all_gather,
         )
         gen_out = self.norm_moe_gen(gen_seq)
@@ -1075,7 +1096,7 @@ class Cosmos3OmniTransformer(nn.Module):
 
         return _decode(gen_out[:n]), _decode(gen_out[n:])
 
-    def denoise_step_batched(self, requests: list[dict], label: str):
+    def denoise_step_batched(self, requests: list[dict], label: str, attn):
         """Denoise one step for several requests at once (image / video).
 
         Each request carries its own latents, timestep, rotary positions (which
@@ -1126,7 +1147,7 @@ class Cosmos3OmniTransformer(nn.Module):
         all_gen = torch.cat(gen_seqs + gen_seqs, dim=0)
         cos = torch.cat(cos_cond + cos_uncond, dim=0)
         sin = torch.cat(sin_cond + sin_uncond, dim=0)
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label)
+        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(all_gen)
 
         sizes = [g.shape[0] for g in gen_seqs]
@@ -1159,7 +1180,7 @@ class Cosmos3OmniTransformer(nn.Module):
         return results
 
     def denoise_step_action_batched(
-        self, requests: list[dict], label: str, with_cfg: bool,
+        self, requests: list[dict], label: str, attn, with_cfg: bool,
     ):
         """Joint ``[video | action]`` denoise for several action requests at once.
 
@@ -1224,7 +1245,7 @@ class Cosmos3OmniTransformer(nn.Module):
             cos = torch.cat(cos_cond, dim=0)
             sin = torch.cat(sin_cond, dim=0)
 
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label)
+        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label, attn)
         gen_out = self.norm_moe_gen(all_gen)
 
         sizes = [g.shape[0] for g in gen_seqs]

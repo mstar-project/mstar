@@ -25,10 +25,10 @@ from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
 from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
 from mstar.model.cosmos3.tests.test_engine_cache import (
-    _flashinfer_cache,
+    _engine_resources,
     _forward_step,
     _load,
-    _SdpaCacheHandle,
+    _SdpaResources,
 )
 
 # ---------------------------------------------------------------------------
@@ -236,9 +236,8 @@ _SOUND_CACHE: dict = {}
 
 
 @torch.no_grad()
-def _run_cache_once_sound(model, dit, cm, init, sound_init, cond_ids, uncond_ids, device):
+def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, uncond_ids, device):
     from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.model.submodule_base import ModelInputsFromEngine
 
     rid = "rs0"
     md = {"height": H, "width": W, "num_frames": FRAMES, "fps": 24.0,
@@ -247,13 +246,12 @@ def _run_cache_once_sound(model, dit, cm, init, sound_init, cond_ids, uncond_ids
         request_id=rid, graph_walk="prefill", requires_cfg=True,
         fwd_index=0, random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
     )
-    ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
     text_inputs = [
         torch.tensor(cond_ids, dtype=torch.long, device=device),
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    _forward_step(dit, "prefill", ei, [ni])
+    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     latents, sound_latents = init.clone(), sound_init.clone()
     time_index = torch.zeros(1, dtype=torch.long, device=device)
@@ -262,7 +260,9 @@ def _run_cache_once_sound(model, dit, cm, init, sound_init, cond_ids, uncond_ids
         ni = dit.prepare_inputs(VIDEO_SOUND_GEN_WALK, fwd, {
             "latents": [latents], "sound_latents": [sound_latents], "time_index": [time_index],
         })
-        out = _forward_step(dit, VIDEO_SOUND_GEN_WALK, ei, [ni])
+        out = _forward_step(
+            dit, VIDEO_SOUND_GEN_WALK, resources, [rid], {rid: fwd}, [ni],
+        )
         latents = out["latents"][0]
         sound_latents = out["sound_latents"][0]
         time_index = out["time_index"][0]
@@ -316,7 +316,7 @@ def test_sound_cache_once_matches_fused_exact() -> None:
     dit.batched_cfg = False
     try:
         lat, snd = _run_cache_once_sound(
-            ctx["model"], dit, _SdpaCacheHandle(), ctx["init"], ctx["sound_init"],
+            ctx["model"], dit, _SdpaResources().as_dict(), ctx["init"], ctx["sound_init"],
             ctx["cond"], ctx["uncond"], ctx["device"],
         )
     finally:
@@ -334,7 +334,7 @@ def test_sound_engine_path_flashinfer() -> None:
         print("  (skipped sound engine parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     try:
-        cm = _flashinfer_cache(ctx["model"], "rs0", ctx["device"], ctx["dtype"])
+        cm = _engine_resources(ctx["model"], ["rs0"], ctx["device"], ctx["dtype"])
     except Exception as exc:  # noqa: BLE001
         print(f"  (skipped sound engine parity: FlashInfer unavailable: {exc})")
         return
