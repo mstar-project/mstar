@@ -214,13 +214,15 @@ class Engine:
         self._runner = StepRunner(self._resources)
 
         for node_name, submodule in submodules.items():
+            resources = {
+                label: self._resources[label] for label in node_to_resources.get(node_name, [])
+            }
             self._submodules[node_name] = SubmoduleManagement(
                 submodule=submodule,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
-                resources={
-                    label: self._resources[label] for label in node_to_resources[node_name]
-                }
+                resources=resources
             )
+            submodule.bind_node_resources(resources)
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.

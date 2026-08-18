@@ -23,7 +23,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.utils.sampling import MultiSamplingConfig, SamplingConfig
+from mstar.utils.sampling import SamplingConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -383,45 +383,15 @@ class Model(ABC):
         self, node_name: str,
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
+        """This node's sampling params. Feed it to the sampler resource's
+        config in ``get_request_resource_configs``.
+
+        A node that samples under several configs (a talker and its code
+        predictor, say) declares one sampler resource per label rather than
+        nesting them here.
+        """
         return SamplingConfig(
             ignore_eos=(model_kwargs or {}).get("ignore_eos", False)
-        )
-
-    def get_aux_sampling_configs(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> dict[str, SamplingConfig]:
-        """
-        For a node that needs to perform sampling with multiple configs, for
-        instance the talker and code predictor in Qwen3-Omni / TTS. Returns
-        label -> SamplingConfig, e.g., {"code_predictor": ...}
-
-        The submodule samples these via ``sampler.sample_aux(label, ...)``; each
-        label gets its own sampler buffers, so the params are per-request and
-        CUDA-graph safe.
-
-        Contract: the label SET must not depend on ``model_kwargs`` — only the
-        values may. The aux SamplerBuffers are allocated once at engine build
-        from the default config, and MultiSampler.set_config /
-        MultiSamplerBuffers.update_request_config intersect against that fixed
-        set, so any label introduced later (per-request) is silently dropped
-        (and only asserts if the submodule then tries to sample it).
-        """
-        return {}
-
-    def resolve_sampling_configs(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> MultiSamplingConfig:
-        """Bundle a node's main + aux configs. The engines consume this, not
-        ``get_sampling_config`` directly."""
-        return MultiSamplingConfig(
-            main=self.get_sampling_config(
-                node_name=node_name, model_kwargs=model_kwargs
-            ),
-            aux=self.get_aux_sampling_configs(
-                node_name=node_name, model_kwargs=model_kwargs
-            )
         )
 
     @abstractmethod

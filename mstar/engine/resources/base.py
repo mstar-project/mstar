@@ -36,6 +36,9 @@ class CGSlotSpec:
     def num_tokens(self):
         return self.bucket.num_tokens
 
+    def __str__(self) -> str:
+        return f"{self.bucket} slot={self.slot}"
+
 
 @dataclass(frozen=True)
 class CGSlotKey:
@@ -187,7 +190,7 @@ def build_resource(
         return KVManager.build(
             spec=spec,
             device=device,
-            comm_group=joint_comm_group,
+            joint_comm_group=joint_comm_group,
             transfer_engine_info=transfer_engine_info,
             dtype=kv_dtype
         )
@@ -196,7 +199,7 @@ def build_resource(
         return SamplerResource.build(
             spec=spec,
             device=device,
-            comm_group=joint_comm_group
+            joint_comm_group=joint_comm_group
         )
     if spec.resource_type == ResourceType.ATTENTION:
         from mstar.engine.v1.attention_manager import AttentionManager

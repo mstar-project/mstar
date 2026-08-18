@@ -23,7 +23,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.orpheus.config import OrpheusModelConfig
+from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, OrpheusModelConfig
 
 
 def _build_decoder_layer(config: OrpheusModelConfig, comm_group: CommGroup | None = None) -> DecoderLayer:
@@ -39,6 +39,9 @@ def _build_decoder_layer(config: OrpheusModelConfig, comm_group: CommGroup | Non
             rope_low_freq_factor=config.rope_scaling["low_freq_factor"],
             rope_high_freq_factor=config.rope_scaling["high_freq_factor"],
             rope_old_context_len=config.rope_scaling["original_max_position_embeddings"],
+            attn_key=ATTN,
+            kv_key=KV_CACHE,
+            pos_key=ROPE
         ),
         mlp=ParallelGatedMLP(
             comm_group=comm_group,

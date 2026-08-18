@@ -7,13 +7,13 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
-from mstar.engine.cuda_graph_config import FlashInferPackedCudaGraphConfig
-from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
-from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.engine.kv_store import PositionInfo
-from mstar.model.orpheus.config import OrpheusModelConfig
+from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
+from mstar.engine.v1.attention_manager import AttentionManager
+from mstar.engine.v1.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.v1.sampler import SamplerResource
+from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
 
@@ -40,47 +40,27 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
-    def _build_prefill_packed(
-        self, num_tokens: int, device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        """Synthesize a tensor-only post-preprocess packed dict for prefill capture.
-
-        Orpheus' ``preprocess`` returns ``{"text_inputs": torch.cat(input_ids)}``;
-        ``embed_tokens`` is called inside ``_forward_prefill`` so the captured
-        static buffer is the packed (num_tokens,) long token-id tensor.
-        """
-        return {
-            "text_inputs": torch.zeros(
-                (num_tokens,), dtype=torch.long, device=device,
-            ),
-        }
-
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
-        prefill_packed = {
-            num_tokens: self._build_prefill_packed(num_tokens, device)
-            for num_tokens in self.PREFILL_TOKEN_BUCKETS
-        }
+    ) -> list[CudaGraphConfig]:
         return [
-            BasicBatchedCudaGraphConfig(
+            BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
-                requires_cfg=False, labels=["main"],
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1
                 ),
             ),
-            FlashInferPackedCudaGraphConfig(
+            PackedCudaGraphConfig(
                 capture_graph_walk="prefill",
-                replay_graph_walks=["prefill"],
-                packed_seq_len_to_inputs=prefill_packed,
-                requires_cfg=False,
-                labels=["main"],
-                compile=True,
-                causal_attention=True,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                make_node_input=lambda n: ARNodeInputs(
+                    input_ids=torch.zeros(
+                        (n,), dtype=torch.long, device=device,
+                    ), input_seq_len=n
+                ),
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES
+            )
         ]
 
     def prepare_inputs(
@@ -96,40 +76,65 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             input_seq_len=inputs["text_inputs"][0].shape[0]
         )
 
+    def declare_step(
+        self, graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs]
+    ):
+        prefill_tokens = {}
+        if graph_walk == "prefill":
+            prefill_tokens = {
+                rid: inp.input_ids for rid, inp in zip(request_ids, inputs)
+            }
+        return SubmoduleStep(
+            segments=[
+                Segment(
+                    request_id=rid,
+                    label="main",
+                    span=inp.input_seq_len,
+                ) for rid, inp in zip(request_ids, inputs)
+            ],
+            steps={
+                KV_CACHE: KVStep(),
+                ATTN: AttentionStep(causal=True),
+                SAMPLER: SamplerStep(
+                    apply_penalty=True,
+                    prefill_tracked_tokens=prefill_tokens
+                ),
+                ROPE: PositionStep()
+            }
+        )
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        cache_manager = engine_inputs.cache_manager
-        enable_nvtx = bool(getattr(cache_manager, "enable_nvtx", False))
-        if enable_nvtx:
-            from mstar.utils.profiler import range_pop, range_push
+        return {
+            "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
+        }
 
-            range_push("orpheus.preprocess.seq_lens", synchronize=False)
-        seq_lens = [
-            inp.input_seq_len for inp in inputs
-        ]
-        if enable_nvtx:
-            range_pop(synchronize=False)
-        # Plan attention and rope for the main cache label
-        if enable_nvtx:
-            range_push("orpheus.preprocess.set_active_label", synchronize=False)
-        cache_manager.set_active_label("main")
-        if enable_nvtx:
-            range_pop(synchronize=False)
-        cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
-        if enable_nvtx:
-            range_push("orpheus.preprocess.pack_inputs", synchronize=False)
-        try:
-            return {
-                "text_inputs": torch.cat([inp.input_ids for inp in inputs]),
-            }
-        finally:
-            if enable_nvtx:
-                range_pop(synchronize=False)
+    def _forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        text_inputs: torch.Tensor,
+    ) -> torch.Tensor:
+        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        attn: AttentionManager = engine_inputs.resources[ATTN]
+        emb = self.embed_tokens(text_inputs)
+        hidden = self.language_model(emb, label="main")
+
+        if graph_walk == "prefill":
+            hidden = attn.select_last_hidden(hidden)
+
+        logits = self.lm_head(hidden)
+        return sampler.sample(
+            engine_inputs.request_ids,
+            logits=logits
+        )
+
 
     def forward(
         self,
@@ -138,46 +143,18 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         text_inputs: torch.Tensor,
         **kwargs
     ) -> NameToTensorList:
-        cache_handle = engine_inputs.cache_manager
-        if graph_walk == "prefill":
-            return self._forward_prefill(
-                cache_handle=cache_handle,
+        return {
+            "new_token": self._forward(
+                graph_walk=graph_walk,
+                engine_inputs=engine_inputs,
                 text_inputs=text_inputs
             )
-        elif graph_walk == "decode":
-            return self._forward_decode(
-                cache_handle=cache_handle,
-                text_inputs=text_inputs
-            )
-        else:
-            raise ValueError(f"Unknown graph walk for OrpheusLLM: {graph_walk!r}")
+        }
 
-    def _forward_prefill(
-        self,
-        text_inputs: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        **kwargs,
-    ) -> NameToTensorList:
-        """Embed text tokens, fill KV cache, and sample the first audio token."""
-        emb = self.embed_tokens(text_inputs)
-        hidden = self.language_model(emb, cache_handle=cache_handle, **kwargs)
-        logits = self.lm_head(hidden[-1:])
-        return {"logits": [logits]}
-
-    def _forward_decode(
-        self,
-        text_inputs: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        **kwargs,
-    ) -> NameToTensorList:
-        """Embed previous token, run LLM forward, return logits for sampling."""
-        emb = self.embed_tokens(text_inputs)
-        hidden = self.language_model(emb, cache_handle=cache_handle, **kwargs)
-
-        logits = self.lm_head(hidden[-1:])
-        return {"logits": [logits]}
-
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(
+        self, batch: NodeBatch,
+        model_inputs: list[NodeInputs]
+    ) -> bool:
         return True
 
     def forward_batched(
@@ -187,80 +164,15 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         text_inputs: torch.Tensor,
         **kwargs
     ) -> dict[str, NameToTensorList]:
-        """Batched forward pass for prefill and decode.
-
-        Both paths sample within the forward pass (with the cuda graphable
-        sampler plugin) for improved performance, and return sampled tokens.
-        """
-        cache_handle = engine_inputs.cache_manager
-        if graph_walk == "decode":
-            return self._forward_decode_batched(
-                cache_manager=cache_handle,
-                request_ids=engine_inputs.request_ids,
-                sampler=engine_inputs.sampler,
-                text_inputs=text_inputs,
-            )
-        elif graph_walk == "prefill":
-            return self._forward_prefill_batched(
-                cache_handle=cache_handle,
-                request_ids=engine_inputs.request_ids,
-                sampler=engine_inputs.sampler,
-                text_inputs=text_inputs,
-            )
-        else:
-            raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
-
-    def _forward_prefill_batched(
-        self,
-        cache_handle: BatchedCacheManager,
-        sampler: Sampler,
-        request_ids: list[str],
-        text_inputs: torch.Tensor,
-    ) -> dict[str, NameToTensorList]:
-        qo_indptr_buf = cache_handle.get_qo_indptr_buf("main")
-        assert qo_indptr_buf is not None, (
-            "prefill forward_batched requires a CUDA-graph "
-            "FlashInferPrefillWrapper (qo_indptr static buffer); got None."
+        new_tokens = self._forward(
+            graph_walk=graph_walk,
+            engine_inputs=engine_inputs,
+            text_inputs=text_inputs
         )
-        last_token_indices = (qo_indptr_buf[1:] - 1).long()
-
-        cache_handle.set_active_label("main")
-        emb = self.embed_tokens(text_inputs)
-        hidden = self.language_model(emb, cache_handle=cache_handle)
-        last_hidden = hidden.index_select(0, last_token_indices)
-        logits = self.lm_head(last_hidden)  # (bs, vocab)
-
-        new_tokens = sampler.sample(
-            request_ids, logits, apply_penalty=True
-        )
-        out: dict = {
+        return {
             rid: {"new_token": [new_tokens[i : i + 1]]}
-            for i, rid in enumerate(request_ids)
+            for i, rid in enumerate(engine_inputs.request_ids)
         }
-        return out
-
-    def _forward_decode_batched(
-        self,
-        cache_manager: BatchedCacheManager,
-        sampler: Sampler,
-        request_ids: list[str],
-        text_inputs: torch.Tensor,
-    ) -> dict[str, NameToTensorList]:
-        request_ids = cache_manager.request_ids
-        embs = self.embed_tokens(text_inputs)
-
-        cache_manager.set_active_label("main")
-        hidden = self.language_model(embs, cache_handle=cache_manager)
-
-        logits = self.lm_head(hidden)
-        new_tokens = sampler.sample(
-            request_ids, logits, apply_penalty=True
-        )
-        out: dict = {
-            rid: {"new_token": [new_tokens[i : i + 1]]}
-            for i, rid in enumerate(request_ids)
-        }
-        return out
 
     def postprocess(
         self, request_id: str,
@@ -283,7 +195,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
             return set()
         token = outputs["new_token"][0].item()
         eos_token_id = self.config.stop_token_id
-        ignore_eos = request_info.sampling_config["LLM"].ignore_eos
+        ignore_eos= request_info.resource_configs[SAMPLER].ignore_eos
         if (not ignore_eos and eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= request_info.max_tokens):
             return {"decode_loop"}
@@ -321,7 +233,9 @@ class SNACDecoderSubmodule(NodeSubmodule):
     def _num_frames(self) -> int:
         return self.config.snac_window_tokens // (4 * self.config.tokens_per_frame)
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[BasicBatchedCudaGraphConfig]:
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[CudaGraphConfig]:
         """Declare the SNAC decode capture.
         """
         # One streaming window is ``snac_window_tokens`` raw tokens
@@ -335,10 +249,10 @@ class SNACDecoderSubmodule(NodeSubmodule):
             input_seq_len=tokens_per_window
         )
         return [
-            BasicBatchedCudaGraphConfig(
+            BatchedCudaGraphConfig(
                 capture_graph_walk="snac_chunk",
                 single_request_inputs=dummy,
-                capture_batch_sizes=[1, 2, 4, 8, 16],
+                caps_eager_batch_size=[1, 2, 4, 8, 16]
             ),
         ]
 
@@ -350,15 +264,6 @@ class SNACDecoderSubmodule(NodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         tokens = inputs["new_token"][0].flatten()
-        # # Need at least one full codebook row (7 tokens) to form a
-        # # meaningful frame; below that, _tokens_to_codes' pad branch
-        # # either crashes on the empty tensor or emits all-pad codes.
-        # if tokens.numel() < self.config.tokens_per_frame:
-        #     logger.debug(
-        #         "SNAC preprocess: only %d tokens — signaling skip",
-        #         tokens.numel(),
-        #     )
-        #     return None
         self._orig_seq_len[fwd_info.request_id] = tokens.shape[0]
         return ARNodeInputs(
             input_ids=self._tokens_to_codes(tokens),
@@ -366,9 +271,6 @@ class SNACDecoderSubmodule(NodeSubmodule):
         )
 
     def can_batch(self, batch: NodeBatch, inputs: list[ARNodeInputs]) -> bool:
-        # return len({
-        #     input.input_seq_len for input in inputs
-        # }) == 1
         return True
 
     def preprocess(

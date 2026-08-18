@@ -7,8 +7,6 @@ from enum import Enum
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
-
 
 class PageAllocator:
     """Simple page allocator using a FIFO queue of free page indices.
@@ -55,6 +53,35 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
+@torch.library.custom_op("mstar::kv_scatter_nhd", mutates_args={"cache"})
+def kv_scatter_nhd(
+    cache: torch.Tensor, layer_idx: int,
+    k: torch.Tensor, v: torch.Tensor,
+    page_idx: torch.Tensor, cache_idx: torch.Tensor,
+) -> None:
+    """Scatter per-token K/V into one layer's (page, offset) slots.
+
+    A custom op rather than plain indexing because the forward reaches the
+    cache through an attribute chain: dynamo lifts it as a graph attribute, so
+    tracing the mutation makes AOTAutograd functionalize it into a copy of the
+    WHOLE cache (tens of GiB). Declaring the mutation here keeps the write in
+    place and in-graph — no copy, and no graph break to recompile the layer
+    body once per layer.
+    """
+    layer = cache[layer_idx]
+    layer[page_idx, 0, cache_idx] = k.to(cache.dtype)
+    layer[page_idx, 1, cache_idx] = v.to(cache.dtype)
+
+
+@kv_scatter_nhd.register_fake
+def _kv_scatter_nhd_fake(
+    cache: torch.Tensor, layer_idx: int,
+    k: torch.Tensor, v: torch.Tensor,
+    page_idx: torch.Tensor, cache_idx: torch.Tensor,
+) -> None:
+    return None
+
+
 class KVLayout(Enum):
     NHD = "NHD"
     # TODO: can add more, like HND, MLA
@@ -75,34 +102,6 @@ class KVConfig:
     def __post_init__(self):
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
-
-
-@dataclass
-class KVSpec(NodeResourceSpec):
-    config: KVConfig
-
-    @property
-    def resource_type(self):
-        return ResourceType.KV_CACHE
-
-    def apply_yaml_overrides(
-        self,
-        max_num_pages: int | None = None,
-        page_size: int | None = None,
-        max_seq_len: int | None = None,
-        cpu_offload_pages: int | None = None,
-        **kwargs,
-    ):
-        """How much cache this deployment gets, and how it is cut up."""
-        del kwargs  # keys meant for other resources
-        for name, value in (
-            ("max_num_pages", max_num_pages),
-            ("page_size", page_size),
-            ("max_seq_len", max_seq_len),
-            ("cpu_offload_pages", cpu_offload_pages),
-        ):
-            if value is not None:
-                setattr(self.config, name, value)
 
 
 class KVCache:
@@ -220,17 +219,20 @@ class KVCache:
         return_tensor: bool=False
     ) -> None:
         """Scatter per-token K/V ([num_tokens, num_kv_heads, head_dim]) into
-        the (page, offset-in-page) slots given by ``page_idx``/``cache_idx``."""
+        the (page, offset-in-page) slots given by ``page_idx``/``cache_idx``.
+
+        Goes through ``mstar::kv_scatter_nhd`` so the mutation survives being
+        traced — see that op for why.
+        """
         if self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"write_tokens is not implemented for layout {self.layout}."
             )
-        layer = self.tensor[layer_idx]
-        layer[page_idx, 0, cache_idx] = k.to(self.dtype)
-        layer[page_idx, 1, cache_idx] = v.to(self.dtype)
-
+        torch.ops.mstar.kv_scatter_nhd(
+            self.tensor, layer_idx, k, v, page_idx, cache_idx,
+        )
         if return_tensor:
-            return layer[page_idx, :, cache_idx]
+            return self.read_tokens(layer_idx, page_idx, cache_idx)
 
     def copy_pages(self, src_pages: list[int], dst_pages: list[int]) -> None:
         """Copy whole pages (every layer, both K and V, all tokens) within

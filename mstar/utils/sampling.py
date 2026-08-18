@@ -16,7 +16,6 @@ Usage:
 """
 
 import logging
-import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
@@ -228,44 +227,6 @@ class SamplingConfig:
 
 
 @dataclass
-class MultiSamplingConfig:
-    """A node's sampling configs: the main one plus any labelled aux samplers.
-
-    Aux samplers exist for submodules that sample more than once per step with
-    different params — e.g. the Qwen3-Omni Talker samples codec group 0 from the
-    Talker LLM and groups 1..N-1 from the CodePredictor.
-    """
-    # Never None after construction — see ``__post_init__``. Callers of a node's
-    # config can read ``.main`` unguarded.
-    main: SamplingConfig = field(default_factory=SamplingConfig)
-    aux: dict[str, SamplingConfig] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if self.main is None:
-            # Allow the upstream (e.g., a model implementation) to return None
-            # for its base config, but set it to the default sampling config here.
-            self.main = SamplingConfig()
-
-    def set_seed(self, seed: int):
-        self.main.set_seed(seed)
-        for label, cfg in self.aux.items():
-            # Derive aux seeds from the request seed so aux draws don't replay
-            # the main sampler's philox stream. crc32 (unlike hash()) is stable
-            # across processes, so TP ranks derive the same seed.
-            cfg.set_seed(seed ^ (zlib.crc32(label.encode()) & 0x7FFFFFFF))
-
-    @property
-    def seed(self):
-        return self.main.seed
-
-    @property
-    def ignore_eos(self) -> bool:
-        # Stop conditions are a main-config concern; submodules' ``check_stop``
-        # reads this straight off the node's config.
-        return self.main.ignore_eos
-
-
-@dataclass
 class BaseSampler(ABC):
     def _broadcast_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """In-place broadcast of ``tokens`` from rank 0 to all TP ranks.
@@ -285,35 +246,6 @@ class BaseSampler(ABC):
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         pass
-
-
-@dataclass
-class BaseMultiSampler(BaseSampler):
-    main: BaseSampler
-    aux: dict[str, BaseSampler] = field(default_factory=dict)
-
-    @property
-    def tp_group(self):
-        # Every label shares the submodule's communicator; expose main's so
-        # ``_broadcast_tokens`` called on the multi-sampler still broadcasts
-        # (without this it reads no tp_group and silently no-ops).
-        return getattr(self.main, "tp_group", None)
-
-    def sample(
-        self, request_ids: list[str], logits: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
-        return self.main.sample(request_ids, logits, **kwargs)
-
-    def sample_aux(
-        self, label: str,
-        request_ids: list[str],
-        logits: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
-        assert label in self.aux, (
-            f"No aux sampler {label!r} (have {sorted(self.aux)}). The node's "
-            "``get_aux_sampling_configs`` must declare it."
-        )
-        return self.aux[label].sample(request_ids, logits, **kwargs)
 
 
 @dataclass
@@ -470,52 +402,6 @@ class Sampler(BaseSampler):
         return tokens
 
 
-@dataclass
-class MultiSampler(BaseMultiSampler):
-    """Eager ``Sampler`` per label. Each owns its own per-request state."""
-    main: Sampler
-    aux: dict[str, Sampler] = field(default_factory=dict)
-
-    @classmethod
-    def new(
-        cls, aux_labels: list[str],
-        device: torch.device,
-        **sampler_kwargs
-    ) -> "MultiSampler":
-        return cls(
-            main=Sampler(device, **sampler_kwargs),
-            aux={
-                label: Sampler(device, **sampler_kwargs) \
-                    for label in aux_labels
-            }
-        )
-
-    def add_request(self, request_id: str):
-        self.main.add_request(request_id)
-        for aux in self.aux.values():
-            aux.add_request(request_id)
-
-    def get_token_mask(self, request_id: str):
-        return self.main.get_token_mask(request_id)
-
-    def get_aux_token_masks(self, request_id: str):
-        return {
-            label: sampler.get_token_mask(request_id) \
-                for label, sampler in self.aux.items()
-        }
-
-    def remove_request(self, request_id: str):
-        self.main.remove_request(request_id)
-        for aux in self.aux.values():
-            aux.remove_request(request_id)
-
-    def set_config(self, request_id: str, config: MultiSamplingConfig):
-        self.main.set_config(request_id, **asdict(config.main))
-        for label in config.aux.keys() & self.aux.keys():
-            self.aux[label].set_config(request_id, **asdict(config.aux[label]))
-
-
-@torch.compiler.disable
 def sample_tokens(
     logits: torch.Tensor,
     temperature: float | torch.Tensor = 0.6,
@@ -745,45 +631,6 @@ class CudaGraphableSampler(BaseSampler):
             mask = m._seen_token_mask
             if mask is not None:
                 mask.copy_(self.seen_tokens_buf[i])
-
-
-@dataclass
-class MultiCudaGraphableSampler(BaseMultiSampler):
-    """Graph-safe counterpart of ``MultiSampler``, built by ``MultiSamplerBuffers``.
-
-    Submodules sample the main stream with ``sample`` and each aux stream with
-    ``sample_aux(label, ...)``; every param comes from the label's own static
-    device buffers, so replay honours per-request configs without recapture.
-    """
-    main: CudaGraphableSampler
-    aux: dict[str, CudaGraphableSampler] = field(default_factory=dict)
-
-    def _samplers(self) -> "Iterable[CudaGraphableSampler]":
-        return [self.main, *self.aux.values()]
-
-    @property
-    def applied_penalty_in_graph(self) -> bool:
-        return any(s.applied_penalty_in_graph for s in self._samplers())
-
-    @applied_penalty_in_graph.setter
-    def applied_penalty_in_graph(self, value: bool) -> None:
-        for s in self._samplers():
-            s.applied_penalty_in_graph = value
-
-    @torch.compiler.disable
-    def sync_seen_token_masks(
-        self, request_ids: list[str], sampler: MultiSampler,
-    ) -> None:
-        """Sync each label's in-graph rows back to its eager ``SeenTokenMask``s."""
-        self.main.sync_seen_token_masks(
-            [sampler.main.get_token_mask(rid) for rid in request_ids]
-        )
-        for label, aux in self.aux.items():
-            eager = sampler.aux.get(label)
-            if eager is not None:
-                aux.sync_seen_token_masks(
-                    [eager.get_token_mask(rid) for rid in request_ids]
-                )
 
 
 @dataclass
@@ -1188,95 +1035,3 @@ class SamplerBuffers:
         masters. Call once AFTER the graph replay for the last gather; GPU-only,
         real rows only (padding rows all map to slot 0)."""
         self.offset.scatter(self._slot_idx_gpu, self._last_real_bs)
-
-
-@dataclass
-class MultiSamplerBuffers:
-    """One ``SamplerBuffers`` per label — the graph-side owner of a node's configs.
-
-    Each label gets independent scalar/seed/offset buffers (and its own optional
-    seen-token mask, sized by that label's ``vocab_size``), so the aux samplers
-    neither share the main sampler's RNG stream nor its penalty state.
-    """
-    main: SamplerBuffers
-    aux: dict[str, SamplerBuffers] = field(default_factory=dict)
-
-    @classmethod
-    def allocate(
-        cls,
-        max_batch_size: int,
-        device: torch.device,
-        config: MultiSamplingConfig | None = None,
-        tp_group: "CommGroup | None" = None,  # noqa: F821
-    ) -> "MultiSamplerBuffers":
-        config = config or MultiSamplingConfig()
-        main_cfg = config.main
-
-        def mk(cfg: SamplingConfig) -> SamplerBuffers:
-            return SamplerBuffers.allocate(
-                max_batch_size=max_batch_size, device=device,
-                tp_group=tp_group, vocab_size=cfg.vocab_size,
-            )
-
-        return cls(
-            main=mk(main_cfg),
-            aux={label: mk(cfg) for label, cfg in config.aux.items()},
-        )
-
-    def register_request(
-        self, rid: str, config: MultiSamplingConfig | None = None,
-    ) -> None:
-        self.main.register_request(rid, config.main if config else None)
-        for label, bufs in self.aux.items():
-            bufs.register_request(rid, config.aux.get(label) if config else None)
-
-    def unregister_request(self, rid: str) -> None:
-        self.main.unregister_request(rid)
-        for bufs in self.aux.values():
-            bufs.unregister_request(rid)
-
-    def update_request_config(
-        self, rid: str, config: MultiSamplingConfig,
-    ) -> None:
-        self.main.update_request_config(rid, config.main)
-        for label, cfg in config.aux.items():
-            bufs = self.aux.get(label)
-            if bufs is not None:
-                bufs.update_request_config(rid, cfg)
-
-    def stage_seen_token_masks(
-        self, request_ids: list[str], sampler: MultiSampler,
-    ) -> None:
-        """Stage every label's live eager masks into its master rows."""
-        self.main.stage_seen_token_masks(
-            request_ids, [sampler.main.get_token_mask(rid) for rid in request_ids]
-        )
-        for label, bufs in self.aux.items():
-            eager = sampler.aux.get(label)
-            if eager is not None:
-                bufs.stage_seen_token_masks(
-                    request_ids,
-                    [eager.get_token_mask(rid) for rid in request_ids],
-                )
-
-    def gather_for_request_ids(
-        self, request_ids: list[str], padded_bs: int,
-        gather_seen_tokens: bool = True,
-    ) -> MultiCudaGraphableSampler:
-        return MultiCudaGraphableSampler(
-            main=self.main.gather_for_request_ids(
-                request_ids, padded_bs, gather_seen_tokens,
-            ),
-            aux={
-                label: bufs.gather_for_request_ids(
-                    request_ids, padded_bs, gather_seen_tokens,
-                ) for label, bufs in self.aux.items()
-            },
-        )
-
-    def scatter_offsets(self) -> None:
-        """Persist every label's advanced RNG offset back to its master. Call
-        once after the graph replay for the gather (see ``SamplerBuffers``)."""
-        self.main.scatter_offset()
-        for bufs in self.aux.values():
-            bufs.scatter_offset()

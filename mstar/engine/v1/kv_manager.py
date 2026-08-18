@@ -7,7 +7,7 @@ import torch
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
-from mstar.engine.resources.spec import ResourceReqConfig, ResourceType
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import (
     AdmitOutcome,
     AllocationFailed,
@@ -17,7 +17,7 @@ from mstar.engine.resources.step import (
     group_by_plan_label,
 )
 from mstar.engine.v1.cpu_page_pool import CPUPagePool
-from mstar.engine.v1.kv_cache import KVCache, KVConfig, KVSpec, PageAllocator
+from mstar.engine.v1.kv_cache import KVCache, KVConfig, PageAllocator
 from mstar.engine.v1.kv_transfer import KVTransferManager, TransferEngineInfo
 
 
@@ -233,6 +233,34 @@ class KVReqConfig(ResourceReqConfig):
         return ["main"]
 
 
+@dataclass
+class KVSpec(NodeResourceSpec):
+    config: KVConfig
+
+    @property
+    def resource_type(self):
+        return ResourceType.KV_CACHE
+
+    def apply_yaml_overrides(
+        self,
+        max_num_pages: int | None = None,
+        page_size: int | None = None,
+        max_seq_len: int | None = None,
+        cpu_offload_pages: int | None = None,
+        **kwargs,
+    ):
+        """How much cache this deployment gets, and how it is cut up."""
+        del kwargs  # keys meant for other resources
+        for name, value in (
+            ("max_num_pages", max_num_pages),
+            ("page_size", page_size),
+            ("max_seq_len", max_seq_len),
+            ("cpu_offload_pages", cpu_offload_pages),
+        ):
+            if value is not None:
+                setattr(self.config, name, value)
+
+
 class KVManager(Resource):
     def __init__(
         self,
@@ -332,10 +360,11 @@ class KVManager(Resource):
         self, rid: str,
         node_name: str,
         graph_walk: str,
-        published: PublishedKVInfo
+        published: PublishedKVInfo | None
     ) -> AdmitOutcome:
-        # TODO: reload from CPU
-
+        if published is None:
+            return AdmitOutcome(ok=True)
+    
         if published.world_size != self._world_size:
             raise RuntimeError(
                 "KV cache transfer across TP world size is currently disallowed"
@@ -825,9 +854,12 @@ class KVManager(Resource):
 
     def write_kv(
         self, k: torch.Tensor, v: torch.Tensor,
-        layer_idx: int, label: str
-    ) -> torch.Tensor:
-        """Write K, V. Returns the slice of the KV cache that was just written.
+        layer_idx: int, label: str, return_tensor: bool = False,
+    ) -> torch.Tensor | None:
+        """Write K, V into this step's planned slots.
+
+        Returns nothing by default: reading the slots back is a gather no
+        caller wants today, and skipping it keeps the write a pure mutation.
         """
         plan_state = self._current_plan_states[label]
         n = plan_state.total_tokens
@@ -836,5 +868,5 @@ class KVManager(Resource):
             k=k[:n], v=v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
-            return_tensor=True
+            return_tensor=return_tensor,
         )

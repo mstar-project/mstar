@@ -99,12 +99,13 @@ class SamplerResource(Resource):
             vocab_size=self._vocab_size
         )
 
-    def ingest_request(self, rid: str, overrides: SamplingReqConfig):
+    def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
+        extra_kwargs = asdict(overrides) if overrides is not None else {}
         self._sampler.add_request(request_id=rid)
         self._sampler.set_config(
             request_id=rid,
             vocab_size=self._vocab_size,
-            **asdict(overrides)
+            **extra_kwargs
         )
         if self._cg_buffers is not None:
             self._cg_buffers.register_request(
@@ -139,13 +140,13 @@ class SamplerResource(Resource):
         )
 
     def commit(self, step: SamplerStep, ctx: StepContext):
-        self._cg_sampler = None # invalidate sampler for next step
         if self._cg_buffers is None:
             return
         self._cg_buffers.scatter_offset()
-        self._cg_buffers.stage_seen_token_masks(
+        self._cg_sampler.sync_seen_token_masks(
             [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
         )
+        self._cg_sampler = None # invalidate sampler for next step
 
     ### Submodule-level functionality
 

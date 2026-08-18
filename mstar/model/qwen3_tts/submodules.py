@@ -54,7 +54,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
 )
 from mstar.utils.sampling import (
-    BaseMultiSampler,
+    BaseSampler,
     SeenTokenMask,
 )
 
@@ -440,7 +440,9 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _code_predictor_piecewise_capture(
         self,
         static_inputs: dict[str, torch.Tensor],
-        sampler: BaseMultiSampler,
+        # TODO: aux sampling is per-label sampler resources now; this
+        # node's depth loop still expects the old nested sampler.
+        sampler: BaseSampler,
         **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Capture entry point: the depth loop *including* its sampling.

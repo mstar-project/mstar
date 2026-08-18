@@ -268,11 +268,22 @@ class FlashInferManager(AttentionManager):
         self._preplan_states = {}
 
     ### Submodule-level functionality
-    def qo_indptr_buf(self, label: str) -> torch.Tensor | None:
+    def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:
         if label not in self._current_plan_states:
             return
         # decode wrappers never set one
         return getattr(self._current_plan_states[label], "_qo_indptr_buf", None)
+
+    def select_last_hidden(
+        self, hidden: torch.Tensor, label: str="main"
+    ) -> torch.Tensor:
+        """
+        Select last token of the hidden vector per request, used for sampling
+        from prefill.
+        """
+        qo_indptr_buf = self.qo_indptr_buf(label)
+        last_token_indices = (qo_indptr_buf[1:] - 1).long()
+        return hidden.index_select(0, last_token_indices)
 
     def run(
         self, q: torch.Tensor, label: str,
@@ -601,7 +612,6 @@ class FlashInferCrossManager(CrossAttentionManager):
             )
             self._eager_plan_states[plan_label] = wrapper
         return plan_label, wrapper
-
 
 
     def run(

@@ -37,7 +37,7 @@ from mstar.model.qwen3_omni.components.rope import (
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
 from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.utils.sampling import MultiCudaGraphableSampler, SeenTokenMask
+from mstar.utils.sampling import CudaGraphableSampler, SeenTokenMask
 
 logger = logging.getLogger(__name__)
 
@@ -1466,7 +1466,9 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _forward_decode_like(
         self, request_ids: list[str],
         cache_handle: BatchedCacheManager,
-        injected_sampler: MultiCudaGraphableSampler,
+        # TODO: aux sampling is per-label sampler resources now; this
+        # walk still expects the old nested sampler.
+        injected_sampler: CudaGraphableSampler,
         suppress_mask: torch.Tensor,
         all_codes: torch.Tensor,
         codec_emb_sum: torch.Tensor,

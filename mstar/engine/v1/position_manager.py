@@ -13,6 +13,55 @@ from mstar.engine.resources.step import PositionStep, StepContext
 from mstar.engine.v1.kv_manager import KVPlanOutput, SequenceView
 
 
+@torch.library.custom_op("mstar::rope_apply_qk_inplace", mutates_args={"q", "k"})
+def rope_apply_qk_inplace(
+    q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    rotary_dim: int | None, interleave: bool,
+    rope_scale: float, rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    """Rotate q and k in place at ``pos_ids``.
+
+    Wrapped as a custom op so the traced forward sees one opaque, declared
+    mutation: FlashInfer's rope goes through a TVM-FFI call dynamo can't trace,
+    so calling it directly breaks the graph once per layer.
+    """
+    import flashinfer
+
+    rope_kwargs = dict(
+        rotary_dim=rotary_dim, interleave=interleave,
+        rope_scale=rope_scale, rope_theta=rope_theta,
+    )
+    llama31 = (
+        low_freq_factor is not None
+        and high_freq_factor is not None
+        and old_context_len is not None
+    )
+    if not llama31:
+        flashinfer.rope.apply_rope_pos_ids_inplace(q, k, pos_ids, **rope_kwargs)
+    else:
+        flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
+            q, k, pos_ids, **rope_kwargs,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+        )
+
+
+@rope_apply_qk_inplace.register_fake
+def _rope_apply_qk_inplace_fake(
+    q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    rotary_dim: int | None, interleave: bool,
+    rope_scale: float, rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    return None
+
+
 class PosBackend(Enum):
     ROPE = "rope"
 
@@ -233,27 +282,19 @@ class RopeManager(PositionManager):
         elif q.dtype == torch.float32:
             q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
 
-        rope_kwargs = dict(
-            rotary_dim=rotary_dim if rotary_dim is not None else config.rotary_dim,
-            interleave=interleave if interleave is not None else config.interleave,
-            rope_scale=rope_scale if rope_scale is not None else config.rope_scale,
-            rope_theta=rope_theta if rope_theta is not None else config.rope_theta,
-        )
         llama31_params = {
             key: value for key, value in kwargs.items()
             if key in ("low_freq_factor", "high_freq_factor", "old_context_len")
         } or config.llama31_params
 
-        import flashinfer
-
-        if not llama31_params:
-            flashinfer.rope.apply_rope_pos_ids_inplace(
-                q, k, pos_ids[:q.shape[0]], **rope_kwargs
-            )
-        else:
-            flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
-                q, k, pos_ids[:q.shape[0]], **rope_kwargs, **llama31_params
-            )
+        torch.ops.mstar.rope_apply_qk_inplace(
+            q, k, pos_ids[:q.shape[0]],
+            rotary_dim if rotary_dim is not None else config.rotary_dim,
+            interleave if interleave is not None else config.interleave,
+            rope_scale if rope_scale is not None else config.rope_scale,
+            rope_theta if rope_theta is not None else config.rope_theta,
+            **llama31_params,
+        )
         return q.to(orig_dtype), k.to(orig_dtype)
 
 

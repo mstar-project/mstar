@@ -1,6 +1,12 @@
 from dataclasses import dataclass, field
 
 
+# Constants
+KV_CACHE = "kv_cache"
+ATTN = "attn"
+SAMPLER = "sampler"
+ROPE = "rope"
+
 @dataclass
 class OrpheusModelConfig:
     # Llama 3.2 3B architecture

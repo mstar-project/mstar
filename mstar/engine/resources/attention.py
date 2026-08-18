@@ -400,7 +400,7 @@ class FlashInferAttentionManager:
         ps.write_store = write_store
         ps.dense_gen = None
 
-    def qo_indptr_buf(self, label: str) -> torch.Tensor | None:
+    def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:
         """The persistent qo_indptr static buffer of ``label``'s CUDA-graph
         prefill wrapper, or None outside that mode. Captured prefill paths
         read it to recover per-request token boundaries from inside the

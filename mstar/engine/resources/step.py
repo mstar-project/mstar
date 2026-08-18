@@ -34,6 +34,10 @@ class BucketKey:
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
 
+    def __str__(self) -> str:
+        key = "" if self.cg_key_info is None else f",key={self.cg_key_info}"
+        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}]"
+
 
 @dataclass(frozen=True)
 class SlotLease:
@@ -66,17 +70,23 @@ class StepContext:
 
 @dataclass(frozen=True)
 class SubmoduleStep:
-    # No batch-layout `segments` here: each ResourceStep carries the segments
-    # it covers, and KV's plan output is the packing authority everything
-    # downstream reads. The cross-check this used to enable (each resource
-    # step being an order-preserving subsequence of a batch layout) went with
-    # it — nothing reconstructed that layout.
     steps: dict[str, ResourceStep] # resource key -> step within cumulative
+
+    # used for convenience only: if a ResourceStep does not specify segments,
+    # it gets this list
+    segments: list[Segment] | None = None
 
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
 
     _ctx: StepContext = None # set by the engine
+
+    def __post_init__(self):
+        if self.segments is None:
+            return
+        for step in self.steps.values():
+            if step.segments is None:
+                object.__setattr__(step, "segments", self.segments)
 
     @property
     def ctx(self):
@@ -96,7 +106,7 @@ class SubmoduleStep:
     def __contains__(self, key: str) -> bool:
         return key in self.steps
 
-"""perhaaps move below to distinct files/location per resource kind"""
+"""perhaps move below to distinct files/location per resource kind"""
 
 @dataclass(frozen=True)
 class KVStep(ResourceStep):

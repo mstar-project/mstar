@@ -82,9 +82,10 @@ class DummyRowPool:
 class CudaGraphSlot:
     """One captured graph + the buffers its replay reads and writes.
 
-    Double-buffer: each bucket holds NUM_SLOTS of these. Replay alternates
+    Double-buffer: a bucket holds one of these per slot. Replay alternates
     between slots so plan(N+1) on the inactive slot's resources can run
-    concurrently with replay(N) on the active slot.
+    concurrently with replay(N) on the active slot — so a node with nothing
+    to pre-plan keeps a single slot.
     """
     graph: torch.cuda.CUDAGraph
     # preprocess output as captured; tensor entries are the static buffers
@@ -111,9 +112,10 @@ class CudaGraphBucket:
 
 
 class CudaGraphRunner:
-    # Double-buffer: capture two graphs per config key. Replay alternates so
-    # plan(N+1) on the inactive slot can run concurrent with replay(N) on the
-    # active slot. Override via MSTAR_NUM_SLOTS=1 to disable double-buffer
+    # Double-buffer: capture two graphs per config key, when the node has a
+    # resource that pre-plans. Replay alternates so plan(N+1) on the inactive
+    # slot can run concurrent with replay(N) on the active slot. Override via
+    # MSTAR_NUM_SLOTS=1 to disable double-buffer
     NUM_SLOTS = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
@@ -142,6 +144,14 @@ class CudaGraphRunner:
         self._autocast_dtype = autocast_dtype
         self._enable_nvtx = enable_nvtx
 
+        # A second slot only buys something when a resource can plan a step
+        # ahead: the point is for that plan to write buffers the in-flight
+        # replay isn't reading. With nothing to pre-plan, the slots would hold
+        # identical graphs and double the capture time and memory.
+        self._num_slots = self.NUM_SLOTS if any(
+            resource.supports_preplan for resource in resources.values()
+        ) else 1
+
         self._buckets: dict[BucketKey, CudaGraphBucket] = {}
 
         self._memory_pool = None
@@ -166,6 +176,10 @@ class CudaGraphRunner:
         # Sum of bytes that WOULD have been allocated by per-capture clones
         # (one full tensor per call). For logging purposes.
         self._capture_clone_bytes_naive = 0
+
+        # config_idx -> its compiled forward, shared by every bucket of that
+        # config so shapes captured twice (once per slot) compile once
+        self._compiled_forwards: dict[int, Any] = {}
 
         # Plan-overlap stream. Lazily created the first time pre_plan
         # is called from Worker.plan_executor.
@@ -196,7 +210,7 @@ class CudaGraphRunner:
                         bs=bs,
                         num_tokens=num_tokens,
                     )
-                    for slot in range(self.NUM_SLOTS):
+                    for slot in range(self._num_slots):
                         specs.append(CGSlotSpec(
                             bucket=bucket,
                             slot=slot,
@@ -336,14 +350,7 @@ class CudaGraphRunner:
                 if isinstance(value, torch.Tensor)
             )
 
-            forward = getattr(self._submodule, config.capture_forward_method)
-            if config.compile:
-                forward = torch.compile(
-                    forward,
-                    mode="max-autotune-no-cudagraphs",
-                    fullgraph=False,
-                    dynamic=False,
-                )
+            forward = self._forward_for(spec)
 
             def run_forward():
                 return forward(
@@ -382,6 +389,26 @@ class CudaGraphRunner:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
             self._dummy_rows.reset(dummy_rids)
+
+    def _forward_for(self, spec: CGSlotSpec):
+        """The callable this bucket captures, compiled once per config.
+
+        One wrapper per config rather than per capture: ``dynamic=False`` keys
+        compiled code by shape, so every bucket of a config shares a cache and
+        the second slot's identical shapes are free. A wrapper per capture
+        would recompile — and re-autotune — all of them.
+        """
+        forward = getattr(self._submodule, spec.config.capture_forward_method)
+        if not spec.config.compile:
+            return forward
+        if spec.config_idx not in self._compiled_forwards:
+            self._compiled_forwards[spec.config_idx] = torch.compile(
+                forward,
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+                dynamic=False,
+            )
+        return self._compiled_forwards[spec.config_idx]
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[str], graph_walk: str,

@@ -338,7 +338,7 @@ class NodeSubmodule(torch.nn.Module):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[NodeInputs],
-    ) -> "SubmoduleStep | None":
+    ) -> SubmoduleStep | None:
         """Declare this batch's step for the runner to drive: which cache
         streams it touches, what spans they grow by, which plans back it,
         which streams fork, and what commits when it lands. The runner

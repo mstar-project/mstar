@@ -331,9 +331,6 @@ class Conductor:
         Resolved once, here, and carried on the request: the worker hands each
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
-
-        TODO: apply the YAML ``kv_cache`` overrides, which used to patch the
-        KVCacheConfig here. They belong on the specs the model declares now.
         """
         return self.model.get_request_resource_configs(model_kwargs)
 

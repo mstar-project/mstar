@@ -44,7 +44,8 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.base import EngineType
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.v1.attention_manager import AttentionConfig, AttentionSpec
-from mstar.engine.v1.kv_cache import KVConfig, KVSpec
+from mstar.engine.v1.kv_cache import KVConfig
+from mstar.engine.v1.kv_manager import KVSpec
 from mstar.engine.v1.kv_manager import KVReqConfig
 from mstar.engine.v1.position_manager import PositionConfig, PositionSpec
 from mstar.engine.v1.sampler import SamplerSpec, SamplingReqConfig
