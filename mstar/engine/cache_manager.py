@@ -74,6 +74,24 @@ class PlanCacheKey(NamedTuple):
     dtype: torch.dtype
 
 
+class XPUPagedSegment(NamedTuple):
+    request_id: str
+    label: str
+    prefix_len: int
+    query_len: int
+
+
+@dataclass
+class XPUPagedPlan:
+    segments: list[XPUPagedSegment]
+    block_table: torch.Tensor
+    cu_q: torch.Tensor
+    host_kv_lens: torch.Tensor
+    max_q: int
+    max_k: int
+    causal: bool
+
+
 @dataclass
 class _PlanState:
     """Pre-computed state from plan_attention/plan_rope for a single cache label.
@@ -123,6 +141,8 @@ class _PlanState:
     # segment over its contiguous frozen prefix. None on paged plans, which
     # keep the FlashInfer path. See DenseGenCacheManager._build_dense_gen_plan.
     dense_gen: dict | None = None
+    # Raw planning inputs consumed by vllm-xpu-kernels paged attention.
+    xpu_paged: XPUPagedPlan | None = None
 
 
 class WorkspaceBufferManager:
@@ -132,6 +152,7 @@ class WorkspaceBufferManager:
         self.size = size
         self.device = device
         self.buffers = {}
+        self.rope_caches = {}
 
     def get(self, label: str="main"):
         if label not in self.buffers:
@@ -139,6 +160,38 @@ class WorkspaceBufferManager:
                 self.size, dtype=torch.uint8, device=self.device
             )
         return self.buffers[label]
+
+    def get_rope_cache(
+        self,
+        max_seq_len: int,
+        rotary_dim: int,
+        rope_scale: float,
+        rope_theta: float,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (max_seq_len, rotary_dim, rope_scale, rope_theta, dtype)
+        if key not in self.rope_caches:
+            positions = (
+                torch.arange(
+                    max_seq_len, device=self.device, dtype=torch.float32,
+                )
+                / rope_scale
+            )
+            inv_freq = 1.0 / (
+                rope_theta
+                ** (
+                    torch.arange(
+                        0, rotary_dim, 2,
+                        device=self.device, dtype=torch.float32,
+                    )
+                    / rotary_dim
+                )
+            )
+            freqs = torch.outer(positions, inv_freq)
+            self.rope_caches[key] = torch.cat(
+                (freqs.cos(), freqs.sin()), dim=-1,
+            ).to(dtype)
+        return self.rope_caches[key]
 
 
 @dataclass
@@ -269,7 +322,11 @@ class BatchedCacheManager(ABC):
         .copy_() outside the graph, so the address stays stable across replay.
         """
         ps = self._plan_states.get(label)
-        if ps is None or ps.wrapper is None:
+        if ps is None:
+            return None
+        if ps.xpu_paged is not None:
+            return ps.xpu_paged.cu_q
+        if ps.wrapper is None:
             return None
         return getattr(ps.wrapper, "_qo_indptr_buf", None)
 
@@ -414,6 +471,11 @@ class BatchedCacheManager(ABC):
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
+        if self.device.type == "xpu" and computed_pos_ids.dtype != torch.long:
+            computed_pos_ids = computed_pos_ids.to(
+                device=self.device, dtype=torch.long,
+            )
+
         if self._cuda_graph_mode:
             if ps.pos_ids is not None:
                 n = computed_pos_ids.shape[0]
@@ -477,6 +539,8 @@ class BatchedCacheManager(ABC):
                     pos_ids_list, dtype=torch.long, device=self.device,
                 ))
         combined_pos_ids = parts[0] if len(parts) == 1 else torch.cat(parts)
+        if self.device.type == "xpu" and combined_pos_ids.dtype != torch.long:
+            combined_pos_ids = combined_pos_ids.to(torch.long)
         self._plan_states[combined_label].pos_ids = combined_pos_ids
 
     @torch.compiler.disable
@@ -493,46 +557,112 @@ class BatchedCacheManager(ABC):
     ):
         """Apply RoPE using the active label's pre-computed position IDs."""
         label = self._active_label()
-
         ps = self._plan_states[label]
         assert ps.pos_ids is not None
 
         orig_dtype = q.dtype
-
         if rope_dtype is not None:
             q, k = q.to(rope_dtype), k.to(rope_dtype)
-        elif torch.is_autocast_enabled():
-            dtype = torch.get_autocast_gpu_dtype()
+        elif torch.is_autocast_enabled(q.device.type):
+            dtype = torch.get_autocast_dtype(q.device.type)
             q, k = q.to(dtype), k.to(dtype)
         elif q.dtype == torch.float32:
-            dtype = torch.bfloat16
-            q, k = q.to(dtype), k.to(dtype)
+            q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
 
-        llama31_params = {}
-        for key, value in kwargs.items():
-            if key in ['low_freq_factor', 'high_freq_factor', 'old_context_len']:
-                llama31_params[key] = value
+        llama31_params = {
+            key: value
+            for key, value in kwargs.items()
+            if key in {"low_freq_factor", "high_freq_factor", "old_context_len"}
+        }
 
-        import flashinfer
+        if q.device.type == "cuda":
+            import flashinfer
 
-        if not llama31_params:
-            flashinfer.rope.apply_rope_pos_ids_inplace(
-                q, k, ps.pos_ids,
+            if llama31_params:
+                flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
+                    q, k, ps.pos_ids,
+                    rotary_dim=rotary_dim,
+                    interleave=interleave,
+                    rope_scale=rope_scale,
+                    rope_theta=rope_theta,
+                    **llama31_params,
+                )
+            else:
+                flashinfer.rope.apply_rope_pos_ids_inplace(
+                    q, k, ps.pos_ids,
+                    rotary_dim=rotary_dim,
+                    interleave=interleave,
+                    rope_scale=rope_scale,
+                    rope_theta=rope_theta,
+                )
+        elif q.device.type == "xpu":
+            if llama31_params:
+                raise NotImplementedError(
+                    "Llama 3.1 RoPE scaling is not implemented for XPU"
+                )
+            rotary_dim = rotary_dim or q.shape[-1]
+            cos_sin_cache = self.buffer_manager.get_rope_cache(
+                max_seq_len=self.kv_cache_config.max_seq_len,
                 rotary_dim=rotary_dim,
-                interleave=interleave,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                dtype=q.dtype,
+            )
 
+            import vllm_xpu_kernels._C  # noqa: F401
+
+            torch.ops._C.rotary_embedding(
+                ps.pos_ids,
+                q,
+                k,
+                q.shape[-1],
+                cos_sin_cache,
+                not interleave,
             )
         else:
-            flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
-                q, k, ps.pos_ids,
-                rotary_dim=rotary_dim,
-                interleave=interleave,
-                rope_scale=rope_scale,
-                rope_theta=rope_theta,
-                **llama31_params
+            if llama31_params:
+                raise NotImplementedError(
+                    "Llama 3.1 RoPE scaling is not implemented for the "
+                    "portable accelerator path"
+                )
+
+            rotary_dim = rotary_dim or q.shape[-1]
+            positions = ps.pos_ids.to(torch.float32) / rope_scale
+            inv_freq = 1.0 / (
+                rope_theta
+                ** (
+                    torch.arange(
+                        0, rotary_dim, 2,
+                        device=q.device, dtype=torch.float32,
+                    )
+                    / rotary_dim
+                )
             )
+            freqs = torch.outer(positions, inv_freq)
+            cos = freqs.cos().to(q.dtype)
+            sin = freqs.sin().to(q.dtype)
+
+            def _apply(x: torch.Tensor) -> torch.Tensor:
+                x_rot = x[..., :rotary_dim]
+                x_pass = x[..., rotary_dim:]
+                if interleave:
+                    even, odd = x_rot[..., ::2], x_rot[..., 1::2]
+                    rotated = torch.stack(
+                        (even * cos[:, None] - odd * sin[:, None],
+                         even * sin[:, None] + odd * cos[:, None]),
+                        dim=-1,
+                    ).flatten(-2)
+                else:
+                    half = rotary_dim // 2
+                    first, second = x_rot[..., :half], x_rot[..., half:]
+                    cos_full = torch.cat((cos, cos), dim=-1)[:, None]
+                    sin_full = torch.cat((sin, sin), dim=-1)[:, None]
+                    rotate_half = torch.cat((-second, first), dim=-1)
+                    rotated = x_rot * cos_full + rotate_half * sin_full
+                return torch.cat((rotated, x_pass), dim=-1)
+
+            q, k = _apply(q), _apply(k)
+
         return q.to(orig_dtype), k.to(orig_dtype)
 
     @torch.compiler.disable
@@ -1263,6 +1393,157 @@ class FlashInferCacheManager(BatchedCacheManager):
         )
         return ps.wrapper.run(q, pool.kv_cache[layer_idx]).to(orig_dtype)
 
+class XPUPagedCacheManager(FlashInferCacheManager):
+    """Paged KV attention backed by vllm-xpu-kernels FlashAttention."""
+
+    def _build_xpu_plan(
+        self,
+        labels: list[str],
+        seq_lens: dict[str, list[int]],
+        causal: bool,
+    ) -> XPUPagedPlan:
+        cfg = self.kv_cache_config
+        segments: list[XPUPagedSegment] = []
+        block_rows = []
+        q_lens = []
+        kv_lens = []
+
+        for label in labels:
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, label)
+                q_len = seq_lens[label][i]
+                total_len = state.seq_len + q_len
+                self.alloc_manager.alloc(rid, label=label, seq_len=total_len)
+                segments.append(
+                    XPUPagedSegment(rid, label, state.seq_len, q_len)
+                )
+                block_rows.append(list(state.page_indices))
+                q_lens.append(q_len)
+                kv_lens.append(total_len)
+
+        max_blocks = max((len(row) for row in block_rows), default=1)
+        padded_rows = [row + [0] * (max_blocks - len(row)) for row in block_rows]
+        cu_q = [0]
+        for q_len in q_lens:
+            cu_q.append(cu_q[-1] + q_len)
+
+        return XPUPagedPlan(
+            segments=segments,
+            block_table=torch.tensor(
+                padded_rows, dtype=torch.int32, device=self.device,
+            ),
+            cu_q=torch.tensor(cu_q, dtype=torch.int32, device=self.device),
+            host_kv_lens=torch.tensor(kv_lens, dtype=torch.int32),
+            max_q=max(q_lens, default=0),
+            max_k=max(kv_lens, default=0),
+            causal=causal,
+        )
+
+    @torch.compiler.disable
+    def plan_attention(
+        self,
+        seq_lens: list[int] | None = None,
+        dtype: torch.dtype | None = None,
+        is_causal=True,
+        write_store: bool = True,
+        label: str | None = None,
+        **kwargs,
+    ):
+        del dtype, kwargs
+        effective_label = label if label is not None else self._active_label()
+        seq_lens = seq_lens or [1] * len(self.request_ids)
+        ps = self._plan_states.get(effective_label) or _PlanState()
+        ps.seq_lens = seq_lens
+        ps.write_store = write_store
+        ps.xpu_paged = self._build_xpu_plan(
+            [effective_label], {effective_label: seq_lens}, is_causal,
+        )
+        self._plan_states[effective_label] = ps
+        self._batched_cfg_info = None
+
+    @torch.compiler.disable
+    def plan_attention_batched_cfg(
+        self,
+        labels: list[str],
+        seq_lens: list[int] | dict[str, list[int]],
+        is_causal: bool = False,
+        write_store: bool = False,
+        dtype=torch.bfloat16,
+        combined_label: str = "_cfg_batched",
+        **kwargs,
+    ):
+        del dtype, kwargs
+        if isinstance(seq_lens, list):
+            seq_lens = {label: seq_lens for label in labels}
+        self._batched_cfg_info = BatchedCfgInfo(per_label_seq_len=seq_lens)
+        ps = self._plan_states.get(combined_label) or _PlanState()
+        ps.seq_lens = [n for label in labels for n in seq_lens[label]]
+        ps.write_store = write_store
+        ps.xpu_paged = self._build_xpu_plan(labels, seq_lens, is_causal)
+        self._plan_states[combined_label] = ps
+
+    @torch.compiler.disable
+    def run_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer_idx: int | None = None,
+    ) -> torch.Tensor:
+        if layer_idx is None:
+            layer_idx = self.layer_idx
+        label = self._active_label()
+        ps = self._plan_states[label]
+        plan = ps.xpu_paged
+        assert plan is not None
+
+        cfg = self.kv_cache_config
+        layer_cache = self.kv_cache[layer_idx]
+        offset = 0
+        for segment in plan.segments:
+            state = self._get_state(segment.request_id, segment.label)
+            positions = torch.arange(
+                segment.prefix_len,
+                segment.prefix_len + segment.query_len,
+                dtype=torch.long, device=self.device,
+            )
+            pages = torch.tensor(
+                state.page_indices, dtype=torch.long, device=self.device,
+            )
+            physical_pages = pages[
+                torch.div(positions, cfg.page_size, rounding_mode="floor")
+            ]
+            page_offsets = positions % cfg.page_size
+            next_offset = offset + segment.query_len
+            layer_cache[physical_pages, 0, page_offsets] = k[offset:next_offset]
+            layer_cache[physical_pages, 1, page_offsets] = v[offset:next_offset]
+            offset = next_offset
+
+        if self.auto_write_store and ps.write_store:
+            for segment in plan.segments:
+                self.alloc_manager.flush_to_store(
+                    segment.request_id, label=segment.label, layers=layer_idx,
+                )
+
+        import vllm_xpu_kernels._C  # noqa: F401
+        import vllm_xpu_kernels._xpu_C  # noqa: F401
+        from vllm_xpu_kernels.flash_attn_interface import (
+            flash_attn_varlen_func,
+        )
+
+        return flash_attn_varlen_func(
+            q,
+            layer_cache[:, 0],
+            layer_cache[:, 1],
+            max_seqlen_q=plan.max_q,
+            cu_seqlens_q=plan.cu_q,
+            max_seqlen_k=plan.max_k,
+            host_kv_lens=plan.host_kv_lens,
+            block_table=plan.block_table,
+            causal=plan.causal,
+        )
+
+
 class DenseGenCacheManager(FlashInferCacheManager):
     """FlashInfer backend with a dense generation-attention fast path.
 
@@ -1492,6 +1773,7 @@ class DenseGenCacheManager(FlashInferCacheManager):
 ATTENTION_BACKENDS: dict[str, type[BatchedCacheManager]] = {
     "flashinfer": FlashInferCacheManager,
     "dense_gen": DenseGenCacheManager,
+    "xpu_paged": XPUPagedCacheManager,
 }
 
 
