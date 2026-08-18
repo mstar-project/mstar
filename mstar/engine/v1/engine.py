@@ -1,6 +1,7 @@
 
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ from mstar.engine.v1.kv_transfer import TransferEngineInfo
 from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.profile.worker import ExecTimings
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import mark, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,13 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
+
+        # MSTAR_STEP_LOG_US=<n>: log any exec step whose host wall time (µs) is
+        # >= n, tagged so jumpy steps self-identify (node, walk, bs, whether a
+        # pre-plan promoted or it planned fresh, captured vs eager). n=0 logs
+        # every step. Host time includes launch-queue stalls, which is the point.
+        step_log = os.environ.get("MSTAR_STEP_LOG_US")
+        self._step_log_us = float(step_log) if step_log is not None else None
 
     def load_model(
         self,
@@ -372,6 +380,11 @@ class Engine:
         nvtx = self._enable_nvtx
         if self._enable_profile and batch.exec_timings.start is None:
             batch.exec_timings.start = time.perf_counter()
+        # captured before the finally clears preplan_event: was a pre-plan consumed?
+        step_log_t0 = (
+            time.perf_counter() if self._step_log_us is not None else None
+        )
+        promoted = batch.preplan_event is not None
         if nvtx:
             range_push(
                 f"engine.{batch.node_name}.{batch.step_context.graph_walk}"
@@ -436,7 +449,11 @@ class Engine:
                     batch.register_admit_error(admit_outcome.reason)
                     return {rid: {} for rid in batch.request_ids}
                 if nvtx:
-                    range_push("engine.plan")
+                    # promoted = a pre-plan was consumed; fresh = planned inline
+                    range_push(
+                        "engine.plan.promoted" if batch.preplan_event is not None
+                        else "engine.plan.fresh"
+                    )
                 try:
                     self._runner.plan(step)
                 finally:
@@ -483,21 +500,8 @@ class Engine:
                 if nvtx:
                     range_pop()
 
-            if nvtx:
-                range_push("engine.collect_outputs")
-            try:
-                # Collect before commit: the sampler's commit invalidates the
-                # gathered per-request sampler this step's logits are sampled
-                # with. Publishing here also lets whoever prepares the next step
-                # start threading these tensors while this one commits.
-                batch.outputs = self._collect_outputs(
-                    batch, submodule_mgmt, lease, outputs, inputs, req_info,
-                )
-            finally:
-                if nvtx:
-                    range_pop()
-            batch.outputs_ready.set()
-
+            # Commit first: releasing `commit_done` here is what lets a pre-plan
+            # of N+1 overlap this step's per-request tail.
             if step is not None:
                 if nvtx:
                     range_push("engine.commit")
@@ -506,6 +510,18 @@ class Engine:
                 finally:
                     if nvtx:
                         range_pop()
+            batch.commit_done.set()
+
+            if nvtx:
+                range_push("engine.collect_outputs")
+            try:
+                batch.outputs = self._collect_outputs(
+                    batch, submodule_mgmt, lease, outputs, inputs, req_info,
+                )
+            finally:
+                if nvtx:
+                    range_pop()
+            batch.outputs_ready.set()
             return batch.outputs
         finally:
             batch.preplan_event = None
@@ -514,6 +530,16 @@ class Engine:
                 cg_runner.release(lease, real_bs)
             if nvtx:
                 range_pop()
+            if step_log_t0 is not None:
+                dt_us = (time.perf_counter() - step_log_t0) * 1e6
+                if dt_us >= self._step_log_us:
+                    logger.info(
+                        "step %s walk=%s bs=%d %s %s %.0fus",
+                        batch.node_name, batch.step_context.graph_walk, real_bs,
+                        "promoted" if promoted else "fresh",
+                        "captured" if lease is not None else "eager",
+                        dt_us,
+                    )
 
     def _forward(
         self,
@@ -938,6 +964,16 @@ class Engine:
         to a step that never ran.
         """
         if batch is not None:
+            if batch.preplanned_rids is not None:
+                # a discarded pre-plan means exec plans inline — the cost this
+                # exists to avoid, so make it visible next to the nvtx ranges
+                if self._enable_nvtx:
+                    mark(f"engine.preplan_discarded.{batch.node_name}")
+                logger.warning(
+                    "pre-plan discarded (node=%s, walk=%s): planned %s, running %s",
+                    batch.node_name, batch.step_context.graph_walk,
+                    batch.preplanned_rids, tuple(batch.request_ids),
+                )
             batch.preplan_event = None
             batch.preplanned_rids = None
             lease = batch.step_context.slot_lease

@@ -211,22 +211,20 @@ class KVPlanState:
     token_to_cache: torch.Tensor
     total_tokens: int | None = None
 
-    def copy_(self, other: "KVPlanState"):
+    def copy_(self, other: "KVPlanState", capture_len: int):
         """Stage a step's addressing into this captured state.
 
-        The tail past the real tokens must be neutralized, not left stale: the
-        graph scatters the token count it was captured at, and a replay can
-        carry fewer (a packed bucket whose batch size is already full has no
-        padding row to absorb the leftover token budget). Stale entries send
-        those writes to the pages the previous step planned — i.e. onto another
-        request's KV. ``SINK_PAGE`` is reserved out of the allocator.
+        Neutralize only ``[n:capture_len]`` — the slots the graph scatters
+        beyond the real tokens (SINK_PAGE, else they hit another request's KV).
+        Decode fills its bucket exactly (n == capture_len), so no-op there; only
+        packed prefill pays it, over the real gap not the whole buffer.
         """
         assert other.total_tokens is not None
         n = other.total_tokens
         self.token_to_cache[:n].copy_(other.token_to_cache)
         self.token_to_page[:n].copy_(other.token_to_page)
-        self.token_to_page[n:].fill_(SINK_PAGE)
-        self.token_to_cache[n:].fill_(0)
+        self.token_to_page[n:capture_len].fill_(SINK_PAGE)
+        self.token_to_cache[n:capture_len].fill_(0)
         self.total_tokens = n
 
 
@@ -330,6 +328,7 @@ class KVManager(Resource):
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
         self._cg_max_seq_len = 0
         self._current_plan_states: dict[str, KVPlanState] = {}
+        self._current_layer_idx: int = 0
 
         self._preplan_states: dict[str, KVPlanState] = {}
         self._preplanned = False
@@ -581,7 +580,7 @@ class KVManager(Resource):
                 )
             if ctx.slot_lease is not None:
                 static_state = self._static_plan_state(ctx.slot_lease.slot, label)
-                static_state.copy_(plan_state)
+                static_state.copy_(plan_state, ctx.slot_lease.bucket.num_tokens)
                 plan_state = static_state
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
@@ -603,6 +602,7 @@ class KVManager(Resource):
             "KV preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
+        self._current_layer_idx = 0
         if self._preplanned:
             self._current_plan_states = self._preplan_states
             res = self._cached_plan_output
@@ -889,18 +889,27 @@ class KVManager(Resource):
         return AllocResult()
 
     ### Submodule-level functionality
-    def layer_view(self, layer_idx: int) -> torch.Tensor:
+    def set_layer_idx(self, layer_idx: int):
+        self._current_layer_idx = layer_idx
+
+    @torch.compiler.disable
+    def layer_view(self, layer_idx: int=None) -> torch.Tensor:
         """layer pages as needed by attention kernel
 
         handed to `AttentionManager::run`. in `kv_manager` so storage mechanics
         are opaque to layers"""
+        if layer_idx is None:
+            layer_idx = self._current_layer_idx
         return self.kv_cache.layer_view(layer_idx)
 
-    def read_kv(self, layer_idx: int, plan_label: str) -> torch.Tensor:
+    @torch.compiler.disable
+    def read_kv(self, layer_idx: int=None, plan_label: str="main") -> torch.Tensor:
         """
         The slots this step's plan writes, e.g. for NHD:
         [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1).
         """
+        if layer_idx is None:
+            layer_idx = self._current_layer_idx
         plan_state = self._current_plan_states[plan_label]
         n = plan_state.total_tokens
         return self.kv_cache.read_tokens(
@@ -909,15 +918,18 @@ class KVManager(Resource):
             cache_idx=plan_state.token_to_cache[:n],
         )
 
+    @torch.compiler.disable
     def write_kv(
         self, k: torch.Tensor, v: torch.Tensor,
-        layer_idx: int, label: str, return_tensor: bool = False,
+        layer_idx: int=None, label: str="main", return_tensor: bool = False,
     ) -> torch.Tensor | None:
         """Write K, V into this step's planned slots.
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
         """
+        if layer_idx is None:
+            layer_idx = self._current_layer_idx
         plan_state = self._current_plan_states[label]
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(

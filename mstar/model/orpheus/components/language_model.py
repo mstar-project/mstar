@@ -78,8 +78,9 @@ class OrpheusLanguageModel(nn.Module):
         label: str,
     ) -> torch.Tensor:
         for layer_idx, decoder_layer in enumerate(self.layers):
+            decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
             query_sequence = decoder_layer(
-                hidden_states=query_sequence, label=label, layer_idx=layer_idx,
+                hidden_states=query_sequence, label=label, layer_idx=None,
             )
         # the advance is the runner's now, off the step declaration
         return self.norm(query_sequence)

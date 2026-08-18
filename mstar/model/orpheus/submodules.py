@@ -37,8 +37,12 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    # PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+
+    # TODO DEBUG
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,

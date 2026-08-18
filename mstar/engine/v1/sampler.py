@@ -126,6 +126,8 @@ class SamplerResource(Resource):
             self._sampler.get_token_mask(rid).add_tokens(tokens)
         self._apply_penalty_this_step = step.apply_penalty
 
+        # invalidated here, not in commit: commit now runs before output collection
+        self._cg_sampler = None
         if self._cg_buffers is None or ctx.slot_lease is None:
             return
         if self._apply_penalty_this_step:
@@ -140,13 +142,13 @@ class SamplerResource(Resource):
         )
 
     def commit(self, step: SamplerStep, ctx: StepContext):
-        if self._cg_buffers is None:
+        # None on an eager step, which never gathered one
+        if self._cg_buffers is None or self._cg_sampler is None:
             return
         self._cg_buffers.scatter_offset()
         self._cg_sampler.sync_seen_token_masks(
             [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
         )
-        self._cg_sampler = None # invalidate sampler for next step
 
     ### Submodule-level functionality
 

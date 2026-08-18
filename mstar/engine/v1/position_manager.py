@@ -91,6 +91,9 @@ class RopeManager(PositionManager):
         # to buffer when capture; to fresh tensor when reager
         self._current_pos_ids: dict[str, torch.Tensor] = {}
 
+        self._preplan_pos_ids: dict[str, torch.Tensor] = {}
+        self._preplanned = False
+
     def depends_on(self):
         return {self._kv_cache_name}
 
@@ -116,10 +119,34 @@ class RopeManager(PositionManager):
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
 
+    @property
+    def supports_preplan(self):
+        return True
+
+    def clear_preplan(self):
+        # rebind rather than clear: a consumed preplan dict is the live one
+        self._preplanned = False
+        self._preplan_pos_ids = {}
+
     def plan(self, step: PositionStep, ctx: StepContext) -> dict[str, torch.Tensor]:
         """submits one position id vector for each plan label
 
         plan labels and token ordering comes from KV plan output"""
+        assert not (self._preplanned and ctx.is_preplan), (
+            "position preplan is already pending; clear_preplan before "
+            "planning a different step ahead"
+        )
+        if self._preplanned:
+            # staged a step early against this same step's KV plan
+            self._current_pos_ids = self._preplan_pos_ids
+            self._preplan_pos_ids = {}
+            self._preplanned = False
+            return self._current_pos_ids
+
+        assert not ctx.is_preplan or ctx.slot_lease is not None, (
+            "preplan requires a cuda graph step: the eager path hands back a "
+            "fresh tensor rather than writing a slot's buffer"
+        )
         plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(
             self._kv_cache_name
         )
@@ -127,13 +154,17 @@ class RopeManager(PositionManager):
             f"position manager expected plan result from {self._kv_cache_name}"
         )
 
-        self._current_pos_ids.clear()
+        # a preplan leases a different slot, so the buffers it writes are
+        # disjoint from the ones the in-flight forward reads
+        pos_ids_out = self._preplan_pos_ids if ctx.is_preplan else self._current_pos_ids
+        pos_ids_out.clear()
         for plan_label, kv_out in plan_outputs.items():
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
             if pos_ids is None:
                 pos_ids = self._build_pos_ids(kv_out.views)
-            self._current_pos_ids[plan_label] = self._place(pos_ids, plan_label, ctx)
-        return self._current_pos_ids
+            pos_ids_out[plan_label] = self._place(pos_ids, plan_label, ctx)
+        self._preplanned = ctx.is_preplan
+        return pos_ids_out
 
     def commit(self, step: PositionStep, ctx: StepContext):
         del ctx

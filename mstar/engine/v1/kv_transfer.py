@@ -156,7 +156,15 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._kv_cache = kv_cache
 
         self._pending: list[Future] = []
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, initializer=self._bind_device,
+        )
+
+    def _bind_device(self) -> None:
+        """CUDA's current device is per-thread and defaults to 0; an unbound
+        pool thread has no context to open the peer's IPC handle against."""
+        if self._device.type == "cuda":
+            torch.cuda.set_device(self._device)
 
     def get_kv_transfer_info(self) -> CudaIpcKVTransferInfo:
         return self._transfer_info
