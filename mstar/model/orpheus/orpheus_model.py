@@ -376,7 +376,12 @@ class OrpheusModel(Model):
                 label=ROPE,
                 nodes={"LLM"},
                 config=PositionConfig(
-                    kv_cache=KV_CACHE
+                    kv_cache=KV_CACHE,
+                    rope_theta=self.config.rope_theta,
+                    rope_scale=self.config.rope_scaling["factor"],
+                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
+                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
+                    old_context_len=self.config.rope_scaling["original_max_position_embeddings"],
                 )
             )
         ]

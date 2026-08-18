@@ -1,29 +1,29 @@
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import Model
-from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+# from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+# from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
-from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
-from mstar.model.wan22.wan22_model import Wan22Model
-from mstar.model.whisper.whisper_model import WhisperModel
+# from mstar.model.pi05.pi05_model import Pi05Model
+# from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+# from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+# from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
+# from mstar.model.wan22.wan22_model import Wan22Model
+# from mstar.model.whisper.whisper_model import WhisperModel
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "bagel": BagelModel,
-    "cosmos3": Cosmos3Model,
-    "cosmos3_droid": Cosmos3Model,
-    "cosmos3_super": Cosmos3Model,
-    "higgs_audio": HiggsAudioModel,
+    # "cosmos3": Cosmos3Model,
+    # "cosmos3_droid": Cosmos3Model,
+    # "cosmos3_super": Cosmos3Model,
+    # "higgs_audio": HiggsAudioModel,
     "orpheus": OrpheusModel,
-    "pi05": Pi05Model,
-    "qwen3_omni": Qwen3OmniModel,
-    "qwen3_tts": Qwen3TTSModel,
-    "vjepa2": VJepa2Model,
-    "vjepa2_ac": VJepa2ACModel,
-    "wan22": Wan22Model,
-    "whisper_large": WhisperModel,
+    # "pi05": Pi05Model,
+    # "qwen3_omni": Qwen3OmniModel,
+    # "qwen3_tts": Qwen3TTSModel,
+    # "vjepa2": VJepa2Model,
+    # "vjepa2_ac": VJepa2ACModel,
+    # "wan22": Wan22Model,
+    # "whisper_large": WhisperModel,
 }
 
 HF_MODELS: dict[str, dict] = {

@@ -195,6 +195,11 @@ class KVPlanOutput:
         return int(lens.sum().item())
 
 
+# Page the padding tail of a captured step scatters into. Reserved at
+# construction so no request is ever handed it; see KVPlanState.copy_.
+SINK_PAGE = 0
+
+
 @dataclass
 class KVPlanState:
     token_to_page: torch.Tensor
@@ -202,10 +207,22 @@ class KVPlanState:
     total_tokens: int | None = None
 
     def copy_(self, other: "KVPlanState"):
+        """Stage a step's addressing into this captured state.
+
+        The tail past the real tokens must be neutralized, not left stale: the
+        graph scatters the token count it was captured at, and a replay can
+        carry fewer (a packed bucket whose batch size is already full has no
+        padding row to absorb the leftover token budget). Stale entries send
+        those writes to the pages the previous step planned — i.e. onto another
+        request's KV. ``SINK_PAGE`` is reserved out of the allocator.
+        """
         assert other.total_tokens is not None
-        self.token_to_cache[:other.total_tokens].copy_(other.token_to_cache)
-        self.token_to_page[:other.total_tokens].copy_(other.token_to_page)
-        self.total_tokens = other.total_tokens
+        n = other.total_tokens
+        self.token_to_cache[:n].copy_(other.token_to_cache)
+        self.token_to_page[:n].copy_(other.token_to_page)
+        self.token_to_page[n:].fill_(SINK_PAGE)
+        self.token_to_cache[n:].fill_(0)
+        self.total_tokens = n
 
 
 @dataclass
@@ -281,6 +298,9 @@ class KVManager(Resource):
             kv_cache=self.kv_cache,
             allocator=PageAllocator(cfg.max_num_pages)
         )
+        # take SINK_PAGE out of circulation; the allocator is FIFO from 0
+        sink = self._arena.acquire(1)
+        assert sink == [SINK_PAGE], f"expected page {SINK_PAGE} first, got {sink}"
         self._transfer = KVTransferManager(
             transfer_engine_info, self.kv_cache
         )
@@ -342,8 +362,9 @@ class KVManager(Resource):
                 token_to_cache=torch.zeros(
                     self._cg_max_seq_len, dtype=torch.long, device=self._device
                 ),
-                token_to_page=torch.zeros(
-                    self._cg_max_seq_len, dtype=torch.long, device=self._device
+                token_to_page=torch.full(
+                    (self._cg_max_seq_len,), SINK_PAGE,
+                    dtype=torch.long, device=self._device
                 ),
             )
         return state
