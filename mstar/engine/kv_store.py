@@ -446,6 +446,26 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._executor.shutdown(wait=True)
 
 
+class LocalOnlyKVTransferEngine(KVTransferEngine):
+    """KV cache that remains local to its worker."""
+
+    def read_batched_async(
+        self, remote_kv_info, read_info: list[KVReadInfo]
+    ) -> Future | None:
+        if read_info:
+            raise RuntimeError(
+                "Cross-worker KV migration is unavailable for this accelerator. "
+                "Use a colocated worker graph or a remote transfer engine."
+            )
+        return None
+
+    def get_kv_transfer_info(self) -> None:
+        return None
+
+    def shutdown(self):
+        pass
+
+
 @dataclass
 class CrossAttnPool:
     """One physical cross-attention KV pool (possibly shared by several
@@ -492,7 +512,10 @@ class PagedAllocationManager:
         elif isinstance(
             transfer_engine_info.transfer_engine, LocalTransferEngine
         ):
-            self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
+            if kv_cache.device.type == "cuda":
+                self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
+            else:
+                self._kv_transfer_engine = LocalOnlyKVTransferEngine()
         else:
             raise ValueError(f"Unsupported transfer engine type: {type(transfer_engine_info.transfer_engine)}")
 
@@ -728,4 +751,3 @@ class PagedAllocationManager:
                 state.seq_len = seq_len
                 state.position_id_start = pos_id
         cpu_pool.sync()
-
