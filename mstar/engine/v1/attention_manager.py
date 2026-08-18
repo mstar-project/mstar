@@ -179,6 +179,9 @@ class FlashInferManager(AttentionManager):
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
 
+        # (label, is_decode) -> wrapper; persistent, because constructing one
+        # allocates FlashInfer's own workspaces and is far from free per step
+        self._eager_plan_states: dict[tuple[str, bool], AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
         self._preplan_states: dict[str, AttentionWrapper] = {}
@@ -246,6 +249,18 @@ class FlashInferManager(AttentionManager):
         self._cg_plan_states[key] = wrapper
         return wrapper
 
+    def _eager_wrapper(self, label: str, is_decode: bool) -> AttentionWrapper:
+        """The persistent eager wrapper for one (label, kind)."""
+        key = (label, is_decode)
+        wrapper = self._eager_plan_states.get(key)
+        if wrapper is None:
+            cls = FlashInferDecodeWrapper if is_decode else FlashInferPrefillWrapper
+            wrapper = self._eager_plan_states[key] = cls(
+                workspace_buffer=self._get_workspace_buffer(label),
+                **self._wrapper_kv_kwargs,
+            )
+        return wrapper
+
     @property
     def supports_preplan(self):
         return True
@@ -280,18 +295,10 @@ class FlashInferManager(AttentionManager):
             if ctx.slot_lease is not None:
                 wrapper = self._cg_wrapper(ctx.slot_lease, label)
             else:
-                is_decode = indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
-                buffer = self._get_workspace_buffer(label)
-                if is_decode:
-                    wrapper = FlashInferDecodeWrapper(
-                        workspace_buffer=buffer,
-                        **self._wrapper_kv_kwargs,
-                    )
-                else:
-                    wrapper = FlashInferPrefillWrapper(
-                        workspace_buffer=buffer,
-                        **self._wrapper_kv_kwargs,
-                    )
+                is_decode = bool(
+                    indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
+                )
+                wrapper = self._eager_wrapper(label, is_decode)
 
             # TODO: cache the latest plan state
             wrapper.plan(

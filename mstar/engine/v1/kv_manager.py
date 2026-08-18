@@ -186,13 +186,18 @@ class KVPlanOutput:
     Output of KVManager.plan for a single label
     """
     cpu_indptrs: PagedIndptrs
-    cuda_indptrs: PagedIndptrs
     # packing in plan order w/h 1 view per segment covered by plan
     views: list[SequenceView]
+    # only the packed write addressing needs these on device, and only the
+    # resource that builds them reads them; see KVManager._setup_plan_states
+    cuda_indptrs: PagedIndptrs | None = None
 
     def get_total_len(self):
-        lens = (self.cpu_indptrs.qo_indptr[1:] - self.cpu_indptrs.qo_indptr[:-1]).to(torch.int32)
-        return int(lens.sum().item())
+        return int(self.cpu_indptrs.qo_indptr[-1])
+
+    @property
+    def is_decode(self) -> bool:
+        return all(view.to_compute == 1 for view in self.views)
 
 
 # Page the padding tail of a captured step scatters into. Reserved at
@@ -532,15 +537,45 @@ class KVManager(Resource):
             total_tokens=total_tokens
         )
 
+    def _decode_plan_state(self, views: list[SequenceView]) -> KVPlanState:
+        """Write addressing for a step appending one token per request.
+
+        The packed path needs the indptrs on device and ~a dozen kernels to
+        unpack them per token. A decode step's slot is just the end of each
+        stream, so build it in the same CPU pass the views came from and send
+        it over as one H2D.
+        """
+        page_size = self.kv_cache.page_size
+        pages: list[int] = []
+        offsets: list[int] = []
+        for view in views:
+            # off the stream's page count, not its logical length: that is what
+            # `build_paged_indptrs` hands attention, so a stream holding more
+            # pages than its length needs stays self-consistent
+            pages.append(view.page_idxs[-1])
+            offsets.append((view.last_page_len(page_size) or page_size) - 1)
+        locations = torch.tensor(
+            [pages, offsets], dtype=torch.long
+        ).to(self._device, non_blocking=True)
+        return KVPlanState(
+            token_to_page=locations[0],
+            token_to_cache=locations[1],
+            total_tokens=len(views),
+        )
+
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
         ctx: StepContext
     ):
         for label, indptrs in plan_output.items():
-            plan_state = self._compute_plan_state(
-                indptrs.cuda_indptrs,
-                total_tokens=indptrs.get_total_len()
-            )
+            if indptrs.is_decode:
+                plan_state = self._decode_plan_state(indptrs.views)
+            else:
+                indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
+                plan_state = self._compute_plan_state(
+                    indptrs.cuda_indptrs,
+                    total_tokens=indptrs.get_total_len()
+                )
             if ctx.slot_lease is not None:
                 static_state = self._static_plan_state(ctx.slot_lease.slot, label)
                 static_state.copy_(plan_state)
@@ -552,10 +587,8 @@ class KVManager(Resource):
 
 
     def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
-        indptrs = build_paged_indptrs(views, self.kv_cache.page_size)
         return KVPlanOutput(
-            cpu_indptrs=indptrs,
-            cuda_indptrs=indptrs.to_device(self._device),
+            cpu_indptrs=build_paged_indptrs(views, self.kv_cache.page_size),
             views=views,
         )
 

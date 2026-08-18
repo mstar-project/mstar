@@ -108,7 +108,6 @@ class CudaGraphBucket:
     config: CudaGraphConfig
     config_idx: int
     slots: list[CudaGraphSlot] = field(default_factory=list)
-    next_slot: int = 0
 
 
 class CudaGraphRunner:
@@ -153,6 +152,10 @@ class CudaGraphRunner:
         ) else 1
 
         self._buckets: dict[BucketKey, CudaGraphBucket] = {}
+
+        # Rotated globally, not per bucket: slot-keyed buffers are shared across
+        # buckets, so per-bucket counters let consecutive steps collide on a slot.
+        self._next_slot = 0
 
         self._memory_pool = None
 
@@ -590,8 +593,8 @@ class CudaGraphRunner:
             return None
         bucket = self._buckets[key]
         if slot is None:
-            slot = bucket.next_slot
-            bucket.next_slot = (bucket.next_slot + 1) % len(bucket.slots)
+            slot = self._next_slot
+            self._next_slot = (self._next_slot + 1) % self._num_slots
         return SlotLease(slot=slot % len(bucket.slots), bucket=key)
 
     def slot_for(self, lease: SlotLease) -> CudaGraphSlot:
