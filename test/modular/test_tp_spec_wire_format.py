@@ -1,19 +1,22 @@
 """Wire-format contract for TP async scheduling (implementation map row 3).
 
-Pins the two properties the rest of the protocol is built on:
+Pins the properties the rest of the protocol is built on:
 
 1. Tagging ``ScheduleTPNode`` with speculation does not disturb today's serial
    broadcast — existing three-arg construction still works and is
    non-speculative by omission.
-2. ``CancelSpec`` is its own message type, dispatchable without touching the
-   schedule FIFO, and names exactly one speculation by seq.
+2. A speculative head names itself (``spec_seq``) and the batch it was built
+   from (``spec_from_seq``); a follower matches ``spec_from_seq`` against its
+   own in-flight batch to decide whether it may build the head early.
+3. There is NO cancel/commit message type: voids are derived from state that
+   is identical on every rank, never signalled (see the ``ScheduleTPNode``
+   docstring and ``tp_async_sim.py`` for why a signalled retract is unsafe).
 
-The *semantics* of Cancel (void-only, never retract) are enforced by the CPU
+The *semantics* (void-only, symmetric derivation) are enforced by the CPU
 model checker in ``tp_async_sim.py``; these tests only pin the carrier.
 """
 from __future__ import annotations
 
-import dataclasses
 import sys
 from pathlib import Path
 
@@ -24,7 +27,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.utils.ipc_format import (  # noqa: E402
-    CancelSpec,
     ScheduleTPNode,
     WorkerMessage,
     WorkerMessageType,
@@ -40,44 +42,46 @@ def test_existing_construction_is_unchanged_and_non_speculative():
     assert msg.request_ids == ["r1", "r2"]
     assert msg.speculative is False
     assert msg.spec_seq == -1
+    assert msg.spec_from_seq == -1
 
 
-def test_speculative_head_carries_its_seq():
-    msg = ScheduleTPNode("node_a", "decode", ["r1"], speculative=True, spec_seq=7)
+def test_speculative_head_names_itself_and_its_parent():
+    msg = ScheduleTPNode(
+        "node_a", "decode", ["r1"], speculative=True, spec_seq=7, spec_from_seq=6
+    )
     assert msg.speculative is True
     assert msg.spec_seq == 7
+    assert msg.spec_from_seq == 6
 
 
-def test_cancel_names_exactly_one_speculation():
-    c = CancelSpec(spec_seq=7)
-    assert c.spec_seq == 7
-    # One seq per message: a Cancel that could name a range would invite
-    # "cancel everything pending", which is the retract semantics the model
-    # checker refutes.
-    fields = [f.name for f in dataclasses.fields(CancelSpec)]
-    assert fields == ["spec_seq"]
+def test_no_cancel_or_commit_message_type():
+    """Voids are derived on every rank from replicated state, never signalled.
+    A cancel type reappearing here means someone re-introduced the retract
+    race the model checker refutes (``B2_RETRACT``)."""
+    names = {m.name for m in WorkerMessageType}
+    assert "CANCEL_SPEC" not in names
+    assert "COMMIT_SPEC" not in names
+    assert "SCHEDULE_TP" in names
 
 
-def test_cancel_is_a_distinct_message_type():
-    """Cancel must be dispatchable without going through the schedule path —
-    a void has to reach a rank whose FIFO must not be disturbed."""
-    assert WorkerMessageType.CANCEL_SPEC != WorkerMessageType.SCHEDULE_TP
-    assert WorkerMessageType.CANCEL_SPEC.value == "cancel_spec"
+def test_wrapped_head_dispatches_on_schedule_tp():
     wrapped = WorkerMessage(
-        message_type=WorkerMessageType.CANCEL_SPEC, body=CancelSpec(spec_seq=3)
+        message_type=WorkerMessageType.SCHEDULE_TP,
+        body=ScheduleTPNode("n", "decode", ["r1"], speculative=True, spec_seq=3, spec_from_seq=2),
     )
+    assert wrapped.message_type is WorkerMessageType.SCHEDULE_TP
     assert wrapped.body.spec_seq == 3
 
 
-def test_spec_seq_round_trips_through_pickle():
-    """TP messages travel as pickled dataclasses over ZMQ, so the tag has to
+def test_seqs_round_trip_through_pickle():
+    """TP messages travel as pickled dataclasses over ZMQ, so the tags have to
     survive that specific path — not a dict round trip."""
     import pickle
 
-    msg = ScheduleTPNode("n", "decode", ["r1"], speculative=True, spec_seq=11)
+    msg = ScheduleTPNode(
+        "n", "decode", ["r1"], speculative=True, spec_seq=11, spec_from_seq=10
+    )
     back = pickle.loads(pickle.dumps(msg))
     assert back == msg
-    assert back.speculative is True and back.spec_seq == 11
-
-    c = pickle.loads(pickle.dumps(CancelSpec(spec_seq=11)))
-    assert c.spec_seq == 11
+    assert back.speculative is True
+    assert back.spec_seq == 11 and back.spec_from_seq == 10
