@@ -1,0 +1,70 @@
+# M* backend built on top of a published Dynamo runtime image, for
+# deployments standardized on NVIDIA's images. Build from the repository
+# root:
+#
+#   docker build -f mstar/integrations/dynamo/docker/Dockerfile.dynamo-base \
+#       -t mstar-dynamo .
+#
+# The base contributes the Dynamo runtime artifacts (etcd/nats binaries,
+# UCX/NIXL libraries) and the CUDA stack; M* installs into its own venv and
+# never touches the engine environment the base ships with. The base must
+# provide nvcc — the vendored MoE align kernel and FlashInfer JIT-compile
+# CUDA kernels on first use. If it doesn't, use the sibling Dockerfile,
+# which builds on a CUDA -devel image.
+ARG DYNAMO_IMAGE=nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.0
+
+FROM ${DYNAMO_IMAGE}
+
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_VERSION=2.9.1
+ARG TORCHVISION_VERSION=0.24.1
+ARG TORCHAUDIO_VERSION=2.9.1
+# torchcodec releases pair with torch minors (0.9.x <-> torch 2.9); a newer
+# torchcodec against this torch fails at runtime with undefined symbols.
+ARG TORCHCODEC_VERSION=0.9.1
+# flash-attn ships no PyPI wheels; the GitHub release wheel's tags must
+# match the torch above (docs/installation.rst).
+ARG FLASH_ATTN_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# A dedicated venv with uv's own CPython keeps M*'s torch pins isolated from
+# whatever the base image's engine environment carries. Torch comes from the
+# explicit CUDA index because the build machine has no GPU to probe.
+RUN uv venv --python 3.12 --seed /opt/mstar/venv \
+    && uv pip install --python /opt/mstar/venv/bin/python \
+        --index-url ${TORCH_INDEX} \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+    && uv pip install --python /opt/mstar/venv/bin/python ${FLASH_ATTN_WHEEL}
+
+WORKDIR /opt/mstar/src
+COPY . .
+
+# [dynamo] installs ai-dynamo into this venv too: the frontend and this
+# backend then both run from /opt/mstar/venv regardless of where the base
+# image keeps its own copy. The torch/torchcodec pins ride along so the
+# resolver can't upgrade them (breaking the flash-attn wheel match or the
+# torch pairing) to satisfy a newer extra; the installed +cu12x/+cu13x
+# builds already satisfy them.
+RUN uv pip install --python /opt/mstar/venv/bin/python -e ".[all,dynamo]" \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION} \
+        torchcodec==${TORCHCODEC_VERSION}
+
+# The venv must lead PATH: FlashInfer's JIT invokes ninja (installed in the
+# venv) via PATH lookup at request time.
+ENV PATH=/opt/mstar/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["/opt/mstar/venv/bin/python", "-m", "mstar.integrations.dynamo"]

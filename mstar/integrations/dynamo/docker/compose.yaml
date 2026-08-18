@@ -1,0 +1,54 @@
+# One M* deployment behind the Dynamo frontend: etcd for discovery, the
+# frontend for the OpenAI surface and routing, one backend worker. Run from
+# this directory:
+#
+#   MSTAR_CONFIG=configs/bagel_single_gpu.yaml \
+#   MODEL_PATH=/models/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/<rev> \
+#   docker compose up
+#
+# Scale throughput by replicating the worker service; the frontend balances
+# across instances.
+
+services:
+  etcd:
+    image: docker.io/bitnamilegacy/etcd:3.6.1
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+
+  frontend:
+    image: mstar-dynamo
+    build:
+      context: ../../../..
+      dockerfile: mstar/integrations/dynamo/docker/Dockerfile
+    entrypoint: ["/opt/mstar/venv/bin/python", "-m", "dynamo.frontend"]
+    command: ["--http-port", "8000"]
+    environment:
+      - ETCD_ENDPOINTS=http://etcd:2379
+    ports:
+      - "8000:8000"
+    depends_on:
+      - etcd
+    restart: on-failure
+
+  worker:
+    image: mstar-dynamo
+    command:
+      - --config
+      - ${MSTAR_CONFIG:?config path inside the image, e.g. configs/bagel_single_gpu.yaml}
+      - --model-path
+      - ${MODEL_PATH:?HF snapshot dir under the /models mount}
+      - --tensor-comm-protocol
+      - SHM
+    environment:
+      - ETCD_ENDPOINTS=http://etcd:2379
+      - HF_HOME=/models
+      - HF_HUB_OFFLINE=1
+    volumes:
+      - ${MODELS_DIR:-~/.cache/huggingface}:/models:ro
+    # The SHM tensor transport and the worker processes allocate from
+    # /dev/shm; the 64 MB container default is far too small.
+    shm_size: 32gb
+    gpus: all
+    depends_on:
+      - etcd
+    restart: on-failure
