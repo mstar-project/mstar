@@ -102,6 +102,25 @@ class KVConfig:
     def __post_init__(self):
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
+        self._unsharded_kv_heads = self.num_kv_heads
+        self._unsharded_qo_heads = self.num_qo_heads
+
+    def shard(self, num_shards: int) -> None:
+        """Narrow the head counts to one rank's slice.
+
+        Idempotent because one KVConfig is shared by the KV resource and the
+        attention resources planned against it, and each shards on construction.
+        ``num_shards`` is the instance world size (tp * sp): Ulysses SP
+        all-to-alls heads, so attention runs at head-degree tp*sp.
+        """
+        from mstar.distributed.utils import divide
+
+        if num_shards >= self._unsharded_kv_heads:
+            # fewer KV heads than ranks — every rank holds a replicated head
+            self.num_kv_heads = 1
+        else:
+            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
+        self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
 
 
 class KVCache:

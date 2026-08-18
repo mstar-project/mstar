@@ -206,6 +206,7 @@ def build_resource(
         return AttentionManager.build(
             spec=spec,
             device=device,
+            joint_comm_group=joint_comm_group,
             dtype=kv_dtype
         )
     if spec.resource_type == ResourceType.CROSS_ATTENTION:
@@ -213,6 +214,7 @@ def build_resource(
         return CrossAttentionManager.build(
             spec=spec,
             device=device,
+            joint_comm_group=joint_comm_group,
             dtype=kv_dtype
         )
     if spec.resource_type == ResourceType.POSITIONS:

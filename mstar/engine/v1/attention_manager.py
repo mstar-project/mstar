@@ -9,6 +9,7 @@ from typing import Any, NamedTuple
 
 import torch
 
+from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotKey, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
 from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
@@ -62,9 +63,14 @@ class AttentionManager(Resource):
     def build(
         cls, spec: AttentionSpec,
         device: torch.device,
+        joint_comm_group: JointGroups | None = None,
         dtype=torch.bfloat16,
         **engine_kwargs
     ):
+        # the wrappers are planned against per-rank head counts; idempotent, so
+        # sharing one KVConfig with the KV resource is fine (KVConfig.shard)
+        if joint_comm_group is not None:
+            spec.kv_config.shard(joint_comm_group.world_size)
         backend = spec.config.backend
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
@@ -406,9 +412,13 @@ class CrossAttentionManager(Resource):
     def build(
         cls, spec: CrossAttentionSpec,
         device: torch.device,
+        joint_comm_group: JointGroups | None = None,
         dtype=torch.bfloat16,
         **engine_kwargs
     ):
+        # the context cache's own head counts; see AttentionManager.build
+        if joint_comm_group is not None:
+            spec.kv_config.shard(joint_comm_group.world_size)
         if spec.config.backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,

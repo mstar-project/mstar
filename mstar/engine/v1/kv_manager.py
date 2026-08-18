@@ -294,6 +294,9 @@ class KVManager(Resource):
         dtype=torch.bfloat16,
     ):
         self.config = cfg
+        if joint_comm_group is not None:
+            # before the cache is allocated: it is sized off the head counts
+            cfg.shard(joint_comm_group.world_size)
         self.kv_cache = KVCache(
             cfg, device, dtype
         )
