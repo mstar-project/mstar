@@ -44,6 +44,25 @@ def test_b2_void_holds_all_scenarios_2_and_3_ranks():
             assert res.ok, (name, nranks, res.violations[:1])
 
 
+def test_b2_local_holds_all_scenarios_2_and_3_ranks():
+    """The implemented protocol (MSTAR_TP_ASYNC_SCHED=1): no cancel message,
+    each rank derives the void when it completes the parent step, and a spec
+    can only launch after that on its own rank. Must hold everywhere the
+    signalled-retract variant fails."""
+    for nranks in (2, 3):
+        for name in SCENARIOS:
+            res = _run("B2_LOCAL", name, nranks)
+            assert res.ok, (name, nranks, res.violations[:1])
+
+
+def test_b2_local_pays_no_wasted_forward_on_structural_cancel():
+    """Where VOID must run S everywhere and discard it, LOCAL never launches
+    it: the structural scenario costs LOCAL only the stop-waste (2), while
+    VOID pays the voided forward on top (3)."""
+    assert _run("B2_LOCAL", "structural-cancel").max_waste == 2
+    assert _run("B2_VOID", "structural-cancel").max_waste == 3
+
+
 def test_b2_retract_is_refuted_on_structural_cancel():
     res = _run("B2_RETRACT", "structural-cancel")
     assert res.violations, "retract semantics unexpectedly held — model changed?"

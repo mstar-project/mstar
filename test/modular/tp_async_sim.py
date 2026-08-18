@@ -26,6 +26,16 @@ Modes:
   B2_VOID     — run-ahead where a broadcast S is *always* executed by every
                 rank; Cancel only voids its effects (outputs dropped, pages
                 freed). This is the semantics the design must specify.
+  B2_LOCAL    — the IMPLEMENTED protocol (MSTAR_TP_ASYNC_SCHED=1): no Cancel
+                message at all. A rank may launch spec batch S only after it
+                has itself completed S's parent step N, and at that moment it
+                applies the same verdict the leader applies at its post(N) —
+                derived from state that is identical on every rank
+                (structural failure on N → drop S locally, never run it).
+                A SPEC that arrives after the rank already completed N is
+                reconciled on arrival. Retract is safe here for the reason
+                B2_RETRACT is not: verdict(N) happens-before launch(S) on
+                every rank, so no rank can have run S when another voids it.
 
 Follower behavior encodes a property of the graph layer: spec batches are
 buildable from replicated graph state alone (``speculative_signals``
@@ -126,6 +136,42 @@ def _unbuild(w, rank, seq, executed_ok):
     raise AssertionError(mode)
 
 
+def _local_verdict_on_step(w, rank, step):
+    """B2_LOCAL: rank ``rank`` just completed ``step``. Apply the verdict for
+    any spec speculated FROM ``step`` that this rank holds: structural failure
+    on ``step`` → retract it locally (it never launches here — and, by the
+    same rule on every rank, nowhere else either); otherwise release its
+    launch gate. Same information the leader uses in its post(step)."""
+    rk = w["ranks"][rank]
+    structural = bool(w["script"].get(step, {}).get("structural"))
+    newq = []
+    for (b, g, v) in rk["q"]:
+        if b[0] == "spec" and b[1] == step + 1:
+            if structural:
+                rk["live"] = rk["live"] - {b}
+                continue          # retract: verdict(N) precedes launch(S) here
+            newq.append((b, False, v))   # release the local launch gate
+        else:
+            newq.append((b, g, v))
+    rk["q"] = tuple(newq)
+
+
+def _local_verdict_on_arrival(w, rank, spec):
+    """B2_LOCAL: a SPEC for parent step ``spec[1]-1`` arrives at ``rank``.
+    If the rank already completed the parent, reconcile now (this is
+    ``Worker._register_tp_follow``): drop on structural, else build ungated.
+    Otherwise build gated; ``_local_verdict_on_step`` will release it."""
+    rk = w["ranks"][rank]
+    parent = spec[1] - 1
+    done = any(b[1] == parent for b in rk["exec"])
+    if not done:
+        _build(w, rank, spec, gated=True)
+        return
+    if w["script"].get(parent, {}).get("structural"):
+        return  # dropped on arrival, never enters the queue
+    _build(w, rank, spec, gated=False)
+
+
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
@@ -174,8 +220,11 @@ def _do_proc(w, r):
     if tag == "STEP":
         _build(w, r, msg[1], gated=False)
     elif tag == "SPEC":
-        # Buildable now — placeholder inputs, no wait on local step-N
-        _build(w, r, msg[1], gated=(w["mode"] == "B1"))
+        if w["mode"] == "B2_LOCAL":
+            _local_verdict_on_arrival(w, r, msg[1])
+        else:
+            # Buildable now — placeholder inputs, no wait on local step-N
+            _build(w, r, msg[1], gated=(w["mode"] == "B1"))
     elif tag == "COMMIT":
         seq = msg[1]
         rk["q"] = tuple(
@@ -194,6 +243,11 @@ def _do_gpu(w, r):
     if batch[0] == "spec" and batch[3] in rk["voided"]:
         rk["live"] = rk["live"] - {batch}
         rk["voided"] = rk["voided"] - {batch[3]}
+    if w["mode"] == "B2_LOCAL" and r != 0:
+        # A follower's "await(N)" is completing N: the moment it decides
+        # about specs speculated from N. The leader decides at post(N) — it
+        # may still be BUILDING S when its GPU finishes N.
+        _local_verdict_on_step(w, r, batch[1])
 
 
 def _do_spec(w):
@@ -205,7 +259,9 @@ def _do_spec(w):
     w["seq"] += 1
     b = ("spec", L["step"] + 1, L["comp"], w["seq"])
     _broadcast(w, ("SPEC", b))
-    _build(w, 0, b, gated=(w["mode"] == "B1"))
+    # B1: gated on Commit. B2_LOCAL: gated on the leader's OWN completion of
+    # step N (released/dropped in _local_verdict_on_step). B2_*: run-ahead.
+    _build(w, 0, b, gated=(w["mode"] in ("B1", "B2_LOCAL")))
     L["spec"] = b
 
 
@@ -231,6 +287,19 @@ def _do_post(w):
 
     if S is None:
         _serial_next()
+    elif mode == "B2_LOCAL":
+        # No message. The leader applies its own verdict for step N to the
+        # S it built (gated on itself until now): structural → retract
+        # locally and reschedule; else release and continue the chain.
+        # Followers reach the identical verdict at their own completion of N
+        # (_local_verdict_on_step / _local_verdict_on_arrival).
+        _local_verdict_on_step(w, 0, L["step"])
+        if structural:
+            _serial_next()
+        else:
+            if stops:
+                L["waste"] += len(stops & set(S[2]))
+            L["cur"] = S
     elif mode == "B1":
         if not structural and not stops:
             _broadcast(w, ("COMMIT", S[3]))
@@ -367,7 +436,7 @@ SCENARIOS = {
                      ("r1",)),
 }
 
-MODES = ("SERIAL", "B1", "B2_VOID", "B2_RETRACT")
+MODES = ("SERIAL", "B1", "B2_VOID", "B2_LOCAL", "B2_RETRACT")
 
 
 def run_all(nranks=2):
