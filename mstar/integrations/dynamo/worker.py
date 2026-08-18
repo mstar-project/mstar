@@ -16,25 +16,27 @@ import argparse
 import asyncio
 import logging
 import multiprocessing as mp
+from typing import TYPE_CHECKING
 
 import yaml
 
-from mstar.api_server.entrypoint import (
-    APIServer,
-    _conductor_process_target,
-    _shutdown_conductor_process,
-)
 from mstar.api_server.openai.adapters import get_adapter
-from mstar.communication.communicator import CommProtocol
 from mstar.integrations.dynamo.bridges import RequestBridge
-from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.utils.logging_config import quiet_noisy_loggers
+
+if TYPE_CHECKING:
+    from mstar.api_server.entrypoint import APIServer
 
 logger = logging.getLogger(__name__)
 
 
 def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     """Start conductor + GPU workers and the API-server core (no HTTP)."""
+    # Engine imports live here so importing this module (registration
+    # mapping, --help) never loads the model stacks.
+    from mstar.api_server.entrypoint import APIServer, _conductor_process_target
+    from mstar.communication.communicator import CommProtocol
+    from mstar.model.registry import HF_MODELS, get_model_class
+
     with open(args.config) as f:
         config = yaml.safe_load(f)
     model_name = config.get("model", "dummy")
@@ -174,6 +176,9 @@ def main(argv: list[str] | None = None) -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     args = parser.parse_args(argv)
+
+    from mstar.api_server.entrypoint import _shutdown_conductor_process
+    from mstar.utils.logging_config import quiet_noisy_loggers
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

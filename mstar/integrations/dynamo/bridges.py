@@ -23,8 +23,8 @@ import base64
 import logging
 import time
 import uuid
+from typing import TYPE_CHECKING
 
-from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -32,6 +32,9 @@ from mstar.api_server.openai.protocol import (
     SpeechRequest,
     VideoGenerationRequest,
 )
+
+if TYPE_CHECKING:
+    from mstar.api_server.entrypoint import APIServer
 
 logger = logging.getLogger(__name__)
 
