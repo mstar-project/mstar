@@ -385,6 +385,16 @@ class Engine:
                 )
 
             if step is not None:
+                if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
+                    # The slot was leased from `cg_key_info` before the step was
+                    # declared. If the two disagree the replay runs a graph that
+                    # was planned for a different declaration — silently wrong
+                    # output, so fail here instead. Derive both from one place.
+                    raise RuntimeError(
+                        f"{batch.node_name}: leased {lease.bucket} but the step "
+                        f"declares cg_key_info={step.cg_key_info!r}; "
+                        "cg_key_info() and declare_step disagree"
+                    )
                 step.set_ctx(batch.step_context)
                 # TODO: skip the resources a pre-plan already admitted and
                 # planned. They no-op (and promote) internally today, so this
@@ -405,6 +415,8 @@ class Engine:
                 per_request_states={
                     rid: submodule.request_state(rid) for rid in rids
                 },
+                captured=lease is not None,
+                step=step,
             )
             preprocessed = submodule.preprocess(
                 batch.step_context.graph_walk,

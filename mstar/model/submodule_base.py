@@ -218,6 +218,22 @@ class ModelInputsFromEngine:
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
     per_request_states: dict[str, PerRequestState] | None = None
 
+    # This step's declaration, as ``declare_step`` returned it. A forward
+    # that has to agree with its own declaration reads it here rather than
+    # re-deriving it (cosmos3 declares its denoise attention against the dense
+    # backend or the paged one depending on whether the step got a capture
+    # slot, and the forward has to call the one that was planned). None for a
+    # submodule that declares no step.
+    step: SubmoduleStep | None = None
+
+    # Whether this forward runs under a captured CUDA graph — either the
+    # capture itself or a replay. What ``cache_manager.is_captured`` used to
+    # carry: a submodule whose ``preprocess`` packs differently for the
+    # fixed-shape graph (cosmos3 stacks its denoise inputs on a leading batch
+    # dim) reads it here. The forward method itself is chosen by the config's
+    # ``capture_forward_method``, so most submodules never need this.
+    captured: bool = False
+
     @property
     @torch.compiler.disable
     def single_request_info(self):

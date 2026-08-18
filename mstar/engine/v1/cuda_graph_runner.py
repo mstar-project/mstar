@@ -322,6 +322,8 @@ class CudaGraphRunner:
                 slot_lease=SlotLease(slot=spec.slot, bucket=spec.bucket),
             ))
 
+        engine_inputs.step = step
+
         def prepare() -> dict[str, Any]:
             if step is not None:
                 outcome = self._step_runner.admit(step)
@@ -417,6 +419,7 @@ class CudaGraphRunner:
             request_ids=list(dummy_rids),
             per_request_info=dummy_metadata(dummy_rids, graph_walk),
             resources=dict(self._resources),
+            captured=True,
         )
 
     @staticmethod
