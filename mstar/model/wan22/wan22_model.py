@@ -1,11 +1,11 @@
 """Wan22Model: Wan2.2-TI2V-5B text/image-to-video generation.
 
-Architecture (4 nodes, all STATELESS — no KV cache anywhere):
-    text_encoder (enc_dec) - UMT5-XXL prompt encoder (thin HF wrapper)
-    vae_encoder  (enc_dec) - Wan2.2-VAE encode of the conditioning frame (I2V)
-    dit          (enc_dec) - dense 5B video DiT; CFG as one batch-2 forward,
-                             UniPC (bh2, order 2, flow prediction) run inline
-    vae_decoder  (enc_dec) - Wan2.2-VAE latent -> pixel decode
+Architecture (4 nodes, no engine resources — nothing here is cached):
+    text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
+    vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
+    dit          - dense 5B video DiT; CFG as one batch-2 forward,
+                   UniPC (bh2, order 2, flow prediction) run inline
+    vae_decoder  - Wan2.2-VAE latent -> pixel decode
 
 Graph walks (4):
     encode_text   - text_encoder; persists text_embeds_pos / text_embeds_neg
@@ -39,8 +39,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -111,16 +110,16 @@ class Wan22Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return []  # all nodes are stateless; no KV cache
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """No engine-built resources: every node here is stateless.
 
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {
-            "text_encoder": EngineType.STATELESS,
-            "vae_encoder": EngineType.STATELESS,
-            "dit": EngineType.STATELESS,
-            "vae_decoder": EngineType.STATELESS,
-        }
+        Nothing in this model reads K/V back across steps. The text encoder
+        and both VAE passes are one-shot forwards, and the DiT recomputes
+        its self-attention over the whole latent grid every denoise step —
+        the only state that crosses a step is the UniPC solver's, which
+        rides the loop-back edges as ordinary tensors rather than a cache.
+        """
+        return []
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the

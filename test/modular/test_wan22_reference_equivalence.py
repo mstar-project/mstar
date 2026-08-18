@@ -167,7 +167,6 @@ def _fwd_info(graph_walk: str, step_metadata: dict, seed: int) -> CurrentForward
         fwd_index=0,
         random_seed=seed,
         max_tokens=0,
-        sampling_config={},
         step_metadata=step_metadata,
     )
 

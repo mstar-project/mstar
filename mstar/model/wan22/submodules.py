@@ -1,4 +1,4 @@
-"""Wan2.2-TI2V-5B node submodules (all four STATELESS).
+"""Wan2.2-TI2V-5B node submodules (all four declare no engine resources).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
@@ -12,12 +12,14 @@ transformer region alone (``config.compile_dit``), leaving the solver eager.
 
 Numerics are governed by the checkpoint dtypes, not by the engine.
 ``Wan22Model.get_autocast_dtype`` returns None so the engine neither autocasts
-nor blanket-casts the modules, and each forward disables any ambient autocast
-itself — reference parity must not depend on what context wraps the call.
+nor blanket-casts the modules, and each forward enters ``_inference_ctx``
+itself — reference parity must not depend on what context wraps the call, and
+the v1 engine supplies neither the autocast nor the no-grad wrapper.
 """
 
 import logging
 import os
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -65,9 +67,21 @@ def normalize_decode_tiling_mode(raw: str) -> str:
     return mode if mode in _DECODE_TILING_MODES else "auto"
 
 
-def _no_autocast():
-    """Reference forwards run under module dtypes, never autocast."""
-    return torch.amp.autocast("cuda", enabled=False)
+@contextmanager
+def _inference_ctx():
+    """The context every wan22 forward runs under: module dtypes, no grad.
+
+    Autocast off because reference parity is governed by the checkpoint
+    dtypes, not by whatever wraps the call. ``inference_mode`` because the
+    v1 engine — unlike the stateless engine these nodes were first written
+    against — does not wrap the eager forward in a grad-disabling context of
+    its own, so a 5B DiT would otherwise build an autograd graph on every one
+    of a request's denoise steps. ``inference_mode`` rather than ``no_grad``
+    to match what the old engine gave this model (it picked ``inference_mode``
+    for any node whose autocast dtype was None, which is all four of these).
+    """
+    with torch.amp.autocast("cuda", enabled=False), torch.inference_mode():
+        yield
 
 
 class _Fp32IslandMixin:
@@ -96,6 +110,44 @@ class _Fp32IslandMixin:
         return result
 
 
+class _SingleRequestMixin:
+    """Serve one request per step, through the engine's batched entry point.
+
+    The v1 engine always dispatches to ``forward_batched`` — the worker builds
+    every batch with ``running_batched=True``, and nothing flips it back — so a
+    submodule that only defines ``forward`` never runs. None of the wan22 nodes
+    batch: a request's latent grid is sized by its own height/width/num_frames,
+    so two requests in one step would have to be padded to a common grid, and
+    the DiT step is large enough that the padding would cost more than the
+    batching saves. So they cap the batch at one and hand that row to
+    ``forward``, rather than pretending to a batching they do not implement.
+
+    ``max_batch_size`` is what actually keeps the batch at one: the micro
+    scheduler reads it (``Engine.get_max_batch_size``) and chunks accordingly.
+    The assert below is the backstop, not the mechanism.
+    """
+
+    def max_batch_size(self, graph_walk: str):
+        return 1
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        request_ids = engine_inputs.request_ids
+        assert len(request_ids) == 1, (
+            f"{type(self).__name__} does not batch; got {len(request_ids)} "
+            "requests in one step (max_batch_size should have capped it at 1)"
+        )
+        return {
+            request_ids[0]: self.forward(
+                graph_walk, engine_inputs=engine_inputs, **kwargs
+            )
+        }
+
+
 def _set_buffer(module: nn.Module, dotted_name: str, value: torch.Tensor):
     owner_path, _, attr = dotted_name.rpartition(".")
     owner = module.get_submodule(owner_path) if owner_path else module
@@ -115,7 +167,7 @@ def _latent_grid(config: Wan22Config, step_metadata: dict) -> tuple[int, int, in
 # text_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
+class Wan22TextEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     """UMT5-XXL prompt encoder.
 
     Consumes ``text_inputs`` = ``[positive_ids, negative_ids]``; emits
@@ -157,7 +209,7 @@ class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         negative_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        with _no_autocast():
+        with _inference_ctx():
             pos = self._encode_one(positive_ids)
             neg = self._encode_one(negative_ids) if negative_ids is not None else pos.new_zeros(1)
             return {
@@ -189,7 +241,7 @@ class Wan22TextEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
 # vae_encoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeEncoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE first-frame encoder (I2V requests only).
 
     Consumes ``image_inputs`` (one ``[C, H, W]`` image, float in ``[0, 1]`` or
@@ -233,7 +285,7 @@ class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         image: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        with _no_autocast():
+        with _inference_ctx():
             device = self.get_device()
             # VideoProcessor.preprocess normalizes to [-1, 1].
             video = (image.float() * 2.0 - 1.0).to(device=device, dtype=self.vae.dtype)
@@ -258,7 +310,7 @@ class Wan22VaeEncoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
 # dit
 # ---------------------------------------------------------------------------
 
-class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
+class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     """Dense 5B video DiT with the UniPC step run inline.
 
     One loop iteration is one batch-2 transformer forward (the positive and
@@ -390,7 +442,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
         k = int(time_index.item())
         device = latents.device
 
-        with _no_autocast():
+        with _inference_ctx():
             sigmas, timesteps = make_unipc_tables(num_steps, self.config.flow_shift)
             t = timesteps[k].to(device)
 
@@ -511,7 +563,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, NodeSubmodule):
 # vae_decoder
 # ---------------------------------------------------------------------------
 
-class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
+class Wan22VaeDecoderSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
     """Wan2.2-VAE latent -> pixel decoder (tiled).
 
     Consumes the loop's final ``latents`` and emits ``video_output``
@@ -637,7 +689,7 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         latents: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        with _no_autocast():
+        with _inference_ctx():
             vae = self.vae
             vae_dtype = self._decode_dtype()
             if next(vae.parameters()).dtype != vae_dtype:
