@@ -306,6 +306,17 @@ class Worker:
         # Leader-side monotonic counter stamped on every ScheduleTPNode it
         # broadcasts (speculative or not) so followers can name batches.
         self._tp_broadcast_seq = 0
+        # Follower-side: the verdict this rank reached on completing each of
+        # its TP-follow steps, keyed by that step's tp_seq —
+        # (rids that were in the step, rids that emitted every loop-back
+        # output the node consumes, void_all). A speculative head whose
+        # ``spec_from_seq`` names a step already in here is reconciled
+        # against it ON ARRIVAL, because the leader's head is sent DURING
+        # its N and can land here after our N already finished (we are the
+        # faster rank, or the leader's build was slow); the after-await
+        # reconcile alone would miss it and the serial path would run a
+        # composition the leader will not. Bounded (see _TP_VERDICTS_KEEP).
+        self._tp_step_verdicts: dict[int, tuple[frozenset, frozenset, bool]] = {}
         if self.tp_async_sched and self.parallel_nodes:
             logger.info(
                 "Worker %s: TP async scheduling ON for %s (%s)",
@@ -703,7 +714,7 @@ class Worker:
             elif message.message_type == WorkerMessageType.STOP_LOOPS:
                 self._stop_loops(message.body)
             elif message.message_type == WorkerMessageType.SCHEDULE_TP:
-                self.scheduler.register_tp_follow(message.body)
+                self._register_tp_follow(message.body)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -1919,59 +1930,115 @@ class Worker:
             tp_seq=head.spec_seq,
         )
 
-    def _reconcile_tp_follow_head(
+    _TP_VERDICTS_KEEP = 256
+
+    def _record_tp_step_verdict(
         self, pending: PendingBatch, output: NodeOutput
     ) -> None:
-        """After awaiting step N on a follower that did NOT build the leader's
-        speculative head for N early: apply the verdict the leader applies to
-        its own speculation at this same point, to the head still sitting in
-        the FIFO — so the serial path never runs a composition the leader
-        will not run.
+        """After awaiting TP-follow step N (tp_seq = s) on a follower: record
+        the verdict the leader applies to ITS speculation from N at this same
+        point, so any speculative head with ``spec_from_seq == s`` — already
+        queued, or still in flight from the leader — is reconciled against it
+        and the serial path never runs a composition the leader will not run.
 
         * allocation failed on N / per-rid failures on N → the leader clears
-          its speculation and reschedules from scratch: drop the head.
+          its speculation and reschedules from scratch: void everything
+          speculated from N.
         * otherwise the leader threads N's outputs into the speculation and
           drops any continuing rid that produced no loop-back output
-          (``_thread_outputs_to_speculative``): shrink the head to the
-          survivors, drop it if none survive.
+          (``_thread_outputs_to_speculative``): a head keeps its fresh rids
+          plus the continuing rids in ``ok_rids``.
+
+        The verdict is a function of N's rids and N's outputs — replicated
+        state — so it is the same one the leader (and any rank that built the
+        head early) reaches inside ``_maybe_clear_spec`` / threading.
         """
-        head = self.scheduler.peek_tp_follow()
-        if head is None or not head.speculative or head.spec_from_seq != pending.tp_seq:
-            return
+        pending_rids = frozenset(pending.batch.node_objects)
         if output.allocation_failed or output.failed_requests:
-            self.scheduler.pop_tp_follow_head()
+            verdict = (pending_rids, frozenset(), True)
+        else:
+            _rid0, sample_node = next(iter(pending.batch.node_objects.items()))
+            # Same-node loop-back is the only speculation a v1 leader
+            # broadcasts, so the consumed edges are N's outputs that feed N's
+            # own node.
+            consumed_names = {
+                edge.name for edge in sample_node.outputs
+                if edge.next_node == pending.node_name
+            }
+            ok = frozenset(tp_spec_survivors(
+                list(pending_rids), pending_rids, consumed_names,
+                output.per_request_output_tensors,
+            ))
+            verdict = (pending_rids, ok, False)
+        self._tp_step_verdicts[pending.tp_seq] = verdict
+        if len(self._tp_step_verdicts) > self._TP_VERDICTS_KEEP:
+            for old in sorted(self._tp_step_verdicts)[: -self._TP_VERDICTS_KEEP]:
+                del self._tp_step_verdicts[old]
+
+    def _apply_tp_step_verdict(self, head: ScheduleTPNode) -> ScheduleTPNode | None:
+        """Reconcile a speculative head against the recorded verdict of the
+        step it was speculated from. Returns the head to keep (possibly
+        shrunk), or ``None`` to drop it. Heads whose parent step has no
+        verdict yet (still in flight, or not ours) pass through unchanged."""
+        if not head.speculative:
+            return head
+        verdict = self._tp_step_verdicts.get(head.spec_from_seq)
+        if verdict is None:
+            return head
+        pending_rids, ok_rids, void_all = verdict
+        if void_all:
             logger.debug(
-                "Worker %s: dropped speculative head seq %d (parent %d %s)",
-                self.worker_id, head.spec_seq, pending.tp_seq,
-                "allocation_failed" if output.allocation_failed else "failed_requests",
+                "Worker %s: dropped speculative head seq %d (parent %d voided)",
+                self.worker_id, head.spec_seq, head.spec_from_seq,
             )
-            return
-        _rid0, sample_node = next(iter(pending.batch.node_objects.items()))
-        consumed_names = {
-            edge.name for edge in sample_node.outputs
-            if edge.next_node == head.node_name
-        }
-        survivors = tp_spec_survivors(
-            head.request_ids, set(pending.batch.node_objects),
-            consumed_names, output.per_request_output_tensors,
-        )
+            return None
+        survivors = [
+            r for r in head.request_ids if r not in pending_rids or r in ok_rids
+        ]
         if not survivors:
-            self.scheduler.pop_tp_follow_head()
             logger.debug(
                 "Worker %s: dropped speculative head seq %d (no survivors)",
                 self.worker_id, head.spec_seq,
             )
-        elif survivors != list(head.request_ids):
-            self.scheduler.replace_tp_follow_head(
-                ScheduleTPNode(
-                    node_name=head.node_name,
-                    graph_walk=head.graph_walk,
-                    request_ids=survivors,
-                    speculative=head.speculative,
-                    spec_seq=head.spec_seq,
-                    spec_from_seq=head.spec_from_seq,
-                )
-            )
+            return None
+        if survivors == list(head.request_ids):
+            return head
+        return ScheduleTPNode(
+            node_name=head.node_name,
+            graph_walk=head.graph_walk,
+            request_ids=survivors,
+            speculative=head.speculative,
+            spec_seq=head.spec_seq,
+            spec_from_seq=head.spec_from_seq,
+        )
+
+    def _reconcile_tp_follow_head(
+        self, pending: PendingBatch, output: NodeOutput
+    ) -> None:
+        """After awaiting step N on a follower that did NOT build the leader's
+        speculative head for N early: record N's verdict, then apply it to the
+        head if it is already sitting in the FIFO. Heads that arrive later are
+        reconciled on arrival (``_register_tp_follow``)."""
+        self._record_tp_step_verdict(pending, output)
+        head = self.scheduler.peek_tp_follow()
+        if head is None or not head.speculative or head.spec_from_seq != pending.tp_seq:
+            return
+        kept = self._apply_tp_step_verdict(head)
+        if kept is None:
+            self.scheduler.pop_tp_follow_head()
+        elif kept is not head:
+            self.scheduler.replace_tp_follow_head(kept)
+
+    def _register_tp_follow(self, message: ScheduleTPNode) -> None:
+        """SCHEDULE_TP arrival on a follower. Under TP async scheduling a
+        speculative head is reconciled against the verdict of the step it was
+        speculated from BEFORE it enters the FIFO, in case that step already
+        completed here."""
+        if self.tp_async_sched and message.speculative:
+            message = self._apply_tp_step_verdict(message)
+            if message is None:
+                return
+        self.scheduler.register_tp_follow(message)
 
     # ------------------------------------------------------------------
     # Postprocessing
@@ -2774,15 +2841,15 @@ class Worker:
                     for node in pending.batch.node_objects.values():
                         node._speculatively_scheduled = False
 
-                    # TP async scheduling, follower side: if the leader's
-                    # speculative head for THIS step is still in the FIFO
-                    # (we did not build it early), apply the same verdict to
-                    # it that the leader is applying to its speculation right
-                    # now — before the serial path below could pick it up.
-                    # A head we DID build early is ``speculation`` and goes
-                    # through ``_maybe_clear_spec`` / threading like the
-                    # leader's own.
-                    if speculation is None and self._is_tp_follow_pending(pending):
+                    # TP async scheduling, follower side: record the verdict
+                    # the leader is applying to its speculation from THIS
+                    # step right now, and apply it to the leader's head if it
+                    # is already queued (we did not build it early) — before
+                    # the serial path below could pick it up. A head that
+                    # arrives later is reconciled on arrival. A head we DID
+                    # build early is ``speculation`` and goes through
+                    # ``_maybe_clear_spec`` / threading like the leader's own.
+                    if self._is_tp_follow_pending(pending):
                         self._reconcile_tp_follow_head(pending, output)
 
                     def _maybe_clear_spec():
