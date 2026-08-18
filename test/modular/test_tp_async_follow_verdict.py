@@ -82,8 +82,12 @@ def _stub():
             stub._register_tp_follow(stub.communicator.inbox.pop(0))
 
     def _try_follow(pending):
+        # like the real one: a successful build consumes the FIFO head
         if stub.build_results:
-            return stub.build_results.pop(0)
+            res = stub.build_results.pop(0)
+            if res is not None and stub.scheduler.peek_tp_follow() is not None:
+                stub.scheduler.pop_tp_follow_head()
+            return res
         return None
 
     stub._process_messages = _process_messages

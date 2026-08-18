@@ -1976,9 +1976,13 @@ class Worker:
         rank has already closed (its forward raised) is dropped: the leader
         never ran it either. Everything else queues as before."""
         if message.speculative and not message.request_ids:
-            self._note_tp_nospec(message.spec_from_seq)
-            return
-        if message.speculative and message.spec_from_seq in self._tp_nospec_from:
+            if self.tp_async_sched:
+                self._note_tp_nospec(message.spec_from_seq)
+            return  # never queue an empty batch, flag or no flag
+        if (
+            self.tp_async_sched and message.speculative
+            and message.spec_from_seq in self._tp_nospec_from
+        ):
             logger.debug(
                 "Worker %s: dropped speculative head seq %d (parent %d closed)",
                 self.worker_id, message.spec_seq, message.spec_from_seq,
