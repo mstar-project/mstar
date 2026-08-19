@@ -552,8 +552,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     "sync_position_ids": torch.zeros(
                         shape.total_tokens, dtype=torch.long, device=device),
                     "last_rows": torch.zeros(bs, dtype=torch.long, device=device),
-                    "chain_position_ids": torch.zeros(
-                        max(k - 1, 1) * bs, dtype=torch.long, device=device),
+                    # One (bs,) input per chain iteration — NOT one flat
+                    # (k-1)*bs buffer: the runner pads the real batch to the
+                    # bucket's bs by copying the caller's tensor into buf[:n]
+                    # and zeroing the tail, so per-request rows must be
+                    # separate inputs to stay aligned when num < bs.
+                    **{
+                        f"chain_pos_{it}": torch.zeros(bs, dtype=torch.long, device=device)
+                        for it in range(1, k)
+                    },
                 }
 
             configs[MTP_DRAFT_PHASE_LABEL] = Glm52MtpTrunkGraphConfig(
@@ -658,14 +665,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             static_inputs["sync_position_ids"],
         )
         last = static_inputs["last_rows"]
-        bs = last.shape[0]
         prev_h = h_raw.index_select(0, last)
         prev_d = self.lm_head(h_head.index_select(0, last)).argmax(dim=-1)
         cols = [prev_d]
-        chain_pos = static_inputs["chain_position_ids"]
         for it in range(1, k):
             static_cm.select_plan_slot(_MAIN, it)
-            pos = chain_pos[(it - 1) * bs:it * bs]
+            pos = static_inputs[f"chain_pos_{it}"]
             it_head, prev_h = mtp(embed(prev_d), prev_h, static_cm, pos)
             prev_d = self.lm_head(it_head).argmax(dim=-1)
             cols.append(prev_d)
@@ -1402,15 +1407,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             for i, (t, h) in enumerate(zip(sync_tokens, pair_hiddens, strict=True)):
                 sync_ids[i * rows:i * rows + t.shape[0]] = t
                 pair_h[i * rows:i * rows + h.shape[0]] = h
-            chain_pos = [st + it for it in range(1, k) for st in starts] or [0] * num
+            phase_inputs = {
+                "sync_ids": sync_ids,
+                "pair_hidden": pair_h,
+                "sync_position_ids": pinned(pos_l, torch.long),
+                "last_rows": pinned(last_l, torch.long),
+            }
+            for it in range(1, k):
+                phase_inputs[f"chain_pos_{it}"] = pinned(
+                    [st + it for st in starts], torch.long)
             out = phase_runner.run(
-                static_inputs={
-                    "sync_ids": sync_ids,
-                    "pair_hidden": pair_h,
-                    "sync_position_ids": pinned(pos_l, torch.long),
-                    "last_rows": pinned(last_l, torch.long),
-                    "chain_position_ids": pinned(chain_pos, torch.long),
-                },
+                static_inputs=phase_inputs,
                 request_ids=request_ids,
                 seq_lens=[rows] * num,
                 plan_ctx={"e_list": list(e_list)},

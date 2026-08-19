@@ -548,9 +548,9 @@ def test_mtp_trunk_piecewise_config_shapes():
         (1, 3), (2, 6), (4, 12), (8, 24), (16, 48)]
     phstatic = ph.make_static_inputs(phshapes[1])
     assert set(phstatic) == {"sync_ids", "pair_hidden", "sync_position_ids",
-                             "last_rows", "chain_position_ids"}
+                             "last_rows", "chain_pos_1"}   # k=2: one chain iteration
     assert phstatic["last_rows"].shape == (2,)
-    assert phstatic["chain_position_ids"].shape == (2,)  # (k-1)*bs = 1*2
+    assert phstatic["chain_pos_1"].shape == (2,)  # per-request, per iteration
     sub._mtp_draft_phase_graph = False
     # The captured MTP prefill (2026-08-19) is env-default-ON and adds the
     # k=0 config's packed prefill buckets — bs x token-bucket, PACKED, the
