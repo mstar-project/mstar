@@ -141,10 +141,11 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler = None
 
     def plan(self, step: SamplerStep, ctx: StepContext):
-        for rid, tokens in step.prefill_tracked_tokens.items():
-            self._sampler.get_token_mask(rid).add_tokens(tokens)
-        self._apply_penalty_this_step = step.apply_penalty
-
+        if not ctx.is_preplan:
+            self._apply_penalty_this_step = step.apply_penalty
+            for rid, tokens in step.prefill_tracked_tokens.items():
+                self._sampler.get_token_mask(rid).add_tokens(tokens)
+        
         # A step planned ahead promotes here. Its static config was gathered in
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
         # double-buffered — it must reflect the previous step's commit, so

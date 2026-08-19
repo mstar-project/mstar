@@ -131,9 +131,9 @@ class ParallelAttention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         """Resolve the resources this layer calls. See
         ``NodeSubmodule.bind_node_resources``."""
-        self.attn = resources[self._attn_key]
-        self.kv = resources[self._kv_key]
-        self.pos = None if self._pos_key is None else resources[self._pos_key]
+        self.attn = resources.get(self._attn_key)
+        self.kv = resources.get(self._kv_key)
+        self.pos = None if self._pos_key is None else resources.get(self._pos_key)
 
     def _apply_rope(
         self,

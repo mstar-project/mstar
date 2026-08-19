@@ -30,7 +30,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.components import ParallelSparseMoeBlock, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
-from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, Qwen3OmniModelConfig
 
 
 class Qwen3OmniThinkerLayer(nn.Module):
@@ -67,6 +67,9 @@ class Qwen3OmniThinkerLayer(nn.Module):
             rms_norm_eps=tc.rms_norm_eps,
             use_mrope=True,
             comm_group=comm_group,
+            attn_key=THINKER_ATTN,
+            kv_key=THINKER_KV,
+            pos_key=THINKER_POS
         )
 
         # Post-attention layernorm
@@ -220,11 +223,14 @@ class Qwen3OmniThinkerModel(nn.Module):
         layer_n_hidden = None
 
         for layer_idx, decoder_layer in enumerate(self.model.layers):
+            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
+            # try to specialize on the layer_idx int
+            decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
                 cos_sin_3d=cos_sin_3d,
                 mrope_section=mrope_section,
-                layer_idx=layer_idx,
+                layer_idx=None,
                 label=label,
             )
 

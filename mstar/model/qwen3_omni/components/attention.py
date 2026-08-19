@@ -42,6 +42,9 @@ class Qwen3OmniAttention(ParallelAttention):
         rms_norm_eps: float = 1e-6,
         use_mrope: bool = False,
         comm_group: CommGroup | None = None,
+        attn_key: str = "attn",
+        kv_key: str = "kv",
+        pos_key: str | None = "rope"
     ):
         super().__init__(
             comm_group=comm_group,
@@ -54,6 +57,10 @@ class Qwen3OmniAttention(ParallelAttention):
             qk_norm=True,
             rms_norm_eps=rms_norm_eps,
             rope_theta=rope_theta,
+            attn_key=attn_key,
+            kv_key=kv_key,
+            pos_key=pos_key
+
         )
         self.use_mrope = use_mrope
 

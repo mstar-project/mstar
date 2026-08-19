@@ -6,11 +6,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
 from mstar.engine.kv_store import PositionInfo
 from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
 from mstar.engine.v1.attention_manager import AttentionManager
 from mstar.engine.v1.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.v1.engine import ExecutingBatch
 from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
@@ -37,12 +37,8 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
 
-    # PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
-    # PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
-
-    # TODO DEBUG
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -156,7 +152,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         }
 
     def can_batch(
-        self, batch: NodeBatch,
+        self, batch: ExecutingBatch,
         model_inputs: list[NodeInputs]
     ) -> bool:
         return True
@@ -274,7 +270,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             input_seq_len=tokens.shape[0]
         )
 
-    def can_batch(self, batch: NodeBatch, inputs: list[ARNodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, inputs: list[ARNodeInputs]) -> bool:
         return True
 
     def preprocess(

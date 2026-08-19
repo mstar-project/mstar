@@ -78,6 +78,8 @@ class OrpheusLanguageModel(nn.Module):
         label: str,
     ) -> torch.Tensor:
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
+            # try to specialize on the layer_idx int
             decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
             query_sequence = decoder_layer(
                 hidden_states=query_sequence, label=label, layer_idx=None,

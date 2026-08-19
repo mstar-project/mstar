@@ -363,6 +363,9 @@ class Engine:
                 node_inputs.append(req_inputs)
 
         batch.register_prepare_batch(node_inputs)
+        batch.running_batched = submodule.can_batch(
+            batch=batch, model_inputs=node_inputs
+        ) or batch.step_context.slot_lease is not None
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
 
     def exec(
@@ -383,10 +386,33 @@ class Engine:
                 f"engine.{batch.node_name}.{batch.step_context.graph_walk}"
                 f".bs{len(batch.request_ids)}"
             )
+        try:
+            # inference-only, matching the captured path's bf16 autocast
+            with torch.no_grad(), torch.amp.autocast(
+                "cuda", enabled=True, dtype=self._autocast_dtype
+            ):
+                # admit/plan/commit assume the whole batch reaches the forward
+                # in order; an unbatchable walk with >1 request can't, so each
+                # request runs its own full cycle and merges.
+                if not batch.running_batched and len(batch.request_ids) > 1:
+                    batch.outputs = self._exec_per_request(batch)
+                else:
+                    batch.outputs = self._exec_single(batch)
+            batch.outputs_ready.set()
+            return batch.outputs
+        finally:
+            batch.preplan_event = None
+            batch.release_waiters()
+            if nvtx:
+                range_pop()
 
+    def _exec_single(
+        self, batch: ExecutingBatch
+    ) -> dict[str, NameToTensorList]:
+        """The one-forward path: batched (a lease replay or ``forward_batched``)
+        or a single eager request."""
         submodule_mgmt = self._submodules[batch.node_name]
         cg_runner = submodule_mgmt.cuda_graph_runner
-        submodule = submodule_mgmt.submodule
         # a caller that pre-planned already reserved one; otherwise take it here
         lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
         real_bs = len(batch.request_ids)
@@ -399,165 +425,225 @@ class Engine:
                 lease, batch.request_ids, batch.per_request_info
             )
             batch.step_context.request_ids = cg_runner.step_ids(lease, batch.request_ids)
-        rids = batch.step_context.request_ids
 
         try:
-            step = batch.step
-            if step is None:
-                if nvtx:
-                    range_push("engine.declare_step")
-                try:
-                    step = batch.step = submodule.declare_step(
-                        graph_walk=batch.step_context.graph_walk,
-                        request_ids=rids,
-                        inputs=inputs
-                    )
-                finally:
-                    if nvtx:
-                        range_pop()
-
-            if step is not None:
-                if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
-                    # The slot was leased from `cg_key_info` before the step was
-                    # declared. If the two disagree the replay runs a graph that
-                    # was planned for a different declaration — silently wrong
-                    # output, so fail here instead. Derive both from one place.
-                    raise RuntimeError(
-                        f"{batch.node_name}: leased {lease.bucket} but the step "
-                        f"declares cg_key_info={step.cg_key_info!r}; "
-                        "cg_key_info() and declare_step disagree"
-                    )
-                step.set_ctx(batch.step_context)
-                # TODO: skip the resources a pre-plan already admitted and
-                # planned. They no-op (and promote) internally today, so this
-                # re-drives the whole sweep to get the rest.
-                if nvtx:
-                    range_push("engine.admit")
-                try:
-                    admit_outcome = self._runner.admit(step)
-                finally:
-                    if nvtx:
-                        range_pop()
-                if not admit_outcome.ok:
-                    batch.register_admit_error(admit_outcome.reason)
-                    return {rid: {} for rid in batch.request_ids}
-                if nvtx:
-                    # promoted = a pre-plan was consumed; fresh = planned inline
-                    range_push(
-                        "engine.plan.promoted" if batch.preplan_event is not None
-                        else "engine.plan.fresh"
-                    )
-                try:
-                    self._runner.plan(step)
-                finally:
-                    if nvtx:
-                        range_pop()
-
-            engine_inputs = ModelInputsFromEngine(
-                request_ids=rids,
-                per_request_info=req_info,
-                resources=submodule_mgmt.resources,
-                piecewise_runners=submodule_mgmt.piecewise_runners,
-                # padding rows get their own states, like their cache streams:
-                # the submodule indexes this by step id, not by real rid
-                per_request_states={
-                    rid: submodule.request_state(rid) for rid in rids
-                },
-                captured=lease is not None,
-                step=step,
+            raw, batch.step = self._drive_step(
+                batch, submodule_mgmt, batch.request_ids, inputs, req_info,
+                batch.step_context, lease, batch.running_batched,
+                step=batch.step, set_launch=True,
             )
-            if nvtx:
-                range_push("engine.preprocess")
-            try:
-                preprocessed = submodule.preprocess(
-                    batch.step_context.graph_walk,
-                    engine_inputs=engine_inputs,
-                    inputs=inputs
-                )
-            finally:
-                if nvtx:
-                    range_pop()
-
-            if self._enable_profile and batch.exec_timings.fwd_start is None:
-                batch.exec_timings.fwd_start = time.perf_counter()
-            # release the waiter now, on the cusp of the GIL-dropping launch
-            if batch.launch_started_event is not None:
-                batch.launch_started_event.set()
-            if nvtx:
-                # the launch/enqueue span, not the GPU work: `synchronize=True`
-                # here would drain the stream and destroy the overlap
-                range_push("engine.forward")
-            try:
-                outputs = self._forward(
-                    batch, submodule, submodule_mgmt, cg_runner,
-                    engine_inputs, preprocessed, lease, real_bs,
-                )
-            finally:
-                if nvtx:
-                    range_pop()
-
+            if raw is None:
+                return {rid: {} for rid in batch.request_ids}
             # Commit first: releasing `commit_done` here is what lets a pre-plan
             # of N+1 overlap this step's per-request tail.
-            if step is not None:
-                if nvtx:
-                    range_push("engine.commit")
-                try:
-                    self._runner.commit(step)
-                finally:
-                    if nvtx:
-                        range_pop()
             batch.commit_done.set()
-
-            if nvtx:
+            if self._enable_nvtx:
                 range_push("engine.collect_outputs")
             try:
-                batch.outputs = self._collect_outputs(
-                    batch, submodule_mgmt, lease, outputs, inputs, req_info,
+                return self._collect_outputs(
+                    batch, submodule_mgmt, lease, raw, inputs, req_info,
+                    request_ids=batch.request_ids,
+                    step_request_ids=batch.step_context.request_ids,
+                )
+            finally:
+                if self._enable_nvtx:
+                    range_pop()
+        finally:
+            if lease is not None:
+                cg_runner.release(lease, real_bs)
+
+    def _exec_per_request(
+        self, batch: ExecutingBatch
+    ) -> dict[str, NameToTensorList]:
+        """Full step cycle per request, eager (no lease), outputs merged.
+
+        The unbatchable fallback: no capture applies (a lease would have set
+        ``running_batched``), so each request declares/admits/plans/commits on
+        its own, keeping the plan matched to its single-request forward.
+        """
+        nvtx = self._enable_nvtx
+        submodule_mgmt = self._submodules[batch.node_name]
+        merged: dict[str, NameToTensorList] = {}
+        launched = False
+        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
+            req_info = {rid: batch.per_request_info[rid]}
+            ctx = StepContext(
+                request_ids=(rid,),
+                graph_walk=batch.step_context.graph_walk,
+                slot=0, capture=False,
+            )
+            if nvtx:
+                range_push(f"engine.per_request.{rid}")
+            try:
+                raw, _ = self._drive_step(
+                    batch, submodule_mgmt, [rid], [inp], req_info, ctx,
+                    lease=None, running_batched=False,
+                    step=None, set_launch=not launched,
+                )
+                if raw is None:
+                    merged[rid] = {}
+                    continue
+                launched = True
+                merged.update(self._collect_outputs(
+                    batch, submodule_mgmt, None, raw, [inp], req_info,
+                    request_ids=[rid], step_request_ids=(rid,),
+                ))
+            finally:
+                if nvtx:
+                    range_pop()
+        batch.commit_done.set()
+        return merged
+
+    def _drive_step(
+        self,
+        batch: ExecutingBatch,
+        submodule_mgmt: SubmoduleManagement,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        req_info: Mapping[str, CurrentForwardPassInfo],
+        ctx: StepContext,
+        lease: SlotLease | None,
+        running_batched: bool,
+        step: SubmoduleStep | None,
+        set_launch: bool,
+    ) -> tuple[dict | None, SubmoduleStep | None]:
+        """declare → admit → plan → preprocess → forward → commit for one forward.
+
+        ``request_ids`` are the real rids (for admit-fail / collect); the model
+        runs over ``ctx.request_ids`` (padded under a lease). Returns
+        ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
+        """
+        nvtx = self._enable_nvtx
+        cg_runner = submodule_mgmt.cuda_graph_runner
+        submodule = submodule_mgmt.submodule
+        rids = list(ctx.request_ids)
+
+        if step is None:
+            if nvtx:
+                range_push("engine.declare_step")
+            try:
+                step = submodule.declare_step(
+                    graph_walk=ctx.graph_walk, request_ids=rids, inputs=inputs,
                 )
             finally:
                 if nvtx:
                     range_pop()
-            batch.outputs_ready.set()
-            return batch.outputs
+
+        if step is not None:
+            if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
+                # The slot was leased from `cg_key_info` before the step was
+                # declared. If the two disagree the replay runs a graph that
+                # was planned for a different declaration — silently wrong
+                # output, so fail here instead. Derive both from one place.
+                raise RuntimeError(
+                    f"{batch.node_name}: leased {lease.bucket} but the step "
+                    f"declares cg_key_info={step.cg_key_info!r}; "
+                    "cg_key_info() and declare_step disagree"
+                )
+            step.set_ctx(ctx)
+            # TODO: skip the resources a pre-plan already admitted and planned.
+            # They no-op (and promote) internally today, so this re-drives the
+            # whole sweep to get the rest.
+            if nvtx:
+                range_push("engine.admit")
+            try:
+                admit_outcome = self._runner.admit(step)
+            finally:
+                if nvtx:
+                    range_pop()
+            if not admit_outcome.ok:
+                batch.register_admit_error(admit_outcome.reason)
+                return None, step
+            if nvtx:
+                # promoted = a pre-plan was consumed; fresh = planned inline
+                range_push(
+                    "engine.plan.promoted" if batch.preplan_event is not None
+                    else "engine.plan.fresh"
+                )
+            try:
+                self._runner.plan(step)
+            finally:
+                if nvtx:
+                    range_pop()
+
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=rids,
+            per_request_info=req_info,
+            resources=submodule_mgmt.resources,
+            piecewise_runners=submodule_mgmt.piecewise_runners,
+            # padding rows get their own states, like their cache streams:
+            # the submodule indexes this by step id, not by real rid
+            per_request_states={
+                rid: submodule.request_state(rid) for rid in rids
+            },
+            captured=lease is not None,
+            step=step,
+        )
+        if nvtx:
+            range_push("engine.preprocess")
+        try:
+            preprocessed = submodule.preprocess(
+                ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs,
+            )
         finally:
-            batch.preplan_event = None
-            batch.release_waiters()
-            if lease is not None:
-                cg_runner.release(lease, real_bs)
             if nvtx:
                 range_pop()
+
+        if self._enable_profile and batch.exec_timings.fwd_start is None:
+            batch.exec_timings.fwd_start = time.perf_counter()
+        # release the waiter now, on the cusp of the GIL-dropping launch
+        if set_launch and batch.launch_started_event is not None:
+            batch.launch_started_event.set()
+        if nvtx:
+            # the launch/enqueue span, not the GPU work: `synchronize=True`
+            # here would drain the stream and destroy the overlap
+            range_push("engine.forward")
+        try:
+            raw = self._forward(
+                batch, submodule, cg_runner, engine_inputs, preprocessed,
+                lease, running_batched, request_ids,
+            )
+        finally:
+            if nvtx:
+                range_pop()
+
+        if step is not None:
+            if nvtx:
+                range_push("engine.commit")
+            try:
+                self._runner.commit(step)
+            finally:
+                if nvtx:
+                    range_pop()
+        return raw, step
 
     def _forward(
         self,
         batch: ExecutingBatch,
         submodule: NodeSubmodule,
-        submodule_mgmt: SubmoduleManagement,
         cg_runner,
         engine_inputs: ModelInputsFromEngine,
         preprocessed: dict[str, Any],
         lease: SlotLease | None,
-        real_bs: int,
+        running_batched: bool,
+        request_ids: list[str],
     ) -> dict:
         """Replay the leased slot, or run the eager forward."""
-        del submodule_mgmt
+        graph_walk = batch.step_context.graph_walk
         if lease is not None:
             return cg_runner.run_forward(
                 lease, preprocessed, plan_done_event=batch.preplan_event,
             )
-        if batch.running_batched:
+        if running_batched:
             return submodule.forward_batched(
-                batch.step_context.graph_walk,
-                engine_inputs=engine_inputs,
-                **preprocessed
+                graph_walk, engine_inputs=engine_inputs, **preprocessed
             )
-        assert real_bs == 1, (
+        assert len(request_ids) == 1, (
             "the unbatched forward takes one request; batch of "
-            f"{real_bs} needs running_batched"
+            f"{len(request_ids)} needs running_batched"
         )
-        return {batch.request_ids[0]: submodule.forward(
-            batch.step_context.graph_walk,
-            engine_inputs=engine_inputs,
-            **preprocessed
+        return {request_ids[0]: submodule.forward(
+            graph_walk, engine_inputs=engine_inputs, **preprocessed
         )}
 
     def postprocess_batch(
@@ -666,6 +752,8 @@ class Engine:
         raw_outputs: dict,
         inputs: list[NodeInputs],
         req_info: Mapping[str, CurrentForwardPassInfo],
+        request_ids: list[str],
+        step_request_ids: tuple[str, ...],
     ) -> dict[str, NameToTensorList]:
         """Per-rid outputs for the real requests: sample logits, drop the
         padding rows, and map a captured graph's keys back to real ids.
@@ -675,9 +763,8 @@ class Engine:
         ``request_ids[i]`` on either path.
         """
         submodule = submodule_mgmt.submodule
-        request_ids = batch.request_ids
         out_ids = (
-            batch.step_context.request_ids if lease is None
+            step_request_ids if lease is None
             else submodule_mgmt.cuda_graph_runner.slot_for(lease).dummy_rids
         )
         sampler = submodule_mgmt.sampler

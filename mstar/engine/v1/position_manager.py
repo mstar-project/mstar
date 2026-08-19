@@ -27,6 +27,8 @@ class PosScheme(Enum):
 
 @dataclass
 class PositionConfig:
+    # TODO: make this work without an upstream KV cache (e.g., always using
+    # custom ids / advance)
     kv_cache: str  # name of upstream KV cache
     backend: PosBackend = PosBackend.ROPE
     scheme: PosScheme = PosScheme.SEQUENTIAL

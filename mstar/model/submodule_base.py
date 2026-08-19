@@ -12,17 +12,11 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.step import SubmoduleStep
-from mstar.utils.sampling import BaseSampler, SeenTokenMask
 
 if TYPE_CHECKING:
-    # deprecated, and importing either eagerly drags the old engine onto the
-    # v1 import path (the resources package reaches back here through the v1
-    # cuda graph config)
-    from mstar.engine.base import NodeBatch
-    from mstar.engine.cache_manager import BatchedCacheManager
-    from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
-    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
-    from mstar.engine.kv_store import PositionInfo
+    from mstar.engine.v1.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
+    from mstar.engine.v1.engine import ExecutingBatch
+    from mstar.engine.v1.cuda_graph_runner import PiecewiseCudaGraphRunner
 
 
 @dataclass
@@ -201,12 +195,6 @@ class ModelInputsFromEngine:
     request_ids: list[str]
     per_request_info: dict[str, CurrentForwardPassInfo]
     resources: dict[str, Resource] = field(default_factory=dict)
-
-    # DEPRECATED
-    cache_manager: BatchedCacheManager | None = None
-
-    # DEPRECATED
-    sampler: BaseSampler | None = None
 
     # label -> warmed-up PiecewiseCudaGraphRunner for inner-loop capture. Owned
     # by the engine, spread in at execute time (like ``cache_manager`` /
@@ -396,7 +384,7 @@ class NodeSubmodule(torch.nn.Module):
 
     def can_batch(
         self,
-        batch: NodeBatch,
+        batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ):
         return False # batching disabled by default
@@ -494,7 +482,7 @@ class NodeSubmodule(torch.nn.Module):
         return {}
 
     def can_use_cuda_graphs(
-        self, batch: NodeBatch,
+        self, batch: ExecutingBatch,
         model_inputs: list[NodeInputs]
     ) -> bool:
         """Return True if this submodule supports CUDA graphs for ``batch``.
@@ -596,8 +584,7 @@ class ARNodeSubmodule(NodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        seen_token_mask: SeenTokenMask,
-        pos_info: dict[str, PositionInfo] = {},
+        **kwargs
     ) -> ARNodeInputs:
         pass
 

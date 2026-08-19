@@ -24,7 +24,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.components import ParallelSparseMoeBlockWithSharedExpert, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
-from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig, TalkerTextConfig
+from mstar.model.qwen3_omni.config import TALKER_ATTN, TALKER_KV, TALKER_POS, Qwen3OmniModelConfig, TalkerTextConfig
 from mstar.utils.attention import decode_attn_nhd, fused_qk_norm_rope
 
 # ---------------------------------------------------------------------------
@@ -80,6 +80,9 @@ class Qwen3OmniTalkerLayer(nn.Module):
             rms_norm_eps=rms_norm_eps,
             use_mrope=False,
             comm_group=comm_group,
+            attn_key=TALKER_ATTN,
+            kv_key=TALKER_KV,
+            pos_key=TALKER_POS
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, rms_norm_eps)
 
@@ -160,9 +163,12 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
     ) -> torch.Tensor:
         hidden_states = input_embeds
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
+            # try to specialize on the layer_idx int
+            decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states=hidden_states,
-                layer_idx=layer_idx,
+                layer_idx=None,
                 label=label,
             )
 

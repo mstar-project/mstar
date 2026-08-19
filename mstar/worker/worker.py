@@ -826,7 +826,6 @@ class Worker:
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids or set(),
-            running_batched=True,
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
