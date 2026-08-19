@@ -14,6 +14,11 @@ from mstar.utils.sampling import CudaGraphableSampler, Sampler, SamplerBuffers
 @dataclass
 class SamplerSpec(NodeResourceSpec):
     vocab_size: int | None # must be set for enabled_repetion_penalty
+    # Capability, not intent: whether this node's sampling kernel is *able* to
+    # apply a repetition penalty, which decides both the seen-token buffers and
+    # the kernel variant baked into the captured graph. Whether the penalty
+    # actually runs on a given step is settled per step from the resident
+    # requests' `repetition_penalty` — see `SamplerResource.admit`.
     enable_repetion_penalty: bool = True
 
     @property
@@ -61,7 +66,29 @@ class SamplerResource(Resource):
             device=device,
             tp_group=comm_group
         )
+        # Two flags, because they have different lifetimes.
+        #
+        # `_apply_penalty_this_step` is the CAPABILITY: whether the sampling
+        # kernel this step runs contains the penalty at all. `APPLY_PENALTY` is
+        # a Triton constexpr baked when the graph is captured (see
+        # `fused_temperature_softmax`), so a replay cannot toggle it — this has
+        # to be the value capture saw, and it is what `sample` forwards.
+        #
+        # `_penalty_needed_this_step` is the LIVENESS: whether the penalty can
+        # change a logit at all right now. With every resident request at
+        # `repetition_penalty == 1.0` the baked kernel is
+        # `where(x > 0, x / 1.0, x * 1.0)` — an identity map WHATEVER the
+        # seen-token mask holds — so the mask may be left stale and every bit of
+        # staging/gathering/syncing around it is skippable, bit-exactly. That
+        # traffic is bs x [vocab] copies plus a [bs, vocab] gather per step, all
+        # off-graph on the GPU thread's critical path, so dropping it when it
+        # cannot matter is the whole point of the split.
         self._apply_penalty_this_step: bool = enable_repetion_penalty
+        self._penalty_needed_this_step: bool = enable_repetion_penalty
+        # Resident requests that asked for a penalty. Held as a set rather than
+        # recomputed per step: `admit` is on the per-step path and this only
+        # moves on ingest/remove.
+        self._penalty_rids: set[str] = set()
         self._device = device
         self._comm_group = comm_group
         self._cg_buffers: SamplerBuffers | None = None
@@ -73,6 +100,20 @@ class SamplerResource(Resource):
         # pre-planned a step ahead, promoted by the next non-preplan plan
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
         self._preplanned = False
+
+    @property
+    def _penalty_live(self) -> bool:
+        """Whether any resident request wants a repetition penalty.
+
+        Resource-level rather than per-step, deliberately. A per-step answer
+        would let a request decode for a stretch with its mask un-synced and
+        then land in a batch beside a penalised one, at which point the penalty
+        would be applied against a mask missing everything generated meanwhile.
+        Keyed on residency, the masks are maintained from the moment anyone
+        needs them; a request sitting at 1.0 accumulates a stale mask that only
+        its own (inert) row ever reads.
+        """
+        return self._track_seen_tokens and bool(self._penalty_rids)
 
     @classmethod
     def build(
@@ -118,6 +159,10 @@ class SamplerResource(Resource):
             vocab_size=self._vocab_size,
             **extra_kwargs
         )
+        # Read off the resolved config rather than `overrides`, so a request
+        # that leaves the penalty unset takes the same default the sampler will.
+        if self._sampler._sampling_config[rid].repetition_penalty != 1.0:
+            self._penalty_rids.add(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.register_request(
                 rid, sampling_config=self._sampler._sampling_config[rid]
@@ -125,12 +170,51 @@ class SamplerResource(Resource):
 
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
+        self._penalty_rids.discard(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
-    def admit(self, step, ctx):
-        del ctx, step
+    def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:
+        """Settle this step's two penalty flags. Reserves nothing.
+
+        Both are read by `plan`, `commit` and `sample`, all of which run on the
+        non-preplan path — and `_drive_step` orders `admit` ahead of them, after
+        the previous step's `commit`. So one pair of flags is always the right
+        one and needs no preplan twin the way `_cg_sampler` does; the preplan
+        path only reaches `gather_static`, which never touches the mask.
+
+        Latching here rather than reading `_penalty_live` at each use also keeps
+        one step internally consistent when a request is removed mid-step.
+        """
+        if not ctx.is_preplan:
+            self._apply_penalty_this_step = (
+                self._track_seen_tokens and step.apply_penalty
+            )
+            self._penalty_needed_this_step = (
+                self._apply_penalty_this_step and self._penalty_live
+            )
+            if __debug__ and self._apply_penalty_this_step \
+                    and not self._penalty_needed_this_step:
+                self._assert_penalty_inert(ctx)
         return AdmitOutcome(ok=True)
+
+    def _assert_penalty_inert(self, ctx: StepContext) -> None:
+        """Skipping the mask is sound only while every penalty in the step is 1.0.
+
+        An O(bs) dict walk on the skip path — a rounding error next to the mask
+        traffic it guards, and this invariant is subtle enough to be worth
+        checking live. `python -O` drops it.
+        """
+        configs = self._sampler._sampling_config
+        penalised = [
+            rid for rid in ctx.request_ids
+            if rid in configs and configs[rid].repetition_penalty != 1.0
+        ]
+        assert not penalised, (
+            "repetition-penalty bookkeeping was skipped for a step carrying "
+            f"penalised requests {penalised}; `_penalty_rids` is out of sync "
+            "with the sampler's configs (a mid-request config update?)"
+        )
 
     @property
     def supports_preplan(self):
@@ -141,11 +225,15 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler = None
 
     def plan(self, step: SamplerStep, ctx: StepContext):
-        if not ctx.is_preplan:
-            self._apply_penalty_this_step = step.apply_penalty
+        # The flags themselves are settled in `admit`. Recording prompt tokens
+        # is only worth it while something reads the mask: a request at penalty
+        # 1.0 whose prompt went unrecorded is unaffected, and a penalised
+        # request is resident (so `_penalty_live` is set) before its own prefill
+        # declares these tokens.
+        if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
-        
+
         # A step planned ahead promotes here. Its static config was gathered in
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
         # double-buffered — it must reflect the previous step's commit, so
@@ -181,17 +269,21 @@ class SamplerResource(Resource):
 
     def _gather_dynamic(self, ctx: StepContext):
         """Gather the per-step RNG offset + seen-token mask into this step's
-        slot, inline so they reflect the previous step's committed tokens."""
+        slot, inline so they reflect the previous step's committed tokens.
+
+        The mask half is the expensive half and is skipped whenever the penalty
+        is inert this step — see the flags in `__init__`. The RNG offset is
+        always gathered: it advances in-graph every step regardless."""
         cg_slot = ctx.slot_lease.slot
         padded_bs = ctx.slot_lease.bucket.bs
-        if self._apply_penalty_this_step:
+        if self._penalty_needed_this_step:
             self._cg_buffers.stage_seen_token_masks(
                 request_ids=ctx.request_ids,
                 seen_masks=[self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
             )
         self._cg_buffers.gather_dynamic(
             ctx.request_ids, padded_bs, cg_slot,
-            gather_seen_tokens=self._track_seen_tokens,
+            gather_seen_tokens=self._penalty_needed_this_step,
         )
 
     def commit(self, step: SamplerStep, ctx: StepContext):
@@ -199,9 +291,13 @@ class SamplerResource(Resource):
         if self._cg_buffers is None or self._cg_sampler is None:
             return
         self._cg_buffers.scatter_offset(ctx.slot_lease.slot)
-        self._cg_sampler.sync_seen_token_masks(
-            [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
-        )
+        # Skipped when nothing read the mask this step: there is then nothing to
+        # copy back, and the rows go stale only for requests at penalty 1.0,
+        # which never read them. See `_penalty_live` for why that stays sound.
+        if self._penalty_needed_this_step:
+            self._cg_sampler.sync_seen_token_masks(
+                [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
+            )
 
     ### Submodule-level functionality
 
@@ -209,6 +305,11 @@ class SamplerResource(Resource):
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ):
         if self._cg_sampler is not None:
+            # The capability flag, not the liveness one. Under a replay this
+            # argument is inert (the kernel variant was baked at capture), and
+            # under capture it has to match what every later replay will run.
+            # `_penalty_needed_this_step` only ever suppresses work that cannot
+            # change the result, so leaving the kernel on costs nothing.
             return self._cg_sampler.sample(
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
