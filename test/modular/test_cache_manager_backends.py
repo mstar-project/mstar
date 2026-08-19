@@ -78,3 +78,26 @@ def test_base_class_is_abstract():
 
 def test_registry_names():
     assert set(ATTENTION_BACKENDS) == {"flashinfer", "dense_gen", "mla_absorb"}
+
+
+def test_mla_absorb_honours_pre_planned_labels():
+    """TP-async's plan thread pre-plans a step into the inactive slot and
+    marks the label in ``_pre_planned_labels``; the GPU thread's inline
+    ``plan_attention`` must then SKIP (record seq_lens/write_store only), as
+    the base class does. Until 2026-08-19 the MLA backend discarded the mark
+    and re-planned inline (~1 ms/step, and a stall behind the in-flight
+    forward under async scheduling), so the overlap never happened on
+    GLM-5.2 / Kimi. Contract check on CPU: the fast path returns before any
+    device work."""
+    from mstar.engine.cache_manager import MlaAbsorbCacheManager, _PlanState
+
+    cm = _make(_cfg("mla_absorb"))
+    assert isinstance(cm, MlaAbsorbCacheManager)
+    cm._plan_states["main"] = _PlanState()
+    cm._pre_planned_labels.add("main")
+    # Would raise on CPU past the fast path (get_device_capability / alloc).
+    cm.plan_attention(seq_lens=[1], label="main", write_store=False)
+    assert "main" not in cm._pre_planned_labels
+    assert cm._plan_states["main"].seq_lens == [1]
+    assert cm._plan_states["main"].write_store is False
+    assert cm._plan_states["main"].wrapper is None  # nothing was planned

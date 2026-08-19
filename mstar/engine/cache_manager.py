@@ -1596,8 +1596,23 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
 
         _t0 = time.perf_counter() if _PLAN_TIMING else 0.0
         effective_label = label if label is not None else self._active_label()
-        # Always re-plan; this backend does not support the overlap skip yet.
-        self._pre_planned_labels.discard(effective_label)
+        if effective_label in self._pre_planned_labels:
+            # Overlap fast path, same contract as the base class
+            # (FlashInferCacheManager.plan_attention): the plan thread already
+            # ran THIS method against the slot's persistent MLA wrapper for
+            # this step (CudaGraphRunner.pre_plan_for_batch), on plan_stream,
+            # and the replay gates on its plan_done_event. Re-planning here
+            # was pure waste on the GPU thread — ~1 ms per decode step at
+            # TP8, and under TP-async scheduling it also stalled behind the
+            # in-flight forward. Only the per-step bookkeeping is recorded.
+            self._pre_planned_labels.discard(effective_label)
+            ps = self._plan_states.get(effective_label)
+            if ps is not None:
+                ps.seq_lens = seq_lens
+                ps.write_store = write_store
+            if _PLAN_TIMING:
+                _add_plan_wall(time.perf_counter() - _t0)
+            return
         if effective_label not in self._plan_states:
             self._plan_states[effective_label] = _PlanState()
         ps = self._plan_states[effective_label]
