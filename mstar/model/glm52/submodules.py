@@ -18,6 +18,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
     PiecewiseCudaGraphConfig,
+    PiecewisePackedConfig,
 )
 from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
 from mstar.engine.kv_store import PositionInfo
@@ -33,6 +34,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
 )
+from mstar.utils.pinned_staging import pinned, to_device_async
 from mstar.utils.sampling import Sampler
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,7 @@ _MAIN = "main"
 MTP_TRUNK_LABEL = "mtp_trunk"
 MTP_DRAFT_LABEL = "mtp_draft"
 MTP_SYNC_LABEL = "mtp_sync"
+MTP_PREFILL_LABEL = "mtp_prefill"
 # Output/edge name for the prefill's [emitted, k drafts] bundle. Deliberately
 # NOT "text_inputs": the conductor seeds persist_signals from initial_signals,
 # where "text_inputs" is the PROMPT, so a persisted edge of that name is
@@ -171,6 +174,19 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # bs>1 is covered by the reduced-dims GPU test only, not yet at scale.
         self._mtp_capture_sync = (
             os.environ.get("MSTAR_GLM52_MTP_CAPTURE_SYNC", "1") == "1"
+        )
+        # Capture the MTP PREFILL trunk (embed + 78 layers over the packed
+        # prompt) as a piecewise graph over the same token buckets the k=0
+        # config captures. With MTP on, get_cuda_graph_configs returns no
+        # full-forward graphs — the whole prefill ran eager, and that is the
+        # +248 ms TTFT (305 vs k=0's 57 ms) [measured 08-09/08-18]. The
+        # sample, the whole-prompt plane sync and the draft chain stay
+        # outside the graph, exactly as the decode step keeps verify outside
+        # the trunk graph. Set MSTAR_GLM52_MTP_CAPTURE_PREFILL=0 for the eager
+        # prefill (escape hatch; per-bucket capture failures also fall back to
+        # eager on their own).
+        self._mtp_capture_prefill = (
+            os.environ.get("MSTAR_GLM52_MTP_CAPTURE_PREFILL", "1") == "1"
         )
         # One-shot flag: warn the first time an MTP decode trunk runs eager
         # (no captured piecewise bucket) — the 2026-08-09 bench showed that
@@ -446,6 +462,24 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=list(self.MTP_CAPTURE_BATCH_SIZES),
                 compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
             )
+        if self._mtp_capture_prefill:
+            # Same token buckets and batch sizes as the k=0 packed prefill
+            # graphs (get_cuda_graph_configs), so MTP-on TTFT lands where
+            # MTP-off's does. Static outputs are the full-row hidden and
+            # prenorm streams: the whole-prompt plane sync needs every row.
+            configs[MTP_PREFILL_LABEL] = PiecewisePackedConfig(
+                total_tokens=list(
+                    self.config.prefill_token_buckets or self.PREFILL_TOKEN_BUCKETS),
+                capture_fn=self._mtp_prefill_captured,
+                make_static_inputs=make_static_inputs,
+                plan_fn=self._mtp_prefill_plan,
+                uses_kv_cache=True,
+                cache_labels=[_MAIN],
+                capture_batch_sizes=list(
+                    self.config.prefill_capture_batch_sizes
+                    or self.PREFILL_CAPTURE_BATCH_SIZES),
+                compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
+            )
         return configs
 
     def _mtp_trunk_captured(
@@ -478,6 +512,35 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         runner's persistent wrappers, is the live plan). At replay the
         runner has already aliased the real request states onto the dummy
         slots, so position reads see real counters."""
+        cache_manager.set_active_label(_MAIN)
+        cache_manager.plan_attention(
+            seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
+        cache_manager.plan_rope(
+            seq_lens=shape.seq_lens, pos_ids=None, label=_MAIN)
+
+    def _mtp_prefill_captured(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        static_cm: BatchedCacheManager | None = None,
+        **_: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Captured region for the MTP prefill trunk: embed + layers over the
+        packed prompt rows, returning both streams for every row (the last
+        rows feed the sample, all rows feed the plane sync). No lm_head
+        inside — prefill needs logits for the last row per request only,
+        and a (tokens, vocab) static output would be 300 MB per bucket."""
+        static_cm.set_active_label(_MAIN)
+        hidden, prenorm = self._hidden(
+            static_inputs["input_ids"], static_inputs["position_ids"], static_cm,
+            with_prenorm=True)
+        return {"hidden": hidden, "prenorm": prenorm}
+
+    def _mtp_prefill_plan(
+        self, cache_manager: BatchedCacheManager, shape: PiecewiseCaptureShape,
+    ) -> None:
+        """Plan the packed prefill on the trunk label — the runner hands the
+        real per-request lengths (plus zero-length padding rows) at replay,
+        mirroring ``preprocess``, which skips its own plan for this step."""
         cache_manager.set_active_label(_MAIN)
         cache_manager.plan_attention(
             seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
@@ -529,11 +592,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 cache_manager.request_ids, shape.seq_lens, strict=True)
             if sl > 0
         ]
-        cache_manager.plan_rope(
-            seq_lens=shape.seq_lens,
-            pos_ids=torch.tensor(
-                pos, dtype=torch.long, device=self.get_device()),
-            label=_MAIN)
+        # A host list: plan_rope stages it through pinned memory and copies
+        # async. ``torch.tensor(pos, device=cuda)`` here was a pageable H2D
+        # that drained the stream on every chain iteration.
+        cache_manager.plan_rope(seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
 
     def _mtp_sync_captured(
         self,
@@ -583,11 +645,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             if sl > 0:
                 start = cache_manager._get_state(rid, _MAIN).position_id_start
                 pos.extend(range(start + 1, start + 1 + sl))
-        cache_manager.plan_rope(
-            seq_lens=shape.seq_lens,
-            pos_ids=torch.tensor(
-                pos, dtype=torch.long, device=self.get_device()),
-            label=_MAIN)
+        cache_manager.plan_rope(seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
 
     def prepare_inputs(
         self,
@@ -643,8 +701,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         trunk_runner = None
         draft_runner = None
         sync_runner = None
+        prefill_runner = None
         if self.config.mtp_num_draft_tokens > 0:
             runners = getattr(engine_inputs, "piecewise_runners", None) or {}
+            if graph_walk == "prefill":
+                # The captured prefill trunk (PACKED: smallest token bucket
+                # >= the real total, real per-request lengths at plan time).
+                pcand = runners.get(MTP_PREFILL_LABEL)
+                if pcand is not None and pcand.can_run(
+                    len(inputs), sum(seq_lens)
+                ):
+                    prefill_runner = pcand
             if graph_walk == "decode":
                 candidate = runners.get(MTP_TRUNK_LABEL)
                 if candidate is not None and candidate.can_run(
@@ -667,7 +734,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 draft_runner = dcand
 
         cache_manager.set_active_label(_MAIN)
-        if trunk_runner is None:
+        if trunk_runner is None and prefill_runner is None:
             cache_manager.plan_attention(
                 seq_lens=seq_lens, is_causal=True, label=_MAIN)
             cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label=_MAIN)
@@ -719,9 +786,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 ))
                 q_start += sl
             pos_ids_list.extend(range(start, start + sl))
-        position_ids = torch.tensor(pos_ids_list, dtype=torch.long, device=device)
+        # Async H2D through pinned staging: a pageable ``torch.tensor(...,
+        # device=cuda)`` here drains the stream before the step even starts,
+        # which defeats any plan/schedule overlap with the previous step.
+        position_ids = to_device_async(pos_ids_list, torch.long, device)
 
-        seq_len_t = torch.tensor(seq_lens, dtype=torch.long, device=device)
+        seq_len_t = to_device_async(seq_lens, torch.long, device)
         return {
             "input_ids": torch.cat([inp.input_ids for inp in inputs]),
             "position_ids": position_ids,
@@ -738,6 +808,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             "mtp_draft_runner": draft_runner,
             # Non-None when the decode sync pass can replay padded.
             "mtp_sync_runner": sync_runner,
+            # Non-None when this prefill's trunk replays its packed graph.
+            "mtp_prefill_runner": prefill_runner,
             "dsa_ctx": Glm52DsaForwardContext(
                 spans=spans, k_store=self._dsa_k_store,
                 needs_selection=needs_selection,
@@ -871,7 +943,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        from mstar.model.glm52.components.mtp import mtp_greedy_verify
+        from mstar.model.glm52.components.mtp import mtp_greedy_verify_host
 
         self._stop_load_heartbeat()
         cache_handle = engine_inputs.cache_manager
@@ -885,19 +957,42 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             row_starts.append(row_starts[-1] + sl)
 
         if graph_walk == "prefill":
-            # Prefill stays eager (v1 scope): its tail needs the engine
-            # sampler plus the same uncapturable sync/draft phases.
-            hidden, prenorm = self._hidden(
-                input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"),
-                with_prenorm=True)
-            # Emit the prefill token through the engine sampler, exactly as
-            # flag-off does — bit-parity for the first emitted token.
-            qo_indptr_buf = cache_handle.get_qo_indptr_buf(_MAIN)
-            if qo_indptr_buf is not None:
-                last_token_indices = (qo_indptr_buf[1:] - 1).long()
-            else:
+            prefill_runner = kwargs.get("mtp_prefill_runner")
+            if prefill_runner is not None:
+                # Replay the captured prefill trunk over the packed prompt
+                # rows (embed + layers; the tail — sample, whole-prompt plane
+                # sync, draft chain — stays eager below, exactly as the
+                # decode step keeps verify outside its trunk graph). The
+                # runner plans the real lengths on its persistent wrappers,
+                # replays, and advances; preprocess skipped its eager plan.
+                # Per-request row boundaries come from preprocess (real
+                # seq_lens): the runner's static_cm, not cache_handle, holds
+                # this step's plan, so get_qo_indptr_buf would be stale here.
+                replay = prefill_runner.run(
+                    static_inputs={
+                        "input_ids": input_ids,
+                        "position_ids": position_ids,
+                    },
+                    request_ids=request_ids,
+                    seq_lens=list(seq_lens),
+                )
+                hidden, prenorm = replay["hidden"], replay["prenorm"]
                 last_token_indices = kwargs.get("last_token_indices")
                 assert last_token_indices is not None
+            else:
+                # Eager prefill (no captured bucket for this shape, or
+                # MSTAR_GLM52_MTP_CAPTURE_PREFILL=0).
+                hidden, prenorm = self._hidden(
+                    input_ids, position_ids, cache_handle, kwargs.get("dsa_ctx"),
+                    with_prenorm=True)
+                qo_indptr_buf = cache_handle.get_qo_indptr_buf(_MAIN)
+                if qo_indptr_buf is not None:
+                    last_token_indices = (qo_indptr_buf[1:] - 1).long()
+                else:
+                    last_token_indices = kwargs.get("last_token_indices")
+                    assert last_token_indices is not None
+            # Emit the prefill token through the engine sampler, exactly as
+            # flag-off does — bit-parity for the first emitted token.
             last_hidden = hidden.index_select(0, last_token_indices)
             new_tokens = self._sample(
                 engine_inputs.sampler, request_ids, self.lm_head(last_hidden))
@@ -962,36 +1057,49 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         results: dict[str, NameToTensorList] = {}
         rewinds: list[int] = []
         sync_tokens, pair_hiddens = [], []
+        # ONE device->host round trip for the whole verify. The per-request
+        # form (``mtp_greedy_verify`` on device slices, then ``int(tok)`` per
+        # emitted token for the EOS scan) was 2 + e syncs per request per
+        # step; each one also drains whatever the GPU still has queued. The
+        # target argmax over all rows and the drafts (already on device from
+        # last step's chain) travel together, and everything after this
+        # line is host arithmetic. Emitted tokens are a VIEW of the target
+        # argmax: greedy verify accepts draft j iff it equals target[j], so
+        # ``drafts[:n_acc] + [target[n_acc]] == target[:n_acc + 1]`` — same
+        # values as ``mtp_greedy_verify`` returned, no gather needed.
+        target_argmax_all = logits.argmax(dim=-1)  # (sum(k+1),)
+        total_rows = row_starts[-1]
+        host = torch.cat([input_ids, target_argmax_all]).tolist()
+        inputs_h, target_h = host[:total_rows], host[total_rows:]
+        pair_rows = self._mtp_pair_rows(hidden, prenorm)
+        eos_ids = self.config.eos_token_ids
         for i, rid in enumerate(request_ids):
-            r = slice(row_starts[i], row_starts[i + 1])
+            lo, hi = row_starts[i], row_starts[i + 1]
             m = seq_lens[i]
-            r_inputs = input_ids[r]
-            drafts_in = r_inputs[1:]
-            target_argmax = logits[r].argmax(dim=-1)
-            n_acc, bonus = mtp_greedy_verify(drafts_in, target_argmax)
+            n_acc = mtp_greedy_verify_host(
+                inputs_h[lo + 1:hi], target_h[lo:hi])
             # Raw (pre-truncation) emission is the draft-quality signal.
             self._mtp_stat_steps += 1
             self._mtp_stat_emitted += n_acc + 1
             self._mtp_stat_acc_hist[n_acc] += 1
-            emitted = torch.cat([drafts_in[:n_acc], bonus.reshape(1)])
             # Truncate: max_tokens budget first, then first stop id. EOS is
             # always the LAST element after truncation, which is the
             # contract check_stop relies on.
             budget = self._mtp_max_tokens[rid] - self._mtp_emitted[rid]
-            e = min(emitted.shape[0], max(budget, 1))
+            e = min(n_acc + 1, max(budget, 1))
             if not self._mtp_ignore_eos[rid]:
                 for j in range(e):
-                    if int(emitted[j]) in self.config.eos_token_ids:
+                    if target_h[lo + j] in eos_ids:
                         e = j + 1
                         break
-            emitted = emitted[:e]
+            emitted = target_argmax_all[lo:lo + e]
             self._mtp_emitted[rid] += e
             # m tokens appended KV this forward; the committed prefix is
             # input[0] plus the e-1 now-emitted drafts. The bonus was never
             # processed.
             rewinds.append(m - e)
             sync_tokens.append(emitted)
-            pair_hiddens.append(self._mtp_pair_rows(hidden, prenorm)[r][:e])
+            pair_hiddens.append(pair_rows[lo:lo + e])
             results[rid] = {"new_token": [emitted]}
         self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
@@ -1069,12 +1177,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             ):
                 sync_ids[i * rows:i * rows + t.shape[0]] = t
                 pair_h[i * rows:i * rows + h.shape[0]] = h
+            # Host-known ints go to the device through PINNED staging
+            # (mstar/utils/pinned_staging.py): the runner's static-input
+            # copy is non_blocking, so nothing here waits for the trunk to
+            # finish — the sync pass is queued right behind it.
             out = sync_runner.run(
                 static_inputs={
                     "sync_ids": sync_ids,
                     "pair_hidden": pair_h,
-                    "position_ids": torch.tensor(
-                        pos_l, dtype=torch.long, device=device),
+                    "position_ids": pinned(pos_l, torch.long),
                 },
                 request_ids=request_ids,
                 seq_lens=[rows] * num,
@@ -1082,8 +1193,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             # The runner advanced `rows` per request; only e were real.
             cache_handle.rewind_seq_lens(over_advance)
             h_head, h_raw = out["h_head"], out["h_raw"]
-            last_rows = torch.tensor(
-                last_l, dtype=torch.long, device=device)
+            last_rows = to_device_async(last_l, torch.long, device)
         else:
             cache_handle.set_layer_idx(mtp_layer)
             cache_handle.plan_attention(
@@ -1091,8 +1201,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             pos_list: list[int] = []
             for st, e in zip(starts, e_list, strict=True):
                 pos_list.extend(range(st - e + 1, st + 1))
-            positions = torch.tensor(
-                pos_list, dtype=torch.long, device=device)
+            positions = to_device_async(pos_list, torch.long, device)
             cache_handle.plan_rope(
                 seq_lens=e_list, pos_ids=positions, label=_MAIN)
             h_head, h_raw = mtp(
@@ -1100,9 +1209,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 cache_handle, positions,
             )
             cache_handle.advance_seq_lens()
-            # Packed (unpadded) layout: last real row via cumsum.
-            last_rows = torch.tensor(
-                e_list, dtype=torch.long, device=device).cumsum(0) - 1
+            # Packed (unpadded) layout: last real row via cumsum (on host).
+            last_l_eager: list[int] = []
+            acc = 0
+            for e in e_list:
+                acc += e
+                last_l_eager.append(acc - 1)
+            last_rows = to_device_async(last_l_eager, torch.long, device)
 
         # Head reads the shared_head-normed rows; the CHAIN threads the raw
         # layer output (hnorm re-norms it next iteration — same convention
@@ -1115,19 +1228,24 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if k > 1 and draft_runner is None:
             self._warn_mtp_draft_eager_once(num)
         for it in range(1, k):
-            positions = torch.tensor(
-                [st + it for st in starts], dtype=torch.long, device=device)
+            pos_it = [st + it for st in starts]
             if draft_runner is not None:
                 # Replay the captured chain iteration. The runner plans on
                 # its persistent wrappers from the aliased states (rope at
                 # counter+1 == st+it, matching ``positions``), replays, and
                 # advances +1 per request — the same bookkeeping as the
                 # eager body, so the final k-1 rewind below is unchanged.
+                # Nothing in this iteration blocks on the previous one: the
+                # positions are pinned host memory (async copy-in), the plan
+                # inside run() stages its indices the same way, and the
+                # wrapper's plan fence only waits for the PREVIOUS plan's
+                # DMAs (i.e. for the GPU to reach the previous replay), so
+                # the host stays one replay ahead of the device.
                 out = draft_runner.run(
                     static_inputs={
                         "draft_ids": prev_d,
                         "prev_hidden": prev_h,
-                        "position_ids": positions,
+                        "position_ids": pinned(pos_it, torch.long),
                     },
                     request_ids=request_ids,
                     seq_lens=ones,
@@ -1135,6 +1253,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 prev_d = out["draft_ids"]
                 prev_h = out["prev_hidden"]
             else:
+                positions = to_device_async(pos_it, torch.long, device)
                 cache_handle.set_layer_idx(mtp_layer)
                 cache_handle.plan_attention(
                     seq_lens=ones, is_causal=True, label=_MAIN)

@@ -54,7 +54,7 @@ set -uo pipefail
 # before it is trusted with a 95-minute box window. On the box, leave unset.
 P=${P:-/m-coriander/coriander/kirill}
 D=$P/glm-m3
-K=2
+K=${K:-2}   # the shipped combined config is k=3: `K=3 ARMS="S L" bash env/m3-trunk-pairing-ab.sh`
 TS=$(date -u +%Y%m%dT%H%M%S)
 RUN=$D/perf-ab-$TS
 BENCH=$D/bench-mstar-b1-mtp-k$K.txt
@@ -206,6 +206,15 @@ run_arm() {
     A) label="defaults (pre-final-norm pairing)";        want_tag="pre-final-norm (default)" ;;
     B) label="PAIR_POSTNORM=1 (vLLM convention)";        want_tag="POST-final-norm (vLLM convention)" ;;
     C) label="CAPTURE_SYNC=1 (padded sync graph)";       want_tag="pre-final-norm (default)" ;;
+    # 2026-08-19 arms. S = the shipped combined config (post-norm + captured
+    # sync, k=3) with the captured MTP prefill and prefill drafts pinned OFF —
+    # i.e. T0's config on THIS tree, so S − T0(66.81) isolates what the
+    # sync-free planning (not flag-gated) is worth. L = the new defaults:
+    # captured MTP prefill ON plus the prefill-drafts edge ON.
+    S) label="shipped combined (post-norm+sync capture), prefill eager, no prefill drafts"
+       want_tag="POST-final-norm (vLLM convention)" ;;
+    L) label="new defaults: + captured MTP prefill + prefill drafts"
+       want_tag="POST-final-norm (vLLM convention)" ;;
     *) say "unknown arm '$arm'"; echo "UNKNOWN-ARM" > "$out/verdict.txt"; return 1 ;;
   esac
 
@@ -248,10 +257,15 @@ run_arm() {
     # default for both flags is ON, so arm A must force them off to measure the
     # pre-norm / eager-sync baseline rather than the shipped combined path.
     export MSTAR_GLM52_MTP_PAIR_POSTNORM=0 MSTAR_GLM52_MTP_CAPTURE_SYNC=0 \
-           MSTAR_GLM52_MTP_PREFILL_DRAFTS=0
+           MSTAR_GLM52_MTP_PREFILL_DRAFTS=0 MSTAR_GLM52_MTP_CAPTURE_PREFILL=0
     case "$arm" in
       B) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 ;;
       C) export MSTAR_GLM52_MTP_CAPTURE_SYNC=1 ;;
+      S) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
+                MSTAR_PHASE_TIMING=200 ;;
+      L) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
+                MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
+                MSTAR_PHASE_TIMING=200 ;;
     esac
     env | grep -E '^MSTAR_GLM52' | sort > "$out/env.txt"
     HOLD_MIN=0 bash "$D/m3-sweep2.sh" "$K"

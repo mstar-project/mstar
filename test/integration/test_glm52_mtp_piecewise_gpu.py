@@ -53,6 +53,7 @@ from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.submodules import (
     MTP_DRAFT_LABEL,
+    MTP_PREFILL_LABEL,
     MTP_SYNC_LABEL,
     MTP_TRUNK_LABEL,
     Glm52LLMSubmodule,
@@ -268,6 +269,10 @@ def test_sync_capture_matches_eager_bit_identically():
             os.environ["MSTAR_GLM52_MTP_CAPTURE_SYNC"] = prev
 
     assert MTP_SYNC_LABEL in runners, "the sync graph did not capture"
+    # 2026-08-19: the MTP prefill trunk is captured too (env-default-ON), so
+    # this arm's FIRST token — and every plane-sync row the drafts descend
+    # from — comes out of a packed prefill graph. Same bit-identity bar.
+    assert MTP_PREFILL_LABEL in runners, "the prefill graph did not capture"
     assert eager["r0"] == replay["r0"], (
         f"padded sync replay diverged from eager:\n eager  {eager['r0']}\n "
         f"replay {replay['r0']}")
@@ -333,3 +338,92 @@ def test_batch_padding_replay_matches_eager():
         assert eager[rid] == replay[rid], (
             f"{rid}: padded (bs=3 -> 4) replay diverged from eager:\n "
             f"eager  {eager[rid]}\n replay {replay[rid]}")
+
+
+def test_captured_decode_step_syncs_exactly_once():
+    """The sync discipline behind the draft-chain speedup (2026-08-19).
+
+    A captured MTP decode step must touch the host exactly ONCE — the batched
+    ``.tolist()`` in greedy verify (a true data dependency: e decides the
+    rewind and the plans). Everything else — the trunk/sync/draft plans, RoPE
+    positions, the scatter maps, the per-iteration position tensors — goes to
+    the device through pinned staging with non_blocking copies, so the CPU
+    queues the whole draft phase without waiting for the GPU between
+    iterations. Before this, each chain iteration paid ~8 stream drains
+    (``torch.tensor(..., device=cuda)``, ``.item()``, FlashInfer's
+    ``.to("cpu")`` on device tensors), which is why a captured 1-layer
+    iteration cost 2.4 ms against ~0.3 ms of compute.
+
+    ``torch.cuda.set_sync_debug_mode("warn")`` reports every synchronizing
+    op PyTorch can see (``.item()``, ``.cpu()``/``.tolist()``, ``nonzero``,
+    blocking ``copy_``, ``torch.tensor(..., device=cuda)``). It cannot see a
+    ``non_blocking`` copy from *pageable* memory (CUDA drains the stream for
+    that too) — the pinned() helper is what closes that hole, asserted below.
+    """
+    import warnings
+
+    from mstar.utils.pinned_staging import pinned
+
+    assert pinned([1, 2, 3], torch.long).is_pinned(), (
+        "pinned() must return pinned memory when CUDA is available")
+
+    cfg = _cfg()
+    model = _build(cfg)
+    prompts = _prompts(1)
+    bs = 1
+    sub = Glm52LLMSubmodule(model, cfg)
+    cm, alloc, buffers, kv_cfg, rids = _kv(cfg, bs)
+    sampler = _sampler(cfg, rids)
+    prev = os.environ.get("MSTAR_GLM52_MTP_CAPTURE_SYNC")
+    os.environ["MSTAR_GLM52_MTP_CAPTURE_SYNC"] = "1"
+    try:
+        runners = build_piecewise_runners(
+            sub, DEVICE, torch.bfloat16, tp_world_size=1,
+            kv_cache_config=kv_cfg, alloc_manager=alloc, buffer_manager=buffers,
+        )
+        assert {MTP_TRUNK_LABEL, MTP_SYNC_LABEL, MTP_DRAFT_LABEL} <= set(runners)
+        ei = ModelInputsFromEngine(
+            request_ids=rids, per_request_info={}, cache_manager=cm,
+            sampler=sampler, piecewise_runners=runners,
+        )
+        infos = {rid: _fwd_info(cfg, rid, 4096) for rid in rids}
+        ars = [sub.prepare_inputs("prefill", infos[rid], {"text_inputs": [p]})
+               for rid, p in zip(rids, prompts, strict=True)]
+        packed = sub.preprocess("prefill", ei, ars)
+        with torch.no_grad():
+            res = sub.forward_batched("prefill", ei, **packed)
+        nxt = {rid: res[rid]["text_inputs"][0] for rid in rids}
+        for rid in rids:
+            sub.postprocess(rid, infos[rid], res[rid])
+        # One warm decode step (first-use allocations, lazy wrappers), then
+        # the measured one.
+        for measured in (False, True):
+            ars = [sub.prepare_inputs("decode", infos[rid], {"text_inputs": [nxt[rid]]})
+                   for rid in rids]
+            torch.cuda.synchronize()
+            if measured:
+                torch.cuda.set_sync_debug_mode("warn")
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    packed = sub.preprocess("decode", ei, ars)
+                    with torch.no_grad():
+                        res = sub.forward_batched("decode", ei, **packed)
+            finally:
+                if measured:
+                    torch.cuda.set_sync_debug_mode("default")
+            for rid in rids:
+                sub.postprocess(rid, infos[rid], res[rid])
+                nxt[rid] = res[rid]["text_inputs"][0]
+        syncs = [str(w.message) for w in caught if "synchroniz" in str(w.message).lower()]
+        assert len(syncs) == 1, (
+            f"expected exactly one host sync per captured decode step (the "
+            f"verify .tolist()), saw {len(syncs)}:\n" + "\n".join(syncs))
+    finally:
+        if prev is None:
+            os.environ.pop("MSTAR_GLM52_MTP_CAPTURE_SYNC", None)
+        else:
+            os.environ["MSTAR_GLM52_MTP_CAPTURE_SYNC"] = prev
+        alloc.cleanup()
+        for rid in rids:
+            sampler.remove_request(rid)

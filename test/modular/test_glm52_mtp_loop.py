@@ -515,6 +515,7 @@ def test_mtp_trunk_piecewise_config_shapes():
     # bit-exact, arm C). Pin it OFF here to check the trunk+draft-only set,
     # then ON below for the sync-included set.
     sub._mtp_capture_sync = False
+    sub._mtp_capture_prefill = False
     assert set(sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
             "mtp_trunk", "mtp_draft"}
@@ -522,6 +523,25 @@ def test_mtp_trunk_piecewise_config_shapes():
     configs = sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)
     assert set(configs) == {"mtp_trunk", "mtp_draft", "mtp_sync"}
+    # The captured MTP prefill (2026-08-19) is env-default-ON and adds the
+    # k=0 config's packed prefill buckets — bs x token-bucket, PACKED, the
+    # full-row hidden/prenorm outputs — never lm_head.
+    sub._mtp_capture_prefill = True
+    configs = sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)
+    assert set(configs) == {"mtp_trunk", "mtp_draft", "mtp_sync", "mtp_prefill"}
+    pf = configs["mtp_prefill"]
+    assert pf.get_config_type() == PiecewiseConfigType.PACKED
+    assert pf.uses_kv_cache and pf.cache_labels == ["main"]
+    pshapes = pf.get_capture_shapes(pf.capture_batch_sizes)
+    buckets = cfg.prefill_token_buckets or sub.PREFILL_TOKEN_BUCKETS
+    bss = cfg.prefill_capture_batch_sizes or sub.PREFILL_CAPTURE_BATCH_SIZES
+    assert sorted((s.bs, s.total_tokens) for s in pshapes) == sorted(
+        (b, t) for b in bss for t in buckets)
+    assert all(sum(s.seq_lens) == s.total_tokens for s in pshapes)
+    pstatic = pf.make_static_inputs(pshapes[0])
+    assert set(pstatic) == {"input_ids", "position_ids"}
+    assert pstatic["input_ids"].shape == (pshapes[0].total_tokens,)
     pc = configs["mtp_trunk"]
     assert pc.get_config_type() == PiecewiseConfigType.PACKED
     assert pc.uses_kv_cache and pc.cache_labels == ["main"]
@@ -565,7 +585,7 @@ def test_mtp_trunk_piecewise_config_shapes():
     cfg.mtp_num_draft_tokens = 1
     assert set(sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
-            "mtp_trunk", "mtp_sync"}
+            "mtp_trunk", "mtp_sync", "mtp_prefill"}
     sub._mtp_capture_sync = False
 
     cfg.mtp_num_draft_tokens = 0

@@ -2728,6 +2728,20 @@ class PiecewiseCudaGraphRunner:
             #
             # If piecewise runners ever gain pre-planning or multiple slots,
             # this key must grow a discriminator before that lands.
+            #
+            # 2026-08-19, sync-free planning: plans now stage their index
+            # tensors through pinned memory and copy async, so the HOST runs
+            # ahead — plan(draft it+1) is issued while replay(draft it) is
+            # still executing. Sharing is still safe, for two reasons that
+            # must both keep holding: (1) every plan's DEVICE writes (the
+            # index bufs, FlashInfer's int-workspace memcpy) are enqueued on
+            # the same stream after the replays already queued, so they land
+            # after those replays have read the workspace and before the
+            # replay they belong to; (2) the wrapper's plan fence
+            # (FlashInferMLAWrapper._plan_event) makes plan N+1 on a wrapper
+            # wait until plan N's DMAs executed, so its pinned host sources
+            # are never overwritten in flight. Nothing here may move to a
+            # second stream without revisiting both.
             workspace = self.buffer_manager.get(
                 f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
             )
@@ -2931,7 +2945,12 @@ class PiecewiseCudaGraphRunner:
             if buf is None or not isinstance(val, torch.Tensor):
                 continue
             n = val.shape[0]
-            buf[:n].copy_(val)
+            # non_blocking: D2D copies are async regardless; for a PINNED
+            # host tensor (mstar/utils/pinned_staging.py) this makes the H2D
+            # a real async DMA instead of a stream-draining memcpy, so a
+            # caller can queue several replays without waiting on the GPU
+            # between them (the MTP draft chain).
+            buf[:n].copy_(val, non_blocking=True)
             if n < buf.shape[0]:
                 buf[n:].zero_()
 

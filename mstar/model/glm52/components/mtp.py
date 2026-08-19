@@ -153,3 +153,26 @@ def mtp_greedy_verify(
     mismatch = draft_tokens != target_argmax[:k]
     num_accepted = int(mismatch.nonzero()[0, 0]) if bool(mismatch.any()) else k
     return num_accepted, target_argmax[num_accepted]
+
+
+def mtp_greedy_verify_host(
+    draft_tokens: list[int], target_argmax: list[int]
+) -> int:
+    """The same rule on host lists — no device round trip.
+
+    Returns ``num_accepted``; the emitted tokens are then
+    ``target_argmax[:num_accepted + 1]`` (an accepted draft equals the
+    target's argmax at its position by definition, so no gather is needed).
+    The tensor version above does 2 D2H syncs per call; the decode step
+    calls this after ONE batched ``.tolist()`` of every row's argmax.
+    """
+    k = len(draft_tokens)
+    if len(target_argmax) != k + 1:
+        raise ValueError(
+            f"target_argmax must have k+1={k + 1} entries, got "
+            f"{len(target_argmax)}"
+        )
+    for j in range(k):
+        if draft_tokens[j] != target_argmax[j]:
+            return j
+    return k

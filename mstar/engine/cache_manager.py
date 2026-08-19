@@ -20,6 +20,7 @@ from mstar.utils.flashinfer_utils import (
     FlashInferMLAWrapper,
     FlashInferPrefillWrapper,
 )
+from mstar.utils.pinned_staging import pinned, to_device_async
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +377,7 @@ class BatchedCacheManager(ABC):
     def plan_rope(
         self,
         seq_lens: list[int],
-        pos_ids: torch.Tensor | None = None,
+        pos_ids: torch.Tensor | list[int] | None = None,
         label: str | None = None,
     ):
         """Pre-compute position IDs for RoPE for a cache label.
@@ -403,7 +404,7 @@ class BatchedCacheManager(ABC):
     def _plan_rope_impl(
         self,
         seq_lens: list[int],
-        pos_ids: torch.Tensor | None = None,
+        pos_ids: torch.Tensor | list[int] | None = None,
         label: str | None = None,
     ):
         from mstar.utils.profiler import range_pop, range_push
@@ -414,17 +415,13 @@ class BatchedCacheManager(ABC):
             self._plan_states[effective_label] = _PlanState()
         ps = self._plan_states[effective_label]
 
-        # Fast path: cuda-graph mode with the static pos_ids buffer already
-        # allocated and no caller-supplied pos_ids. Build the position list on
-        # CPU and copy straight into the static buffer — skipping the
-        # intermediate device-side allocation + GPU→GPU copy the eager path
-        # would do.
-        static_copy_from_cpu = (
-            self._cuda_graph_mode and ps.pos_ids is not None and pos_ids is None
-        )
-
-        computed_pos_ids = pos_ids
-        if computed_pos_ids is None:
+        # Positions are staged through PINNED host memory and shipped with a
+        # non_blocking copy in every mode. A pageable ``torch.tensor(list)``
+        # followed by ``copy_``/``.to(device)`` is a stream-draining H2D —
+        # the CPU would wait here for every kernel already queued (the
+        # previous decode step, or the previous draft-chain iteration).
+        # Callers may pass a list, a CPU tensor, or a device tensor.
+        if pos_ids is None:
             # CPU-accumulate the position list (1 int per output token). The
             # old `torch.cat([torch.arange(...) + start for ...])` launched
             # 2 GPU kernels per request.
@@ -435,14 +432,16 @@ class BatchedCacheManager(ABC):
                 for rid, sl in zip(self.request_ids, seq_lens, strict=True):
                     start = self._get_state(rid, effective_label).position_id_start
                     pos_ids_list.extend(range(start, start + sl))
-                computed_pos_ids = torch.tensor(
-                    pos_ids_list,
-                    dtype=torch.long,
-                    device=None if static_copy_from_cpu else self.device,
-                )
+                computed_pos_ids = pinned(pos_ids_list, torch.long)
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+        elif isinstance(pos_ids, torch.Tensor):
+            computed_pos_ids = (
+                pos_ids if pos_ids.device.type != "cpu" else pinned(pos_ids, torch.long)
+            )
+        else:
+            computed_pos_ids = pinned(pos_ids, torch.long)
 
         if self._cuda_graph_mode:
             if ps.pos_ids is not None:
@@ -450,8 +449,8 @@ class BatchedCacheManager(ABC):
                 if self.enable_nvtx:
                     range_push("cache.plan_rope.copy_pos_ids", synchronize=False)
                 try:
-                    # CPU→GPU when static_copy_from_cpu, else GPU→GPU. Both
-                    # are stream-ordered before any subsequent graph replay.
+                    # Pinned-host->GPU or GPU->GPU: both async, both
+                    # stream-ordered before any subsequent graph replay.
                     ps.pos_ids[:n].copy_(computed_pos_ids, non_blocking=True)
                 finally:
                     if self.enable_nvtx:
@@ -460,9 +459,13 @@ class BatchedCacheManager(ABC):
                 # First plan_rope on this label: adopt the just-built tensor
                 # as the static buffer. Must live on the device.
                 if computed_pos_ids.device != self.device:
-                    computed_pos_ids = computed_pos_ids.to(self.device)
+                    computed_pos_ids = computed_pos_ids.to(
+                        self.device, non_blocking=True)
                 ps.pos_ids = computed_pos_ids
         else:
+            if computed_pos_ids.device != self.device:
+                computed_pos_ids = computed_pos_ids.to(
+                    self.device, non_blocking=True)
             ps.pos_ids = computed_pos_ids
 
     @torch.compiler.disable
@@ -871,12 +874,16 @@ class FlashInferCacheManager(BatchedCacheManager):
         if self.enable_nvtx:
             range_push("cache.plan_attention.make_tensors", synchronize=False)
         try:
-            qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
-            paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
-            paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
-            paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+            # Pinned, not merely CPU: FlashInfer copies these into its
+            # graph-mode buffers with non_blocking=True, which is only a real
+            # async DMA from pinned memory — from pageable memory the copy
+            # drains the stream first (mstar/utils/pinned_staging.py).
+            qo_indptr = pinned(qo_indptr_list, torch.int32)
+            paged_kv_indptr = pinned(kv_indptr_list, torch.int32)
+            paged_kv_indices = pinned(all_page_indices, torch.int32)
+            paged_kv_last_page_len = pinned(kv_last_page_lens, torch.int32)
             kv_cache_locations = (
-                torch.tensor(kv_cache_locations_list, dtype=torch.long)
+                pinned(kv_cache_locations_list, torch.long)
                 if len(kv_cache_locations_list) == len(self.request_ids)
                 else None
             )
@@ -1618,10 +1625,20 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
                 kv_indptr_list.append(kv_indptr_list[-1] + len(page_indices))
                 kv_len_list.append(total_len)
 
-            qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=self.device)
-            kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32, device=self.device)
-            kv_indices = torch.tensor(all_page_indices, dtype=torch.int32, device=self.device)
-            kv_len_arr = torch.tensor(kv_len_list, dtype=torch.int32, device=self.device)
+            # Pinned HOST tensors, on purpose. FlashInfer's plan() does
+            # ``.to("cpu")`` on three of these (a stream-draining D2H per
+            # tensor when they live on the device) and copies them into its
+            # graph-mode buffers with ``non_blocking=True`` (a real async DMA
+            # only from pinned memory). Building them on the device with
+            # ``torch.tensor(..., device=cuda)`` was 4 pageable H2D copies —
+            # each one waits for every kernel already queued — followed by
+            # 3 D2H syncs inside FlashInfer: ~8 stream drains per plan, per
+            # decode step, per draft-chain iteration. See
+            # mstar/utils/pinned_staging.py.
+            qo_indptr = pinned(qo_indptr_list, torch.int32)
+            kv_indptr = pinned(kv_indptr_list, torch.int32)
+            kv_indices = pinned(all_page_indices, torch.int32)
+            kv_len_arr = pinned(kv_len_list, torch.int32)
 
             if dtype is None:
                 dtype = self.kv_cache.dtype
@@ -1672,18 +1689,21 @@ class MlaAbsorbCacheManager(FlashInferCacheManager):
                     "q_start": q_start,
                     "seq_len": sl,
                     "total_len": total_len,
-                    "page_indices": torch.tensor(
-                        page_indices, dtype=torch.long, device=self.device
+                    "page_indices": to_device_async(
+                        page_indices, torch.long, self.device
                     ),
                 })
                 q_start += sl
 
+            # Async H2D through pinned staging (same reason as the kernel
+            # path above): the eager fallback is what the reduced-dims GPU
+            # harness runs, so its host/device overlap must mirror the box.
             ps.mla = {
-                "token_to_page": torch.tensor(
-                    token_to_page, dtype=torch.long, device=self.device
+                "token_to_page": to_device_async(
+                    token_to_page, torch.long, self.device
                 ),
-                "token_to_cache": torch.tensor(
-                    token_to_cache, dtype=torch.long, device=self.device
+                "token_to_cache": to_device_async(
+                    token_to_cache, torch.long, self.device
                 ),
                 "requests": requests,
             }
