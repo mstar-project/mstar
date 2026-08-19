@@ -215,6 +215,12 @@ run_arm() {
        want_tag="POST-final-norm (vLLM convention)" ;;
     L) label="new defaults: + captured MTP prefill + prefill drafts"
        want_tag="POST-final-norm (vLLM convention)" ;;
+    # F = L plus the fused shared+routed MoE all-reduce (default-off flag). NOTE:
+    # this one may legitimately move the token count (bf16 sum order) — a
+    # TRIPWIRE on tokens here means "read armF/bench.txt and diff the streams",
+    # not "the code is broken".
+    F) label="L + MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 (one all-reduce per MoE layer)"
+       want_tag="POST-final-norm (vLLM convention)" ;;
     *) say "unknown arm '$arm'"; echo "UNKNOWN-ARM" > "$out/verdict.txt"; return 1 ;;
   esac
 
@@ -266,6 +272,9 @@ run_arm() {
       L) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
                 MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
                 MSTAR_PHASE_TIMING=200 ;;
+      F) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
+                MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
+                MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_PHASE_TIMING=200 ;;
     esac
     env | grep -E '^MSTAR_GLM52' | sort > "$out/env.txt"
     HOLD_MIN=0 bash "$D/m3-sweep2.sh" "$K"
