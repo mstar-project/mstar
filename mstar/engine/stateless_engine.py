@@ -332,7 +332,7 @@ class StatelessEngine(BaseEngine):
         if dtype is not None:
             return _ComposedContext(
                 torch.amp.autocast(
-                    "cuda", enabled=True, dtype=dtype
+                    self.device.type, enabled=True, dtype=dtype
                 ),
                 torch.no_grad(),
             )
