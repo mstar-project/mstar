@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -128,6 +129,66 @@ class Glm52MtpTrunkGraphConfig(PiecewiseCudaGraphConfig):
         ]
 
 
+class _MtpStepTimer:
+    """nsys-lite for one MTP decode step, gated by MSTAR_GLM52_MTP_STEP_TIMING=N.
+
+    On every N-th step, records a CUDA event + host timestamp at each phase
+    boundary (trunk replay, verify, sync replay, each chain replay, tail) and,
+    at the next sampled step, reads them back: the GPU column is the device
+    timeline between consecutive events (includes any idle the GPU spent
+    waiting for the host to enqueue), the host column is the wall the host
+    spent enqueueing that phase. GPU >> host means the phase is GPU-bound;
+    GPU ≈ host means the host is the bottleneck. Costs one event sync per
+    sampled step; zero cost when off.
+    """
+
+    def __init__(self, every: int):
+        self.every = every
+        self.step = 0
+        self._marks: list[tuple[str, torch.cuda.Event, float]] = []
+        self._pending: list[tuple[str, torch.cuda.Event, float]] | None = None
+        self.active = False
+
+    def begin(self) -> None:
+        self.step += 1
+        self.active = self.every > 0 and self.step % self.every == 0
+        if self.active:
+            self._marks = []
+            self.mark("start")
+
+    def mark(self, name: str) -> None:
+        if not self.active:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._marks.append((name, ev, time.perf_counter()))
+
+    def end(self) -> None:
+        if not self.active:
+            return
+        self.mark("end")
+        self._pending, self._marks = self._marks, []
+        self.active = False
+
+    def report(self, log) -> None:
+        """Called at the START of a step (before new work): the previous
+        sample's events are long complete, so reading them is free."""
+        if not self._pending:
+            return
+        marks, self._pending = self._pending, None
+        if not marks[-1][1].query():
+            marks[-1][1].synchronize()
+        parts = []
+        gpu_total = marks[0][1].elapsed_time(marks[-1][1])
+        host_total = (marks[-1][2] - marks[0][2]) * 1e3
+        for (_n0, e0, h0), (n1, e1, h1) in zip(marks, marks[1:], strict=False):
+            parts.append(f"{n1} {e0.elapsed_time(e1):.2f}|{(h1 - h0) * 1e3:.2f}")
+        log.info(
+            "MTP step timing (GPU ms | host ms per phase, step %d): %s ; total %.2f|%.2f",
+            self.step, ", ".join(parts), gpu_total, host_total,
+        )
+
+
 class Glm52LLMSubmodule(ARNodeSubmodule):
     """Embed + 78 decoder layers + lm_head, one fat TP node."""
 
@@ -203,6 +264,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # rate can't separate "first draft mediocre" from "chained drafts
         # collapse" — the conditional per-position profile can.
         self._mtp_stat_acc_hist = [0] * (config.mtp_num_draft_tokens + 1)
+        # nsys-lite (see _MtpStepTimer): MSTAR_GLM52_MTP_STEP_TIMING=200 logs
+        # the per-phase GPU|host split of every 200th decode step.
+        self._mtp_timer = _MtpStepTimer(
+            int(os.environ.get("MSTAR_GLM52_MTP_STEP_TIMING", "0") or "0"))
 
     def set_load_heartbeat_stop(self, stop) -> None:
         """Adopt the load-time GPU liveness tick; stopped on first forward."""
@@ -1028,6 +1093,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             raise ValueError(
                 f"Batched forward not supported for graph walk: {graph_walk!r}")
 
+        timer = self._mtp_timer
+        timer.report(logger)
+        timer.begin()
         trunk_runner = kwargs.get("mtp_trunk_runner")
         if trunk_runner is not None:
             # Replay the captured trunk (embed + layers + lm_head over the
@@ -1069,7 +1137,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # values as ``mtp_greedy_verify`` returned, no gather needed.
         target_argmax_all = logits.argmax(dim=-1)  # (sum(k+1),)
         total_rows = row_starts[-1]
+        timer.mark("trunk")
         host = torch.cat([input_ids, target_argmax_all]).tolist()
+        timer.mark("verify_d2h")
         inputs_h, target_h = host[:total_rows], host[total_rows:]
         pair_rows = self._mtp_pair_rows(hidden, prenorm)
         eos_ids = self.config.eos_token_ids
@@ -1103,6 +1173,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             results[rid] = {"new_token": [emitted]}
         self._maybe_log_mtp_acceptance()
         cache_handle.rewind_seq_lens(rewinds)
+        timer.mark("verify_host")
         sync_runner = kwargs.get("mtp_sync_runner")
         if sync_runner is None and self._mtp_capture_sync:
             self._warn_mtp_sync_eager_once(len(request_ids))
@@ -1114,6 +1185,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             emitted = results[rid]["new_token"][0]
             results[rid]["text_inputs"] = [
                 torch.cat([emitted[-1:], drafts[i]])]
+        timer.mark("tail")
+        timer.end()
         return results
 
     def _mtp_sync_and_draft(
@@ -1217,6 +1290,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 last_l_eager.append(acc - 1)
             last_rows = to_device_async(last_l_eager, torch.long, device)
 
+        self._mtp_timer.mark("sync")
         # Head reads the shared_head-normed rows; the CHAIN threads the raw
         # layer output (hnorm re-norms it next iteration — same convention
         # as the trunk pairing).
@@ -1264,6 +1338,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 cache_handle.advance_seq_lens()
                 prev_d = self.lm_head(it_head).argmax(dim=-1)
             draft_cols.append(prev_d)
+            self._mtp_timer.mark(f"chain{it}")
         if k > 1:
             cache_handle.rewind_seq_lens([k - 1] * num)
         stacked = torch.stack(draft_cols, dim=1)       # (B, k)
