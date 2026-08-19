@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 import time as _time
 from collections import defaultdict
@@ -1143,6 +1144,10 @@ class Worker:
                 node_batch.completion_event = event
             return outputs
         finally:
+            # Safety net: a step that raised before the forward would otherwise
+            # leave the submitter blocked on this for the full wait timeout.
+            if node_batch.launch_started_event is not None:
+                node_batch.launch_started_event.set()
             # Safety net: a step that raised before publishing outputs or
             # committing would otherwise strand the plan thread preparing the
             # next one. The engine does this too on its own paths; here covers
@@ -2339,6 +2344,10 @@ class Worker:
                                 self._reset_skip_plan_flags(spec_node_batch)
                                 speculation.plan_future = None
 
+                            # Hold the main thread off the GIL until the GPU
+                            # thread reaches the forward launch; see exec.
+                            spec_launch_started = threading.Event()
+                            spec_node_batch.launch_started_event = spec_launch_started
                             spec_future = gpu_executor.submit(
                                 self._execute_on_gpu_thread,
                                 spec_batch, spec_node_batch,
@@ -2348,6 +2357,7 @@ class Worker:
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
+                            spec_launch_started.wait(timeout=0.005)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:

@@ -1,7 +1,6 @@
 
 
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -118,6 +117,12 @@ class ExecutingBatch:
     # what a reader of the output values has to wait on.
     completion_event: torch.cuda.Event | None = None
 
+    # Set by exec right before the forward's CUDA launch (where torch drops the
+    # GIL). A worker that submitted this batch to the GPU thread and then wants
+    # to do its own Python work waits on this first, so its GIL grab doesn't
+    # stall the GPU thread's path to graph.replay(). None => nobody is waiting.
+    launch_started_event: threading.Event | None = None
+
     # Per-step wall-clock, for the worker's profiler
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
 
@@ -174,13 +179,6 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
-
-        # MSTAR_STEP_LOG_US=<n>: log any exec step whose host wall time (µs) is
-        # >= n, tagged so jumpy steps self-identify (node, walk, bs, whether a
-        # pre-plan promoted or it planned fresh, captured vs eager). n=0 logs
-        # every step. Host time includes launch-queue stalls, which is the point.
-        step_log = os.environ.get("MSTAR_STEP_LOG_US")
-        self._step_log_us = float(step_log) if step_log is not None else None
 
     def load_model(
         self,
@@ -380,11 +378,6 @@ class Engine:
         nvtx = self._enable_nvtx
         if self._enable_profile and batch.exec_timings.start is None:
             batch.exec_timings.start = time.perf_counter()
-        # captured before the finally clears preplan_event: was a pre-plan consumed?
-        step_log_t0 = (
-            time.perf_counter() if self._step_log_us is not None else None
-        )
-        promoted = batch.preplan_event is not None
         if nvtx:
             range_push(
                 f"engine.{batch.node_name}.{batch.step_context.graph_walk}"
@@ -487,6 +480,9 @@ class Engine:
 
             if self._enable_profile and batch.exec_timings.fwd_start is None:
                 batch.exec_timings.fwd_start = time.perf_counter()
+            # release the waiter now, on the cusp of the GIL-dropping launch
+            if batch.launch_started_event is not None:
+                batch.launch_started_event.set()
             if nvtx:
                 # the launch/enqueue span, not the GPU work: `synchronize=True`
                 # here would drain the stream and destroy the overlap
@@ -530,16 +526,6 @@ class Engine:
                 cg_runner.release(lease, real_bs)
             if nvtx:
                 range_pop()
-            if step_log_t0 is not None:
-                dt_us = (time.perf_counter() - step_log_t0) * 1e6
-                if dt_us >= self._step_log_us:
-                    logger.info(
-                        "step %s walk=%s bs=%d %s %s %.0fus",
-                        batch.node_name, batch.step_context.graph_walk, real_bs,
-                        "promoted" if promoted else "fresh",
-                        "captured" if lease is not None else "eager",
-                        dt_us,
-                    )
 
     def _forward(
         self,
@@ -964,16 +950,10 @@ class Engine:
         to a step that never ran.
         """
         if batch is not None:
-            if batch.preplanned_rids is not None:
-                # a discarded pre-plan means exec plans inline — the cost this
-                # exists to avoid, so make it visible next to the nvtx ranges
-                if self._enable_nvtx:
-                    mark(f"engine.preplan_discarded.{batch.node_name}")
-                logger.warning(
-                    "pre-plan discarded (node=%s, walk=%s): planned %s, running %s",
-                    batch.node_name, batch.step_context.graph_walk,
-                    batch.preplanned_rids, tuple(batch.request_ids),
-                )
+            if batch.preplanned_rids is not None and self._enable_nvtx:
+                # a discarded pre-plan falls back to inline plan; mark it so the
+                # cost is visible next to the nvtx ranges
+                mark(f"engine.preplan_discarded.{batch.node_name}")
             batch.preplan_event = None
             batch.preplanned_rids = None
             lease = batch.step_context.slot_lease
