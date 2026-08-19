@@ -19,6 +19,8 @@ import logging
 
 import torch
 
+from mstar.utils.pinned_staging import pinned
+
 logger = logging.getLogger(__name__)
 
 # Page index the padded tail of every captured KV scatter aims at. The
@@ -193,10 +195,22 @@ class FlashInferPrefillWrapper:
         per-token bookkeeping below.
         """
         self.dtype = dtype
+        host_inputs = qo_indptr.device.type == "cpu"
+        # FlashInfer copies ``paged_kv_indices`` into its static buffer with
+        # non_blocking only when the source is already on the device (it
+        # cannot know a host tensor is pinned, so it forces a BLOCKING copy —
+        # a stream drain, prefill.py:2331 / decode.py:1460). Ship the indices
+        # ourselves, async from pinned memory, and hand FlashInfer the device
+        # tensor; the indptr/last_page_len stay on the host because its plan
+        # wants ``.to("cpu")`` views of those (no-op for host tensors).
+        indices_dev = (
+            paged_kv_indices.to(self.device, non_blocking=True)
+            if host_inputs else paged_kv_indices
+        )
         self.attn_wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
+            paged_kv_indices=indices_dev,
             paged_kv_last_page_len=paged_kv_last_page_len,
             num_qo_heads=self.num_qo_heads,
             num_kv_heads=self.num_kv_heads,
@@ -206,13 +220,19 @@ class FlashInferPrefillWrapper:
             q_data_type=dtype,
         )
 
-        # Async H2D for the GPU-side per-token bookkeeping that follows.
-        if qo_indptr.device.type != "cuda":
-            qo_indptr = qo_indptr.to(self.device, non_blocking=True)
-            paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
-            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
-            paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
+        if host_inputs:
+            # Host-side per-token bookkeeping: the scatter map is a pure
+            # function of host-known ints (mstar/utils/pinned_staging.py for
+            # why the device version cost ~5 stream drains per plan).
+            self._plan_scatter_host(
+                qo_indptr, paged_kv_indptr, paged_kv_indices,
+                paged_kv_last_page_len,
+            )
+            if not self.use_cuda_graph:
+                self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
+            return
 
+        # Legacy device-tensor path (syncs on repeat_interleave / .item()).
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
         # even if we're not in a cuda graph
         if not self.use_cuda_graph:
@@ -267,6 +287,39 @@ class FlashInferPrefillWrapper:
         else:
             self.token_to_page = token_to_page
             self.token_to_cache = token_to_cache
+
+    def _plan_scatter_host(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+    ) -> None:
+        """Per-token (page, offset) map from host lists, shipped async."""
+        qo = qo_indptr.tolist()
+        kvp = paged_kv_indptr.tolist()
+        lpl = paged_kv_last_page_len.tolist()
+        # kv length AFTER append, per request: full pages + the last page.
+        kv_len = [
+            (kvp[i + 1] - kvp[i] - 1) * self.page_size + lpl[i]
+            if kvp[i + 1] > kvp[i] else 0
+            for i in range(len(kvp) - 1)
+        ]
+        t2p, t2c = paged_scatter_map_host(
+            qo, kvp, paged_kv_indices.tolist(), kv_len, self.page_size)
+        total_tokens = len(t2p)
+        self._total_tokens = total_tokens
+        h2p = pinned(t2p, torch.long)
+        h2c = pinned(t2c, torch.long)
+        if self.use_cuda_graph:
+            self.token_to_page[:total_tokens].copy_(h2p, non_blocking=True)
+            self.token_to_cache[:total_tokens].copy_(h2c, non_blocking=True)
+            if total_tokens < self.max_total_tokens:
+                self.token_to_page[total_tokens:] = NULL_PAGE_IDX
+                self.token_to_cache[total_tokens:] = 0
+        else:
+            self.token_to_page = h2p.to(self.device, non_blocking=True)
+            self.token_to_cache = h2c.to(self.device, non_blocking=True)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -399,6 +452,12 @@ class FlashInferDecodeWrapper:
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
         n_req = paged_kv_indptr.shape[0] - 1
+        # Indices go to the device ourselves (async from pinned): FlashInfer
+        # forces a BLOCKING copy for a host ``indices`` tensor (decode.py:1460)
+        # — see the prefill wrapper. indptr/last_page_len stay on the host
+        # for its ``.to("cpu")`` views.
+        if paged_kv_indices.device.type != "cuda":
+            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
 
         if self.enable_nvtx:
             from mstar.utils.profiler import range_pop, range_push
@@ -425,7 +484,7 @@ class FlashInferDecodeWrapper:
                 range_push("flashinfer.decode.metadata_h2d", synchronize=False)
             try:
                 paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
-                paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
+                # (paged_kv_indices already moved to the device above)
                 paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
             finally:
                 if self.enable_nvtx:
@@ -500,14 +559,14 @@ class FlashInferDecodeWrapper:
         kv_cache_layer[pages, 1, positions] = v[:n].to(self.dtype)
 
 
-def mla_scatter_map_host(
+def paged_scatter_map_host(
     qo_indptr: list[int],
     kv_indptr: list[int],
     kv_indices: list[int],
     kv_len_arr: list[int],
     page_size: int,
 ) -> tuple[list[int], list[int]]:
-    """Latent-cache scatter map for the new tokens of a planned batch, on host.
+    """Paged-cache scatter map for the new tokens of a planned batch, on host.
 
     Token ``j`` (0-based) of request ``i`` — whose ``kv_len_arr[i]`` counts
     the new tokens too — lands at global slot ``g = kv_len[i] - len[i] + j``,
@@ -530,6 +589,9 @@ def mla_scatter_map_host(
             t2p.append(kv_indices[ptr + g // page_size])
             t2c.append(g % page_size)
     return t2p, t2c
+
+
+mla_scatter_map_host = paged_scatter_map_host  # historical name
 
 
 class FlashInferMLAWrapper:
@@ -697,7 +759,7 @@ class FlashInferMLAWrapper:
         """Scatter map from host lists: token t of request i (intra offset j)
         lands at global slot g = kv_len[i] - len[i] + j -> page
         kv_indices[kv_indptr[i] + g // page_size], offset g % page_size."""
-        t2p, t2c = mla_scatter_map_host(
+        t2p, t2c = paged_scatter_map_host(
             qo_indptr.tolist(), kv_indptr.tolist(), kv_indices.tolist(),
             kv_len_arr.tolist(), self.page_size,
         )
