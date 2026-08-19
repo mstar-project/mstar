@@ -221,6 +221,12 @@ run_arm() {
     # not "the code is broken".
     F) label="L + MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 (one all-reduce per MoE layer)"
        want_tag="POST-final-norm (vLLM convention)" ;;
+    # G = F + small-message all-reduce over torch symmetric memory (NVLS
+    # multimem): microbench 08-19 measured 7.4 us vs NCCL's 26.4 us per 10 KB
+    # all-reduce inside a CUDA graph, 0 NaNs, 1 bf16 ulp vs NCCL. Same token
+    # caveat as F.
+    G) label="F + MSTAR_TP_ALLREDUCE=symm_multimem (NVLS all-reduce for <=512 KB messages)"
+       want_tag="POST-final-norm (vLLM convention)" ;;
     *) say "unknown arm '$arm'"; echo "UNKNOWN-ARM" > "$out/verdict.txt"; return 1 ;;
   esac
 
@@ -274,9 +280,14 @@ run_arm() {
                 MSTAR_PHASE_TIMING=200 MSTAR_GLM52_MTP_STEP_TIMING=200 ;;
       F) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
                 MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
-                MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_PHASE_TIMING=200 ;;
+                MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_PHASE_TIMING=200 \
+                MSTAR_GLM52_MTP_STEP_TIMING=200 ;;
+      G) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
+                MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
+                MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_TP_ALLREDUCE=symm_multimem \
+                MSTAR_PHASE_TIMING=200 MSTAR_GLM52_MTP_STEP_TIMING=200 ;;
     esac
-    env | grep -E '^MSTAR_GLM52' | sort > "$out/env.txt"
+    env | grep -E '^(MSTAR_GLM52|MSTAR_TP_|MSTAR_PHASE)' | sort > "$out/env.txt"
     HOLD_MIN=0 bash "$D/m3-sweep2.sh" "$K"
   )
   kill "$sampler" 2>/dev/null
