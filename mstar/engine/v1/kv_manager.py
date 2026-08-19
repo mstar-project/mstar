@@ -377,12 +377,13 @@ class KVManager(Resource):
         return state
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
-        self._streams[rid] = {
-            "main": CacheStream()
-        }
         if overrides is None:
             overrides = KVReqConfig()
-        self._overrides[rid] = overrides
+        # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
+        # or reset/remove on another thread (see `_lock`)
+        with self._lock:
+            self._streams[rid] = {"main": CacheStream()}
+            self._overrides[rid] = overrides
 
     def admit_retrieve(
         self, rid: str,
@@ -398,38 +399,39 @@ class KVManager(Resource):
                 "KV cache transfer across TP world size is currently disallowed"
             )
         needed_labels = self._overrides[rid].get_labels(node_name, graph_walk)
-        for label, seq_info in published.get(self._rank).items():
-            if label not in needed_labels:
-                continue
-            if not self._check_ready(rid, label):
-                # read already in progress: admitted, just not ready yet
-                return AdmitOutcome(ok=True, ready=False)
+        # one critical section: reading stored_len, comparing to published, and
+        # firing the retrieve must be atomic against a concurrent commit/reset
+        # (both non-blocking inside, so holding the lock is safe)
+        with self._lock:
+            for label, seq_info in published.get(self._rank).items():
+                if label not in needed_labels:
+                    continue
+                if not self._check_ready(rid, label):
+                    # read already in progress: admitted, just not ready yet
+                    return AdmitOutcome(ok=True, ready=False)
 
-            stream = self._ensure_label(rid, label)
-            new_len = seq_info.seq_len
-            old_len = stream.stored_len
-            if new_len <= old_len:
-                continue
+                stream = self._ensure_label(rid, label)
+                new_len = seq_info.seq_len
+                old_len = stream.stored_len
+                if new_len <= old_len:
+                    continue
 
-            # _alloc takes a total length, not a delta
-            alloc_res = self._alloc(rid, label, new_len)
-            if not alloc_res.success:
-                return AdmitOutcome(
-                    ok=False,
-                    reason=alloc_res.error
+                # _alloc takes a total length, not a delta
+                alloc_res = self._alloc(rid, label, new_len)
+                if not alloc_res.success:
+                    return AdmitOutcome(ok=False, reason=alloc_res.error)
+
+                fut = self._transfer.start_async_retrieve(
+                    start_len=old_len, end_len=new_len,
+                    local_page_indices=stream.page_indices,
+                    remote_page_indices=seq_info.page_indices,
+                    kv_transfer_info=seq_info.latest_kv_transfer_info
                 )
+                stream.read_future = fut
+                stream.read_pending = fut is not None
+                stream.stored_len = new_len
 
-            fut = self._transfer.start_async_retrieve(
-                start_len=old_len, end_len=new_len,
-                local_page_indices=stream.page_indices,
-                remote_page_indices=seq_info.page_indices,
-                kv_transfer_info=seq_info.latest_kv_transfer_info
-            )
-            stream.read_future = fut
-            stream.read_pending = fut is not None
-            stream.stored_len = new_len
-
-        ready = all(self._check_ready(rid, label) for label in needed_labels)
+            ready = all(self._check_ready(rid, label) for label in needed_labels)
         return AdmitOutcome(
             ok=True, ready=ready
         )
@@ -447,32 +449,29 @@ class KVManager(Resource):
         forks = [(pre, 0) for pre in step.pre_forks] + [
             (post, growth) for post in step.post_forks
         ]
-        for (from_label, to_label), extra in forks:
-            for rid in ctx.request_ids:
-                alloc_res = self._reserve_fork(
-                    rid, from_label, to_label,
-                    extra=0 if not extra else extra.get((rid, from_label), 0),
+        # one critical section so the read-of-stored_len then alloc is atomic
+        # against a concurrent reset/remove/commit on another thread
+        with self._lock:
+            for (from_label, to_label), extra in forks:
+                for rid in ctx.request_ids:
+                    alloc_res = self._reserve_fork(
+                        rid, from_label, to_label,
+                        extra=0 if not extra else extra.get((rid, from_label), 0),
+                    )
+                    if not alloc_res.success:
+                        return AdmitOutcome(ok=False, reason=alloc_res.error)
+
+            for segment in step.segments:
+                if segment.span == 0:
+                    continue
+                stream = self._ensure_label(segment.request_id, segment.label)
+                alloc_res = self._alloc(
+                    segment.request_id,
+                    segment.label,
+                    segment.span + stream.stored_len
                 )
                 if not alloc_res.success:
-                    return AdmitOutcome(
-                        ok=False,
-                        reason=alloc_res.error
-                    )
-
-        for segment in step.segments:
-            if segment.span == 0:
-                continue
-            stream = self._ensure_label(segment.request_id, segment.label)
-            alloc_res = self._alloc(
-                segment.request_id,
-                segment.label,
-                segment.span + stream.stored_len
-            )
-            if not alloc_res.success:
-                return AdmitOutcome(
-                    ok=False,
-                    reason=alloc_res.error
-                )
+                    return AdmitOutcome(ok=False, reason=alloc_res.error)
         # TODO: apply retention policy
 
         return AdmitOutcome(ok=True)
@@ -636,15 +635,17 @@ class KVManager(Resource):
         self._cached_plan_output = None
 
     def commit(self, step: KVStep, ctx: StepContext):
-        for segment in step.segments:
-            if step.commit and segment.span > 0:
-                stream = self._streams[segment.request_id][segment.label]
-                stream.stored_len += segment.span
-        # post-forks copy what this step just wrote, so they land after the
-        # spans above are counted
-        for (from_label, to_label) in step.post_forks:
-            for rid in ctx.request_ids:
-                self._apply_fork(rid, from_label, to_label)
+        # atomic against admit_retrieve reading stored_len on another thread
+        with self._lock:
+            for segment in step.segments:
+                if step.commit and segment.span > 0:
+                    stream = self._streams[segment.request_id][segment.label]
+                    stream.stored_len += segment.span
+            # post-forks copy what this step just wrote, so they land after the
+            # spans above are counted
+            for (from_label, to_label) in step.post_forks:
+                for rid in ctx.request_ids:
+                    self._apply_fork(rid, from_label, to_label)
         # TODO: handle retention policy, free pages if not commit
 
     # Eviction
@@ -665,28 +666,33 @@ class KVManager(Resource):
         if self._cpu_pool is None or rid not in self._streams:
             return 0
         freed = 0
-        with self._lock:
-            for label, stream in self._streams[rid].items():
-                if stream.offloaded or not stream.page_indices:
+        for label in list(self._streams.get(rid, {})):
+            with self._lock:
+                stream = self._streams[rid].get(label)
+                if stream is None or stream.offloaded or not stream.page_indices:
                     continue
-                if stream.read_future is not None:
-                    # its pages are still being written into
-                    wait([stream.read_future])
-                moved = self._cpu_pool.offload_stream(
-                    rid=rid, label=label,
-                    gpu_kv_cache=self.kv_cache.tensor,
-                    gpu_page_indices=stream.page_indices,
-                    stored_len=stream.stored_len,
-                    position=stream.position,
-                    released=stream.released,
-                )
-                if not moved:
+                read_future = stream.read_future
+                pages = list(stream.page_indices)
+                geom = (stream.stored_len, stream.position, stream.released)
+            # blocking work OUTSIDE the lock: drain the in-flight read, copy the
+            # pages to host, sync so the release can't precede the copy
+            if read_future is not None:
+                wait([read_future])
+            moved = self._cpu_pool.offload_stream(
+                rid=rid, label=label,
+                gpu_kv_cache=self.kv_cache.tensor,
+                gpu_page_indices=pages,
+                stored_len=geom[0], position=geom[1], released=geom[2],
+            )
+            if not moved:
+                continue
+            self._cpu_pool.sync()
+            with self._lock:
+                stream = self._streams[rid].get(label)
+                if stream is None:
                     continue
-                # the copy runs on the pool's stream; order the release behind
-                # it so a later allocation can't write these pages first
-                self._cpu_pool.sync()
-                freed += len(stream.page_indices)
-                self._arena.release(stream.page_indices)
+                freed += len(pages)
+                self._arena.release(pages)
                 stream.page_indices = []
                 stream.offloaded = True
                 stream.reset()
@@ -723,8 +729,10 @@ class KVManager(Resource):
                 stream.position = state.position
                 stream.released = state.released
                 stream.offloaded = False
-            # attention reads these pages on the compute stream
-            self._cpu_pool.sync()
+        # sync outside the lock: orders the reload H2D copies before attention
+        # reads them, but the pages are already assigned so it touches no
+        # shared state
+        self._cpu_pool.sync()
         return True
 
     def get_offload_priority(self, rid: str) -> float:
@@ -748,29 +756,35 @@ class KVManager(Resource):
         )
 
     def reset_request(self, rid: str, free: bool=False):
-        if rid in self._streams:
-            for stream in self._streams[rid].values():
-                if stream.read_future is not None:
-                    # the read's result is irrelevant here, but its pages
-                    # must not be reused until it finishes writing
-                    wait([stream.read_future])
+        streams = self._streams.get(rid)
+        if streams is None:
+            return
+        # drain in-flight reads OUTSIDE the lock (their pages must not be reused
+        # until they finish writing); the transfer thread doesn't touch _streams
+        for stream in streams.values():
+            if stream.read_future is not None:
+                wait([stream.read_future])
+        with self._lock:
+            for stream in self._streams.get(rid, {}).values():
                 if free:
                     self._arena.release(stream.page_indices)
                 stream.reset(freed=free)
 
     def remove_request(self, rid: str):
-        if rid in self._streams:
-            for stream in self._streams[rid].values():
+        streams = self._streams.get(rid)
+        if streams is not None:
+            # drain in-flight reads outside the lock; see reset_request
+            for stream in streams.values():
                 if stream.read_future is not None:
-                    # the read's result is irrelevant here, but its pages
-                    # must not be reused until it finishes writing
                     wait([stream.read_future])
-                self._arena.release(stream.page_indices)
-        if self._cpu_pool is not None:
-            self._cpu_pool.remove_request(rid)
-
-        self._streams.pop(rid, None)
-        self._overrides.pop(rid, None)
+        with self._lock:
+            if rid in self._streams:
+                for stream in self._streams[rid].values():
+                    self._arena.release(stream.page_indices)
+            if self._cpu_pool is not None:
+                self._cpu_pool.remove_request(rid)
+            self._streams.pop(rid, None)
+            self._overrides.pop(rid, None)
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
@@ -846,20 +860,24 @@ class KVManager(Resource):
         )
 
     def _apply_fork(self, rid: str, from_label: str, to_label: str) -> None:
-        """Copy a stream onto its fork target, over pages `_reserve_fork` took."""
-        if from_label not in self._streams[rid]:
-            return
-        from_stream = self._streams[rid][from_label]
-        to_stream = self._ensure_label(rid, to_label)
-        # TODO: only copy necessary pages
-        # the source can hold more pages than the fork needs (pages
-        # reserved for an uncommitted span), so copy only the prefix
-        self._arena.copy_pages(
-            from_stream.page_indices[:len(to_stream.page_indices)],
-            to_stream.page_indices
-        )
-        to_stream.stored_len = from_stream.stored_len
-        to_stream.generation += 1
+        """Copy a stream onto its fork target, over pages `_reserve_fork` took.
+
+        Locked (reentrant): called from plan (pre-forks, else unguarded) and
+        from the already-locked commit (post-forks)."""
+        with self._lock:
+            if from_label not in self._streams[rid]:
+                return
+            from_stream = self._streams[rid][from_label]
+            to_stream = self._ensure_label(rid, to_label)
+            # TODO: only copy necessary pages
+            # the source can hold more pages than the fork needs (pages
+            # reserved for an uncommitted span), so copy only the prefix
+            self._arena.copy_pages(
+                from_stream.page_indices[:len(to_stream.page_indices)],
+                to_stream.page_indices
+            )
+            to_stream.stored_len = from_stream.stored_len
+            to_stream.generation += 1
 
     def _alloc(
         self, request_id: str, label: str, seq_len: int

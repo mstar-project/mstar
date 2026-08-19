@@ -66,9 +66,13 @@ class SamplerResource(Resource):
         self._comm_group = comm_group
         self._cg_buffers: SamplerBuffers | None = None
         self._cg_max_bs = 0
+        self._cg_slots = 1
 
         # This is set during plan in the cuda graph case
         self._cg_sampler: CudaGraphableSampler | None = None
+        # pre-planned a step ahead, promoted by the next non-preplan plan
+        self._preplan_cg_sampler: CudaGraphableSampler | None = None
+        self._preplanned = False
 
     @classmethod
     def build(
@@ -87,16 +91,23 @@ class SamplerResource(Resource):
     def build_cuda_graph_buffers(
         self, slots, max_bs: int, max_seq_len: int
     ):
-        del slots, max_seq_len
+        del max_seq_len
+        cg_slots = max((s.slot for s in slots), default=0) + 1
         # every runner capturing against this node calls in; reallocating would
         # drop the rows already registered, so only grow
-        if self._cg_buffers is not None and max_bs <= self._cg_max_bs:
+        if (
+            self._cg_buffers is not None
+            and max_bs <= self._cg_max_bs
+            and cg_slots <= self._cg_slots
+        ):
             return
         self._cg_max_bs = max_bs
+        self._cg_slots = max(cg_slots, self._cg_slots)
         self._cg_buffers = SamplerBuffers.allocate(
             max_batch_size=max_bs, device=self._device,
             tp_group=self._comm_group,
-            vocab_size=self._vocab_size
+            vocab_size=self._vocab_size,
+            cg_slots=self._cg_slots,
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -121,31 +132,72 @@ class SamplerResource(Resource):
         del ctx, step
         return AdmitOutcome(ok=True)
 
+    @property
+    def supports_preplan(self):
+        return True
+
+    def clear_preplan(self):
+        self._preplanned = False
+        self._preplan_cg_sampler = None
+
     def plan(self, step: SamplerStep, ctx: StepContext):
         for rid, tokens in step.prefill_tracked_tokens.items():
             self._sampler.get_token_mask(rid).add_tokens(tokens)
         self._apply_penalty_this_step = step.apply_penalty
 
-        # invalidated here, not in commit: commit now runs before output collection
-        self._cg_sampler = None
+        # A step planned ahead promotes here. Its static config was gathered in
+        # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
+        # double-buffered — it must reflect the previous step's commit, so
+        # gather it inline now, on the default stream, after that commit.
+        if self._preplanned and not ctx.is_preplan:
+            self._gather_dynamic(ctx)
+            self._cg_sampler = self._preplan_cg_sampler
+            self._preplan_cg_sampler = None
+            self._preplanned = False
+            return
+
+        # invalidated on the inline path here (not in commit, which now runs
+        # before output collection); a preplan must leave the in-flight one be
+        if not ctx.is_preplan:
+            self._cg_sampler = None
         if self._cg_buffers is None or ctx.slot_lease is None:
             return
+
+        cg_slot = ctx.slot_lease.slot
+        padded_bs = ctx.slot_lease.bucket.bs
+        # static config only: safe to pre-plan (unchanged step to step). A
+        # preplan leases a different slot, so this is disjoint from the in-flight
+        # forward's buffers.
+        self._cg_buffers.gather_static(ctx.request_ids, padded_bs, cg_slot)
+        sampler = self._cg_buffers.sampler_for(padded_bs, cg_slot)
+        if ctx.is_preplan:
+            self._preplan_cg_sampler = sampler
+            self._preplanned = True
+        else:
+            # fresh inline (capture / no preplan): gather the per-step state too
+            self._gather_dynamic(ctx)
+            self._cg_sampler = sampler
+
+    def _gather_dynamic(self, ctx: StepContext):
+        """Gather the per-step RNG offset + seen-token mask into this step's
+        slot, inline so they reflect the previous step's committed tokens."""
+        cg_slot = ctx.slot_lease.slot
+        padded_bs = ctx.slot_lease.bucket.bs
         if self._apply_penalty_this_step:
             self._cg_buffers.stage_seen_token_masks(
                 request_ids=ctx.request_ids,
                 seen_masks=[self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
             )
-        self._cg_sampler = self._cg_buffers.gather_for_request_ids(
-            request_ids=ctx.request_ids,
-            padded_bs=ctx.slot_lease.bucket.bs,
-            gather_seen_tokens=self._track_seen_tokens
+        self._cg_buffers.gather_dynamic(
+            ctx.request_ids, padded_bs, cg_slot,
+            gather_seen_tokens=self._track_seen_tokens,
         )
 
     def commit(self, step: SamplerStep, ctx: StepContext):
         # None on an eager step, which never gathered one
         if self._cg_buffers is None or self._cg_sampler is None:
             return
-        self._cg_buffers.scatter_offset()
+        self._cg_buffers.scatter_offset(ctx.slot_lease.slot)
         self._cg_sampler.sync_seen_token_masks(
             [self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
         )

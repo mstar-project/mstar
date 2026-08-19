@@ -56,6 +56,10 @@ class StepRunner:
             res for res in self._order if self._resources[res].supports_preplan
         ]
         self._check_preplan_deps()
+        # keyset -> ordered keys; a step's resource set is fixed for a node, so
+        # admit/plan/commit reuse this rather than re-filtering _order each call
+        self._keys_cache: dict[frozenset[str], list[str]] = {}
+        self._preplan_keys_cache: dict[frozenset[str], list[str]] = {}
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -83,16 +87,26 @@ class StepRunner:
         return self._resources
 
     def _keys_for(self, step: SubmoduleStep) -> list[str]:
-        unknown = set(step.keys()) - set(self._resources)
-        if unknown:
-            raise KeyError(
-                f"step declares resource key(s) {sorted(unknown)} that this "
-                f"node does not have; available: {sorted(self._resources)}"
-            )
-        return [key for key in self._order if key in step]
+        keyset = frozenset(step.keys())
+        cached = self._keys_cache.get(keyset)
+        if cached is None:
+            unknown = keyset - self._resources.keys()
+            if unknown:
+                raise KeyError(
+                    f"step declares resource key(s) {sorted(unknown)} that this "
+                    f"node does not have; available: {sorted(self._resources)}"
+                )
+            cached = self._keys_cache[keyset] = [k for k in self._order if k in keyset]
+        return cached
 
     def _preplan_keys_for(self, step: SubmoduleStep) -> list[str]:
-        return [key for key in self._preplan_order if key in step]
+        keyset = frozenset(step.keys())
+        cached = self._preplan_keys_cache.get(keyset)
+        if cached is None:
+            cached = self._preplan_keys_cache[keyset] = [
+                k for k in self._preplan_order if k in keyset
+            ]
+        return cached
 
 
 
