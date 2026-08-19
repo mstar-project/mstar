@@ -24,6 +24,7 @@ from mstar.engine.resources.step import (
 from mstar.engine.v1.cuda_graph_runner import (
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
+    autocast_scope,
 )
 from mstar.engine.v1.kv_transfer import TransferEngineInfo
 from mstar.engine.v1.sampler import SamplerResource
@@ -267,6 +268,10 @@ class Engine:
                     node_name, exc_info=True
                 )
 
+    def _autocast_dtype_for(self, submodule: NodeSubmodule) -> torch.dtype | None:
+        """This node's autocast dtype, or None for one that opted out."""
+        return None if submodule.disable_autocast else self._autocast_dtype
+
     def warmup(self) -> None:
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
@@ -276,7 +281,7 @@ class Engine:
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
-                autocast_dtype=self._autocast_dtype,
+                autocast_dtype=self._autocast_dtype_for(submodule),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 enable_nvtx=self._enable_nvtx
             )
@@ -303,9 +308,11 @@ class Engine:
         A region whose capture fails is left out, so its forward takes the
         eager path for that label.
         """
+        node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
         configs = submodule_mgmt.submodule.get_piecewise_cuda_graph_configs(
             self._device,
-            self._autocast_dtype,
+            # the dtype the region runs in; an opted-out node keeps its params'
+            node_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
         )
         runners: dict[str, PiecewiseCudaGraphRunner] = {}
@@ -316,7 +323,7 @@ class Engine:
                 resources=submodule_mgmt.resources,
                 step_runner=self._runner,
                 device=self._device,
-                autocast_dtype=self._autocast_dtype,
+                autocast_dtype=node_dtype,
                 joint_comm_group=submodule_mgmt.joint_comm_group,
             )
             runner.warmup_and_capture()
@@ -387,9 +394,9 @@ class Engine:
                 f".bs{len(batch.request_ids)}"
             )
         try:
-            # inference-only, matching the captured path's bf16 autocast
-            with torch.no_grad(), torch.amp.autocast(
-                "cuda", enabled=True, dtype=self._autocast_dtype
+            # inference-only, under the same scope the capture path used
+            with torch.no_grad(), autocast_scope(
+                self._autocast_dtype_for(self._submodules[batch.node_name].submodule)
             ):
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each

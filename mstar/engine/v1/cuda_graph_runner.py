@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
 
+def autocast_scope(dtype: torch.dtype | None):
+    """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
+    submodule in its own dtype and shuts out any ambient autocast."""
+    return torch.amp.autocast(
+        "cuda", enabled=dtype is not None, dtype=dtype or torch.bfloat16
+    )
+
+
 def dummy_metadata(
     rids: list[str], graph_walk: str,
 ) -> dict[str, CurrentForwardPassInfo]:
@@ -126,7 +134,7 @@ class CudaGraphRunner:
         resources: Mapping[str, Resource],
         step_runner: StepRunner,
         device: torch.device,
-        autocast_dtype: torch.dtype,
+        autocast_dtype: torch.dtype | None,
         joint_comm_group: JointGroups,
         enable_nvtx: bool=False,
     ):
@@ -367,7 +375,7 @@ class CudaGraphRunner:
             torch.cuda.set_device(self._device)
             torch.cuda.synchronize()
             for _ in range(self.NUM_WARMUP):
-                with torch.amp.autocast("cuda", enabled=True, dtype=self._autocast_dtype):
+                with autocast_scope(self._autocast_dtype):
                     run_forward()
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the same shapes the first prepare did
@@ -376,7 +384,7 @@ class CudaGraphRunner:
             torch.cuda.synchronize()
 
             graph = torch.cuda.CUDAGraph()
-            with torch.amp.autocast("cuda", enabled=True, dtype=self._autocast_dtype):
+            with autocast_scope(self._autocast_dtype):
                 with torch.cuda.graph(graph, pool=self._memory_pool):
                     output = run_forward()
             torch.cuda.synchronize()
@@ -782,7 +790,7 @@ class PiecewiseCudaGraphRunner:
         resources: Mapping[str, Resource],
         step_runner: StepRunner,
         device: torch.device,
-        autocast_dtype: torch.dtype,
+        autocast_dtype: torch.dtype | None,
         joint_comm_group: JointGroups | None = None,
     ):
         self._label = label
@@ -886,7 +894,7 @@ class PiecewiseCudaGraphRunner:
             self._plan(step, shape)
             torch.cuda.synchronize()
             for _ in range(self.NUM_WARMUP):
-                with torch.amp.autocast("cuda", enabled=True, dtype=self._autocast_dtype):
+                with autocast_scope(self._autocast_dtype):
                     run_fn()
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
@@ -895,7 +903,7 @@ class PiecewiseCudaGraphRunner:
             torch.cuda.synchronize()
 
             graph = torch.cuda.CUDAGraph()
-            with torch.amp.autocast("cuda", enabled=True, dtype=self._autocast_dtype):
+            with autocast_scope(self._autocast_dtype):
                 with torch.cuda.graph(graph, pool=self._memory_pool):
                     static_outputs = self._normalize_output(run_fn())
             torch.cuda.synchronize()

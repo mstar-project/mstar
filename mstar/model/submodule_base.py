@@ -250,6 +250,12 @@ class NodeSubmodule(torch.nn.Module):
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
 
+    # Set True on a submodule that must run in its own parameter dtype — e.g. a
+    # numerically sensitive fp32 vocoder. The engine then neither casts its
+    # params to the autocast dtype nor wraps its forward (or capture) in
+    # autocast, and explicitly disables any ambient one.
+    disable_autocast: bool = False
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs

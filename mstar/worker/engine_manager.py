@@ -79,6 +79,10 @@ class EngineManager:
             )
             if submodule is None:
                 continue
+            if submodule.disable_autocast:
+                # keeps the dtype it was built in; the engine won't autocast it
+                submodules[name] = submodule.to(device=device)
+                continue
             # A submodule that must run in its own dtype (an audio codec in
             # fp32, say) says so; otherwise it takes the engine's.
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype

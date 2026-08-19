@@ -1611,6 +1611,11 @@ class Code2WavSubmodule(NodeSubmodule):
     vocoder, trims overlap context, and returns the PCM audio chunk.
     """
 
+    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
+    # stateless engine, stated directly now that the v1 engine reads these.
+    disable_torch_compile = True
+    disable_autocast = True
+
     def __init__(self, code2wav_model: Qwen3OmniMoeCode2Wav, config: Qwen3OmniModelConfig):
         super().__init__()
         self.code2wav = code2wav_model
