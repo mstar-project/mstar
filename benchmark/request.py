@@ -1774,14 +1774,47 @@ def _record_vllm_completions_chunk(chunk: dict, metrics: "RequestMetrics") -> No
 class VllmCompletions(InferenceSystem):
     """Benchmark adapter for a plain vLLM OpenAI server's ``/v1/completions``.
 
-    Exists for engine-vs-engine T2T parity runs (the M4/M5 protocol):
-    :class:`OurSystem` drives mstar's native ``/generate`` with raw completion
-    text, so the vLLM side must be raw completions too. Pointing the same
-    prompts at ``/v1/chat/completions`` (:class:`VLLMOmni`) would wrap them in
-    the model's chat template server-side — for GLM-5.2 that adds role
-    headers and a thinking-mode preamble, a different workload than the one
-    M* is serving. Text-only by design.
+    Exists for engine-vs-engine T2T parity runs (the M4/M5 protocol). Text-only
+    by design.
+
+    ⚠ Prompt-rendering parity [2026-08-19]. An earlier version of this docstring
+    claimed M* serves *raw* completion text, so raw completions here would match.
+    That is false for GLM-5.2: ``Glm52Model.process_prompt`` applies the HF chat
+    template server-side (``apply_chat_template([{"role": "user", ...}],
+    add_generation_prompt=True)``), so M* saw 1381 prompt tokens where vLLM saw
+    1141 in every A/B to date, and vLLM hit EOS early on some prompts (3072 vs
+    3264 output tokens). MTP-off tok/s is content-independent (<1%); MTP
+    *acceptance* is not. Set ``MSTAR_BENCH_VLLM_CHAT_TEMPLATE=<hf model path>``
+    to render the same template client-side (tokenizer loaded once) before
+    posting, which makes the two engines' workloads identical.
     """
+
+    _template_tokenizer = None
+    _template_path_loaded: str | None = None
+
+    @classmethod
+    def _render_prompt(cls, prompt: str) -> str:
+        path = os.environ.get("MSTAR_BENCH_VLLM_CHAT_TEMPLATE", "").strip()
+        if not path:
+            return prompt
+        if cls._template_path_loaded != path:
+            from transformers import AutoTokenizer
+
+            cls._template_tokenizer = AutoTokenizer.from_pretrained(
+                path, trust_remote_code=True)
+            cls._template_path_loaded = path
+        tok = cls._template_tokenizer
+        if not getattr(tok, "chat_template", None):
+            return prompt
+        # Same call as mstar/model/glm52/glm52_model.py:process_prompt, but
+        # returning text: the OpenAI completions endpoint tokenizes it, and
+        # special tokens in the rendered string ([gMASK]<sop><|user|>...) are
+        # recognised by the tokenizer as specials.
+        return tok.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
 
     async def send_request(
         self,
@@ -1813,7 +1846,7 @@ class VllmCompletions(InferenceSystem):
             payload = {k: v for k, v in merged.items() if k in _VLLM_COMPLETIONS_KEYS}
             payload.update(
                 model=model.get_hf_url(),
-                prompt=req_input.prompt,
+                prompt=self._render_prompt(req_input.prompt),
                 stream=True,
                 stream_options={"include_usage": True},
             )
