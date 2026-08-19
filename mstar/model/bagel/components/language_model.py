@@ -16,10 +16,17 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 
+from mstar.distributed.communication import CommGroup
 from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.bagel.config import BagelModelConfig
-from mstar.model.components import FusedColumnLinear, FusedGatedMLP
-from mstar.utils.flashinfer_utils import run_rms_norm
+from mstar.model.components.distributed import (
+    ColumnParallelLinear,
+    ParallelGatedMLP,
+    QKVParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
+from mstar.model.components.norm import run_rms_norm
 
 
 class BagelRMSNorm(nn.Module):
@@ -45,11 +52,14 @@ class BagelRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class BagelMLP(FusedGatedMLP):
-    def __init__(self, config: BagelModelConfig):
+class BagelMLP(ParallelGatedMLP):
+    def __init__(
+        self, config: BagelModelConfig, comm_group: CommGroup | None = None,
+    ):
         super().__init__(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            comm_group=comm_group,
             activation=ACT2FN[config.hidden_act],
             bias=False,
         )
@@ -70,10 +80,11 @@ def split_function_mot(
 
         text_out = text_function(text_part)
         image_out = image_fuction(image_part)
+        assert text_out.dtype == image_out.dtype
 
         out = torch.empty(
             (text_out.shape[0] + image_out.shape[0], *text_out.shape[1:]),
-            device=query_sequence.device, dtype=query_sequence.dtype
+            device=query_sequence.device, dtype=text_out.dtype
         )
         out[text_idxs]  = text_out
         out[img_idxs] = image_out
@@ -86,21 +97,25 @@ def split_function_mot(
 
 
 class BagelAttentionMoT(nn.Module):
-    def __init__(self, config: BagelModelConfig, layer_idx: Optional[int] = None):
+    def __init__(
+        self,
+        config: BagelModelConfig,
+        layer_idx: Optional[int] = None,
+        comm_group: CommGroup | None = None,
+    ):
         super().__init__()
+        comm_group = comm_group or CommGroup.trivial()
         self.config = config
 
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.total_num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = config.is_causal
         self.attention_dropout = config.attention_dropout
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        if (self.head_dim * self.total_num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
@@ -109,11 +124,26 @@ class BagelAttentionMoT(nn.Module):
         # / ``v_proj`` checkpoint tensors into one GEMM via the loader's
         # stacked-param rules. ``_split_qkv`` slices the fused output back
         # into per-head q / k / v.
+        self.qkv_proj = QKVParallelLinear(
+            comm_group=comm_group,
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=config.num_attention_heads,
+            total_num_kv_heads=config.num_key_value_heads,
+            bias=True,
+        )
+        self.num_heads = self.qkv_proj.num_heads
+        self.num_key_value_heads = self.qkv_proj.num_kv_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
-        qkv_shards = {"q": self.q_size, "k": self.kv_size, "v": self.kv_size}
-        self.qkv_proj = FusedColumnLinear(self.hidden_size, qkv_shards, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.local_hidden_size = self.q_size
+        self.o_proj = RowParallelLinear(
+            comm_group=comm_group,
+            input_size=self.hidden_size,
+            output_size=self.hidden_size,
+            bias=False,
+            input_is_parallel=True,
+        )
 
         if self.config.qk_norm:
             self.q_norm = BagelRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -126,8 +156,21 @@ class BagelAttentionMoT(nn.Module):
             self.q_norm_moe_gen = nn.Identity()
             self.k_norm_moe_gen = nn.Identity()
 
-        self.qkv_proj_moe_gen = FusedColumnLinear(self.hidden_size, qkv_shards, bias=True)
-        self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.qkv_proj_moe_gen = QKVParallelLinear(
+            comm_group=comm_group,
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=config.num_attention_heads,
+            total_num_kv_heads=config.num_key_value_heads,
+            bias=True,
+        )
+        self.o_proj_moe_gen = RowParallelLinear(
+            comm_group=comm_group,
+            input_size=self.hidden_size,
+            output_size=self.hidden_size,
+            bias=False,
+            input_is_parallel=True,
+        )
 
     def _split_qkv(
         self, qkv: torch.Tensor,
@@ -217,7 +260,7 @@ class BagelAttentionMoT(nn.Module):
             v=value_states,
         )
 
-        attn_output = attn_output.reshape(-1, self.hidden_size)
+        attn_output = attn_output.reshape(-1, self.local_hidden_size)
 
         if mode == "und":
             attn_output = self.o_proj(attn_output)
@@ -241,16 +284,17 @@ class BagelMoTDecoderLayer(nn.Module):
         self,
         config: BagelModelConfig,
         layer_idx: Optional[int] = None,
-        attn_module = BagelAttentionMoT,
+        attn_module=BagelAttentionMoT,
+        comm_group: CommGroup | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.freeze_und = config.freeze_und
 
-        self.self_attn = attn_module(config, layer_idx)
+        self.self_attn = attn_module(config, layer_idx, comm_group=comm_group)
 
-        self.mlp = BagelMLP(config)
-        self.mlp_moe_gen = BagelMLP(config)
+        self.mlp = BagelMLP(config, comm_group=comm_group)
+        self.mlp_moe_gen = BagelMLP(config, comm_group=comm_group)
         self.input_layernorm = BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm_moe_gen = BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -335,16 +379,27 @@ class BagelMoTDecoderLayer(nn.Module):
 
 
 class BagelLanguageModel(nn.Module):
-    def __init__(self, config: BagelModelConfig):
+    def __init__(
+        self, config: BagelModelConfig, comm_group: CommGroup | None = None,
+    ):
         super().__init__()
+        comm_group = comm_group or CommGroup.trivial()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.use_moe = True
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            comm_group=comm_group,
+            padding_idx=self.padding_idx,
+        )
         layer_module = BagelMoTDecoderLayer
         self.layers = nn.ModuleList(
-            [layer_module(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                layer_module(config, layer_idx, comm_group=comm_group)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
 
         self.norm = BagelRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -418,11 +473,20 @@ class BagelLanguageModel(nn.Module):
 
 
 class BagelForCausalLM(nn.Module):
-    def __init__(self, config: BagelModelConfig):
+    def __init__(
+        self, config: BagelModelConfig, comm_group: CommGroup | None = None,
+    ):
         super().__init__()
-        self.model = BagelLanguageModel(config)
+        comm_group = comm_group or CommGroup.trivial()
+        self.model = BagelLanguageModel(config, comm_group=comm_group)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(
+            comm_group=comm_group,
+            input_size=config.hidden_size,
+            output_size=config.vocab_size,
+            bias=False,
+            gather_output=True,
+        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

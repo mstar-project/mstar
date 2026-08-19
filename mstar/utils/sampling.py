@@ -559,6 +559,67 @@ def sample_tokens(
     # Default to the conservative "unknown → do the work" path.
     run_greedy = True if any_greedy is None else any_greedy
 
+    if logits.device.type == "xpu":
+        import vllm_xpu_kernels._xpu_C  # noqa: F401
+
+        scores = logits.float()
+        if seen_token_mask is not None:
+            penalty = repetition_penalty[:, None]
+            penalized = torch.where(
+                scores < 0, scores * penalty, scores / penalty,
+            )
+            scores = torch.where(seen_token_mask, penalized, scores)
+
+        greedy = temperature == 0
+        safe_temperature = torch.where(
+            greedy, torch.ones_like(temperature), temperature,
+        )
+        scores = (scores / safe_temperature[:, None]).contiguous()
+        greedy_tokens = scores.argmax(dim=-1) if run_greedy else None
+
+        # The XPU kernel accepts one CPU [seed, offset] pair per invocation.
+        # Invoke it per row to preserve independent request RNG streams.
+        sampled_rows = []
+        seeds_cpu = seed.detach().cpu() if seed is not None else None
+        offsets_cpu = (
+            rand_offset.detach().cpu() if rand_offset is not None else None
+        )
+        for row in range(batch_size):
+            sampled = torch.empty(
+                1, dtype=torch.int64, device=logits.device,
+            )
+            row_seed = int(seeds_cpu[row]) if seeds_cpu is not None else 0
+            row_offset = (
+                int(offsets_cpu[row]) if offsets_cpu is not None else 0
+            )
+            seed_offset = torch.tensor(
+                [row_seed, row_offset], dtype=torch.int64,
+            )
+
+            row_k = top_k[row:row + 1].to(torch.int64)
+            if any_top_k_zero is not False and int(row_k.item()) == 0:
+                row_k = None
+            row_p = top_p[row:row + 1]
+            if float(row_p.item()) >= 1.0:
+                row_p = None
+
+            torch.ops._xpu_C.topk_topp_sampler(
+                sampled,
+                None,
+                scores[row:row + 1],
+                row_k,
+                row_p,
+                "raw_logits",
+                seed_offset,
+                1.0,
+            )
+            sampled_rows.append(sampled[0])
+
+        sampled = torch.stack(sampled_rows)
+        if greedy_tokens is not None:
+            sampled = torch.where(greedy, greedy_tokens, sampled)
+        return sampled
+
     import flashinfer
 
     # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
