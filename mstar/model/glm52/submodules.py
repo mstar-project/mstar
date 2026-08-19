@@ -544,6 +544,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     self.config.prefill_capture_batch_sizes
                     or self.PREFILL_CAPTURE_BATCH_SIZES),
                 compile=os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
+                # One 512 MiB FlashInfer workspace for all 30 prefill buckets,
+                # not 30: arm L (08-19) measured +17 GB/rank from the per-bucket
+                # default, leaving ~10 GB headroom on an H200. One prefill
+                # replays per step, so sharing is safe.
+                share_workspace_across_buckets=True,
             )
         return configs
 

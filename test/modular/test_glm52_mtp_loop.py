@@ -542,6 +542,9 @@ def test_mtp_trunk_piecewise_config_shapes():
     pstatic = pf.make_static_inputs(pshapes[0])
     assert set(pstatic) == {"input_ids", "position_ids"}
     assert pstatic["input_ids"].shape == (pshapes[0].total_tokens,)
+    # One FlashInfer workspace for all 30 buckets (per-bucket = +15 GiB/rank).
+    assert pf.share_workspace_across_buckets
+    assert not configs["mtp_trunk"].share_workspace_across_buckets  # trunk keeps per-shape
     pc = configs["mtp_trunk"]
     assert pc.get_config_type() == PiecewiseConfigType.PACKED
     assert pc.uses_kv_cache and pc.cache_labels == ["main"]

@@ -2742,9 +2742,12 @@ class PiecewiseCudaGraphRunner:
             # wait until plan N's DMAs executed, so its pinned host sources
             # are never overwritten in flight. Nothing here may move to a
             # second stream without revisiting both.
-            workspace = self.buffer_manager.get(
-                f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
+            ws_key = (
+                f"{label}_pcgr_{self.label}_shared"
+                if getattr(self.config, "share_workspace_across_buckets", False)
+                else f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
             )
+            workspace = self.buffer_manager.get(ws_key)
             if use_mla_kernel:
                 wrapper = FlashInferMLAWrapper(
                     workspace_buffer=workspace,

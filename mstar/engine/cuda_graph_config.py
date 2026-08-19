@@ -227,6 +227,14 @@ class PiecewiseCudaGraphConfig(ABC):
     # Whether to torch.compile capture_fn before capture. Default off; the block
     # loop already benefits from graph capture alone.
     compile: bool = False
+    # Share ONE FlashInfer workspace across all of this runner's buckets instead
+    # of one per (bs, total_tokens). WorkspaceBufferManager hands out a full
+    # MSTAR_WORKSPACE_BUFFER_MB (512 MiB default) per distinct key, so a
+    # 30-bucket runner costs 15 GiB per rank the per-bucket way (measured
+    # 2026-08-19: +17 GB/rank for the MTP prefill graphs). Safe when at most
+    # one bucket of the runner is planned+replayed at a time (every piecewise
+    # runner today: buckets are captured sequentially and a step replays one).
+    share_workspace_across_buckets: bool = False
 
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:
