@@ -392,9 +392,10 @@ def test_captured_decode_step_syncs_exactly_once():
         packed = sub.preprocess("prefill", ei, ars)
         with torch.no_grad():
             res = sub.forward_batched("prefill", ei, **packed)
-        nxt = {rid: res[rid]["text_inputs"][0] for rid in rids}
+        nxt = {}
         for rid in rids:
-            sub.postprocess(rid, infos[rid], res[rid])
+            sub.postprocess(rid, infos[rid], res[rid])  # sets text_inputs
+            nxt[rid] = res[rid]["text_inputs"][0]
         # One warm decode step (first-use allocations, lazy wrappers), then
         # the measured one.
         for measured in (False, True):
