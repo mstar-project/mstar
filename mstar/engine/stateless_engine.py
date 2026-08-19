@@ -238,7 +238,7 @@ class StatelessEngine(BaseEngine):
                 f"engine.{self.config.name}.{batch.node_name}."
                 f"{batch.graph_walk}.bs{len(batch.request_ids)}"
             )
-        self.parallel_groups.get_tp_config_for_node(batch.node_name).barrier()
+        self.parallel_groups.get_tp_config_for_node(batch.node_name).step_barrier()
         submodule = self.submodules.get(batch.node_name)
         per_submodule_dtype = submodule.get_autocast_dtype() if submodule is not None else None
         try:

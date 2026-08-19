@@ -21,6 +21,20 @@ DIST_TIMEOUT_ENV = "MSTAR_DIST_TIMEOUT_S"
 TP_ALLREDUCE_ENV = "MSTAR_TP_ALLREDUCE"
 TP_SYMM_AR_MAX_KB_ENV = "MSTAR_TP_SYMM_AR_MAX_KB"
 
+# Per-step TP barrier at the engine's execute entry (KVCacheEngine.execute_forward,
+# StatelessEngine.execute_batch). "1" (default) keeps it. With the NCCL backend
+# dist.barrier() is a dummy all-reduce followed by a current-stream synchronize,
+# so the host blocks until everything already enqueued (the previous step)
+# drains: it forbids enqueueing step N+1 behind N — which is exactly what
+# MSTAR_TP_ASYNC_SCHED tries to do. The forward's own NCCL collectives keep
+# ranks in lockstep without it; capture-time barriers (cuda_graph_runner) are
+# separate and unaffected. Flag-gated, default unchanged: measure, then decide.
+TP_STEP_BARRIER_ENV = "MSTAR_TP_STEP_BARRIER"
+
+
+def step_barrier_enabled() -> bool:
+    return os.environ.get(TP_STEP_BARRIER_ENV, "1").strip() not in ("0", "false", "no", "off")
+
 
 class _SymmAllReduce:
     """One persistent symmetric-memory buffer per group; all-reduce small
@@ -147,6 +161,15 @@ class CommGroup:
 
     def barrier(self):
         if self.world_size == 1:
+            return
+        dist.barrier(group=self.device_group)
+
+    def step_barrier(self):
+        """The per-step barrier at the engine's execute entry. Same as
+        ``barrier()`` unless ``MSTAR_TP_STEP_BARRIER=0`` (see the env note at the
+        top of this module). Read per call: the flag is a launch-time setting and
+        the lookup is ~100 ns against a ~100 us barrier."""
+        if self.world_size == 1 or not step_barrier_enabled():
             return
         dist.barrier(group=self.device_group)
 
