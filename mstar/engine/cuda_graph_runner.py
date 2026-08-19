@@ -2753,7 +2753,10 @@ class PiecewiseCudaGraphRunner:
             # (planned before it, read by kernels in the same graph), so they
             # cannot share FlashInfer's per-wrapper scheduling state.
             n_plans = max(1, int(getattr(self.config, "plans_per_label", 1) or 1))
-            slice_len = workspace.numel() // n_plans
+            # 256-byte aligned slices: FlashInfer requires a 16-byte aligned
+            # float workspace (the prefill wrapper checks; the MLA one merely
+            # assumes) and the buffer is uint8.
+            slice_len = (workspace.numel() // n_plans) // 256 * 256
             wrappers = []
             for pi in range(n_plans):
                 ws_i = (
