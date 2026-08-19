@@ -309,10 +309,7 @@ class WorkerParallelGroups:
         """
         if not self.any_parallelism:
             return
-        if not dist.is_initialized():
-            return
-        fence = torch.ones(1, dtype=torch.int32, device=self._device)
-        dist.all_reduce(fence)
+        dist.barrier()
 
 
 class GlobalParallelConfig:
