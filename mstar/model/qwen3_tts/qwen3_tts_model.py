@@ -38,9 +38,12 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_cache_engine import KVCacheConfig
-from mstar.engine.resources.spec import NodeResourceSpec, ScratchKVSpec
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.v1.attention_manager import AttentionConfig, AttentionSpec
+from mstar.engine.v1.kv_cache import KVConfig
+from mstar.engine.v1.kv_manager import KVSpec
+from mstar.engine.v1.position_manager import PositionConfig, PositionSpec
+from mstar.engine.v1.sampler import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -50,11 +53,17 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
+from mstar.model.qwen3_tts.config import (
+    CODE_PRED_SAMPLER,
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    TALKER_SAMPLER,
+    Qwen3TTSModelConfig,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
-from mstar.utils.sampling import SamplingConfig
 
 # ---------------------------------------------------------------------------
 # Checkpoint discovery
@@ -216,57 +225,45 @@ class Qwen3TTSModel(Model):
         return self.local_dir
 
     # -----------------------------------------------------------------------
-    # Model ABC: KV cache and engine assignment
+    # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        """Declare the paged self-attention cache used only by the Talker."""
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """Talker paged KV + attention/position/sampler resources.
+
+        The CodePredictor's frame-local KV scratch is not a resource; the
+        Talker submodule owns it (overwritten every step)."""
         talker = self.config.talker
-        return [KVCacheConfig(
+        cp = talker.code_predictor
+        talker_kv = KVConfig(
             num_layers=talker.num_hidden_layers,
             num_kv_heads=talker.num_key_value_heads,
             head_dim=talker.head_dim,
             max_seq_len=talker.max_position_embeddings,
             num_qo_heads=talker.num_attention_heads,
-            nodes=["Talker"],
-            # Keep the model portable: deployment YAML may pin FA2 when its
-            # toolchain cannot build the Hopper FA3 JIT kernels.
-            flashinfer_backend="auto",
-        )]
-
-    def get_node_resources(
-        self, kv_cache_config: list[KVCacheConfig],
-    ) -> list[NodeResourceSpec]:
-        """The Talker adds the CodePredictor's fixed-shape scratch cache.
-
-        CodePredictor attention is local to one 16-group frame, so its
-        cache is overwritten every Talker step rather than paged across
-        steps; a maximum-batch allocation gives the captured decode graph
-        stable addresses.
-        """
-        from mstar.model.qwen3_tts.submodules import TalkerSubmodule
-
-        specs = super().get_node_resources(kv_cache_config)
-        cp = self.config.talker.code_predictor
-        for spec in specs:
-            nodes = spec.kv_cache_config.nodes or []
-            if "Talker" in nodes:
-                spec.scratch["code_predictor"] = ScratchKVSpec(shape=(
-                    cp.num_hidden_layers,
-                    TalkerSubmodule.MAX_BATCH_SIZE,
-                    2,
-                    self.config.talker.num_code_groups,
-                    cp.num_key_value_heads,
-                    cp.head_dim,
-                ))
-        return specs
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        """Talker keeps cross-step KV state; Codec is a pure frame decoder."""
-        return {
-            "Talker": EngineType.KV_CACHE,
-            "Codec": EngineType.STATELESS,
-        }
+        )
+        return [
+            KVSpec(label=TALKER_KV, nodes={"Talker"}, config=talker_kv),
+            AttentionSpec(
+                label=TALKER_ATTN, nodes={"Talker"},
+                config=AttentionConfig(kv_cache=TALKER_KV),
+                kv_config=talker_kv,
+            ),
+            PositionSpec(
+                label=TALKER_POS, nodes={"Talker"},
+                config=PositionConfig(kv_cache=TALKER_KV),
+            ),
+            SamplerSpec(
+                label=TALKER_SAMPLER, nodes={"Talker"},
+                vocab_size=talker.vocab_size,
+                enable_repetion_penalty=True,
+            ),
+            SamplerSpec(
+                label=CODE_PRED_SAMPLER, nodes={"Talker"},
+                vocab_size=cp.vocab_size,
+                enable_repetion_penalty=False,
+            ),
+        ]
 
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
@@ -585,18 +582,13 @@ class Qwen3TTSModel(Model):
     # Sampling and output encoding
     # -----------------------------------------------------------------------
 
-    def get_sampling_config(
-        self,
-        node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> SamplingConfig | None:
-        """Configure sampling for codec group 0 predicted by the Talker.
+    def get_request_resource_configs(
+        self, model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Per-request sampling: Talker head (group 0) + CodePredictor (1-15).
 
-        Residual groups 1-15 use the independent ``subtalker_*`` settings,
-        returned separately by ``get_aux_sampling_configs``.
-        """
-        if node_name != "Talker":
-            return None
+        The CodePredictor's ``subtalker_*`` knobs drive its own sampler
+        resource; ``*_dosample=False`` maps to temperature 0 (greedy)."""
         model_kwargs = model_kwargs or {}
         generation = self.config.generation
         do_sample = model_kwargs.get("do_sample", generation.do_sample)
@@ -606,43 +598,25 @@ class Qwen3TTSModel(Model):
         )
         if not do_sample:
             temperature = 0.0
-        return SamplingConfig(
-            vocab_size=self.config.talker.vocab_size,
-            temperature=temperature,
-            top_k=model_kwargs.get("top_k", generation.top_k),
-            top_p=model_kwargs.get("top_p", generation.top_p),
-            repetition_penalty=model_kwargs.get(
-                "repetition_penalty", generation.repetition_penalty
-            ),
-            ignore_eos=model_kwargs.get("ignore_eos", False),
-        )
-
-    def get_aux_sampling_configs(
-        self,
-        node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> dict[str, SamplingConfig]:
-        """Sampling for residual codec groups 1-15, predicted by the CodePredictor.
-
-        Driven by the ``subtalker_*`` knobs. ``subtalker_dosample=False`` maps to
-        temperature 0, which the sampler buffers encode as greedy.
-        """
-        if node_name != "Talker":
-            return {}
-        model_kwargs = model_kwargs or {}
-        generation = self.config.generation
-        do_sample = model_kwargs.get(
+        sub_do_sample = model_kwargs.get(
             "subtalker_dosample", generation.subtalker_dosample
         )
-        # No vocab_size: the depth loop applies no repetition penalty, so this
-        # label allocates no seen-token mask buffers.
         return {
-            "code_predictor": SamplingConfig(
+            TALKER_SAMPLER: SamplingReqConfig(
+                temperature=temperature,
+                top_k=model_kwargs.get("top_k", generation.top_k),
+                top_p=model_kwargs.get("top_p", generation.top_p),
+                repetition_penalty=model_kwargs.get(
+                    "repetition_penalty", generation.repetition_penalty
+                ),
+                ignore_eos=model_kwargs.get("ignore_eos", False),
+            ),
+            CODE_PRED_SAMPLER: SamplingReqConfig(
                 temperature=(
                     model_kwargs.get(
                         "subtalker_temperature", generation.subtalker_temperature
                     )
-                    if do_sample
+                    if sub_do_sample
                     else 0.0
                 ),
                 top_k=model_kwargs.get(
@@ -651,7 +625,7 @@ class Qwen3TTSModel(Model):
                 top_p=model_kwargs.get(
                     "subtalker_top_p", generation.subtalker_top_p
                 ),
-            )
+            ),
         }
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
@@ -696,7 +670,7 @@ class Qwen3TTSModel(Model):
     ) -> NodeSubmodule | None:
         """Build only the node assigned to this worker and cache the wrapper."""
         del sp_group
-        if node_name not in self.get_node_engine_types():
+        if node_name not in ("Talker", "Codec"):
             raise ValueError(f"Unknown Qwen3-TTS node: {node_name!r}")
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]

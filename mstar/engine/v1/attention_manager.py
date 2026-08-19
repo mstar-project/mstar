@@ -362,6 +362,13 @@ class FlashInferManager(AttentionManager):
         return self._current_plan_states[label].run(q, kv_cache_layer)
 
 
+class QueryPacking(NamedTuple):
+    """One plan label's query side: the requests in packed order, and the
+    cumulative query lengths over them."""
+    request_ids: list[str]
+    qo_indptr: torch.Tensor  # int32, CPU
+
+
 @dataclass
 class CrossAttentionConfig:
     """Cross-attention against a context written once and never extended.
@@ -372,9 +379,14 @@ class CrossAttentionConfig:
     context shares the decoder's head config — the context then lives in it
     under its own ``context_label``. They differ when it does not, which is
     the usual case (an encoder's head count rarely matches the decoder's).
+
+    ``query_kv_cache=None`` covers the query side having no KV cache at all
+    (nothing is cached across steps on it): the packing then comes off the
+    cross-attention step's own segments, one qo entry per segment in
+    declared order.
     """
     kv_cache: str  # name of the KV cache holding the context
-    query_kv_cache: str  # name of the KV cache driving the queries
+    query_kv_cache: str | None = None  # KV cache driving the queries, if any
     context_label: str = "context"
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
@@ -446,7 +458,7 @@ class FlashInferCrossManager(CrossAttentionManager):
     def __init__(
         self,
         kv_cache: str,
-        query_kv_cache: str,
+        query_kv_cache: str | None,
         context_label: str,
         device: torch.device,
         dtype: torch.dtype,
@@ -491,6 +503,10 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._workspace_buffers: dict[str, torch.Tensor] = {}
 
     def depends_on(self):
+        # a query side with no cache contributes no dependency: its packing
+        # comes off the step, not another resource's plan
+        if self._query_kv_cache_name is None:
+            return {self._kv_cache_name}
         return {self._kv_cache_name, self._query_kv_cache_name}
 
     @property
@@ -513,7 +529,6 @@ class FlashInferCrossManager(CrossAttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
-        del step  # non-causal
         assert not ctx.is_preplan or ctx.slot_lease is not None, (
             "preplan requires a cuda graph step: the eager wrapper for a label "
             "persists and would be replanned under the in-flight forward"
@@ -534,8 +549,8 @@ class FlashInferCrossManager(CrossAttentionManager):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
-        for plan_label, kv_out in self._query_plan_outputs(ctx).items():
-            indptrs = self._build_indptrs(kv_out, context_views, plan_label)
+        for plan_label, packing in self._query_packings(step, ctx).items():
+            indptrs = self._build_indptrs(packing, context_views, plan_label)
             state_key, wrapper = self._wrapper_for(plan_label, ctx)
 
             # The context pages are immutable once written, so between steps
@@ -586,7 +601,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
         return {view.request_id: view for view in kv_out.views}
 
-    def _query_plan_outputs(self, ctx: StepContext) -> dict[str, KVPlanOutput]:
+    def _query_packings(
+        self, step: AttentionStep, ctx: StepContext
+    ) -> dict[str, QueryPacking]:
+        if self._query_kv_cache_name is None:
+            return self._step_query_packings(step)
+
         plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(
             self._query_kv_cache_name
         )
@@ -594,38 +614,65 @@ class FlashInferCrossManager(CrossAttentionManager):
             f"Cross Attention Manager expected plan result from "
             f"{self._query_kv_cache_name}"
         )
-        if self._query_kv_cache_name != self._kv_cache_name:
-            return plan_outputs
-
-        # cache holds both q, k. context is in k, not in own q stream
+        if self._query_kv_cache_name == self._kv_cache_name:
+            # cache holds both q, k. context is in k, not in own q stream
+            plan_outputs = {
+                label: kv_out for label, kv_out in plan_outputs.items()
+                if label != self._context_label
+            }
         return {
-            label: kv_out for label, kv_out in plan_outputs.items()
-            if label != self._context_label
+            label: QueryPacking(
+                request_ids=[view.request_id for view in kv_out.views],
+                qo_indptr=kv_out.cpu_indptrs.qo_indptr,
+            )
+            for label, kv_out in plan_outputs.items()
+        }
+
+    def _step_query_packings(self, step: AttentionStep) -> dict[str, QueryPacking]:
+        """Query packing off this step's own segments, for a query side with no
+        KV cache: one entry per segment, in declared order.
+
+        No ``combined_labels`` here — that grouping lives on ``KVStep``, so a
+        cacheless query side plans one label per segment label.
+        """
+        rids: dict[str, list[str]] = {}
+        qo_indptrs: dict[str, list[int]] = {}
+        for segment in step.segments or ():
+            rids.setdefault(segment.label, []).append(segment.request_id)
+            qo = qo_indptrs.setdefault(segment.label, [0])
+            qo.append(qo[-1] + segment.span)
+
+        return {
+            label: QueryPacking(
+                request_ids=label_rids,
+                qo_indptr=torch.tensor(qo_indptrs[label], dtype=torch.int32),
+            )
+            for label, label_rids in rids.items()
         }
 
     def _build_indptrs(
         self,
-        query_out: KVPlanOutput,
+        packing: QueryPacking,
         context_views: dict[str, SequenceView],
         plan_label: str,
     ) -> PagedIndptrs:
-        """key off context, query off decoder
+        """key off context, query off the packing
 
-        reuse of decoder `qo_indpter` keeps the label major order produced by
+        reuse of the query `qo_indptr` keeps the label major order produced by
         combined CFG plan."""
         page_size = self._kv_config.page_size
         kv_indptr = [0]
         all_pages: list[int] = []
         last_page_lens: list[int] = []
 
-        for view in query_out.views:
-            context = context_views.get(view.request_id)
+        for request_id in packing.request_ids:
+            context = context_views.get(request_id)
             assert context is not None, (
-                f"no cross attention context for request {view.request_id!r} "
+                f"no cross attention context for request {request_id!r} "
                 f"under label {self._context_label!r}"
             )
             assert context.length > 0, (
-                f"cross attention context for request {view.request_id!r} is "
+                f"cross attention context for request {request_id!r} is "
                 "empty; it must be written before the step that attends it"
             )
             # stream can have more pages than context needs takes only the prefix
@@ -643,7 +690,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
 
         return PagedIndptrs(
-            qo_indptr=query_out.cpu_indptrs.qo_indptr,
+            qo_indptr=packing.qo_indptr,
             paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
             paged_kv_indices=torch.tensor(all_pages, dtype=torch.int32),
             paged_kv_last_page_len=torch.tensor(last_page_lens, dtype=torch.int32),

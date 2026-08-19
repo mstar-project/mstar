@@ -21,7 +21,13 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
+from mstar.model.qwen3_tts.config import (
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    Qwen3TTSModelConfig,
+    Qwen3TTSTalkerConfig,
+)
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames
@@ -59,6 +65,9 @@ class Qwen3TTSTalkerLayer(nn.Module):
             qk_norm=True,
             rms_norm_eps=config.rms_norm_eps,
             comm_group=comm_group,
+            attn_key=TALKER_ATTN,
+            kv_key=TALKER_KV,
+            pos_key=TALKER_POS,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps
@@ -120,7 +129,10 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
             # The layer names which of the node's KV streams it is writing
             # (`label`) and which layer of it (`layer_idx`); the resources it
             # calls own the pages, so module code stays clear of the allocator.
-            hidden_states = layer(hidden_states, label=label, layer_idx=layer_idx)
+            # Set layer_idx on the KV resource and pass None so inductor doesn't
+            # specialize on the int.
+            layer.self_attn.kv.set_layer_idx(layer_idx)
+            hidden_states = layer(hidden_states, label=label, layer_idx=None)
         # Sequence lengths still advance once per forward, after every layer
         # wrote K/V for the same packed range — the runner does it now, on the
         # step this forward was declared from.

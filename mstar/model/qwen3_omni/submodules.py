@@ -20,11 +20,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
 from mstar.engine.kv_store import PositionInfo
 from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
 from mstar.engine.v1.attention_manager import FlashInferManager
 from mstar.engine.v1.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.v1.engine import ExecutingBatch
 from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.components.rope import (
@@ -718,7 +718,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         return result
 
     # ---- batching ----
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return len(model_inputs) > 1
 
     PREFILL_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
@@ -1538,7 +1538,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         """Remove per-request state when a request completes."""
         self._eos_embed_sent.discard(request_id)
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return batch.graph_walk in [
             "talker_decode", "talker_last_prefill"
         ] and len(model_inputs) <= self.MAX_BATCH_SIZE
@@ -1795,7 +1795,7 @@ class Code2WavSubmodule(NodeSubmodule):
         audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return len({
             inputs.tensor_inputs["codec_tokens"].numel() \
                 for inputs in model_inputs
