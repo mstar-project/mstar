@@ -525,6 +525,7 @@ def test_mtp_trunk_piecewise_config_shapes():
     # then ON below for the sync-included set.
     sub._mtp_capture_sync = False
     sub._mtp_capture_prefill = False
+    sub._mtp_draft_phase_graph = False
     assert set(sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
             "mtp_trunk", "mtp_draft"}
@@ -532,6 +533,25 @@ def test_mtp_trunk_piecewise_config_shapes():
     configs = sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)
     assert set(configs) == {"mtp_trunk", "mtp_draft", "mtp_sync"}
+    # The one-graph draft phase (2026-08-19): sync capture on + flag on adds
+    # a (bs, k+1) PACKED bucket per batch size with k plan slots, no runner
+    # advance (the plan_fn positions the counters), and the caller inputs.
+    sub._mtp_draft_phase_graph = True
+    configs = sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)
+    assert set(configs) == {"mtp_trunk", "mtp_draft", "mtp_sync", "mtp_draft_phase"}
+    ph = configs["mtp_draft_phase"]
+    assert ph.get_config_type() == PiecewiseConfigType.PACKED
+    assert ph.plans_per_label == 2 and ph.advance_seq_lens is False
+    phshapes = ph.get_capture_shapes(ph.capture_batch_sizes)
+    assert [(s.bs, s.total_tokens) for s in phshapes] == [
+        (1, 3), (2, 6), (4, 12), (8, 24), (16, 48)]
+    phstatic = ph.make_static_inputs(phshapes[1])
+    assert set(phstatic) == {"sync_ids", "pair_hidden", "sync_position_ids",
+                             "last_rows", "chain_position_ids"}
+    assert phstatic["last_rows"].shape == (2,)
+    assert phstatic["chain_position_ids"].shape == (2,)  # (k-1)*bs = 1*2
+    sub._mtp_draft_phase_graph = False
     # The captured MTP prefill (2026-08-19) is env-default-ON and adds the
     # k=0 config's packed prefill buckets — bs x token-bucket, PACKED, the
     # full-row hidden/prenorm outputs — never lm_head.
@@ -598,6 +618,10 @@ def test_mtp_trunk_piecewise_config_shapes():
     assert set(sub.get_piecewise_cuda_graph_configs(
         torch.device("cpu"), torch.bfloat16, tp_world_size=1)) == {
             "mtp_trunk", "mtp_sync", "mtp_prefill"}
+    sub._mtp_draft_phase_graph = True  # k=1: sync + draft-1 head, no chain
+    assert "mtp_draft_phase" in sub.get_piecewise_cuda_graph_configs(
+        torch.device("cpu"), torch.bfloat16, tp_world_size=1)
+    sub._mtp_draft_phase_graph = False
     sub._mtp_capture_sync = False
 
     cfg.mtp_num_draft_tokens = 0

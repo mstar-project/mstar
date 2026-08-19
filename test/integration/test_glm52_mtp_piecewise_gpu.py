@@ -53,6 +53,7 @@ from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.submodules import (
     MTP_DRAFT_LABEL,
+    MTP_DRAFT_PHASE_LABEL,
     MTP_PREFILL_LABEL,
     MTP_SYNC_LABEL,
     MTP_TRUNK_LABEL,
@@ -273,6 +274,10 @@ def test_sync_capture_matches_eager_bit_identically():
     # this arm's FIRST token — and every plane-sync row the drafts descend
     # from — comes out of a packed prefill graph. Same bit-identity bar.
     assert MTP_PREFILL_LABEL in runners, "the prefill graph did not capture"
+    # 2026-08-19: with sync capture on, the decode draft phase (sync + head +
+    # k-1 chain iterations, k plan slots) replays as ONE graph — this arm
+    # runs through it, so the bit-identity below covers it too.
+    assert MTP_DRAFT_PHASE_LABEL in runners, "the draft-phase graph did not capture"
     assert eager["r0"] == replay["r0"], (
         f"padded sync replay diverged from eager:\n eager  {eager['r0']}\n "
         f"replay {replay['r0']}")

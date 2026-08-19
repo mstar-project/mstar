@@ -2748,36 +2748,50 @@ class PiecewiseCudaGraphRunner:
                 else f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
             )
             workspace = self.buffer_manager.get(ws_key)
-            if use_mla_kernel:
-                wrapper = FlashInferMLAWrapper(
-                    workspace_buffer=workspace,
-                    num_heads=cfg.num_qo_heads,
-                    head_dim_ckv=cfg.mla_ckv_dim,
-                    head_dim_kpe=cfg.head_dim - cfg.mla_ckv_dim,
-                    page_size=cfg.page_size,
-                    sm_scale=cfg.softmax_scale,
-                    batch_size=shape.bs,
-                    max_num_pages=cfg.max_num_pages,
-                    max_total_tokens=shape.total_tokens,
-                    device=self.device,
-                    use_cuda_graph=True,
+            # Multi-plan labels get one wrapper per plan slot, each on its own
+            # slice of the workspace: all slots are LIVE inside one replay
+            # (planned before it, read by kernels in the same graph), so they
+            # cannot share FlashInfer's per-wrapper scheduling state.
+            n_plans = max(1, int(getattr(self.config, "plans_per_label", 1) or 1))
+            slice_len = workspace.numel() // n_plans
+            wrappers = []
+            for pi in range(n_plans):
+                ws_i = (
+                    workspace if n_plans == 1
+                    else workspace.narrow(0, pi * slice_len, slice_len)
                 )
-            else:
-                wrapper = FlashInferPrefillWrapper(
-                    workspace_buffer=workspace,
-                    num_qo_heads=cfg.num_qo_heads,
-                    num_kv_heads=cfg.num_kv_heads,
-                    head_dim=cfg.head_dim,
-                    page_size=cfg.page_size,
-                    batch_size=shape.bs,
-                    max_total_tokens=shape.total_tokens,
-                    max_num_pages=cfg.max_num_pages,
-                    device=self.device,
-                    use_cuda_graph=True,
-                    backend=cfg.flashinfer_backend,
-                )
+                if use_mla_kernel:
+                    wrappers.append(FlashInferMLAWrapper(
+                        workspace_buffer=ws_i,
+                        num_heads=cfg.num_qo_heads,
+                        head_dim_ckv=cfg.mla_ckv_dim,
+                        head_dim_kpe=cfg.head_dim - cfg.mla_ckv_dim,
+                        page_size=cfg.page_size,
+                        sm_scale=cfg.softmax_scale,
+                        batch_size=shape.bs,
+                        max_num_pages=cfg.max_num_pages,
+                        max_total_tokens=shape.total_tokens,
+                        device=self.device,
+                        use_cuda_graph=True,
+                    ))
+                else:
+                    wrappers.append(FlashInferPrefillWrapper(
+                        workspace_buffer=ws_i,
+                        num_qo_heads=cfg.num_qo_heads,
+                        num_kv_heads=cfg.num_kv_heads,
+                        head_dim=cfg.head_dim,
+                        page_size=cfg.page_size,
+                        batch_size=shape.bs,
+                        max_total_tokens=shape.total_tokens,
+                        max_num_pages=cfg.max_num_pages,
+                        device=self.device,
+                        use_cuda_graph=True,
+                        backend=cfg.flashinfer_backend,
+                    ))
+            wrapper = wrappers[0]
             plan_states[label] = _PlanState(
                 wrapper=wrapper,
+                wrappers=wrappers if n_plans > 1 else None,
                 # Static RoPE position buffer so plan_rope's graph-mode
                 # .copy_() path has a stable address (same contract as
                 # CudaGraphRunner's per-slot static_pos_ids).
@@ -2792,6 +2806,7 @@ class PiecewiseCudaGraphRunner:
         static_cm: BatchedCacheManager,
         shape: PiecewiseCaptureShape,
         seq_lens: list[int] | None = None,
+        plan_ctx: dict | None = None,
     ) -> None:
         """Plan attention outside the graph for capture or replay.
 
@@ -2799,6 +2814,9 @@ class PiecewiseCudaGraphRunner:
         real per-request lengths). A custom ``config.plan_fn`` receives a shape
         carrying the effective seq_lens; the type-default plans every cache
         label with those seq_lens (``is_causal`` read from forward_kwargs).
+        ``plan_ctx`` (from ``run(plan_ctx=...)``) is passed through to a custom
+        plan_fn as keyword arguments — data-dependent ints a multi-plan region
+        needs (e.g. per-request accepted counts) that the shape cannot carry.
         """
         effective = list(seq_lens) if seq_lens is not None else shape.seq_lens
         if self.config.plan_fn is not None:
@@ -2807,6 +2825,7 @@ class PiecewiseCudaGraphRunner:
                 PiecewiseCaptureShape(
                     bs=shape.bs, seq_lens=effective, total_tokens=sum(effective),
                 ),
+                **(plan_ctx or {}),
             )
             return
         is_causal = self.config.forward_kwargs.get("is_causal", False)
@@ -2903,6 +2922,7 @@ class PiecewiseCudaGraphRunner:
         request_ids: list[str] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
+        plan_ctx: dict | None = None,
     ) -> PiecewiseOutput:
         """Replay the captured graph for the given real inputs.
 
@@ -2985,6 +3005,7 @@ class PiecewiseCudaGraphRunner:
                     static_cm,
                     data.shape,
                     seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
+                    plan_ctx=plan_ctx,
                 )
 
             # --- 3: replay ---

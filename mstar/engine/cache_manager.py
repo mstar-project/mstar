@@ -132,6 +132,11 @@ class _PlanState:
     seq_lens: list[int] | None = None
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
+    # Multi-plan labels (PiecewiseCudaGraphConfig.plans_per_label > 1): every
+    # persistent wrapper for this label; ``wrapper`` is the SELECTED one
+    # (``BatchedCacheManager.select_plan_slot``). None for ordinary labels.
+    wrappers: list | None = None
+    plan_slot: int = 0
     # Plan memo: fingerprint of the last wrapper.plan() inputs for this label;
     # when it matches, the re-plan is skipped. Only the cross-attention path
     # sets it today (its context pages are immutable after add_cross_attn_kv),
@@ -291,6 +296,19 @@ class BatchedCacheManager(ABC):
         self.layer_idx = layer_idx
 
     @torch.compiler.disable
+    def select_plan_slot(self, label: str, slot: int) -> None:
+        """Make plan slot ``slot`` of a multi-plan label the live one: the
+        wrapper that ``plan_attention`` plans and ``run_attention`` runs.
+        Host-only bookkeeping — inside a captured region it runs at capture
+        time and the graph simply reads that slot's static buffers."""
+        ps = self._plan_states.get(label)
+        if ps is None or not ps.wrappers:
+            if slot == 0:
+                return
+            raise ValueError(f"label {label!r} has no plan slots (asked for {slot})")
+        ps.wrapper = ps.wrappers[slot]
+        ps.plan_slot = slot
+
     def get_qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
         """Return the persistent qo_indptr static buffer for a CUDA-graph
         prefill wrapper, or None if not in CUDA-graph mode / wrong wrapper.
