@@ -50,12 +50,17 @@ logger = logging.getLogger(__name__)
 def _mtp_prefill_drafts_enabled() -> bool:
     """Carry the MTP prefill's [emitted, k drafts] bundle into decode step 1.
 
-    DEFAULT OFF pending GPU validation. Read through one helper so the edge
-    that WRITES the bundle and the transition that READS it can never
-    disagree: gating only the write path left the read live and regressed
-    the "off" arm on 2026-08-10.
+    DEFAULT ON [2026-08-19]: arm L on coriander (TP8, k=3, uncontended) ran
+    with it on — 78.53 tok/s, 3264 tokens bit-exact, 0 eager, and the
+    acceptance histogram's forced n_acc=0 bin fell 143 -> 129 (the first
+    decode step is now a speculated (k+1)-row step like every other). Set
+    MSTAR_GLM52_MTP_PREFILL_DRAFTS=0 to drop the bundle (one wasted
+    unspeculated step per request). Read through one helper so the edge that
+    WRITES the bundle and the transition that READS it can never disagree:
+    gating only the write path left the read live and regressed the "off"
+    arm on 2026-08-10.
     """
-    return os.environ.get("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "0") == "1"
+    return os.environ.get("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1") == "1"
 
 
 def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":

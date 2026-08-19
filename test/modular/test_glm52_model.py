@@ -92,16 +92,21 @@ def _make_model_k(k: int) -> Glm52Model:
     return model
 
 
-def test_glm52_prefill_drafts_are_off_by_default(monkeypatch):
-    """Both MTP perf features ship OFF until GPU-validated. Enabling the
-    prefill-draft edge measured 33.02 tok/s / p1 0.18 against the eager
-    path's 49.65 / 0.76 on 2026-08-10, so the DEFAULT walk must be the
-    known-good one.
+def test_glm52_prefill_drafts_default_on_and_escape_hatch(monkeypatch):
+    """The prefill-draft edge ships ON as of 2026-08-19 (arm L: 78.53 tok/s,
+    3264 bit-exact, forced n_acc=0 bin 143 -> 129). The 2026-08-10 regression
+    that kept it off (33.02 / p1 0.18) was the `text_inputs` name collision,
+    fixed since. MSTAR_GLM52_MTP_PREFILL_DRAFTS=0 must still drop the edge.
 
     delenv, not ambient env: reading whatever the process happens to have
     set is the exact dependence that let 8 tests rot silently in this
     suite."""
+    from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
+
     monkeypatch.delenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", raising=False)
+    prefill = _make_model_k(2).get_graph_walk_graphs()["prefill"]
+    assert [e.name for e in prefill.outputs] == ["new_token", MTP_DRAFT_BUNDLE]
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "0")
     prefill = _make_model_k(2).get_graph_walk_graphs()["prefill"]
     assert [e.name for e in prefill.outputs] == ["new_token"]
 
@@ -188,7 +193,7 @@ def test_glm52_decode_ignores_a_persisted_bundle_when_the_flag_is_off(monkeypatc
     alone leaves the rest of the suite green."""
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
-    monkeypatch.delenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", raising=False)
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "0")  # default is ON since 08-19
     metadata = CurrentForwardConductorMetadata(
         input_modalities=["text"], output_modalities=["text"],
         graph_walk="prefill", is_prefill=True,
