@@ -345,6 +345,27 @@ def test_batch_padding_replay_matches_eager():
             f"eager  {eager[rid]}\n replay {replay[rid]}")
 
 
+def test_batch_padding_replay_matches_eager_k3_two_chain_iterations():
+    """Same padded regime (bs=3 -> 4) at k=3, i.e. TWO chain iterations inside
+    the one-graph draft phase. This is the layout the flat chain-position
+    buffer got wrong (blocks of `num` written, blocks of bucket `bs` read):
+    per-iteration ``chain_pos_{it}`` inputs are what makes padding safe, and
+    only k>=3 with num<bs exercises it."""
+    cfg = _cfg()
+    cfg.mtp_num_draft_tokens = 3
+    model = _build(cfg)
+    prompts = _prompts(3)
+
+    eager, _ = _drive(cfg, model, prompts, steps=5, use_graphs=False)
+    replay, runners = _drive(cfg, model, prompts, steps=5, use_graphs=True)
+
+    assert MTP_TRUNK_LABEL in runners and MTP_DRAFT_PHASE_LABEL in runners
+    for rid in eager:
+        assert eager[rid] == replay[rid], (
+            f"{rid}: k=3 padded (bs=3 -> 4) replay diverged from eager:\n "
+            f"eager  {eager[rid]}\n replay {replay[rid]}")
+
+
 def test_captured_decode_step_syncs_exactly_once():
     """The sync discipline behind the draft-chain speedup (2026-08-19).
 
