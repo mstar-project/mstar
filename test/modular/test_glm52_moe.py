@@ -363,3 +363,65 @@ def test_per_token_group_quant_is_compiler_disabled():
     assert hasattr(per_token_group_quant_fp8, "_torchdynamo_disable") or hasattr(
         per_token_group_quant_fp8, "_torchdynamo_orig_callable"
     ), "per_token_group_quant_fp8 lost its torch.compiler.disable wrap"
+
+
+class _RecordingGroup:
+    """A 2-rank CommGroup stand-in for one process: collectives are
+    identity ops that RECORD what was reduced, so a test can count them
+    and check the local arithmetic. Shard sizes follow world_size."""
+
+    def __init__(self, rank=0, world_size=2):
+        self.rank = rank
+        self.global_rank = rank
+        self.world_size = world_size
+        self.group_members = list(range(world_size))
+        self.device_group = None
+        self.reduced: list[torch.Tensor] = []
+
+    def all_reduce(self, t):
+        self.reduced.append(t.clone())
+        return t
+
+    def all_gather(self, t, dim=-1):
+        return torch.cat([t] * self.world_size, dim=dim)
+
+    def reduce_scatter(self, t, dim=-1):
+        return t
+
+
+def test_fused_allreduce_reduces_once_and_keeps_local_math(monkeypatch):
+    """MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1: the block issues ONE all-reduce
+    (of routed_partial + shared_partial) instead of two, and what it reduces
+    equals the sum of what the unfused block reduced — the local arithmetic
+    is unchanged; only the reduction order moves."""
+    torch.manual_seed(3)
+    cfg = Glm52ModelConfig.reduced()
+
+    monkeypatch.delenv("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", raising=False)
+    g0 = _RecordingGroup()
+    plain = Glm52SparseMoeBlock(cfg, comm_group=g0)
+    monkeypatch.setenv("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", "1")
+    g1 = _RecordingGroup()
+    fused = Glm52SparseMoeBlock(cfg, comm_group=g1)
+    assert not plain._fused_allreduce and fused._fused_allreduce
+    assert plain.shared_expert.down_proj.reduce_results
+    assert not fused.shared_expert.down_proj.reduce_results
+
+    # Parameters are torch.empty at construction (the loader fills them);
+    # give both blocks the same finite weights.
+    for prm in plain.parameters():
+        prm.data.normal_(0, 0.05)
+    fused.load_state_dict(plain.state_dict())
+    x = torch.randn(5, cfg.hidden_size) * 0.1
+    out_plain = plain(x)
+    out_fused = fused(x)
+
+    # unfused: routed all-reduce + shared down_proj all-reduce = 2 collectives
+    # fused: exactly one, on the sum of the two partials
+    assert len(g0.reduced) == 2, len(g0.reduced)
+    assert len(g1.reduced) == 1, len(g1.reduced)
+    routed_p, shared_p = g0.reduced
+    assert torch.allclose(g1.reduced[0], (routed_p + shared_p).view_as(g1.reduced[0]),
+                          atol=1e-6, rtol=1e-5)
+    # With identity collectives (one rank's view) the outputs agree too.
+    assert torch.allclose(out_plain, out_fused, atol=1e-6, rtol=1e-5)

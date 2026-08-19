@@ -18,6 +18,7 @@ M* has no fp8 kernel today) or adopt DeepGEMM.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 import torch.nn.functional as F
@@ -226,12 +227,26 @@ class Glm52SparseMoeBlock(nn.Module):
             )
         self._attach_expert_weight_loaders()
 
+        # One all-reduce per MoE block instead of two (vLLM's DeepseekV2MoE
+        # layout): the shared expert returns its per-rank partial, it is
+        # added to the routed partial, and the SUM is reduced once. Saves 76
+        # collectives per decode step at TP8 (~15-25 us each on NVSwitch
+        # [estimate] -> ~1-2 ms of a 19 ms step), MTP off and on alike.
+        # DEFAULT OFF: bf16 rounding moves (sum-then-reduce vs reduce-then-
+        # sum), so the emitted stream can differ from today's at FP near-ties
+        # — a policy call to make with a measurement, not silently.
+        # MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 to enable.
+        self._fused_allreduce = (
+            self.tp_size > 1
+            and os.environ.get("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", "0") == "1"
+        )
         self.shared_expert = ParallelGatedMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
             comm_group=comm_group,
             activation=config.hidden_act,
             bias=False,
+            reduce_results=not self._fused_allreduce,
         )
 
     def _attach_expert_weight_loaders(self) -> None:
@@ -285,10 +300,12 @@ class Glm52SparseMoeBlock(nn.Module):
                     topk_weights, topk_ids,
                     block_size=self.block_size,
                 )
-                if self.tp_size > 1:
+                if self.tp_size > 1 and not self._fused_allreduce:
                     self.comm_group.all_reduce(routed)
             else:
-                routed = self._dispatch_fp8_reference(flat, topk_weights, topk_ids)
+                routed = self._dispatch_fp8_reference(
+                    flat, topk_weights, topk_ids,
+                    reduce=not self._fused_allreduce)
         elif self.tp_size == 1:
             routed = _dispatch(
                 flat,
@@ -307,15 +324,21 @@ class Glm52SparseMoeBlock(nn.Module):
                 topk_ids,
                 topk_weights,
             )
-            self.comm_group.all_reduce(routed)
+            if not self._fused_allreduce:
+                self.comm_group.all_reduce(routed)
         shared = self.shared_expert(flat)
-        return (routed + shared).view(input_shape)
+        out = routed + shared
+        if self._fused_allreduce:
+            # Both terms are per-rank partials here; one reduce for the sum.
+            self.comm_group.all_reduce(out)
+        return out.view(input_shape)
 
     def _dispatch_fp8_reference(
         self,
         flat: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Per-expert loop that dequantizes only the experts this batch hit.
 
@@ -350,7 +373,7 @@ class Glm52SparseMoeBlock(nn.Module):
             out = out * topk_weights[token_idx, top_k_pos, None]
             final.index_add_(0, token_idx, out.to(final.dtype))
 
-        if self.tp_size > 1:
+        if reduce and self.tp_size > 1:
             self.comm_group.all_reduce(final)
         return final
 
