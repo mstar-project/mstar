@@ -1046,7 +1046,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     request_ids=request_ids,
                     seq_lens=list(seq_lens),
                 )
-                hidden, prenorm = replay["hidden"], replay["prenorm"]
+                # Views, not clones: both are consumed inside this step
+                # (index_select + the eager plane sync) before this runner
+                # replays again.
+                hidden = replay.get_view("hidden")
+                prenorm = replay.get_view("prenorm")
                 last_token_indices = kwargs.get("last_token_indices")
                 assert last_token_indices is not None
             else:
@@ -1118,9 +1122,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 request_ids=request_ids,
                 seq_lens=list(seq_lens),
             )
-            hidden = replay["hidden"]
-            prenorm = replay["prenorm"]
-            logits = replay["logits"]
+            # Views into the trunk graph's static outputs (no clone launches):
+            # logits go straight into argmax below, hidden/prenorm rows are
+            # copied into the sync pass this same step — all before the next
+            # trunk replay.
+            hidden = replay.get_view("hidden")
+            prenorm = replay.get_view("prenorm")
+            logits = replay.get_view("logits")
         else:
             self._warn_mtp_trunk_eager_once(len(request_ids), sum(seq_lens))
             hidden, prenorm = self._hidden(
@@ -1270,7 +1278,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             )
             # The runner advanced `rows` per request; only e were real.
             cache_handle.rewind_seq_lens(over_advance)
-            h_head, h_raw = out["h_head"], out["h_raw"]
+            # Views: index_select'd immediately below.
+            h_head, h_raw = out.get_view("h_head"), out.get_view("h_raw")
             last_rows = to_device_async(last_l, torch.long, device)
         else:
             cache_handle.set_layer_idx(mtp_layer)
@@ -1329,8 +1338,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     request_ids=request_ids,
                     seq_lens=ones,
                 )
+                # draft_ids must be an owned copy (it is kept in draft_cols
+                # across later replays that overwrite the static output);
+                # prev_hidden is only copied into the next replay's static
+                # input, so a view is enough.
                 prev_d = out["draft_ids"]
-                prev_h = out["prev_hidden"]
+                prev_h = out.get_view("prev_hidden")
             else:
                 positions = to_device_async(pos_it, torch.long, device)
                 cache_handle.set_layer_idx(mtp_layer)

@@ -71,6 +71,15 @@ class _EngineInputs:
         self.piecewise_runners = piecewise_runners or {}
 
 
+class _StubOutput(dict):
+    """Stand-in for ``PiecewiseOutput``: indexing returns an owned tensor
+    (the stubs already clone), ``get_view`` returns the same tensor (the
+    stubs have no static buffer for a view to alias)."""
+
+    def get_view(self, key, default=None):
+        return self.get(key, default)
+
+
 class _StubTrunkRunner:
     """Contract double for ``PiecewiseCudaGraphRunner.run`` on the MTP
     trunk: plans on the (real) handle, runs the trunk eagerly, returns
@@ -93,11 +102,11 @@ class _StubTrunkRunner:
         hidden, prenorm = self.sub._hidden(
             static_inputs["input_ids"], static_inputs["position_ids"],
             self.handle, with_prenorm=True)
-        return {
+        return _StubOutput({
             "hidden": hidden.clone(),
             "prenorm": prenorm.clone(),
             "logits": self.sub.lm_head(hidden).clone(),
-        }
+        })
 
 
 class _StubDraftRunner:
@@ -143,10 +152,10 @@ class _StubDraftRunner:
             embed(static_inputs["draft_ids"]), static_inputs["prev_hidden"],
             handle, pos)
         handle.advance_seq_lens()
-        return {
+        return _StubOutput({
             "draft_ids": sub.lm_head(h_head).argmax(dim=-1).clone(),
             "prev_hidden": h_raw.clone(),
-        }
+        })
 
 
 class _StubSyncRunner:
@@ -189,7 +198,7 @@ class _StubSyncRunner:
             embed(static_inputs["sync_ids"]), static_inputs["pair_hidden"],
             handle, pos)
         handle.advance_seq_lens()
-        return {"h_head": h_head.clone(), "h_raw": h_raw.clone()}
+        return _StubOutput({"h_head": h_head.clone(), "h_raw": h_raw.clone()})
 
 
 def _mtp_cfg(k: int) -> Glm52ModelConfig:
