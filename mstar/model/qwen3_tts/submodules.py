@@ -916,7 +916,9 @@ class CodecSubmodule(ARNodeSubmodule):
         return [BatchedCudaGraphConfig(
             capture_graph_walk="codec_chunk",
             single_request_inputs=ARNodeInputs(
-                input_seq_len=self.full_seq_len,
+                # 1, not full_seq_len: batched buckets match on bs, and this
+                # keeps the intern seq_len from aliasing the fixed trailing dims.
+                input_seq_len=1,
                 tensor_inputs={
                     "codec_tokens": torch.zeros(
                         self.config.codec.num_quantizers,

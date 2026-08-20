@@ -21,6 +21,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
+from mstar.utils.attention import decode_attn_nhd
 from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_KV,
@@ -323,21 +324,16 @@ class Qwen3TTSCodePredictor(nn.Module):
                 q, k, position_ids, float(attn.rope_theta)
             )
 
-            # Append this depth position, then attend over the prefix already
-            # generated within the same codec frame.
+            # Append this depth position, then attend over the prefix. Read the
+            # full fixed-shape cache and mask to `end` inside decode_attn_nhd
+            # (compiler-disabled), so torch.compile doesn't recompile per
+            # cache_pos the way a variable ``[:end]`` slice would.
             end = cache_pos + seq_len
             kv_cache[layer_idx, :, 0, cache_pos:end].copy_(k)
             kv_cache[layer_idx, :, 1, cache_pos:end].copy_(v)
-            keys = kv_cache[layer_idx, :, 0, :end].transpose(1, 2)
-            values = kv_cache[layer_idx, :, 1, :end].transpose(1, 2)
-            queries = q.transpose(1, 2)
-            attn_output = F.scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                is_causal=False,
-                enable_gqa=True,
-            ).transpose(1, 2)
+            attn_output = decode_attn_nhd(
+                q, kv_cache[layer_idx, :, 0], kv_cache[layer_idx, :, 1], end,
+            )
             attn_output = attn_output.reshape(batch_size, seq_len, -1)
             hidden_states = residual + attn.o_proj(attn_output)
 
