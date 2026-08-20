@@ -1,12 +1,15 @@
 """Paged attention through vllm-xpu-kernels."""
 
 import functools
+import math
 from dataclasses import dataclass
 
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.base import CGSlotKey
+from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
 
@@ -25,7 +28,7 @@ def _xpu_paged_unavailable_reason() -> str | None:
     return None
 
 
-@dataclass(frozen=True)
+@dataclass
 class XPUPagedPlan:
     block_table: torch.Tensor
     cu_q: torch.Tensor
@@ -33,6 +36,18 @@ class XPUPagedPlan:
     max_q: int
     max_k: int
     causal: bool
+
+    def copy_(self, other: "XPUPagedPlan") -> None:
+        """Refresh graph-stable plan buffers without changing their addresses."""
+        for name in ("block_table", "cu_q", "host_kv_lens"):
+            dst = getattr(self, name)
+            src = getattr(other, name)
+            if dst.shape != src.shape:
+                raise ValueError(
+                    f"XPU graph {name} shape changed from "
+                    f"{tuple(dst.shape)} to {tuple(src.shape)}"
+                )
+            dst.copy_(src)
 
 
 class XPUPagedAttentionManager(AttentionManager):
@@ -42,35 +57,78 @@ class XPUPagedAttentionManager(AttentionManager):
         self,
         kv_cache: str,
         device: torch.device,
+        kv_config: KVConfig,
     ):
         self._kv_cache_name = kv_cache
         self._device = device
+        self._kv_config = kv_config
         self._current_plans: dict[str, XPUPagedPlan] = {}
+        self._cg_plans: dict[CGSlotKey, XPUPagedPlan] = {}
+        self._preplan_states: dict[str, XPUPagedPlan] = {}
+        self._preplanned = False
 
     def depends_on(self):
         return {self._kv_cache_name}
 
     def plan(self, step: AttentionStep, ctx: StepContext):
-        if ctx.slot_lease is not None or ctx.is_preplan:
-            raise RuntimeError(
-                "xpu_paged attention is eager-only: its plan metadata is "
-                "rebuilt for every step and does not have capture-stable addresses"
-            )
         self.reset_default_cursors()
+        lease = ctx.slot_lease
+        assert not ctx.is_preplan or lease is not None, (
+            "preplan requires an accelerator graph step"
+        )
+        if self._preplanned:
+            self._current_plans = self._preplan_states
+            self._preplan_states = {}
+            self._preplanned = False
+            return
+
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, (
             f"XPU attention expected plan result from {self._kv_cache_name}"
         )
-        self._current_plans = {
-            label: self._build_plan(kv_out, step.causal)
-            for label, kv_out in plan_outputs.items()
-        }
+        plan_states = (
+            self._preplan_states if ctx.is_preplan else self._current_plans
+        )
+        plan_states.clear()
+        for label, kv_out in plan_outputs.items():
+            new_plan = self._build_plan(
+                kv_out, step.causal, graph_mode=lease is not None
+            )
+            if lease is None:
+                plan = new_plan
+            else:
+                key = CGSlotKey(
+                    bucket=lease.bucket, slot=lease.slot, label=label
+                )
+                plan = self._cg_plans.get(key)
+                if plan is None:
+                    self._cg_plans[key] = new_plan
+                    plan = new_plan
+                else:
+                    plan.copy_(new_plan)
+            plan_states[label] = plan
+        self._preplanned = ctx.is_preplan
+
+    @property
+    def supports_preplan(self):
+        return True
+
+    def clear_preplan(self):
+        self._preplanned = False
+        self._preplan_states = {}
 
     def _build_plan(
-        self, kv_out: KVPlanOutput, causal: bool,
+        self, kv_out: KVPlanOutput, causal: bool, graph_mode: bool,
     ) -> XPUPagedPlan:
         views = kv_out.views
         max_blocks = max((len(view.page_idxs) for view in views), default=1)
+        if graph_mode:
+            max_blocks = max(
+                max_blocks,
+                math.ceil(
+                    self._kv_config.max_seq_len / self._kv_config.page_size
+                ),
+            )
         block_table = [
             view.page_idxs
             + [SINK_PAGE] * (max_blocks - len(view.page_idxs))
@@ -88,10 +146,17 @@ class XPUPagedAttentionManager(AttentionManager):
                 block_table, dtype=torch.int32, device=self._device,
             ),
             cu_q=torch.tensor(cu_q, dtype=torch.int32, device=self._device),
-            # vllm-xpu-kernels consumes KV lengths from host memory.
-            host_kv_lens=torch.tensor(kv_lens, dtype=torch.int32),
+            host_kv_lens=torch.tensor(
+                kv_lens,
+                dtype=torch.int32,
+                device=self._device if graph_mode else None,
+            ),
             max_q=max((view.to_compute for view in views), default=0),
-            max_k=max(kv_lens, default=0),
+            max_k=(
+                self._kv_config.max_seq_len
+                if graph_mode
+                else max(kv_lens, default=0)
+            ),
             causal=causal,
         )
 
