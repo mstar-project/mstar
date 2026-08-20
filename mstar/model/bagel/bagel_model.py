@@ -417,13 +417,7 @@ class BagelModel(Model):
                 node_name=node_name,
             )
         elif node_name == "combine_cfg":
-            self._init_language_model_components(
-                device, autocast_dtype=autocast_dtype, tp_group=tp_group,
-            )
-            return CombineCFGSubmodule(
-                llm2vae=self.llm2vae,
-                config=self.config,
-            )
+            return CombineCFGSubmodule(config=self.config)
         elif node_name == "vit_encoder":
             self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return ViTEncoderSubmodule(
@@ -641,7 +635,9 @@ class BagelModel(Model):
         from mstar.distributed.base import ShardingConfig
 
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
+            groups=[],
+            tp_enabled_nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
+            shard_dim={},
         )
 
     def get_worker_graphs(self, config_path: str):

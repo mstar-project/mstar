@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import os
 import queue
 import threading
 from abc import ABC, abstractmethod
@@ -246,8 +248,18 @@ class KVTransferEngine(ABC):
         pass
 
     @abstractmethod
-    def get_kv_transfer_info(self) -> Any:
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> Any:
         pass
+
+    def remove_request(self, request_id: str) -> None:
+        """Release request-scoped transfer resources, if any."""
+        return None
 
     @abstractmethod
     def shutdown(self):
@@ -281,7 +293,13 @@ class MooncakeKVTransferEngine(KVTransferEngine):
             kv_cache.device
         )
 
-    def get_kv_transfer_info(self) -> MooncakeKVTransferInfo:
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> MooncakeKVTransferInfo:
         return self._transfer_info
 
     def _get_ptr_nbytes(
@@ -372,7 +390,13 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._pending: list[Future] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    def get_kv_transfer_info(self) -> CudaIpcKVTransferInfo:
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> CudaIpcKVTransferInfo:
         return self._transfer_info
 
     def read_batched_async(
@@ -446,24 +470,121 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._executor.shutdown(wait=True)
 
 
-class LocalOnlyKVTransferEngine(KVTransferEngine):
-    """KV cache that remains local to its worker."""
+@dataclass
+class ShmKVTransferInfo:
+    path: str
+    page_indices: tuple[int, ...]
+
+
+class ShmKVTransferEngine(KVTransferEngine):
+    """Host-staged KV transfer through a shared-memory filesystem.
+
+    Each producer publishes a packed tensor containing only the occupied
+    physical pages for one request label. Consumers attach by path and copy
+    the requested page/token ranges into their local accelerator cache.
+    """
+
+    def __init__(
+        self,
+        kv_cache: torch.Tensor,
+        entity_id: str,
+        shm_dir: str | None = None,
+    ):
+        self._kv_cache = kv_cache
+        self._device = kv_cache.device
+        root = shm_dir or os.getenv("MSTAR_KV_SHM_DIR")
+        if root is None:
+            root = "/dev/shm/mstar_kv" if os.path.isdir("/dev/shm") else "/tmp/mstar_kv"
+        self._shm_dir = root
+        os.makedirs(self._shm_dir, exist_ok=True)
+        self._entity_id = entity_id
+        self._published: dict[
+            tuple[str, str], tuple[tuple[tuple[int, ...], int], ShmKVTransferInfo]
+        ] = {}
+
+    def _path(self, request_id: str, label: str) -> str:
+        key = f"{self._entity_id}:{request_id}:{label}".encode()
+        digest = hashlib.sha256(key).hexdigest()
+        return os.path.join(self._shm_dir, f"mstar_kv_{digest}.pt")
+
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> ShmKVTransferInfo | None:
+        if request_id is None or label is None or page_indices is None or seq_len is None:
+            return None
+        pages = tuple(page_indices)
+        version = (pages, seq_len)
+        key = (request_id, label)
+        previous = self._published.get(key)
+        if previous is not None and previous[0] == version:
+            return previous[1]
+
+        path = self._path(request_id, label)
+        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        if pages:
+            packed = self._kv_cache[:, list(pages)].detach().cpu().contiguous()
+        else:
+            packed = torch.empty((0,), dtype=self._kv_cache.dtype)
+        torch.save(packed, tmp_path)
+        os.replace(tmp_path, path)
+        info = ShmKVTransferInfo(path=path, page_indices=pages)
+        self._published[key] = (version, info)
+        return info
 
     def read_batched_async(
-        self, remote_kv_info, read_info: list[KVReadInfo]
+        self,
+        remote_kv_info: ShmKVTransferInfo | None,
+        read_info: list[KVReadInfo],
     ) -> Future | None:
-        if read_info:
-            raise RuntimeError(
-                "Cross-worker KV migration is unavailable for this accelerator. "
-                "Use a colocated worker graph or a remote transfer engine."
+        if not read_info:
+            return None
+        if remote_kv_info is None:
+            raise RuntimeError("Missing SHM metadata for remote KV cache")
+
+        packed = torch.load(
+            remote_kv_info.path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        packed_page = {
+            remote_page: idx
+            for idx, remote_page in enumerate(remote_kv_info.page_indices)
+        }
+        page_copies = {
+            (
+                info.remote_page_idx,
+                info.local_page_idx,
+                info.token_start,
+                info.token_end,
             )
+            for info in read_info
+        }
+        for remote_page, local_page, token_start, token_end in page_copies:
+            source_idx = packed_page[remote_page]
+            source = packed[:, source_idx, :, token_start:token_end].to(self._device)
+            self._kv_cache[
+                :, local_page, :, token_start:token_end
+            ].copy_(source)
+        if self._device.type != "cpu":
+            torch.accelerator.synchronize(self._device)
         return None
 
-    def get_kv_transfer_info(self) -> None:
-        return None
+    def remove_request(self, request_id: str) -> None:
+        keys = [key for key in self._published if key[0] == request_id]
+        for key in keys:
+            _, info = self._published.pop(key)
+            try:
+                os.unlink(info.path)
+            except FileNotFoundError:
+                pass
 
     def shutdown(self):
-        pass
+        for request_id, _ in list(self._published):
+            self.remove_request(request_id)
 
 
 @dataclass
@@ -515,7 +636,10 @@ class PagedAllocationManager:
             if kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
             else:
-                self._kv_transfer_engine = LocalOnlyKVTransferEngine()
+                self._kv_transfer_engine = ShmKVTransferEngine(
+                    kv_cache=kv_cache,
+                    entity_id=transfer_engine_info.my_entity_id,
+                )
         else:
             raise ValueError(f"Unsupported transfer engine type: {type(transfer_engine_info.transfer_engine)}")
 
@@ -659,11 +783,18 @@ class PagedAllocationManager:
 
     def get_per_label_seq_info(self, request_id: str):
         per_label_seq_info: dict[str, SequenceInfo] = {}
-        transfer_info = self._kv_transfer_engine.get_kv_transfer_info()
         for label, state in self.request_states.get(request_id, {}).items():
             self.wait_for_retrieves(request_id, label)
 
             state = self.get_state(request_id, label)
+            transfer_info = None
+            if self.write_policy == StoreWritePolicy.ALWAYS:
+                transfer_info = self._kv_transfer_engine.get_kv_transfer_info(
+                    request_id=request_id,
+                    label=label,
+                    page_indices=state.page_indices,
+                    seq_len=state.seq_len,
+                )
             per_label_seq_info[label] = SequenceInfo(
                 seq_len = state.seq_len,
                 pos_id = state.position_id_start,
@@ -706,6 +837,7 @@ class PagedAllocationManager:
                 self.page_allocator.free(state.page_indices)
             del self.request_states[request_id]
             del self.pending_reads[request_id]
+        self._kv_transfer_engine.remove_request(request_id)
 
     # ----- CPU offloading helpers -----
 
