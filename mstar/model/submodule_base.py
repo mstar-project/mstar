@@ -484,9 +484,28 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         return None
 
-    # Note: do not import CudaGraphConfig; it causes a circular import situation
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
+    # Note: graph config types are imported only under TYPE_CHECKING to avoid a cycle.
+    def get_accelerator_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[CudaGraphConfig]:
+        """Return graph captures supported by the active accelerator.
+
+        Existing model integrations override ``get_cuda_graph_configs``; keep
+        that method as the compatibility hook until they migrate.
+        """
+        return self.get_cuda_graph_configs(device, tp_world_size)
+
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1
+    ) -> list[CudaGraphConfig]:
         return []
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        return self.get_piecewise_cuda_graph_configs(
+            device, autocast_dtype, tp_world_size
+        )
 
     def get_piecewise_cuda_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
@@ -521,6 +540,25 @@ class NodeSubmodule(torch.nn.Module, ABC):
         independent graphs (i.e., one per outer function to be graphed).
         """
         return {}
+
+    def can_use_accelerator_graphs(
+        self,
+        batch: NodeBatch,
+        model_inputs: list[NodeInputs],
+        device: torch.device,
+    ) -> bool:
+        """Return whether the active accelerator may replay this Walk.
+
+        Preserve model-specific legacy eligibility overrides while allowing
+        device-specific graph declarations such as BAGEL XPUGraph buckets.
+        """
+        if type(self).can_use_cuda_graphs is not NodeSubmodule.can_use_cuda_graphs:
+            return self.can_use_cuda_graphs(batch, model_inputs)
+        configs = self.get_accelerator_graph_configs(device, tp_world_size=1)
+        return any(
+            batch.graph_walk in config.replay_graph_walks
+            for config in configs
+        )
 
     def can_use_cuda_graphs(
         self, batch: ExecutingBatch,

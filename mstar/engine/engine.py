@@ -12,9 +12,9 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.cuda_graph_runner import (
-    CudaGraphRunner,
-    PiecewiseCudaGraphRunner,
+from mstar.engine.accelerator_graph_runner import (
+    AcceleratorGraphRunner as CudaGraphRunner,
+    PiecewiseAcceleratorGraphRunner as PiecewiseCudaGraphRunner,
     autocast_scope,
 )
 from mstar.engine.resources import (
@@ -160,7 +160,7 @@ class ExecutingBatch:
     cg_key_info: Any | None = None
 
     # Populated on preplan
-    preplan_event: torch.cuda.Event | None = None
+    preplan_event: Any | None = None
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
@@ -203,7 +203,7 @@ class ExecutingBatch:
 
     # Recorded on the default stream once this step's GPU work is submitted;
     # what a reader of the output values has to wait on.
-    completion_event: torch.cuda.Event | None = None
+    completion_event: Any | None = None
 
     # Set by exec right before the forward's CUDA launch (where torch drops the
     # GIL). A worker that submitted this batch to the GPU thread and then wants
@@ -299,6 +299,7 @@ class Engine:
         kv_cache_type=None,
     ):
         self._device = device
+        self._device_module = getattr(torch, device.type)
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype
 
@@ -385,7 +386,7 @@ class Engine:
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
         """
-        if not torch.cuda.is_available():
+        if not torch.accelerator.is_available():
             return
 
         for node_name, submodule_mgmt in self._submodules.items():
@@ -474,7 +475,7 @@ class Engine:
         its forward takes the eager path for that label.
         """
         node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
-        configs = submodule_mgmt.submodule.get_piecewise_cuda_graph_configs(
+        configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
             node_dtype or torch.float32,
@@ -652,11 +653,14 @@ class Engine:
             # holds the GPU thread until the step drains, tightening the 2-step
             # launch bound to 1. Must stay after `commit_done`, which the plan
             # thread gates on. Skipped during capture: you can't sync mid-capture.
-            if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
+            if (
+                _ENGINE_STEP_SYNC
+                and not self._device_module.is_current_stream_capturing()
+            ):
                 if self._enable_nvtx:
                     range_push("engine.await_outputs")
                 try:
-                    torch.cuda.current_stream().synchronize()
+                    self._device_module.current_stream().synchronize()
                 finally:
                     if self._enable_nvtx:
                         range_pop()
@@ -713,7 +717,7 @@ class Engine:
         # on reuse inside the loop (the rotation wraps after `num_slots`
         # requests), and on the way out — see below.
         fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
-        slot_events: dict[int, torch.cuda.Event] = {}
+        slot_events: dict[int, Any] = {}
 
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
             req_info = {rid: batch.per_request_info[rid]}
@@ -736,7 +740,7 @@ class Engine:
                     continue
                 launched = True
                 if fence:
-                    slot_events[slot] = torch.cuda.Event()
+                    slot_events[slot] = self._device_module.Event()
                     slot_events[slot].record()
 
                 merged.update(self._collect_outputs(
@@ -758,11 +762,14 @@ class Engine:
         batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
-        if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
+        if (
+            _ENGINE_STEP_SYNC
+            and not self._device_module.is_current_stream_capturing()
+        ):
             if nvtx:
                 range_push("engine.await_outputs")
             try:
-                torch.cuda.current_stream().synchronize()
+                self._device_module.current_stream().synchronize()
             finally:
                 if nvtx:
                     range_pop()
@@ -1336,9 +1343,9 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with torch.cuda.stream(stream):
+            with self._device_module.stream(stream):
                 self._runner.pre_plan(step)
-            batch.preplan_event = torch.cuda.Event()
+            batch.preplan_event = self._device_module.Event()
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)
         finally:

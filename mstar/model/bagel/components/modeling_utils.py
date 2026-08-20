@@ -89,6 +89,16 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        half = frequency_embedding_size // 2
+        self.register_buffer(
+            "timestep_freqs",
+            torch.exp(
+                -math.log(10000)
+                * torch.arange(half, dtype=torch.float32)
+                / half
+            ),
+            persistent=False,
+        )
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
@@ -111,9 +121,13 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq.float())
-        return t_emb
+        args = t[:, None].float() * self.timestep_freqs[None]
+        t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if self.frequency_embedding_size % 2:
+            t_freq = torch.cat(
+                [t_freq, torch.zeros_like(t_freq[:, :1])], dim=-1
+            )
+        return self.mlp(t_freq.float())
 
 
 class BagelMLPconnector(nn.Module):
