@@ -20,7 +20,7 @@ from torch import nn
 
 from mstar.model.components import AdaRMSNorm, GatedDecoderLayer
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.pi05.config import Pi05Config
+from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
 
 
 class Pi05TimeMLP(nn.Module):
@@ -62,6 +62,9 @@ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
             head_dim=config.head_dim,
             input_hidden_size=h,
             rope_theta=config.rope_theta,
+            attn_key=LLM_ATTN,
+            kv_key=LLM_KV,
+            pos_key=LLM_POS,
         ),
         mlp=ParallelGatedMLP(
             hidden_size=h,
@@ -96,11 +99,14 @@ class Pi05ActionExpert(nn.Module):
         label: str,
     ) -> torch.Tensor:
         for layer_idx, layer in enumerate(self.layers):
+            # Set layer_idx on the KV resource and pass None so inductor doesn't
+            # specialize on the int.
+            layer.self_attn.kv.set_layer_idx(layer_idx)
             query_sequence = layer(
                 hidden_states=query_sequence,
                 adarms_cond=adarms_cond,
                 label=label,
-                layer_idx=layer_idx,
+                layer_idx=None,
             )
         out, _ = self.norm(query_sequence, adarms_cond)
         return out

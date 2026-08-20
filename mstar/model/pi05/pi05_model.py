@@ -34,8 +34,11 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.v1.attention_manager import AttentionConfig, AttentionSpec
+from mstar.engine.v1.kv_cache import KVConfig
+from mstar.engine.v1.kv_manager import KVSpec
+from mstar.engine.v1.position_manager import PositionConfig, PositionSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -51,7 +54,13 @@ from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05Time
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
 from mstar.model.pi05.components.tokenization import Pi05Tokenizer
-from mstar.model.pi05.config import Pi05Config, load_pi05_config
+from mstar.model.pi05.config import (
+    LLM_ATTN,
+    LLM_KV,
+    LLM_POS,
+    Pi05Config,
+    load_pi05_config,
+)
 from mstar.model.pi05.submodules import Pi05LLMSubmodule, Pi05ViTEncoderSubmodule
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -380,20 +389,33 @@ class Pi05Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> KVCacheConfig:
-        return [KVCacheConfig(
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """LLM paged KV + attention/position. vit_encoder is stateless.
+
+        No sampler: actions come from flow matching, not token sampling. The
+        action expert shares this KV cache with PaliGemma (same head dims), and
+        ``action_gen`` reads the frozen prefix read-only via ``KVStep(commit=
+        False)`` while ``prefill`` commits it.
+        """
+        kv_config = KVConfig(
             num_layers=self.config.num_layers,
             num_kv_heads=self.config.num_kv_heads,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_qo_heads,
-        )]
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {
-            "vit_encoder": EngineType.STATELESS,
-            "LLM": EngineType.KV_CACHE,
-        }
+        )
+        return [
+            KVSpec(label=LLM_KV, nodes={"LLM"}, config=kv_config),
+            AttentionSpec(
+                label=LLM_ATTN, nodes={"LLM"},
+                config=AttentionConfig(kv_cache=LLM_KV),
+                kv_config=kv_config,
+            ),
+            PositionSpec(
+                label=LLM_POS, nodes={"LLM"},
+                config=PositionConfig(kv_cache=LLM_KV),
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # Pi0.5 encodes the robot state as a decimal-string suffix on the

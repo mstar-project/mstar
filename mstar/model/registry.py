@@ -5,7 +5,7 @@ from mstar.model.base import Model
 # from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 
-# from mstar.model.pi05.pi05_model import Pi05Model
+from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 # from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
@@ -20,7 +20,7 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
     # "cosmos3_super": Cosmos3Model,
     # "higgs_audio": HiggsAudioModel,
     "orpheus": OrpheusModel,
-    # "pi05": Pi05Model,
+    "pi05": Pi05Model,
     "qwen3_omni": Qwen3OmniModel,
     "qwen3_tts": Qwen3TTSModel,
     # "vjepa2": VJepa2Model,

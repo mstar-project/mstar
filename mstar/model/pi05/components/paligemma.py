@@ -1,8 +1,8 @@
 """PaliGemma transformer expert for Pi0.5 (prefix processing).
 
-A Gemma-style transformer that integrates with mstar's BatchedCacheManager
-for paged KV cache. Used for the prefill graph walk where it processes
-the prefix tokens (image + language + state) and writes the KV cache
+A Gemma-style transformer that writes the paged KV cache through the node's
+KV/attention/position resources. Used for the prefill graph walk where it
+processes the prefix tokens (image + language + state) and writes the KV cache
 that the action expert later reads during action generation.
 
 Composed entirely from ``mstar.model.components`` — Gemma RMSNorm
@@ -17,7 +17,7 @@ from torch import nn
 
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.pi05.config import Pi05Config
+from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
 
 
 def _build_paligemma_layer(
@@ -41,6 +41,9 @@ def _build_paligemma_layer(
             head_dim=config.head_dim,
             input_hidden_size=h,
             rope_theta=config.rope_theta,
+            attn_key=LLM_ATTN,
+            kv_key=LLM_KV,
+            pos_key=LLM_POS,
         ),
         mlp=ParallelGatedMLP(
             hidden_size=h,
@@ -76,8 +79,11 @@ class Pi05PaliGemmaExpert(nn.Module):
         label: str,
     ) -> torch.Tensor:
         for layer_idx, layer in enumerate(self.layers):
+            # Set layer_idx on the KV resource and pass None so inductor doesn't
+            # specialize on the int.
+            layer.self_attn.kv.set_layer_idx(layer_idx)
             query_sequence = layer(
-                hidden_states=query_sequence, label=label, layer_idx=layer_idx,
+                hidden_states=query_sequence, label=label, layer_idx=None,
             )
 
         # `write_cache` and the advance that followed it are the step
