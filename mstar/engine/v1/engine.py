@@ -372,9 +372,7 @@ class Engine:
         batch.register_prepare_batch(node_inputs)
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
-        ) or batch.step_context.slot_lease is not None
-        if not batch.running_batched:
-            print("WARNING NOT RUNNING BATCHED")
+        )
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
 
     def exec(
@@ -400,10 +398,12 @@ class Engine:
             with torch.no_grad(), autocast_scope(
                 self._autocast_dtype_for(self._submodules[batch.node_name].submodule)
             ):
+                # a caller that pre-planned already reserved one; otherwise take it here
+                lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)  
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
-                if not batch.running_batched and len(batch.request_ids) > 1:
+                if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)
                 else:
                     batch.outputs = self._exec_single(batch)
@@ -422,8 +422,7 @@ class Engine:
         or a single eager request."""
         submodule_mgmt = self._submodules[batch.node_name]
         cg_runner = submodule_mgmt.cuda_graph_runner
-        # a caller that pre-planned already reserved one; otherwise take it here
-        lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
+        lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
 
         inputs = batch.inputs
