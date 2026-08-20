@@ -1013,7 +1013,7 @@ class KVCacheEngine(BaseEngine):
         if not batch.request_ids:
             return NodeOutput(per_request_output_tensors={})
 
-        submod_mgmt.tp_group.barrier()
+        submod_mgmt.tp_group.step_barrier()
 
         if self._can_use_cuda_graph(batch, node_inputs):
             if self.enable_nvtx:
