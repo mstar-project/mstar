@@ -366,6 +366,38 @@ def test_batch_padding_replay_matches_eager_k3_two_chain_iterations():
             f"eager  {eager[rid]}\n replay {replay[rid]}")
 
 
+def test_phase_prepare_matches_unprepared_bit_identically():
+    """MSTAR_GLM52_MTP_PHASE_PREPARE=1 (the slot-0 hoist): full-row sync
+    inputs staged and slot 0 planned BEFORE the verify readback, only
+    last_rows/chain_pos and the chain plans after it. Bit-identity against
+    the unprepared replay is the whole claim — the pad rows now carry
+    rejected-continuation tokens instead of zeros, and only causality plus
+    the transient-slot argument keeps that invisible. bs=3 -> 4 at k=3 so
+    the padding row and both chain iterations are in play."""
+    cfg = _cfg()
+    cfg.mtp_num_draft_tokens = 3
+    model = _build(cfg)
+    prompts = _prompts(3)
+
+    baseline, runners = _drive(cfg, model, prompts, steps=5, use_graphs=True)
+    assert MTP_DRAFT_PHASE_LABEL in runners, "the draft-phase graph did not capture"
+    prev = os.environ.get("MSTAR_GLM52_MTP_PHASE_PREPARE")
+    os.environ["MSTAR_GLM52_MTP_PHASE_PREPARE"] = "1"
+    try:
+        prepared, runners2 = _drive(cfg, model, prompts, steps=5, use_graphs=True)
+    finally:
+        if prev is None:
+            os.environ.pop("MSTAR_GLM52_MTP_PHASE_PREPARE", None)
+        else:
+            os.environ["MSTAR_GLM52_MTP_PHASE_PREPARE"] = prev
+
+    assert MTP_DRAFT_PHASE_LABEL in runners2
+    for rid in baseline:
+        assert baseline[rid] == prepared[rid], (
+            f"{rid}: prepared (hoisted) replay diverged from unprepared:\n "
+            f"base     {baseline[rid]}\n prepared {prepared[rid]}")
+
+
 def test_captured_decode_step_syncs_exactly_once():
     """The sync discipline behind the draft-chain speedup (2026-08-19).
 

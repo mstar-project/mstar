@@ -3040,6 +3040,91 @@ class PiecewiseCudaGraphRunner:
         real_len = real_total_tokens if is_packed else real_bs
         return PiecewiseOutput(data.static_outputs, real_len)
 
+    def _resolve_data(self, request_ids, seq_lens):
+        real_bs = len(request_ids)
+        is_packed = self.config.get_config_type() == PiecewiseConfigType.PACKED
+        real_total_tokens = sum(seq_lens) if seq_lens is not None else None
+        key = self._resolve_key(real_bs, real_total_tokens if is_packed else None)
+        if key is None:
+            raise RuntimeError(
+                f"PiecewiseCudaGraphRunner: no captured graph for bs={real_bs}, "
+                f"total_tokens={real_total_tokens}"
+            )
+        return self.graphs[key], real_bs
+
+    def prepare(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[str],
+        seq_lens: list[int],
+        plan_ctx: dict | None = None,
+    ) -> None:
+        """The data-independent half of ``run()``, callable while the GPU is
+        still executing the graph that produces this replay's remaining
+        inputs (the MTP draft phase calls it during the ~20 ms the host would
+        otherwise spend blocked in the verify readback).
+
+        Does run()'s steps 1–2 for whatever it is given: copies
+        ``static_inputs`` into the runner-owned buffers, aliases the real KV
+        states onto the dummy slots (idempotent — run() re-aliases the same
+        slots), and calls the plan_fn with ``plan_ctx`` (the caller's phase
+        marker rides in there; a split plan_fn plans only its early slots).
+
+        Contract: ``run()`` for the SAME request_ids/seq_lens must follow on
+        this thread before anything else replays through this runner. If the
+        caller aborts in between, it MUST call ``abort_prepare(request_ids,
+        seq_lens)``: a dummy slot left aliased to a live request would let a
+        later replay's padding-slot ``reset_label(free=True)`` free live
+        pages (the exact failure run()'s own finally exists to prevent).
+        On an exception inside this call the aliased slots are restored
+        (free=False) before it propagates.
+        """
+        data, real_bs = self._resolve_data(request_ids, seq_lens)
+        for name, val in static_inputs.items():
+            buf = data.static_inputs.get(name)
+            if buf is None or not isinstance(val, torch.Tensor):
+                continue
+            n = val.shape[0]
+            buf[:n].copy_(val, non_blocking=True)
+            if n < buf.shape[0]:
+                buf[n:].zero_()
+        static_cm = data.static_cache_manager
+        if static_cm is None:
+            return
+        swapped_slots = 0
+        try:
+            for i, rid in enumerate(request_ids):
+                dummy_rid = data.dummy_rids[i]
+                for label in self.cache_labels:
+                    real_state = self.alloc_manager.get_state(rid, label)
+                    self.alloc_manager.get_state(dummy_rid, label)
+                    self.alloc_manager.request_states[dummy_rid][label] = real_state
+                swapped_slots = i + 1
+            self._plan(
+                static_cm,
+                data.shape,
+                seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
+                plan_ctx=plan_ctx,
+            )
+        except Exception:
+            for i in range(swapped_slots):
+                for label in self.cache_labels:
+                    self.alloc_manager.reset_label(
+                        data.dummy_rids[i], label, free=False)
+            raise
+
+    def abort_prepare(
+        self, request_ids: list[str], seq_lens: list[int],
+    ) -> None:
+        """Restore the dummy slots a ``prepare()`` aliased when the paired
+        ``run()`` will not happen. free=False everywhere: every slot prepare
+        touched aliases a live state, and padding slots were never touched."""
+        data, _ = self._resolve_data(request_ids, seq_lens)
+        for i in range(len(request_ids)):
+            for label in self.cache_labels:
+                self.alloc_manager.reset_label(
+                    data.dummy_rids[i], label, free=False)
+
 
 def build_piecewise_runners(
     submodule: NodeSubmodule,

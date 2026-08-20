@@ -260,6 +260,19 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_draft_phase_graph = (
             os.environ.get("MSTAR_GLM52_MTP_DRAFT_PHASE_GRAPH", "1") == "1"
         )
+        # Hoist the e-independent half of the draft phase above the verify
+        # readback: full-row sync inputs (rows < e are exactly the emitted
+        # tokens; rows >= e are rejected continuations landing on the same
+        # transient pad slots the zeros used), the contiguous positions
+        # range(P0+1, P0+k+2) (identical to mtp_sync_padded_layout's — its two
+        # ranges concatenate), and the e-independent slot-0 FlashInfer plan.
+        # The host does ~0.6-0.9 ms of that work during the ~20 ms it spends
+        # blocked in the verify .tolist() while the GPU runs the trunk,
+        # instead of stalling the GPU for it afterwards. Bit-exact by
+        # construction; DEFAULT OFF until a box arm measures it (lane rule).
+        self._mtp_phase_prepare = (
+            os.environ.get("MSTAR_GLM52_MTP_PHASE_PREPARE", "0") == "1"
+        )
         # One-shot flag: warn the first time an MTP decode trunk runs eager
         # (no captured piecewise bucket) — the 2026-08-09 bench showed that
         # regression is 13x and silence lets it masquerade as "MTP is slow".
@@ -677,32 +690,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         static_cm.select_plan_slot(_MAIN, 0)
         return {"drafts": torch.stack(cols, dim=1)}  # (bs, k)
 
-    def _mtp_draft_phase_plan(
+    def _plan_sync_slot(
         self,
         cache_manager: BatchedCacheManager,
         shape: PiecewiseCaptureShape,
-        e_list: list[int] | None = None,
     ) -> None:
-        """Plan every slot of the draft-phase graph before its single replay.
-
-        Slot 0 is the padded sync pass exactly as ``_mtp_sync_plan`` (k+1 rows
-        per present request, counter at P: the caller has rewound e). Then the
-        aliased states are advanced by e (the sync consumed e REAL rows) and
-        slot ``it`` (1..k-1) plans one row per request at kv length P+e+it-1
-        with RoPE at position start+1 — exactly what ``_mtp_draft_plan`` plans
-        for the it-th replay today. The states end at P+e+(k-1); the caller
-        rewinds k-1, mirroring the three-graph path. ``e_list`` comes from
-        ``run(plan_ctx=...)``; capture/warmup pass none and plan e=1."""
-        k = self.config.mtp_num_draft_tokens
-        rows = k + 1
-        cache_manager.set_active_label(_MAIN)
-        cache_manager.set_layer_idx(self.config.num_hidden_layers)
-        present = [sl > 0 for sl in shape.seq_lens]
-        if e_list is None:
-            e_list = [1] * sum(present)
-        e_iter = iter(e_list)
-        e_by_slot = [next(e_iter) if p else 0 for p in present]
-        # Slot 0: padded sync (k+1 rows), positions start+1 .. start+k+1.
+        """Slot 0 of the draft-phase graph: the padded sync pass, k+1 rows per
+        present request at the current counter P, positions P+1..P+k+1. Reads
+        nothing data-dependent — callable before the verify readback."""
         cache_manager.select_plan_slot(_MAIN, 0)
         cache_manager.plan_attention(
             seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
@@ -712,10 +707,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 start = cache_manager._get_state(rid, _MAIN).position_id_start
                 pos.extend(range(start + 1, start + 1 + sl))
         cache_manager.plan_rope(seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
-        # The sync consumed e real rows: advance by rows, rewind rows-e.
-        cache_manager.advance_seq_lens()
-        cache_manager.rewind_seq_lens(
-            [rows - e if p else 0 for p, e in zip(present, e_by_slot, strict=True)])
+
+    def _plan_chain_slots(
+        self, cache_manager: BatchedCacheManager, present: list[bool],
+    ) -> None:
+        """Slots 1..k-1: one row per present request, planned at the current
+        counter (P+e at entry), advancing one per iteration. Ends with slot 0
+        selected so the next trunk plan lands where it always has."""
+        k = self.config.mtp_num_draft_tokens
         ones = [1 if p else 0 for p in present]
         for it in range(1, k):
             cache_manager.select_plan_slot(_MAIN, it)
@@ -728,6 +727,73 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             cache_manager.plan_rope(seq_lens=ones, pos_ids=pos_it, label=_MAIN)
             cache_manager.advance_seq_lens()
         cache_manager.select_plan_slot(_MAIN, 0)
+
+    def _mtp_draft_phase_plan(
+        self,
+        cache_manager: BatchedCacheManager,
+        shape: PiecewiseCaptureShape,
+        e_list: list[int] | None = None,
+        phase: str | None = None,
+    ) -> None:
+        """Plan the draft-phase graph's slots before its single replay.
+
+        ``phase=None`` (capture, warmup, and the un-hoisted replay): all k
+        slots in one call. Slot 0 is the padded sync pass exactly as
+        ``_mtp_sync_plan`` (k+1 rows per present request, counter at P: the
+        caller has rewound e). Then the aliased states are advanced by e (the
+        sync consumed e REAL rows) and slot ``it`` (1..k-1) plans one row per
+        request at kv length P+e+it-1 with RoPE at position start+1 — exactly
+        what ``_mtp_draft_plan`` plans for the it-th replay today. The states
+        end at P+e+(k-1); the caller rewinds k-1, mirroring the three-graph
+        path. ``e_list`` comes from ``run(plan_ctx=...)``; capture/warmup pass
+        none and plan e=1.
+
+        ``phase="prepare"`` (from ``prepare()``, before the verify readback):
+        slot 0 only. Counters sit at P+rows (the trunk's post-replay advance);
+        rewind rows, plan, and restore them EXACTLY — by snapshot, so a
+        mid-plan AllocationFailedError cannot strand the live aliased
+        counters (this lane's audit risk #1). e is neither known nor needed.
+
+        ``phase="finish"`` (the paired ``run()``): slots 1..k-1 only, from the
+        post-verify counter P+e — the caller must NOT have rewound e_list.
+        Ends at P+e+(k-1) like the full plan; the caller rewinds k-1."""
+        k = self.config.mtp_num_draft_tokens
+        rows = k + 1
+        cache_manager.set_active_label(_MAIN)
+        cache_manager.set_layer_idx(self.config.num_hidden_layers)
+        present = [sl > 0 for sl in shape.seq_lens]
+
+        if phase == "prepare":
+            snap = [
+                cache_manager._get_state(rid, _MAIN)
+                for rid, p in zip(cache_manager.request_ids, present, strict=True)
+                if p
+            ]
+            saved = [(st.seq_len, st.position_id_start) for st in snap]
+            cache_manager.rewind_seq_lens([rows if p else 0 for p in present])
+            try:
+                # leaves slot 0 selected, exactly as the one-shot plan does
+                self._plan_sync_slot(cache_manager, shape)
+            finally:
+                for st, (sl_, ps_) in zip(snap, saved, strict=True):
+                    st.seq_len, st.position_id_start = sl_, ps_
+            return
+
+        if phase == "finish":
+            self._plan_chain_slots(cache_manager, present)
+            return
+
+        if e_list is None:
+            e_list = [1] * sum(present)
+        e_iter = iter(e_list)
+        e_by_slot = [next(e_iter) if p else 0 for p in present]
+        # Slot 0: padded sync (k+1 rows), positions start+1 .. start+k+1.
+        self._plan_sync_slot(cache_manager, shape)
+        # The sync consumed e real rows: advance by rows, rewind rows-e.
+        cache_manager.advance_seq_lens()
+        cache_manager.rewind_seq_lens(
+            [rows - e if p else 0 for p, e in zip(present, e_by_slot, strict=True)])
+        self._plan_chain_slots(cache_manager, present)
 
     def _mtp_prefill_captured(
         self,
@@ -1301,50 +1367,101 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         target_argmax_all = logits.argmax(dim=-1)  # (sum(k+1),)
         total_rows = row_starts[-1]
         timer.mark("trunk")
-        host = torch.cat([input_ids, target_argmax_all]).tolist()
-        timer.mark("verify_d2h")
-        inputs_h, target_h = host[:total_rows], host[total_rows:]
-        pair_rows = self._mtp_pair_rows(hidden, prenorm)
-        eos_ids = self.config.eos_token_ids
-        for i, rid in enumerate(request_ids):
-            lo, hi = row_starts[i], row_starts[i + 1]
-            m = seq_lens[i]
-            n_acc = mtp_greedy_verify_host(
-                inputs_h[lo + 1:hi], target_h[lo:hi])
-            # Raw (pre-truncation) emission is the draft-quality signal.
-            self._mtp_stat_steps += 1
-            self._mtp_stat_emitted += n_acc + 1
-            self._mtp_stat_acc_hist[n_acc] += 1
-            # Truncate: max_tokens budget first, then first stop id. EOS is
-            # always the LAST element after truncation, which is the
-            # contract check_stop relies on.
-            budget = self._mtp_max_tokens[rid] - self._mtp_emitted[rid]
-            e = min(n_acc + 1, max(budget, 1))
-            if not self._mtp_ignore_eos[rid]:
-                for j in range(e):
-                    if target_h[lo + j] in eos_ids:
-                        e = j + 1
-                        break
-            emitted = target_argmax_all[lo:lo + e]
-            self._mtp_emitted[rid] += e
-            # m tokens appended KV this forward; the committed prefix is
-            # input[0] plus the e-1 now-emitted drafts. The bonus was never
-            # processed.
-            rewinds.append(m - e)
-            sync_tokens.append(emitted)
-            pair_hiddens.append(pair_rows[lo:lo + e])
-            results[rid] = {"new_token": [emitted]}
-        self._maybe_log_mtp_acceptance()
-        cache_handle.rewind_seq_lens(rewinds)
-        timer.mark("verify_host")
-        sync_runner = kwargs.get("mtp_sync_runner")
-        if sync_runner is None and self._mtp_capture_sync:
-            self._warn_mtp_sync_eager_once(len(request_ids))
-        drafts = self._mtp_sync_and_draft(
-            cache_handle, sync_tokens, pair_hiddens,
-            draft_runner=kwargs.get("mtp_draft_runner"),
-            sync_runner=sync_runner,
-            phase_runner=kwargs.get("mtp_draft_phase_runner"))
+        phase_runner = kwargs.get("mtp_draft_phase_runner")
+        rows_uniform = all(
+            sl == self.config.mtp_num_draft_tokens + 1 for sl in seq_lens)
+        prepared = False
+        pair_rows = None
+        if phase_runner is not None and self._mtp_phase_prepare and rows_uniform:
+            # Hoist the e-independent half of the draft phase into the window
+            # where the host otherwise sits blocked in the verify readback
+            # below (the GPU is still running the trunk):
+            #   - full-row sync inputs: rows j < e of request i ARE the
+            #     emitted tokens (emitted is a view of the target argmax);
+            #     rows >= e are rejected continuations landing on the same
+            #     transient pad slots the zero pads used — causality keeps
+            #     real rows from attending to them, and the chain/next step
+            #     overwrites them in place;
+            #   - positions: mtp_sync_padded_layout's two ranges concatenate
+            #     to range(P0+1, P0+rows+1) — contiguous, e-independent, and
+            #     IDENTICAL to the post-verify value (pinned by
+            #     test_glm52_mtp_phase_prepare);
+            #   - the slot-0 FlashInfer plan (padded sync, k+1 rows at P0).
+            # Only last_rows, chain_pos_{it} and the k-1 chain plans depend
+            # on e and stay after the verify.
+            pair_rows = self._mtp_pair_rows(hidden, prenorm)
+            pos_full: list[int] = []
+            for i, rid in enumerate(request_ids):
+                p_now = cache_handle._get_state(rid, _MAIN).position_id_start
+                p0 = p_now - seq_lens[i]
+                pos_full.extend(range(p0 + 1, p0 + 1 + seq_lens[i]))
+            phase_runner.prepare(
+                static_inputs={
+                    "sync_ids": target_argmax_all,
+                    "pair_hidden": pair_rows,
+                    "sync_position_ids": pinned(pos_full, torch.long),
+                },
+                request_ids=request_ids,
+                seq_lens=list(seq_lens),
+                plan_ctx={"phase": "prepare"},
+            )
+            prepared = True
+            timer.mark("prepare")
+        try:
+            host = torch.cat([input_ids, target_argmax_all]).tolist()
+            timer.mark("verify_d2h")
+            inputs_h, target_h = host[:total_rows], host[total_rows:]
+            if pair_rows is None:
+                pair_rows = self._mtp_pair_rows(hidden, prenorm)
+            eos_ids = self.config.eos_token_ids
+            for i, rid in enumerate(request_ids):
+                lo, hi = row_starts[i], row_starts[i + 1]
+                m = seq_lens[i]
+                n_acc = mtp_greedy_verify_host(
+                    inputs_h[lo + 1:hi], target_h[lo:hi])
+                # Raw (pre-truncation) emission is the draft-quality signal.
+                self._mtp_stat_steps += 1
+                self._mtp_stat_emitted += n_acc + 1
+                self._mtp_stat_acc_hist[n_acc] += 1
+                # Truncate: max_tokens budget first, then first stop id. EOS is
+                # always the LAST element after truncation, which is the
+                # contract check_stop relies on.
+                budget = self._mtp_max_tokens[rid] - self._mtp_emitted[rid]
+                e = min(n_acc + 1, max(budget, 1))
+                if not self._mtp_ignore_eos[rid]:
+                    for j in range(e):
+                        if target_h[lo + j] in eos_ids:
+                            e = j + 1
+                            break
+                emitted = target_argmax_all[lo:lo + e]
+                self._mtp_emitted[rid] += e
+                # m tokens appended KV this forward; the committed prefix is
+                # input[0] plus the e-1 now-emitted drafts. The bonus was never
+                # processed.
+                rewinds.append(m - e)
+                sync_tokens.append(emitted)
+                pair_hiddens.append(pair_rows[lo:lo + e])
+                results[rid] = {"new_token": [emitted]}
+            self._maybe_log_mtp_acceptance()
+            cache_handle.rewind_seq_lens(rewinds)
+            timer.mark("verify_host")
+            sync_runner = kwargs.get("mtp_sync_runner")
+            if sync_runner is None and self._mtp_capture_sync:
+                self._warn_mtp_sync_eager_once(len(request_ids))
+            drafts = self._mtp_sync_and_draft(
+                cache_handle, sync_tokens, pair_hiddens,
+                draft_runner=kwargs.get("mtp_draft_runner"),
+                sync_runner=sync_runner,
+                phase_runner=phase_runner,
+                prepared=prepared)
+        except Exception:
+            if prepared:
+                # A dummy slot left aliased to a live request would let a
+                # later replay's padding-slot reset free live pages — restore
+                # before propagating (run()'s own finally covers everything
+                # from its call onward; abort twice is a harmless no-op).
+                phase_runner.abort_prepare(request_ids, list(seq_lens))
+            raise
         for i, rid in enumerate(request_ids):
             emitted = results[rid]["new_token"][0]
             results[rid]["text_inputs"] = [
@@ -1361,6 +1478,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         draft_runner=None,
         sync_runner=None,
         phase_runner=None,
+        prepared: bool = False,
     ) -> list[torch.Tensor]:
         """Extend the MTP plane over the newly committed tokens, then draft
         k tokens autoregressively. Returns per-request (k,) draft tensors.
@@ -1388,9 +1506,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             for rid in request_ids
         ]
 
+        assert not prepared or phase_runner is not None, (
+            "prepared=True is only meaningful for the one-graph draft phase")
         # Sync pass (+ draft 1 from its last row): plane positions
-        # start-e .. start-1, token positions start-e+1 .. start.
-        cache_handle.rewind_seq_lens(e_list)
+        # start-e .. start-1, token positions start-e+1 .. start. When the
+        # phase runner was PREPARED before the verify, slot 0 is already
+        # planned at P0 and the counters must stay at P0+e — no rewind.
+        if not prepared:
+            cache_handle.rewind_seq_lens(e_list)
         if phase_runner is not None:
             # ONE graph for sync + draft-1 head + the k-1 chain iterations.
             # Inputs mirror the padded sync (real rows first, pads after) plus
@@ -1399,20 +1522,32 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             rows = k + 1
             assert all(e <= rows for e in e_list), (
                 f"draft-phase graph got rows {e_list} outside [1, {rows}]")
-            pos_l, last_l, _over = mtp_sync_padded_layout(e_list, starts, k)
-            sync_ids = torch.zeros(num * rows, dtype=torch.long, device=device)
-            pair_h = torch.zeros(
-                (num * rows, pair_hiddens[0].shape[-1]),
-                dtype=pair_hiddens[0].dtype, device=device)
-            for i, (t, h) in enumerate(zip(sync_tokens, pair_hiddens, strict=True)):
-                sync_ids[i * rows:i * rows + t.shape[0]] = t
-                pair_h[i * rows:i * rows + h.shape[0]] = h
-            phase_inputs = {
-                "sync_ids": sync_ids,
-                "pair_hidden": pair_h,
-                "sync_position_ids": pinned(pos_l, torch.long),
-                "last_rows": pinned(last_l, torch.long),
-            }
+            if prepared:
+                # sync_ids / pair_hidden / sync_position_ids and the slot-0
+                # plan went in through prepare() before the verify readback;
+                # only the e-dependent leftovers travel here.
+                phase_inputs = {
+                    "last_rows": pinned(
+                        [i * rows + e - 1 for i, e in enumerate(e_list)],
+                        torch.long),
+                }
+                plan_ctx = {"e_list": list(e_list), "phase": "finish"}
+            else:
+                pos_l, last_l, _over = mtp_sync_padded_layout(e_list, starts, k)
+                sync_ids = torch.zeros(num * rows, dtype=torch.long, device=device)
+                pair_h = torch.zeros(
+                    (num * rows, pair_hiddens[0].shape[-1]),
+                    dtype=pair_hiddens[0].dtype, device=device)
+                for i, (t, h) in enumerate(zip(sync_tokens, pair_hiddens, strict=True)):
+                    sync_ids[i * rows:i * rows + t.shape[0]] = t
+                    pair_h[i * rows:i * rows + h.shape[0]] = h
+                phase_inputs = {
+                    "sync_ids": sync_ids,
+                    "pair_hidden": pair_h,
+                    "sync_position_ids": pinned(pos_l, torch.long),
+                    "last_rows": pinned(last_l, torch.long),
+                }
+                plan_ctx = {"e_list": list(e_list)}
             for it in range(1, k):
                 phase_inputs[f"chain_pos_{it}"] = pinned(
                     [st + it for st in starts], torch.long)
@@ -1420,7 +1555,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 static_inputs=phase_inputs,
                 request_ids=request_ids,
                 seq_lens=[rows] * num,
-                plan_ctx={"e_list": list(e_list)},
+                plan_ctx=plan_ctx,
             )
             # plan_fn left the counters at start+(k-1) (P+e+k-1); the chain
             # entries beyond the counter are transient, as in the 3-graph path.
