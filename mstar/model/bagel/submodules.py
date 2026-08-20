@@ -162,6 +162,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
     def forward(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         packed_pixel_values: torch.Tensor,
         packed_position_ids: torch.Tensor,
