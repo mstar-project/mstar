@@ -226,6 +226,8 @@ class KVCacheEngine(BaseEngine):
             cfg.shard(
                 parallel_groups.get_instance_world_size_for_node(next(iter(nodes)))
             )
+            if device.type == "xpu":
+                cfg.attention_backend = "xpu_paged"
             num_kv_heads = cfg.num_kv_heads
 
             kv_cache = torch.zeros(
@@ -845,7 +847,7 @@ class KVCacheEngine(BaseEngine):
             try:
                 with torch.no_grad():
                     with torch.amp.autocast(
-                        "cuda", enabled=True, dtype=autocast_dtype
+                        self.device.type, enabled=True, dtype=autocast_dtype
                     ):
                         return super().execute_batch(batch)
             except AllocationFailedError as err:

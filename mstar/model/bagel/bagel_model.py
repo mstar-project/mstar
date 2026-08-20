@@ -293,13 +293,17 @@ class BagelModel(Model):
         )
         self.repo = Path(local_dir)
 
-    def _init_language_model_components(self, device, autocast_dtype=None):
+    def _init_language_model_components(
+        self, device, autocast_dtype=None, tp_group=None,
+    ):
         if self.llm_initialized:
             return
         self._download_hf()
         self.llm_initialized = True
         with torch.device("meta"):
-            self.language_model = BagelForCausalLM(self.config)
+            self.language_model = BagelForCausalLM(
+                self.config, comm_group=tp_group,
+            )
             self.llm2vae = nn.Linear(self.config.hidden_size, self.config.patch_latent_dim)
 
         ema_path = self.repo / "ema.safetensors"
@@ -391,11 +395,14 @@ class BagelModel(Model):
     def _create_submodule(
         self, node_name: str, device: str,
         autocast_dtype: torch.dtype | None = None,
+        tp_group=None,
     ) -> NodeSubmodule | None:
         """Create a submodule wrapper on first access."""
         logger.debug("Creating submodule for BAGEL model node %s", node_name)
         if node_name in ("LLM", "LLM_cfg_text", "LLM_cfg_img"):
-            self._init_language_model_components(device, autocast_dtype=autocast_dtype)
+            self._init_language_model_components(
+                device, autocast_dtype=autocast_dtype, tp_group=tp_group,
+            )
             return LLMSubmodule(
                 language_model=self.language_model,
                 llm2vae=self.llm2vae,
@@ -410,11 +417,7 @@ class BagelModel(Model):
                 node_name=node_name,
             )
         elif node_name == "combine_cfg":
-            self._init_language_model_components(device, autocast_dtype=autocast_dtype)
-            return CombineCFGSubmodule(
-                llm2vae=self.llm2vae,
-                config=self.config,
-            )
+            return CombineCFGSubmodule(config=self.config)
         elif node_name == "vit_encoder":
             self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return ViTEncoderSubmodule(
@@ -609,7 +612,9 @@ class BagelModel(Model):
     ) -> torch.nn.Module | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, autocast_dtype=autocast_dtype)
+        submodule = self._create_submodule(
+            node_name, device, autocast_dtype=autocast_dtype, tp_group=tp_group,
+        )
         logger.info(f"Successfully loaded in BAGEL submodule for {node_name}")
         self._submodule_cache[node_name] = submodule
         return submodule
@@ -625,6 +630,15 @@ class BagelModel(Model):
             "combine_cfg": EngineType.STATELESS,
             "vae_decoder": EngineType.STATELESS,
         }
+
+    def get_default_sharding_config(self):
+        from mstar.distributed.base import ShardingConfig
+
+        return ShardingConfig(
+            groups=[],
+            tp_enabled_nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
+            shard_dim={},
+        )
 
     def get_worker_graphs(self, config_path: str):
         import yaml
