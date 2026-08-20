@@ -330,7 +330,11 @@ class KVManager(AttentionResource):
                 old_len = stream.stored_len
                 if new_len <= old_len:
                     continue
-                if seq_info.latest_kv_transfer_info == self._own_transfer_info():
+                if self._transfer.owns_transfer_info(
+                    transfer_info=seq_info.latest_kv_transfer_info,
+                    request_id=rid,
+                    label=label,
+                ):
                     # This shouldn't happen: the pages already ARE in this cache;
                     # opening our own IPC handle raises `invalid device context`
                     logger.warning(
@@ -871,9 +875,19 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
-    def _own_transfer_info(self):
+    def _own_transfer_info(
+        self,
+        request_id: str,
+        label: str,
+        stream: CacheStream,
+    ):
         """This cache's transfer descriptor, as `publish` stamps it."""
-        return self._transfer.get_kv_transfer_info()
+        return self._transfer.get_kv_transfer_info(
+            request_id=request_id,
+            label=label,
+            page_indices=stream.page_indices,
+            seq_len=stream.stored_len,
+        )
 
     def publish(self, request_id: str):
         # `remove_request` can pop the streams from another thread between the
@@ -882,12 +896,15 @@ class KVManager(AttentionResource):
         if streams is None:
             return None
 
-        transfer_info = self._own_transfer_info()
         with self._lock:
             seq_info = {
                 label: KVSequenceInfo(
                     seq_len=stream.stored_len,
-                    latest_kv_transfer_info=transfer_info,
+                    latest_kv_transfer_info=self._own_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        stream=stream,
+                    ),
                     page_indices=list(stream.page_indices),
                 ) for label, stream in streams.items()
             }
@@ -925,6 +942,7 @@ class KVManager(AttentionResource):
                 self._cpu_pool.remove_request(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+        self._transfer.remove_request(rid)
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank

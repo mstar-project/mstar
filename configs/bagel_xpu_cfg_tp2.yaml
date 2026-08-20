@@ -1,0 +1,49 @@
+model: "bagel"
+max_seq_len: 8192
+max_concurrent_requests: 1
+
+kv_cache:
+  max_seq_len: 8192
+  page_size: 64
+  max_num_pages: 1024
+  attention_backend: "xpu_paged"
+
+node_groups:
+  - node_names:
+      - vit_encoder
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LLM
+    ranks:
+      - 1
+      - 2
+    tp_size: 2
+
+  - node_names:
+      - combine_cfg
+    ranks:
+      - 1
+    graph_walks:
+      - image_gen_cfg
+
+  - node_names:
+      - LLM_cfg_text
+    ranks:
+      - 3
+      - 4
+    tp_size: 2
+    graph_walks:
+      - image_gen_cfg
+
+  - node_names:
+      - LLM_cfg_img
+    ranks:
+      - 5
+      - 6
+    tp_size: 2
+    graph_walks:
+      - image_gen_cfg

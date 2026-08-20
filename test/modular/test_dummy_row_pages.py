@@ -35,11 +35,18 @@ class _StubTransferManager:
     def __init__(self, transfer_engine_info, kv_cache):
         del transfer_engine_info, kv_cache
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del transfer_info, kwargs
+        return False
 
     def cleanup(self):
         pass
+
+    def remove_request(self, request_id):
+        del request_id
 
 
 @pytest.fixture(autouse=True)
