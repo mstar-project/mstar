@@ -388,9 +388,12 @@ class BagelLanguageModel(nn.Module):
                 )
 
         for _layer_idx, decoder_layer in enumerate(self.layers):
+            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
+            # try to specialize on the layer_idx int
+            decoder_layer.self_attn.kv.set_layer_idx(_layer_idx)
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
-                layer_idx=_layer_idx,
+                layer_idx=None,
                 label=label,
                 **extra_inputs,
             )

@@ -36,6 +36,7 @@ from mstar.model.bagel.components.modeling_utils import (
     vllm_vit_resize,
 )
 from mstar.model.bagel.config import BagelModelConfig
+from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -520,23 +521,6 @@ class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TEXT_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
-    def _build_prefill_text_packed(
-        self, num_tokens: int, device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        """Synthesize a tensor-only post-preprocess packed dict for prefill_text capture.
-
-        BAGEL's ``preprocess`` for prefill_text returns a dict whose only
-        capture-relevant tensor is the packed ``input_ids`` (long); the
-        rest (``seq_lens``, ``requires_cfg``, ``input_seq_len``) are
-        non-tensor entries the runner doesn't intern. ``_forward_prefill_text``
-        embeds and forwards inside the captured region.
-        """
-        return {
-            "input_ids": torch.zeros(
-                (num_tokens,), dtype=torch.long, device=device,
-            ),
-        }
-
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BatchedCudaGraphConfig | PackedCudaGraphConfig]:
@@ -552,10 +536,7 @@ class LLMSubmodule(ARNodeSubmodule):
         unaffected (they don't depend on this capture's snapshot
         semantics).
         """
-        dummy = ARNodeInputs(
-            input_ids=torch.zeros(1, dtype=torch.long, device=device),
-            input_seq_len=1
-        )
+
         # `additional_key_info` carries what `requires_cfg` / `labels` used to:
         # the cfg-on and cfg-off decodes declare different segments, so they
         # are different capture buckets. `declare_step` stamps the same value
@@ -564,19 +545,27 @@ class LLMSubmodule(ARNodeSubmodule):
             BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=False,
-                single_request_inputs=dummy.clone(),
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=1
+                ),
             ),
             BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=True,
-                single_request_inputs=dummy.clone(),
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=1,
+                    resource_step_info=True, # requires cfg
+                ),
             ),
             PackedCudaGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text"],
                 capture_token_lengths=list(self.PREFILL_TEXT_TOKEN_BUCKETS),
-                make_node_input=lambda num_tokens: self._build_prefill_text_packed(
-                    num_tokens, device,
+                make_node_input=lambda n: ARNodeInputs(
+                    input_ids=torch.zeros(n, dtype=torch.long, device=device),
+                    input_seq_len=n
                 ),
                 additional_key_info=False,
                 compile=True,
@@ -1367,7 +1356,7 @@ class LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
-        ignore_eos = request_info.sampling_config["LLM"].ignore_eos
+        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         if (not ignore_eos and self.eos_token_id == token) or \
                 (request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2 >= request_info.max_tokens):
             return {"decode_loop"}

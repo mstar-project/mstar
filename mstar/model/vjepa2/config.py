@@ -11,6 +11,11 @@ from dataclasses import dataclass
 from typing import Any
 
 
+# Constants for resource labels
+KV_CACHE = "kv"
+ATTN = "attn"
+
+
 @dataclass
 class VJepa2ACPredictorConfig:
     """Configuration for the action-conditioned predictor (upstream V-JEPA 2-AC).

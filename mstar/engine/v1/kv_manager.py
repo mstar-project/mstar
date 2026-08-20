@@ -401,6 +401,7 @@ class KVManager(Resource):
                 "KV cache transfer across TP world size is currently disallowed"
             )
         needed_labels = self._overrides[rid].get_labels(node_name, graph_walk)
+        print(needed_labels)
         # one critical section: reading stored_len, comparing to published, and
         # firing the retrieve must be atomic against a concurrent commit/reset
         # (both non-blocking inside, so holding the lock is safe)
@@ -408,6 +409,7 @@ class KVManager(Resource):
             for label, seq_info in published.get(self._rank).items():
                 if label not in needed_labels:
                     continue
+                print(label)
                 if not self._check_ready(rid, label):
                     # read already in progress: admitted, just not ready yet
                     return AdmitOutcome(ok=True, ready=False)
@@ -439,7 +441,7 @@ class KVManager(Resource):
         )
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
-        if self._preplanned:
+        if self._preplanned and not ctx.is_preplan:
             # pages were already reserved by the preplan pass
             return ADMIT_OK
         # forks reserve here and copy later (plan for pre-, commit for post-),
@@ -746,7 +748,7 @@ class KVManager(Resource):
         ))
 
     def publish(self, request_id: str):
-        return PublishedKVInfo.build_for_rank(
+        res = PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size,
             seq_info={
                 label: KVSequenceInfo(
@@ -756,6 +758,7 @@ class KVManager(Resource):
                 ) for label, stream in self._streams[request_id].items()
             }
         )
+        return res
 
     def reset_request(self, rid: str, free: bool=False):
         streams = self._streams.get(rid)

@@ -29,20 +29,15 @@ import torch.nn.functional as F
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
-from mstar.engine.cache_manager import BatchedCacheManager
-from mstar.engine.cuda_graph_config import (
-    PiecewiseBatchedConfig,
-    PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
-)
 
-if TYPE_CHECKING:
-    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SubmoduleStep
+from mstar.engine.v1.cuda_graph_config import PiecewiseBatchedConfig, PiecewiseCaptureShape, PiecewiseCudaGraphConfig
+from mstar.engine.v1.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
-from mstar.model.vjepa2.config import VJepa2Config
+from mstar.model.vjepa2.config import ATTN, KV_CACHE, VJepa2Config
 
 logger = logging.getLogger(__name__)
 
@@ -901,7 +896,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     def _block_loop_capture(
         self,
         static_inputs: dict[str, torch.Tensor],
-        static_cm: BatchedCacheManager | None = None,
         *,
         cond_tokens: int = 2,
     ) -> dict[str, torch.Tensor]:
@@ -913,7 +907,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         before each replay. ``static_cm`` is the runner's persistent cache
         manager (planned outside the graph).
         """
-        fn = self.predictor.make_block_loop_fn(static_cm, static_inputs, cond_tokens)
+        fn = self.predictor.make_block_loop_fn(static_inputs, cond_tokens)
         return {"x": fn(static_inputs["x"])}
 
     def get_piecewise_cuda_graph_configs(
@@ -949,14 +943,30 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 "time_pos": torch.zeros(cond_tokens, dtype=torch.float32, device=device),
             }
 
+        def declare_step(
+            request_ids: list[str], seq_lens: list[int],
+        ) -> SubmoduleStep:
+            # Only the CodePredictor sampler runs in this region (no paged KV);
+            # its step sets up the cg-sampler buffers the capture reads from.
+            del seq_lens
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=1)
+                    for rid in request_ids
+                ],
+                steps={
+                    KV_CACHE: KVStep(),
+                    ATTN: AttentionStep(causal=False)
+                }
+            )
+
         return {
             "block_loop": PiecewiseBatchedConfig(
                 capture_fn=self._block_loop_capture,
                 make_static_inputs=make_static_inputs,
+                declare_step=declare_step,
                 seq_len=capture_seq_len,
                 forward_kwargs={"cond_tokens": cond_tokens},
-                uses_kv_cache=True,
-                cache_labels=["main"],
                 capture_batch_sizes=[1, 2, 4, 8],
             )
         }
@@ -1070,18 +1080,10 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             inp.tensor_inputs["states"] for inp in inputs
         ], dim=0)
 
-        per_req_seq_len = out["encoder_hidden"].shape[1] + 2
         if "extrinsics" in inputs[0].tensor_inputs:
             out["extrinsics"] = torch.cat([
                 inp.tensor_inputs["extrinsics"] for inp in inputs
             ], dim=0)
-            per_req_seq_len += 1
-
-        # plan attention
-        engine_inputs.cache_manager.plan_attention(
-            seq_lens=[per_req_seq_len] * len(inputs),
-            is_causal=False
-        )
 
         return out
 
@@ -1092,7 +1094,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         actions: torch.Tensor,                   # [B, 1, action_embed_dim]
         states: torch.Tensor,                    # [B, 1, action_embed_dim]
         t_0: int,
-        cache_handle: BatchedCacheManager,
         extrinsics: torch.Tensor | None = None,  # [B, 1, action_embed_dim - 1] or None
         request_ids: list[str] | None = None,    # needed by PiecewiseCudaGraphRunner
         runner: "PiecewiseCudaGraphRunner | None" = None,
@@ -1137,7 +1138,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 states,
                 extrinsics=extrinsics,
                 t_0=t_0,
-                cache_handle=cache_handle,
             )
 
         # Per-step LayerNorm — matches the upstream notebook's step_predictor
@@ -1164,7 +1164,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         new_tg = self._rollout_step(
             encoder_hidden, actions, states,
             t_0=request_info.dynamic_loop_iter_counts.get("rollout_loop", 0),
-            cache_handle=engine_inputs.cache_manager,
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
             runner=engine_inputs.piecewise_runners.get("block_loop"),
@@ -1207,7 +1206,6 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         new_tg = self._rollout_step(
             encoder_hidden, actions, states,
             t_0=iter_idx,
-            cache_handle=engine_inputs.cache_manager,
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
             runner=engine_inputs.piecewise_runners.get("block_loop"),

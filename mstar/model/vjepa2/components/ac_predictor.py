@@ -518,6 +518,10 @@ class VisionTransformerPredictorAC(nn.Module):
             w_pos   = static_pos_bufs["w_pos"]
             time_pos = static_pos_bufs.get("time_pos")
             for blk_num, blk in enumerate(blocks):
+                if label is not None:
+                    # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
+                    # try to specialize on the layer_idx int
+                    blk.attn.kv.set_layer_idx(blk_num)
                 x = blk(
                     x,
                     attn_mask=None,
@@ -525,7 +529,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     h=gh, w=gw,
                     action_tokens=cond_tokens,
                     label=label,
-                    layer_idx=blk_num,
+                    layer_idx=None,
                     d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
                 )
             return x
@@ -568,6 +572,10 @@ class VisionTransformerPredictorAC(nn.Module):
             )
 
         for blk_num, blk in enumerate(self.predictor_blocks):
+            if label is not None:
+                # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
+                # try to specialize on the layer_idx int
+                blk.attn.kv.set_layer_idx(blk_num)
             x = blk(
                 x,
                 attn_mask=attn_mask,
@@ -577,7 +585,7 @@ class VisionTransformerPredictorAC(nn.Module):
                 action_tokens=cond_tokens,
                 t_0=t_0,
                 label=label,
-                layer_idx=blk_num,
+                layer_idx=None,
                 d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
             )
 
