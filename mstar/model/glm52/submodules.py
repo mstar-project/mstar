@@ -674,7 +674,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_manager.set_active_label(_MAIN)
         cache_manager.plan_attention(
             seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
-        self._plan_rope(cache_manager, 
+        self._plan_rope(cache_manager,
             seq_lens=shape.seq_lens, pos_ids=None, label=_MAIN)
 
     def _mtp_draft_phase_captured(
@@ -854,7 +854,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_manager.set_active_label(_MAIN)
         cache_manager.plan_attention(
             seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
-        self._plan_rope(cache_manager, 
+        self._plan_rope(cache_manager,
             seq_lens=shape.seq_lens, pos_ids=None, label=_MAIN)
 
     def _mtp_draft_captured(
@@ -1647,7 +1647,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             for st, e in zip(starts, e_list, strict=True):
                 pos_list.extend(range(st - e + 1, st + 1))
             positions = to_device_async(pos_list, torch.long, device)
-            self._plan_rope(cache_handle, 
+            self._plan_rope(cache_handle,
                 seq_lens=e_list, pos_ids=positions, label=_MAIN)
             h_head, h_raw = mtp(
                 embed(torch.cat(sync_tokens)), torch.cat(pair_hiddens),
@@ -1707,7 +1707,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 cache_handle.set_layer_idx(mtp_layer)
                 cache_handle.plan_attention(
                     seq_lens=ones, is_causal=True, label=_MAIN)
-                self._plan_rope(cache_handle, 
+                self._plan_rope(cache_handle,
                     seq_lens=ones, pos_ids=positions, label=_MAIN)
                 it_head, prev_h = mtp(
                     embed(prev_d), prev_h, cache_handle, positions)
