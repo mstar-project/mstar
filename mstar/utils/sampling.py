@@ -682,6 +682,15 @@ class Buffer:
     row_cpu: torch.Tensor
     default: float
     dtype: torch.dtype
+    # Reuse fence for ``row_cpu``. A non_blocking H2D reads the pinned buffer
+    # whenever the DMA engine gets to it — which, with kernels queued ahead
+    # (or the host running ahead of the GPU under MSTAR_TP_ASYNC_SCHED /
+    # MSTAR_TP_STEP_BARRIER=0), can be well after the NEXT
+    # ``write_master_row`` overwrote the staging row: the earlier write would
+    # then land the later value. Recorded after every staged copy; waited
+    # before the next CPU write. Steady state the event is long complete and
+    # the wait is ~1 us.
+    _stage_ev: "torch.cuda.Event | None" = field(default=None, repr=False)
 
     @classmethod
     def allocate(
@@ -697,8 +706,14 @@ class Buffer:
         )
 
     def write_master_row(self, slot: int, value) -> None:
+        if self._stage_ev is not None:
+            self._stage_ev.synchronize()
         self.row_cpu[0] = value
         self.master[slot:slot + 1].copy_(self.row_cpu, non_blocking=True)
+        if self.master.is_cuda:
+            if self._stage_ev is None:
+                self._stage_ev = torch.cuda.Event()
+            self._stage_ev.record()
 
     def grow_master(self, new_capacity: int) -> None:
         new = torch.full(
@@ -793,6 +808,10 @@ class SamplerBuffers:
     # index tensor that ``index_select`` reads from.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
+    # Reuse fence for ``_slot_idx_cpu`` — same hazard and same treatment as
+    # ``Buffer._stage_ev``: the pinned buffer must not be refilled for step
+    # N+1 while step N's async H2D may still be queued behind kernels.
+    _slot_idx_ev: "torch.cuda.Event | None" = field(default=None, repr=False)
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
@@ -996,6 +1015,10 @@ class SamplerBuffers:
         # CPU-only fill of the pinned slot-index buffer. Unregistered rids
         # fall back to slot 0 (matches the defaults — temp=1, top_k=0, top_p=1,
         # rep_penalty=1 — for any rid the AR engine forgot to register).
+        # The fence keeps this refill from racing the PREVIOUS step's still-
+        # queued H2D of the same pinned buffer (see ``_slot_idx_ev``).
+        if self._slot_idx_ev is not None:
+            self._slot_idx_ev.synchronize()
         for i, rid in enumerate(request_ids):
             self._slot_idx_cpu[i] = self._rid_to_slot.get(rid, 0)
         for i in range(len(request_ids), padded_bs):
@@ -1004,6 +1027,10 @@ class SamplerBuffers:
         # Single async H2D (pinned) of the slot indices.
         idx_view = self._slot_idx_gpu[:padded_bs]
         idx_view.copy_(self._slot_idx_cpu[:padded_bs], non_blocking=True)
+        if idx_view.is_cuda:
+            if self._slot_idx_ev is None:
+                self._slot_idx_ev = torch.cuda.Event()
+            self._slot_idx_ev.record()
 
         # One index_select per buffer, writing directly into the
         # cuda-graph-friendly per-step buffers.
