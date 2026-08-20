@@ -31,7 +31,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.base import NodeBatch
 
 from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SubmoduleStep
-from mstar.engine.v1.cuda_graph_config import PiecewiseBatchedConfig, PiecewiseCaptureShape, PiecewiseCudaGraphConfig
+from mstar.engine.v1.cuda_graph_config import PiecewiseBatchedConfig, PiecewiseCallInputs, PiecewiseCaptureShape, PiecewiseCudaGraphConfig
 from mstar.engine.v1.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
@@ -895,9 +895,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
 
     def _block_loop_capture(
         self,
-        static_inputs: dict[str, torch.Tensor],
-        *,
-        cond_tokens: int = 2,
+        inp: PiecewiseCallInputs,
     ) -> dict[str, torch.Tensor]:
         """Captured region for the ``block_loop`` piecewise graph.
 
@@ -907,8 +905,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         before each replay. ``static_cm`` is the runner's persistent cache
         manager (planned outside the graph).
         """
-        fn = self.predictor.make_block_loop_fn(static_inputs, cond_tokens)
-        return {"x": fn(static_inputs["x"])}
+        cond_tokens = inp.kwargs.get("cond_tokens")
+        fn = self.predictor.make_block_loop_fn("main", inp.static_inputs, cond_tokens)
+        return {"x": fn(inp.static_inputs["x"])}
 
     def get_piecewise_cuda_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
@@ -946,13 +945,10 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         def declare_step(
             request_ids: list[str], seq_lens: list[int],
         ) -> SubmoduleStep:
-            # Only the CodePredictor sampler runs in this region (no paged KV);
-            # its step sets up the cg-sampler buffers the capture reads from.
-            del seq_lens
             return SubmoduleStep(
                 segments=[
-                    Segment(request_id=rid, label="main", span=1)
-                    for rid in request_ids
+                    Segment(request_id=rid, label="main", span=seq_len)
+                    for rid, seq_len in zip(request_ids, seq_lens)
                 ],
                 steps={
                     KV_CACHE: KVStep(),

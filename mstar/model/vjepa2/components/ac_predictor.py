@@ -85,6 +85,9 @@ class ACRoPEAttention(nn.Module):
         self.w_dim = third
         self.grid_size = grid_size
 
+        self.kv = None
+        self.attn = None
+
     @staticmethod
     def _separate_positions(ids: torch.Tensor, h: int, w: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens_per_frame = h * w
@@ -139,7 +142,7 @@ class ACRoPEAttention(nn.Module):
         w_pos: torch.Tensor | None = None,
         time_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if label is not None:
+        if label is not None and self.attn is not None:
             if d_pos is None:
                 d_pos, h_pos, w_pos, time_pos = self._compute_positions(
                     t_0, h, w, action_tokens, x.device, x.dtype
@@ -305,8 +308,8 @@ class ACRoPEAttention(nn.Module):
         return self.proj(x)
 
     def bind_resources(self, resources: dict) -> None:
-        self.attn = resources["attn"]
-        self.kv = resources["kv"]
+        self.attn = resources.get("attn", self.attn)
+        self.kv = resources.get("kv", self.kv)
 
 
 class ACBlock(nn.Module):

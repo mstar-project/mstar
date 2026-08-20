@@ -401,7 +401,6 @@ class KVManager(Resource):
                 "KV cache transfer across TP world size is currently disallowed"
             )
         needed_labels = self._overrides[rid].get_labels(node_name, graph_walk)
-        print(needed_labels)
         # one critical section: reading stored_len, comparing to published, and
         # firing the retrieve must be atomic against a concurrent commit/reset
         # (both non-blocking inside, so holding the lock is safe)
@@ -409,7 +408,6 @@ class KVManager(Resource):
             for label, seq_info in published.get(self._rank).items():
                 if label not in needed_labels:
                     continue
-                print(label)
                 if not self._check_ready(rid, label):
                     # read already in progress: admitted, just not ready yet
                     return AdmitOutcome(ok=True, ready=False)

@@ -304,7 +304,7 @@ class VJepa2Model(Model):
             ),
             AttentionSpec(
                 label=ATTN,
-                nodes={"Thinker"},
+                nodes={"rollout_predictor"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE
                 ),
