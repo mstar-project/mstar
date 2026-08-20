@@ -15,7 +15,13 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
 from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
 from mstar.engine.v1.attention_wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
 from mstar.engine.v1.kv_cache import KVConfig
-from mstar.engine.v1.kv_manager import SINK_PAGE, KVPlanOutput, PagedIndptrs, SequenceView
+from mstar.engine.v1.kv_manager import (
+    SINK_PAGE,
+    KVPlanOutput,
+    KVPlanOutputs,
+    PagedIndptrs,
+    SequenceView,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +294,7 @@ class FlashInferManager(AttentionManager):
             self._preplanned = False
             return
 
-        plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(self._kv_cache_name)
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
 
         # a preplan leases a different cg slot, so its wrappers and workspaces
@@ -586,7 +592,7 @@ class FlashInferCrossManager(CrossAttentionManager):
 
         key by request rather than zip with query view because not
         necessarily same length"""
-        plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._kv_cache_name
         )
         assert plan_outputs is not None, (
@@ -607,7 +613,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         if self._query_kv_cache_name is None:
             return self._step_query_packings(step)
 
-        plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._query_kv_cache_name
         )
         assert plan_outputs is not None, (
@@ -884,7 +890,7 @@ class DenseAttentionManager(AttentionManager):
             "concatenation allocate and are shaped by the step, so there is "
             "nothing for a captured graph to replay"
         )
-        plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(self._kv_cache_name)
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, (
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
         )

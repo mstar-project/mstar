@@ -2,18 +2,23 @@
 
 has ownership of per-(request,label) position counter"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, Resource
+from mstar.engine.resources.base import CGSlotKey, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
-from mstar.engine.resources.step import PositionStep, StepContext
+from mstar.engine.resources.step import (
+    ADMIT_OK,
+    AdmitOutcome,
+    PositionStep,
+    StepContext,
+)
 from mstar.engine.v1.attention_wrappers import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
-from mstar.engine.v1.kv_manager import KVPlanOutput, SequenceView
+from mstar.engine.v1.kv_manager import KVPlanOutputs, SequenceView
 
 
 class PosBackend(Enum):
@@ -64,6 +69,17 @@ class PositionSpec(NodeResourceSpec):
     @property
     def resource_type(self):
         return ResourceType.POSITIONS
+
+
+@dataclass
+class PublishedPositionInfo(PublishedInfo):
+    """Where each of a request's streams has reached. label -> next position."""
+    counters: dict[str, int] = field(default_factory=dict)
+
+    def update(self, other: "PublishedPositionInfo") -> None:
+        for label, position in other.counters.items():
+            if position > self.counters.get(label, 0):
+                self.counters[label] = position
 
 
 class PositionManager(Resource):
@@ -121,6 +137,33 @@ class RopeManager(PositionManager):
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
 
+    def publish(self, request_id: str) -> "PublishedPositionInfo | None":
+        counters = self._counters.get(request_id)
+        if not counters:
+            return None
+        return PublishedPositionInfo(counters=dict(counters))
+
+    def admit_retrieve(
+        self, rid: str, node_name: str, graph_walk: str,
+        published: "PublishedPositionInfo | None",
+    ) -> AdmitOutcome:
+        """Take on the counters a stream was published with.
+
+        A node that receives another node's KV (a CFG branch on its own GPU,
+        a decode engine after disaggregated prefill) has never advanced these
+        streams itself, so its counters start at zero while the KV it just
+        pulled in is many tokens long. Monotonic, like the KV lengths beside
+        them: a stale echo of this node's own publish never rewinds it.
+        """
+        del node_name, graph_walk
+        if published is None:
+            return ADMIT_OK
+        counters = self._counters.setdefault(rid, {})
+        for label, position in published.counters.items():
+            if position > counters.get(label, 0):
+                counters[label] = position
+        return ADMIT_OK
+
     @property
     def supports_preplan(self):
         return True
@@ -149,7 +192,7 @@ class RopeManager(PositionManager):
             "preplan requires a cuda graph step: the eager path hands back a "
             "fresh tensor rather than writing a slot's buffer"
         )
-        plan_outputs: dict[str, KVPlanOutput] = ctx.plan_results.get(
+        plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._kv_cache_name
         )
         assert plan_outputs is not None, (
@@ -158,6 +201,10 @@ class RopeManager(PositionManager):
 
         # a preplan leases a different slot, so the buffers it writes are
         # disjoint from the ones the in-flight forward reads
+        # a stream forked off another starts at the source's position, so
+        # mirror the forks KV just applied before any counter is read below
+        self._apply_forks(plan_outputs.pre_forks, ctx.request_ids)
+
         pos_ids_out = self._preplan_pos_ids if ctx.is_preplan else self._current_pos_ids
         pos_ids_out.clear()
         for plan_label, kv_out in plan_outputs.items():
@@ -169,13 +216,26 @@ class RopeManager(PositionManager):
         return pos_ids_out
 
     def commit(self, step: PositionStep, ctx: StepContext):
-        del ctx
         for segment, advance in zip(
             step.segments, self._advances(step), strict=True
         ):
             if advance:
                 counters = self._counters.setdefault(segment.request_id, {})
                 counters[segment.label] = counters.get(segment.label, 0) + advance
+
+        # post-forks copy the source after this step advanced it, matching
+        # where KV applies them
+        plan_outputs = ctx.plan_results.get(self._kv_cache_name)
+        if plan_outputs is not None:
+            self._apply_forks(plan_outputs.post_forks, ctx.request_ids)
+
+    def _apply_forks(
+        self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],
+    ) -> None:
+        for from_label, to_label in forks:
+            for rid in request_ids:
+                counters = self._counters.setdefault(rid, {})
+                counters[to_label] = counters.get(from_label, 0)
 
     def _advances(self, step: PositionStep) -> tuple[int, ...]:
         """how far does each segment move the stream counter?

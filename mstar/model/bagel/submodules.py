@@ -346,6 +346,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
 
     def forward(
         self,
+        graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         padded_images: torch.Tensor,
         packed_vae_position_ids: torch.Tensor,
@@ -722,15 +723,22 @@ class LLMSubmodule(ARNodeSubmodule):
                     pos_ids={
                         self.CFG_BATCHED_LABEL: torch.cat(pos_ids)
                     } if pos_ids else None,
+                    # the latents sit at the stream's current position every
+                    # iteration; nothing here is kept, so nothing advances
+                    advance=(0,) * len(segments),
                 ),
             })
 
         writes = graph_walk not in ("image_gen", "image_gen_cfg")
-        # Image blocks occupy one position regardless of their token count.
-        pos_advance = (
-            (1,) * len(segments)
-            if graph_walk in ("prefill_vit", "prefill_vae") else None
-        )
+        if graph_walk in ("prefill_vit", "prefill_vae"):
+            # An image block occupies one position regardless of token count.
+            pos_advance = (1,) * len(segments)
+        elif not writes:
+            # Flow matching: the caches are frozen and every iteration puts the
+            # latents at the same position, so the counters must not move.
+            pos_advance = (0,) * len(segments)
+        else:
+            pos_advance = None
         pos_ids = {
             label: torch.cat(tensors)
             for label, tensors in per_label_pos_ids.items() if tensors

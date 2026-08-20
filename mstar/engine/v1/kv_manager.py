@@ -202,6 +202,31 @@ class KVPlanOutput:
         return all(view.to_compute == 1 for view in self.views)
 
 
+class KVPlanOutputs(dict[str, KVPlanOutput]):
+    """Plan label -> output, plus the label forks of the step it came from.
+
+    A dict subclass so consumers that only want the per-label plans keep
+    reading it as the mapping it is. Positions need the forks too — a fork
+    target inherits the source's counter the way it inherits its pages — and
+    a fork target is not necessarily a segment of the step, so it has
+    nowhere else to ride.
+    """
+
+    __slots__ = ("pre_forks", "post_forks")
+
+    def __init__(
+        self,
+        mapping: dict[str, KVPlanOutput] | None = None,
+        pre_forks: tuple[tuple[str, str], ...] = (),
+        post_forks: tuple[tuple[str, str], ...] = (),
+    ):
+        super().__init__(mapping or {})
+        # applied by `plan`; the consumer mirrors them at plan time
+        self.pre_forks = pre_forks
+        # applied by `commit`, after this step's spans land
+        self.post_forks = post_forks
+
+
 # Page the padding tail of a captured step scatters into. Reserved at
 # construction so no request is ever handed it; see KVPlanState.copy_.
 SINK_PAGE = 0
@@ -614,12 +639,16 @@ class KVManager(Resource):
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.request_ids:
                 self._apply_fork(rid, from_label, to_label)
-        res = {
-            plan_label: self._plan_output(self._sequence_views(segments))
-            for plan_label, segments in group_by_plan_label(
-                step.segments, step.combined_labels
-            ).items()
-        }
+        res = KVPlanOutputs(
+            {
+                plan_label: self._plan_output(self._sequence_views(segments))
+                for plan_label, segments in group_by_plan_label(
+                    step.segments, step.combined_labels
+                ).items()
+            },
+            pre_forks=step.pre_forks,
+            post_forks=step.post_forks,
+        )
         self._setup_plan_states(res, ctx)
         if ctx.is_preplan:
             self._preplanned = True
