@@ -373,6 +373,8 @@ class Engine:
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
         ) or batch.step_context.slot_lease is not None
+        if not batch.running_batched:
+            print("WARNING NOT RUNNING BATCHED")
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
 
     def exec(
