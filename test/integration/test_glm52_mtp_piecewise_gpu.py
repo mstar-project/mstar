@@ -398,6 +398,33 @@ def test_phase_prepare_matches_unprepared_bit_identically():
             f"base     {baseline[rid]}\n prepared {prepared[rid]}")
 
 
+def test_plan_rope_skip_matches_default_bit_identically():
+    """MSTAR_GLM52_PLAN_ROPE=0: GLM applies RoPE explicitly, so the staged
+    rope plans should be dead — this is the check standing between that
+    claim and a box arm. If anything in the MLA plan/replay path actually
+    consumes ps.pos_ids, the streams fork here, not on 8 GPUs."""
+    cfg = _cfg()
+    model = _build(cfg)
+    prompts = _prompts(2)
+
+    baseline, _ = _drive(cfg, model, prompts, steps=5, use_graphs=True)
+    prev = os.environ.get("MSTAR_GLM52_PLAN_ROPE")
+    os.environ["MSTAR_GLM52_PLAN_ROPE"] = "0"
+    try:
+        skipped, runners = _drive(cfg, model, prompts, steps=5, use_graphs=True)
+    finally:
+        if prev is None:
+            os.environ.pop("MSTAR_GLM52_PLAN_ROPE", None)
+        else:
+            os.environ["MSTAR_GLM52_PLAN_ROPE"] = prev
+
+    assert MTP_TRUNK_LABEL in runners
+    for rid in baseline:
+        assert baseline[rid] == skipped[rid], (
+            f"{rid}: PLAN_ROPE=0 diverged — something DOES read the rope "
+            f"plan:\n default {baseline[rid]}\n skipped {skipped[rid]}")
+
+
 def test_captured_decode_step_syncs_exactly_once():
     """The sync discipline behind the draft-chain speedup (2026-08-19).
 

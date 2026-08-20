@@ -273,6 +273,18 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_phase_prepare = (
             os.environ.get("MSTAR_GLM52_MTP_PHASE_PREPARE", "0") == "1"
         )
+        # GLM-5.2 applies RoPE explicitly (Glm52RotaryEmbedding(position_ids),
+        # components/attention.py:185/250) and never calls
+        # ``cache_handle.apply_rope`` — the only consumer of what plan_rope
+        # stages (cache_manager.py:549 asserts ps.pos_ids inside apply_rope).
+        # Every GLM plan_rope call is therefore dead work: a pinned host
+        # build + async H2D per plan (3-4 per MTP step, 2 of them on the
+        # post-verify critical path). MSTAR_GLM52_PLAN_ROPE=0 skips them;
+        # default 1 keeps today's behavior until a box arm confirms
+        # bit-identity (the GPU rung checks it first).
+        self._glm_plan_rope = (
+            os.environ.get("MSTAR_GLM52_PLAN_ROPE", "1") == "1"
+        )
         # One-shot flag: warn the first time an MTP decode trunk runs eager
         # (no captured piecewise bucket) — the 2026-08-09 bench showed that
         # regression is 13x and silence lets it masquerade as "MTP is slow".
@@ -648,7 +660,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_manager.set_active_label(_MAIN)
         cache_manager.plan_attention(
             seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
-        cache_manager.plan_rope(
+        self._plan_rope(cache_manager, 
             seq_lens=shape.seq_lens, pos_ids=None, label=_MAIN)
 
     def _mtp_draft_phase_captured(
@@ -690,6 +702,13 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         static_cm.select_plan_slot(_MAIN, 0)
         return {"drafts": torch.stack(cols, dim=1)}  # (bs, k)
 
+    def _plan_rope(self, cache_manager, **kw) -> None:
+        """GLM's rope plans are dead unless something regrows an
+        ``apply_rope`` consumer — see the MSTAR_GLM52_PLAN_ROPE note in
+        ``__init__``. Default on (unchanged); flip off in a measured arm."""
+        if getattr(self, "_glm_plan_rope", True):
+            cache_manager.plan_rope(**kw)
+
     def _plan_sync_slot(
         self,
         cache_manager: BatchedCacheManager,
@@ -706,7 +725,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             if sl > 0:
                 start = cache_manager._get_state(rid, _MAIN).position_id_start
                 pos.extend(range(start + 1, start + 1 + sl))
-        cache_manager.plan_rope(seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
+        self._plan_rope(cache_manager, seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
 
     def _plan_chain_slots(
         self, cache_manager: BatchedCacheManager, present: list[bool],
@@ -724,7 +743,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 for rid, sl in zip(cache_manager.request_ids, ones, strict=True)
                 if sl > 0
             ]
-            cache_manager.plan_rope(seq_lens=ones, pos_ids=pos_it, label=_MAIN)
+            self._plan_rope(cache_manager, seq_lens=ones, pos_ids=pos_it, label=_MAIN)
             cache_manager.advance_seq_lens()
         cache_manager.select_plan_slot(_MAIN, 0)
 
@@ -821,7 +840,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         cache_manager.set_active_label(_MAIN)
         cache_manager.plan_attention(
             seq_lens=shape.seq_lens, is_causal=True, label=_MAIN)
-        cache_manager.plan_rope(
+        self._plan_rope(cache_manager, 
             seq_lens=shape.seq_lens, pos_ids=None, label=_MAIN)
 
     def _mtp_draft_captured(
@@ -872,7 +891,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # A host list: plan_rope stages it through pinned memory and copies
         # async. ``torch.tensor(pos, device=cuda)`` here was a pageable H2D
         # that drained the stream on every chain iteration.
-        cache_manager.plan_rope(seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
+        self._plan_rope(cache_manager, seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
 
     def _mtp_sync_captured(
         self,
@@ -922,7 +941,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             if sl > 0:
                 start = cache_manager._get_state(rid, _MAIN).position_id_start
                 pos.extend(range(start + 1, start + 1 + sl))
-        cache_manager.plan_rope(seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
+        self._plan_rope(cache_manager, seq_lens=shape.seq_lens, pos_ids=pos, label=_MAIN)
 
     def prepare_inputs(
         self,
@@ -1020,7 +1039,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if trunk_runner is None and prefill_runner is None:
             cache_manager.plan_attention(
                 seq_lens=seq_lens, is_causal=True, label=_MAIN)
-            cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label=_MAIN)
+            self._plan_rope(cache_manager, seq_lens=seq_lens, pos_ids=None, label=_MAIN)
 
         device = self.get_device()
         # With dsa_long_context off, dense MLA equals the reference
@@ -1614,7 +1633,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             for st, e in zip(starts, e_list, strict=True):
                 pos_list.extend(range(st - e + 1, st + 1))
             positions = to_device_async(pos_list, torch.long, device)
-            cache_handle.plan_rope(
+            self._plan_rope(cache_handle, 
                 seq_lens=e_list, pos_ids=positions, label=_MAIN)
             h_head, h_raw = mtp(
                 embed(torch.cat(sync_tokens)), torch.cat(pair_hiddens),
@@ -1674,7 +1693,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 cache_handle.set_layer_idx(mtp_layer)
                 cache_handle.plan_attention(
                     seq_lens=ones, is_causal=True, label=_MAIN)
-                cache_handle.plan_rope(
+                self._plan_rope(cache_handle, 
                     seq_lens=ones, pos_ids=positions, label=_MAIN)
                 it_head, prev_h = mtp(
                     embed(prev_d), prev_h, cache_handle, positions)
