@@ -28,7 +28,12 @@ from mstar.engine.v1.cuda_graph_runner import (
 )
 from mstar.engine.v1.kv_transfer import TransferEngineInfo
 from mstar.engine.v1.sampler import SamplerResource
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import (
+    LazyRequestStates,
+    ModelInputsFromEngine,
+    NodeInputs,
+    NodeSubmodule,
+)
 from mstar.profile.worker import ExecTimings
 from mstar.utils.profiler import mark, range_pop, range_push
 
@@ -581,9 +586,7 @@ class Engine:
             piecewise_runners=submodule_mgmt.piecewise_runners,
             # padding rows get their own states, like their cache streams:
             # the submodule indexes this by step id, not by real rid
-            per_request_states={
-                rid: submodule.request_state(rid) for rid in rids
-            },
+            per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
         )

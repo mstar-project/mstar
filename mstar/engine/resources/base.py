@@ -8,7 +8,7 @@ import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
-from mstar.engine.resources.step import AdmitOutcome, BucketKey, ResourceStep, StepContext
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
     # the config reaches back here through the submodule base, so keep the
@@ -81,12 +81,12 @@ class Resource(ABC):
         of a retrieval if needed (e.g., PD disaggregation KV transfer).
         Returns whether the retrieve has completed.
         """
-        return AdmitOutcome(ok=True, ready=True)
+        return ADMIT_OK
 
     # Step lifecycle
 
     def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
-        return AdmitOutcome(ok=True)
+        return ADMIT_OK
 
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:
         """ret is immutable and opaque to runner; only gives to `ctx.plan_results`"""

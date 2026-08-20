@@ -9,6 +9,7 @@ from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import (
+    ADMIT_OK,
     AdmitOutcome,
     AllocationFailed,
     KVStep,
@@ -116,8 +117,9 @@ class AllocResult:
     error: AllocationFailed | None = None
 
 
-@dataclass
-class SequenceView:
+class SequenceView(NamedTuple):
+    """One (request, label) stream as this step sees it. A NamedTuple because
+    it is built per segment per step and never mutated."""
     request_id: str
     label: str
     page_idxs: list[int]
@@ -392,7 +394,7 @@ class KVManager(Resource):
         published: PublishedKVInfo | None
     ) -> AdmitOutcome:
         if published is None:
-            return AdmitOutcome(ok=True)
+            return ADMIT_OK
     
         if published.world_size != self._world_size:
             raise RuntimeError(
@@ -439,7 +441,7 @@ class KVManager(Resource):
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned:
             # pages were already reserved by the preplan pass
-            return AdmitOutcome(ok=True)
+            return ADMIT_OK
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
@@ -474,7 +476,7 @@ class KVManager(Resource):
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
         # TODO: apply retention policy
 
-        return AdmitOutcome(ok=True)
+        return ADMIT_OK
 
     def _sequence_views(self, segments: list[Segment]) -> list[SequenceView]:
         views = []

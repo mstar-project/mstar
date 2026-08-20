@@ -2,19 +2,22 @@
 import itertools
 from collections.abc import KeysView
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
 
-@dataclass(frozen=True)
-class Segment:
+class Segment(NamedTuple):
     """One step's addition to a request's cache stream.
 
     A request contributes one segment per label active for it in a step;
     the batch's ordered segment list defines the layout of per-token
     arrays. ``span`` may be 0: a zero-span segment reads its stream
     without extending it (admission reserves nothing, commit is a no-op).
+
+    A NamedTuple, not a frozen dataclass: one is built per request per
+    step, and the frozen dataclass's ``object.__setattr__``-per-field
+    __init__ is the expensive way to do that.
     """
     request_id: str
     label: str
@@ -188,8 +191,12 @@ class AllocationFailed(AdmitFailedReason):
     request_id: str
 
 
-@dataclass(frozen=True)
-class AdmitOutcome:
+class AdmitOutcome(NamedTuple):
     ok: bool
     ready: bool = True
     reason: AdmitFailedReason | None = None
+
+
+# Every resource's admit returns this on the common path, several times a
+# step; nothing reads identity, so hand back one instance rather than build it.
+ADMIT_OK = AdmitOutcome(ok=True, ready=True)

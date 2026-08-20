@@ -7,7 +7,7 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
-from mstar.engine.resources.step import AdmitOutcome, SamplerStep, StepContext
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SamplerStep, StepContext
 from mstar.utils.sampling import CudaGraphableSampler, Sampler, SamplerBuffers
 
 
@@ -196,7 +196,7 @@ class SamplerResource(Resource):
             if __debug__ and self._apply_penalty_this_step \
                     and not self._penalty_needed_this_step:
                 self._assert_penalty_inert(ctx)
-        return AdmitOutcome(ok=True)
+        return ADMIT_OK
 
     def _assert_penalty_inert(self, ctx: StepContext) -> None:
         """Skipping the mask is sound only while every penalty in the step is 1.0.

@@ -792,6 +792,11 @@ class SamplerBuffers:
     # Real (unpadded) batch size of the last gather per cg slot — the
     # scatter-back writes only these rows (padding rows all map to slot 0).
     _last_real_bs: list[int] = field(default_factory=list, repr=False)
+    # cg slot -> the (rids, padded_bs) its pinned index row currently holds, so
+    # gather_dynamic can re-issue the H2D without redoing the O(bs) CPU fill
+    _staged_rids: dict[int, tuple[tuple[str, ...], int]] = field(
+        default_factory=dict, repr=False
+    )
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
@@ -1002,10 +1007,10 @@ class SamplerBuffers:
     # Per-step gather: pinned-H2D slot-index → index_select into per-step bufs
     # ------------------------------------------------------------------
 
-    def _fill_slot_idx(
+    def _stage_slot_idx(
         self, request_ids: list[str], padded_bs: int, cg_slot: int,
-    ) -> torch.Tensor:
-        """Stage this batch's master-slot indices for ``cg_slot`` and H2D them.
+    ) -> None:
+        """Write this batch's master-slot indices into ``cg_slot``'s pinned row.
 
         Padding slots (``i >= len(request_ids)``) reuse slot 0's row — the
         captured graph forwards them through the same kernels as real slots,
@@ -1025,6 +1030,10 @@ class SamplerBuffers:
             self._slot_idx_cpu[cg_slot, i] = slot
         for i in range(len(request_ids), padded_bs):
             self._slot_idx_cpu[cg_slot, i] = 0
+        self._staged_rids[cg_slot] = (tuple(request_ids), padded_bs)
+
+    def _upload_slot_idx(self, padded_bs: int, cg_slot: int) -> torch.Tensor:
+        """H2D the staged row on the CURRENT stream, and hand back its view."""
         idx_view = self._slot_idx_gpu[cg_slot, :padded_bs]
         idx_view.copy_(self._slot_idx_cpu[cg_slot, :padded_bs], non_blocking=True)
         return idx_view
@@ -1035,7 +1044,8 @@ class SamplerBuffers:
         """Gather the per-request scalar config (temp/top_k/top_p/seed/penalty)
         into ``cg_slot``. Safe to pre-plan: these change only on a config
         update, never step to step."""
-        idx_view = self._fill_slot_idx(request_ids, padded_bs, cg_slot)
+        self._stage_slot_idx(request_ids, padded_bs, cg_slot)
+        idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         for buf in self._scalar_buffers():
             buf.gather(idx_view, padded_bs, cg_slot)
         self._last_real_bs[cg_slot] = len(request_ids)
@@ -1047,12 +1057,18 @@ class SamplerBuffers:
         """Gather the per-step state — RNG offset and seen-token mask — into
         ``cg_slot``. Must run inline (default stream) AFTER the previous step's
         commit scattered the offset / synced the mask; pre-planning it reads
-        stale state across the plan/default stream boundary. Re-fills the slot
-        index on the default stream so it doesn't depend on a plan-stream fill.
+        stale state across the plan/default stream boundary.
+
+        Only the H2D is re-issued (the pinned row ``gather_static`` staged for
+        this slot is stream-agnostic, and this step's batch is the one it was
+        staged for) — restaging is the fallback for a caller that reached here
+        without a matching ``gather_static``.
 
         The seen-token mask is large ([bs, V] bool); only gathered when the
         caller's graph actually applies the penalty in-graph (the Talker)."""
-        idx_view = self._fill_slot_idx(request_ids, padded_bs, cg_slot)
+        if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
+            self._stage_slot_idx(request_ids, padded_bs, cg_slot)
+        idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
@@ -1061,9 +1077,6 @@ class SamplerBuffers:
         """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).
         Valid regardless of when the buffers are (re)gathered into."""
         return CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
-
-        slices = self.slice_for_bs(padded_bs, cg_slot)
-        return CudaGraphableSampler(**slices)
 
     def scatter_offset(self, cg_slot: int = 0) -> None:
         """Persist the (in-graph advanced) per-step offsets back to their slot

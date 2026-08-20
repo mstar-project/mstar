@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -190,6 +191,37 @@ class PerRequestState:
         return key in self.tensors or key in self.kwargs
 
 
+class LazyRequestStates(Mapping):
+    """The batch's ``PerRequestState``s, resolved on first read.
+
+    Only a couple of submodules read these, but the engine builds the view for
+    every step of every node; materialising the dict there is bs dict inserts
+    (and, for a padded step, bs ``PerRequestState`` allocations) per step that
+    nothing usually looks at.
+    """
+
+    __slots__ = ("_submodule", "_rids", "_members")
+
+    def __init__(self, submodule: "NodeSubmodule", rids: "Sequence[str]"):
+        self._submodule = submodule
+        self._rids = rids
+        self._members: set[str] | None = None
+
+    def __getitem__(self, rid: str) -> "PerRequestState":
+        # membership set built on first read, so a step nobody reads pays nothing
+        if self._members is None:
+            self._members = set(self._rids)
+        if rid not in self._members:
+            raise KeyError(rid)
+        return self._submodule.request_state(rid)
+
+    def __iter__(self):
+        return iter(self._rids)
+
+    def __len__(self) -> int:
+        return len(self._rids)
+
+
 @dataclass
 class ModelInputsFromEngine:
     request_ids: list[str]
@@ -204,7 +236,8 @@ class ModelInputsFromEngine:
 
     # The batch's per-request states, injected by the engine (None on paths
     # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
-    per_request_states: dict[str, PerRequestState] | None = None
+    # Usually a ``LazyRequestStates`` view rather than a materialised dict.
+    per_request_states: "Mapping[str, PerRequestState] | None" = None
 
     # This step's declaration, as ``declare_step`` returned it. A forward
     # that has to agree with its own declaration reads it here rather than

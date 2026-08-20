@@ -12,7 +12,7 @@ from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
-from mstar.engine.resources.step import AdmitOutcome, SubmoduleStep
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SubmoduleStep
 
 
 def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
@@ -60,6 +60,13 @@ class StepRunner:
         # admit/plan/commit reuse this rather than re-filtering _order each call
         self._keys_cache: dict[frozenset[str], list[str]] = {}
         self._preplan_keys_cache: dict[frozenset[str], list[str]] = {}
+        # publish runs per rid per step; most resources inherit the base
+        # no-op, so settle who can actually publish once instead of calling
+        # every resource bs times a step to be handed None
+        self._publish_order = [
+            key for key in self._order
+            if type(self._resources[key]).publish is not Resource.publish
+        ]
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -140,7 +147,7 @@ class StepRunner:
             if not outcome.ok:
                 return outcome
             ready = ready and outcome.ready
-        return AdmitOutcome(ok=True, ready=ready)
+        return ADMIT_OK if ready else AdmitOutcome(ok=True, ready=False)
 
 
 
@@ -152,7 +159,7 @@ class StepRunner:
             if not outcome.ok:
                 return outcome
             ready = ready and outcome.ready
-        return AdmitOutcome(ok=True, ready=ready)
+        return ADMIT_OK if ready else AdmitOutcome(ok=True, ready=False)
 
     def plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan in dependency order
@@ -176,7 +183,7 @@ class StepRunner:
             if not outcome.ok:
                 return outcome
             ready = ready and outcome.ready
-        return AdmitOutcome(ok=True, ready=ready)
+        return ADMIT_OK if ready else AdmitOutcome(ok=True, ready=False)
 
     def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan the pre-planning subset, a step ahead
@@ -200,11 +207,14 @@ class StepRunner:
         """durable state outward publish
 
         non-publish resources noop; pairs with `admit_retrieve`"""
+        if not self._publish_order:
+            return {rid: {} for rid in request_ids}
+        publishers = [(key, self._resources[key]) for key in self._publish_order]
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
-            for key in self._order:
-                info = self._resources[key].publish(rid)
+            for key, resource in publishers:
+                info = resource.publish(rid)
                 if info is not None:
                     per_key[key] = info
             out[rid] = per_key
