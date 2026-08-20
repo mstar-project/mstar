@@ -765,3 +765,27 @@ def test_mtp_acceptance_log_per_position(caplog):
         r.getMessage() for r in caplog.records if "by position" in r.getMessage()
     ]
     assert "POST-final-norm" in post_line
+
+
+def test_graph_config_getters_stop_the_load_heartbeat():
+    """Both capture-config getters must kill the load heartbeat BEFORE any
+    capture: under cudaStreamCaptureModeGlobal the heartbeat's cuBLAS mm
+    from its own thread both fails and invalidates an in-flight capture
+    (2026-08-20 arm U1: an mtp_trunk bucket capture died on two ranks and
+    every request hung in NCCL for the rest of the box hold)."""
+    import threading
+
+    cfg = _mtp_cfg(2)
+    model = Glm52ForCausalLM(cfg)
+
+    sub = Glm52LLMSubmodule(model, cfg)
+    stop = threading.Event()
+    sub.set_load_heartbeat_stop(stop)
+    sub.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.bfloat16)
+    assert stop.is_set(), "piecewise config getter must stop the heartbeat"
+
+    sub2 = Glm52LLMSubmodule(model, cfg)
+    stop2 = threading.Event()
+    sub2.set_load_heartbeat_stop(stop2)
+    sub2.get_cuda_graph_configs(torch.device("cpu"))
+    assert stop2.is_set(), "full-graph config getter must stop the heartbeat"

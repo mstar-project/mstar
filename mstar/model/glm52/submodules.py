@@ -392,6 +392,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
+        # Graph capture is about to start. The load heartbeat MUST die first:
+        # its cuBLAS mm can hit a lazy allocation, and under the capturer's
+        # default cudaStreamCaptureModeGlobal ANY unsafe CUDA API call from
+        # ANY thread both fails and invalidates the in-flight capture. On
+        # 2026-08-20 (arm U1) exactly that killed an mtp_trunk bucket capture
+        # on two ranks mid-collective and every subsequent request hung in
+        # NCCL — a 68-minute box hold for zero tokens. Capture + warmup
+        # produce plenty of GPU activity for the box reaper, so nothing
+        # needs the tick from here on.
+        self._stop_load_heartbeat()
         if self.config.dsa_long_context:
             # DSA maintenance is host-side per-request work (k-store appends,
             # per-request selection + gather loops): a captured decode would
@@ -484,6 +494,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         ``_forward_batched_mtp``. Same MSTAR_GLM52_GRAPH_COMPILE gate as
         the full-forward captures so the kernel stack matches the k=0 fast
         config."""
+        # See get_cuda_graph_configs: the load heartbeat must be dead before
+        # any capture begins (global capture mode + the heartbeat's cuBLAS mm
+        # broke an mtp_trunk capture and hung the server, 2026-08-20 arm U1).
+        self._stop_load_heartbeat()
         k = self.config.mtp_num_draft_tokens
         if (
             k <= 0

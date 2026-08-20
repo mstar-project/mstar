@@ -87,8 +87,16 @@ def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
         # matmul still samples ~5% utilization — visible, near-free.
         a = torch.ones(8192, 8192, device=device, dtype=torch.bfloat16)
         while not stop.wait(0.25):
-            for _ in range(5):
-                torch.mm(a, a)
+            try:
+                for _ in range(5):
+                    torch.mm(a, a)
+            except torch.AcceleratorError:
+                # A CUDA graph capture is in flight somewhere in the process
+                # (global capture mode rejects unsafe calls from any thread).
+                # The capture path stops this thread before capturing —
+                # get_cuda_graph_configs / get_piecewise_cuda_graph_configs —
+                # so this is a race backstop: skip the tick, stay alive.
+                continue
 
     t = threading.Thread(target=_tick, daemon=True, name="glm52-load-heartbeat")
     t.start()
