@@ -310,8 +310,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._load_heartbeat_stop = stop
 
     def _stop_load_heartbeat(self) -> None:
-        if self._load_heartbeat_stop is not None:
-            self._load_heartbeat_stop.set()
+        # getattr: the graph-config getters call this first thing, and the CPU
+        # tests construct partially-initialized submodules that never ran
+        # __init__ (nn.Module.__getattr__ would raise, not return None).
+        stop = getattr(self, "_load_heartbeat_stop", None)
+        if stop is not None:
+            stop.set()
             self._load_heartbeat_stop = None
 
     def cleanup_request(self, request_id: str):
