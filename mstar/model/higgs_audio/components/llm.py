@@ -24,7 +24,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, HiggsAudioModelConfig
 
 
 def _build_decoder_layer(
@@ -41,6 +41,9 @@ def _build_decoder_layer(
             rms_norm_eps=config.rms_norm_eps,
             rope_theta=config.rope_theta,
             input_hidden_size=config.hidden_size,
+            attn_key=ATTN,
+            kv_key=KV_CACHE,
+            pos_key=ROPE,
         ),
         mlp=ParallelGatedMLP(
             comm_group=comm_group,
@@ -88,8 +91,11 @@ class HiggsAudioLLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = input_embeds
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
+            # try to specialize on the layer_idx int
+            decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
-                hidden_states=hidden_states, label=label, layer_idx=layer_idx,
+                hidden_states=hidden_states, label=label, layer_idx=None,
             )
         # the advance is the runner's now, off the step declaration
         return self.norm(hidden_states)

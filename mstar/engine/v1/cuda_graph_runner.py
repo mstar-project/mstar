@@ -603,7 +603,15 @@ class CudaGraphRunner:
         if slot is None:
             slot = self._next_slot
             self._next_slot = (self._next_slot + 1) % self._num_slots
-        return SlotLease(slot=slot % len(bucket.slots), bucket=key)
+        # Hand back the bucket the capture ran under, not the alias this walk
+        # found it by. Resources key their per-slot state (attention wrappers,
+        # position buffers) on `lease.bucket`, so a lease naming an aliased
+        # walk would build them fresh at replay instead of reusing the ones the
+        # graph recorded addresses for — see `_get_addtl_slot_specs`.
+        return SlotLease(
+            slot=slot % len(bucket.slots),
+            bucket=replace(key, graph_walk=bucket.config.capture_graph_walk),
+        )
 
     def slot_for(self, lease: SlotLease) -> CudaGraphSlot:
         return self._buckets[lease.bucket].slots[lease.slot]

@@ -15,7 +15,7 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
 from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
 from mstar.engine.v1.attention_wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
 from mstar.engine.v1.kv_cache import KVConfig
-from mstar.engine.v1.kv_manager import KVPlanOutput, PagedIndptrs, SequenceView
+from mstar.engine.v1.kv_manager import SINK_PAGE, KVPlanOutput, PagedIndptrs, SequenceView
 
 logger = logging.getLogger(__name__)
 
@@ -671,10 +671,16 @@ class FlashInferCrossManager(CrossAttentionManager):
                 f"no cross attention context for request {request_id!r} "
                 f"under label {self._context_label!r}"
             )
-            assert context.length > 0, (
-                f"cross attention context for request {request_id!r} is "
-                "empty; it must be written before the step that attends it"
-            )
+            if context.length == 0:
+                # A capture's padding row never had an encoder context written,
+                # and `release` resets the streams after every replay, so this
+                # is the normal state for the tail of a padded batch. Plan it
+                # against SINK_PAGE: a well-formed row whose output the step
+                # discards, rather than failing the whole batch.
+                all_pages.append(SINK_PAGE)
+                kv_indptr.append(kv_indptr[-1] + 1)
+                last_page_lens.append(1)
+                continue
             # stream can have more pages than context needs takes only the prefix
             # written length covers
             n_pages = (context.length + page_size - 1) // page_size

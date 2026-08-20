@@ -3,9 +3,8 @@
 # ---------------------------------------------------------------------------
 #
 # Two submodules covering the encoder-decoder pipeline:
-#   1. WhisperEncoderSubmodule  (enc_dec engine)  — HF WhisperEncoder, one-shot
-#   2. WhisperDecoderSubmodule  (ar engine)       — mstar-native decoder with
-#      paged self-attn KV cache + per-request static cross-attn K/V
+#   1. WhisperEncoderSubmodule  (stateless)  — HF WhisperEncoder, one-shot
+#   2. WhisperDecoderSubmodule  (KV/attention/cross-attention/positions/sampler)
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -18,8 +17,12 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
-from mstar.engine.kv_store import PositionInfo
+from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
+from mstar.engine.v1.attention_manager import AttentionManager
+from mstar.engine.v1.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
+from mstar.engine.v1.engine import ExecutingBatch
+from mstar.engine.v1.position_manager import PositionManager
+from mstar.engine.v1.sampler import SamplerResource
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -28,14 +31,22 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
 )
 from mstar.model.whisper.components.decoder import WhisperDecoderModel
-from mstar.model.whisper.config import WhisperModelConfig
-from mstar.utils.sampling import SeenTokenMask
+from mstar.model.whisper.config import (
+    ATTN,
+    CONTEXT_LABEL,
+    CROSS_ATTN,
+    CROSS_KV_CACHE,
+    KV_CACHE,
+    POS,
+    SAMPLER,
+    WhisperModelConfig,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ===================================================================
-# 1. WhisperEncoderSubmodule (enc_dec engine)
+# 1. WhisperEncoderSubmodule (stateless)
 # ===================================================================
 
 
@@ -81,7 +92,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
 
 
 # ===================================================================
-# 2. WhisperDecoderSubmodule (ar engine)
+# 2. WhisperDecoderSubmodule
 # ===================================================================
 
 
@@ -91,18 +102,22 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     Dispatches on graph_walk:
       - prefill: embed the forced decoder prompt
         (``<|startoftranscript|><|lang|><|task|><|notimestamps|>``),
-        compute per-layer cross-attn K/V from ``encoder_states`` and
-        write them into the engine's cross-attention context pool (they
-        are static for the whole generation), fill the self-attn KV
-        cache, and emit logits for the first token.
+        project ``encoder_states`` to per-layer cross-attention K/V and
+        write them into the context stream, fill the self-attention KV
+        cache, and sample the first transcript token.
       - decode: embed the previous token, single-step decode.
 
-    Cross-attn K/V live in the engine's per-source context pool (see
-    ``KVCacheConfig.cross_attn`` / issue #160); the write + plan happen
-    in ``preprocess`` so ``forward`` is pure planned compute. Requests
-    still run one per step (``can_batch`` False) — batching is now an
-    engine-side follow-up rather than blocked on submodule state.
+    Both cache streams belong to the step: ``main`` grows by the token
+    count, ``context`` grows by the encoder output at prefill and is
+    declared zero-span (read-only) thereafter. Only decode is captured —
+    prefill runs once per request and is dominated by the 1500-token
+    cross-K/V projection, which has nothing to gain from a graph.
     """
+
+    # Every prefill is the same shape (a 4-token forced prompt over a
+    # max_source_positions encoder window), so decode is the only walk whose
+    # capture buys anything.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
         super().__init__()
@@ -110,12 +125,6 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         self.config = config
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
-        # Compile-inline cross-attn fast path (#160 recovery): contiguous
-        # per-request encoder K/V, computed once at prefill and fed into the
-        # torch.compiled decoder forward every step so cross-attn is traced
-        # inline (see WhisperCrossAttention). Keyed by request_id; freed in
-        # check_stop. Each entry is (cross_k, cross_v), stacked over layers.
-        self._cross_kv: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def _apply_suppress(self, logits: torch.Tensor, is_first_token: bool) -> torch.Tensor:
         """HF generate parity: mask the always-suppressed token set, plus
@@ -134,29 +143,85 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             logits.index_fill_(-1, self._begin_suppress_ids, float("-inf"))
         return logits
 
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[CudaGraphConfig]:
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
+                    input_seq_len=1,
+                ),
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+            ),
+        ]
+
     def prepare_inputs(
         self,
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        seen_token_mask: SeenTokenMask = None,
-        pos_info: dict[str, PositionInfo] = {},
         **kwargs,
     ) -> ARNodeInputs:
-        device = self.decoder.embed_tokens.weight.device
-        start_pos = pos_info.get("main", PositionInfo()).position_id_start
-
+        device = self.get_device()
         token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
-        embeds = self.decoder.embed(token_ids, start_pos)
 
         tensor_inputs = {}
         if graph_walk == "prefill":
-            tensor_inputs["encoder_states"] = inputs["encoder_states"][0]
+            tensor_inputs["encoder_states"] = inputs["encoder_states"][0].to(device)
 
         return ARNodeInputs(
             input_seq_len=token_ids.shape[0],
-            input_embeds=embeds,
+            input_ids=token_ids,
             tensor_inputs=tensor_inputs,
+        )
+
+    @staticmethod
+    def _context_span(inp: ARNodeInputs) -> int:
+        """How far this step grows the request's encoder-context stream.
+
+        Non-zero only on the prefill that writes it; every later step reads
+        the same pages without extending them.
+        """
+        encoder_states = inp.tensor_inputs.get("encoder_states")
+        return 0 if encoder_states is None else encoder_states.shape[0]
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+    ) -> SubmoduleStep:
+        context_segments = tuple(
+            Segment(
+                request_id=rid,
+                label=CONTEXT_LABEL,
+                span=self._context_span(inp),
+            ) for rid, inp in zip(request_ids, inputs, strict=True)
+        )
+        return SubmoduleStep(
+            # the default, for the resources over the self-attention cache
+            segments=[
+                Segment(
+                    request_id=rid,
+                    label="main",
+                    span=inp.input_seq_len,
+                ) for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            steps={
+                KV_CACHE: KVStep(),
+                ATTN: AttentionStep(causal=True),
+                # The context stream: a real span on the prefill that writes
+                # it, zero afterwards. `commit` is what turns the prefill's
+                # reservation into resident pages the later steps read.
+                CROSS_KV_CACHE: KVStep(segments=context_segments),
+                CROSS_ATTN: AttentionStep(
+                    segments=context_segments, causal=False,
+                ),
+                SAMPLER: SamplerStep(apply_penalty=False),
+                POS: PositionStep(),
+            },
         )
 
     def preprocess(
@@ -165,63 +230,88 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        assert len(inputs) == 1, (
-            "WhisperDecoderSubmodule runs one request per step."
-        )
-        cache_manager = engine_inputs.cache_manager
-        seq_lens = [inputs[0].input_seq_len]
-        cache_manager.set_active_label("main")
-        cache_manager.plan_attention(
-            seq_lens=seq_lens, is_causal=True, label="main",
-        )
-        # No plan_rope: Whisper has no RoPE (learned absolute positions).
-
-        # Prefill: compute per-layer cross-attn K/V from the encoder output
-        # once per request (static for the whole generation) and stash them
-        # contiguous, stacked over layers. Fed into the compiled decoder every
-        # step for the inline-SDPA cross-attn fast path (#160 recovery) — no
-        # engine cross-attention pool write / per-step plan on this path.
-        request_id = engine_inputs.request_ids[0]
-        encoder_states = inputs[0].tensor_inputs.get("encoder_states")
-        if encoder_states is not None:
-            device = self.decoder.embed_tokens.weight.device
-            dtype = inputs[0].input_embeds.dtype
-            encoder_states = encoder_states.to(device=device, dtype=dtype)
-            with torch.no_grad():
-                cross_kvs = self.decoder.compute_cross_kv(encoder_states)
-            cross_k = torch.stack([k for k, _ in cross_kvs]).contiguous()
-            cross_v = torch.stack([v for _, v in cross_kvs]).contiguous()
-            self._cross_kv[request_id] = (cross_k, cross_v)
-
-        cross_k, cross_v = self._cross_kv[request_id]
-        return {
-            "input_embeds": inputs[0].input_embeds,
-            "cross_k": cross_k,
-            "cross_v": cross_v,
+        preprocessed: dict[str, torch.Tensor | Any] = {
+            "input_ids": torch.cat([inp.input_ids for inp in inputs]),
         }
+        if graph_walk == "prefill":
+            # Concatenated in segment order, which is how the context plan
+            # laid the requests' pages out.
+            preprocessed["encoder_states"] = torch.cat(
+                [inp.tensor_inputs["encoder_states"] for inp in inputs], dim=0,
+            )
+        return preprocessed
+
+    def _forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        encoder_states: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the decoder and sample one token per request."""
+        attn: AttentionManager = engine_inputs.resources[ATTN]
+        pos: PositionManager = engine_inputs.resources[POS]
+        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+
+        if encoder_states is not None:
+            # prefill only: fills the context pages this step reserved, before
+            # the layers read them back
+            self.decoder.write_cross_kv(encoder_states)
+
+        input_embeds = self.decoder.embed(input_ids, pos.pos_ids("main"))
+        hidden = self.decoder(input_embeds=input_embeds, label="main")
+
+        if graph_walk == "prefill":
+            # packed prefill: one hidden per request, at its last token
+            hidden = attn.select_last_hidden(hidden)
+
+        logits = self.decoder.lm_head(hidden)
+        logits = self._apply_suppress(
+            logits, is_first_token=graph_walk == "prefill",
+        )
+        return sampler.sample(engine_inputs.request_ids, logits=logits)
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        input_embeds: torch.Tensor,
-        cross_k: torch.Tensor,
-        cross_v: torch.Tensor,
+        input_ids: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        hidden = self.decoder(
-            input_embeds=input_embeds,
-            cache_handle=engine_inputs.cache_manager,
-            cross_k=cross_k,
-            cross_v=cross_v,
-        )
-        logits = self.decoder.lm_head(hidden[-1:])
-        # The prefill step samples the first generated token.
-        logits = self._apply_suppress(logits, is_first_token=graph_walk == "prefill")
-        return {"logits": [logits]}
+        return {
+            "new_token": [self._forward(
+                graph_walk=graph_walk,
+                engine_inputs=engine_inputs,
+                input_ids=input_ids,
+                encoder_states=encoder_states,
+            )]
+        }
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
-        return False
+    def can_batch(
+        self, batch: ExecutingBatch,
+        model_inputs: list[NodeInputs],
+    ) -> bool:
+        return True
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        input_ids: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        new_tokens = self._forward(
+            graph_walk=graph_walk,
+            engine_inputs=engine_inputs,
+            input_ids=input_ids,
+            encoder_states=encoder_states,
+        )
+        return {
+            rid: {"new_token": [new_tokens[i:i + 1]]}
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
 
     def postprocess(
         self,
@@ -245,18 +335,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return set()
         token = outputs["new_token"][0].item()
-        ignore_eos = request_info.sampling_config["decoder"].ignore_eos
+        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded_tokens = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
         if (not ignore_eos and token == self.config.eos_token_id) or \
                 decoded_tokens >= request_info.max_tokens:
             return {"decode_loop"}
         return set()
-
-    def cleanup_request(self, request_id: str):
-        # Free the request's stashed contiguous cross-attn K/V. Done here (not
-        # in check_stop) because a pipelined next-step preprocess can still run
-        # for a just-finished request; the engine calls cleanup_request only
-        # after the request is fully torn down.
-        self._cross_kv.pop(request_id, None)
-        super().cleanup_request(request_id)
-

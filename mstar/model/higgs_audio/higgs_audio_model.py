@@ -35,14 +35,17 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.v1.attention_manager import AttentionConfig, AttentionSpec
+from mstar.engine.v1.kv_cache import KVConfig
+from mstar.engine.v1.kv_manager import KVSpec
+from mstar.engine.v1.position_manager import PositionConfig, PositionSpec
+from mstar.engine.v1.sampler import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, SAMPLER, HiggsAudioModelConfig
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -99,31 +102,57 @@ class HiggsAudioModel(Model):
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     # -------------------------------------------------------------------
-    # Model ABC: KV cache config
+    # Model ABC: resources
     # -------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [KVCacheConfig(
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """LLM paged KV + attention/positions/sampler. audio_encoder is
+        stateless: it runs once per request and holds nothing."""
+        kv_config = KVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_attention_heads,
-            nodes=["LLM"],
             # ~2k tokens per ASR request (prompt + 12.5 audio embeds/s +
             # transcript); 256 pages = 32k tokens ≈ 16 concurrent
             # requests at ~3.7 GB.
             max_num_pages=256,
-        )]
+        )
+        return [
+            KVSpec(label=KV_CACHE, nodes={"LLM"}, config=kv_config),
+            AttentionSpec(
+                label=ATTN, nodes={"LLM"},
+                config=AttentionConfig(kv_cache=KV_CACHE),
+                kv_config=kv_config,
+            ),
+            PositionSpec(
+                label=ROPE, nodes={"LLM"},
+                config=PositionConfig(
+                    kv_cache=KV_CACHE,
+                    rope_theta=self.config.rope_theta,
+                ),
+            ),
+            SamplerSpec(
+                label=SAMPLER, nodes={"LLM"},
+                vocab_size=self.config.vocab_size,
+                # ASR transcription: the reference decodes greedily and
+                # exposes no penalty knob, so no seen-token buffers.
+                enable_repetion_penalty=False,
+            ),
+        ]
 
-    # -------------------------------------------------------------------
-    # Model ABC: node engine types
-    # -------------------------------------------------------------------
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
+    def get_request_resource_configs(
+        self, model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        model_kwargs = model_kwargs or {}
         return {
-            "audio_encoder": EngineType.STATELESS,
-            "LLM": EngineType.KV_CACHE,
+            SAMPLER: SamplingReqConfig(
+                # Reference eval decodes greedily (do_sample=False).
+                temperature=model_kwargs.get("temperature", 0.0),
+                top_p=model_kwargs.get("top_p", 1.0),
+                ignore_eos=model_kwargs.get("ignore_eos", False),
+            )
         }
 
     # -------------------------------------------------------------------
@@ -395,21 +424,8 @@ class HiggsAudioModel(Model):
         }
 
     # -------------------------------------------------------------------
-    # Model ABC: sampling / postprocess
+    # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    def get_sampling_config(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> SamplingConfig | None:
-        model_kwargs = model_kwargs or {}
-        return SamplingConfig(
-            vocab_size=self.config.vocab_size,
-            # Reference eval decodes greedily (do_sample=False).
-            temperature=model_kwargs.get("temperature", 0.0),
-            top_p=model_kwargs.get("top_p", 1.0),
-            ignore_eos=model_kwargs.get("ignore_eos", False),
-        )
 
     def postprocess(
         self,

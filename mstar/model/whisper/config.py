@@ -9,6 +9,24 @@ import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Resource label constants (decoder node)
+# ---------------------------------------------------------------------------
+KV_CACHE = "kv_cache"
+ATTN = "attn"
+SAMPLER = "sampler"
+# Positions: Whisper has no RoPE. The resource is declared for its
+# per-(request, label) position counter, which drives the learned absolute
+# ``embed_positions`` lookup; the attention layers never call it.
+POS = "positions"
+
+# The encoder context lives in its own KV cache so the self-attention
+# resource, which plans a wrapper per label of the cache it names, never sees
+# it. Written once at prefill, read (zero-span) by every later step.
+CROSS_KV_CACHE = "cross_kv_cache"
+CROSS_ATTN = "cross_attn"
+CONTEXT_LABEL = "main"
+
 
 @dataclass
 class WhisperModelConfig:
