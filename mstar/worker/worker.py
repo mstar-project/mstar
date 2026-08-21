@@ -1136,13 +1136,14 @@ class Worker:
                 synchronize=False,
             )
         try:
+            engine.prepare_inputs(node_batch)
             outputs = engine.exec_and_postprocess(node_batch)
             if torch.cuda.is_available():
                 event = torch.cuda.Event()
                 event.record(torch.cuda.default_stream(self.device))
                 node_batch.completion_event = event
             return outputs
-        finally:
+        finally:    
             # Safety net: a step that raised before the forward would otherwise
             # leave the submitter blocked on this for the full wait timeout.
             if node_batch.launch_started_event is not None:
@@ -2313,19 +2314,11 @@ class Worker:
                     if speculation is not None:
                         spec_batch = speculation.scheduled_batch
                         spec_node_batch = speculation.node_batch
-                        # Promote per-rid speculative_signals → real inputs,
-                        # then prepare. Both stay on the main thread: a
-                        # submodule's prepare_inputs may read a token value,
-                        # which is only settled now that N has completed.
-                        if speculation.plan_future is not None:
-                            speculation.plan_future.result()
                         if not speculation.is_yield_away:
                             self._thread_outputs_to_speculative(speculation, outputs)
                         engine = self.engine_manager.get_engine(
                             spec_node_batch.node_name
                         )
-                        if spec_node_batch.request_ids:
-                            engine.prepare_inputs(spec_node_batch)
                         # set node._speculatively_scheduled to true, so that it doesn't
                         # accidentally get put on the ready queue while already executing
                         for node in spec_batch.node_objects.values():
@@ -2447,7 +2440,6 @@ class Worker:
                 # thread then admits, plans and runs it inline; the slot is
                 # leased inside exec, once the token count is known.
                 fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
-                fallthrough_engine.prepare_inputs(node_batch)
 
                 # send messages to follower ranks if relevant
                 self.maybe_send_zmq_to_tp_followers(node_batch)

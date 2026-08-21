@@ -1,3 +1,5 @@
+import logging
+import os
 import threading
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
@@ -20,6 +22,39 @@ from mstar.engine.resources.step import (
 from mstar.engine.v1.cpu_page_pool import CPUPagePool
 from mstar.engine.v1.kv_cache import KVCache, KVConfig, PageAllocator
 from mstar.engine.v1.kv_transfer import KVTransferManager, TransferEngineInfo
+
+logger = logging.getLogger(__name__)
+
+
+class _NullLock:
+    """Stand-in for ``KVManager._lock`` under ``MSTAR_KV_NO_LOCK=1``.
+
+    DIAGNOSTIC ONLY — it removes real mutual exclusion. It exists to answer one
+    question: how much of the pre-plan-thread regression is this lock, versus
+    GIL contention that finer locking cannot fix. ``main`` ran these same stream
+    mutations unlocked (its ``cache_manager`` has no locks at all), so a run
+    with this set is measuring roughly main's synchronisation, not a fantasy.
+    The ``PageAllocator`` lock is deliberately NOT disabled: ``main`` has it
+    too, so it is not part of the regression budget.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _build_kv_lock():
+    if os.environ.get("MSTAR_KV_NO_LOCK", "0") == "1":
+        logger.warning(
+            "MSTAR_KV_NO_LOCK=1: KVManager stream locking is DISABLED. "
+            "Diagnostic only — do not use for correctness-sensitive runs."
+        )
+        return _NullLock()
+    return threading.RLock()
 
 
 @dataclass
@@ -349,7 +384,7 @@ class KVManager(Resource):
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
         self._device = device
-        self._lock = threading.RLock()
+        self._lock = _build_kv_lock()
 
         # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
