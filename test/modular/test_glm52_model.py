@@ -119,7 +119,6 @@ def test_glm52_prefill_persists_drafts_only_under_mtp(monkeypatch):
     one artificial n_acc=0 per request into the acceptance histogram (it
     deflates measured p1). k=0 must keep the byte-identical old walk."""
     from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
     monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1")

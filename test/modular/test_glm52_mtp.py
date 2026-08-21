@@ -18,6 +18,7 @@ import torch
 from mstar.model.glm52.components.indexer import is_full_indexer_layer
 from mstar.model.glm52.config import Glm52ModelConfig
 
+
 def _cpu_rmsnorm(x, weight, eps=1e-6):
     x32 = x.float()
     normed = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)

@@ -66,7 +66,7 @@ def _log_capture_outcome(submodule_name: str, attempted: int, captured: int) -> 
     all-failed case an ERROR with the consequence spelled out; partial
     failure stays a WARNING.
     """
-    if attempted == 0 or captured == attempted:
+    if attempted in (0, captured):
         return
     if captured == 0:
         logger.error(

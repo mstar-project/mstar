@@ -30,8 +30,8 @@ from benchmark.request import (
     RequestInput,
     RequestMetrics,
     SGLangOmni,
-    VLLMOmni,
     VllmCompletions,
+    VLLMOmni,
     VoxServe,
     aggregate_metrics,
 )
