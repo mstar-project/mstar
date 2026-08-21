@@ -98,6 +98,27 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+
+Distributed (TP / SP)
+---------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_TP_STEP_BARRIER``
+     - ``1``
+     - Per-step ``tp_group.barrier()`` at the engine's execute entry
+       (``KVCacheEngine.execute_forward``, ``StatelessEngine.execute_batch``).
+       On NCCL this is a dummy all-reduce plus a current-stream synchronize,
+       so the host blocks until the previous step has drained. ``0`` skips
+       it: the forward's own collectives keep ranks in lockstep, and step
+       N+1 can be enqueued behind step N. Capture-time barriers in
+       ``cuda_graph_runner`` are unaffected.
+
 Serving (Rust frontend)
 -----------------------
 
