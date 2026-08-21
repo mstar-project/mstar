@@ -73,6 +73,14 @@ def flatten_messages(
         paths.append(path)
 
     def add_text(text: str) -> None:
+        # Adjacent text parts were newline-joined before ordering was kept;
+        # merge them here so only text an attachment separates gets its own
+        # part, and the rendered prompt keeps the separator it used to have.
+        if parts and parts[-1].modality == "text":
+            parts[-1] = PromptPart(
+                modality="text", text=f"{parts[-1].text}\n{text}"
+            )
+            return
         parts.append(PromptPart(modality="text", text=text))
 
     for msg in messages or []:

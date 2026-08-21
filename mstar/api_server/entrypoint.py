@@ -765,6 +765,15 @@ async def generate(
     if input_modalities is not None:
         in_mods = [m.strip() for m in input_modalities.split(",") if m.strip()]
         parts = []
+        # A layout with no text slot would drop the prompt on the floor; it
+        # went at the end before ordering was kept, so put it back there.
+        if text and "text" not in in_mods:
+            in_mods.append("text")
+        # And a declared text slot with no text renders to nothing, so the
+        # prompt has one fewer span than the layout plans for. Drop it here,
+        # where intake and the schedule builder both still read the same list.
+        if not text:
+            in_mods = [m for m in in_mods if m != "text"]
     else:
         in_mods = [p.modality for p in parts]
 
