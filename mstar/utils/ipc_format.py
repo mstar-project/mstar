@@ -89,9 +89,54 @@ class StopLoops(MessageBody):
 
 @dataclass
 class ScheduleTPNode(MessageBody):
+    """Leader → followers: schedule this node for these rids.
+
+    Deliberately THIN — ids only. Followers rebuild the batch locally from
+    replicated state (``register_tp_follow`` → ``_try_schedule_tp_follow``),
+    so nothing tensor-shaped rides the wire.
+
+    ``speculative`` / ``spec_seq`` / ``spec_from_seq`` extend the same message
+    for TP async scheduling (``MSTAR_TP_ASYNC_SCHED=1``) rather than opening a
+    second channel: a speculative head is the same schedule request, tagged.
+
+    * ``spec_seq`` — the leader's monotonic broadcast counter for THIS batch.
+      Under async scheduling every leader broadcast carries one, speculative
+      or not, so a follower can name the batch it is currently running.
+    * ``spec_from_seq`` — for a speculative head, the ``spec_seq`` of the batch
+      the leader speculated it FROM (the leader's in-flight step N). A follower
+      whose in-flight batch has that seq may build the head early, during its
+      own forward N, and submit it as soon as N completes — the whole point.
+
+    There is deliberately no commit / cancel message. Once broadcast, a
+    speculative head executes on every rank of the group; whether it must be
+    voided (allocation failure on N, per-rid failure, a continuing rid that
+    produced no loop-back output) is decided by each rank from state that is
+    identical on every rank by construction — admission is rank-0-driven and
+    replicated, and sampling is redundant per rank from conductor-set seeds
+    (``mstar/utils/sampling.py``: "TP ranks derive the same seed"). A void is
+    therefore *derived*, not *signalled*, which removes the one race the CPU
+    model checker found for a signalled retract (``test/modular/tp_async_sim.py``,
+    ``B2_RETRACT``): a rank that drops S while a faster rank already ran it
+    posts a different collective sequence. Here every rank reaches the same
+    verdict at the same point in its own step, so no rank can be ahead of the
+    verdict.
+
+    All three fields are defaulted so every existing construction site keeps
+    working unchanged and today's serial broadcasts stay non-speculative by
+    omission. Note this is *source* compatibility, not wire compatibility: these
+    travel as pickled dataclasses, and an old pickle would leave the new
+    attributes unset rather than defaulted. That is fine here — the ranks of a
+    TP group are launched together from one conductor and always run the same
+    build — but it is not a mixed-version guarantee, so don't lean on it as one.
+    """
+
     node_name: str
     graph_walk: str
     request_ids: list[str]
+    speculative: bool = False
+    spec_seq: int = -1
+    spec_from_seq: int = -1
+
 
 @dataclass
 class WorkerMessage:

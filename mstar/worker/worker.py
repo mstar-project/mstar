@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 import time as _time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -66,6 +66,11 @@ class PendingBatch:
     future: Future
     speculative_new_iter: bool = False
     loop_name: str = None
+    # TP async scheduling: the leader's broadcast seq for this batch (see
+    # ``ScheduleTPNode.spec_seq``). Followers match a speculative head's
+    # ``spec_from_seq`` against this; leaders stamp it on what they broadcast.
+    tp_seq: int = -1
+
 
 @dataclass
 class Speculation:
@@ -92,6 +97,10 @@ class Speculation:
     dropped: set[str] = field(default_factory=set)
 
     plan_future: Future | None = None
+    # TP async scheduling: the leader's broadcast seq under which this
+    # speculation travels (leader: assigned at broadcast; follower: copied
+    # from the head it built). Becomes ``PendingBatch.tp_seq`` on submit.
+    tp_seq: int = -1
 
 
 @dataclass(frozen=True)
@@ -257,6 +266,33 @@ class Worker:
             )
 
         self.is_tp_follower = len(self.parallel_nodes - self.parallel_leader_nodes) > 0
+
+        # TP async scheduling (MSTAR_TP_ASYNC_SCHED=1): let the instance
+        # leader speculate step N+1 of a lockstep-parallel node during its
+        # forward N and broadcast that speculation early, so followers can
+        # build N+1 during THEIR forward N too and every rank submits N+1 the
+        # moment N completes. Off by default: the serial path (leader
+        # schedules after N, followers rebuild after the broadcast) is the
+        # baseline every number so far was measured against.
+        self.tp_async_sched = os.environ.get("MSTAR_TP_ASYNC_SCHED", "0") == "1"
+        # Leader-side monotonic counter stamped on every ScheduleTPNode it
+        # broadcasts (speculative or not) so followers can name batches.
+        self._tp_broadcast_seq = 0
+        # Follower-side: seqs of leader steps that will NOT be followed by a
+        # speculative head — the leader said so (an empty speculative
+        # ``ScheduleTPNode`` from that seq), or this rank closed the step
+        # itself (its forward raised). A follower awaiting step s resolves
+        # exactly one of {a head with spec_from_seq == s, s in this set}
+        # before it post-processes s, so it never has to guess whether the
+        # leader speculated. Bounded FIFO of seqs (see _TP_NOSPEC_KEEP).
+        self._tp_nospec_from: set[int] = set()
+        self._tp_nospec_order: deque[int] = deque()
+        if self.tp_async_sched and self.parallel_nodes:
+            logger.info(
+                "Worker %s: TP async scheduling ON for %s (%s)",
+                worker_id, sorted(self.parallel_nodes),
+                "follower" if self.is_tp_follower else "leader",
+            )
 
         self.scheduler = MicroScheduler(
             self.engine_manager,
@@ -648,7 +684,7 @@ class Worker:
             elif message.message_type == WorkerMessageType.STOP_LOOPS:
                 self._stop_loops(message.body)
             elif message.message_type == WorkerMessageType.SCHEDULE_TP:
-                self.scheduler.register_tp_follow(message.body)
+                self._register_tp_follow(message.body)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -897,11 +933,22 @@ class Worker:
         )
 
     def maybe_send_zmq_to_tp_followers(
-        self, node_batch: NodeBatch
-    ):
+        self, node_batch: NodeBatch,
+        *, speculative: bool = False, spec_from_seq: int = -1,
+    ) -> int:
+        """Leader → followers: broadcast this batch as a ``ScheduleTPNode``.
+
+        Returns the seq stamped on the broadcast (``-1`` when this worker is
+        not the leader of a parallel node, i.e. nothing was sent). Every
+        broadcast is stamped, speculative or not, so a follower can always
+        name the batch it is running; ``speculative=True`` additionally names
+        the parent step via ``spec_from_seq`` — see ``ScheduleTPNode``.
+        """
         if node_batch.node_name not in self.parallel_nodes or \
                 node_batch.node_name not in self.parallel_leader_nodes:
-            return
+            return -1
+        seq = self._tp_broadcast_seq
+        self._tp_broadcast_seq += 1
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -917,7 +964,40 @@ class Worker:
                     body=ScheduleTPNode(
                         node_name=node_batch.node_name,
                         graph_walk=node_batch.graph_walk,
-                        request_ids=node_batch.request_ids
+                        request_ids=list(node_batch.request_ids),
+                        speculative=speculative,
+                        spec_seq=seq,
+                        spec_from_seq=spec_from_seq,
+                    )
+                )
+            )
+        return seq
+
+    def _broadcast_tp_nospec(self, pending: PendingBatch) -> None:
+        """Leader → followers: "no speculative head will follow step
+        ``pending.tp_seq``" — an empty speculative ``ScheduleTPNode`` naming
+        that step. Sent whenever the leader looked at speculating from a
+        lockstep-parallel step and did not (nothing to speculate, or it
+        yielded to other work), so a follower awaiting that step never has to
+        guess: it resolves exactly one of {head from s, no-spec for s} before
+        it post-processes s. Not counted in the seq space (no batch)."""
+        node_batch = pending.node_batch
+        sample_rid = node_batch.request_ids[0]
+        cfg = self.worker_graphs_manager.per_request_info[sample_rid]
+        workers = cfg.sharding_config.get_sharding_group(
+            node_batch.node_name, node_batch.graph_walk
+        )._workers[1:]
+        for worker in workers:
+            self.communicator.send(
+                worker, msg=WorkerMessage(
+                    message_type=WorkerMessageType.SCHEDULE_TP,
+                    body=ScheduleTPNode(
+                        node_name=node_batch.node_name,
+                        graph_walk=node_batch.graph_walk,
+                        request_ids=[],
+                        speculative=True,
+                        spec_seq=-1,
+                        spec_from_seq=pending.tp_seq,
                     )
                 )
             )
@@ -1306,10 +1386,47 @@ class Worker:
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if any(
             not node.enable_async_scheduling for node in batch.node_objects.values()
-        ) or batch.node_name in self.parallel_nodes:
-            # disable speculation for lockstep-parallel nodes for now
+        ):
             return False
+        if batch.node_name in self.parallel_nodes:
+            # Lockstep-parallel nodes: only the instance leader initiates
+            # speculation, and only under TP async scheduling. Followers never
+            # initiate — they mirror the leader's broadcast speculation via
+            # ``_try_follow_speculation`` instead (a separate branch of the
+            # main loop, not this predicate).
+            return (
+                self.tp_async_sched
+                and batch.node_name in self.parallel_leader_nodes
+            )
         return True
+
+    def _is_tp_lead_pending(self, pending: PendingBatch) -> bool:
+        """True when ``pending`` is a lockstep-parallel batch this worker LEADS
+        under TP async scheduling (callers have already checked
+        ``_can_speculate``, i.e. the node allows async scheduling)."""
+        return (
+            self.tp_async_sched
+            and pending.node_name in self.parallel_nodes
+            and pending.node_name in self.parallel_leader_nodes
+        )
+
+    def _is_tp_follow_pending(self, pending: PendingBatch) -> bool:
+        """True when ``pending`` is a lockstep-parallel batch this worker
+        executes as a FOLLOWER under TP async scheduling — i.e. the leader will
+        broadcast, for this very step, either a speculative head we can build
+        or the marker that it did not speculate. Mirrors the leader's
+        ``_can_speculate`` predicate (node allows async scheduling), so both
+        ranks agree on which steps carry a decision."""
+        return (
+            self.tp_async_sched
+            and self.is_tp_follower
+            and pending.node_name in self.parallel_nodes
+            and pending.node_name not in self.parallel_leader_nodes
+            and all(
+                node.enable_async_scheduling
+                for node in pending.batch.node_objects.values()
+            )
+        )
 
     def _get_wgio_for_rid(self, batch: ScheduledBatch, rid: str):
         """Per-rid WorkerGraphIO for the wg that owns this rid in this batch.
@@ -1331,6 +1448,107 @@ class Worker:
                 for info in edge.tensor_info
             ]
         return tensors
+
+    def _prep_continuing_rid_for_spec(
+        self,
+        batch_N: ScheduledBatch,
+        batch_N_node: GraphNode,
+        rid: str,
+        spec_node_name: str,
+        speculating_same_node: bool,
+    ) -> tuple[GraphNode, str, NameToTensorList, list[GraphEdge], list[GraphEdge]] | None:
+        """Prepare one CONTINUING rid (in flight in batch_N) for the speculative
+        batch: ingest any streaming chunks it needs, check it will be ready once
+        N's outputs land (``is_ready_for_speculation``, placeholders), and gather
+        its placeholder inputs.
+
+        Returns ``(node, wg_id, inputs, ingested_into_ready_signals,
+        ingested_into_ready_next_iter)`` on success, or ``None`` after rolling
+        the rid back to its pre-call state. Shared by the leader's
+        ``_try_speculate_next`` and the follower's ``_try_follow_speculation`` so
+        both ranks prepare a rid identically; the two ingested lists are what
+        ``_rollback_continuing_rid_prep`` needs if the CALLER later abandons a
+        successful prep.
+        """
+        wgio = self._get_wgio_for_rid(batch_N, rid)
+        # If the speculation is contingent on streaming edges, ingest the
+        # appropriate streaming edges
+        node = wgio.nodes[spec_node_name]
+
+        # temporarily set to prevent ingesting streaming inputs from re-adding the node to
+        # the ready queue
+        node._speculatively_scheduled = True
+        streaming_edges = self._poll_stream_buffers_for_speculation(
+            rid, spec_node_name
+        )
+        # Track which slot each ingest landed in so we can roll back if
+        # the readiness check below fails. ``ingest_input`` returns success
+        # without telling us which slot it used, so peek the slot state
+        # before the call.
+        ingested_into_ready_signals: list[GraphEdge] = []
+        ingested_into_ready_next_iter: list[GraphEdge] = []
+        for edge in streaming_edges:
+            already_in_ready_signals = (
+                edge.name in node.ready_signals.ready_names
+            )
+            if node.ingest_input(
+                edge, can_buffer=speculating_same_node
+            ):
+                if already_in_ready_signals:
+                    ingested_into_ready_next_iter.append(edge)
+                else:
+                    ingested_into_ready_signals.append(edge)
+            else:
+                self._return_speculative_streaming_edge(rid, edge)
+
+        # Check if the node is ready after ingesting the streaming edges
+        wgio.ingest_for_speculation(
+            batch_N_node.outputs, batch_N_node.name
+        )
+        fully_ready = node.is_ready_for_speculation(
+            check_next_iter=speculating_same_node,
+            allow_streaming=False
+        )
+        wgio.clear_speculative_inputs()
+        node._speculatively_scheduled = False # reset in case this rid gets dropped
+        if not fully_ready:
+            # Roll back the streaming edges we just ingested so the
+            # chunks don't sit in the spec target's ready_signals /
+            # ready_next_iter unused. Return each chunk to its
+            # StreamBuffer's uningested cache so a future scheduling
+            # of this node consumes it normally. The registry's
+            # ``ready_names`` / ``ready_next_iter`` sets weren't
+            # touched (gated by ``_speculatively_scheduled=True``
+            # above), so no registry-state rollback is needed.
+            self._rollback_continuing_rid_prep(
+                rid, node, ingested_into_ready_signals, ingested_into_ready_next_iter,
+            )
+            return None
+
+        inputs = self._get_input_tensors(
+            rid, node, check_next_iter=speculating_same_node,
+        )
+        return (
+            node, wgio.wg_id, inputs,
+            ingested_into_ready_signals, ingested_into_ready_next_iter,
+        )
+
+    def _rollback_continuing_rid_prep(
+        self,
+        rid: str,
+        node: GraphNode,
+        ingested_into_ready_signals: list[GraphEdge],
+        ingested_into_ready_next_iter: list[GraphEdge],
+    ) -> None:
+        """Undo ``_prep_continuing_rid_for_spec``: pull the streaming chunks it
+        ingested back out of the node's ready slots and return them to their
+        StreamBuffers, so a future scheduling consumes them normally."""
+        for edge in ingested_into_ready_signals:
+            node.ready_signals.remove(edge.name)
+            self._return_speculative_streaming_edge(rid, edge)
+        for edge in ingested_into_ready_next_iter:
+            node.ready_next_iter.remove(edge.name)
+            self._return_speculative_streaming_edge(rid, edge)
 
     def _try_speculate_next(
         self,
@@ -1371,8 +1589,13 @@ class Worker:
         # Filter out destinations that aren't speculation candidates.
         #
         # * ``info.node_name in self.parallel_nodes`` — lockstep-parallel nodes
-        #   don't support speculation in v1 (the instance leader schedules;
-        #   followers can't initiate).
+        #   are speculation targets only under TP async scheduling, only from
+        #   the instance leader, and only as a same-node loop-back (decode
+        #   iter K → K+1). A transition INTO the parallel node from another
+        #   node stays serial: followers rebuild a speculative head from
+        #   their own in-flight batch of the same node, and for a transition
+        #   they have no such batch (the source node may not even live on the
+        #   follower's worker).
         # * ``not wgio.nodes[info.node_name].enable_async_scheduling`` — the
         #   destination node opts out of async scheduling. Mirrors the
         #   source-side check in ``_can_speculate``; without this, a
@@ -1381,7 +1604,14 @@ class Worker:
         #   then dropped per-rid further down.
         ready_for_spec = [
             info for info in ready_for_spec
-            if info.node_name not in self.parallel_nodes
+            if (
+                info.node_name not in self.parallel_nodes
+                or (
+                    self.tp_async_sched
+                    and info.node_name in self.parallel_leader_nodes
+                    and info.node_name == batch_N.node_name
+                )
+            )
             and wgio.nodes[info.node_name].enable_async_scheduling
         ]
 
@@ -1414,71 +1644,20 @@ class Worker:
                 # Loop/request has already finished, don't speculate further work
                 continue
 
-            # If the speculation is contingent on streaming edges, ingest the
-            # appropriate streaming edges
-            node = wgio.nodes[spec_node_info.node_name]
-
-            # temporarily set to prevent ingesting streaming inputs from re-adding the node to
-            # the ready queue
-            node._speculatively_scheduled = True
-            streaming_edges = self._poll_stream_buffers_for_speculation(
-                rid, spec_node_info.node_name
+            prep = self._prep_continuing_rid_for_spec(
+                batch_N, batch_N_node, rid, spec_node_info.node_name,
+                speculating_same_node,
             )
-            # Track which slot each ingest landed in so we can roll back if
-            # the readiness check below fails. ``ingest_input`` returns success
-            # without telling us which slot it used, so peek the slot state
-            # before the call.
-            ingested_into_ready_signals: list[GraphEdge] = []
-            ingested_into_ready_next_iter: list[GraphEdge] = []
-            for edge in streaming_edges:
-                already_in_ready_signals = (
-                    edge.name in node.ready_signals.ready_names
-                )
-                if node.ingest_input(
-                    edge, can_buffer=speculating_same_node
-                ):
-                    if already_in_ready_signals:
-                        ingested_into_ready_next_iter.append(edge)
-                    else:
-                        ingested_into_ready_signals.append(edge)
-                else:
-                    self._return_speculative_streaming_edge(rid, edge)
-
-            # Check if the node is ready after ingesting the streaming edges
-            wgio.ingest_for_speculation(
-                batch_N_node.outputs, batch_N_node.name
-            )
-            fully_ready = node.is_ready_for_speculation(
-                check_next_iter=speculating_same_node,
-                allow_streaming=False
-            )
-            wgio.clear_speculative_inputs()
-            node._speculatively_scheduled = False # reset in case this rid gets dropped
-            if not fully_ready:
-                # Roll back the streaming edges we just ingested so the
-                # chunks don't sit in the spec target's ready_signals /
-                # ready_next_iter unused. Return each chunk to its
-                # StreamBuffer's uningested cache so a future scheduling
-                # of this node consumes it normally. The registry's
-                # ``ready_names`` / ``ready_next_iter`` sets weren't
-                # touched (gated by ``_speculatively_scheduled=True``
-                # above), so no registry-state rollback is needed.
-                for edge in ingested_into_ready_signals:
-                    node.ready_signals.remove(edge.name)
-                    self._return_speculative_streaming_edge(rid, edge)
-                for edge in ingested_into_ready_next_iter:
-                    node.ready_next_iter.remove(edge.name)
-                    self._return_speculative_streaming_edge(rid, edge)
+            if prep is None:
                 continue
+            node, wg_id, inputs, into_signals, into_next_iter = prep
 
             # prepare speculative batch
             continuing.append(rid)
             new_node_objects[rid] = node
-            new_request_to_worker_graph[rid] = wgio.wg_id
-            per_request_inputs[rid] = self._get_input_tensors(
-                rid, node, check_next_iter=speculating_same_node,
-            )
-            consumed_streaming_edges[rid] = ingested_into_ready_next_iter + ingested_into_ready_signals
+            new_request_to_worker_graph[rid] = wg_id
+            per_request_inputs[rid] = inputs
+            consumed_streaming_edges[rid] = into_next_iter + into_signals
 
         if not continuing:
             return None
@@ -1515,17 +1694,12 @@ class Worker:
                     # in-flight step and shouldn't be in ready queues —
                     # but if it does, the in-flight rid wins.
                     #
-                    # KNOWN GAP (latent): if fresh_batch ever came from the
-                    # TP-follow path, ``_try_schedule_tp_follow`` has already
-                    # popped the leader's ScheduleTPNode. Pushing the node
-                    # back onto the ready queue does not undo that, and this
-                    # worker is a follower for that node so nothing will
-                    # reschedule it — the TP group stalls. Unreachable today
-                    # (spec targets exclude ``parallel_nodes``, so the
-                    # target_node_name filter never matches a TP batch), but
-                    # any future overlap needs the scheduler to re-queue the
-                    # message, or to defer the popleft until the caller
-                    # commits to the batch.
+                    # fresh_batch can never be a TP-follow batch here: this
+                    # is a targeted get_next_batch call, and the scheduler
+                    # refuses to pop the TP-follow FIFO for targeted callers
+                    # (``_try_schedule_tp_follow``) precisely because this
+                    # merge may reject rids — a popped ScheduleTPNode has no
+                    # re-queue path, and stranding it stalls the TP group.
                     wg_id = fresh_batch.request_to_worker_graph[rid]
                     self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
                     continue
@@ -1616,6 +1790,278 @@ class Worker:
                 speculation.consumed_streaming_edges.pop(rid, None)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
+
+    # ------------------------------------------------------------------
+    # TP async scheduling — the follower side
+    # ------------------------------------------------------------------
+    #
+    # The leader speculates step N+1 during its forward N (``_try_speculate_
+    # next``) and broadcasts the result as a speculative ``ScheduleTPNode``
+    # naming the batch it was built from (``spec_from_seq``). A follower whose
+    # in-flight batch has that seq rebuilds the SAME speculation from its own
+    # replicated state during ITS forward N — same continuing rids (prepared
+    # by the same helper the leader used), same fresh rids (popped from its
+    # own queues, all-or-nothing), same wire order — and then runs the
+    # leader's loop unchanged: reserve slot, pre-plan, await N, clear-or-
+    # thread, submit. No commit / cancel traffic: every verdict the leader
+    # reaches about the speculation after N (allocation failed → clear;
+    # per-rid failure → clear; a continuing rid without loop-back output →
+    # drop that rid) is a function of state that is identical on every rank,
+    # so the follower reaches it too. (Per-rid failures are rank-local
+    # exceptions in principle; treating them as symmetric is the same
+    # assumption the serial TP path already makes for the forward itself —
+    # a follower-only prepare_inputs failure desyncs the collective today.)
+    #
+    # The one thing a follower cannot derive is whether the leader speculated
+    # from N AT ALL — so the leader always says: a speculative head from N,
+    # or the empty "no-spec" marker for N. A follower that could not build
+    # the head during N settles it right after await(N), BEFORE N is
+    # post-processed (``_resolve_follow_speculation``): builds it from N's
+    # real outputs through the same speculation flow (so a continuing rid
+    # whose loop ends at N runs as the leader runs it — one wasted forward),
+    # or goes serial on the marker. The speculative head therefore never
+    # reaches the serial ``_try_schedule_tp_follow`` path, whose readiness
+    # check could not build a batch containing a finished rid.
+
+    def _try_follow_speculation(self, pending: PendingBatch) -> Speculation | None:
+        head = self.scheduler.peek_tp_follow()
+        if head is None or not head.speculative:
+            return None
+        if head.spec_from_seq != pending.tp_seq:
+            # Speculated from some other step (we are behind, or ahead); the
+            # serial path will get to it in FIFO order.
+            return None
+        if head.node_name != pending.node_name or head.graph_walk != pending.graph_walk:
+            # v1 leaders only speculate same-node loop-backs, so this cannot
+            # happen from a well-formed leader; leave it for the serial path.
+            logger.warning(
+                "Worker %s: speculative head %s/%s (seq %d) does not match its "
+                "parent batch %s/%s; leaving it for the serial path",
+                self.worker_id, head.node_name, head.graph_walk, head.spec_seq,
+                pending.node_name, pending.graph_walk,
+            )
+            return None
+
+        batch_N = pending.batch
+        rid0, sample_node = next(iter(batch_N.node_objects.items()))
+        if not sample_node.outputs:
+            return None
+        wgio = self._get_wgio_for_rid(batch_N, rid0)
+        ready_for_spec = wgio.ingest_for_speculation(
+            sample_node.outputs, sample_node.name
+        )
+        wgio.clear_speculative_inputs()
+        infos = [i for i in ready_for_spec if i.node_name == head.node_name]
+        if not infos:
+            return None
+        spec_node_info = infos[0]
+
+        continuing = [r for r in head.request_ids if r in batch_N.node_objects]
+        fresh = [r for r in head.request_ids if r not in batch_N.node_objects]
+
+        # Prepare continuing rids exactly as the leader did. Unlike the
+        # leader we do NOT skip rids our local stop/remove state calls
+        # finished: the leader's list is the composition every rank runs.
+        prepped: dict[str, tuple] = {}
+
+        def _rollback_all() -> None:
+            for r, (node, _wg, _inputs, into_sig, into_next) in prepped.items():
+                self._rollback_continuing_rid_prep(r, node, into_sig, into_next)
+
+        for rid in continuing:
+            prep = self._prep_continuing_rid_for_spec(
+                batch_N, batch_N.node_objects[rid], rid, head.node_name,
+                speculating_same_node=True,
+            )
+            if prep is None:
+                _rollback_all()
+                return None
+            prepped[rid] = prep
+
+        popped = self.scheduler.pop_ready_rids(
+            self.worker_graphs_manager, head.node_name, head.graph_walk, fresh,
+        )
+        if popped is None:
+            _rollback_all()
+            return None
+        fresh_nodes, fresh_wg = popped
+
+        new_node_objects: dict[str, GraphNode] = {}
+        new_request_to_worker_graph: dict[str, str] = {}
+        per_request_inputs: dict[str, NameToTensorList] = {}
+        consumed_streaming_edges: dict[str, list[GraphEdge]] = {}
+        for rid in head.request_ids:  # wire order == the leader's batch order
+            if rid in prepped:
+                node, wg_id, inputs, into_sig, into_next = prepped[rid]
+                consumed_streaming_edges[rid] = into_next + into_sig
+            else:
+                node = fresh_nodes[rid]
+                wg_id = fresh_wg[rid]
+                inputs = self._get_input_tensors(rid, node, check_next_iter=False)
+            new_node_objects[rid] = node
+            new_request_to_worker_graph[rid] = wg_id
+            per_request_inputs[rid] = inputs
+
+        consumed_edges: set[tuple[str, str]] = {
+            (edge.name, edge.next_node)
+            for edge in sample_node.outputs
+            if edge.next_node == head.node_name
+        }
+        request_ids = list(head.request_ids)
+        spec_batch = ScheduledBatch(
+            node_name=head.node_name,
+            graph_walk=head.graph_walk,
+            node_objects=new_node_objects,
+            request_to_worker_graph=new_request_to_worker_graph,
+            tp_seq=head.spec_seq,
+        )
+        spec_node_batch = NodeBatch(
+            node_name=head.node_name,
+            graph_walk=head.graph_walk,
+            request_ids=request_ids,
+            per_request_input_tensors=per_request_inputs,
+            per_request_info={
+                rid: self.worker_graphs_manager.get_fwd_info(rid, pending.partition)
+                for rid in request_ids
+            },
+            final_stream_rids={
+                rid for rid, edges in consumed_streaming_edges.items()
+                if any(e._final_stream_chunk for e in edges)
+            },
+        )
+
+        # Committed: the head is ours now, the serial path must not see it.
+        self.scheduler.pop_tp_follow_head()
+        # The head's rids are as good as in flight from here on: the caller
+        # keeps processing messages while N runs, and a remove that lands
+        # before this batch is submitted must be deferred like any other
+        # in-flight rid's, not applied under it. ``_set_pending`` re-derives
+        # the set on submit.
+        self._in_flight_rids |= set(request_ids)
+        logger.debug(
+            "Follow-speculating: %s %s (seq %d from %d)",
+            head.node_name, request_ids, head.spec_seq, head.spec_from_seq,
+        )
+        return Speculation(
+            scheduled_batch=spec_batch,
+            node_batch=spec_node_batch,
+            consumed_edges=consumed_edges,
+            continuing_rids=set(continuing),
+            partition=pending.partition,
+            is_new_iter=spec_node_info.is_new_loop_iter,
+            is_same_node=True,
+            loop_name=spec_node_info.loop_name,
+            consumed_streaming_edges=consumed_streaming_edges,
+            tp_seq=head.spec_seq,
+        )
+
+    _TP_NOSPEC_KEEP = 1024
+
+    def _note_tp_nospec(self, spec_from_seq: int) -> None:
+        """Remember that no speculative head will (or may) follow leader step
+        ``spec_from_seq`` on this follower — either the leader said so, or
+        this rank closed the step itself. Bounded."""
+        if spec_from_seq in self._tp_nospec_from:
+            return
+        self._tp_nospec_from.add(spec_from_seq)
+        self._tp_nospec_order.append(spec_from_seq)
+        while len(self._tp_nospec_order) > self._TP_NOSPEC_KEEP:
+            self._tp_nospec_from.discard(self._tp_nospec_order.popleft())
+
+    def _register_tp_follow(self, message: ScheduleTPNode) -> None:
+        """SCHEDULE_TP arrival. An EMPTY speculative head is the leader's
+        "no speculation from step ``spec_from_seq``" marker (see
+        ``_broadcast_tp_nospec``): record it, never queue it — the serial path
+        has no batch to build from an empty rid list. A head for a step this
+        rank has already closed (its forward raised) is dropped: the leader
+        never ran it either. Everything else queues as before."""
+        if message.speculative and not message.request_ids:
+            if self.tp_async_sched:
+                self._note_tp_nospec(message.spec_from_seq)
+            return  # never queue an empty batch, flag or no flag
+        if (
+            self.tp_async_sched and message.speculative
+            and message.spec_from_seq in self._tp_nospec_from
+        ):
+            logger.debug(
+                "Worker %s: dropped speculative head seq %d (parent %d closed)",
+                self.worker_id, message.spec_seq, message.spec_from_seq,
+            )
+            return
+        self.scheduler.register_tp_follow(message)
+
+    def _close_tp_follow_step(self, pending: PendingBatch) -> None:
+        """This rank will not act on any speculative head from
+        ``pending.tp_seq`` (its forward raised — the leader's, symmetric, did
+        too, and the leader dropped its speculation without submitting it).
+        Drop such a head if it already arrived; make sure one arriving later
+        is dropped on arrival."""
+        self._note_tp_nospec(pending.tp_seq)
+        head = self.scheduler.peek_tp_follow()
+        if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
+            self.scheduler.pop_tp_follow_head()
+
+    def _resolve_follow_speculation(
+        self, pending: PendingBatch, output: NodeOutput, arm,
+    ) -> Speculation | None:
+        """Follower, right after awaiting TP-follow step N (tp_seq = s) with no
+        speculation built yet: find out what the leader did about N+1 and act
+        on it BEFORE N is post-processed. Exactly one of these arrives (the
+        leader sends one per lockstep step it looked at speculating from):
+
+        * a speculative head from s → build it here from N's real outputs via
+          the same speculation machinery the leader used (``_try_follow_
+          speculation``, then the shared clear-or-thread-then-submit flow),
+          so a continuing rid whose loop ends at N is run as the leader runs
+          it (one wasted forward, output discarded in postprocess) instead of
+          becoming an un-buildable batch on the serial path;
+        * the no-speculation marker for s → the serial path handles N+1.
+
+        ``output.allocation_failed`` on N is the one verdict the leader
+        reaches BEFORE threading — it clears its speculation and reschedules
+        from scratch — so a head from s is dropped here on that verdict
+        without being built. Any other reason the head is not buildable yet
+        (a fresh rid not ready on this rank, a streaming chunk still in
+        flight) is transient: the leader had it, so it is coming; keep
+        polling. Waits are bounded by the leader's step-2 latency after it
+        submitted N (normally the head landed during our N and was built
+        then, so this returns immediately); a leader that dies leaves us
+        here, logging, which is the pre-existing NCCL-timeout failure mode.
+        """
+        s = pending.tp_seq
+        t0 = _time.perf_counter()
+        last_warn = t0
+        while True:
+            if s in self._tp_nospec_from:
+                return None
+            head = self.scheduler.peek_tp_follow()
+            if head is not None and head.speculative and head.spec_from_seq == s:
+                if output.allocation_failed:
+                    self.scheduler.pop_tp_follow_head()
+                    logger.debug(
+                        "Worker %s: dropped speculative head seq %d "
+                        "(parent %d allocation_failed)",
+                        self.worker_id, head.spec_seq, s,
+                    )
+                    return None
+                spec = self._try_follow_speculation(pending)
+                if spec is not None:
+                    arm(spec)
+                    return spec
+                # not buildable yet — make readiness progress, then retry
+                self._check_ready_tensors()
+                self._poll_stream_buffers()
+            self.communicator.wait_for_work(20)
+            self._process_messages()
+            now = _time.perf_counter()
+            if now - last_warn > 2.0:
+                last_warn = now
+                logger.warning(
+                    "Worker %s: still waiting for the leader's decision on "
+                    "step seq %d after %.1fs (head queued: %s)",
+                    self.worker_id, s, now - t0,
+                    head is not None and head.spec_from_seq == s,
+                )
 
     # ------------------------------------------------------------------
     # Postprocessing
@@ -2294,6 +2740,23 @@ class Worker:
                             _phase_record("speculate", _time.perf_counter() - _t0)
                         if self.enable_nvtx:
                             range_pop(synchronize=False)
+                        if speculation is not None:
+                            # TP async scheduling: a leader of a lockstep-
+                            # parallel node broadcasts the speculation NOW,
+                            # during forward N, so followers can build it
+                            # during their forward N too. Non-parallel nodes
+                            # get -1 back and nothing is sent.
+                            speculation.tp_seq = self.maybe_send_zmq_to_tp_followers(
+                                speculation.node_batch,
+                                speculative=True, spec_from_seq=pending.tp_seq,
+                            )
+                    if speculation is None and self._is_tp_lead_pending(pending):
+                        # TP async scheduling: no speculation from this
+                        # lockstep step (nothing to speculate, or we yield).
+                        # Tell the followers so, now — they resolve exactly
+                        # one of {head from this step, this marker} before
+                        # they post-process it.
+                        self._broadcast_tp_nospec(pending)
                     if speculation is None:
                         yield_away_from_target = (
                             pending.node_name,
@@ -2318,48 +2781,93 @@ class Worker:
                                 is_yield_away=True
                             )
 
-                            # send messages to follower ranks if relevant
-                            self.maybe_send_zmq_to_tp_followers(node_batch)
-                    if speculation is not None:
-                        # Reserve the double-buffer slot for batch_(N+1) NOW
-                        # so both pre-plan and replay (queued below) target
-                        # the SAME slot — and the OPPOSITE slot from
-                        # batch_N's in-flight replay. The reservation lives
-                        # on spec_node_batch.metadata['cuda_graph_slot'];
-                        # the engine forwards it to the runner.
-                        if speculation is not None:
-                            engine = self.engine_manager.get_engine(
-                                speculation.node_batch.node_name
-                            )
-                            engine.reserve_replay_slot(speculation.node_batch)
+                            # send messages to follower ranks if relevant. A
+                            # leader gets the seq it just broadcast; a
+                            # follower whose yield-away batch came off the
+                            # TP-follow FIFO keeps that batch's seq (a mixed-
+                            # role worker: this node's follower shard next to
+                            # another node it leads); everyone else -1.
+                            ya_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
+                            speculation.tp_seq = ya_seq if ya_seq >= 0 else batch.tp_seq
+                elif pending is not None and self._is_tp_follow_pending(pending):
+                    # TP async scheduling, follower side: if the leader has
+                    # already broadcast its speculation for our in-flight
+                    # step, rebuild it now — during OUR forward N — from
+                    # replicated state. None means "not this step" (nothing
+                    # broadcast yet, or we cannot build it early); we keep
+                    # watching for it while N runs, and settle it right after
+                    # await(N) at the latest (_resolve_follow_speculation).
+                    if self.enable_nvtx:
+                        range_push("worker.follow_speculate", synchronize=False)
+                    _t0 = _time.perf_counter() if phase_period else 0.0
+                    speculation = self._try_follow_speculation(pending)
+                    if phase_period:
+                        _phase_record("follow_speculate", _time.perf_counter() - _t0)
+                    if self.enable_nvtx:
+                        range_pop(synchronize=False)
 
-                        # Kick off pre-planning on the plan_executor NOW —
-                        # its Python work runs while the main thread is in
-                        # await_gpu (releases GIL). plan_executor waits on
-                        # prev's advance_event so  plan(N+1) starts before
-                        # replay(N) finishes. replay(N) keeps running on
-                        # the active slot.
-                        if speculation is not None and plan_executor is not None:
-                            engine = self.engine_manager.get_engine(
-                                speculation.node_batch.node_name
+                def _arm_speculation(spec: Speculation) -> None:
+                    # Reserve the double-buffer slot for batch_(N+1) NOW
+                    # so both pre-plan and replay (queued below) target
+                    # the SAME slot — and the OPPOSITE slot from
+                    # batch_N's in-flight replay. The reservation lives
+                    # on spec_node_batch.metadata['cuda_graph_slot'];
+                    # the engine forwards it to the runner.
+                    engine = self.engine_manager.get_engine(
+                        spec.node_batch.node_name
+                    )
+                    engine.reserve_replay_slot(spec.node_batch)
+
+                    # Kick off pre-planning on the plan_executor NOW —
+                    # its Python work runs while the main thread is in
+                    # await_gpu (releases GIL). plan_executor waits on
+                    # prev's advance_event so  plan(N+1) starts before
+                    # replay(N) finishes. replay(N) keeps running on
+                    # the active slot.
+                    if plan_executor is not None:
+                        prev_advance_event_for_plan: threading.Event | None = None
+                        if pending is not None:
+                            prev_advance_event_for_plan = (
+                                pending.node_batch.metadata.get("advance_event")
                             )
-                            prev_advance_event_for_plan: threading.Event | None = None
-                            if pending is not None:
-                                prev_advance_event_for_plan = (
-                                    pending.node_batch.metadata.get("advance_event")
-                                )
-                            speculation.plan_future = plan_executor.submit(
-                                self._pre_plan_for_speculative_batch,
-                                engine,
-                                speculation.node_batch,
-                                prev_advance_event_for_plan,
-                            )
+                        spec.plan_future = plan_executor.submit(
+                            self._pre_plan_for_speculative_batch,
+                            engine,
+                            spec.node_batch,
+                            prev_advance_event_for_plan,
+                        )
+
+                if speculation is not None:
+                    _arm_speculation(speculation)
 
                 # 3. If pending: await GPU(N), submit speculated GPU(N+1)
                 # asap, then post-process N (fast then slow) overlapping
                 # with GPU(N+1).
                 spec_pending = None
                 if pending is not None:
+                    # TP async scheduling, follower side: the leader builds
+                    # and broadcasts its speculation AFTER it has submitted
+                    # N — i.e. typically after we passed step 2 for our own
+                    # N (in steady state both ranks submit N within µs of
+                    # each other). So keep watching for the head while N
+                    # runs, instead of blocking blind on the future: wake on
+                    # a message or on N completing, whichever comes first,
+                    # and build the head the moment it lands. Bounded by N's
+                    # own duration; the plain ``future.result()`` below is
+                    # unchanged for every other case.
+                    if speculation is None and self._is_tp_follow_pending(pending):
+                        while not pending.future.done():
+                            self.communicator.wait_for_work(50)
+                            self._process_messages()
+                            # readiness of a fresh rid on this rank may hinge
+                            # on a tensor / stream chunk landing during N
+                            self._check_ready_tensors()
+                            self._poll_stream_buffers()
+                            speculation = self._try_follow_speculation(pending)
+                            if speculation is not None:
+                                _arm_speculation(speculation)
+                                break
+
                     if self.enable_nvtx:
                         range_push("worker.await_gpu", synchronize=False)
                     _t0 = _time.perf_counter() if phase_period else 0.0
@@ -2373,6 +2881,17 @@ class Worker:
                     # the node has just completed
                     for node in pending.batch.node_objects.values():
                         node._speculatively_scheduled = False
+
+                    # TP async scheduling, follower side: if we did not build
+                    # the leader's speculation for THIS step during N, settle
+                    # it now — before N is post-processed — by building the
+                    # head from N's real outputs (the same speculation flow
+                    # the leader ran) or by learning the leader did not
+                    # speculate. See _resolve_follow_speculation.
+                    if speculation is None and self._is_tp_follow_pending(pending):
+                        speculation = self._resolve_follow_speculation(
+                            pending, output, _arm_speculation,
+                        )
 
                     def _maybe_clear_spec():
                         nonlocal speculation
@@ -2398,6 +2917,18 @@ class Worker:
                                 for rid, edges in speculation.consumed_streaming_edges.items():
                                     for edge in edges:
                                         self._return_speculative_streaming_edge(rid, edge)
+                                # Fresh rids were popped out of their ready
+                                # queues into this speculation; continuing
+                                # rids are re-readied by N's own routing, but
+                                # a fresh rid would otherwise never be
+                                # scheduled again. Give its node back.
+                                sb = speculation.scheduled_batch
+                                for rid, node in sb.node_objects.items():
+                                    if rid in speculation.continuing_rids:
+                                        continue
+                                    wg_id = sb.request_to_worker_graph.get(rid)
+                                    if wg_id is not None:
+                                        self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
                                 speculation = None
 
                     if output.allocation_failed:
@@ -2481,6 +3012,7 @@ class Worker:
                                 future=spec_future,
                                 speculative_new_iter=speculation.is_new_iter,
                                 loop_name=speculation.loop_name,
+                                tp_seq=speculation.tp_seq,
                             )
                         elif speculation.plan_future is not None:
                             # All continuing rids were dropped post-thread,
@@ -2565,8 +3097,12 @@ class Worker:
                 fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
                 fallthrough_engine.reserve_replay_slot(node_batch)
 
-                # send messages to follower ranks if relevant
-                self.maybe_send_zmq_to_tp_followers(node_batch)
+                # send messages to follower ranks if relevant. A leader gets
+                # the seq it just broadcast; a follower running a TP-follow
+                # batch keeps the seq the batch came off the FIFO with (so a
+                # later speculative head can name it); everyone else -1.
+                broadcast_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
+                fallthrough_tp_seq = broadcast_seq if broadcast_seq >= 0 else batch.tp_seq
 
                 # Attach a fresh advance_event so the next iter's
                 # plan_executor (if it speculates) can wait on this batch's
@@ -2585,10 +3121,19 @@ class Worker:
                     node_name=batch.node_name,
                     partition=batch_partition,
                     graph_walk=batch.graph_walk,
-                    future=future
+                    future=future,
+                    tp_seq=fallthrough_tp_seq,
                 ))
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch)
+                # TP async scheduling, follower side: a step that raised here
+                # will not be followed by a speculation on this rank (the
+                # leader's raised too — symmetric — and it dropped its
+                # speculation unsubmitted). Close the step so a head from it
+                # (queued, or still arriving) is dropped rather than left at
+                # the FIFO front with rids that were just failed.
+                if pending is not None and self._is_tp_follow_pending(pending):
+                    self._close_tp_follow_step(pending)
                 # Clear the in-flight step. Without this the next iteration
                 # calls .result() on the same completed-with-exception future
                 # and re-raises forever, wedging the worker on one bad batch.
