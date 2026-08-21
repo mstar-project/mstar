@@ -141,12 +141,19 @@ The abstract methods you **must** implement:
    The heart of the model: returns ``{walk_name: graph}``. See
    `Step 3 — Declare the computation graph`_.
 
-``process_prompt(self, prompt, input_modalities, output_modalities, tensors=None, **kwargs) -> NameToTensorList``
+``process_prompt(self, prompt, input_modalities, output_modalities, tensors=None, prompt_parts=None, **kwargs) -> NameToTensorList``
    Tokenize the prompt and produce the initial request tensors (e.g.
    ``{"text_inputs": [token_ids]}``). It runs in the API-server data worker *after*
    raw media tensors have been loaded, so it may read ``tensors`` (e.g.
    ``image_inputs`` / ``audio_inputs`` / ``video_inputs``) to compute derived tensors
    such as ``pixel_values``. The returned dict is merged into the request's tensors.
+
+   ``input_modalities`` is the request layout: one entry per prompt element in the
+   order written, so ``["image", "text", "image"]`` is a distinct request from
+   ``["image", "image", "text"]``. ``prompt_parts`` carries the same sequence with
+   the text attached, and is ``None`` for entrypoints that submit files and text
+   separately. :mod:`mstar.model.multimodal` turns either into the prefill plan
+   that ``process_prompt`` and the schedule builder both work from.
 
 ``get_initial_forward_pass_args(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs=None) -> ForwardPassArgs``
    Build the first :class:`mstar.model.base.ForwardPassArgs` for a partition — which

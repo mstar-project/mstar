@@ -25,6 +25,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
         input_modalities=args.input_modalities,
         output_modalities=args.output_modalities,
         model_kwargs=args.model_kwargs,
+        prompt_parts=args.prompt_parts,
         streaming=bool(req.stream),
         request_id=request_id,
     )

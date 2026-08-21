@@ -24,6 +24,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
+from mstar.model.multimodal import PromptPart
 from mstar.utils.sampling import MultiSamplingConfig, SamplingConfig
 
 DECODE = "decode"
@@ -432,6 +433,7 @@ class Model(ABC):
         input_modalities: list[str],
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
+        prompt_parts: list[PromptPart] | None = None,
         **kwargs,
     ) -> NameToTensorList:
         """Tokenize prompt and produce initial tensors for the request.
@@ -451,6 +453,9 @@ class Model(ABC):
                 (``image_inputs``, ``audio_inputs``, ``video_inputs``).
                 The model may read these to compute derived tensors.
                 Models that don't need the raw tensors may ignore this.
+            prompt_parts: Ordered text/attachment sequence as written.
+                ``None`` from entrypoints with no ordering to preserve; see
+                :func:`mstar.model.multimodal.parts_from_modalities`.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:
