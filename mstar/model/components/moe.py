@@ -476,9 +476,9 @@ class ParallelSparseMoeBlock(nn.Module):
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             routing_weights, selected_experts, reduce_results=False,
         )
-        self.comm_group.all_reduce(cache3)
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
+        self.comm_group.all_reduce(output)
         return output
 
 
@@ -585,7 +585,7 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
             flat, self.experts.gate_up_proj, self.experts.down_proj,
             routing_weights, selected_experts, reduce_results=False,
         )
-        self.comm_group.all_reduce(cache3)
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
+        self.comm_group.all_reduce(output)
         return output

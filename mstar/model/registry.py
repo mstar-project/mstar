@@ -9,6 +9,7 @@ from mstar.model.pi05.pi05_model import Pi05Model
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
+from mstar.model.wan22.wan22_model import Wan22Model
 from mstar.model.whisper.whisper_model import WhisperModel
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
@@ -25,6 +26,7 @@ MODEL_REGISTRY: dict[str, type[Model]] = {
     "qwen3_tts": Qwen3TTSModel,
     "vjepa2": VJepa2Model,
     "vjepa2_ac": VJepa2ACModel,
+    "wan22": Wan22Model,
     "whisper_large": WhisperModel,
 }
 
@@ -68,6 +70,9 @@ HF_MODELS: dict[str, dict] = {
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.
     "vjepa2_ac": {"model_path_hf": "vjepa2-ac-vitg"},
+    # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
+    # only; the A14B MoE variants are a separate follow-up.
+    "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},

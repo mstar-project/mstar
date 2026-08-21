@@ -169,8 +169,24 @@ The abstract methods you **must** implement:
    `Step 4 — Implement the submodules`_.
 
 Useful overridable defaults (not abstract): ``get_sampling_config`` (temperature/top-p
-per node), ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image`` /
-``load_audio`` / ``load_video``, and the partition API below.
+per node), ``get_aux_sampling_configs`` (see below), ``get_max_output_tokens``,
+``get_autocast_dtype``, ``load_image`` / ``load_audio`` / ``load_video``, and the
+partition API below.
+
+A node whose forward samples **more than once per step** with different parameters
+declares the extra configs from ``get_aux_sampling_configs(node_name, model_kwargs)``,
+which returns ``label -> SamplingConfig``. Qwen3-Omni's Talker does this: the Talker LLM
+samples codec group 0 from the main config, and the CodePredictor samples groups
+1..N-1 from the ``"code_predictor"`` aux config. The submodule then samples with::
+
+   layer0 = sampler.sample(request_ids, logits)                      # main config
+   code = sampler.sample_aux("code_predictor", request_ids, logits)  # aux config
+
+Each label gets its own sampler buffers (independent per-request params, philox stream
+and optional repetition-penalty mask), so aux params stay per-request and CUDA-graph
+safe. Do **not** pass sampling parameters into a captured forward as Python scalars:
+they are baked into the captured kernel launch and every replay silently reuses the
+capture-time values.
 
 Step 3 — Declare the computation graph
 --------------------------------------

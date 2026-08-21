@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.utils.sampling import SamplingConfig
+from mstar.utils.sampling import MultiSamplingConfig
 
 
 @dataclass
@@ -71,7 +71,7 @@ class CurrentForwardPassInfo:
     max_tokens: int
 
     # node name to sampling config
-    sampling_config: dict[str, SamplingConfig | None]
+    sampling_config: dict[str, MultiSamplingConfig | None]
     step_metadata: dict = field(default_factory=dict)
     per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default="default")

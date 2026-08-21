@@ -234,10 +234,12 @@ class BagelAdapter(OpenAIAdapter):
 class Qwen3OmniAdapter(OpenAIAdapter):
     """Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.
 
-    Sampling is split across two stages: the Thinker (text) takes
-    ``thinker_*`` keys, the Talker (speech) ``talker_*``. The other Talker knobs
-    (``talker_top_k``, ``talker_repetition_penalty``) aren't OpenAI fields — pass
-    them via ``extra_body``.
+    Sampling is split across three stages: the Thinker (text) takes
+    ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker's
+    CodePredictor (residual codec groups) ``code_predictor_*``. Everything
+    except temperature/top_p is not an OpenAI field (``talker_top_k``,
+    ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those
+    via ``extra_body``.
     """
 
     supports_chat = True
@@ -373,6 +375,59 @@ class Cosmos3Adapter(OpenAIAdapter):
         )
 
 
+class Wan22Adapter(OpenAIAdapter):
+    """Wan2.2-TI2V-5B: text/image-to-video generation (video only).
+
+    ``size`` ("WxH") maps to the model's ``width`` / ``height`` kwargs; ``seed``
+    and any extra knobs (``guidance_scale``, ``num_inference_steps``,
+    ``negative_prompt``) pass through via ``extra_body``. ``fps`` is a playback
+    rate (the mp4 container rate), not a generation knob — see
+    ``Wan22Model.postprocess``.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "size", None):
+            # Unlike cosmos3, the model has no "size" kwarg — its generation
+            # knobs are width/height, so the adapter does the split here.
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '832x480'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        # num_frames / fps are first-class video fields (not in extra_body).
+        if getattr(req, "num_frames", None) is not None:
+            mk.setdefault("num_frames", req.num_frames)
+        if getattr(req, "fps", None) is not None:
+            mk.setdefault("fps", req.fps)
+        # Image-to-video: the conditioning frame (URL / data URI) is persisted
+        # and loaded by the worker, which VAE-encodes it into the frame-0
+        # anchor. Wan2.2 has no video-conditioned mode.
+        if getattr(req, "video", None):
+            raise ValueError("Wan2.2 does not support 'video' conditioning; provide 'image' or neither.")
+        image = getattr(req, "image", None)
+        if image:
+            _, path = media_io.resolve_media_ref(image, upload_dir)
+            return SubmitArgs(
+                text=req.prompt,
+                file_paths={"image": [path]},
+                input_modalities=["image", "text"],
+                output_modalities=["video"],
+                model_kwargs=mk,
+            )
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video"],
+            model_kwargs=mk,
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
@@ -382,6 +437,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),
+    "wan22": Wan22Adapter(),
 }
 
 

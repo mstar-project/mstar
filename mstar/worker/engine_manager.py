@@ -164,7 +164,7 @@ class EngineManager:
                 transfer_engine_info=transfer_engine_info,
                 kv_cache_type=autocast_dtype,
                 default_sampling_config={
-                    node: model.get_sampling_config(node, {}) \
+                    node: model.resolve_sampling_configs(node, {}) \
                         for node in submodules
                 }
             )

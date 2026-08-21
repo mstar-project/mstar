@@ -44,7 +44,11 @@ from mstar.engine.kv_store import KVCacheConfig, PagedAllocationManager
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeSubmodule
 from mstar.profile.worker import ExecTimings
 from mstar.utils.profiler import mark, range_pop, range_push
-from mstar.utils.sampling import Sampler, SamplerBuffers, SamplingConfig, make_sampler_from_buffers
+from mstar.utils.sampling import (
+    MultiSampler,
+    MultiSamplerBuffers,
+    MultiSamplingConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,11 +206,11 @@ class CudaGraphRunner:
         submodule: ARNodeSubmodule,
         kv_cache_config: KVCacheConfig,
         alloc_manager: PagedAllocationManager,
-        sampler: Sampler,
+        sampler: MultiSampler,
         buffer_manager: WorkspaceBufferManager,
         device: torch.device,
         autocast_dtype: torch.dtype,
-        default_sampling_config: SamplingConfig,
+        default_sampling_config: MultiSamplingConfig,
         tp_group=None,
     ):
         from mstar.distributed.communication import CommGroup
@@ -223,9 +227,9 @@ class CudaGraphRunner:
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.buffer_manager = buffer_manager
-        # ``get_sampling_config`` is typed Optional; coalesce so the
-        # ``.vocab_size`` access below (and any future use) is None-safe.
-        self.default_sampling_config = default_sampling_config or SamplingConfig()
+        # ``resolve_sampling_configs`` is typed Optional; coalesce so the
+        # allocation below (and any future use) is None-safe.
+        self.default_sampling_config = default_sampling_config or MultiSamplingConfig()
         self.enable_nvtx = False  # set by KVCacheEngine after construction
 
         self.graphs: dict[CudaGraphKey, CudaGraphData] = {}
@@ -266,14 +270,15 @@ class CudaGraphRunner:
             [max(config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES)
             for config in self.capture_configs] or [1]
         )
-        self.sampler_buffer: SamplerBuffers = SamplerBuffers.allocate(
+        self.sampler_buffer: MultiSamplerBuffers = MultiSamplerBuffers.allocate(
             max_batch_size=self.max_bs, device=device,
             tp_group=self.tp_group,
-            # A vocab size on the model's default sampling config enables the
-            # seen-token mask buffers (allocated before capture) so submodules
-            # that sample with a repetition penalty in-graph (e.g. the
-            # Qwen3-Omni Talker) can apply it. None => no mask buffers.
-            vocab_size=self.default_sampling_config.vocab_size,
+            # One SamplerBuffers per label (main + each aux). A vocab size on a
+            # label's default sampling config enables its seen-token mask
+            # buffers (allocated before capture) so submodules that sample with
+            # a repetition penalty in-graph (e.g. the Qwen3-Omni Talker) can
+            # apply it. None => no mask buffers for that label.
+            config=self.default_sampling_config,
         )
 
     def warmup_and_capture(self) -> None:
@@ -562,11 +567,10 @@ class CudaGraphRunner:
             request_ids=dummy_rids,
             per_request_info=dummy_metadata,
             cache_manager=cache_manager,
-            sampler=make_sampler_from_buffers(
-                bufs=self.sampler_buffer,
-                request_ids=[], sampling_configs={},
+            sampler=self.sampler_buffer.gather_for_request_ids(
+                request_ids=[],
                 padded_bs=len(dummy_rids)
-            ),
+            )
         )
 
     def _make_dummy_seq_lens(
@@ -1035,25 +1039,21 @@ class CudaGraphRunner:
         return key if key in self.graphs else None
 
     def _get_sampler(
-        self, per_request_info: dict[str, CurrentForwardPassInfo],
-        request_ids: list[str], padded_bs: int,
+        self, request_ids: list[str], padded_bs: int,
         gather_seen_tokens: bool = True,
     ):
         # Per-request sampling configs are pre-staged on master GPU buffers
         # (see ``register_request`` / ``update_request_config`` from KVCacheEngine);
-        # the per-step path is just a slot-index gather + index_select. The
-        # ``per_request_info`` argument is unused here but kept on the
-        # signature for symmetry with the older callers.
-        del per_request_info
+        # the per-step path is just a slot-index gather + index_select.
         return self.sampler_buffer.gather_for_request_ids(
             request_ids=request_ids, padded_bs=padded_bs,
             gather_seen_tokens=gather_seen_tokens,
         )
 
     def register_request(
-        self, request_id: str, sampling_config: SamplingConfig | None = None,
+        self, request_id: str, sampling_config: MultiSamplingConfig | None = None,
     ) -> None:
-        """Allocate a SamplerBuffers slot for ``request_id`` if not present."""
+        """Allocate a SamplerBuffers slot per label for ``request_id``."""
         self.sampler_buffer.register_request(request_id, sampling_config)
 
     def unregister_request(self, request_id: str) -> None:
@@ -1061,7 +1061,7 @@ class CudaGraphRunner:
         self.sampler_buffer.unregister_request(request_id)
 
     def update_request_config(
-        self, request_id: str, sampling_config: SamplingConfig,
+        self, request_id: str, sampling_config: MultiSamplingConfig,
     ) -> None:
         """Change-detect update for ``request_id``'s master sampling row."""
         self.sampler_buffer.update_request_config(request_id, sampling_config)
@@ -1466,15 +1466,13 @@ class CudaGraphRunner:
             # the in-graph penalty. Gated per-config; no-op for non-penalty graphs.
             if graph_data.applied_penalty_in_graph:
                 self.sampler_buffer.stage_seen_token_masks(
-                    request_ids,
-                    [self.sampler._seen_token_mask[rid] for rid in request_ids],
+                    request_ids, self.sampler,
                 )
             engine_inputs = ModelInputsFromEngine(
                 request_ids=dummy_rids,
                 per_request_info=real_metadata,
                 cache_manager=static_cm,
                 sampler=self._get_sampler(
-                    per_request_info=per_request_info,
                     request_ids=request_ids,
                     padded_bs=padded_bs,
                     gather_seen_tokens=graph_data.applied_penalty_in_graph,
@@ -1535,8 +1533,11 @@ class CudaGraphRunner:
 
             if graph_data.applied_penalty_in_graph:
                 engine_inputs.sampler.sync_seen_token_masks(
-                    [self.sampler._seen_token_mask[rid] for rid in request_ids]
+                    request_ids, self.sampler,
                 )
+            # Persist the in-graph-advanced RNG offsets back to their slot
+            # masters (GPU-only; keyed by slot, so batch-position invariant).
+            self.sampler_buffer.scatter_offsets()
 
             # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
             # advance_seq_lens is not captured in the graph; we call it manually so
@@ -1701,15 +1702,13 @@ class CudaGraphRunner:
             # the in-graph penalty. Gated per-config; no-op for non-penalty graphs.
             if graph_data.applied_penalty_in_graph:
                 self.sampler_buffer.stage_seen_token_masks(
-                    request_ids,
-                    [self.sampler._seen_token_mask[rid] for rid in request_ids],
+                    request_ids, self.sampler,
                 )
             engine_inputs = ModelInputsFromEngine(
                 request_ids=dummy_rids,
                 per_request_info=real_metadata,
                 cache_manager=static_cm,
                 sampler=self._get_sampler(
-                    per_request_info=per_request_info,
                     request_ids=request_ids,
                     padded_bs=padded_bs,
                     gather_seen_tokens=graph_data.applied_penalty_in_graph,
@@ -1767,8 +1766,10 @@ class CudaGraphRunner:
 
             if graph_data.applied_penalty_in_graph:
                 engine_inputs.sampler.sync_seen_token_masks(
-                    [self.sampler._seen_token_mask[rid] for rid in request_ids]
+                    request_ids, self.sampler,
                 )
+            # Persist the in-graph-advanced RNG offsets back to their slot masters.
+            self.sampler_buffer.scatter_offsets()
 
             # --- Step 5: Advance seq_lens on REAL request states (Python-only) ---
             if self.enable_nvtx:
@@ -2505,6 +2506,7 @@ class PiecewiseCudaGraphRunner:
         kv_cache_config: KVCacheConfig | None = None,
         alloc_manager: PagedAllocationManager | None = None,
         buffer_manager: WorkspaceBufferManager | None = None,
+        sampler_buffers: MultiSamplerBuffers | None = None,
         tp_group=None,
         label: str = "",
     ):
@@ -2524,6 +2526,7 @@ class PiecewiseCudaGraphRunner:
         self.kv_cache_config = kv_cache_config
         self.alloc_manager = alloc_manager
         self.buffer_manager = buffer_manager
+        self.sampler_buffer = sampler_buffers
         # ``tp_group`` is the per-node TP comm group. Defaults to the trivial
         # single-rank group so the runner behaves identically for non-TP
         # submodules. When ``world_size > 1`` the captured region may include
@@ -2618,11 +2621,21 @@ class PiecewiseCudaGraphRunner:
                 dynamic=False,
             )
 
+        # TODO: in the future, consider inputting a ModelInputsFromEngine struct
+        # instead of inputting static_cm and sampler separately
+        extra_kwargs = {}
+        if self.sampler_buffer is not None:
+            extra_kwargs["sampler"] = self.sampler_buffer.gather_for_request_ids(
+                request_ids=[],
+                padded_bs=shape.bs
+            )
+
         def run_fn():
             return fn(
                 static_inputs=static_inputs,
                 static_cm=static_cm,
                 **self.config.forward_kwargs,
+                **extra_kwargs
             )
 
         def plan():
@@ -3011,8 +3024,21 @@ class PiecewiseCudaGraphRunner:
                     plan_ctx=plan_ctx,
                 )
 
+            if self.sampler_buffer is not None and request_ids is not None:
+                # TODO: add "gather_seen_tokens" as an explicit flag in the piecewise cuda
+                # graph config so we don't do unnecessary work here
+                self.sampler_buffer.gather_for_request_ids(
+                    request_ids=request_ids, padded_bs=data.shape.bs,
+                    gather_seen_tokens=True,
+                )
+
             # --- 3: replay ---
             data.graph.replay()
+
+            if self.sampler_buffer is not None and request_ids is not None:
+                # Persist the in-graph-advanced RNG offsets back to their slot
+                # masters (mirrors the gather above; GPU-only, real rows only).
+                self.sampler_buffer.scatter_offsets()
 
             # --- 4: advance seq_lens (Python-only, post-replay) ---
             # Uses the per-request lengths planned in step 2, so this is correct for
@@ -3135,6 +3161,7 @@ def build_piecewise_runners(
     kv_cache_config: KVCacheConfig | None = None,
     alloc_manager: PagedAllocationManager | None = None,
     buffer_manager: WorkspaceBufferManager | None = None,
+    sampler_buffers: MultiSamplerBuffers | None = None,
 ) -> dict[str, PiecewiseCudaGraphRunner]:
     """Build + warm up one ``PiecewiseCudaGraphRunner`` per label a submodule
     declares via ``get_piecewise_cuda_graph_configs``.
@@ -3158,6 +3185,7 @@ def build_piecewise_runners(
                 kv_cache_config=kv_cache_config if config.uses_kv_cache else None,
                 alloc_manager=alloc_manager if config.uses_kv_cache else None,
                 buffer_manager=buffer_manager if config.uses_kv_cache else None,
+                sampler_buffers=sampler_buffers if config.uses_sampler else None,
                 tp_group=tp_group,
                 label=label,
             )

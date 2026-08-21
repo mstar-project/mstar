@@ -1,7 +1,7 @@
 """Pin the FlashInfer seed/offset contract the Talker's graph sampler relies on.
 
 The Talker samples stochastically (temperature ~0.9, top_k ~50) under CUDA-graph
-capture. ``CudaGraphableSampler.sample_with_config`` passes per-request philox
+capture. ``CudaGraphableSampler.sample`` passes per-request philox
 ``seed``/``offset`` as captured int tensors and advances ``offset_buf += 1``
 in-graph so each replay steps the RNG (see the comments in
 ``mstar/utils/sampling.py`` about a frozen offset never reaching EOS).
@@ -55,7 +55,7 @@ def _stochastic_probs(batch: int, vocab: int, device: torch.device):
 def test_tensor_seed_offset_accepted_under_capture():
     """Pinned FlashInfer must accept captured tensor seed/offset and advancing
     offset_buf in-graph must step the RNG -- the exact pattern
-    CudaGraphableSampler.sample_with_config relies on.
+    CudaGraphableSampler.sample relies on.
 
     Fails loudly (not skips) on a too-old build that rejects tensor seed, since
     that build silently breaks stochastic Talker sampling.
@@ -136,3 +136,76 @@ def test_none_offset_is_illegal_under_capture():
             flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p, deterministic=True, seed=None, offset=None
             )
+
+
+def test_aux_sampling_config_is_live_after_capture():
+    """An aux label's params must come from its buffers, not from capture-time
+    constants: capture a graph that samples via ``sample_aux``, then change the
+    aux config and replay. The replay must honour the new params.
+
+    Pins the fix for the old ``sample_with_config``, which took Python scalars
+    and so froze temperature/top_k/top_p into the captured kernel launch.
+    """
+    _flashinfer_or_skip()
+    from mstar.utils.sampling import (
+        MultiSamplerBuffers,
+        MultiSamplingConfig,
+        SamplingConfig,
+    )
+
+    dev = torch.device("cuda")
+    V = 16
+    rid, label = "r1", "code_predictor"
+
+    def cfg(temperature: float, top_k: int) -> MultiSamplingConfig:
+        c = MultiSamplingConfig(
+            main=SamplingConfig(),
+            aux={label: SamplingConfig(temperature=temperature, top_k=top_k)},
+        )
+        c.set_seed(7)
+        return c
+
+    # allocate() creates one SamplerBuffers per label named in the config.
+    bufs = MultiSamplerBuffers.allocate(
+        max_batch_size=1, device=dev, config=cfg(5.0, 0),
+    )
+    bufs.register_request(rid, cfg(5.0, 0))
+
+    # Near-uniform logits so a wide top_k actually produces varied samples,
+    # with an unambiguous argmax for the top_k=1 phase.
+    torch.manual_seed(0)
+    logits = torch.zeros(1, V, device=dev)
+    logits[0, 3] = 5.0
+    argmax = 3
+
+    sampler = bufs.gather_for_request_ids([rid], padded_bs=1)
+    for _ in range(2):  # warm up triton autotune + flashinfer outside capture
+        sampler.sample_aux(label, [rid], logits)
+    torch.cuda.synchronize()
+
+    pool = torch.cuda.graph_pool_handle()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, pool=pool):
+        out = sampler.sample_aux(label, [rid], logits)
+
+    # Phase 1 (captured config): temperature 5.0, top_k disabled -> varied.
+    bufs.gather_for_request_ids([rid], padded_bs=1)
+    hot = []
+    for _ in range(20):
+        g.replay()
+        torch.cuda.synchronize()
+        hot.append(int(out.item()))
+    assert len(set(hot)) > 1, f"expected a varied stream, got {hot}"
+
+    # Phase 2: swap in top_k=1. Same graph, no recapture -> must be argmax.
+    bufs.update_request_config(rid, cfg(5.0, 1))
+    bufs.gather_for_request_ids([rid], padded_bs=1)
+    greedy = []
+    for _ in range(20):
+        g.replay()
+        torch.cuda.synchronize()
+        greedy.append(int(out.item()))
+    assert set(greedy) == {argmax}, (
+        "aux sampling params were frozen at capture: after switching to "
+        f"top_k=1 the replay should return argmax={argmax}, got {sorted(set(greedy))}"
+    )

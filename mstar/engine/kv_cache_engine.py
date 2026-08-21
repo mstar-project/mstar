@@ -1,7 +1,7 @@
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 import torch
 
@@ -38,7 +38,7 @@ from mstar.engine.kv_store import (
 )
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 from mstar.utils.profiler import range_pop, range_push
-from mstar.utils.sampling import Sampler, SamplingConfig
+from mstar.utils.sampling import MultiSampler, MultiSamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +125,8 @@ class SubmoduleManagement:
     submodule: ARNodeSubmodule
     kv_management: KVManagement
     tp_group: CommGroup
-    default_sampling_config: SamplingConfig
-    sampler: Sampler = field(default_factory=Sampler)
+    default_sampling_config: MultiSamplingConfig
+    sampler: MultiSampler
     cuda_graph_runner: CudaGraphRunner | None = None
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up.
@@ -181,7 +181,7 @@ class KVCacheEngine(BaseEngine):
         kv_cache_config: list[KVCacheConfig],
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
-        default_sampling_config: dict[str, SamplingConfig],
+        default_sampling_config: dict[str, MultiSamplingConfig],
         kv_cache_type=None,
     ) -> None:
         self.device = device
@@ -286,14 +286,16 @@ class KVCacheEngine(BaseEngine):
 
         for node_name, submodule in submodules.items():
             tp_group = parallel_groups.get_tp_config_for_node(node_name)
+            sampl_cfg = default_sampling_config.get(
+                node_name, MultiSamplingConfig()
+            )
             self.submodule_management[node_name] = SubmoduleManagement(
                 submodule=submodule,
                 kv_management=node_to_kv_mgmt[node_name],
                 tp_group=tp_group,
-                default_sampling_config=default_sampling_config.get(
-                    node_name, SamplingConfig()
-                ),
-                sampler=Sampler(
+                default_sampling_config=sampl_cfg,
+                sampler=MultiSampler.new(
+                    aux_labels=list(sampl_cfg.aux.keys()),
                     device=self.device, tp_group=tp_group
                 ),
             )
@@ -400,6 +402,9 @@ class KVCacheEngine(BaseEngine):
                 kv_cache_config=kv_mgmt.kv_cache_config,
                 alloc_manager=kv_mgmt.alloc_manager,
                 buffer_manager=kv_mgmt.buffer_manager,
+                # Lets a captured region sample in-graph off the node's static
+                # sampler buffers (e.g. the Qwen3-TTS CodePredictor depth loop).
+                sampler_buffers=runner.sampler_buffer,
             )
 
         # torch.compile applied after CUDA graph capture so compiled kernels
@@ -518,7 +523,7 @@ class KVCacheEngine(BaseEngine):
 
     def _execute_batched(
         self, batch: NodeBatch, submodule: ARNodeSubmodule,
-        inputs: list[ARNodeInputs], sampler: Sampler,
+        inputs: list[ARNodeInputs], sampler: MultiSampler,
     ) -> NodeOutput:
         """Execute batch with BatchedCacheManager for true vectorized batching."""
         cache_manager = self._create_cache_manager(
@@ -640,7 +645,7 @@ class KVCacheEngine(BaseEngine):
         self, batch: NodeBatch,
         submodule: ARNodeSubmodule,
         inputs: list[ARNodeInputs],
-        sampler: Sampler,
+        sampler: MultiSampler,
     ) -> NodeOutput:
         """Original per-request execution with CacheHandle."""
         per_request_outputs = {}
@@ -934,8 +939,8 @@ class KVCacheEngine(BaseEngine):
         runner = submod_mgmt.cuda_graph_runner
         for rid, info in batch.per_request_info.items():
             sampling_config = info.sampling_config.get(batch.node_name)
-            sampling_kwargs = {} if sampling_config is None else asdict(sampling_config)
-            submod_mgmt.sampler.set_config(rid, **sampling_kwargs)
+            if sampling_config is not None:
+                submod_mgmt.sampler.set_config(rid, sampling_config)
             # Mirror into the cuda-graph runner's master GPU buffers.
             # update_request_config is change-detected, so steady-state
             # requests pay only a dict comparison here — no GPU work.

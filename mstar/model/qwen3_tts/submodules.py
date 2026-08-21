@@ -8,8 +8,9 @@
 #      - Maintains the Talker paged KV cache across 12 Hz decode steps.
 #      - Predicts codec group 0 with the Talker and groups 1-15 with the
 #        depth-wise CodePredictor.
-#      - Supports continuous batching, whole-forward decode CUDA Graphs, and
-#        a piecewise CUDA Graph for the CodePredictor inner loop.
+#      - Supports continuous batching and whole-forward decode CUDA Graphs
+#        (the CodePredictor depth loop is captured inside them), plus a
+#        piecewise graph covering that loop on eager paths like prefill.
 #   2. CodecSubmodule (STATELESS engine)
 #      - Receives buffered codec frames from the Talker partition.
 #      - Pads variable final tails to fixed CUDA Graph capture shapes.
@@ -26,6 +27,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -51,7 +53,10 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
 )
-from mstar.utils.sampling import SeenTokenMask
+from mstar.utils.sampling import (
+    BaseMultiSampler,
+    SeenTokenMask,
+)
 
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
@@ -70,8 +75,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     # Compiling the entire engine-facing forward traces request sampling,
     # residual-code control flow, and recurrent routing in addition to the
     # transformer. It introduces graph breaks and showed no steady-state win
-    # for this path. The CodePredictor hot loop remains CUDA-graph captured
-    # independently below.
+    # for this path. The whole decode forward (CodePredictor loop included) is
+    # still CUDA-graph captured.
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -92,6 +97,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.cp_config = config.talker.code_predictor
         self.num_codes = config.talker.num_code_groups
         self._suppress_mask: torch.Tensor | None = None
+        self._decode_last_token_indices: torch.Tensor | None = None
         self._cp_kv_cache: torch.Tensor | None = None
 
     def _get_suppress_mask(self) -> torch.Tensor:
@@ -108,25 +114,41 @@ class TalkerSubmodule(ARNodeSubmodule):
             self._suppress_mask = mask
         return self._suppress_mask
 
-    def _get_batch_suppress_mask(
+    def _get_batch_suppress_eos(
         self, inputs: list[ARNodeInputs]
     ) -> torch.Tensor:
-        """Apply input-carried minimum-length EOS suppression to the base mask.
+        """Pack the input-carried minimum-length EOS flags for this batch.
 
         CUDA Graph replay calls ``preprocess`` with capture-slot dummy request
         ids, so looking up request state here would permanently observe a new
         request at frame zero. ``prepare_inputs`` runs with the real request and
         carries the dynamic flag as a tensor instead.
         """
-        mask = self._get_suppress_mask().unsqueeze(0).expand(
-            len(inputs), -1
-        ).clone()
+        flags = [item.tensor_inputs["suppress_eos"] for item in inputs]
+        packed = flags[0] if len(flags) == 1 else torch.cat(flags)
+        return packed.to(device=self.get_device(), dtype=torch.bool)
+
+    def _get_decode_last_token_indices(self, batch_size: int) -> torch.Tensor:
+        """Return cached packed-sequence indices for one-token decode rows."""
+        if self._decode_last_token_indices is None:
+            self._decode_last_token_indices = torch.arange(
+                self.MAX_BATCH_SIZE,
+                dtype=torch.long,
+                device=self.get_device(),
+            )
+        return self._decode_last_token_indices[:batch_size]
+
+    def _mask_invalid_logits(
+        self, logits: torch.Tensor, suppress_eos: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the static codec mask and the per-request EOS decision."""
+        logits = logits.masked_fill(
+            self._get_suppress_mask().unsqueeze(0), float("-inf")
+        )
         eos = self.talker_config.codec_eos_token_id
-        if 0 <= eos < mask.shape[1]:
-            mask[:, eos] = torch.cat([
-                item.tensor_inputs["suppress_eos"] for item in inputs
-            ]).to(device=mask.device, dtype=torch.bool)
-        return mask
+        if 0 <= eos < logits.shape[1]:
+            logits[:, eos].masked_fill_(suppress_eos, float("-inf"))
+        return logits
 
     def _get_cp_kv_cache(self, batch_size: int) -> torch.Tensor:
         """Return the fixed CodePredictor scratch cache for this micro-batch.
@@ -134,7 +156,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         CodePredictor attention is local to one 16-group frame, so this cache
         does not belong to the engine's cross-step paged KV cache. A maximum
         batch allocation is reused and overwritten for every Talker step,
-        which also gives the piecewise CUDA Graph stable addresses.
+        which also gives the captured decode graph stable addresses.
         """
         expected = (
             self.cp_config.num_hidden_layers,
@@ -343,114 +365,107 @@ class TalkerSubmodule(ARNodeSubmodule):
         request back to the hidden state used for codec-group-0 prediction.
         FlashInfer receives separate sequence lengths and KV page tables.
         """
-        del graph_walk
         cache_manager = engine_inputs.cache_manager
         assert cache_manager is not None
         cache_manager.set_active_label("main")
         seq_lens = [item.input_seq_len for item in inputs]
         cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
         cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
-        return {
-            "input_embeds": torch.cat([
-                item.input_embeds for item in inputs if item.input_embeds is not None
-            ], dim=0),
-            "last_token_indices": (
+        input_embeds = [
+            item.input_embeds for item in inputs if item.input_embeds is not None
+        ]
+        if graph_walk == "talker_decode":
+            if any(seq_len != 1 for seq_len in seq_lens):
+                raise ValueError("Qwen3-TTS decode expects one token per request")
+            packed_embeds = (
+                input_embeds[0]
+                if len(input_embeds) == 1
+                else torch.cat(input_embeds, dim=0)
+            )
+            last_token_indices = self._get_decode_last_token_indices(len(inputs))
+        else:
+            packed_embeds = torch.cat(input_embeds, dim=0)
+            last_token_indices = (
                 torch.tensor(seq_lens, device=self.get_device()).cumsum(0) - 1
-            ),
-            "suppress_mask": self._get_batch_suppress_mask(inputs),
+            )
+
+        # Materialize the persistent base mask before CUDA Graph capture. Only
+        # the per-request EOS flags need to cross the replay input boundary.
+        self._get_suppress_mask()
+        return {
+            "input_embeds": packed_embeds,
+            "last_token_indices": last_token_indices,
+            "suppress_eos": self._get_batch_suppress_eos(inputs),
         }
 
-    @staticmethod
-    def _sample_code_predictor(
-        sampler,
-        logits: torch.Tensor,
-        sampling: dict[str, Any],
-    ) -> torch.Tensor:
-        """Eager fallback sampler for one residual codec group."""
-        temperature = float(sampling.get("temperature", 0.9))
-        if not sampling.get("do_sample", True) or temperature <= 0:
-            return sampler._broadcast_tokens(logits.argmax(dim=-1))
-        return sampler.sample_with_config(
-            logits=logits,
-            temperature=temperature,
-            top_k=int(sampling.get("top_k", 50)),
-            top_p=float(sampling.get("top_p", 1.0)),
-        )
+    def _run_frame(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        input_embeds: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        suppress_eos: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Produce one complete codec frame for every request in the batch.
 
-    @staticmethod
-    def _sample_from_uniform(
-        logits: torch.Tensor,
-        uniform: torch.Tensor,
-        temperature: torch.Tensor,
-        top_k: torch.Tensor,
-        top_p: torch.Tensor,
-        do_sample: torch.Tensor,
-    ) -> torch.Tensor:
-        """Graph-safe batched top-k/top-p sampling from supplied uniforms.
-
-        TODO(#199): replace this model-local path with the engine's auxiliary
-        sampler once it supports independent per-request CUDA-graph buffers.
+        The main Talker advances the engine-managed KV cache and predicts group
+        0; the CodePredictor's unrolled depth loop fills groups 1..N-1 through
+        the ``code_predictor`` aux sampler. Both read their params from
+        engine-owned static buffers, so this single path serves eager execution
+        and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
         """
-        vocab_size = logits.shape[-1]
-        greedy = logits.argmax(dim=-1)
-        safe_temperature = torch.where(
-            do_sample,
-            temperature.clamp_min(1e-5),
-            torch.ones_like(temperature),
-        ).unsqueeze(1)
-        sorted_logits, sorted_indices = torch.sort(
-            logits / safe_temperature, dim=-1, descending=True
-        )
-        positions = torch.arange(vocab_size, device=logits.device).unsqueeze(0)
-        effective_top_k = torch.where(
-            top_k > 0,
-            top_k.clamp_max(vocab_size),
-            torch.full_like(top_k, vocab_size),
-        )
-        sorted_logits = sorted_logits.masked_fill(
-            positions >= effective_top_k.unsqueeze(1), float("-inf")
-        )
-        probs = torch.softmax(sorted_logits, dim=-1)
-        cumulative = probs.cumsum(dim=-1)
-        remove = cumulative - probs > top_p.clamp_min(1e-6).unsqueeze(1)
-        probs = probs.masked_fill(remove, 0)
-        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        cdf = probs.cumsum(dim=-1)
-        sampled_rank = (cdf < uniform.unsqueeze(1)).sum(dim=-1)
-        sampled_rank = sampled_rank.clamp_max(vocab_size - 1)
-        sampled = sorted_indices.gather(1, sampled_rank.unsqueeze(1)).squeeze(1)
-        return torch.where(do_sample, sampled, greedy).to(torch.long)
+        hidden = self.model(input_embeds, engine_inputs.cache_manager)
+        last_hidden = hidden.index_select(0, last_token_indices)
+        logits = self.model.codec_head(last_hidden)
+        logits = self._mask_invalid_logits(logits, suppress_eos)
+        sampler = engine_inputs.sampler
+        assert sampler is not None
+        request_ids = engine_inputs.request_ids
+        # The repetition penalty applies to group 0 only; the depth loop below
+        # stays penalty-free (its aux config declares no vocab_size).
+        layer0_codes = sampler.sample(request_ids, logits, apply_penalty=True)
 
-    def _run_code_predictor_tensor_loop(
+        piecewise = self._run_depth_loop_piecewise(
+            engine_inputs, last_hidden, layer0_codes
+        )
+        if piecewise is not None:
+            all_codes, codec_embed_sum = piecewise
+        else:
+            all_codes, codec_embed_sum = self._depth_loop(
+                last_hidden, layer0_codes,
+                lambda cp_logits: sampler.sample_aux(
+                    "code_predictor", request_ids, cp_logits
+                ),
+            )
+
+        return {
+            "talker_input_embeds": codec_embed_sum,
+            "codec_tokens": all_codes,
+            "new_token": layer0_codes,
+        }
+
+    def _depth_loop(
         self,
         last_hidden: torch.Tensor,
         layer0_codes: torch.Tensor,
-        uniforms: torch.Tensor,
-        temperature: torch.Tensor,
-        top_k: torch.Tensor,
-        top_p: torch.Tensor,
-        do_sample: torch.Tensor,
+        sample_codes: "Callable[[torch.Tensor], torch.Tensor]",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict residual groups 1-15 with graph-safe tensor operations.
+        """Walk residual groups 1..N-1, returning (all_codes, codec_embed_sum).
 
-        Random uniforms and sampling parameters are inputs, rather than being
-        created in this function, so CUDA Graph replay changes samples without
-        recapturing the depth loop.
+        ``sample_codes`` maps one group's logits to codes. Every op here is
+        graph-safe, so this body is captured verbatim — inside the whole-walk
+        decode graph, or on its own by the piecewise runner.
         """
         batch_size = layer0_codes.shape[0]
+        device = layer0_codes.device
         all_codes = torch.empty(
-            batch_size,
-            self.num_codes,
-            dtype=torch.long,
-            device=layer0_codes.device,
+            batch_size, self.num_codes, dtype=torch.long, device=device
         )
         all_codes[:, 0] = layer0_codes
         codec_embed = self.model.model.codec_embedding(layer0_codes)
         codec_embed_sum = codec_embed.clone()
+
         cp_cache = self._get_cp_kv_cache(batch_size)
-        pos = torch.zeros(
-            batch_size, 1, dtype=torch.long, device=layer0_codes.device
-        )
+        pos = torch.zeros(batch_size, 1, dtype=torch.int32, device=device)
         # Position 0 conditions the depth decoder on the Talker hidden state.
         # Each following position consumes the previous group's embedding.
         self.code_predictor.forward_depth_unrolled(
@@ -465,14 +480,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 cp_hidden,
                 self.code_predictor.lm_head_weight[group_idx - 1].t(),
             )
-            codes = self._sample_from_uniform(
-                cp_logits,
-                uniforms[:, group_idx - 1],
-                temperature,
-                top_k,
-                top_p,
-                do_sample,
-            )
+            codes = sample_codes(cp_logits)
             all_codes[:, group_idx] = codes
             codec_embed = self.code_predictor.model.codec_embedding[
                 group_idx - 1
@@ -483,185 +491,49 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _code_predictor_piecewise_capture(
         self,
         static_inputs: dict[str, torch.Tensor],
-        static_cm=None,
+        sampler: BaseMultiSampler,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
-        """Piecewise capture entry point for the hot residual-code depth loop."""
-        del static_cm
-        all_codes, codec_embed_sum = self._run_code_predictor_tensor_loop(
-            last_hidden=static_inputs["last_hidden"],
-            layer0_codes=static_inputs["layer0_codes"],
-            uniforms=static_inputs["uniforms"],
-            temperature=static_inputs["temperature"],
-            top_k=static_inputs["top_k"],
-            top_p=static_inputs["top_p"],
-            do_sample=static_inputs["do_sample"],
-        )
-        return {
-            "all_codes": all_codes,
-            "codec_embed_sum": codec_embed_sum,
-        }
+        """Capture entry point: the depth loop *including* its sampling.
 
-    def _piecewise_sampling_inputs(
-        self,
-        engine_inputs: ModelInputsFromEngine,
-        sampling: dict[str, Any],
-    ) -> dict[str, torch.Tensor]:
-        """Generate per-request RNG and dynamic sampling tensors before replay.
-
-        A persistent generator preserves each request's random stream across
-        changing micro-batches. Distributed workers broadcast the uniforms so
-        replicated CodePredictors choose identical residual codes.
+        The aux sampler for this bucket reads the engine's static param buffers,
+        so nothing about sampling has to be hoisted out as a static input the
+        way per-step uniforms and scalars used to be.
         """
-        batch_size = len(engine_inputs.request_ids)
-        device = self.get_device()
-        uniforms = []
-        for request_id in engine_inputs.request_ids:
-            state = self.request_state(request_id)
-            generator = state.get("code_predictor_generator")
-            if generator is None:
-                generator = torch.Generator(device=device)
-                generator.manual_seed(
-                    int(engine_inputs.per_request_info[request_id].random_seed)
-                )
-                state.add("code_predictor_generator", generator)
-            uniforms.append(torch.rand(
-                self.num_codes - 1,
-                dtype=torch.float32,
-                device=device,
-                generator=generator,
-            ))
-        uniform_tensor = torch.stack(uniforms)
-        sampler = engine_inputs.sampler
         assert sampler is not None
-        uniform_tensor = sampler._broadcast_tokens(uniform_tensor)
-        return {
-            "uniforms": uniform_tensor,
-            "temperature": torch.full(
-                (batch_size,),
-                float(sampling.get("temperature", 0.9)),
-                dtype=torch.float32,
-                device=device,
-            ),
-            "top_k": torch.full(
-                (batch_size,),
-                int(sampling.get("top_k", 50)),
-                dtype=torch.long,
-                device=device,
-            ),
-            "top_p": torch.full(
-                (batch_size,),
-                float(sampling.get("top_p", 1.0)),
-                dtype=torch.float32,
-                device=device,
-            ),
-            "do_sample": torch.full(
-                (batch_size,),
-                bool(sampling.get("do_sample", True)),
-                dtype=torch.bool,
-                device=device,
-            ),
-        }
+        layer0_codes = static_inputs["layer0_codes"]
+        all_codes, codec_embed_sum = self._depth_loop(
+            static_inputs["last_hidden"], layer0_codes,
+            lambda cp_logits: sampler.sample_aux("code_predictor", [], cp_logits),
+        )
+        return {"all_codes": all_codes, "codec_embed_sum": codec_embed_sum}
 
-    def _run_code_predictor_piecewise(
+    def _run_depth_loop_piecewise(
         self,
         engine_inputs: ModelInputsFromEngine,
         last_hidden: torch.Tensor,
         layer0_codes: torch.Tensor,
-        sampling: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Replay the captured depth loop, or signal the caller to use eager."""
+        """Replay the captured depth loop, or None to run it inline.
+
+        Used on paths the whole-walk graph doesn't cover — above all
+        ``talker_prefill``, which is eager because it is variable-length. Left
+        eager, this loop costs ~4x its captured time.
+        """
         runner = engine_inputs.piecewise_runners.get("code_predictor_loop")
         batch_size = layer0_codes.shape[0]
         if runner is None or not runner.can_run(batch_size=batch_size):
             return None
-        static_inputs = self._piecewise_sampling_inputs(engine_inputs, sampling)
-        static_inputs.update({
-            "last_hidden": last_hidden,
-            "layer0_codes": layer0_codes,
-        })
-        output = runner.run(static_inputs=static_inputs, real_bs=batch_size)
-        sampler = engine_inputs.sampler
-        assert sampler is not None
-        all_codes = sampler._broadcast_tokens(output["all_codes"])
-        codec_embed_sum = sampler._broadcast_tokens(output["codec_embed_sum"])
-        return all_codes, codec_embed_sum
 
-    def _run_frame(
-        self,
-        engine_inputs: ModelInputsFromEngine,
-        input_embeds: torch.Tensor,
-        last_token_indices: torch.Tensor,
-        suppress_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Produce one complete codec frame for every request in the batch.
-
-        The main Talker advances the engine-managed KV cache and predicts group
-        0. The CodePredictor fills residual groups through the piecewise graph
-        when available, with the identical eager loop as a fallback.
-        """
-        hidden = self.model(input_embeds, engine_inputs.cache_manager)
-        last_hidden = hidden.index_select(0, last_token_indices)
-        logits = self.model.codec_head(last_hidden)
-        logits = logits.masked_fill(suppress_mask, float("-inf"))
-        sampler = engine_inputs.sampler
-        assert sampler is not None
-        layer0_codes = sampler.sample(
-            engine_inputs.request_ids, logits, apply_penalty=True
+        output = runner.run(
+            static_inputs={
+                "last_hidden": last_hidden,
+                "layer0_codes": layer0_codes,
+            },
+            request_ids=engine_inputs.request_ids,
+            real_bs=batch_size,
         )
-
-        sampling = engine_inputs.first_request_info.step_metadata.get(
-            "subtalker_sampling", {}
-        )
-        piecewise_result = self._run_code_predictor_piecewise(
-            engine_inputs=engine_inputs,
-            last_hidden=last_hidden,
-            layer0_codes=layer0_codes,
-            sampling=sampling,
-        )
-        if piecewise_result is not None:
-            all_codes, codec_embed_sum = piecewise_result
-            return {
-                "talker_input_embeds": codec_embed_sum,
-                "codec_tokens": all_codes,
-                "new_token": layer0_codes,
-            }
-
-        # Eager fallback mirrors `_run_code_predictor_tensor_loop`. It uses the
-        # engine sampler directly because this path is outside CUDA capture.
-        batch_size = layer0_codes.shape[0]
-        all_codes = torch.empty(
-            batch_size, self.num_codes, dtype=torch.long, device=logits.device
-        )
-        all_codes[:, 0] = layer0_codes
-        codec_embed = self.model.model.codec_embedding(layer0_codes)
-        codec_embed_sum = codec_embed.clone()
-
-        cp_cache = self._get_cp_kv_cache(batch_size)
-        pos = torch.zeros(batch_size, 1, dtype=torch.long, device=logits.device)
-        self.code_predictor.forward_depth_unrolled(
-            last_hidden.unsqueeze(1), pos, cp_cache, cache_pos=0
-        )
-        for group_idx in range(1, self.num_codes):
-            pos.fill_(group_idx)
-            cp_hidden = self.code_predictor.forward_depth_unrolled(
-                codec_embed.unsqueeze(1), pos, cp_cache, cache_pos=group_idx
-            ).squeeze(1)
-            cp_logits = torch.matmul(
-                cp_hidden,
-                self.code_predictor.lm_head_weight[group_idx - 1].t(),
-            )
-            codes = self._sample_code_predictor(sampler, cp_logits, sampling)
-            all_codes[:, group_idx] = codes
-            codec_embed = self.code_predictor.model.codec_embedding[
-                group_idx - 1
-            ](codes)
-            codec_embed_sum.add_(codec_embed)
-
-        return {
-            "talker_input_embeds": codec_embed_sum,
-            "codec_tokens": all_codes,
-            "new_token": layer0_codes,
-        }
+        return output["all_codes"], output["codec_embed_sum"]
 
     def forward(
         self,
@@ -669,12 +541,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
-        suppress_mask: torch.Tensor,
+        suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> NameToTensorList:
         del graph_walk, kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_mask
+            engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         return {name: [tensor] for name, tensor in output.items()}
 
@@ -684,12 +556,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
-        suppress_mask: torch.Tensor,
+        suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, NameToTensorList]:
         del graph_walk, kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_mask
+            engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         return {
             request_id: {
@@ -760,21 +632,15 @@ class TalkerSubmodule(ARNodeSubmodule):
     def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
         """Admit compatible prefill/decode requests to continuous batching.
 
-        Residual sampling settings must match because the eager path reads one
-        batch-level configuration. Main Talker sampling remains request-local
-        through the engine sampler.
+        Both the Talker and the CodePredictor sample per-request off their own
+        sampler buffers, so requests with differing sampling settings batch
+        together freely.
         """
-        if (
-            batch.graph_walk not in {"talker_prefill", "talker_decode"}
-            or not model_inputs
-            or len(model_inputs) > self.MAX_BATCH_SIZE
-        ):
-            return False
-        sampling = {
-            repr(info.step_metadata.get("subtalker_sampling", {}))
-            for info in batch.per_request_info.values()
-        }
-        return len(sampling) <= 1
+        return (
+            batch.graph_walk in {"talker_prefill", "talker_decode"}
+            and bool(model_inputs)
+            and len(model_inputs) <= self.MAX_BATCH_SIZE
+        )
 
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
@@ -822,12 +688,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         autocast_dtype: torch.dtype,
         tp_world_size: int = 1,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
-        """Capture CodePredictor's 15-step depth loop as an inner CUDA Graph.
+        """Capture the CodePredictor depth loop, sampling included.
 
-        This runner is also useful when the whole Talker graph is ineligible,
-        for example after a request overrides ``subtalker_*`` sampling values.
-        It has no engine KV cache: its small frame-local cache is a static
-        tensor owned by this submodule.
+        The whole-walk decode graph already covers this loop; this runner serves
+        the paths it can't — chiefly ``talker_prefill``, which stays eager
+        because it is variable-length and runs once per request. It has no
+        engine KV cache: its frame-local cache is a static tensor owned here.
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
@@ -838,43 +704,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         ) -> dict[str, torch.Tensor]:
             return {
                 "last_hidden": torch.zeros(
-                    shape.bs,
-                    hidden_size,
-                    dtype=capture_dtype,
-                    device=device,
+                    shape.bs, hidden_size, dtype=capture_dtype, device=device,
                 ),
                 "layer0_codes": torch.zeros(
                     shape.bs, dtype=torch.long, device=device
-                ),
-                "uniforms": torch.zeros(
-                    shape.bs,
-                    self.num_codes - 1,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "temperature": torch.full(
-                    (shape.bs,),
-                    self.config.generation.subtalker_temperature,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "top_k": torch.full(
-                    (shape.bs,),
-                    self.config.generation.subtalker_top_k,
-                    dtype=torch.long,
-                    device=device,
-                ),
-                "top_p": torch.full(
-                    (shape.bs,),
-                    self.config.generation.subtalker_top_p,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "do_sample": torch.full(
-                    (shape.bs,),
-                    self.config.generation.subtalker_dosample,
-                    dtype=torch.bool,
-                    device=device,
                 ),
             }
 
@@ -884,6 +717,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 make_static_inputs=make_static_inputs,
                 seq_len=1,
                 uses_kv_cache=False,
+                uses_sampler=True,
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,
             )
@@ -892,20 +726,12 @@ class TalkerSubmodule(ARNodeSubmodule):
     def can_use_cuda_graphs(
         self, batch: NodeBatch, model_inputs: list[NodeInputs]
     ) -> bool:
-        """Use the whole decode graph only for its captured sampling constants."""
+        """Replay the whole decode graph; sampling params are read from buffers,
+        so no request's settings can disqualify it."""
         if batch.graph_walk != "talker_decode" or not self.can_batch(
             batch, model_inputs
         ):
             return False
-        expected = {
-            "do_sample": self.config.generation.subtalker_dosample,
-            "temperature": self.config.generation.subtalker_temperature,
-            "top_k": self.config.generation.subtalker_top_k,
-            "top_p": self.config.generation.subtalker_top_p,
-        }
-        for info in batch.per_request_info.values():
-            if info.step_metadata.get("subtalker_sampling", expected) != expected:
-                return False
         return super().can_use_cuda_graphs(batch, model_inputs)
 
     def get_needed_cache_labels(
