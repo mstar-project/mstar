@@ -38,7 +38,6 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.base import EngineType
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.v1.attention_manager import (
     AttentionConfig,
@@ -269,16 +268,6 @@ class Cosmos3Model(Model):
         if self.skip_weight_loading:
             return True
         return (self._ensure_repo() / "sound_tokenizer" / "config.json").exists()
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        types = {
-            DIT_NODE: EngineType.KV_CACHE,
-            VAE_ENCODER_NODE: EngineType.STATELESS,
-            VAE_DECODER_NODE: EngineType.STATELESS,
-        }
-        if self._sound_serving_enabled():
-            types[AUDIO_DECODER_NODE] = EngineType.STATELESS
-        return types
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The DiT supports tensor parallelism: per layer the attention heads and
@@ -1061,7 +1050,12 @@ class Cosmos3Model(Model):
         # checkpoint exactly and halves resident weight memory vs the float32
         # meta default; the engine additionally runs the forward under a bf16
         # autocast (a no-op here).
-        with torch.device("meta" if not self.skip_weight_loading else "cpu"):
+        # Always meta: both branches below call ``to_empty``, which re-allocates
+        # uninitialized storage and drops whatever construction produced, so
+        # building on CPU only pays for allocation + parameter init that is then
+        # thrown away (seconds per billion params on the skip_weight_loading
+        # path). Same shape as the orpheus / higgs_audio builders.
+        with torch.device("meta"):
             model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:

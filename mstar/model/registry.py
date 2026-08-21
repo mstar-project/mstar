@@ -1,7 +1,7 @@
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import Model
 
-# from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.model.pi05.pi05_model import Pi05Model
@@ -14,9 +14,9 @@ from mstar.model.whisper.whisper_model import WhisperModel
 
 MODEL_REGISTRY: dict[str, type[Model]] = {
     "bagel": BagelModel,
-    # "cosmos3": Cosmos3Model,
-    # "cosmos3_droid": Cosmos3Model,
-    # "cosmos3_super": Cosmos3Model,
+    "cosmos3": Cosmos3Model,
+    "cosmos3_droid": Cosmos3Model,
+    "cosmos3_super": Cosmos3Model,
     "higgs_audio": HiggsAudioModel,
     "orpheus": OrpheusModel,
     "pi05": Pi05Model,

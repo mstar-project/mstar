@@ -139,7 +139,7 @@ def test_droid_loader_shape_coverage() -> None:
 
 @needs_droid
 def test_droid_sound_pathway_disabled() -> None:
-    from mstar.engine.base import EngineType
+    from mstar.engine.v1.kv_manager import KVSpec
     from mstar.model.cosmos3 import constants
 
     model = Cosmos3Model(model_path_hf=str(DROID_DIR))
@@ -151,9 +151,14 @@ def test_droid_sound_pathway_disabled() -> None:
     walks = model.get_graph_walk_graphs()
     assert constants.VIDEO_SOUND_GEN_WALK not in walks
     assert constants.ACTION_GEN_WALK in walks and constants.ACTION_VIDEO_GEN_WALK in walks
-    types = model.get_node_engine_types()
-    assert "audio_decoder" not in types
-    assert types["dit"] is EngineType.KV_CACHE
+    # v1: the graph walks declare which nodes are served, and the DiT's paged
+    # K/V shows up as a KVSpec in get_node_resources rather than an engine type.
+    served = {n for g in walks.values() for n in g.get_nodes()}
+    assert "audio_decoder" not in served
+    assert "dit" in served
+    assert any(
+        isinstance(s, KVSpec) and "dit" in s.nodes for s in model.get_node_resources()
+    )
 
     # A sound-requesting video request is rejected up front.
     with pytest.raises(ValueError, match="sound"):

@@ -102,12 +102,17 @@ def test_sound_request_validation() -> None:
         except ValueError:
             pass
     # The sound walk + audio decoder node are registered when sound is enabled...
+    # Under the v1 engine the graph walks are what declare a node as served, so
+    # the node set is read off them rather than off an engine-type mapping.
+    def served_nodes(m) -> set[str]:
+        return {n for g in m.get_graph_walk_graphs().values() for n in g.get_nodes()}
+
     assert VIDEO_SOUND_GEN_WALK in model.get_graph_walk_graphs()
-    assert model.get_node_engine_types()[AUDIO_DECODER_NODE] is not None
+    assert AUDIO_DECODER_NODE in served_nodes(model)
     # ...and disappear when the serving knob is off.
     model.config.enable_sound = False
     assert VIDEO_SOUND_GEN_WALK not in model.get_graph_walk_graphs()
-    assert AUDIO_DECODER_NODE not in model.get_node_engine_types()
+    assert AUDIO_DECODER_NODE not in served_nodes(model)
     try:
         model._resolve_gen_params({"generate_sound": True, "num_frames": 17}, [], ["video"])
         raise AssertionError("expected ValueError with sound serving disabled")
