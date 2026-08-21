@@ -942,11 +942,16 @@ class BagelModel(Model):
         for step in plan:
             pool = texts if step.modality == "text" else images
             if step.index >= len(pool):
-                raise ValueError(
-                    f"BAGEL cannot prefill this layout: {input_modalities} needs a "
-                    f"{step.modality} span at index {step.index}, but the prompt "
-                    f"produced {len(pool)}"
+                # ``check_plan`` already failed a mismatch at intake, where a
+                # 400 can still be returned. This runs in the conductor, whose
+                # loop only logs — raising here orphans the request and hangs
+                # the client instead. Same choice as Qwen3-Omni's builder.
+                logger.warning(
+                    "BAGEL prefill plan wants a %s span at index %d but the "
+                    "prompt produced %d; skipping it",
+                    step.modality, step.index, len(pool),
                 )
+                continue
             if step.modality == "text":
                 schedule.append(("prefill_text", texts[step.index]))
             else:
