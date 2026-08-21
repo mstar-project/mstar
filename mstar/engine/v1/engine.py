@@ -225,7 +225,7 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.label)
 
-        self._runner = StepRunner(self._resources)
+        self._runner = StepRunner(self._resources, enable_nvtx=self._enable_nvtx)
 
         for node_name, submodule in submodules.items():
             resources = {

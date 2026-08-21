@@ -13,6 +13,7 @@ from typing import Any
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SubmoduleStep
+from mstar.utils.profiler import range_pop, range_push
 
 
 def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
@@ -49,7 +50,11 @@ def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
 class StepRunner:
     """drives resources through per-step cycle"""
 
-    def __init__(self, resources: Mapping[str, Resource]):
+    def __init__(self, resources: Mapping[str, Resource], enable_nvtx: bool = False):
+        # Per-resource NVTX. `engine.plan.promoted` only reports that the sweep
+        # was slow; these say WHICH resource ate it. Gated because range_push
+        # is a real CUDA call even with no profiler attached.
+        self._nvtx = enable_nvtx
         self._resources: dict[str, Resource] = dict(resources)
         self._order = topo_sort(self._resources) # only toposort once to minimize cpu time on python
         self._preplan_order = [
@@ -155,7 +160,13 @@ class StepRunner:
         """reserve capacity for step"""
         ready = True
         for key in self._keys_for(step):
-            outcome = self._resources[key].admit(step.get(key), step.ctx)
+            if self._nvtx:
+                range_push(f"res.admit.{key}")
+            try:
+                outcome = self._resources[key].admit(step.get(key), step.ctx)
+            finally:
+                if self._nvtx:
+                    range_pop()
             if not outcome.ok:
                 return outcome
             ready = ready and outcome.ready
@@ -169,7 +180,13 @@ class StepRunner:
         results = step.ctx.plan_results
         results.clear()
         for key in self._keys_for(step):
-            results[key] = self._resources[key].plan(step.get(key), step.ctx)
+            if self._nvtx:
+                range_push(f"res.plan.{key}")
+            try:
+                results[key] = self._resources[key].plan(step.get(key), step.ctx)
+            finally:
+                if self._nvtx:
+                    range_pop()
         return results
 
     def pre_admit(self, step: SubmoduleStep) -> AdmitOutcome:
@@ -179,7 +196,13 @@ class StepRunner:
         state as already reserved and no-op"""
         ready = True
         for key in self._preplan_keys_for(step):
-            outcome = self._resources[key].admit(step.get(key), step.ctx)
+            if self._nvtx:
+                range_push(f"res.admit.{key}")
+            try:
+                outcome = self._resources[key].admit(step.get(key), step.ctx)
+            finally:
+                if self._nvtx:
+                    range_pop()
             if not outcome.ok:
                 return outcome
             ready = ready and outcome.ready
@@ -193,13 +216,25 @@ class StepRunner:
         in `ctx.plan_results` for the dependents in this same subset."""
         results = step.ctx.plan_results
         for key in self._preplan_keys_for(step):
-            results[key] = self._resources[key].plan(step.get(key), step.ctx)
+            if self._nvtx:
+                range_push(f"res.plan.{key}")
+            try:
+                results[key] = self._resources[key].plan(step.get(key), step.ctx)
+            finally:
+                if self._nvtx:
+                    range_pop()
         return results
 
     def commit(self, step: SubmoduleStep) -> None:
         """record step consumption"""
         for key in self._keys_for(step):
-            self._resources[key].commit(step.get(key), step.ctx)
+            if self._nvtx:
+                range_push(f"res.commit.{key}")
+            try:
+                self._resources[key].commit(step.get(key), step.ctx)
+            finally:
+                if self._nvtx:
+                    range_pop()
 
     def publish(
         self, request_ids: list[str],
