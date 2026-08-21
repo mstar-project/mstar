@@ -471,6 +471,16 @@ class PreprocessWorkerThread:
                                 "sample_rate": self.model.get_output_sample_rate("audio"),
                                 "num_channels": self.model.get_output_audio_channels("audio"),
                             }
+                        # Text arrives one token per chunk and postprocess
+                        # decodes it lossily (per-token decode can split
+                        # multi-byte chars). Surface the raw ids so clients
+                        # can do token-exact comparisons (engine-vs-engine
+                        # parity at temp 0) without re-encoding text.
+                        if modality == "text":
+                            chunk_metadata = {
+                                **chunk_metadata,
+                                "token_ids": tensor.flatten().tolist(),
+                            }
 
                         self.out_queue.put(ResultChunk(
                             request_id=request_id,

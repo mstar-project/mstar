@@ -15,6 +15,7 @@ from benchmark.dataset import (
     DROIDDataset,
     Food101Dataset,
     LibriSpeechDataset,
+    PromptsJsonDataset,
     SeedTTSDataset,
     TxtFileDataset,
     UCF101Dataset,
@@ -29,6 +30,7 @@ from benchmark.request import (
     RequestInput,
     RequestMetrics,
     SGLangOmni,
+    VllmCompletions,
     VLLMOmni,
     VoxServe,
     aggregate_metrics,
@@ -38,6 +40,7 @@ from benchmark.request import (
 class DatasetType(Enum):
     VBENCH = "vbench"
     TEXT = "text"
+    PROMPTS_JSON = "prompts_json"
     LIBRI = "libri"
     FOOD = "food101"
     UCF = "ucf101"
@@ -50,6 +53,7 @@ class InferenceSystemType(Enum):
     OURS = "ours"
     OURS_OPENAI = "ours_openai"
     VLLM_OMNI = "vllm_omni"
+    VLLM_COMPLETIONS = "vllm_completions"
     VOX_SERVE = "vox_serve"
     SGLANG_OMNI = "sglang_omni"
 
@@ -60,6 +64,8 @@ class InferenceSystemType(Enum):
             return OursOpenAI()
         elif self == InferenceSystemType.VLLM_OMNI:
             return VLLMOmni()
+        elif self == InferenceSystemType.VLLM_COMPLETIONS:
+            return VllmCompletions()
         elif self == InferenceSystemType.VOX_SERVE:
             return VoxServe()
         elif self == InferenceSystemType.SGLANG_OMNI:
@@ -108,6 +114,9 @@ class BenchmarkConfig:
     # text dataset args
     request_txt_file: str = "benchmark/assets/simple_text_queries.txt"
 
+    # prompts_json dataset args — M1 harness format: [{id, text, max_tokens}, ...]
+    prompts_json_file: Optional[str] = None
+
     # DROID (robotics) args — used by DROIDDataset for pi05 / vjepa2_ac.
     # rollout_horizon is only consumed by the vjepa2_ac task.
     droid_rollout_horizon: int = 4
@@ -138,6 +147,16 @@ class Benchmark:
         elif self.config.dataset == DatasetType.TEXT:
             return TxtFileDataset(
                 filename=self.config.request_txt_file,
+                num_requests=self.config.num_requests,
+                req_type=self.config.request_type,
+            )
+        elif self.config.dataset == DatasetType.PROMPTS_JSON:
+            if self.config.prompts_json_file is None:
+                raise ValueError(
+                    "--prompts-json-file is required with --dataset prompts_json"
+                )
+            return PromptsJsonDataset(
+                filename=self.config.prompts_json_file,
                 num_requests=self.config.num_requests,
                 req_type=self.config.request_type,
             )
@@ -569,6 +588,18 @@ def parse_args() -> BenchmarkConfig:
         help="Text file with one line per prompt",
     )
 
+    # Prompts-JSON dataset args
+    prompts_json = parser.add_argument_group("prompts_json")
+    prompts_json.add_argument(
+        "--prompts-json-file",
+        default=None,
+        help=(
+            "JSON prompts file in the M1 harness format: a list of "
+            '{"id", "text", "max_tokens"} objects. Implies --dataset '
+            "prompts_json when --dataset is omitted."
+        ),
+    )
+
     # DROID (robotics) dataset args
     droid = parser.add_argument_group("droid")
     droid.add_argument(
@@ -630,8 +661,12 @@ def parse_args() -> BenchmarkConfig:
             dataset = DatasetType.LIBRI
             txtfile = None
         elif request_type == RequestType.T2T:
-            dataset = DatasetType.TEXT
-            txtfile = "benchmark/assets/simple_text_queries.txt"
+            if args.prompts_json_file:
+                dataset = DatasetType.PROMPTS_JSON
+                txtfile = None
+            else:
+                dataset = DatasetType.TEXT
+                txtfile = "benchmark/assets/simple_text_queries.txt"
         elif request_type == RequestType.T2S:
             dataset = DatasetType.TEXT
             if args.model in {
@@ -675,6 +710,7 @@ def parse_args() -> BenchmarkConfig:
         seed_tts_dir=args.seed_tts_dir,
         seed_tts_locale=args.seed_tts_locale,
         request_txt_file=txtfile,
+        prompts_json_file=args.prompts_json_file,
         local_cache_dir=args.local_cache,
         droid_rollout_horizon=args.droid_rollout_horizon,
         droid_hf_cache=args.droid_hf_cache,

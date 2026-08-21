@@ -235,6 +235,22 @@ class PiecewiseCudaGraphConfig(ABC):
     # Whether to torch.compile capture_fn before capture. Default off; the block
     # loop already benefits from graph capture alone.
     compile: bool = False
+    # Share ONE FlashInfer workspace across all of this runner's buckets instead
+    # of one per (bs, total_tokens). WorkspaceBufferManager hands out a full
+    # MSTAR_WORKSPACE_BUFFER_MB (512 MiB default) per distinct key, so a
+    # 30-bucket runner costs 15 GiB per rank the per-bucket way (measured
+    # 2026-08-19: +17 GB/rank for the MTP prefill graphs). Safe when at most
+    # one bucket of the runner is planned+replayed at a time (every piecewise
+    # runner today: buckets are captured sequentially and a step replays one).
+    share_workspace_across_buckets: bool = False
+    # Number of independently planned attention wrappers per cache label. A
+    # captured region that runs attention over the SAME label several times
+    # with different plans (e.g. GLM-5.2's whole MTP draft phase in one graph:
+    # a padded sync pass, then k-1 one-row chain iterations at growing kv
+    # lengths) needs one persistent wrapper per plan, all planned before the
+    # replay. The captured fn switches with ``static_cm.select_plan_slot``
+    # (host-only, runs at capture); ``plan_fn`` plans every slot at replay.
+    plans_per_label: int = 1
 
     @abstractmethod
     def get_config_type(self) -> PiecewiseConfigType:

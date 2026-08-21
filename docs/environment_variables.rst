@@ -35,6 +35,15 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
+   * - ``MSTAR_DIST_TIMEOUT_S``
+     - config's ``dist_timeout_s``
+     - Timeout in seconds for the NCCL world group and its parallel
+       subgroups (:func:`mstar.distributed.communication.resolve_dist_timeout`).
+       Overrides the deployment config's ``dist_timeout_s``; with neither set,
+       PyTorch's default applies. Raise it only where weight load, JIT or
+       CUDA-graph capture can exceed that default (a 1T MoE at TP8 does) —
+       a hung collective takes correspondingly longer to abort. Must be set
+       before the conductor spawns workers, which inherit it.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.

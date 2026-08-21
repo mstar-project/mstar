@@ -1,5 +1,8 @@
 import functools
 import logging
+import os
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -12,9 +15,35 @@ from mstar.engine.kv_store import (
     KVRequestState,
     PagedAllocationManager,
 )
-from mstar.utils.flashinfer_utils import FlashInferDecodeWrapper, FlashInferPrefillWrapper
+from mstar.utils.flashinfer_utils import (
+    FlashInferDecodeWrapper,
+    FlashInferMLAWrapper,
+    FlashInferPrefillWrapper,
+)
+from mstar.utils.pinned_staging import pinned, to_device_async
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock spent in plan_attention* per execute, gated by the same env as
+# the worker's phase records (zero-cost when unset). Thread-local because the
+# plan_executor's pre_plan_for_batch also calls plan_attention from its own
+# thread — only the GPU executor thread's inline plans should land in the
+# per-execute total the worker reads (reset_plan_wall at
+# _execute_on_gpu_thread entry, get_plan_wall at exit; same thread both).
+_PLAN_TIMING = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0") > 0
+_plan_wall = threading.local()
+
+
+def reset_plan_wall() -> None:
+    _plan_wall.s = 0.0
+
+
+def get_plan_wall() -> float:
+    return getattr(_plan_wall, "s", 0.0)
+
+
+def _add_plan_wall(dt: float) -> None:
+    _plan_wall.s = getattr(_plan_wall, "s", 0.0) + dt
 
 
 def cross_attn_label(label: str, source: str = "default") -> str:
@@ -98,11 +127,16 @@ class _PlanState:
     actually consumes this — the model's inner ``advance_seq_lens(pos_id_ns=...)``
     runs at capture time only and is not replayed.
     """
-    wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | None = None
+    wrapper: FlashInferPrefillWrapper | FlashInferDecodeWrapper | FlashInferMLAWrapper | None = None
     pos_ids: torch.Tensor | None = None
     seq_lens: list[int] | None = None
     write_store: bool = True
     custom_pos_advance: list[int] | None = None
+    # Multi-plan labels (PiecewiseCudaGraphConfig.plans_per_label > 1): every
+    # persistent wrapper for this label; ``wrapper`` is the SELECTED one
+    # (``BatchedCacheManager.select_plan_slot``). None for ordinary labels.
+    wrappers: list | None = None
+    plan_slot: int = 0
     # Plan memo: fingerprint of the last wrapper.plan() inputs for this label;
     # when it matches, the re-plan is skipped. Only the cross-attention path
     # sets it today (its context pages are immutable after add_cross_attn_kv),
@@ -123,6 +157,8 @@ class _PlanState:
     # segment over its contiguous frozen prefix. None on paged plans, which
     # keep the FlashInfer path. See DenseGenCacheManager._build_dense_gen_plan.
     dense_gen: dict | None = None
+    # MLA absorb fallback plan: latent scatter indices and per-request gather layout.
+    mla: dict | None = None
 
 
 class WorkspaceBufferManager:
@@ -260,6 +296,19 @@ class BatchedCacheManager(ABC):
         self.layer_idx = layer_idx
 
     @torch.compiler.disable
+    def select_plan_slot(self, label: str, slot: int) -> None:
+        """Make plan slot ``slot`` of a multi-plan label the live one: the
+        wrapper that ``plan_attention`` plans and ``run_attention`` runs.
+        Host-only bookkeeping — inside a captured region it runs at capture
+        time and the graph simply reads that slot's static buffers."""
+        ps = self._plan_states.get(label)
+        if ps is None or not ps.wrappers:
+            if slot == 0:
+                return
+            raise ValueError(f"label {label!r} has no plan slots (asked for {slot})")
+        ps.wrapper = ps.wrappers[slot]
+        ps.plan_slot = slot
+
     def get_qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
         """Return the persistent qo_indptr static buffer for a CUDA-graph
         prefill wrapper, or None if not in CUDA-graph mode / wrong wrapper.
@@ -346,7 +395,7 @@ class BatchedCacheManager(ABC):
     def plan_rope(
         self,
         seq_lens: list[int],
-        pos_ids: torch.Tensor | None = None,
+        pos_ids: torch.Tensor | list[int] | None = None,
         label: str | None = None,
     ):
         """Pre-compute position IDs for RoPE for a cache label.
@@ -373,7 +422,7 @@ class BatchedCacheManager(ABC):
     def _plan_rope_impl(
         self,
         seq_lens: list[int],
-        pos_ids: torch.Tensor | None = None,
+        pos_ids: torch.Tensor | list[int] | None = None,
         label: str | None = None,
     ):
         from mstar.utils.profiler import range_pop, range_push
@@ -384,17 +433,13 @@ class BatchedCacheManager(ABC):
             self._plan_states[effective_label] = _PlanState()
         ps = self._plan_states[effective_label]
 
-        # Fast path: cuda-graph mode with the static pos_ids buffer already
-        # allocated and no caller-supplied pos_ids. Build the position list on
-        # CPU and copy straight into the static buffer — skipping the
-        # intermediate device-side allocation + GPU→GPU copy the eager path
-        # would do.
-        static_copy_from_cpu = (
-            self._cuda_graph_mode and ps.pos_ids is not None and pos_ids is None
-        )
-
-        computed_pos_ids = pos_ids
-        if computed_pos_ids is None:
+        # Positions are staged through PINNED host memory and shipped with a
+        # non_blocking copy in every mode. A pageable ``torch.tensor(list)``
+        # followed by ``copy_``/``.to(device)`` is a stream-draining H2D —
+        # the CPU would wait here for every kernel already queued (the
+        # previous decode step, or the previous draft-chain iteration).
+        # Callers may pass a list, a CPU tensor, or a device tensor.
+        if pos_ids is None:
             # CPU-accumulate the position list (1 int per output token). The
             # old `torch.cat([torch.arange(...) + start for ...])` launched
             # 2 GPU kernels per request.
@@ -405,14 +450,16 @@ class BatchedCacheManager(ABC):
                 for rid, sl in zip(self.request_ids, seq_lens, strict=True):
                     start = self._get_state(rid, effective_label).position_id_start
                     pos_ids_list.extend(range(start, start + sl))
-                computed_pos_ids = torch.tensor(
-                    pos_ids_list,
-                    dtype=torch.long,
-                    device=None if static_copy_from_cpu else self.device,
-                )
+                computed_pos_ids = pinned(pos_ids_list, torch.long)
             finally:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+        elif isinstance(pos_ids, torch.Tensor):
+            computed_pos_ids = (
+                pos_ids if pos_ids.device.type != "cpu" else pinned(pos_ids, torch.long)
+            )
+        else:
+            computed_pos_ids = pinned(pos_ids, torch.long)
 
         if self._cuda_graph_mode:
             if ps.pos_ids is not None:
@@ -420,8 +467,8 @@ class BatchedCacheManager(ABC):
                 if self.enable_nvtx:
                     range_push("cache.plan_rope.copy_pos_ids", synchronize=False)
                 try:
-                    # CPU→GPU when static_copy_from_cpu, else GPU→GPU. Both
-                    # are stream-ordered before any subsequent graph replay.
+                    # Pinned-host->GPU or GPU->GPU: both async, both
+                    # stream-ordered before any subsequent graph replay.
                     ps.pos_ids[:n].copy_(computed_pos_ids, non_blocking=True)
                 finally:
                     if self.enable_nvtx:
@@ -430,9 +477,13 @@ class BatchedCacheManager(ABC):
                 # First plan_rope on this label: adopt the just-built tensor
                 # as the static buffer. Must live on the device.
                 if computed_pos_ids.device != self.device:
-                    computed_pos_ids = computed_pos_ids.to(self.device)
+                    computed_pos_ids = computed_pos_ids.to(
+                        self.device, non_blocking=True)
                 ps.pos_ids = computed_pos_ids
         else:
+            if computed_pos_ids.device != self.device:
+                computed_pos_ids = computed_pos_ids.to(
+                    self.device, non_blocking=True)
             ps.pos_ids = computed_pos_ids
 
     @torch.compiler.disable
@@ -630,6 +681,27 @@ class BatchedCacheManager(ABC):
         for ps in self._plan_states.values():
             ps.custom_pos_advance = None
 
+    def rewind_seq_lens(self, ns: list[int] | int) -> None:
+        """Roll each request's seq_len / position_id_start back by ``ns``
+        tokens (M3 draft rejection: the paged layout is truncation-friendly
+        — rolled-back positions are simply re-appended by the next forward,
+        overwriting the stale rows in every layer plane, so no KV data
+        movement is needed). Pages allocated for the rolled-back tail stay
+        in ``page_indices`` and are reused as the position re-advances."""
+        for i, rid in enumerate(self.request_ids):
+            n = ns if isinstance(ns, int) else ns[i]
+            if n == 0:
+                continue
+            label = self.active_labels[rid]
+            state = self._get_state(rid, label=label)
+            if n < 0 or n > state.seq_len:
+                raise ValueError(
+                    f"rewind_seq_lens: request {rid} asked to rewind {n} of "
+                    f"{state.seq_len} tokens"
+                )
+            state.seq_len -= n
+            state.position_id_start -= n
+
     @torch.compiler.disable
     def snapshot_all(
         self, from_label: str,
@@ -707,6 +779,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         from mstar.utils.profiler import range_pop, range_push
         self._batched_cfg_info = None
 
+        _t0 = time.perf_counter() if _PLAN_TIMING else 0.0
         if self.enable_nvtx:
             range_push("cache.plan_attention", synchronize=False)
         try:
@@ -735,6 +808,8 @@ class FlashInferCacheManager(BatchedCacheManager):
                 label=label,
             )
         finally:
+            if _PLAN_TIMING:
+                _add_plan_wall(time.perf_counter() - _t0)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -819,12 +894,16 @@ class FlashInferCacheManager(BatchedCacheManager):
         if self.enable_nvtx:
             range_push("cache.plan_attention.make_tensors", synchronize=False)
         try:
-            qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32)
-            paged_kv_indptr = torch.tensor(kv_indptr_list, dtype=torch.int32)
-            paged_kv_indices = torch.tensor(all_page_indices, dtype=torch.int32)
-            paged_kv_last_page_len = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+            # Pinned, not merely CPU: FlashInfer copies these into its
+            # graph-mode buffers with non_blocking=True, which is only a real
+            # async DMA from pinned memory — from pageable memory the copy
+            # drains the stream first (mstar/utils/pinned_staging.py).
+            qo_indptr = pinned(qo_indptr_list, torch.int32)
+            paged_kv_indptr = pinned(kv_indptr_list, torch.int32)
+            paged_kv_indices = pinned(all_page_indices, torch.int32)
+            paged_kv_last_page_len = pinned(kv_last_page_lens, torch.int32)
             kv_cache_locations = (
-                torch.tensor(kv_cache_locations_list, dtype=torch.long)
+                pinned(kv_cache_locations_list, torch.long)
                 if len(kv_cache_locations_list) == len(self.request_ids)
                 else None
             )
@@ -914,6 +993,7 @@ class FlashInferCacheManager(BatchedCacheManager):
         See ``BatchedCacheManager.plan_attention_batched_cfg`` for the argument
         contract.
         """
+        _t0 = time.perf_counter() if _PLAN_TIMING else 0.0
         assert self.kv_cache is not None
         if isinstance(seq_lens, list):
             seq_lens = {
@@ -1018,6 +1098,8 @@ class FlashInferCacheManager(BatchedCacheManager):
         # A paged plan clears any prior dense plan (set by DenseGenCacheManager)
         # so run_attention routes this label back through the wrapper.
         ps.dense_gen = None
+        if _PLAN_TIMING:
+            _add_plan_wall(time.perf_counter() - _t0)
 
     @torch.compiler.disable
     def run_attention(
@@ -1488,10 +1570,284 @@ class DenseGenCacheManager(FlashInferCacheManager):
         return out[0] if isinstance(out, tuple) else out
 
 
+@functools.cache
+def _mla_kernel_available(ckv: int, kpe: int, sm_major: int) -> bool:
+    """Whether the FlashInfer MLA kernel fast path can serve these latent dims.
+
+    Gated conservatively: ``flashinfer.mla.BatchMLAPagedAttentionWrapper`` is
+    hard-locked to the real Kimi dims (ckv=512, kpe=64). Off-dim calls trigger an
+    *uncatchable* illegal memory access (it corrupts the CUDA context — not a
+    catchable exception), so this decision MUST be made BEFORE any kernel
+    construction/call. Requires the flashinfer MLA module, exactly ckv=512/kpe=64,
+    and a Hopper (sm90) GPU (``backend="auto"`` -> fa3). Everything else — reduced
+    configs, pre-sm90, Blackwell (sm100, which wants the trtllm MLA path), or a
+    build without flashinfer — returns False and the manager uses the all-dims
+    SDPA fallback.
+    """
+    if not (ckv == 512 and kpe == 64):
+        return False
+    if sm_major != 9:
+        return False
+    try:
+        import flashinfer.mla  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+class MlaAbsorbCacheManager(FlashInferCacheManager):
+    """Paged-cache backend for weight-absorbed MLA.
+
+    Uses a 4D latent cache ``[layers, pages, page_size, ckv + kpe]``. Real Kimi
+    dims on sm90 use FlashInfer MLA; other dims fall back to eager SDPA.
+    """
+
+    def plan_attention(
+        self,
+        seq_lens: list[int] | None = None,
+        dtype: torch.dtype | None = None,
+        is_causal=True,
+        write_store: bool=True,
+        label: str | None = None,
+        **kwargs,
+    ):
+        """Allocate pages and plan the FlashInfer MLA or eager SDPA path."""
+        self._batched_cfg_info = None
+
+        _t0 = time.perf_counter() if _PLAN_TIMING else 0.0
+        effective_label = label if label is not None else self._active_label()
+        if effective_label in self._pre_planned_labels:
+            # Overlap fast path, same contract as the base class
+            # (FlashInferCacheManager.plan_attention): the plan thread already
+            # ran THIS method against the slot's persistent MLA wrapper for
+            # this step (CudaGraphRunner.pre_plan_for_batch), on plan_stream,
+            # and the replay gates on its plan_done_event. Re-planning here
+            # was pure waste on the GPU thread — ~1 ms per decode step at
+            # TP8, and under TP-async scheduling it also stalled behind the
+            # in-flight forward. Only the per-step bookkeeping is recorded.
+            self._pre_planned_labels.discard(effective_label)
+            ps = self._plan_states.get(effective_label)
+            if ps is not None:
+                ps.seq_lens = seq_lens
+                ps.write_store = write_store
+            if _PLAN_TIMING:
+                _add_plan_wall(time.perf_counter() - _t0)
+            return
+        if effective_label not in self._plan_states:
+            self._plan_states[effective_label] = _PlanState()
+        ps = self._plan_states[effective_label]
+
+        cfg = self.kv_cache_config
+        page_size = cfg.page_size
+        ckv = cfg.mla_ckv_dim
+        kpe = (cfg.head_dim - ckv) if ckv is not None else None
+        sm_major = torch.cuda.get_device_capability(self.device)[0]
+        use_kernel = ckv is not None and _mla_kernel_available(ckv, kpe, sm_major)
+
+        if use_kernel:
+            qo_indptr_list = [0]
+            kv_indptr_list = [0]
+            all_page_indices: list[int] = []
+            kv_len_list: list[int] = []
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, effective_label)
+                sl = seq_lens[i]
+                total_len = state.seq_len + sl
+                self.alloc_manager.alloc(rid, label=effective_label, seq_len=total_len)
+                page_indices = state.page_indices
+                qo_indptr_list.append(qo_indptr_list[-1] + sl)
+                all_page_indices.extend(page_indices)
+                kv_indptr_list.append(kv_indptr_list[-1] + len(page_indices))
+                kv_len_list.append(total_len)
+
+            # Pinned HOST tensors, on purpose. FlashInfer's plan() does
+            # ``.to("cpu")`` on three of these (a stream-draining D2H per
+            # tensor when they live on the device) and copies them into its
+            # graph-mode buffers with ``non_blocking=True`` (a real async DMA
+            # only from pinned memory). Building them on the device with
+            # ``torch.tensor(..., device=cuda)`` was 4 pageable H2D copies —
+            # each one waits for every kernel already queued — followed by
+            # 3 D2H syncs inside FlashInfer: ~8 stream drains per plan, per
+            # decode step, per draft-chain iteration. See
+            # mstar/utils/pinned_staging.py.
+            qo_indptr = pinned(qo_indptr_list, torch.int32)
+            kv_indptr = pinned(kv_indptr_list, torch.int32)
+            kv_indices = pinned(all_page_indices, torch.int32)
+            kv_len_arr = pinned(kv_len_list, torch.int32)
+
+            if dtype is None:
+                dtype = self.kv_cache.dtype
+            if ps.wrapper is None:
+                # Eager gets a fresh wrapper; CUDA graph injects a persistent one.
+                ps.wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=self.buffer_manager.get(effective_label),
+                    num_heads=cfg.num_qo_heads,
+                    head_dim_ckv=ckv,
+                    head_dim_kpe=kpe,
+                    page_size=page_size,
+                    sm_scale=cfg.softmax_scale,
+                    device=self.device,
+                    enable_nvtx=self.enable_nvtx,
+                )
+            ps.wrapper.plan(
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                kv_len_arr=kv_len_arr,
+                causal=is_causal,
+                dtype=dtype,
+            )
+            ps.mla = None
+        else:
+            token_to_page: list[int] = []
+            token_to_cache: list[int] = []
+            requests: list[dict] = []
+            q_start = 0
+            for i, rid in enumerate(self.request_ids):
+                state = self._get_state(rid, effective_label)
+                sl = seq_lens[i]
+                old_len = state.seq_len
+                total_len = old_len + sl
+
+                self.alloc_manager.alloc(
+                    rid, label=effective_label, seq_len=total_len
+                )
+                page_indices = state.page_indices
+
+                # Same page/offset mapping as FlashInfer's token_to_page plan.
+                for j in range(sl):
+                    g = old_len + j
+                    token_to_page.append(page_indices[g // page_size])
+                    token_to_cache.append(g % page_size)
+
+                requests.append({
+                    "q_start": q_start,
+                    "seq_len": sl,
+                    "total_len": total_len,
+                    "page_indices": to_device_async(
+                        page_indices, torch.long, self.device
+                    ),
+                })
+                q_start += sl
+
+            # Async H2D through pinned staging (same reason as the kernel
+            # path above): the eager fallback is what the reduced-dims GPU
+            # harness runs, so its host/device overlap must mirror the box.
+            ps.mla = {
+                "token_to_page": to_device_async(
+                    token_to_page, torch.long, self.device
+                ),
+                "token_to_cache": to_device_async(
+                    token_to_cache, torch.long, self.device
+                ),
+                "requests": requests,
+            }
+
+        # Keep advance_seq_lens / flush_to_store aligned with the base manager.
+        ps.seq_lens = seq_lens
+        ps.write_store = write_store
+        ps.dense_gen = None
+        if _PLAN_TIMING:
+            _add_plan_wall(time.perf_counter() - _t0)
+
+    @torch.compiler.disable
+    def run_attention_mla(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        layer_idx: int | None = None,
+    ) -> torch.Tensor:
+        """Compressed-latent MLA attention over the paged latent cache.
+
+        Args:
+            q_nope: [T, H, L]        query, no-rope part (L = kv_lora_rank).
+            q_pe:   [T, H, Drope]    query, rope part.
+            kv_c:   [T, 1, L]        compressed KV latent (single MQA head).
+            k_pe:   [T, 1, Drope]    rope key (single MQA head).
+            layer_idx: transformer layer; defaults to self.layer_idx.
+        Returns:
+            [T, H, L] attention output (the ``value`` = ``kv_c`` slice width).
+        """
+        if layer_idx is None:
+            layer_idx = self.layer_idx
+
+        label = self._active_label()
+        ps = self._plan_states[label]
+        assert self.kv_cache is not None
+
+        latent_cache = self.kv_cache[layer_idx]
+        latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)
+
+        if ps.wrapper is not None:
+            ps.wrapper.set_latent(latent_cache, latent)
+            L = q_nope.shape[-1]  # ckv width (post-w_kc absorption)
+            ckv_cache = latent_cache[..., :L]
+            kpe_cache = latent_cache[..., L:]
+            return ps.wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache).to(q_nope.dtype)
+
+        mla = ps.mla
+        assert mla is not None
+
+        latent_cache[mla["token_to_page"], mla["token_to_cache"]] = latent.to(
+            latent_cache.dtype
+        )
+
+        T, H, L = q_nope.shape
+        scale = self.kv_cache_config.softmax_scale
+        query_all = torch.cat([q_nope, q_pe], dim=-1)
+        out = torch.empty(T, H, L, dtype=q_nope.dtype, device=q_nope.device)
+
+        for req in mla["requests"]:
+            q_start = req["q_start"]
+            sl = req["seq_len"]
+            total_len = req["total_len"]
+
+            # Mirror the dense-gen page gather for the fallback.
+            gathered = latent_cache[req["page_indices"]].reshape(
+                -1, latent_cache.shape[-1]
+            )[:total_len]
+            key = gathered
+            value = gathered[:, :L]
+
+            q_req = query_all[q_start:q_start + sl]
+            out[q_start:q_start + sl] = self._sdpa_mla(
+                q_req, key, value, old_len=total_len - sl, scale=scale
+            )
+        return out
+
+    @staticmethod
+    def _sdpa_mla(
+        q: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        old_len: int,
+        scale: float,
+    ) -> torch.Tensor:
+        """Causal SDPA fallback for one request over the shared latent head."""
+        sl = q.shape[0]
+        total = key.shape[0]
+        qt = q.transpose(0, 1).float()
+        scores = torch.einsum("hqd,kd->hqk", qt, key.float()) * scale
+        q_pos = old_len + torch.arange(sl, device=q.device)
+        k_pos = torch.arange(total, device=q.device)
+        mask = torch.where(
+            k_pos[None, :] <= q_pos[:, None],
+            0.0,
+            torch.tensor(float("-inf"), device=q.device),
+        )
+        scores = scores + mask
+        attn = scores.softmax(-1)
+        out = torch.einsum("hqk,kd->hqd", attn, value.float())
+        return out.transpose(0, 1).to(q.dtype)
+
+
 # Backend registry: KVCacheConfig.attention_backend names one of these.
 ATTENTION_BACKENDS: dict[str, type[BatchedCacheManager]] = {
     "flashinfer": FlashInferCacheManager,
     "dense_gen": DenseGenCacheManager,
+    "mla_absorb": MlaAbsorbCacheManager,
 }
 
 

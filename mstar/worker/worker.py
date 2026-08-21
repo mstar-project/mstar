@@ -20,6 +20,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.base import EngineType, NodeBatch, NodeOutput
+from mstar.engine.cache_manager import get_plan_wall, reset_plan_wall
 from mstar.engine.kv_store import KVCacheConfig, StoreWritePolicy, TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.graph_io import format_graph_edge_list
@@ -985,7 +986,14 @@ class Worker:
                 request_id, outputs.persist
             )
 
-        if outputs.new_token_outputs:
+        # Only the tp-leader computes new-token counts: the conductor consumes
+        # ``new_token_counts`` exclusively from ``is_first_tp_rank`` messages
+        # (see conductor.py — ``if body.is_first_tp_rank``), and for a replicated
+        # (non-persisted) EMIT_TO_CLIENT + conductor_new_token edge the token
+        # tensor is only kept alive on rank 0. Without this gate the 7 non-leader
+        # ranks call get_tensor() on an already-dereferenced/GC'd uuid and crash
+        # with KeyError.
+        if outputs.new_token_outputs and outputs.is_first_tp_rank:
             name_to_count: dict[str, int] = {}
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_count:
@@ -1194,6 +1202,14 @@ class Worker:
         """
         from mstar.utils.profiler import range_pop, range_push
 
+        phase_timing = getattr(self, "_phase_timing", False)
+        if phase_timing:
+            # Reset the thread-local plan accumulator so get_plan_wall()
+            # in the finally reads only THIS execute's plan_attention
+            # calls — entry reset and inline plans share the single GPU
+            # executor thread.
+            _gpu_t0 = _time.perf_counter()
+            reset_plan_wall()
         engine = self.engine_manager.get_engine(batch.node_name)
         logger.debug(
             "Executing batch for node %s on engine %s",
@@ -1220,6 +1236,7 @@ class Worker:
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
                 synchronize=False,
             )
+        output: NodeOutput | None = None
         try:
             output = engine.execute_with_max_batch_size(node_batch)
             if torch.cuda.is_available():
@@ -1246,6 +1263,12 @@ class Worker:
             # allocation_failed, or an uncaught raise — finalize_batch
             # reads whatever state the engine actually reached.
             engine.finalize_batch(node_batch)
+            if phase_timing and output is not None:
+                # Stashed like completion_event; recorded main-thread after
+                # future.result(). Wall spans entry to return (finalize
+                # included) so await_gpu can be accounted against it.
+                output.gpu_plan_wall = get_plan_wall()
+                output.gpu_thread_wall = _time.perf_counter() - _gpu_t0
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2196,6 +2219,8 @@ class Worker:
         # vs "GPU done, idle" (overlap not paying off). Set the env var to a
         # positive integer = the dump period in iters (e.g. 200).
         phase_period = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0")
+        # GPU-thread side of the same gate, read by _execute_on_gpu_thread.
+        self._phase_timing = phase_period > 0
         phase_buf: dict[str, list[float]] = defaultdict(list)
         phase_iter = [0]
 
@@ -2366,6 +2391,21 @@ class Worker:
                     output: NodeOutput = pending.future.result()
                     if phase_period:
                         _phase_record("await_gpu", _time.perf_counter() - _t0)
+                        # GPU-thread self-timings stashed by
+                        # _execute_on_gpu_thread. gpu_plan + gpu_exec_other
+                        # = gpu_thread_total; gpu_thread_total − await_gpu =
+                        # the main thread's head start between submit and
+                        # this wait.
+                        if output.gpu_thread_wall is not None:
+                            _plan = output.gpu_plan_wall or 0.0
+                            _phase_record("gpu_plan", _plan)
+                            _phase_record(
+                                "gpu_exec_other",
+                                output.gpu_thread_wall - _plan,
+                            )
+                            _phase_record(
+                                "gpu_thread_total", output.gpu_thread_wall
+                            )
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
 
@@ -2511,6 +2551,13 @@ class Worker:
                     in_flight = set(spec_pending.batch.node_objects.keys()) if spec_pending else set()
                     self._apply_pending_removes_safe_to_drop(in_flight)
                     _set_pending(None)
+                    if phase_period:
+                        # Includes the CUDA-event wait on N's output tensors
+                        # (the GPU thread returns at enqueue, so THIS is
+                        # where actual forward time surfaces at B=1) +
+                        # routing + removes. The _t0 above predated this
+                        # record — it was set but never consumed.
+                        _phase_record("postprocess", _time.perf_counter() - _t0)
 
                 if spec_pending is not None:
                     if speculation.is_yield_away:
@@ -2527,8 +2574,14 @@ class Worker:
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
+                # TP nodes live here EVERY step (_can_speculate refuses
+                # lockstep-parallel nodes), so this path carries its own
+                # phase records + flush — without them a TP-serving worker
+                # buffers phase data forever and never prints (the 08-07
+                # glm52 TP8 run: env set, zero histogram lines).
                 if self.enable_nvtx:
                     range_push("worker.schedule", synchronize=False)
+                _t0 = _time.perf_counter() if phase_period else 0.0
                 batch = None
                 if yield_away_from_target is not None:
                     batch = self.scheduler.get_next_batch(
@@ -2537,12 +2590,15 @@ class Worker:
                     )
                 if batch is None:
                     batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
+                if phase_period:
+                    _phase_record("sched", _time.perf_counter() - _t0)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
                 if batch is None:
                     self.communicator.wait_for_work(10)
                     continue
 
+                _t0 = _time.perf_counter() if phase_period else 0.0
                 if self.enable_nvtx:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_node_batch(batch)
@@ -2587,6 +2643,11 @@ class Worker:
                     graph_walk=batch.graph_walk,
                     future=future
                 ))
+                if phase_period:
+                    _phase_record("build_submit", _time.perf_counter() - _t0)
+                    _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_iter[0] += 1
+                    _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch)
                 # Clear the in-flight step. Without this the next iteration

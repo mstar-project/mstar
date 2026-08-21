@@ -323,6 +323,40 @@ class HiggsAudio(Model):
         }
 
 
+class Glm52(Model):
+    """GLM-5.2 (753B/40B MoE causal LM) — the first text-only model in the
+    harness, exercising RequestType.T2T over the native /generate endpoint.
+
+    Streaming contract: text chunks arrive one per token as NDJSON, and each
+    chunk's metadata carries the raw ``token_ids``
+    (mstar/api_server/data_worker.py), so the client counts tokens from
+    metadata instead of re-tokenizing lossily-decoded text.
+    """
+
+    def get_hf_url(self):
+        # Matches mstar/model/registry.py HF_MODELS["glm52"] — the official
+        # FP8 e4m3 block-scale release, served TP8 on an 8xH200 node.
+        return "zai-org/GLM-5.2-FP8"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # Greedy for engine-vs-engine parity: the M4/M5 protocol drives both
+        # M* and the vLLM baseline with this same client, and sampled text
+        # diverges at the first token. Send both max-token spellings, same
+        # rationale as Qwen3Omni above (`max_tokens` = OpenAI convention,
+        # `max_output_tokens` = mstar's own kwarg); 1024 mirrors
+        # mstar/model/glm52/config.py so the cap is explicit on the wire.
+        # Per-prompt budgets from a prompts JSON (PromptsJsonDataset) override
+        # these via RequestInput.model_kwargs at send time.
+        return {
+            "temperature": 0.0,
+            "max_tokens": 1024,
+            "max_output_tokens": 1024,
+        }
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -332,6 +366,7 @@ class ModelType(Enum):
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
+    GLM52 = "glm52"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -350,4 +385,6 @@ class ModelType(Enum):
             return WhisperLarge(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.GLM52:
+            return Glm52(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

@@ -77,6 +77,74 @@ class TxtFileDataset(BaseDataset):
         return self.items[idx]
 
 
+class PromptsJsonDataset(BaseDataset):
+    """
+    Dataset loader for text-to-text prompts from a JSON file in the M1
+    harness format: ``{"prompts": [{"id", "text", "max_tokens"}, ...]}``
+    (top-level keys other than ``prompts`` — e.g. ``_comment`` — are
+    ignored), or a bare list of the same row objects.
+
+    ``max_tokens`` is optional per row; when present it is stamped onto the
+    request as both ``max_tokens`` and ``max_output_tokens`` (the OpenAI and
+    mstar spellings, mirroring ``Benchmark._assign_output_lengths``) so the
+    per-prompt budget overrides the model-level default at send time.
+    """
+
+    def __init__(
+        self,
+        filename: str,
+        num_requests: int,
+        req_type=RequestType.T2T,
+    ):
+        assert req_type.get_input_modalities() == "text"
+
+        with open(filename) as f:
+            rows = json.load(f)
+        if isinstance(rows, dict):
+            rows = rows.get("prompts")
+        if not isinstance(rows, list):
+            raise ValueError(
+                f"{filename}: expected a JSON list of prompt objects or a "
+                f'{{"prompts": [...]}} object, got {type(rows).__name__}'
+            )
+
+        self.items: list[RequestInput] = []
+        self._num_requests = num_requests
+        for row in rows:
+            text = row.get("text")
+            if not text:
+                continue
+            model_kwargs = {}
+            max_tokens = row.get("max_tokens")
+            if max_tokens is not None:
+                model_kwargs = {
+                    "max_tokens": int(max_tokens),
+                    "max_output_tokens": int(max_tokens),
+                }
+            self.items.append(RequestInput(
+                req_type=req_type,
+                prompt=text,
+                model_kwargs=model_kwargs,
+            ))
+
+        if not self.items:
+            raise RuntimeError(
+                f"PromptsJsonDataset loaded 0 usable rows from {filename} -- "
+                f'expected [{{"id", "text", "max_tokens"}}, ...] with non-empty "text".'
+            )
+        self.items = self._resize_data(self.items)
+
+    @property
+    def num_requests(self):
+        return self._num_requests
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestInput:
+        return self.items[idx]
+
+
 VBENCH_UND_PROMPT = "Describe this image in detail."
 
 

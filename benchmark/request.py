@@ -117,6 +117,12 @@ class RequestMetrics:
 
     # For storing outputs of different modalities
     _text_chunks: list[str] = field(default_factory=list, repr=False)
+    # Exact per-chunk token counts, parallel to _text_chunks, valid only when
+    # the server attested raw ids (`token_ids` metadata — the mstar path).
+    # Cross-system adapters estimate n_tokens, so ITL falls back to
+    # re-tokenizing decoded text for them.
+    _text_chunk_tokens: list[int] = field(default_factory=list, repr=False)
+    _token_ids_attested: bool = field(default=False, repr=False)
     _image_chunks: list[bytes] = field(default_factory=list, repr=False)
     _audio_pcm: io.BytesIO = field(default_factory=io.BytesIO, repr=False)
     # Robotics outputs: raw float32 bytes per chunk
@@ -142,7 +148,28 @@ class RequestMetrics:
         for final output assembly. Call this for every streamed chunk.
         """
         data = base64.b64decode(data_b64)
+        if (metadata or {}).get("token_ids"):
+            self._token_ids_attested = True
         if not data:
+            # A text chunk can decode to empty bytes while carrying real
+            # tokens: the k=0 final EOS decodes to "" under
+            # skip_special_tokens, while under MTP the EOS rides a
+            # multi-token chunk and IS counted. Dropping the attested ids
+            # here undercounts k=0 by ~1 token/request vs k>0 — a
+            # systematic skew in exactly the MTP-vs-baseline comparisons
+            # this bench exists to run. Count the emission (and its
+            # arrival, for ITL); contribute no text.
+            token_ids = (metadata or {}).get("token_ids")
+            if modality == "text" and token_ids:
+                self._output_modalities_recvd.append(modality)
+                self.record_token(
+                    modality=modality,
+                    nbytes=0,
+                    arrival_time=arrival_time,
+                    n_tokens=len(token_ids),
+                )
+                self._text_chunks.append("")
+                self._text_chunk_tokens.append(len(token_ids))
             return
 
         if modality == "error":
@@ -170,6 +197,7 @@ class RequestMetrics:
 
         if modality == "text":
             self._text_chunks.append(data.decode("utf-8", errors="replace"))
+            self._text_chunk_tokens.append(n_tokens)
         elif modality == "image":
             self._image_chunks.append(data)
         elif modality == "audio":
@@ -339,18 +367,29 @@ class RequestMetrics:
             return None
         # gap[i] is the time from chunk i's arrival to chunk i+1's arrival; we
         # attribute it to chunk i+1 (the one that "took" that long to arrive).
-        if tokenizer is None or len(self._text_chunks) < 2:
+        if len(self._text_chunks) < 2 or (
+            tokenizer is None and not self._token_ids_attested
+        ):
             return list(gaps)
+        # When the server attested raw ids per chunk, use their exact counts:
+        # re-encoding decoded text mis-tokenizes chunk-boundary multi-byte
+        # splits (errors="replace"), which skews multi-token MTP chunks.
+        use_exact = self._token_ids_attested and len(
+            self._text_chunk_tokens) == len(self._text_chunks)
         out: list[float] = []
         for i, gap in enumerate(gaps):
             chunk_idx = i + 1
             if chunk_idx >= len(self._text_chunks):
                 continue
-            chunk_text = self._text_chunks[chunk_idx]
-            try:
-                n_tokens = len(tokenizer.encode(chunk_text, add_special_tokens=False))
-            except Exception:
-                n_tokens = 1
+            if use_exact:
+                n_tokens = self._text_chunk_tokens[chunk_idx]
+            else:
+                chunk_text = self._text_chunks[chunk_idx]
+                try:
+                    n_tokens = len(
+                        tokenizer.encode(chunk_text, add_special_tokens=False))
+                except Exception:
+                    n_tokens = 1
             if n_tokens <= 0:
                 continue
             per_token = gap / n_tokens
@@ -736,6 +775,10 @@ class OurSystem(InferenceSystem):
         try:
             form = aiohttp.FormData()
             form.add_field("text", req_input.prompt)
+            # Explicit even though it matches the server default
+            # (entrypoint.py: `streaming: bool = Form(True)`) — the NDJSON
+            # chunk protocol parsed below only exists on the streaming path.
+            form.add_field("streaming", "true")
             form.add_field("model_kwargs", model_kwargs)
             form.add_field("output_modalities", output_mod)
             # VLA and other multi-modal input types require an explicit
@@ -775,18 +818,31 @@ class OurSystem(InferenceSystem):
                         msg = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if not msg.get("data"):
+                    # Empty data alone doesn't disqualify a chunk: the k=0
+                    # final EOS decodes to "" (skip_special_tokens) but its
+                    # metadata still attests the emitted id — it must reach
+                    # record_output_chunk to be counted.
+                    if not msg.get("data") and not (
+                        msg.get("metadata") or {}
+                    ).get("token_ids"):
                         continue
                     arrival_time = time.monotonic()
                     mod = msg.get("modality")
                     data_b64 = msg.get("data", "")
+                    metadata = msg.get("metadata") or {}
+                    # mstar emits one token per chunk; where the server also
+                    # surfaces the raw ids (text chunks carry `token_ids` in
+                    # metadata — data_worker.py) trust their count instead of
+                    # assuming 1.
+                    token_ids = metadata.get("token_ids")
+                    n_tokens = len(token_ids) if token_ids else 1
 
                     metrics.record_output_chunk(
                         modality=mod,
                         data_b64=data_b64,
                         arrival_time=arrival_time,
-                        n_tokens=1,  # mstar server emits one token per chunk
-                        metadata=msg.get("metadata"),
+                        n_tokens=n_tokens,
+                        metadata=metadata,
                     )
 
         except Exception as e:
@@ -1674,4 +1730,173 @@ class OursOpenAI(VLLMOmni):
             metrics.record_error(str(e))
         else:
             metrics.record_completion()
+        return metrics
+
+
+# Keys forwarded verbatim to vLLM's /v1/completions. Everything else in the
+# merged model_kwargs is mstar-native (e.g. ``max_output_tokens``) and would
+# 400 on vLLM's stricter OpenAI schema.
+_VLLM_COMPLETIONS_KEYS = {
+    "temperature",
+    "max_tokens",
+    "top_p",
+    "seed",
+    "stop",
+    "ignore_eos",
+}
+
+
+def _record_vllm_completions_chunk(chunk: dict, metrics: "RequestMetrics") -> None:
+    """Record one /v1/completions SSE chunk: text deltas and/or usage.
+
+    Like vllm-omni (see :class:`VLLMOmni` note 2), a chunk can carry BOTH
+    choices and usage — usage must be read on every chunk, never `continue`d
+    past. The final usage overwrites the per-chunk token count, which is an
+    estimate (one token per chunk holds for vLLM's default detokenize path
+    but not for multi-token bursts).
+    """
+    arrival_time = time.monotonic()
+    for choice in chunk.get("choices") or []:
+        text = choice.get("text")
+        if text:
+            metrics.record_output_chunk(
+                modality="text",
+                data_b64=base64.b64encode(text.encode()).decode(),
+                arrival_time=arrival_time,
+                n_tokens=1,
+            )
+    usage = chunk.get("usage") or {}
+    if (ct := usage.get("completion_tokens")) is not None:
+        metrics.output_text_tokens = ct
+    if (pt := usage.get("prompt_tokens")) is not None:
+        metrics.input_tokens = pt
+
+
+class VllmCompletions(InferenceSystem):
+    """Benchmark adapter for a plain vLLM OpenAI server's ``/v1/completions``.
+
+    Exists for engine-vs-engine T2T parity runs (the M4/M5 protocol). Text-only
+    by design.
+
+    ⚠ Prompt-rendering parity [2026-08-19]. An earlier version of this docstring
+    claimed M* serves *raw* completion text, so raw completions here would match.
+    That is false for GLM-5.2: ``Glm52Model.process_prompt`` applies the HF chat
+    template server-side (``apply_chat_template([{"role": "user", ...}],
+    add_generation_prompt=True)``), so M* saw 1381 prompt tokens where vLLM saw
+    1141 in every A/B to date, and vLLM hit EOS early on some prompts (3072 vs
+    3264 output tokens). MTP-off tok/s is content-independent (<1%); MTP
+    *acceptance* is not. Set ``MSTAR_BENCH_VLLM_CHAT_TEMPLATE=<hf model path>``
+    to render the same template client-side (tokenizer loaded once) before
+    posting, which makes the two engines' workloads identical.
+    """
+
+    _template_tokenizer = None
+    _template_path_loaded: str | None = None
+
+    @classmethod
+    def _render_prompt(cls, prompt: str) -> str:
+        path = os.environ.get("MSTAR_BENCH_VLLM_CHAT_TEMPLATE", "").strip()
+        if not path:
+            return prompt
+        if cls._template_path_loaded != path:
+            from transformers import AutoTokenizer
+
+            cls._template_tokenizer = AutoTokenizer.from_pretrained(
+                path, trust_remote_code=True)
+            cls._template_path_loaded = path
+        tok = cls._template_tokenizer
+        if not getattr(tok, "chat_template", None):
+            return prompt
+        # Same call as mstar/model/glm52/glm52_model.py:process_prompt, but
+        # returning text: the OpenAI completions endpoint tokenizes it, and
+        # special tokens in the rendered string ([gMASK]<sop><|user|>...) are
+        # recognised by the tokenizer as specials.
+        return tok.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+
+    async def send_request(
+        self,
+        session: aiohttp.ClientSession,
+        req_input: RequestInput,
+        base_url: str,
+        request_id: int,
+        model: Model,
+        additional_model_kwargs: dict = {},
+    ) -> RequestMetrics:
+        req_type = req_input.req_type
+        assert (
+            req_type.get_input_modalities() == "text"
+            and req_type.get_output_modalities() == "text"
+        ), "vllm_completions is a raw text adapter; use vllm_omni for multimodal"
+
+        metrics = RequestMetrics(
+            request_id=request_id,
+            type=req_type,
+            expected_output_modalities=["text"],
+        )
+
+        try:
+            merged = {
+                **model.get_model_kwargs(req_type),
+                **req_input.model_kwargs,
+                **additional_model_kwargs,
+            }
+            payload = {k: v for k, v in merged.items() if k in _VLLM_COMPLETIONS_KEYS}
+            payload.update(
+                model=model.get_hf_url(),
+                prompt=self._render_prompt(req_input.prompt),
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+            metrics.start_time = time.monotonic()
+            async with session.post(
+                f"{base_url}/v1/completions",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                read_bufsize=2**24,
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
+            ) as resp:
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {await resp.text()}")
+
+                # Same SSE discipline as VLLMOmni: iter_any() + manual \n\n
+                # framing (the default line iterator drops oversized lines),
+                # keep reading past [DONE], flush a possible unterminated tail.
+                buffer = b""
+                async for raw_bytes in resp.content.iter_any():
+                    if not raw_bytes:
+                        continue
+                    buffer += raw_bytes
+                    while b"\n\n" in buffer:
+                        message, buffer = buffer.split(b"\n\n", 1)
+                        message = message.strip()
+                        if not message:
+                            continue
+                        chunk = _parse_sse_chunk(message)
+                        if chunk is None or chunk.get("_done"):
+                            continue
+                        _record_vllm_completions_chunk(chunk, metrics)
+
+                tail = buffer.strip()
+                if tail.startswith(b"data:"):
+                    payload_str = tail[len(b"data:") :].strip()
+                    if payload_str and payload_str != b"[DONE]":
+                        try:
+                            json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            pass
+                        else:
+                            chunk = _parse_sse_chunk(tail)
+                            if chunk is not None and not chunk.get("_done"):
+                                _record_vllm_completions_chunk(chunk, metrics)
+
+        except Exception as e:
+            metrics.record_error(str(e))
+        else:
+            metrics.record_completion()
+
         return metrics

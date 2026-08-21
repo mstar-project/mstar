@@ -228,11 +228,18 @@ class KVCacheEngine(BaseEngine):
             )
             num_kv_heads = cfg.num_kv_heads
 
-            kv_cache = torch.zeros(
-                num_layers, max_num_pages, 2,
-                page_size, num_kv_heads, head_dim,
-                dtype=kv_cache_type, device=device,
-            ).contiguous()
+            if cfg.attention_backend == "mla_absorb":
+                # One compressed latent per token: no K/V axis and no KV-head axis.
+                kv_cache = torch.zeros(
+                    num_layers, max_num_pages, page_size, head_dim,
+                    dtype=kv_cache_type, device=device,
+                ).contiguous()
+            else:
+                kv_cache = torch.zeros(
+                    num_layers, max_num_pages, 2,
+                    page_size, num_kv_heads, head_dim,
+                    dtype=kv_cache_type, device=device,
+                ).contiguous()
 
             cpu_page_pool = None
             if cfg.cpu_offload_pages > 0:
@@ -1013,7 +1020,7 @@ class KVCacheEngine(BaseEngine):
         if not batch.request_ids:
             return NodeOutput(per_request_output_tensors={})
 
-        submod_mgmt.tp_group.barrier()
+        submod_mgmt.tp_group.step_barrier()
 
         if self._can_use_cuda_graph(batch, node_inputs):
             if self.enable_nvtx:

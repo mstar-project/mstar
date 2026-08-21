@@ -56,6 +56,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_AR_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
+def _log_capture_outcome(submodule_name: str, attempted: int, captured: int) -> None:
+    """Summarize a warmup's capture results at the right volume.
+
+    A submodule that registered configs but captured NOTHING serves every
+    batch on the eager fallback — an order-of-magnitude decode regression
+    (measured 13x on GLM-5.2 MTP, 2026-08-09) that previously announced
+    itself only as per-shape warnings scrolled off during warmup. Make the
+    all-failed case an ERROR with the consequence spelled out; partial
+    failure stays a WARNING.
+    """
+    if attempted in (0, captured):
+        return
+    if captured == 0:
+        logger.error(
+            "CudaGraphRunner[%s]: ALL %d CUDA-graph captures FAILED — every "
+            "batch will run the EAGER fallback (order-of-magnitude slower "
+            "decode). First failure above has the traceback.",
+            submodule_name, attempted,
+        )
+    else:
+        logger.warning(
+            "CudaGraphRunner[%s]: %d/%d captures failed; batches without a "
+            "captured shape fall back to eager.",
+            submodule_name, attempted - captured, attempted,
+        )
+
+
 @dataclass
 class DummyCaptureInput:
     tensors: dict[str, list[torch.Tensor]]  # {tensor_name: [tensor(s)]}
@@ -206,6 +233,9 @@ class CudaGraphRunner:
         self.enable_nvtx = False  # set by KVCacheEngine after construction
 
         self.graphs: dict[CudaGraphKey, CudaGraphData] = {}
+        # Filled by warmup_and_capture; read by tests and health checks.
+        self.capture_attempted = 0
+        self.capture_failed = 0
 
         self.memory_pool = None
 
@@ -266,6 +296,8 @@ class CudaGraphRunner:
         self.memory_pool = torch.cuda.graphs.graph_pool_handle()
         mem_before = torch.cuda.memory_allocated(self.device)
 
+        attempted = 0
+        captured = 0
         for config in self.capture_configs:
             sizes = config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
             for bs in reversed(sizes):
@@ -276,6 +308,8 @@ class CudaGraphRunner:
                         bs=bs, num_tokens=num_tokens
                     )
                     self.tp_group.barrier()
+                    attempted += 1
+                    registered_before = len(self.graphs)
                     try:
                         cfg_type = config.get_config_type()
                         if cfg_type == CudaGraphConfigType.BASIC_BATCHED:
@@ -292,6 +326,15 @@ class CudaGraphRunner:
                         logger.warning(
                             "Failed to capture CUDA graph for %s: %s bs=%d",
                             self.submodule_name, key, bs, exc_info=True)
+                    # Registration is the ground truth for "captured" — the
+                    # per-type paths can also bail without raising (e.g. a
+                    # BASIC_BATCHED config with no template inputs).
+                    if len(self.graphs) > registered_before:
+                        captured += 1
+
+        self.capture_attempted = attempted
+        self.capture_failed = attempted - captured
+        _log_capture_outcome(self.submodule_name, attempted, captured)
 
         mem_after = torch.cuda.memory_allocated(self.device)
         shared_bytes = sum(
@@ -326,15 +369,27 @@ class CudaGraphRunner:
         can run on plan_stream concurrently with replay(slot 0) on
         default_stream without racing on the wrapper's persistent state.
         """
-        from mstar.engine.cache_manager import _PlanState
+        from mstar.engine.cache_manager import _mla_kernel_available, _PlanState
         from mstar.utils.flashinfer_utils import (
             FlashInferDecodeWrapper,
+            FlashInferMLAWrapper,
             FlashInferPrefillWrapper,
         )
 
         is_decode = (total_tokens == bs)
 
         cfg = self.kv_cache_config
+
+        # Only the FlashInfer MLA path is capturable; absorbed SDPA stays eager.
+        use_mla_kernel = (
+            cfg.attention_backend == "mla_absorb"
+            and cfg.mla_ckv_dim is not None
+            and _mla_kernel_available(
+                cfg.mla_ckv_dim,
+                cfg.head_dim - cfg.mla_ckv_dim,
+                torch.cuda.get_device_capability(self.device)[0],
+            )
+        )
 
         # Allocate workspace buffer for CUDA graph wrappers.
         # Each (label, slot) gets its own workspace — slots must NOT share
@@ -344,7 +399,22 @@ class CudaGraphRunner:
         plan_states = {}
         for label in config.labels:
             ws_label = f"{label}_cugraph_slot{slot_idx}"
-            if is_decode:
+            if use_mla_kernel:
+                wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=self.buffer_manager.get(ws_label),
+                    num_heads=cfg.num_qo_heads,
+                    head_dim_ckv=cfg.mla_ckv_dim,
+                    head_dim_kpe=cfg.head_dim - cfg.mla_ckv_dim,
+                    page_size=cfg.page_size,
+                    sm_scale=cfg.softmax_scale,
+                    batch_size=bs,
+                    max_num_pages=cfg.max_num_pages,
+                    max_total_tokens=total_tokens,
+                    device=self.device,
+                    use_cuda_graph=True,
+                    enable_nvtx=self.enable_nvtx,
+                )
+            elif is_decode:
                 wrapper = FlashInferDecodeWrapper(
                     workspace_buffer=self.buffer_manager.get(ws_label),
                     num_qo_heads=cfg.num_qo_heads,
@@ -2438,10 +2508,19 @@ class PiecewiseCudaGraphRunner:
         buffer_manager: WorkspaceBufferManager | None = None,
         sampler_buffers: MultiSamplerBuffers | None = None,
         tp_group=None,
+        label: str = "",
     ):
         from mstar.distributed.communication import CommGroup
 
         self.config = config
+        # Namespaces this runner's dummy request ids. Without it the ids are
+        # derived from the capture SHAPE alone, so two labels that capture the
+        # same (bs, total_tokens) — e.g. GLM-5.2's mtp_trunk and mtp_sync, both
+        # (bs, k+1) — get identical ids and share one slot in the shared
+        # alloc_manager. add_request OVERWRITES request_states[rid], so the
+        # second runner's setup discards the first's dummy state and orphans
+        # any pages capture had allocated to it.
+        self.label = label
         self.device = device
         self.autocast_dtype = autocast_dtype
         self.kv_cache_config = kv_cache_config
@@ -2511,7 +2590,28 @@ class PiecewiseCudaGraphRunner:
     def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
         static_inputs = self.config.make_static_inputs(shape)
         static_cm, dummy_rids = self._setup_cache_manager(shape)
+        try:
+            self._capture_one_inner(shape, static_inputs, static_cm, dummy_rids)
+        finally:
+            # Free dummy KV state on SUCCESS AND FAILURE. A failed capture
+            # that keeps its dummy pages skews num_free_pages on just this
+            # rank — and since capture failures (e.g. the Inductor autotune
+            # sync race) land on different ranks at different buckets, the
+            # leak turns into cross-rank allocator asymmetry that
+            # _verify_tp_kv_symmetry rejects, killing the whole server at
+            # warmup (hit 2026-08-09: [508,508,504,...] = one bs-sized leak
+            # per rank's failed bucket).
+            for rid in dummy_rids:
+                for label in self.cache_labels:
+                    self.alloc_manager.reset_label(rid, label, free=True)
 
+    def _capture_one_inner(
+        self,
+        shape: PiecewiseCaptureShape,
+        static_inputs: dict[str, torch.Tensor],
+        static_cm: BatchedCacheManager | None,
+        dummy_rids: list[str],
+    ) -> None:
         fn = self.config.capture_fn
         if self.config.compile:
             fn = torch.compile(
@@ -2560,11 +2660,9 @@ class PiecewiseCudaGraphRunner:
                 static_out = self._normalize_output(run_fn())
         torch.cuda.synchronize()
 
-        # Free dummy KV state so it doesn't accumulate across buckets.
-        for rid in dummy_rids:
-            for label in self.cache_labels:
-                self.alloc_manager.reset_label(rid, label, free=True)
-
+        # Dummy KV state is freed by _capture_one's finally — success and
+        # failure both — so per-bucket leftovers can't accumulate or skew
+        # cross-rank allocator symmetry.
         self.graphs[(shape.bs, shape.total_tokens)] = PiecewiseGraphData(
             graph=graph,
             static_inputs=static_inputs,
@@ -2580,8 +2678,10 @@ class PiecewiseCudaGraphRunner:
         if not self.config.uses_kv_cache:
             return None, []
 
+        ns = f"{self.label}_" if self.label else ""
         dummy_rids = [
-            f"__pcgr_{shape.bs}_{shape.total_tokens}_{i}__" for i in range(shape.bs)
+            f"__pcgr_{ns}{shape.bs}_{shape.total_tokens}_{i}__"
+            for i in range(shape.bs)
         ]
         for rid in dummy_rids:
             self.alloc_manager.add_request(rid, labels=self.cache_labels)
@@ -2600,28 +2700,121 @@ class PiecewiseCudaGraphRunner:
         return static_cm, dummy_rids
 
     def _build_persistent_wrappers(self, shape: PiecewiseCaptureShape) -> dict:
-        from mstar.engine.cache_manager import _PlanState
-        from mstar.utils.flashinfer_utils import FlashInferPrefillWrapper
+        from mstar.engine.cache_manager import _mla_kernel_available, _PlanState
+        from mstar.utils.flashinfer_utils import (
+            FlashInferMLAWrapper,
+            FlashInferPrefillWrapper,
+        )
 
         cfg = self.kv_cache_config
+        # Mirror CudaGraphRunner._create_persistent_wrappers: an mla_absorb
+        # cache plans through the MLA wrapper (the GLM-5.2 / Kimi latent
+        # layout); everything else through the ragged prefill wrapper.
+        use_mla_kernel = (
+            cfg.attention_backend == "mla_absorb"
+            and cfg.mla_ckv_dim is not None
+            and _mla_kernel_available(
+                cfg.mla_ckv_dim,
+                cfg.head_dim - cfg.mla_ckv_dim,
+                torch.cuda.get_device_capability(self.device)[0],
+            )
+        )
         plan_states: dict = {}
         for label in self.cache_labels:
-            wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self.buffer_manager.get(
-                    f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
-                ),
-                num_qo_heads=cfg.num_qo_heads,
-                num_kv_heads=cfg.num_kv_heads,
-                head_dim=cfg.head_dim,
-                page_size=cfg.page_size,
-                batch_size=shape.bs,
-                max_total_tokens=shape.total_tokens,
-                max_num_pages=cfg.max_num_pages,
-                device=self.device,
-                use_cuda_graph=True,
-                backend=cfg.flashinfer_backend,
+            # Keyed on (cache label, shape) only, so two piecewise labels of
+            # the same shape — GLM-5.2's mtp_trunk and mtp_sync, both
+            # (bs, k+1) — share one workspace. That is SAFE here and the
+            # sharing is deliberate: WorkspaceBufferManager.get allocates a
+            # full MSTAR_WORKSPACE_BUFFER_MB (512 MiB default) per distinct
+            # key, so discriminating by label would cost +5 buffers /
+            # +2.5 GiB per rank at GLM-5.2's five capture batch sizes.
+            #
+            # Safe because there is no concurrency on this path: run() plans
+            # and replays inside one call on the default stream, and the
+            # step's runners execute strictly in order (trunk -> sync ->
+            # draft). Corrupting a replay needs the interleaving
+            # plan-A, plan-B, replay-A, which cannot occur. The full-graph
+            # runner's per-slot split (_create_persistent_wrappers) is NOT a
+            # precedent for splitting here — its key omits bs/tokens/walk, so
+            # it shares across graphs too, and its comment names the reason
+            # as a concurrent plan(slot B) + replay(slot A) race.
+            #
+            # If piecewise runners ever gain pre-planning or multiple slots,
+            # this key must grow a discriminator before that lands.
+            #
+            # 2026-08-19, sync-free planning: plans now stage their index
+            # tensors through pinned memory and copy async, so the HOST runs
+            # ahead — plan(draft it+1) is issued while replay(draft it) is
+            # still executing. Sharing is still safe, for two reasons that
+            # must both keep holding: (1) every plan's DEVICE writes (the
+            # index bufs, FlashInfer's int-workspace memcpy) are enqueued on
+            # the same stream after the replays already queued, so they land
+            # after those replays have read the workspace and before the
+            # replay they belong to; (2) the wrapper's plan fence
+            # (FlashInferMLAWrapper._plan_event) makes plan N+1 on a wrapper
+            # wait until plan N's DMAs executed, so its pinned host sources
+            # are never overwritten in flight. Nothing here may move to a
+            # second stream without revisiting both.
+            ws_key = (
+                f"{label}_pcgr_{self.label}_shared"
+                if getattr(self.config, "share_workspace_across_buckets", False)
+                else f"{label}_pcgr_{shape.bs}_{shape.total_tokens}"
             )
-            plan_states[label] = _PlanState(wrapper=wrapper)
+            workspace = self.buffer_manager.get(ws_key)
+            # Multi-plan labels get one wrapper per plan slot, each on its own
+            # slice of the workspace: all slots are LIVE inside one replay
+            # (planned before it, read by kernels in the same graph), so they
+            # cannot share FlashInfer's per-wrapper scheduling state.
+            n_plans = max(1, int(getattr(self.config, "plans_per_label", 1) or 1))
+            # 256-byte aligned slices: FlashInfer requires a 16-byte aligned
+            # float workspace (the prefill wrapper checks; the MLA one merely
+            # assumes) and the buffer is uint8.
+            slice_len = (workspace.numel() // n_plans) // 256 * 256
+            wrappers = []
+            for pi in range(n_plans):
+                ws_i = (
+                    workspace if n_plans == 1
+                    else workspace.narrow(0, pi * slice_len, slice_len)
+                )
+                if use_mla_kernel:
+                    wrappers.append(FlashInferMLAWrapper(
+                        workspace_buffer=ws_i,
+                        num_heads=cfg.num_qo_heads,
+                        head_dim_ckv=cfg.mla_ckv_dim,
+                        head_dim_kpe=cfg.head_dim - cfg.mla_ckv_dim,
+                        page_size=cfg.page_size,
+                        sm_scale=cfg.softmax_scale,
+                        batch_size=shape.bs,
+                        max_num_pages=cfg.max_num_pages,
+                        max_total_tokens=shape.total_tokens,
+                        device=self.device,
+                        use_cuda_graph=True,
+                    ))
+                else:
+                    wrappers.append(FlashInferPrefillWrapper(
+                        workspace_buffer=ws_i,
+                        num_qo_heads=cfg.num_qo_heads,
+                        num_kv_heads=cfg.num_kv_heads,
+                        head_dim=cfg.head_dim,
+                        page_size=cfg.page_size,
+                        batch_size=shape.bs,
+                        max_total_tokens=shape.total_tokens,
+                        max_num_pages=cfg.max_num_pages,
+                        device=self.device,
+                        use_cuda_graph=True,
+                        backend=cfg.flashinfer_backend,
+                    ))
+            wrapper = wrappers[0]
+            plan_states[label] = _PlanState(
+                wrapper=wrapper,
+                wrappers=wrappers if n_plans > 1 else None,
+                # Static RoPE position buffer so plan_rope's graph-mode
+                # .copy_() path has a stable address (same contract as
+                # CudaGraphRunner's per-slot static_pos_ids).
+                pos_ids=torch.zeros(
+                    shape.total_tokens, dtype=torch.long, device=self.device
+                ),
+            )
         return plan_states
 
     def _plan(
@@ -2629,6 +2822,7 @@ class PiecewiseCudaGraphRunner:
         static_cm: BatchedCacheManager,
         shape: PiecewiseCaptureShape,
         seq_lens: list[int] | None = None,
+        plan_ctx: dict | None = None,
     ) -> None:
         """Plan attention outside the graph for capture or replay.
 
@@ -2636,6 +2830,9 @@ class PiecewiseCudaGraphRunner:
         real per-request lengths). A custom ``config.plan_fn`` receives a shape
         carrying the effective seq_lens; the type-default plans every cache
         label with those seq_lens (``is_causal`` read from forward_kwargs).
+        ``plan_ctx`` (from ``run(plan_ctx=...)``) is passed through to a custom
+        plan_fn as keyword arguments — data-dependent ints a multi-plan region
+        needs (e.g. per-request accepted counts) that the shape cannot carry.
         """
         effective = list(seq_lens) if seq_lens is not None else shape.seq_lens
         if self.config.plan_fn is not None:
@@ -2644,6 +2841,7 @@ class PiecewiseCudaGraphRunner:
                 PiecewiseCaptureShape(
                     bs=shape.bs, seq_lens=effective, total_tokens=sum(effective),
                 ),
+                **(plan_ctx or {}),
             )
             return
         is_causal = self.config.forward_kwargs.get("is_causal", False)
@@ -2740,6 +2938,7 @@ class PiecewiseCudaGraphRunner:
         request_ids: list[str] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
+        plan_ctx: dict | None = None,
     ) -> PiecewiseOutput:
         """Replay the captured graph for the given real inputs.
 
@@ -2785,63 +2984,172 @@ class PiecewiseCudaGraphRunner:
             if buf is None or not isinstance(val, torch.Tensor):
                 continue
             n = val.shape[0]
-            buf[:n].copy_(val)
+            # non_blocking: D2D copies are async regardless; for a PINNED
+            # host tensor (mstar/utils/pinned_staging.py) this makes the H2D
+            # a real async DMA instead of a stream-draining memcpy, so a
+            # caller can queue several replays without waiting on the GPU
+            # between them (the MTP draft chain).
+            buf[:n].copy_(val, non_blocking=True)
             if n < buf.shape[0]:
                 buf[n:].zero_()
 
         # --- 2: KV state swap + plan_attention ---
+        # Swap-and-restore must be paired (same lesson as _run_basic_batched):
+        # _plan can raise a retryable AllocationFailedError under page-pool
+        # pressure, and without the finally the dummy slots would stay aliased
+        # to live RequestState objects — a later replay's step-5
+        # reset_label(free=True) on a stale-aliased padding slot would then
+        # free a live request's pages — and because the real state's own
+        # page list stays populated, remove_request would later double-free
+        # those indices back into the allocator FIFO. ``swapped`` is set
+        # BEFORE the aliasing loop so a mid-loop failure is covered too:
+        # slots below real_bs that were never reached take free=False, which
+        # frees nothing at all), and slots at/above real_bs hold dummy state
+        # whose pages _capture_one already released.
         static_cm = data.static_cache_manager
-        if static_cm is not None and request_ids is not None:
-            for i, rid in enumerate(request_ids):
-                dummy_rid = data.dummy_rids[i]
+        swapped = False
+        try:
+            if static_cm is not None and request_ids is not None:
+                swapped = True
+                for i, rid in enumerate(request_ids):
+                    dummy_rid = data.dummy_rids[i]
+                    for label in self.cache_labels:
+                        real_state = self.alloc_manager.get_state(rid, label)
+                        self.alloc_manager.get_state(dummy_rid, label)  # ensure slot exists
+                        self.alloc_manager.request_states[dummy_rid][label] = real_state
+                self._plan(
+                    static_cm,
+                    data.shape,
+                    seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
+                    plan_ctx=plan_ctx,
+                )
+
+            if self.sampler_buffer is not None and request_ids is not None:
+                # TODO: add "gather_seen_tokens" as an explicit flag in the piecewise cuda
+                # graph config so we don't do unnecessary work here
+                self.sampler_buffer.gather_for_request_ids(
+                    request_ids=request_ids, padded_bs=data.shape.bs,
+                    gather_seen_tokens=True,
+                )
+
+            # --- 3: replay ---
+            data.graph.replay()
+
+            if self.sampler_buffer is not None and request_ids is not None:
+                # Persist the in-graph-advanced RNG offsets back to their slot
+                # masters (mirrors the gather above; GPU-only, real rows only).
+                self.sampler_buffer.scatter_offsets()
+
+            # --- 4: advance seq_lens (Python-only, post-replay) ---
+            # Uses the per-request lengths planned in step 2, so this is correct for
+            # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
+            # config.advance_seq_lens=False when the caller advances the cache itself.
+            if (
+                self.config.advance_seq_lens
+                and static_cm is not None
+                and request_ids is not None
+            ):
                 for label in self.cache_labels:
-                    real_state = self.alloc_manager.get_state(rid, label)
-                    self.alloc_manager.get_state(dummy_rid, label)  # ensure slot exists
-                    self.alloc_manager.request_states[dummy_rid][label] = real_state
-            self._plan(
-                static_cm,
-                data.shape,
-                seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
-            )
-
-        if self.sampler_buffer is not None and request_ids is not None:
-            # TODO: add "gather_seen_tokens" as an explicit flag in the piecewise cuda
-            # graph config so we don't do unnecessary work here
-            self.sampler_buffer.gather_for_request_ids(
-                request_ids=request_ids, padded_bs=data.shape.bs,
-                gather_seen_tokens=True,
-            )
-
-        # --- 3: replay ---
-        data.graph.replay()
-
-        if self.sampler_buffer is not None and request_ids is not None:
-            # Persist the in-graph-advanced RNG offsets back to their slot
-            # masters (mirrors the gather above; GPU-only, real rows only).
-            self.sampler_buffer.scatter_offsets()
-
-        # --- 4: advance seq_lens (Python-only, post-replay) ---
-        # Uses the per-request lengths planned in step 2, so this is correct for
-        # both uniform (BATCHED) and variable (PACKED) sequences. Opt out via
-        # config.advance_seq_lens=False when the caller advances the cache itself.
-        if (
-            self.config.advance_seq_lens
-            and static_cm is not None
-            and request_ids is not None
-        ):
-            for label in self.cache_labels:
-                static_cm.set_active_label(label)
-                static_cm.advance_seq_lens()
-
-        # --- 5: restore dummy states ---
-        if static_cm is not None and request_ids is not None:
-            for i, dummy_rid in enumerate(data.dummy_rids):
-                for label in self.cache_labels:
-                    self.alloc_manager.reset_label(dummy_rid, label, free=i >= real_bs)
+                    static_cm.set_active_label(label)
+                    static_cm.advance_seq_lens()
+        finally:
+            # --- 5: restore dummy states ---
+            # free= only for padding slots: slots < real_bs alias live states
+            # on the success path and must never have their pages freed.
+            if swapped:
+                for i, dummy_rid in enumerate(data.dummy_rids):
+                    for label in self.cache_labels:
+                        self.alloc_manager.reset_label(
+                            dummy_rid, label, free=i >= real_bs)
 
         # --- 6: return output view ---
         real_len = real_total_tokens if is_packed else real_bs
         return PiecewiseOutput(data.static_outputs, real_len)
+
+    def _resolve_data(self, request_ids, seq_lens):
+        real_bs = len(request_ids)
+        is_packed = self.config.get_config_type() == PiecewiseConfigType.PACKED
+        real_total_tokens = sum(seq_lens) if seq_lens is not None else None
+        key = self._resolve_key(real_bs, real_total_tokens if is_packed else None)
+        if key is None:
+            raise RuntimeError(
+                f"PiecewiseCudaGraphRunner: no captured graph for bs={real_bs}, "
+                f"total_tokens={real_total_tokens}"
+            )
+        return self.graphs[key], real_bs
+
+    def prepare(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[str],
+        seq_lens: list[int],
+        plan_ctx: dict | None = None,
+    ) -> None:
+        """The data-independent half of ``run()``, callable while the GPU is
+        still executing the graph that produces this replay's remaining
+        inputs (the MTP draft phase calls it during the ~20 ms the host would
+        otherwise spend blocked in the verify readback).
+
+        Does run()'s steps 1–2 for whatever it is given: copies
+        ``static_inputs`` into the runner-owned buffers, aliases the real KV
+        states onto the dummy slots (idempotent — run() re-aliases the same
+        slots), and calls the plan_fn with ``plan_ctx`` (the caller's phase
+        marker rides in there; a split plan_fn plans only its early slots).
+
+        Contract: ``run()`` for the SAME request_ids/seq_lens must follow on
+        this thread before anything else replays through this runner. If the
+        caller aborts in between, it MUST call ``abort_prepare(request_ids,
+        seq_lens)``: a dummy slot left aliased to a live request would let a
+        later replay's padding-slot ``reset_label(free=True)`` free live
+        pages (the exact failure run()'s own finally exists to prevent).
+        On an exception inside this call the aliased slots are restored
+        (free=False) before it propagates.
+        """
+        data, real_bs = self._resolve_data(request_ids, seq_lens)
+        for name, val in static_inputs.items():
+            buf = data.static_inputs.get(name)
+            if buf is None or not isinstance(val, torch.Tensor):
+                continue
+            n = val.shape[0]
+            buf[:n].copy_(val, non_blocking=True)
+            if n < buf.shape[0]:
+                buf[n:].zero_()
+        static_cm = data.static_cache_manager
+        if static_cm is None:
+            return
+        swapped_slots = 0
+        try:
+            for i, rid in enumerate(request_ids):
+                dummy_rid = data.dummy_rids[i]
+                for label in self.cache_labels:
+                    real_state = self.alloc_manager.get_state(rid, label)
+                    self.alloc_manager.get_state(dummy_rid, label)
+                    self.alloc_manager.request_states[dummy_rid][label] = real_state
+                swapped_slots = i + 1
+            self._plan(
+                static_cm,
+                data.shape,
+                seq_lens=self._replay_seq_lens(data.shape, seq_lens, real_bs),
+                plan_ctx=plan_ctx,
+            )
+        except Exception:
+            for i in range(swapped_slots):
+                for label in self.cache_labels:
+                    self.alloc_manager.reset_label(
+                        data.dummy_rids[i], label, free=False)
+            raise
+
+    def abort_prepare(
+        self, request_ids: list[str], seq_lens: list[int],
+    ) -> None:
+        """Restore the dummy slots a ``prepare()`` aliased when the paired
+        ``run()`` will not happen. free=False everywhere: every slot prepare
+        touched aliases a live state, and padding slots were never touched."""
+        data, _ = self._resolve_data(request_ids, seq_lens)
+        for i in range(len(request_ids)):
+            for label in self.cache_labels:
+                self.alloc_manager.reset_label(
+                    data.dummy_rids[i], label, free=False)
 
 
 def build_piecewise_runners(
@@ -2879,6 +3187,7 @@ def build_piecewise_runners(
                 buffer_manager=buffer_manager if config.uses_kv_cache else None,
                 sampler_buffers=sampler_buffers if config.uses_sampler else None,
                 tp_group=tp_group,
+                label=label,
             )
             runner.warmup_and_capture()
             if runner.graphs:
