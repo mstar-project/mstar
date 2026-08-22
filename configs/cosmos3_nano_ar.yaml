@@ -1,0 +1,20 @@
+model: "cosmos3"
+# Sequence-length hint for the scheduler. The conductor only asserts its
+# presence; the real per-request capacity is the KV pool below.
+max_seq_len: 8192
+kv_cache:
+  max_num_pages: 1024
+# Windowed-AR serving config: same nano deployment as cosmos3_nano.yaml plus
+# the opt-in windowed video walk (enable_windowed_video adds the
+# vae_decoder_ar node and its streaming decoder partition; requests opt in
+# per call via window_mode). Windowed requests run the eager denoise path, so
+# capture stays enabled only for the t2i tiers it already covers.
+model_kwargs:
+  cuda_graph: true
+  graph_max_latent_area: 2000
+  enable_windowed_video: true
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0]
+  - node_names: ["vae_encoder", "vae_decoder", "vae_decoder_ar", "audio_decoder"]
+    ranks: [0]

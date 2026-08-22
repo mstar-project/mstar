@@ -35,11 +35,13 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
+    PartitionDefinition,
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.base import EngineType
 from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -58,13 +60,17 @@ from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
     IMAGE_GEN_LOOP,
+    VIDEO_GEN_AR_LOOP,
     VIDEO_GEN_LOOP,
     VIDEO_SOUND_GEN_LOOP,
     Cosmos3AudioDecoderSubmodule,
     Cosmos3DiTSubmodule,
+    Cosmos3VAEDecoderARSubmodule,
     Cosmos3VAEDecoderSubmodule,
     Cosmos3VAEEncoderSubmodule,
 )
+from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +78,7 @@ DIT_NODE = "dit"
 VAE_ENCODER_NODE = "vae_encoder"
 VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
+VAE_DECODER_AR_NODE = "vae_decoder_ar"
 
 
 class Cosmos3Model(Model):
@@ -82,6 +89,8 @@ class Cosmos3Model(Model):
     PREFILL_COND_VIDEO_WALK = constants.PREFILL_COND_VIDEO_WALK
     IMAGE_GEN_WALK = constants.IMAGE_GEN_WALK
     VIDEO_GEN_WALK = constants.VIDEO_GEN_WALK
+    VIDEO_GEN_AR_WALK = constants.VIDEO_GEN_AR_WALK
+    VIDEO_DECODE_AR_WALK = constants.VIDEO_DECODE_AR_WALK
     VIDEO_SOUND_GEN_WALK = constants.VIDEO_SOUND_GEN_WALK
     ACTION_GEN_WALK = constants.ACTION_GEN_WALK
     ACTION_VIDEO_GEN_WALK = constants.ACTION_VIDEO_GEN_WALK
@@ -196,6 +205,11 @@ class Cosmos3Model(Model):
             return True
         return (self._ensure_repo() / "sound_tokenizer" / "config.json").exists()
 
+    def _windowed_serving_enabled(self) -> bool:
+        """Whether the opt-in windowed-AR video walk (and its vae_decoder_ar
+        node + streaming decoder partition) is served."""
+        return bool(self.config.enable_windowed_video)
+
     def get_node_engine_types(self) -> dict[str, EngineType]:
         types = {
             DIT_NODE: EngineType.KV_CACHE,
@@ -204,6 +218,8 @@ class Cosmos3Model(Model):
         }
         if self._sound_serving_enabled():
             types[AUDIO_DECODER_NODE] = EngineType.STATELESS
+        if self._windowed_serving_enabled():
+            types[VAE_DECODER_AR_NODE] = EngineType.STATELESS
         return types
 
     def get_default_sharding_config(self) -> ShardingConfig:
@@ -451,7 +467,88 @@ class Cosmos3Model(Model):
         # (and only needs a node_groups entry) when sound serving is enabled.
         if self._sound_serving_enabled():
             walks[self.VIDEO_SOUND_GEN_WALK] = video_sound_gen
+
+        # Windowed AR video (opt-in): the same denoise loop, run window by
+        # window. On each window's last step the DiT emits the finished
+        # window's latents on a streaming edge; the vae_decoder_ar node — its
+        # own partition, so it decodes window k while the loop denoises
+        # window k+1 — consumes them per chunk and emits the assembled video.
+        if self._windowed_serving_enabled():
+            walks[self.VIDEO_GEN_AR_WALK] = Sequential(
+                [
+                    Loop(
+                        name=VIDEO_GEN_AR_LOOP,
+                        section=GraphNode(
+                            name=DIT_NODE,
+                            input_names=["latents", "time_index", "cond_latents"],
+                            outputs=[
+                                GraphEdge(next_node=DIT_NODE, name="latents"),
+                                GraphEdge(next_node=DIT_NODE, name="time_index"),
+                                StreamingGraphEdge(
+                                    next_node=VAE_DECODER_AR_NODE,
+                                    name="window_latents",
+                                    target_partition=constants.WINDOW_DECODER_PARTITION,
+                                ),
+                            ],
+                            enable_async_scheduling=True,
+                        ),
+                        max_iters=self.config.max_windows
+                        * (self.config.max_inference_steps + 1),
+                        outputs=[],
+                    ),
+                ]
+            )
+            # The decoder partition's walk must be the bare consumer node (the
+            # streaming consumer lookup resolves the edge's node from a
+            # top-level GraphNode section).
+            walks[self.VIDEO_DECODE_AR_WALK] = GraphNode(
+                name=VAE_DECODER_AR_NODE,
+                input_names=["window_latents"],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="video_output",
+                        output_modality="video",
+                    ),
+                ],
+            )
         return walks
+
+    def get_partitions(self):
+        if not self._windowed_serving_enabled():
+            return super().get_partitions()
+        walks = set(self.get_graph_walk_graphs().keys())
+        return [
+            PartitionDefinition(
+                name="default",
+                graph_walks=walks - {self.VIDEO_DECODE_AR_WALK},
+                initial_walk=None,
+                producer_partitions=[],
+            ),
+            PartitionDefinition(
+                name=constants.WINDOW_DECODER_PARTITION,
+                graph_walks={self.VIDEO_DECODE_AR_WALK},
+                initial_walk=self.VIDEO_DECODE_AR_WALK,
+                producer_partitions=["default"],
+            ),
+        ]
+
+    def get_partition_topology(self):
+        if not self._windowed_serving_enabled():
+            return super().get_partition_topology()
+        return PartitionTopology(
+            partitions=["default", constants.WINDOW_DECODER_PARTITION],
+            connections=[
+                Connection(
+                    from_partition="default",
+                    to_partition=constants.WINDOW_DECODER_PARTITION,
+                    edge_name="window_latents",
+                    # One committed window per chunk; the decoder manages its
+                    # own left context from the latents it has already seen.
+                    chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                ),
+            ],
+        )
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -804,6 +901,122 @@ class Cosmos3Model(Model):
             params["generate_sound"] = True
             if mk.get("sound_duration") is not None:
                 params["sound_duration"] = float(mk["sound_duration"])
+        # Opt-in windowed AR video: the clip is generated window by window.
+        # ``chained`` conditions each window on the previous window's tail
+        # (full bidirectional denoise per window); ``kv`` runs block-causal
+        # cross-window attention through committed K/V, with frames older
+        # than the context horizon evicted from the cache. Frame-count knobs
+        # are quantized to latent frames here so the whole pipeline agrees on
+        # the schedule; validation up front so malformed requests fail at
+        # submission.
+        window_mode = mk.get("window_mode")
+        if window_mode is not None:
+            window_mode = str(window_mode).strip().lower()
+            if window_mode not in ("chained", "kv"):
+                raise ValueError(
+                    f"Cosmos3 window_mode must be 'chained' or 'kv', got "
+                    f"{mk.get('window_mode')!r}."
+                )
+            if not self._windowed_serving_enabled():
+                raise ValueError(
+                    "Cosmos3 windowed video generation is disabled for this deployment."
+                )
+            if num_frames <= 1 or action_mode is not None:
+                raise ValueError(
+                    "Cosmos3 windowed generation requires a video request "
+                    "(num_frames > 1, no action mode)."
+                )
+            if params.get("generate_sound"):
+                raise ValueError(
+                    "Cosmos3 windowed generation does not support sound generation."
+                )
+            if params.get("has_video_condition"):
+                raise ValueError(
+                    "Cosmos3 windowed generation does not support video conditioning."
+                )
+            is_kv = window_mode == "kv"
+            if not is_kv and mk.get("context_frames") is not None:
+                raise ValueError(
+                    "Cosmos3 context_frames applies to window_mode='kv' only."
+                )
+            tf = self.config.vae.scale_factor_temporal
+            window_frames = int(mk.get("window_frames", self.config.window_frames_default))
+            if window_frames < 1 + tf:
+                raise ValueError(
+                    f"Cosmos3 window_frames must be at least {1 + tf}, got {window_frames}."
+                )
+            window_units = 1 + (window_frames - 1) // tf
+            # kv windows advance without re-pinned overlap — cross-window
+            # conditioning flows through the committed K/V, and a zero overlap
+            # keeps each commit exactly covering the pages its denoise steps
+            # wrote (the cache stream stays page-exact).
+            default_overlap = 0 if is_kv else self.config.overlap_frames_default
+            overlap_frames = int(mk.get("overlap_frames", default_overlap))
+            if is_kv and overlap_frames:
+                raise ValueError(
+                    "Cosmos3 window_mode='kv' does not support overlap_frames; "
+                    "cross-window conditioning comes from the committed context."
+                )
+            overlap_units = min(max(round(overlap_frames / tf), 0), window_units - 1)
+            if overlap_units:
+                # Two clean latent frames are the conditioning floor (the V2V
+                # recipe's pin count); a single frame visibly degrades the
+                # next window.
+                overlap_units = max(overlap_units, 2)
+            if overlap_units >= window_units:
+                raise ValueError(
+                    f"Cosmos3 windowed request needs window_frames large enough "
+                    f"for its overlap (window {window_units} vs overlap "
+                    f"{overlap_units} latent frames)."
+                )
+            context_units = 0
+            if is_kv:
+                context_frames = int(
+                    mk.get("context_frames", self.config.context_frames_default)
+                )
+                if context_frames < 0:
+                    raise ValueError(
+                        f"Cosmos3 context_frames must be >= 0, got {context_frames}."
+                    )
+                # 0 retains all committed frames (no eviction).
+                if context_frames:
+                    context_units = 1 + (context_frames - 1) // tf
+            total_units = 1 + (num_frames - 1) // tf
+            # Pad the schedule up to whole windows: a short final window can
+            # regenerate just a frame or two off almost pure conditioning,
+            # which comes out degraded. The decoder trims the assembled video
+            # back to the requested frame count.
+            stride = window_units - overlap_units
+            if total_units > window_units:
+                rem = (total_units - window_units) % stride
+                total_units += (stride - rem) % stride
+            schedule = WindowSchedule(
+                total_units, window_units,
+                context_units=context_units, overlap_units=overlap_units,
+            )
+            if schedule.num_windows > self.config.max_windows:
+                raise ValueError(
+                    f"Cosmos3 windowed request spans {schedule.num_windows} windows, "
+                    f"over the served limit of {self.config.max_windows}."
+                )
+            params["window_mode"] = window_mode
+            params["window_latent_units"] = window_units
+            params["overlap_latent_units"] = overlap_units
+            params["context_latent_units"] = context_units
+            params["total_latent_units"] = total_units
+            params["num_windows"] = schedule.num_windows
+            params["stream_video"] = bool(mk.get("stream_video"))
+            # Every window after the first is conditioned generation, which
+            # the reference recipe runs at the V2V flow shift; one shift for
+            # all windows keeps the per-window schedules consistent. Request
+            # flow_shift overrides.
+            params.setdefault("flow_shift", constants.V2V_DEFAULT_FLOW_SHIFT)
+        elif mk.get("stream_video"):
+            # The non-windowed walks emit one video at the very end; there is
+            # nothing to deliver incrementally.
+            raise ValueError(
+                "Cosmos3 stream_video requires a windowed request (set window_mode)."
+            )
         return params
 
     def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
@@ -820,6 +1033,24 @@ class Cosmos3Model(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
+        # The windowed decoder partition starts idle on its decode walk; the
+        # window stream self-triggers its passes, and the resolved params ride
+        # along for its per-request window bookkeeping. Non-windowed requests
+        # leave it idle until the stream's terminal flush, which it skips.
+        if partition_name == constants.WINDOW_DECODER_PARTITION:
+            md = CurrentForwardConductorMetadata(
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+                graph_walk=self.VIDEO_DECODE_AR_WALK,
+                is_prefill=False,
+                kwargs=params,
+            )
+            return ForwardPassArgs(
+                full_metadata=md,
+                inputs=[],
+                unpersist_tensors=[],
+                step_metadata=self._step_metadata(md),
+            )
         # Visual conditioning routes through a conditioned prefill that also feeds
         # the DiT the input to VAE-encode: a video (action inverse-dynamics) or an
         # image (image-to-video, action policy/forward-dynamics). Fall back to the
@@ -870,6 +1101,18 @@ class Cosmos3Model(Model):
         request_done = False
         inputs: list[GraphEdge] = []
 
+        # The windowed decoder partition is self-triggered by its stream
+        # buffer; the conductor only keeps its walk pinned. Its completion is
+        # the stream's final chunk, not a conductor decision.
+        if partition_name == constants.WINDOW_DECODER_PARTITION:
+            metadata.graph_walk = self.VIDEO_DECODE_AR_WALK
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=[],
+                unpersist_tensors=[],
+                step_metadata=self._step_metadata(metadata),
+            )
+
         # Forward-dynamics conditions on a clean action chunk and emits the
         # predicted video; inverse-dynamics / policy emit the action.
         is_fd = metadata.kwargs.get("action_mode") == "forward_dynamics"
@@ -888,6 +1131,8 @@ class Cosmos3Model(Model):
                 metadata.graph_walk = self.ACTION_VIDEO_GEN_WALK
             elif is_action:
                 metadata.graph_walk = self.ACTION_GEN_WALK
+            elif is_video and metadata.kwargs.get("window_mode"):
+                metadata.graph_walk = self.VIDEO_GEN_AR_WALK
             elif is_video and metadata.kwargs.get("generate_sound"):
                 metadata.graph_walk = self.VIDEO_SOUND_GEN_WALK
             elif is_video:
@@ -912,8 +1157,8 @@ class Cosmos3Model(Model):
             cond_edge.tensor_info = persist_signals.get("cond_latents", [])
             inputs.append(cond_edge)
         elif metadata.graph_walk in (
-            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, self.VIDEO_SOUND_GEN_WALK,
-            self.ACTION_GEN_WALK, self.ACTION_VIDEO_GEN_WALK,
+            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, self.VIDEO_GEN_AR_WALK,
+            self.VIDEO_SOUND_GEN_WALK, self.ACTION_GEN_WALK, self.ACTION_VIDEO_GEN_WALK,
         ):
             request_done = True
 
@@ -961,6 +1206,12 @@ class Cosmos3Model(Model):
             )
         if node_name == VAE_DECODER_NODE:
             return Cosmos3VAEDecoderSubmodule(
+                vae=self._build_vae(device), config=self.config
+            )
+        if node_name == VAE_DECODER_AR_NODE:
+            # Shares the decoder VAE weights; only the streaming chunk state
+            # and compile wrapper are per-node.
+            return Cosmos3VAEDecoderARSubmodule(
                 vae=self._build_vae(device), config=self.config
             )
         if node_name == AUDIO_DECODER_NODE:

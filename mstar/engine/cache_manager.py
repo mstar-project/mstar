@@ -548,6 +548,10 @@ class BatchedCacheManager(ABC):
         for rid in self.request_ids:
             state = self._get_state(rid)
             state.seq_len += n
+            if n:
+                # Committed content grew — signal caches of prefix-derived
+                # views (see KVRequestState.prefix_epoch).
+                state.prefix_epoch += 1
             state.position_id_start += (pos_id_n if pos_id_n is not None else n)
 
     @torch.compiler.disable
@@ -601,6 +605,8 @@ class BatchedCacheManager(ABC):
                     n = seq_lens[i]
                     state = self._get_state(rid, label=label)
                     state.seq_len += n
+                    if n:
+                        state.prefix_epoch += 1
                     if pos_id_ns is None:
                         state.position_id_start += n
                     elif isinstance(pos_id_ns, int):
@@ -616,6 +622,8 @@ class BatchedCacheManager(ABC):
                 n = ps.seq_lens[i]
                 state = self._get_state(rid, label=label)
                 state.seq_len += n
+                if n:
+                    state.prefix_epoch += 1
                 if pos_id_ns is None:
                     if ps.custom_pos_advance is not None:
                         state.position_id_start += ps.custom_pos_advance[i]
@@ -629,6 +637,26 @@ class BatchedCacheManager(ABC):
         # bleed into a subsequent walk.
         for ps in self._plan_states.values():
             ps.custom_pos_advance = None
+
+    @torch.compiler.disable
+    def protect_prefix(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> None:
+        """Mark the first ``num_tokens`` of the request's stream (active label
+        unless given) as never releasable. See
+        ``PagedAllocationManager.protect_prefix``."""
+        label = label or self.active_labels.get(request_id, "main")
+        self.alloc_manager.protect_prefix(request_id, label, num_tokens)
+
+    @torch.compiler.disable
+    def release_oldest(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> int:
+        """Free the oldest unprotected tokens of a live request, whole pages
+        only; returns tokens actually freed. See
+        ``PagedAllocationManager.release_oldest``."""
+        label = label or self.active_labels.get(request_id, "main")
+        return self.alloc_manager.release_oldest(request_id, label, num_tokens)
 
     @torch.compiler.disable
     def snapshot_all(
@@ -1462,14 +1490,22 @@ class DenseGenCacheManager(FlashInferCacheManager):
         offset = 0
         for idx, prefix_len, gen_len, state in dg["segs"]:
             prefix_cache = state.dense_prefix_kv
-            if prefix_cache is None:
-                prefix_cache = state.dense_prefix_kv = {}
-            cached = prefix_cache.get(layer_idx)
+            if prefix_cache is None or prefix_cache.get("epoch") != state.prefix_epoch:
+                # First gather, or the committed content mutated since the
+                # last one (windowed generation appends/evicts per window —
+                # prefix_epoch moves with every such mutation): drop the stale
+                # clones and re-gather from the live pages. Static-prefix
+                # requests keep the single-gather behavior (their epoch never
+                # moves after prefill).
+                prefix_cache = state.dense_prefix_kv = {
+                    "epoch": state.prefix_epoch, "layers": {},
+                }
+            cached = prefix_cache["layers"].get(layer_idx)
             if cached is None:
                 sub = kv_layer[idx]  # [n_pages, 2, page_size, num_kv_heads, head_dim]
                 k_pref = sub[:, 0].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
                 v_pref = sub[:, 1].reshape(-1, num_kv_heads, head_dim)[:prefix_len].clone()
-                prefix_cache[layer_idx] = (k_pref, v_pref)
+                prefix_cache["layers"][layer_idx] = (k_pref, v_pref)
             else:
                 k_pref, v_pref = cached
             k_parts.append(k_pref)
