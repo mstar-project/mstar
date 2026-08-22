@@ -1,6 +1,4 @@
-import json
 import logging
-import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -10,33 +8,6 @@ from mstar.graph.base import GraphNode
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import WorkerGraphsManager
-
-
-# ---------------------------------------------------------------------------
-# Scheduler tracing. Off unless MSTAR_SCHED_LOG names a file.
-#
-# Exists to compare batch formation between builds: the decisive number is the
-# READY-SET size for the selected (node, walk), because a smaller assembled
-# batch means either fewer requests were ready (a readiness problem) or the
-# same set was cut differently (an assembly problem), and only the ready-set
-# size separates those. One JSON line per scan that produced a batch; empty
-# scans are counted rather than logged, so the file stays small.
-# ---------------------------------------------------------------------------
-_SCHED_LOG_PATH = os.environ.get("MSTAR_SCHED_LOG", "")
-_sched_log_fh = None
-
-
-def _sched_log(**fields) -> None:
-    global _sched_log_fh
-    if not _SCHED_LOG_PATH:
-        return
-    if _sched_log_fh is None:
-        # line-buffered append: every worker process writes the same file, and
-        # a short line is an atomic append on Linux
-        _sched_log_fh = open(_SCHED_LOG_PATH, "a", buffering=1)
-    fields["pid"] = os.getpid()
-    fields["t"] = round(time.time(), 6)
-    _sched_log_fh.write(json.dumps(fields) + "\n")
 
 
 logger = logging.getLogger(__name__)
@@ -87,7 +58,6 @@ class MicroScheduler:
         self.engine_manager = engine_manager
         self.batch_number = 0
         self.sched_type = sched_type
-        self._scan_count = 0
 
         # RIDs that have failed but have not gone through the cleanup procedure;
         # these cannot be scheduled (unless this is a TP follower node)
@@ -220,7 +190,6 @@ class MicroScheduler:
         target_graph_walk: str | None = None,
         exclude_target: tuple[str, str] | None = None,
     ) -> ScheduledBatch | None:
-        self._scan_count += 1
         """
         Scans all worker graph queues for ready nodes, groups by node name,
         and returns one step's worth.
@@ -320,15 +289,6 @@ class MicroScheduler:
         batches = self._assemble_batches(
             worker_graphs_manager, best_node_name, graph_walk,
             entries, max_batch_size,
-        )
-        _sched_log(
-            node=best_node_name, walk=graph_walk,
-            ready=len(entries),
-            ready_all=sum(len(v) for v in node_name_to_requests.values()),
-            max_bs=max_batch_size,
-            batches=[len(b.node_objects) for b in batches],
-            backlog=len(self.backlog),
-            scans=self._scan_count,
         )
         if not batches:
             return None
