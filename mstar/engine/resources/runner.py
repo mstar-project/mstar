@@ -7,7 +7,7 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
@@ -50,7 +50,11 @@ def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
 class StepRunner:
     """drives resources through per-step cycle"""
 
-    def __init__(self, resources: Mapping[str, Resource], enable_nvtx: bool = False):
+    def __init__(
+        self, resources: Mapping[str, Resource],
+        node_resources: Mapping[str, Collection[str]] | None = None,
+        enable_nvtx: bool = False,
+    ):
         # Per-resource NVTX. `engine.plan.promoted` only reports that the sweep
         # was slow; these say WHICH resource ate it. Gated because range_push
         # is a real CUDA call even with no profiler attached.
@@ -72,6 +76,21 @@ class StepRunner:
             key for key in self._order
             if type(self._resources[key]).publish is not Resource.publish
         ]
+        # Same for admit_retrieve, which check_ready drives per ready request
+        # per scheduler scan — the hottest sweep here. The base returns
+        # ADMIT_OK, the identity for both the short-circuit and the `ready`
+        # fold, so an inheritor cannot change the outcome.
+        self._retrieve_order = [
+            key for key in self._order
+            if type(self._resources[key]).admit_retrieve
+            is not Resource.admit_retrieve
+        ]
+        # Both sweeps run on behalf of one node and have no step to filter by,
+        # so settle each node's share of them up front. `node_resources` must
+        # name every node, including one that owns nothing — an absent node
+        # falls back to the full sweep, which is the un-scoped behaviour.
+        self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
+        self._node_publish_order = self._per_node(node_resources, self._publish_order)
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -111,6 +130,30 @@ class StepRunner:
             cached = self._keys_cache[keyset] = [k for k in self._order if k in keyset]
         return cached
 
+    @staticmethod
+    def _per_node(
+        node_resources: Mapping[str, Collection[str]] | None, base: list[str],
+    ) -> dict[str, list[str]] | None:
+        """``base`` split into each node's own share, in ``base``'s order.
+
+        ``None`` keeps every sweep global, which is what a runner built
+        without the map (a test, say) had before.
+        """
+        if node_resources is None:
+            return None
+        return {
+            node: [key for key in base if key in set(keys)]
+            for node, keys in node_resources.items()
+        }
+
+    def _sweep(
+        self, per_node: dict[str, list[str]] | None,
+        base: list[str], node_name: str | None,
+    ) -> list[str]:
+        if per_node is None or node_name is None:
+            return base
+        return per_node.get(node_name, base)
+
     def _preplan_keys_for(self, step: SubmoduleStep) -> list[str]:
         keyset = frozenset(step.keys())
         cached = self._preplan_keys_cache.get(keyset)
@@ -142,9 +185,18 @@ class StepRunner:
     ) -> AdmitOutcome:
         """bring published state in
 
-        gives `ready=False` when still has inflights; shortcircuit on failure"""
+        gives `ready=False` when still has inflights; shortcircuit on failure
+
+        Swept over `node_name`'s own resources. Asking a node about resources
+        it does not own is not just wasted work: `KVManager.get_labels`
+        answers for an unrecognised node with the default `["main"]`, so the
+        node ends up gated on — and able to allocate against — another node's
+        cache.
+        """
         ready = True
-        for key in self._order:
+        for key in self._sweep(
+            self._node_retrieve_order, self._retrieve_order, node_name
+        ):
             outcome = self._resources[key].admit_retrieve(
                 rid, node_name, graph_walk,
                 None if published is None else published.get(key),
@@ -237,14 +289,18 @@ class StepRunner:
                     range_pop()
 
     def publish(
-        self, request_ids: list[str],
+        self, request_ids: list[str], node_name: str | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
-        non-publish resources noop; pairs with `admit_retrieve`"""
-        if not self._publish_order:
+        non-publish resources noop; pairs with `admit_retrieve`
+
+        Scoped to the node whose step just ran; no other node's state moved,
+        and `merge_publish_info` keeps the entry it already published."""
+        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        if not order:
             return {rid: {} for rid in request_ids}
-        publishers = [(key, self._resources[key]) for key in self._publish_order]
+        publishers = [(key, self._resources[key]) for key in order]
         out: dict[str, dict[str, PublishedInfo]] = {}
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}

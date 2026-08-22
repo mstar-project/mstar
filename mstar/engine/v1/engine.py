@@ -226,7 +226,13 @@ class Engine:
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.label)
 
-        self._runner = StepRunner(self._resources, enable_nvtx=self._enable_nvtx)
+        self._runner = StepRunner(
+            self._resources,
+            # every node, including one that owns nothing (Code2Wav) — an
+            # absent node would fall back to the full sweep
+            node_resources={n: node_to_resources.get(n, []) for n in node_names},
+            enable_nvtx=self._enable_nvtx,
+        )
 
         for node_name, submodule in submodules.items():
             resources = {
@@ -755,7 +761,9 @@ class Engine:
             range_push("engine.finalize_batch")
         try:
             # Returns rid -> {resource label -> published info}
-            published = self._runner.publish(batch.request_ids)
+            published = self._runner.publish(
+                batch.request_ids, node_name=batch.node_name,
+            )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
                     continue

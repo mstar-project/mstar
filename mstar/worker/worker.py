@@ -6,6 +6,7 @@ import time
 import time as _time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
@@ -142,6 +143,12 @@ class Worker:
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = enable_nvtx
+
+        # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
+        # rather than in run()'s scope because the GPU and plan threads
+        # record into it too; run() owns the periodic flush.
+        self._phase_period = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0")
+        self._phase_buf: dict[str, list[float]] = defaultdict(list)
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
@@ -1062,29 +1069,20 @@ class Worker:
                 # Safety timeout — the engine releases this event even on its
                 # failure paths, so it should only fire if the GPU thread died.
                 # Bail out rather than block plan_executor forever.
-                if self.enable_nvtx:
-                    range_push("worker.plan_thread.await_commit", synchronize=False)
-                try:
+                with self._span("worker.plan_thread.await_commit"):
                     committed = pending.node_batch.commit_done.wait(timeout=10.0)
-                finally:
-                    if self.enable_nvtx:
-                        range_pop(synchronize=False)
                 if not committed:
                     logger.warning(
                         "Worker %s: plan_executor timed out waiting for "
                         "batch N commit; skipping pre-plan", self.worker_id,
                     )
                     return False
-            if self.enable_nvtx:
-                range_push("worker.plan_thread.reserve_slot", synchronize=False)
-            try:
+            with self._span("worker.plan_thread.reserve_slot"):
                 leased = engine.reserve_replay_slot(spec_batch) is not None
-            finally:
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
             if not leased:
                 return False  # eager, or no batched capture for this shape
-            return engine.pre_plan_for_batch(spec_batch)
+            with self._span("worker.plan_thread.pre_plan"):
+                return engine.pre_plan_for_batch(spec_batch)
         except Exception:
             logger.exception("Worker %s: plan_executor pre-plan failed", self.worker_id)
             self._reset_skip_plan_flags(spec_batch)
@@ -1114,6 +1112,29 @@ class Worker:
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
 
+    @contextmanager
+    def _span(self, name: str):
+        """One NVTX range plus one MSTAR_PHASE_TIMING sample, same name.
+
+        Safe off the main thread: the append is the only shared mutation and
+        run()'s flush snapshots before it clears.
+        """
+        nvtx = self.enable_nvtx
+        if nvtx:
+            range_push(name, synchronize=False)
+        t0 = _time.perf_counter() if self._phase_period else 0.0
+        try:
+            yield
+        finally:
+            if self._phase_period:
+                self._phase_buf[name].append(_time.perf_counter() - t0)
+            if nvtx:
+                range_pop(synchronize=False)
+
+    def _phase_record(self, name: str, dt: float) -> None:
+        if self._phase_period > 0:
+            self._phase_buf[name].append(dt)
+
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1140,24 +1161,21 @@ class Worker:
         # The plan thread wrote this batch's plan into the resources; wait for
         # it before the forward reads them. Waiting releases the GIL.
         if plan_future is not None:
-            if self.enable_nvtx:
-                range_push("worker.gpu_thread.await_plan", synchronize=False)
-            try:
+            with self._span("worker.gpu_thread.await_plan"):
                 plan_future.result()
-            finally:
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
         if self.enable_nvtx:
             range_push(
                 f"worker[{self.worker_id}].node[{batch.node_name}].graph_walk[{batch.graph_walk}]",
                 synchronize=False,
             )
         try:
-            engine.prepare_inputs(node_batch)
+            with self._span("worker.gpu_thread.prepare_inputs"):
+                engine.prepare_inputs(node_batch)
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
-            outputs = engine.exec_and_postprocess(node_batch)
+            with self._span("worker.gpu_thread.exec"):
+                outputs = engine.exec_and_postprocess(node_batch)
             if torch.cuda.is_available():
                 event = torch.cuda.Event()
                 event.record(torch.cuda.default_stream(self.device))
@@ -2131,18 +2149,17 @@ class Worker:
         # see whether await_gpu time = "GPU still running" (overlap working)
         # vs "GPU done, idle" (overlap not paying off). Set the env var to a
         # positive integer = the dump period in iters (e.g. 200).
-        phase_period = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0")
-        phase_buf: dict[str, list[float]] = defaultdict(list)
+        phase_period = self._phase_period
+        phase_buf = self._phase_buf
         phase_iter = [0]
-
-        def _phase_record(name: str, dt: float) -> None:
-            if phase_period > 0:
-                phase_buf[name].append(dt)
+        _phase_record = self._phase_record
 
         def _phase_flush() -> None:
             if phase_period <= 0 or phase_iter[0] % phase_period != 0:
                 return
-            samples = sorted((k, v) for k, v in phase_buf.items() if v)
+            # list() first: the GPU and plan threads append to this while we
+            # read it, and iterating the live dict would raise on resize.
+            samples = sorted((k, v) for k, v in list(phase_buf.items()) if v)
             parts = []
             for name, vs in samples:
                 vs.sort()
@@ -2235,10 +2252,11 @@ class Worker:
                             pending.node_name,
                             pending.graph_walk,
                         ) if must_yield_away else None
-                        batch = self.scheduler.get_next_batch(
-                            self.worker_graphs_manager,
-                            exclude_target=yield_away_from_target,
-                        )
+                        with self._span("worker.schedule_yield_away"):
+                            batch = self.scheduler.get_next_batch(
+                                self.worker_graphs_manager,
+                                exclude_target=yield_away_from_target,
+                            )
                         if batch is not None:
                             node_batch = self._build_executing_batch(batch)
                             batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
@@ -2396,14 +2414,9 @@ class Worker:
                     # allocation_failed since the output tensors aren't valid;
                     # ``_handle_allocation_failure`` already rehabilitated the
                     # failed rids upstream.
-                    _t0 = _time.perf_counter() if phase_period else 0.0
-
                     if not pending.node_batch.allocation_failed:
-                        if self.enable_nvtx:
-                            range_push("worker.postprocess_batch", synchronize=False)
-                        self._postprocess_batch(pending, outputs)
-                        if self.enable_nvtx:
-                            range_pop(synchronize=False)
+                        with self._span("worker.postprocess_batch"):
+                            self._postprocess_batch(pending, outputs)
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
@@ -2426,18 +2439,15 @@ class Worker:
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
-                if self.enable_nvtx:
-                    range_push("worker.schedule", synchronize=False)
-                batch = None
-                if yield_away_from_target is not None:
-                    batch = self.scheduler.get_next_batch(
-                        self.worker_graphs_manager,
-                        exclude_target=yield_away_from_target,
-                    )
-                if batch is None:
-                    batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
+                with self._span("worker.schedule"):
+                    batch = None
+                    if yield_away_from_target is not None:
+                        batch = self.scheduler.get_next_batch(
+                            self.worker_graphs_manager,
+                            exclude_target=yield_away_from_target,
+                        )
+                    if batch is None:
+                        batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
                 if batch is None:
                     self.communicator.wait_for_work(10)
                     continue
