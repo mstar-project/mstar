@@ -186,13 +186,6 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
-        # Hold the submitting thread until after commit rather than releasing it
-        # at the launch. The post-launch sweep (commit, output collection) is
-        # GIL-hungry, so releasing at the launch lets the submitter contend for
-        # the whole of it; deferring trades that away against losing the overlap.
-        self._release_after_commit = (
-            os.environ.get("MSTAR_RELEASE_AFTER_COMMIT", "0") == "1"
-        )
 
     def load_model(
         self,
@@ -612,13 +605,8 @@ class Engine:
             batch.exec_timings.fwd_start = time.perf_counter()
         # The waiter is released inside the forward, immediately before the
         # launch that drops the GIL — not here, which is still several GIL-held
-        # staging copies away from it. MSTAR_RELEASE_AFTER_COMMIT=1 defers it
-        # further still, to after commit, so the submitter cannot contend for
-        # the GIL during the post-launch resource sweep either.
-        release_event = (
-            batch.launch_started_event
-            if set_launch and not self._release_after_commit else None
-        )
+        # staging copies away from it.
+        release_event = batch.launch_started_event if set_launch else None
         if nvtx:
             # the launch/enqueue span, not the GPU work: `synchronize=True`
             # here would drain the stream and destroy the overlap
@@ -640,12 +628,6 @@ class Engine:
             finally:
                 if nvtx:
                     range_pop()
-        if (
-            self._release_after_commit
-            and set_launch
-            and batch.launch_started_event is not None
-        ):
-            batch.launch_started_event.set()
         return raw, step
 
     def _forward(
