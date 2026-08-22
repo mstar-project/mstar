@@ -1,6 +1,7 @@
 
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -185,6 +186,13 @@ class Engine:
 
         self._enable_nvtx = enable_nvtx
         self._enable_profile = enable_profile
+        # Hold the submitting thread until after commit rather than releasing it
+        # at the launch. The post-launch sweep (commit, output collection) is
+        # GIL-hungry, so releasing at the launch lets the submitter contend for
+        # the whole of it; deferring trades that away against losing the overlap.
+        self._release_after_commit = (
+            os.environ.get("MSTAR_RELEASE_AFTER_COMMIT", "0") == "1"
+        )
 
     def load_model(
         self,
@@ -602,9 +610,15 @@ class Engine:
 
         if self._enable_profile and batch.exec_timings.fwd_start is None:
             batch.exec_timings.fwd_start = time.perf_counter()
-        # release the waiter now, on the cusp of the GIL-dropping launch
-        if set_launch and batch.launch_started_event is not None:
-            batch.launch_started_event.set()
+        # The waiter is released inside the forward, immediately before the
+        # launch that drops the GIL — not here, which is still several GIL-held
+        # staging copies away from it. MSTAR_RELEASE_AFTER_COMMIT=1 defers it
+        # further still, to after commit, so the submitter cannot contend for
+        # the GIL during the post-launch resource sweep either.
+        release_event = (
+            batch.launch_started_event
+            if set_launch and not self._release_after_commit else None
+        )
         if nvtx:
             # the launch/enqueue span, not the GPU work: `synchronize=True`
             # here would drain the stream and destroy the overlap
@@ -612,7 +626,7 @@ class Engine:
         try:
             raw = self._forward(
                 batch, submodule, cg_runner, engine_inputs, preprocessed,
-                lease, running_batched, request_ids,
+                lease, running_batched, request_ids, release_event,
             )
         finally:
             if nvtx:
@@ -626,6 +640,12 @@ class Engine:
             finally:
                 if nvtx:
                     range_pop()
+        if (
+            self._release_after_commit
+            and set_launch
+            and batch.launch_started_event is not None
+        ):
+            batch.launch_started_event.set()
         return raw, step
 
     def _forward(
@@ -638,13 +658,20 @@ class Engine:
         lease: SlotLease | None,
         running_batched: bool,
         request_ids: list[str],
+        release_event: "threading.Event | None" = None,
     ) -> dict:
-        """Replay the leased slot, or run the eager forward."""
+        """Replay the leased slot, or run the eager forward.
+
+        ``release_event`` is set as late as possible before the call that drops
+        the GIL — the replay, or the submodule forward on the eager path."""
         graph_walk = batch.step_context.graph_walk
         if lease is not None:
             return cg_runner.run_forward(
                 lease, preprocessed, plan_done_event=batch.preplan_event,
+                launch_started_event=release_event,
             )
+        if release_event is not None:
+            release_event.set()
         if running_batched:
             return submodule.forward_batched(
                 graph_walk, engine_inputs=engine_inputs, **preprocessed

@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
@@ -675,16 +676,25 @@ class CudaGraphRunner:
     def run_forward(
         self, lease: SlotLease, preprocessed: dict[str, Any],
         plan_done_event: torch.cuda.Event | None = None,
+        launch_started_event: "threading.Event | None" = None,
     ) -> dict:
         """Stage this step's inputs into the slot and replay it.
 
         ``plan_done_event`` is the pre-plan's event: its plan wrote this slot's
         buffers on another stream, so the replay has to wait for those writes
         before it reads them.
+
+        ``launch_started_event`` releases the submitting thread. It is set HERE
+        rather than before the forward: staging copies each preprocessed tensor
+        into its static buffer and holds the GIL while doing so, so releasing
+        earlier hands the main thread a GIL the GPU thread still needs. Only
+        `graph.replay()` below drops it in C++.
         """
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             torch.cuda.default_stream(self._device).wait_event(plan_done_event)
+        if launch_started_event is not None:
+            launch_started_event.set()
         return self._replay(lease)
 
     def release(self, lease: SlotLease, real_bs: int) -> None:
