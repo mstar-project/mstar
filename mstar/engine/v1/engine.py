@@ -1018,10 +1018,10 @@ class Engine:
         cg_runner, lease: SlotLease,
     ) -> bool:
 
+        # Declare-only, so the unprepared case takes the bucket's shared
+        # template rows rather than cloning a fresh set per pre-plan.
         inputs = (
-            cg_runner.config_for(lease).get_node_inputs(
-                lease.bucket.bs, lease.bucket.num_tokens
-            )
+            cg_runner.declare_inputs_for(lease)
             if batch.inputs is None
             else cg_runner.pad_inputs(lease, batch.inputs)
         )

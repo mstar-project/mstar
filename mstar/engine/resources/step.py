@@ -50,9 +50,6 @@ class SlotLease:
     slot: int
     bucket: BucketKey | None # None -> eagre
 
-    # NOTE @nsagan: needed?
-    filler: tuple[Segment, ...] = field(default_factory=tuple)
-
 
 @dataclass
 class StepContext:

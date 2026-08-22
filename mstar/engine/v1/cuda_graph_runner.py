@@ -197,6 +197,10 @@ class CudaGraphRunner:
         # is called from Worker.plan_executor.
         self._plan_stream: torch.cuda.Stream | None = None
 
+        # Per-bucket template rows for declare-only calls; see
+        # `declare_inputs_for`.
+        self._declare_inputs: dict[BucketKey, list[NodeInputs]] = {}
+
         self.max_bs = max(
             (max(self._batch_sizes(config)) for config in self._capture_configs),
             default=1,
@@ -275,6 +279,14 @@ class CudaGraphRunner:
 
             for key_spec in [spec, *self._get_addtl_slot_specs(spec)]:
                 self._register_slot(key_spec, slot)
+
+            # pre-seed preplan inputs
+            if self._num_slots > 1:
+                # can preplan
+                self.declare_inputs_for(SlotLease(
+                    slot=slot,
+                    bucket=spec.bucket
+                ))
             logger.info(
                 "Captured CUDA graph for %s: %s", self._submodule_name, spec
             )
@@ -619,6 +631,24 @@ class CudaGraphRunner:
 
     def config_for(self, lease: SlotLease) -> CudaGraphConfig:
         return self._buckets[lease.bucket].config
+
+    def declare_inputs_for(self, lease: SlotLease) -> list[NodeInputs]:
+        """Template rows for a declare-only call, cached per bucket.
+
+        A bucket's shape is fixed, so these rows are constant; building them
+        fresh cost ~130us of clones per pre-plan at bs=16, plus that many D2D
+        copies. Only for callers that hand the rows to ``declare_step`` and
+        nothing else — the list is shared, so a caller that mutates it or
+        passes it to ``preprocess`` corrupts every later step on this bucket.
+        """
+        cached = self._declare_inputs.get(lease.bucket)
+        if cached is None:
+            cached = self._declare_inputs[lease.bucket] = (
+                self._buckets[lease.bucket].config.get_node_inputs(
+                    lease.bucket.bs, lease.bucket.num_tokens
+                )
+            )
+        return cached
 
     def pad_inputs(
         self, lease: SlotLease, inputs: list[NodeInputs],

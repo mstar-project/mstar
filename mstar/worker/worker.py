@@ -1062,13 +1062,27 @@ class Worker:
                 # Safety timeout — the engine releases this event even on its
                 # failure paths, so it should only fire if the GPU thread died.
                 # Bail out rather than block plan_executor forever.
-                if not pending.node_batch.commit_done.wait(timeout=10.0):
+                if self.enable_nvtx:
+                    range_push("worker.plan_thread.await_commit", synchronize=False)
+                try:
+                    committed = pending.node_batch.commit_done.wait(timeout=10.0)
+                finally:
+                    if self.enable_nvtx:
+                        range_pop(synchronize=False)
+                if not committed:
                     logger.warning(
                         "Worker %s: plan_executor timed out waiting for "
                         "batch N commit; skipping pre-plan", self.worker_id,
                     )
                     return False
-            if engine.reserve_replay_slot(spec_batch) is None:
+            if self.enable_nvtx:
+                range_push("worker.plan_thread.reserve_slot", synchronize=False)
+            try:
+                leased = engine.reserve_replay_slot(spec_batch) is not None
+            finally:
+                if self.enable_nvtx:
+                    range_pop(synchronize=False)
+            if not leased:
                 return False  # eager, or no batched capture for this shape
             return engine.pre_plan_for_batch(spec_batch)
         except Exception:
