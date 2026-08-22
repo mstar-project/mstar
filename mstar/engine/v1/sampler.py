@@ -1,6 +1,5 @@
 
 
-import os
 from dataclasses import asdict, dataclass
 
 import torch
@@ -9,14 +8,7 @@ from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SamplerStep, StepContext
-from mstar.utils.profiler import range_pop, range_push
 from mstar.utils.sampling import CudaGraphableSampler, Sampler, SamplerBuffers
-
-# Opt-in second level of NVTX, under the per-resource ranges StepRunner emits.
-# The sampler is the only resource that does real work on the promote path, so
-# this splits `res.plan.<sampler>` into mask-stage vs gather. Env-gated rather
-# than plumbed: it is a debugging aid, and range_push is not free.
-_NVTX = os.environ.get("MSTAR_NVTX_SAMPLER", "0") == "1"
 
 
 @dataclass
@@ -265,13 +257,7 @@ class SamplerResource(Resource):
         # static config only: safe to pre-plan (unchanged step to step). A
         # preplan leases a different slot, so this is disjoint from the in-flight
         # forward's buffers.
-        if _NVTX:
-            range_push("sampler.gather_static")
-        try:
-            self._cg_buffers.gather_static(ctx.request_ids, padded_bs, cg_slot)
-        finally:
-            if _NVTX:
-                range_pop()
+        self._cg_buffers.gather_static(ctx.request_ids, padded_bs, cg_slot)
         sampler = self._cg_buffers.sampler_for(padded_bs, cg_slot)
         if ctx.is_preplan:
             self._preplan_cg_sampler = sampler
@@ -291,26 +277,14 @@ class SamplerResource(Resource):
         cg_slot = ctx.slot_lease.slot
         padded_bs = ctx.slot_lease.bucket.bs
         if self._penalty_needed_this_step:
-            if _NVTX:
-                range_push("sampler.stage_masks")
-            try:
-                self._cg_buffers.stage_seen_token_masks(
-                    request_ids=ctx.request_ids,
-                    seen_masks=[self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
-                )
-            finally:
-                if _NVTX:
-                    range_pop()
-        if _NVTX:
-            range_push("sampler.gather_dynamic")
-        try:
-            self._cg_buffers.gather_dynamic(
-                ctx.request_ids, padded_bs, cg_slot,
-                gather_seen_tokens=self._penalty_needed_this_step,
+            self._cg_buffers.stage_seen_token_masks(
+                request_ids=ctx.request_ids,
+                seen_masks=[self._sampler.get_token_mask(rid) for rid in ctx.request_ids]
             )
-        finally:
-            if _NVTX:
-                range_pop()
+        self._cg_buffers.gather_dynamic(
+            ctx.request_ids, padded_bs, cg_slot,
+            gather_seen_tokens=self._penalty_needed_this_step,
+        )
 
     def commit(self, step: SamplerStep, ctx: StepContext):
         # None on an eager step, which never gathered one

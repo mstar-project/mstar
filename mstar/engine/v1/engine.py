@@ -954,6 +954,19 @@ class Engine:
             batch.lease_slot(lease)
         return lease
 
+    def can_pre_plan(self, node_name: str) -> bool:
+        """Whether pre-planning this node could stage anything at all.
+
+        A node with no pre-planning resource has nothing to stage: its step
+        declaration is empty, so `pre_plan_for_batch` is guaranteed to bail.
+        Asked BEFORE the plan thread waits on the previous batch's commit, so
+        a stateless node does not pay that wait to reach a foregone conclusion.
+        """
+        mgmt = self._submodules.get(node_name)
+        if mgmt is None or mgmt.cuda_graph_runner is None:
+            return False
+        return any(r.supports_preplan for r in mgmt.resources.values())
+
     def pre_plan_for_batch(self, batch: ExecutingBatch) -> bool:
         """Admit and plan the pre-planning resources a step ahead.
 

@@ -1054,6 +1054,9 @@ class Worker:
         """
         spec_batch = speculation.node_batch
         engine = self.engine_manager.get_engine(spec_batch.node_name)
+
+        if not engine.can_pre_plan(spec_batch.node_name):
+            return False
         try:
             if pending is not None:
                 # Safety timeout — the engine releases this event even on its
@@ -1137,6 +1140,9 @@ class Worker:
             )
         try:
             engine.prepare_inputs(node_batch)
+            # call is_stale after prepare_inputs because prepare_inputs may drop rids
+            if plan_future is not None and engine.preplan_is_stale(node_batch):
+                engine.reset_pre_plan_for_batch(node_batch)
             outputs = engine.exec_and_postprocess(node_batch)
             if torch.cuda.is_available():
                 event = torch.cuda.Event()
@@ -2329,12 +2335,9 @@ class Worker:
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
                             _t0 = _time.perf_counter() if phase_period else 0.0
-                            # Threading outputs and preparing may have
-                            # dropped rids since the plan was staged, which
-                            # makes it stale — let the GPU thread plan inline.
-                            if engine.preplan_is_stale(spec_node_batch):
-                                self._reset_skip_plan_flags(spec_node_batch)
-                                speculation.plan_future = None
+                            # Staleness is checked on the GPU thread, after
+                            # the plan future resolves and after prepare; see
+                            # _execute_on_gpu_thread.
 
                             # Hold the main thread off the GIL until the GPU
                             # thread reaches the forward launch; see exec.
@@ -2368,7 +2371,10 @@ class Worker:
                             # All continuing rids were dropped, so no spec
                             # batch was submitted. Drop the orphaned pre-plan
                             # so the next step to lease that slot doesn't
-                            # promote it.
+                            # promote it. Await first: this batch never reaches
+                            # the GPU thread, so nothing else joins the future,
+                            # and resetting under a running plan races it.
+                            speculation.plan_future.result()
                             self._reset_skip_plan_flags(speculation.node_batch)
 
                     # Post-process N (routing stage) — runs concurrently with

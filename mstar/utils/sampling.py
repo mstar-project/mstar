@@ -627,10 +627,19 @@ class CudaGraphableSampler(BaseSampler):
         """
         if self.seen_tokens_buf is None:
             return
+        # One multi-tensor-apply instead of bs separate copy_ launches. The
+        # masks are separately-owned tensors, so a single index_copy_ would
+        # need them to be views into one buffer; _foreach_copy_ fuses the
+        # launches without changing that ownership.
+        dsts = []
+        srcs = []
         for i, m in enumerate(seen_masks):
             mask = m._seen_token_mask
             if mask is not None:
-                mask.copy_(self.seen_tokens_buf[i])
+                dsts.append(mask)
+                srcs.append(self.seen_tokens_buf[i])
+        if dsts:
+            torch._foreach_copy_(dsts, srcs)
 
 
 @dataclass
@@ -982,6 +991,11 @@ class SamplerBuffers:
         """
         if self.seen_tokens is None:
             return
+        # Batched for the same reason as sync_seen_token_masks: bs launches
+        # become one. _init_slot still has to run per slot (it is CPU-side
+        # bookkeeping plus a master-row write) before anything is staged.
+        dsts = []
+        srcs = []
         for rid, m in zip(request_ids, seen_masks, strict=False):
             slot = self._rid_to_slot.get(rid)
             if slot is None:
@@ -991,7 +1005,10 @@ class SamplerBuffers:
                 self._init_slot(slot, rid)
             mask = m._seen_token_mask
             if mask is not None:
-                self.seen_tokens.write_master_row(slot, mask)
+                dsts.append(self.seen_tokens.master[slot])
+                srcs.append(mask)
+        if dsts:
+            torch._foreach_copy_(dsts, srcs)
 
     def _init_slot(self, slot: int, rid: str) -> None:
         """GPU-side init for a newly registered slot. Must run on the thread
