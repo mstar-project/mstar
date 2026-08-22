@@ -72,7 +72,7 @@ def split_function_mot(
 
         out = torch.empty(
             (text_out.shape[0] + image_out.shape[0], *text_out.shape[1:]),
-            device=query_sequence.device, dtype=query_sequence.dtype
+            device=query_sequence.device, dtype=text_out.dtype
         )
         out[text_idxs]  = text_out
         out[img_idxs] = image_out
