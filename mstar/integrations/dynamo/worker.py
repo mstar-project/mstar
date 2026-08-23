@@ -8,7 +8,9 @@ capabilities: chat, speech, and images share one endpoint (their bodies
 are distinguishable), video generation gets its own (a minimal video
 body looks like an image body), and realtime gets its own bidirectional
 endpoint (streaming-input requests are a different wire shape than the
-unary ones).
+unary ones). Models with a tensor spec (KServe Predict v2 shapes, e.g.
+pi05) register a TensorBased card on its own endpoint — for those the
+spec, not an OpenAI adapter, is what makes the model servable here.
 """
 
 from __future__ import annotations
@@ -22,7 +24,12 @@ from typing import TYPE_CHECKING
 import yaml
 
 from mstar.api_server.openai.adapters import get_adapter
-from mstar.integrations.dynamo.bridges import RealtimeBridge, RequestBridge
+from mstar.integrations.dynamo.bridges import (
+    RealtimeBridge,
+    RequestBridge,
+    TensorBridge,
+    get_tensor_spec,
+)
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -102,14 +109,16 @@ def serve(server: APIServer, model_name: str, args) -> None:
     model_type = _model_type(adapter) if adapter is not None else None
     supports_videos = adapter is not None and getattr(adapter, "supports_videos", False)
     supports_realtime = adapter is not None and getattr(adapter, "supports_realtime", False)
-    if model_type is None and not supports_videos and not supports_realtime:
+    tensor_spec = get_tensor_spec(model_name)
+    if (model_type is None and not supports_videos and not supports_realtime
+            and tensor_spec is None):
         raise SystemExit(
-            f"model {model_name!r} has no OpenAI adapter surface to register; "
-            "models without one are served via the native /generate only"
+            f"model {model_name!r} has no OpenAI adapter surface or tensor spec "
+            "to register; models without one are served via the native /generate only"
         )
 
     served = args.served_model_name or model_name
-    bridge = RequestBridge(server, adapter, served)
+    bridge = RequestBridge(server, adapter, served) if adapter is not None else None
 
     @dynamo_worker()
     async def _run(runtime: DistributedRuntime):
@@ -162,6 +171,24 @@ def serve(server: APIServer, model_name: str, args) -> None:
             surfaces.append((f"{args.endpoint}_realtime={ModelType.Realtime}",
                              realtime_ep.serve_bidirectional_endpoint(
                                  realtime_bridge.generate, graceful_shutdown=True)))
+        if tensor_spec is not None:
+            tensor_bridge = TensorBridge(server, tensor_spec, served)
+            tensor_ep = runtime.endpoint(
+                f"{args.namespace}.{args.component}.{args.endpoint}_tensor"
+            )
+            await register_model(
+                ModelInput.Tensor,
+                ModelType.TensorBased,
+                tensor_ep,
+                args.model_path,
+                served,
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+                tensor_model_config=tensor_spec.model_config(served),
+            )
+            surfaces.append((f"{args.endpoint}_tensor={ModelType.TensorBased}",
+                             tensor_ep.serve_endpoint(
+                                 tensor_bridge.generate, graceful_shutdown=True)))
         logger.info(
             "MSTAR_DYNAMO_READY model=%s component=%s.%s surfaces=%s",
             served, args.namespace, args.component,

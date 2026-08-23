@@ -19,6 +19,11 @@ the same per-model adapters the native ``/v1`` routes use, submitted via
   (:class:`RealtimeBridge`) — appended audio is committed into independent
   chat-shaped requests whose text/audio chunks stream back as
   ``response.*`` events.
+- tensor: KServe Predict v2 requests (the frontend's ``ModelInfer`` /
+  ``ModelStreamInfer`` gRPC route) translated through a per-model
+  :data:`TENSOR_SPECS` entry (:class:`TensorBridge`); pi05 maps camera
+  frames + state + prompt onto the multipart shape ``/generate`` takes
+  and returns the action trajectory as one Float32 tensor.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import base64
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
@@ -709,3 +715,155 @@ class RealtimeBridge:
                 *(turn.task for turn in turns if turn.task is not None),
                 return_exceptions=True,
             )
+
+
+# ----------------------------------------------------------------------
+# tensor (KServe Predict v2 models)
+# ----------------------------------------------------------------------
+
+# The frontend's tensor route parses KServe ModelInfer requests into dicts
+# shaped like its internal tensor protocol: {"id", "model", "parameters",
+# "tensors": [{"metadata": {"name", "data_type", "shape", "parameters"},
+# "data": {"data_type", "values"}}]}. Responses take the same shape back
+# (validated: dtype must match the data variant, shape must multiply out
+# to the element count), and a unary ModelInfer requires exactly one
+# response. Dtype names in these dicts are the internal variant names
+# ("Uint8"/"Float32"/"Bytes"), not the KServe wire strings ("UINT8"/...).
+
+
+class Pi05TensorSpec:
+    """pi05: camera frames + robot state + task prompt in, one action
+    trajectory out. Translated onto the multipart shape ``/generate``
+    takes — encoded image files, prompt text, ``robot_state`` in
+    model_kwargs — so the bridge adds no new native capability."""
+
+    # Baked into the pi05 weights (action_in/out_proj); the trajectory
+    # length varies with the server's action_horizon, the width does not.
+    action_dim = 32
+
+    def model_config(self, served_model_name: str) -> dict:
+        return {
+            "name": served_model_name,
+            "inputs": [
+                # cameras x H x W x RGB; all cameras equal size per request,
+                # images[0] is the primary camera.
+                {"name": "images", "data_type": "Uint8", "shape": [-1, -1, -1, 3]},
+                {"name": "state", "data_type": "Float32", "shape": [-1]},
+                {"name": "prompt", "data_type": "Bytes", "shape": [1]},
+            ],
+            "outputs": [
+                {"name": "actions", "data_type": "Float32", "shape": [-1, self.action_dim]},
+            ],
+        }
+
+    def submit_args(self, tensors: dict[str, dict], upload_dir) -> SubmitArgs:
+        import numpy as np
+        from PIL import Image
+
+        images = tensors.get("images")
+        prompt = tensors.get("prompt")
+        if images is None or prompt is None:
+            raise ValueError("pi05 needs 'images' and 'prompt' input tensors")
+
+        prompt_values = prompt["data"]["values"]
+        if len(prompt_values) != 1:
+            raise ValueError("'prompt' must hold exactly one string element")
+        text = bytes(prompt_values[0]).decode("utf-8")
+
+        shape = [int(d) for d in images["metadata"]["shape"]]
+        if len(shape) != 4 or shape[3] != 3:
+            raise ValueError(
+                f"'images' must be [cameras, height, width, 3] uint8, got shape {shape}"
+            )
+        values = images["data"]["values"]
+        if isinstance(values, (bytes, bytearray)):
+            frames = np.frombuffer(bytes(values), dtype=np.uint8).reshape(shape)
+        else:
+            frames = np.asarray(values, dtype=np.uint8).reshape(shape)
+
+        upload_dir = Path(upload_dir)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        tag = uuid.uuid4().hex
+        paths = []
+        for i, frame in enumerate(frames):
+            path = upload_dir / f"tensor_{tag}_cam{i}.png"
+            Image.fromarray(np.ascontiguousarray(frame), mode="RGB").save(path)
+            paths.append(str(path))
+
+        model_kwargs = {}
+        state = tensors.get("state")
+        if state is not None:
+            model_kwargs["robot_state"] = [float(v) for v in state["data"]["values"]]
+
+        return SubmitArgs(
+            text=text,
+            file_paths={"image": paths},
+            input_modalities=["image", "text"],
+            output_modalities=["action"],
+            model_kwargs=model_kwargs,
+        )
+
+    def output_tensors(self, chunk) -> list[dict] | None:
+        if chunk.modality != "action":
+            return None
+        import numpy as np
+
+        actions = np.frombuffer(chunk.data, dtype="<f4")
+        if actions.size == 0 or actions.size % self.action_dim:
+            raise ValueError(
+                f"action chunk holds {actions.size} float32 values, "
+                f"not a non-empty multiple of {self.action_dim}"
+            )
+        steps = actions.size // self.action_dim
+        return [{
+            "metadata": {
+                "name": "actions",
+                "data_type": "Float32",
+                "shape": [steps, self.action_dim],
+            },
+            "data": {"data_type": "Float32", "values": actions.tolist()},
+        }]
+
+
+TENSOR_SPECS = {
+    "pi05": Pi05TensorSpec(),
+}
+
+
+def get_tensor_spec(model_name: str):
+    return TENSOR_SPECS.get(model_name)
+
+
+class TensorBridge:
+    """Serve one tensor model's KServe requests against an embedded server."""
+
+    def __init__(self, server: APIServer, spec, served_model_name: str):
+        self.server = server
+        self.spec = spec
+        self.served_model_name = served_model_name
+
+    async def generate(self, request: dict, context=None):
+        named = {t["metadata"]["name"]: t for t in request.get("tensors", [])}
+        args = self.spec.submit_args(named, self.server.upload_dir)
+        rid = _submit(self.server, args, prefix="tensor")
+        produced = False
+        cancelled = False
+        try:
+            async for chunk in self.server.iter_result_chunks(rid):
+                if context is not None and context.is_stopped():
+                    cancelled = True
+                    break
+                if chunk.modality == "error":
+                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                tensors = self.spec.output_tensors(chunk)
+                if tensors:
+                    produced = True
+                    yield {
+                        "id": request.get("id"),
+                        "model": request.get("model") or self.served_model_name,
+                        "tensors": tensors,
+                    }
+        finally:
+            self.server.abort_request(rid)
+        if not produced and not cancelled:
+            raise RuntimeError("no tensor output produced")

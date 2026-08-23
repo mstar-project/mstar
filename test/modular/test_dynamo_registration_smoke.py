@@ -26,6 +26,7 @@ def test_registration_vocabulary():
     assert str(ModelType.Chat | ModelType.Audios) == "chat,audios"
     assert str(ModelType.Videos) == "videos"
     assert str(ModelType.Realtime) == "realtime"
+    assert str(ModelType.TensorBased) == "tensor"
     for name in ("Chat", "Completions", "Embedding", "Images", "Videos",
                  "Audios", "Realtime", "TensorBased"):
         assert hasattr(ModelType, name), name
@@ -139,6 +140,22 @@ def test_register_model_in_process(tmp_path):
                 "citest",
                 worker_type=WorkerType.Aggregated,
                 needs=[],
+            )
+            # Tensor: card-only mask whose tensor_model_config dict must
+            # deserialize into the frontend's TensorModelConfig — the exact
+            # declaration the pi05 spec produces.
+            from mstar.integrations.dynamo.bridges import TENSOR_SPECS
+
+            tensor = runtime.endpoint("mstar.citest_vla.generate_tensor")
+            await register_model(
+                ModelInput.Tensor,
+                ModelType.TensorBased,
+                tensor,
+                model_dir,
+                "citest-vla",
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+                tensor_model_config=TENSOR_SPECS["pi05"].model_config("citest-vla"),
             )
         finally:
             runtime.shutdown()

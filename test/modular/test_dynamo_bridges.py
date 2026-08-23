@@ -8,16 +8,20 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.openai.protocol import SpeechRequest, VideoGenerationRequest
 from mstar.integrations.dynamo.bridges import (
+    TENSOR_SPECS,
     RealtimeBridge,
+    TensorBridge,
     _clean,
     _image_body,
     _speech_body,
     _video_body,
+    get_tensor_spec,
 )
 
 PNG_1X1 = (
@@ -309,4 +313,164 @@ def test_realtime_stop_mid_turn(tmp_path):
     # claimed no completed response.
     assert "response.output_audio_transcript.delta" in types
     assert "response.done" not in types
+    assert server.aborted
+
+
+# ----------------------------------------------------------------------
+# tensor bridge (seam double; no engine)
+# ----------------------------------------------------------------------
+
+def _tensor(name, data_type, shape, values):
+    return {
+        "metadata": {"name": name, "data_type": data_type, "shape": shape},
+        "data": {"data_type": data_type, "values": values},
+    }
+
+
+def _pi05_frames(cameras=2, h=4, w=5):
+    n = cameras * h * w * 3
+    return (np.arange(n, dtype=np.int64) % 251).astype(np.uint8).reshape(
+        cameras, h, w, 3
+    )
+
+
+def _pi05_request(frames, prompt=b"pick up the block", state=None, req_id="req-1"):
+    tensors = [
+        _tensor("images", "Uint8", list(frames.shape), frames.flatten().tolist()),
+        _tensor("prompt", "Bytes", [1], [list(prompt)]),
+    ]
+    if state is not None:
+        tensors.append(_tensor("state", "Float32", [len(state)], state))
+    return {"id": req_id, "model": "pi05", "parameters": {}, "tensors": tensors}
+
+
+def _run_tensor(server, request, ctx=None):
+    bridge = TensorBridge(server, TENSOR_SPECS["pi05"], "pi05")
+    ctx = ctx or server._stop_ctx or _Ctx()
+
+    async def collect():
+        out = []
+        async for response in bridge.generate(request, ctx):
+            out.append(response)
+        return out
+
+    return asyncio.run(collect())
+
+
+def test_tensor_spec_registry_and_config():
+    assert get_tensor_spec("pi05") is TENSOR_SPECS["pi05"]
+    assert get_tensor_spec("qwen3_omni") is None
+    config = TENSOR_SPECS["pi05"].model_config("served-name")
+    assert config["name"] == "served-name"
+    assert [(t["name"], t["data_type"], t["shape"]) for t in config["inputs"]] == [
+        ("images", "Uint8", [-1, -1, -1, 3]),
+        ("state", "Float32", [-1]),
+        ("prompt", "Bytes", [1]),
+    ]
+    assert config["outputs"] == [
+        {"name": "actions", "data_type": "Float32", "shape": [-1, 32]},
+    ]
+
+
+def test_tensor_full_request(tmp_path):
+    frames = _pi05_frames()
+    state = [float(i) / 10 for i in range(32)]
+    actions = (np.arange(50 * 32, dtype="<f4") / 100).reshape(50, 32)
+    server = _FakeRealtimeServer([_chunk("action", actions.tobytes())], tmp_path)
+
+    out = _run_tensor(server, _pi05_request(frames, state=state))
+
+    assert len(out) == 1
+    assert out[0]["id"] == "req-1" and out[0]["model"] == "pi05"
+    (result,) = out[0]["tensors"]
+    assert result["metadata"] == {
+        "name": "actions", "data_type": "Float32", "shape": [50, 32],
+    }
+    got = np.array(result["data"]["values"], dtype="<f4").reshape(50, 32)
+    assert np.array_equal(got, actions)
+
+    sub = server.submitted[0]
+    assert sub["text"] == "pick up the block"
+    assert sub["input_modalities"] == ["image", "text"]
+    assert sub["output_modalities"] == ["action"]
+    assert sub["model_kwargs"]["robot_state"] == state
+    paths = sub["file_paths"]["image"]
+    assert len(paths) == 2
+    from PIL import Image
+    for i, path in enumerate(paths):
+        assert np.array_equal(np.asarray(Image.open(path)), frames[i])
+    assert server.aborted
+
+
+def test_tensor_state_is_optional(tmp_path):
+    server = _FakeRealtimeServer(
+        [_chunk("action", np.zeros(32, dtype="<f4").tobytes())], tmp_path
+    )
+    out = _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
+    assert out[0]["tensors"][0]["metadata"]["shape"] == [1, 32]
+    assert "robot_state" not in server.submitted[0]["model_kwargs"]
+
+
+def test_tensor_prompt_as_bytes(tmp_path):
+    # The request-plane codec may deliver Bytes elements as byte strings
+    # instead of int lists; both must decode.
+    server = _FakeRealtimeServer(
+        [_chunk("action", np.zeros(32, dtype="<f4").tobytes())], tmp_path
+    )
+    request = _pi05_request(_pi05_frames(cameras=1))
+    request["tensors"][1]["data"]["values"] = [b"open the drawer"]
+    _run_tensor(server, request)
+    assert server.submitted[0]["text"] == "open the drawer"
+
+
+def test_tensor_missing_inputs_error(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    request = {"id": "r", "model": "pi05", "tensors": [
+        _tensor("prompt", "Bytes", [1], [list(b"x")]),
+    ]}
+    with pytest.raises(ValueError, match="images"):
+        _run_tensor(server, request)
+    assert not server.submitted and not server.aborted
+
+
+def test_tensor_bad_images_shape_error(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    request = _pi05_request(_pi05_frames(cameras=1))
+    request["tensors"][0]["metadata"]["shape"] = [4, 5, 3]  # missing camera dim
+    with pytest.raises(ValueError, match="cameras"):
+        _run_tensor(server, request)
+    assert not server.submitted
+
+
+def test_tensor_error_chunk_raises(tmp_path):
+    server = _FakeRealtimeServer([_chunk("error", b"engine exploded")], tmp_path)
+    with pytest.raises(RuntimeError, match="engine exploded"):
+        _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
+    assert server.aborted
+
+
+def test_tensor_misaligned_action_bytes(tmp_path):
+    server = _FakeRealtimeServer([_chunk("action", b"\x00" * 4)], tmp_path)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
+    assert server.aborted
+
+
+def test_tensor_no_output_raises(tmp_path):
+    server = _FakeRealtimeServer([_chunk("text", b"stray")], tmp_path)
+    with pytest.raises(RuntimeError, match="no tensor output"):
+        _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
+    assert server.aborted
+
+
+def test_tensor_stop_before_output(tmp_path):
+    ctx = _Ctx()
+    server = _FakeRealtimeServer([
+        _chunk("text", b"ignored"),
+        _chunk("action", np.zeros(32, dtype="<f4").tobytes()),
+    ], tmp_path, stop_ctx=ctx, stop_after=1)
+    out = _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
+    # Stopped after the first (non-action) chunk: no response, no
+    # "no output" error — a cancel is not a failure — and the abort ran.
+    assert out == []
     assert server.aborted
