@@ -321,6 +321,11 @@ class StepDB:
     def count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM steps").fetchone()[0]
 
+    def gpu_names(self) -> list[str]:
+        """Device names that have rows, for callers that must pick one."""
+        return [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT gpu_name FROM steps ORDER BY gpu_name")]
+
     def models(self) -> list[str]:
         return [r[0] for r in self.conn.execute(
             "SELECT DISTINCT model FROM steps ORDER BY model")]

@@ -38,6 +38,7 @@ from mstar.engine.base import (
     EngineType,
     NodeBatch,
     NodeOutput,
+    PlannedBatch,
     PreparedBatch,
     StopCheckResult,
 )
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 ENV_ENABLE = "MSTAR_HOLLOW"
 ENV_DB = "MSTAR_HOLLOW_DB"
+ENV_GPU = "MSTAR_HOLLOW_GPU"
 #: Delay charged when no stepdb row matches, so a hollow run still advances.
 DEFAULT_STEP_S = 0.002
 
@@ -75,6 +77,7 @@ class SimEngine(BaseEngine):
         enable_profile: bool = False,
         model: Any = None,
         stepdb_path: str | None = None,
+        gpu_name: str | None = None,
         **kwargs,
     ):
         super().__init__(enable_nvtx=enable_nvtx, enable_profile=enable_profile)
@@ -90,12 +93,32 @@ class SimEngine(BaseEngine):
         if model is not None:
             self._index_graph_outputs(model)
 
+        # Hollow mode runs on CPU but emulates a GPU deployment, so rows are
+        # looked up under the *target* device, not this host's. With one
+        # device in the table the choice is unambiguous; otherwise name it
+        # explicitly, because silently picking one would emulate the wrong
+        # hardware without saying so.
         self._db = None
+        self._model_key = ""
         path = stepdb_path or os.environ.get(ENV_DB)
         if path and os.path.exists(path):
             from mstar.sim.stepdb import StepDB
-            self._db = StepDB(path)
-            self._model_key = self._db.models()[0] if self._db.models() else ""
+            probe = StepDB(path)
+            names = probe.gpu_names()
+            probe.close()
+            target = gpu_name or os.environ.get(ENV_GPU)
+            if target is None and len(names) == 1:
+                target = names[0]
+            elif target is None and len(names) > 1:
+                logger.warning(
+                    "stepdb %s holds rows for %s; set %s to choose one. "
+                    "Falling back to a flat %.0f ms per step.",
+                    path, ", ".join(names), ENV_GPU, DEFAULT_STEP_S * 1e3,
+                )
+            if target is not None:
+                self._db = StepDB(path, gpu_name=target)
+                models = self._db.models()
+                self._model_key = models[0] if models else ""
 
     def _index_graph_outputs(self, model: Any) -> None:
         try:
@@ -141,6 +164,17 @@ class SimEngine(BaseEngine):
 
     def prepare_batch(self, batch: NodeBatch) -> PreparedBatch:
         return PreparedBatch(batch=batch, submodule=None)
+
+    def execute_forward(self, planned: PlannedBatch) -> NodeOutput:
+        """Satisfies the ABC; unused because ``execute_batch`` is overridden.
+
+        The template's four hooks exist so an engine can plug into the
+        standard flow. A hollow engine has no flow to plug into — there is
+        nothing to prepare, plan, or postprocess — so it replaces
+        ``execute_batch`` outright and routes here only if something calls
+        the hook directly.
+        """
+        return self.execute_batch(planned.batch)
 
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         """Charge the modeled delay, then emit one token per request."""
@@ -231,6 +265,7 @@ def install(model: Any = None) -> None:
             enable_profile=enable_prof,
             model=model,
         )
+
 
     em.ENGINE_TYPE_FACTORIES = {k: factory for k in em.ENGINE_TYPE_FACTORIES}
     em.STATELESS_FLAVOR_FACTORIES = {
