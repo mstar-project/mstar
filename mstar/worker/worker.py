@@ -46,7 +46,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
@@ -147,8 +147,8 @@ class Worker:
         # Per-phase wall-clock timing (MSTAR_PHASE_TIMING). On the worker
         # rather than in run()'s scope because the GPU and plan threads
         # record into it too; run() owns the periodic flush.
-        self._phase_period = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0")
-        self._phase_buf: dict[str, list[float]] = defaultdict(list)
+        self._phase_period = PHASE_PERIOD
+        self._phase_buf = phase_buffer()
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
@@ -1159,7 +1159,9 @@ class Worker:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
         # The plan thread wrote this batch's plan into the resources; wait for
-        # it before the forward reads them. Waiting releases the GIL.
+        # it before the forward reads them. Waiting releases the GIL — which is
+        # the point: running prepare_inputs here instead just puts the two
+        # threads in contention for it, and measured worse.
         if plan_future is not None:
             with self._span("worker.gpu_thread.await_plan"):
                 plan_future.result()
@@ -1181,7 +1183,7 @@ class Worker:
                 event.record(torch.cuda.default_stream(self.device))
                 node_batch.completion_event = event
             return outputs
-        finally:    
+        finally:
             # Safety net: a step that raised before the forward would otherwise
             # leave the submitter blocked on this for the full wait timeout.
             if node_batch.launch_started_event is not None:
@@ -2114,6 +2116,10 @@ class Worker:
         # Default ON. Set MSTAR_PRE_PLAN_SPEC=0 to fall back to the
         # double-buffer-without-pre-plan baseline.
         pre_plan_spec = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
+        # How long the submitter holds off the GIL waiting for the GPU thread
+        # to reach the launch. submit_spec often sits on this cap, but raising
+        # it to 8ms did not help; tunable for another look.
+        launch_wait_s = float(os.environ.get("MSTAR_LAUNCH_WAIT_MS", "5")) / 1000.0
         plan_executor = None
         if pre_plan_spec:
             plan_executor = ThreadPoolExecutor(
@@ -2384,7 +2390,7 @@ class Worker:
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
-                            spec_launch_started.wait(timeout=0.005)
+                            spec_launch_started.wait(timeout=launch_wait_s)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:

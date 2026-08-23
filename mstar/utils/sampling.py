@@ -798,6 +798,10 @@ class SamplerBuffers:
     # device-side index tensor that ``index_select`` reads from.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
+    # Zero-copy numpy view of ``_slot_idx_cpu``, so staging is one slice write
+    # rather than a tensor __setitem__ per row. Built lazily; the tensor is
+    # allocated once and never rebound, so the view stays valid.
+    _slot_idx_np: Any = field(default=None, repr=False)
     # Real (unpadded) batch size of the last gather per cg slot — the
     # scatter-back writes only these rows (padding rows all map to slot 0).
     _last_real_bs: list[int] = field(default_factory=list, repr=False)
@@ -1038,15 +1042,24 @@ class SamplerBuffers:
             f"padded_bs={padded_bs} exceeds SamplerBuffers.max_batch_size="
             f"{self.max_batch_size}"
         )
-        for i, rid in enumerate(request_ids):
-            slot = self._rid_to_slot.get(rid)
+        # Batched for the same reason as stage_seen_token_masks: _init_slot has
+        # to run per slot, but the staging writes become one. Elementwise, this
+        # was ~46us at bs=16 — all Python, and the plan thread pays it inline.
+        if self._slot_idx_np is None:
+            self._slot_idx_np = self._slot_idx_cpu.numpy()
+        get = self._rid_to_slot.get
+        pending = self._pending_init
+        rows = []
+        for rid in request_ids:
+            slot = get(rid)
             if slot is None:
                 slot = 0
-            elif slot in self._pending_init:
+            elif slot in pending:
                 self._init_slot(slot, rid)
-            self._slot_idx_cpu[cg_slot, i] = slot
-        for i in range(len(request_ids), padded_bs):
-            self._slot_idx_cpu[cg_slot, i] = 0
+            rows.append(slot)
+        if len(rows) < padded_bs:
+            rows.extend([0] * (padded_bs - len(rows)))
+        self._slot_idx_np[cg_slot, :padded_bs] = rows
         self._staged_rids[cg_slot] = (tuple(request_ids), padded_bs)
 
     def _upload_slot_idx(self, padded_bs: int, cg_slot: int) -> torch.Tensor:
