@@ -423,7 +423,6 @@ class Simulator:
         does — per-request graph state (loop counters, readiness) must not be
         shared between requests.
         """
-        from mstar.graph.graph_io import WorkerGraphIO
 
         previous = req.current_walk
         req.current_walk = walk

@@ -89,7 +89,8 @@ class EngineManager:
         # Hollow mode: swap in a fake engine before any submodule is built,
         # so no weights load and no GPU work runs. Everything above the
         # engine — worker, scheduler, graph routing — is untouched.
-        from mstar.sim.hollow import hollow_enabled, install as install_hollow
+        from mstar.sim.hollow import hollow_enabled
+        from mstar.sim.hollow import install as install_hollow
         if hollow_enabled():
             install_hollow(model)
 

@@ -24,7 +24,6 @@ import statistics
 from dataclasses import dataclass, field
 
 from mstar.sim.des import Simulator
-from mstar.sim.stepdb import Coverage
 
 #: The benchmark harness assumes 24 kHz mono when converting audio bytes to
 #: seconds; keep the same constant so RTF is comparable.
@@ -151,7 +150,9 @@ def summarize(sim: Simulator, num_submitted: int | None = None) -> SimReport:
     gaps: list[float] = []
     for r in done:
         times = sorted(t for _, t in r.chunks)
-        gaps.extend((b - a) * 1e3 for a, b in zip(times, times[1:]))
+        gaps.extend(
+            (b - a) * 1e3 for a, b in zip(times, times[1:], strict=False)
+        )
     rep.itl_ms = _pcts(gaps)
 
     span = max((r.finish_s for r in done), default=0.0)
