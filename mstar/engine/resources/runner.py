@@ -13,9 +13,7 @@ from typing import Any
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SubmoduleStep
-from time import perf_counter
-
-from mstar.utils.profiler import PHASE_PERIOD, phase_record, range_pop, range_push
+from mstar.utils.profiler import range_pop, range_push
 
 
 def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
@@ -119,20 +117,6 @@ class StepRunner:
     def resources(self) -> Mapping[str, Resource]:
         return self._resources
 
-    def _res_begin(self, kind: str, key: str) -> float:
-        """Open one resource's span. `kind` separates the plan-thread passes
-        (pre_admit/pre_plan) from the inline ones, which share a name in nsys
-        today and so can't be told apart."""
-        if self._nvtx:
-            range_push(f"res.{kind}.{key}")
-        return perf_counter() if PHASE_PERIOD else 0.0
-
-    def _res_end(self, kind: str, key: str, t0: float) -> None:
-        if PHASE_PERIOD:
-            phase_record(f"res.{kind}.{key}", perf_counter() - t0)
-        if self._nvtx:
-            range_pop()
-
     def _keys_for(self, step: SubmoduleStep) -> list[str]:
         keyset = frozenset(step.keys())
         cached = self._keys_cache.get(keyset)
@@ -228,11 +212,13 @@ class StepRunner:
         """reserve capacity for step"""
         ready = True
         for key in self._keys_for(step):
-            t0 = self._res_begin("admit", key)
+            if self._nvtx:
+                range_push(f"res.admit.{key}")
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
-                self._res_end("admit", key, t0)
+                if self._nvtx:
+                    range_pop()
             if not outcome.ok:
                 return outcome
             ready = ready and outcome.ready
@@ -246,11 +232,13 @@ class StepRunner:
         results = step.ctx.plan_results
         results.clear()
         for key in self._keys_for(step):
-            t0 = self._res_begin("plan", key)
+            if self._nvtx:
+                range_push(f"res.plan.{key}")
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                self._res_end("plan", key, t0)
+                if self._nvtx:
+                    range_pop()
         return results
 
     def pre_admit(self, step: SubmoduleStep) -> AdmitOutcome:
@@ -260,11 +248,13 @@ class StepRunner:
         state as already reserved and no-op"""
         ready = True
         for key in self._preplan_keys_for(step):
-            t0 = self._res_begin("pre_admit", key)
+            if self._nvtx:
+                range_push(f"res.pre_admit.{key}")
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
             finally:
-                self._res_end("pre_admit", key, t0)
+                if self._nvtx:
+                    range_pop()
             if not outcome.ok:
                 return outcome
             ready = ready and outcome.ready
@@ -278,11 +268,13 @@ class StepRunner:
         in `ctx.plan_results` for the dependents in this same subset."""
         results = step.ctx.plan_results
         for key in self._preplan_keys_for(step):
-            t0 = self._res_begin("pre_plan", key)
+            if self._nvtx:
+                range_push(f"res.pre_plan.{key}")
             try:
                 results[key] = self._resources[key].plan(step.get(key), step.ctx)
             finally:
-                self._res_end("pre_plan", key, t0)
+                if self._nvtx:
+                    range_pop()
         return results
 
     def commit(self, step: SubmoduleStep) -> None:
