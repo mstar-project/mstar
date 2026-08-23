@@ -66,6 +66,7 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
         capture_batch_sizes: list[int] | None = None,
         capture_forward_method: str = "forward_batched",
         caps_eager_batch_size: bool = True,
+        total_tokens_multiplier: int = 1,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -77,12 +78,22 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
             caps_eager_batch_size=caps_eager_batch_size,
         )
         self.single_request_inputs = single_request_inputs
+        # ``single_request_inputs.input_seq_len`` is also read per-label by the
+        # submodule's own ``declare_step`` (e.g. replicated across cond/uncond
+        # labels for a combined guidance step), so it must stay a per-label
+        # span there. When one request's captured step actually commits KV
+        # across more than one label combined into a single plan (batched
+        # classifier-free guidance packing cond+uncond into one sequence),
+        # the static buffer this bucket allocates has to hold all of them —
+        # this multiplier scales the buffer size independently of the
+        # per-label span. Default 1 preserves every existing caller.
+        self.total_tokens_multiplier = total_tokens_multiplier
 
     def get_config_type(self) -> CudaGraphConfigType:
         return CudaGraphConfigType.BASIC_BATCHED
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [self.single_request_inputs.input_seq_len * bs]
+        return [self.single_request_inputs.input_seq_len * bs * self.total_tokens_multiplier]
 
     def get_node_inputs(self, bs: int, num_tokens: int):
         del num_tokens

@@ -228,13 +228,22 @@ class FlashInferManager(AttentionManager):
             )
         return self._workspace_buffers[key]
 
-    def _cg_wrapper(self, lease: SlotLease, label: str) -> AttentionWrapper:
+    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int) -> AttentionWrapper:
         """The captured-graph wrapper for one (bucket, slot, label).
 
         Built on the first plan for that key rather than up front: which labels
         a walk plans under is the step's to declare, and the first plan for a
         bucket runs during capture, before the graph is recorded, so the wrapper
         is just as persistent either way.
+
+        ``num_rows`` is the qo_indptr row count this label actually plans —
+        the FlashInfer batch_size for CUDA-graph mode, which must stay fixed
+        for the wrapper's lifetime. It equals ``bucket.bs`` (one row per
+        request) for an ordinary label, but a label that combines several
+        source labels into one plan (e.g. cond+uncond batched CFG) always
+        contributes several rows per request; using ``bucket.bs`` there
+        under-allocates the wrapper's fixed buffers and every later plan()
+        call overruns them with a "runtime batch size" mismatch.
         """
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
@@ -246,14 +255,14 @@ class FlashInferManager(AttentionManager):
         if bucket.bs == bucket.num_tokens:
             wrapper = FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
-                batch_size=bucket.bs,
+                batch_size=num_rows,
                 use_cuda_graph=True,
                 **self._wrapper_kv_kwargs,
             )
         else:
             wrapper = FlashInferPrefillWrapper(
                 workspace_buffer=buffer,
-                batch_size=bucket.bs,
+                batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
                 use_cuda_graph=True,
                 **self._wrapper_kv_kwargs,
@@ -305,7 +314,8 @@ class FlashInferManager(AttentionManager):
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
             if ctx.slot_lease is not None:
-                wrapper = self._cg_wrapper(ctx.slot_lease, label)
+                num_rows = indptrs.qo_indptr.shape[0] - 1
+                wrapper = self._cg_wrapper(ctx.slot_lease, label, num_rows)
             else:
                 is_decode = bool(
                     indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1

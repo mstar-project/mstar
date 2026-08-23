@@ -367,7 +367,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def prepare_inputs(
-        self, graph_walk, fwd_info, inputs, seen_token_mask=None, pos_info={},
+        self, graph_walk, fwd_info, inputs, seen_token_mask=None, pos_info={}, **kwargs,
     ) -> ARNodeInputs:
         device = self.get_device()
         if graph_walk in PREFILL_WALKS:
@@ -1603,6 +1603,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # uncaptured sizes / mixed resolutions run the eager batched
                 # denoise, so don't cap max_batch_size to them.
                 caps_eager_batch_size=False,
+                # This bucket's step always runs both guidance branches
+                # combined into one KV plan (``resource_step_info`` below is
+                # cfg=True/cfg_active=True unconditionally) — `single.input_seq_len`
+                # is one branch's span (declare_step replicates it per label),
+                # but the combined plan commits both branches' tokens, so the
+                # static buffer needs double the capacity or the real replay's
+                # KV plan overruns it (KVPlanState.copy_ shape mismatch).
+                total_tokens_multiplier=2,
             ))
 
         # Understanding-tower text prefill: cond+uncond packed into one combined
