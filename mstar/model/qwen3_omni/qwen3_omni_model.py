@@ -1527,6 +1527,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeAudioEncoder,
         )
 
+        from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Load config only (no weights)
@@ -1544,6 +1545,7 @@ class Qwen3OmniModel(Model):
         # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
         # SDPA on the full packed sequence (no per-segment fusion),
         # which is significantly slower than FA2's varlen path.
+        patch_hf_fa2_int_maxlen()
         audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
             audio_config, attn_implementation="flash_attention_2"
         )
@@ -1566,6 +1568,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeVisionEncoder,
         )
 
+        from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Load full config (no weights)
@@ -1587,6 +1590,7 @@ class Qwen3OmniModel(Model):
         # N-frame video. This causes the 10× V2T/V2S TTFT regression vs
         # vllm-omni. With "flash_attention_2", a single varlen FA2 call
         # per layer handles all frames at once via cu_seqlens.
+        patch_hf_fa2_int_maxlen()
         vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
             vision_config, attn_implementation="flash_attention_2"
         )

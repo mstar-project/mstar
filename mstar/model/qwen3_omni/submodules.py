@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Optional
 
@@ -41,6 +42,21 @@ from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInput
 logger = logging.getLogger(__name__)
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """True if fn takes `name` as a keyword (explicitly or via **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    param = params.get(name)
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
 # ===================================================================
 # 1. AudioEncoderSubmodule (enc_dec engine)
 # ===================================================================
@@ -60,6 +76,8 @@ class AudioEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.audio_encoder = audio_encoder
         self.config = config
+        # Older transformers take return_dict; newer ones dropped it.
+        self._encoder_takes_return_dict = _accepts_kwarg(audio_encoder.forward, "return_dict")
 
     def prepare_inputs(
         self,
@@ -96,11 +114,13 @@ class AudioEncoderSubmodule(NodeSubmodule):
             "Running AudioEncoder with audio_features shape=%s",
             audio_features.shape,
         )
-        audio_embeds = self.audio_encoder(
+        extra_kwargs = {"return_dict": True} if self._encoder_takes_return_dict else {}
+        audio_out = self.audio_encoder(
             audio_features,
             feature_lens=audio_seqlens,
-            return_dict=True,
-        ).last_hidden_state
+            **extra_kwargs,
+        )
+        audio_embeds = getattr(audio_out, "last_hidden_state", audio_out)
 
         # Flatten to (num_audio_tokens, hidden_size) if needed
         if audio_embeds.dim() == 3:
