@@ -153,6 +153,8 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats"]
     if args.log_stats_file:
         argv += ["--log-stats-file", args.log_stats_file]
+    if args.log_stats_json:
+        argv += ["--log-stats-json", args.log_stats_json]
     # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
     # silently staying on uvicorn would be a footgun.
     if args.rust_frontend or args.rust_frontend_bin:
@@ -196,6 +198,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="append per-request profiling stats to this file (implies --log-stats)",
     )
     serve.add_argument(
+        "--log-stats-json", default=None,
+        help="append per-request profiling stats to this file as JSON Lines "
+             "(implies --log-stats); machine-readable, for simulator calibration",
+    )
+    serve.add_argument(
         "--rust-frontend", action="store_true",
         help="serve HTTP from the Rust mstar-server binary instead of "
              "uvicorn/FastAPI (see docs: environment variables / installation)",
@@ -206,7 +213,65 @@ def build_parser() -> argparse.ArgumentParser:
              "$PATH, then rust/server/target/release)",
     )
     serve.set_defaults(func=_serve)
+
+    # ── M*-Sim: performance prediction ───────────────────────────────────
+    #
+    # These take their own argv rather than mirroring every flag here: the
+    # sim tools evolve independently of the serving CLI, and duplicating
+    # their parsers would guarantee drift.
+    predict = sub.add_parser(
+        "predict",
+        help="query measured per-step costs (no server, no GPU needed)",
+        add_help=False,
+    )
+    predict.add_argument("rest", nargs=argparse.REMAINDER)
+    predict.set_defaults(func=_predict)
+
+    harvest = sub.add_parser(
+        "harvest",
+        help="build a step cost table from a profiled run's step logs",
+        add_help=False,
+    )
+    harvest.add_argument("rest", nargs=argparse.REMAINDER)
+    harvest.set_defaults(func=_harvest)
+
+    calibrate = sub.add_parser(
+        "calibrate",
+        help="measure the simulator's non-step timings from a profiled run",
+        add_help=False,
+    )
+    calibrate.add_argument("rest", nargs=argparse.REMAINDER)
+    calibrate.set_defaults(func=_calibrate)
+
+    simulate = sub.add_parser(
+        "simulate",
+        help="simulate a workload against a deployment config (no GPU needed)",
+        add_help=False,
+    )
+    simulate.add_argument("rest", nargs=argparse.REMAINDER)
+    simulate.set_defaults(func=_simulate)
+
     return parser
+
+
+def _predict(args: argparse.Namespace) -> None:
+    from mstar.sim.predict import main as predict_main
+    raise SystemExit(predict_main(args.rest))
+
+
+def _harvest(args: argparse.Namespace) -> None:
+    from mstar.sim.harvest_cli import main as harvest_main
+    raise SystemExit(harvest_main(args.rest))
+
+
+def _calibrate(args: argparse.Namespace) -> None:
+    from mstar.sim.calibration import main as calibrate_main
+    raise SystemExit(calibrate_main(args.rest))
+
+
+def _simulate(args: argparse.Namespace) -> None:
+    from mstar.sim.simulate_cli import main as simulate_main
+    raise SystemExit(simulate_main(args.rest))
 
 
 def main(argv: list[str] | None = None) -> None:
