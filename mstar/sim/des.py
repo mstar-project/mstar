@@ -291,9 +291,18 @@ class Simulator:
 
         #: Coverage flags OR'd across every step priced, so the report can say
         #: whether any number in it was extrapolated or missing.
+        # The api server preprocesses on ONE worker thread, so concurrent
+        # arrivals serialize through it. That stagger is not a detail: it
+        # offsets each request's streaming buffer by a token or two, which
+        # is what stops a codec consumer from batching every request in
+        # lockstep with the backbone.
+        self.preprocess_free_s = 0.0
+
         self.coverage = Coverage.EXACT
         self.missing_keys: dict[str, int] = {}
         self.step_count = 0
+        #: (node, walk) -> steps executed, the V1 validation gate's input.
+        self.step_counts_by_key: dict[tuple[str, str], int] = {}
 
         # Shapes actually measured, per (node, walk, mode) — used to snap a
         # requested batch onto the bucket the engine would have padded to.
@@ -364,11 +373,20 @@ class Simulator:
         self.cal.push(req.arrival_s, EventType.ARRIVAL, req.rid)
 
     def _on_arrival(self, rid: str) -> None:
-        req = self.requests[rid]
-        # api-server preprocess, then the conductor's poll latency.
-        t = self.cal.now + self.timing.preprocess_s
-        self.waiting.append(rid)
-        self.cal.push(t + self.timing.conductor_hop_s, EventType.CONDUCTOR, None)
+        # Queue for the single preprocess thread, then pay the conductor's
+        # poll latency before admission.
+        start = max(self.cal.now, self.preprocess_free_s)
+        done = start + self.timing.preprocess_s
+        self.preprocess_free_s = done
+        # The request joins the conductor's queue only once preprocessing
+        # has actually produced its inputs — enqueuing at arrival instead
+        # would let one conductor tick admit a whole burst simultaneously
+        # and erase the stagger the serial preprocess thread creates.
+        self.cal.push(
+            done + self.timing.conductor_hop_s,
+            EventType.CONDUCTOR,
+            ("ingest", rid, ""),
+        )
 
     def _admit_waiting(self) -> None:
         """FIFO admission under the concurrency cap — the conductor's rule."""
@@ -588,26 +606,46 @@ class Simulator:
         if cost.coverage & Coverage.MISSING:
             w.missing_cost_steps += 1
 
-        # Two-lane schedule. The CPU submit must finish before the GPU can
-        # start; the CPU is then free to build the next step while the GPU
-        # runs; the postprocess lands after the GPU completes.
-        submit_s = cost.prepare_s + cost.plan_s + cost.launch_s
-        post_s = cost.sample_s + self.timing.worker_step_overhead_s
+        # Two-lane schedule mirroring the worker's speculation pipeline
+        # (worker.py:1084-1098): the CPU *builds* the next batch while the
+        # current GPU step is still running, submits it the moment that step
+        # lands, and only then postprocesses the finished one.
+        #
+        #   CPU:  [ build N ][ submit N ][ post N-1 ][ build N+1 ] ...
+        #   GPU:            [========= step N =========]
+        #
+        # Because the build overlaps the previous GPU step, the loop settles
+        # at max(GPU, CPU) rather than their sum. Ordering the CPU lane as
+        # build → submit → post (instead of submit → post → build) is what
+        # produces that; getting it backwards silently turns every predicted
+        # step into gpu + cpu and inflates every latency downstream.
+        build_s = cost.prepare_s + cost.plan_s
+        after_s = cost.launch_s + cost.sample_s + self.timing.worker_step_overhead_s
 
         ready_s = max(i.ready_s for i in items)
-        cpu_submit_start = max(w.cpu_free_s, ready_s, self.cal.now)
-        cpu_submit_end = cpu_submit_start + submit_s
-        gpu_start = max(w.gpu_free_s, cpu_submit_end)
+        build_start = max(w.cpu_free_s, ready_s, self.cal.now)
+        build_end = build_start + build_s
+        gpu_start = max(w.gpu_free_s, build_end)
         gpu_end = gpu_start + cost.gpu_s
-        post_start = max(cpu_submit_end, gpu_end)
-        post_end = post_start + post_s
+        # The launch and everything after it (sampling, routing, ZMQ) run
+        # while this step's kernels are already on the GPU — that is the
+        # whole point of the async pipeline — so they are charged from
+        # gpu_start, not from gpu_end. Charging them after the step would
+        # serialize the two lanes and turn every predicted step into
+        # gpu + cpu, inflating every latency downstream.
+        cpu_done = gpu_start + after_s
+        # Outputs are routable only once both lanes have finished.
+        post_end = max(gpu_end, cpu_done)
 
         w.gpu_free_s = gpu_end
-        w.cpu_free_s = post_end
+        w.cpu_free_s = cpu_done
         w.gpu_busy_s += cost.gpu_s
-        w.cpu_busy_s += submit_s + post_s
+        w.cpu_busy_s += build_s + after_s
         w.steps += 1
         self.step_count += 1
+        self.step_counts_by_key[(node, walk)] = (
+            self.step_counts_by_key.get((node, walk), 0) + 1
+        )
 
         self.cal.push(post_end, EventType.STEP_DONE, (rank, node, walk, items))
 
@@ -743,15 +781,15 @@ class Simulator:
         window/stride arithmetic — and therefore how often the consumer runs
         per producer token — is the deployment's, not the simulator's.
         """
-        node = edge.next_node
-        policy = req.stream_policies.get(node)
-        if policy is None:
-            policy = self._chunk_policy_for(node)
-            req.stream_policies[node] = policy
-        req.stream_buffers[node] = req.stream_buffers.get(node, 0) + 1
+        key = f"{edge.next_node}:{edge.name}"
+        if key not in req.stream_policies:
+            req.stream_policies[key] = self._chunk_policy_for(edge.name)
+        policy = req.stream_policies[key]
+        req.stream_buffers[key] = req.stream_buffers.get(key, 0) + 1
 
         if policy is None:
             return True  # no declared policy: consume item-by-item
+        node = key
         buffered = req.stream_buffers[node]
         if not policy.is_ready(buffered):
             return False
@@ -760,22 +798,21 @@ class Simulator:
         req.stream_buffers[node] = max(0, buffered - take)
         return True
 
-    def _chunk_policy_for(self, consumer_node: str) -> Any:
-        """A fresh ChunkPolicy for a consumer, from the partition topology."""
-        import copy as _copy
+    def _chunk_policy_for(self, edge_name: str) -> Any:
+        """A fresh ChunkPolicy for a streaming edge, from the model's topology.
 
+        ``Connection`` keys on the edge name and hands out policies through a
+        factory, so each request gets its own policy instance with its own
+        consumed-item counter — the same lifetime the real StreamBuffer gives
+        it.
+        """
         topo = self.dep.partition_topology
-        for attr in ("connections", "_connections"):
-            conns = getattr(topo, attr, None)
-            if not conns:
+        for conn in (getattr(topo, "connections", None) or []):
+            if getattr(conn, "edge_name", None) != edge_name:
                 continue
-            for conn in (conns.values() if isinstance(conns, dict) else conns):
-                policy = getattr(conn, "chunk_policy", None)
-                target = getattr(conn, "consumer_node", None) or getattr(
-                    conn, "next_node", None
-                )
-                if policy is not None and (target is None or target == consumer_node):
-                    return _copy.deepcopy(policy)
+            factory = getattr(conn, "chunk_policy_factory", None)
+            if factory is not None:
+                return factory()
         return None
 
     @staticmethod
@@ -822,6 +859,10 @@ class Simulator:
             self._admit_waiting()
             return
         kind, rid, walk = payload
+        if kind == "ingest":
+            self.waiting.append(rid)
+            self._admit_waiting()
+            return
         if kind != "walk_done":
             return
         req = self.requests.get(rid)

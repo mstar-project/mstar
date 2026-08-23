@@ -86,6 +86,13 @@ class EngineManager:
         (model=None or get_submodule returns None), engines run without
         real computation.
         """
+        # Hollow mode: swap in a fake engine before any submodule is built,
+        # so no weights load and no GPU work runs. Everything above the
+        # engine — worker, scheduler, graph routing — is untouched.
+        from mstar.sim.hollow import hollow_enabled, install as install_hollow
+        if hollow_enabled():
+            install_hollow(model)
+
         node_to_engine_type = model.get_node_engine_types()
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
@@ -107,7 +114,7 @@ class EngineManager:
         # audio-codec vocoders, whose stateless engine locks autocast off)
         # don't use the meta+to_empty path and simply ignore this hint.
         node_submodules: dict[str, torch.nn.Module | None] = {}
-        if model is not None:
+        if model is not None and not hollow_enabled():
             for name in node_names:
                 node_tp_group = parallel_groups.get_tp_config_for_node(name)
                 # Sequence parallelism is opt-in per node; only forward the SP

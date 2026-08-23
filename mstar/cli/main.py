@@ -243,6 +243,14 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("rest", nargs=argparse.REMAINDER)
     calibrate.set_defaults(func=_calibrate)
 
+    validate = sub.add_parser(
+        "validate",
+        help="score a simulation against a measured run",
+        add_help=False,
+    )
+    validate.add_argument("rest", nargs=argparse.REMAINDER)
+    validate.set_defaults(func=_validate)
+
     simulate = sub.add_parser(
         "simulate",
         help="simulate a workload against a deployment config (no GPU needed)",
@@ -267,6 +275,11 @@ def _harvest(args: argparse.Namespace) -> None:
 def _calibrate(args: argparse.Namespace) -> None:
     from mstar.sim.calibration import main as calibrate_main
     raise SystemExit(calibrate_main(args.rest))
+
+
+def _validate(args: argparse.Namespace) -> None:
+    from mstar.sim.validate_cli import main as validate_main
+    raise SystemExit(validate_main(args.rest))
 
 
 def _simulate(args: argparse.Namespace) -> None:

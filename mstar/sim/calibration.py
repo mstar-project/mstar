@@ -167,8 +167,11 @@ def main(argv: list[str] | None = None) -> int:
     for field_name, value in asdict(tm).items():
         n = diag.get(f"{field_name}_n")
         origin = f"{n} observations" if n else "default (not measured)"
-        unit = value * 1e3
-        print(f"  {field_name:<28} {unit:9.4f} ms   [{origin}]")
+        # Only the *_s fields are durations; bandwidth is not.
+        if field_name.endswith("_s"):
+            print(f"  {field_name:<28} {value * 1e3:9.4f} ms   [{origin}]")
+        else:
+            print(f"  {field_name:<28} {value:9.1f}      [{origin}]")
     print(f"wrote {args.out}")
     return 0
 

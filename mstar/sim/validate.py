@@ -63,8 +63,15 @@ def gate_v1_semantics(
     sim_steps: dict[tuple[str, str], int],
     measured_step_log: list[dict],
     tolerance: float = 0.10,
+    absolute_slack: int = 2,
 ) -> GateResult:
-    """Simulated vs measured step counts per (node, walk)."""
+    """Simulated vs measured step counts per (node, walk).
+
+    Judged on relative error, with ``absolute_slack`` steps of grace: on a
+    node that runs a handful of times (a prefill in a short run), one step of
+    difference is 12% and means nothing, while on a decode loop running
+    thousands of steps the same percentage is a real divergence.
+    """
     measured: dict[tuple[str, str], int] = {}
     for rec in measured_step_log:
         key = (rec["node"], rec["graph_walk"])
@@ -72,25 +79,42 @@ def gate_v1_semantics(
 
     rows = [("node/walk", "sim", "real", "rel_err")]
     worst = 0.0
+    worst_key = ""
     for key in sorted(set(sim_steps) | set(measured)):
         s = sim_steps.get(key, 0)
         m = measured.get(key, 0)
         err = _rel_err(s, m)
-        worst = max(worst, err if err != float("inf") else 1.0)
+        err = err if err != float("inf") else 1.0
         rows.append((f"{key[0]}/{key[1]}", s, m, f"{err * 100:.1f}%"))
+        if abs(s - m) <= absolute_slack:
+            continue
+        if err > worst:
+            worst, worst_key = err, f"{key[0]}/{key[1]}"
 
     return GateResult(
         name="V1 semantics — per-(node,walk) step counts",
         passed=worst <= tolerance,
-        detail=f"worst relative error {worst * 100:.1f}% (tolerance {tolerance * 100:.0f}%)",
+        detail=(
+            f"worst relative error {worst * 100:.1f}%"
+            + (f" ({worst_key})" if worst_key else "")
+            + f" (tolerance {tolerance * 100:.0f}%, "
+            f"ignoring differences of <={absolute_slack} steps)"
+        ),
         rows=rows,
     )
 
 
 def gate_v2_step_costs(
     db, model: str, measured_step_log: list[dict], tolerance: float = 0.05,
+    min_observations: int = 5,
 ) -> GateResult:
-    """Stepdb lookups vs the measured step times, per bucket."""
+    """Stepdb lookups vs the measured step times, per bucket.
+
+    Only buckets with at least ``min_observations`` samples are judged. A
+    bucket seen once has no distribution to compare against — its single
+    sample may be the warmup replay — and scoring the table against it says
+    more about sampling luck than about the table.
+    """
     from mstar.sim.harvest import bucket_kv
     from mstar.sim.stepdb import StepKey
 
@@ -110,25 +134,33 @@ def gate_v2_step_costs(
 
     rows = [("node/walk", "bs", "kv", "sim_ms", "real_ms", "rel_err", "n")]
     worst = 0.0
+    judged = skipped = 0
     for (key, kv), obs in sorted(
         by_key.items(), key=lambda kv2: (kv2[0][0].node, kv2[0][0].padded_bs)
     )[:40]:
         cost = db.lookup(key, kv)
         real = _median(obs)
         err = _rel_err(cost.gpu_s, real)
-        worst = max(worst, err if err != float("inf") else 1.0)
+        err = err if err != float("inf") else 1.0
+        thin = len(obs) < min_observations
+        if thin:
+            skipped += 1
+        else:
+            judged += 1
+            worst = max(worst, err)
         rows.append((
             f"{key.node}/{key.graph_walk}", key.padded_bs, kv,
             f"{cost.gpu_s * 1e3:.3f}", f"{real * 1e3:.3f}",
-            f"{err * 100:.1f}%", len(obs),
+            f"{err * 100:.1f}%", f"{len(obs)}{' (thin)' if thin else ''}",
         ))
 
     return GateResult(
         name="V2 step costs — stepdb vs measured GPU time",
-        passed=worst <= tolerance,
+        passed=judged > 0 and worst <= tolerance,
         detail=(
-            f"worst relative error {worst * 100:.1f}% over {len(by_key)} buckets "
-            f"(tolerance {tolerance * 100:.0f}%); self-consistency check"
+            f"worst relative error {worst * 100:.1f}% over {judged} buckets "
+            f"with >={min_observations} samples ({skipped} thin buckets not "
+            f"judged); tolerance {tolerance * 100:.0f}%; self-consistency check"
         ),
         rows=rows,
     )
