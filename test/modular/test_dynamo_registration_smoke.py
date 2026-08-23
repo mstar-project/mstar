@@ -25,6 +25,7 @@ def test_registration_vocabulary():
     assert str(ModelType.Chat | ModelType.Images) == "chat,images"
     assert str(ModelType.Chat | ModelType.Audios) == "chat,audios"
     assert str(ModelType.Videos) == "videos"
+    assert str(ModelType.Realtime) == "realtime"
     for name in ("Chat", "Completions", "Embedding", "Images", "Videos",
                  "Audios", "Realtime", "TensorBased"):
         assert hasattr(ModelType, name), name
@@ -49,6 +50,8 @@ def test_every_adapter_surface_maps():
             assert _model_type(adapter) is not None, name
         if getattr(adapter, "supports_videos", False):
             assert True  # registered separately on the videos endpoint
+        if getattr(adapter, "supports_realtime", False):
+            assert True  # registered separately on the realtime endpoint
 
 
 def _minimal_model_dir(tmp_path):
@@ -120,6 +123,20 @@ def test_register_model_in_process(tmp_path):
                 speech,
                 model_dir,
                 "citest-tts",
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+            )
+            # Realtime: card-only mask on its own endpoint, served via the
+            # bidirectional binding (presence-checked here; serving it needs
+            # a live connection).
+            realtime = runtime.endpoint("mstar.citest.generate_realtime")
+            assert hasattr(realtime, "serve_bidirectional_endpoint")
+            await register_model(
+                ModelInput.Text,
+                ModelType.Realtime,
+                realtime,
+                model_dir,
+                "citest",
                 worker_type=WorkerType.Aggregated,
                 needs=[],
             )

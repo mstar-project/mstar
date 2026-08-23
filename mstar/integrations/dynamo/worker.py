@@ -6,8 +6,9 @@ uvicorn, the server registers with the Dynamo runtime and serves the
 bridge handlers. Registration derives from the model's OpenAI adapter
 capabilities: chat, speech, and images share one endpoint (their bodies
 are distinguishable), video generation gets its own (a minimal video
-body looks like an image body). The realtime surface still needs its
-wire format mapped.
+body looks like an image body), and realtime gets its own bidirectional
+endpoint (streaming-input requests are a different wire shape than the
+unary ones).
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from mstar.api_server.openai.adapters import get_adapter
-from mstar.integrations.dynamo.bridges import RequestBridge
+from mstar.integrations.dynamo.bridges import RealtimeBridge, RequestBridge
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
@@ -100,7 +101,8 @@ def serve(server: APIServer, model_name: str, args) -> None:
     adapter = get_adapter(model_name)
     model_type = _model_type(adapter) if adapter is not None else None
     supports_videos = adapter is not None and getattr(adapter, "supports_videos", False)
-    if model_type is None and not supports_videos:
+    supports_realtime = adapter is not None and getattr(adapter, "supports_realtime", False)
+    if model_type is None and not supports_videos and not supports_realtime:
         raise SystemExit(
             f"model {model_name!r} has no OpenAI adapter surface to register; "
             "models without one are served via the native /generate only"
@@ -143,6 +145,23 @@ def serve(server: APIServer, model_name: str, args) -> None:
             )
             surfaces.append((f"{args.endpoint}_videos={ModelType.Videos}",
                              video_ep.serve_endpoint(bridge.videos, graceful_shutdown=True)))
+        if supports_realtime:
+            realtime_bridge = RealtimeBridge(server, adapter, served)
+            realtime_ep = runtime.endpoint(
+                f"{args.namespace}.{args.component}.{args.endpoint}_realtime"
+            )
+            await register_model(
+                ModelInput.Text,
+                ModelType.Realtime,
+                realtime_ep,
+                args.model_path,
+                served,
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+            )
+            surfaces.append((f"{args.endpoint}_realtime={ModelType.Realtime}",
+                             realtime_ep.serve_bidirectional_endpoint(
+                                 realtime_bridge.generate, graceful_shutdown=True)))
         logger.info(
             "MSTAR_DYNAMO_READY model=%s component=%s.%s surfaces=%s",
             served, args.namespace, args.component,

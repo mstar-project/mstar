@@ -14,11 +14,16 @@ the same per-model adapters the native ``/v1`` routes use, submitted via
   unwraps ``b64_json`` into a raw audio-bytes response;
 - videos: a single ``NvVideosResponse``-shaped dict carrying the mp4 as
   ``b64_json``, served on its own endpoint (a minimal video body is not
-  distinguishable from an image body, so they can't share one).
+  distinguishable from an image body, so they can't share one);
+- realtime: OpenAI Realtime events over a bidirectional endpoint
+  (:class:`RealtimeBridge`) — appended audio is committed into independent
+  chat-shaped requests whose text/audio chunks stream back as
+  ``response.*`` events.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
@@ -335,15 +340,372 @@ class RequestBridge:
     # ------------------------------------------------------------------
 
     def _submit(self, args: SubmitArgs, prefix: str) -> str:
-        rid = f"{prefix}-{uuid.uuid4()}"
-        self.server.submit_request(
-            text=args.text,
-            file_paths=args.file_paths,
-            input_modalities=args.input_modalities,
-            output_modalities=args.output_modalities,
-            model_kwargs=args.model_kwargs,
-            streaming=True,
-            request_id=rid,
-        )
-        logger.info("request %s submitted (out=%s)", rid, args.output_modalities)
-        return rid
+        return _submit(self.server, args, prefix)
+
+
+def _submit(server: APIServer, args: SubmitArgs, prefix: str) -> str:
+    rid = f"{prefix}-{uuid.uuid4()}"
+    server.submit_request(
+        text=args.text,
+        file_paths=args.file_paths,
+        input_modalities=args.input_modalities,
+        output_modalities=args.output_modalities,
+        model_kwargs=args.model_kwargs,
+        streaming=True,
+        request_id=rid,
+    )
+    logger.info("request %s submitted (out=%s)", rid, args.output_modalities)
+    return rid
+
+
+# ----------------------------------------------------------------------
+# realtime
+# ----------------------------------------------------------------------
+
+# Template end-of-turn tokens stripped from transcript deltas (they close the
+# model's chat turn; they are not speech transcript).
+_TEMPLATE_END_TOKENS = ("<|im_end|>",)
+
+
+def _event_id() -> str:
+    return f"event_{uuid.uuid4().hex}"
+
+
+def _decode_pcm16_b64(audio_b64) -> bytes | None:
+    """Base64 PCM16 append payload -> raw bytes; None when empty or malformed.
+
+    PCM16 is 2-byte aligned; a bad frame is dropped rather than tearing down
+    the whole session.
+    """
+    if not audio_b64 or not isinstance(audio_b64, str):
+        return None
+    try:
+        raw = base64.b64decode(audio_b64)
+    except Exception:  # noqa: BLE001 — drop the malformed chunk, keep the session
+        return None
+    if not raw or len(raw) % 2:
+        return None
+    return raw
+
+
+def _drain(queue: asyncio.Queue) -> None:
+    while not queue.empty():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+
+class _RealtimeTurn:
+    """One committed utterance and the response events it produces.
+
+    ``events`` buffers this turn's server events for in-order forwarding
+    (``None`` marks the end of the turn's response); bounded so a turn
+    waiting for its forwarding slot backpressures its own engine drain
+    instead of buffering without limit.
+    """
+
+    def __init__(self) -> None:
+        self.response_id = f"resp_{uuid.uuid4().hex}"
+        self.item_id = f"item_{uuid.uuid4().hex}"
+        self.events: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self.task: asyncio.Task | None = None
+
+
+class RealtimeBridge:
+    """Serve one ``/v1/realtime`` connection per handler invocation.
+
+    The frontend parses client frames into typed OpenAI Realtime events and
+    forwards them as dicts on ``request_stream``; every yielded dict must
+    deserialize into the frontend's typed server-event enum, so only
+    spec-shaped events leave here. Turn model (single utterance): appended
+    audio buffers until ``input_audio_buffer.commit``; each commit becomes
+    one independent chat-shaped engine request (audio in, text+audio out)
+    whose chunks are translated to ``response.*`` events. Turns may overlap
+    in the engine, but their responses are forwarded strictly in commit
+    order. ``conversation.item.*`` / ``response.*`` client events are
+    accepted and ignored.
+    """
+
+    def __init__(
+        self,
+        server: APIServer,
+        adapter,
+        served_model_name: str,
+        max_concurrent_turns: int = 2,
+    ) -> None:
+        self.server = server
+        self.adapter = adapter
+        self.served_model_name = served_model_name
+        self.max_concurrent_turns = max_concurrent_turns
+
+    # -- server-event shapes -------------------------------------------
+
+    @staticmethod
+    def _session_updated(session) -> dict:
+        return {"type": "session.updated", "event_id": _event_id(), "session": session}
+
+    @staticmethod
+    def _committed(turn: _RealtimeTurn) -> dict:
+        return {
+            "type": "input_audio_buffer.committed",
+            "event_id": _event_id(),
+            "previous_item_id": None,
+            "item_id": turn.item_id,
+        }
+
+    @staticmethod
+    def _error(message: str, *, etype: str = "server_error", code: str | None = None) -> dict:
+        return {
+            "type": "error",
+            "event_id": _event_id(),
+            "error": {"type": etype, "code": code, "message": message},
+        }
+
+    @staticmethod
+    def _response(turn: _RealtimeTurn, status: str, modalities: list[str],
+                  status_details: dict | None = None) -> dict:
+        response: dict = {
+            "id": turn.response_id,
+            "object": "realtime.response",
+            "max_output_tokens": "inf",
+            "output": [],
+            "output_modalities": modalities,
+            "status": status,
+        }
+        if status_details is not None:
+            response["status_details"] = status_details
+        return response
+
+    def _response_created(self, turn: _RealtimeTurn, modalities: list[str]) -> dict:
+        return {"type": "response.created", "event_id": _event_id(),
+                "response": self._response(turn, "in_progress", modalities)}
+
+    def _response_done(self, turn: _RealtimeTurn, modalities: list[str],
+                       status: str = "completed",
+                       status_details: dict | None = None) -> dict:
+        return {"type": "response.done", "event_id": _event_id(),
+                "response": self._response(turn, status, modalities, status_details)}
+
+    @staticmethod
+    def _content_event(etype: str, turn: _RealtimeTurn, **fields) -> dict:
+        return {
+            "type": etype,
+            "event_id": _event_id(),
+            "response_id": turn.response_id,
+            "item_id": turn.item_id,
+            "output_index": 0,
+            "content_index": 0,
+            **fields,
+        }
+
+    # -- utterance -> engine -------------------------------------------
+
+    def _utterance_args(self, session, pcm: bytes) -> SubmitArgs:
+        """Build the chat-shaped submit args for one committed utterance.
+
+        The body is exactly what the native ``/v1/chat/completions`` route
+        would see (one user turn with an ``input_audio`` part), so the
+        model's chat adapter does the whole translation.
+        """
+        from mstar.api_server import media_io
+
+        session = session if isinstance(session, dict) else {}
+        audio_cfg = session.get("audio") or {}
+        fmt = (audio_cfg.get("input") or {}).get("format") or {}
+        rate = int(fmt.get("rate") or 24000) if isinstance(fmt, dict) else 24000
+        wav = media_io.pcm16_to_wav_bytes(pcm, rate)
+
+        body: dict = {
+            "model": self.served_model_name,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64.b64encode(wav).decode("ascii"),
+                        "format": "wav",
+                    },
+                }],
+            }],
+        }
+        modalities = session.get("output_modalities")
+        text_only = isinstance(modalities, list) and modalities and "audio" not in modalities
+        if not text_only:
+            body["modalities"] = ["audio"]
+        voice = (audio_cfg.get("output") or {}).get("voice")
+        if voice:
+            body["audio"] = {"voice": voice}
+        max_tokens = session.get("max_output_tokens")
+        if isinstance(max_tokens, int):
+            body["max_completion_tokens"] = max_tokens
+
+        req = ChatCompletionRequest.model_validate(body)
+        return self.adapter.chat_to_request(req, self.server.upload_dir)
+
+    async def _run_turn(self, turn: _RealtimeTurn, args: SubmitArgs, context) -> None:
+        """Drive one utterance through the engine and buffer its events.
+
+        Always closes ``turn.events`` with the ``None`` sentinel; failures
+        emit ``error`` plus a terminal ``response.done(status=failed)`` that
+        carries the response id, so the client can correlate.
+        """
+        events = turn.events
+        want_audio = "audio" in args.output_modalities
+        modalities = ["audio"] if want_audio else ["text"]
+        try:
+            await events.put(self._response_created(turn, modalities))
+            rid = _submit(self.server, args, prefix="rt")
+            sent_audio = False
+            stopped = False
+            text_parts: list[str] = []
+            try:
+                async for chunk in self.server.iter_result_chunks(rid):
+                    if context is not None and context.is_stopped():
+                        stopped = True
+                        break
+                    if chunk.modality == "text":
+                        delta = chunk.data.decode("utf-8", "replace")
+                        for token in _TEMPLATE_END_TOKENS:
+                            delta = delta.replace(token, "")
+                        if not delta:
+                            continue
+                        text_parts.append(delta)
+                        etype = ("response.output_audio_transcript.delta" if want_audio
+                                 else "response.output_text.delta")
+                        await events.put(self._content_event(etype, turn, delta=delta))
+                    elif chunk.modality == "audio":
+                        sent_audio = True
+                        await events.put(self._content_event(
+                            "response.output_audio.delta", turn,
+                            delta=base64.b64encode(chunk.data).decode("ascii")))
+                    elif chunk.modality == "error":
+                        raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+            finally:
+                self.server.abort_request(rid)
+            if stopped:
+                # Connection torn down mid-turn; claim no completed response.
+                return
+            if sent_audio:
+                await events.put(self._content_event("response.output_audio.done", turn))
+            if not want_audio:
+                await events.put(self._content_event(
+                    "response.output_text.done", turn, text="".join(text_parts)))
+            await events.put(self._response_done(turn, modalities))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — engine failures travel in-band
+            logger.exception("realtime turn %s failed", turn.response_id)
+            await events.put(self._error(str(exc), code="generation_error"))
+            await events.put(self._response_done(
+                turn, modalities, status="failed",
+                status_details={
+                    "type": "failed",
+                    "error": {"code": "generation_error", "type": "server_error"},
+                }))
+        finally:
+            await events.put(None)
+
+    # -- connection orchestration --------------------------------------
+
+    async def generate(self, request_stream, context=None):
+        """Bidirectional endpoint handler; one invocation per connection.
+
+        A pump task demuxes client events and buffers audio; each commit
+        spawns a turn task (capped by a semaphore) whose buffered events the
+        loop below forwards in commit order, one turn's response completing
+        before the next begins. Request-stream end is not cancellation —
+        the turns already in flight finish and their responses flush.
+        """
+        out_stream: asyncio.Queue = asyncio.Queue()
+        turns: list[_RealtimeTurn] = []
+        session = None
+        pcm = bytearray()
+        slots = asyncio.Semaphore(self.max_concurrent_turns)
+
+        async def pump() -> None:
+            nonlocal session, pcm
+            try:
+                async for event in request_stream:
+                    if context is not None and context.is_stopped():
+                        break
+                    etype = event.get("type") if isinstance(event, dict) else None
+                    if etype == "session.update":
+                        session = event.get("session")
+                        fmt = {}
+                        if isinstance(session, dict):
+                            fmt = ((session.get("audio") or {}).get("input") or {}).get("format") or {}
+                        if isinstance(fmt, dict) and fmt.get("type") not in (None, "audio/pcm"):
+                            out_stream.put_nowait(self._error(
+                                f"unsupported input audio format {fmt.get('type')!r}; "
+                                "only audio/pcm is supported",
+                                etype="invalid_request_error",
+                                code="unsupported_audio_format"))
+                        out_stream.put_nowait(self._session_updated(session))
+                    elif etype == "input_audio_buffer.append":
+                        raw = _decode_pcm16_b64(event.get("audio", ""))
+                        if raw is None:
+                            logger.warning("realtime: dropping malformed audio append")
+                        else:
+                            pcm.extend(raw)
+                    elif etype == "input_audio_buffer.commit":
+                        if not pcm:
+                            out_stream.put_nowait(self._error(
+                                "input audio buffer is empty",
+                                etype="invalid_request_error",
+                                code="input_audio_buffer_commit_empty"))
+                            continue
+                        try:
+                            args = self._utterance_args(session, bytes(pcm))
+                        except Exception as exc:  # noqa: BLE001 — keep the session usable
+                            logger.exception("realtime: building the utterance request failed")
+                            out_stream.put_nowait(self._error(
+                                str(exc), etype="invalid_request_error"))
+                            pcm = bytearray()
+                            continue
+                        pcm = bytearray()
+                        await slots.acquire()
+                        turn = _RealtimeTurn()
+                        turns.append(turn)
+                        out_stream.put_nowait(self._committed(turn))
+                        out_stream.put_nowait(turn)
+                        turn.task = asyncio.create_task(self._run_turn(turn, args, context))
+                        turn.task.add_done_callback(lambda _: slots.release())
+                    elif etype == "input_audio_buffer.clear":
+                        pcm = bytearray()
+                    else:
+                        logger.debug("realtime: ignoring client event %s", etype)
+            finally:
+                # No more turns/events will be queued; the forwarder stops
+                # after draining every turn already on out_stream.
+                out_stream.put_nowait(None)
+
+        pump_task = asyncio.create_task(pump())
+        try:
+            while True:
+                item = await out_stream.get()
+                if item is None:
+                    break
+                if isinstance(item, _RealtimeTurn):
+                    while True:
+                        event = await item.events.get()
+                        if event is None:
+                            break
+                        yield event
+                    turns.remove(item)
+                else:
+                    yield item
+        finally:
+            pump_task.cancel()
+            for turn in turns:
+                if turn.task is not None:
+                    turn.task.cancel()
+            # Unblock turn tasks parked on a full events queue so their
+            # cancellation propagates, then drive everything to completion.
+            for turn in turns:
+                _drain(turn.events)
+            await asyncio.gather(
+                pump_task,
+                *(turn.task for turn in turns if turn.task is not None),
+                return_exceptions=True,
+            )

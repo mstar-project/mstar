@@ -1,12 +1,19 @@
-"""Unit tests for the Dynamo request bridges (body translation only — no
-server, no Dynamo runtime). The registration mapping tests skip when the
-ai-dynamo bindings aren't installed."""
+"""Unit tests for the Dynamo request bridges (body translation and the
+realtime event translation against a seam double — no server, no Dynamo
+runtime). The registration mapping tests skip when the ai-dynamo bindings
+aren't installed."""
+
+import asyncio
+import base64
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.openai.protocol import SpeechRequest, VideoGenerationRequest
 from mstar.integrations.dynamo.bridges import (
+    RealtimeBridge,
     _clean,
     _image_body,
     _speech_body,
@@ -111,3 +118,195 @@ def test_model_type_mapping():
     # cosmos3's video surface registers on its own endpoint, not in this mask
     assert str(_model_type(get_adapter("cosmos3"))) == "images"
     assert get_adapter("cosmos3").supports_videos
+
+
+def test_realtime_surface_flags():
+    # Realtime registers on its own bidirectional endpoint, gated by the flag.
+    assert ADAPTER_REGISTRY["qwen3_omni"].supports_realtime
+    assert not ADAPTER_REGISTRY["orpheus"].supports_realtime
+    assert not ADAPTER_REGISTRY["bagel"].supports_realtime
+
+
+# ----------------------------------------------------------------------
+# realtime bridge (seam double; no engine)
+# ----------------------------------------------------------------------
+
+PCM = b"\x00\x10" * 200  # 200 PCM16 samples
+
+
+class _Ctx:
+    def __init__(self):
+        self.stopped = False
+
+    def is_stopped(self):
+        return self.stopped
+
+
+class _FakeRealtimeServer:
+    """Seam double: records submits, streams scripted chunks, records aborts.
+    Optionally flips ``stop_ctx.stopped`` after ``stop_after`` chunks."""
+
+    def __init__(self, chunks, upload_dir, stop_ctx=None, stop_after=None):
+        self.chunks = chunks
+        self.upload_dir = Path(upload_dir)
+        self.submitted = []
+        self.aborted = []
+        self._stop_ctx = stop_ctx
+        self._stop_after = stop_after
+
+    def submit_request(self, **kwargs):
+        self.submitted.append(kwargs)
+        return kwargs.get("request_id")
+
+    async def iter_result_chunks(self, request_id):
+        for i, chunk in enumerate(self.chunks):
+            yield chunk
+            if self._stop_ctx is not None and i + 1 == self._stop_after:
+                self._stop_ctx.stopped = True
+
+    def abort_request(self, request_id):
+        self.aborted.append(request_id)
+
+
+async def _client_events(items):
+    for item in items:
+        yield item
+
+
+def _run_connection(server, events):
+    bridge = RealtimeBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+    ctx = server._stop_ctx or _Ctx()
+
+    async def collect():
+        out = []
+        async for event in bridge.generate(_client_events(events), ctx):
+            out.append(event)
+        return out
+
+    return asyncio.run(collect())
+
+
+def _chunk(modality, data):
+    return SimpleNamespace(modality=modality, data=data, metadata={})
+
+
+def test_realtime_full_turn(tmp_path):
+    server = _FakeRealtimeServer([
+        _chunk("text", b"hello"),
+        _chunk("audio", b"\x01\x02\x03\x04"),
+        _chunk("text", b"<|im_end|>"),  # bare end token: stripped, no delta
+    ], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {
+            "type": "realtime", "model": "q3o",
+            "audio": {"output": {"voice": "cherry"}},
+        }},
+        {"type": "input_audio_buffer.append",
+         "audio": base64.b64encode(PCM).decode("ascii")},
+        {"type": "input_audio_buffer.commit"},
+    ])
+
+    assert [e["type"] for e in out] == [
+        "session.updated",
+        "input_audio_buffer.committed",
+        "response.created",
+        "response.output_audio_transcript.delta",
+        "response.output_audio.delta",
+        "response.output_audio.done",
+        "response.done",
+    ]
+    audio_delta = next(e for e in out if e["type"] == "response.output_audio.delta")
+    assert base64.b64decode(audio_delta["delta"]) == b"\x01\x02\x03\x04"
+    assert out[-1]["response"]["status"] == "completed"
+    # Every content event carries the same response/item ids.
+    rids = {e["response_id"] for e in out if "response_id" in e}
+    assert rids == {out[-1]["response"]["id"]}
+
+    # The submit is chat-shaped: the committed buffer landed as a WAV file,
+    # speech output was requested, and the session voice mapped through.
+    sub = server.submitted[0]
+    assert sub["input_modalities"] == ["audio"]
+    assert sub["output_modalities"] == ["text", "audio"]
+    assert sub["model_kwargs"]["voice"] == "cherry"
+    wav = Path(sub["file_paths"]["audio"][0]).read_bytes()
+    assert wav[:4] == b"RIFF" and PCM in wav
+    assert server.aborted  # release runs even on clean completion
+
+
+def test_realtime_empty_commit_errors(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o"}},
+        {"type": "input_audio_buffer.commit"},
+    ])
+    assert [e["type"] for e in out] == ["session.updated", "error"]
+    assert out[1]["error"]["code"] == "input_audio_buffer_commit_empty"
+    assert not server.submitted
+
+
+def test_realtime_text_only_session(tmp_path):
+    server = _FakeRealtimeServer([
+        _chunk("text", b"a"),
+        _chunk("text", b"b"),
+    ], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {
+            "type": "realtime", "model": "q3o", "output_modalities": ["text"],
+        }},
+        {"type": "input_audio_buffer.append",
+         "audio": base64.b64encode(PCM).decode("ascii")},
+        {"type": "input_audio_buffer.commit"},
+    ])
+    types = [e["type"] for e in out]
+    assert types == [
+        "session.updated",
+        "input_audio_buffer.committed",
+        "response.created",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.done",
+    ]
+    assert next(e for e in out if e["type"] == "response.output_text.done")["text"] == "ab"
+    assert out[-1]["response"]["output_modalities"] == ["text"]
+    assert server.submitted[0]["output_modalities"] == ["text"]
+
+
+def test_realtime_bad_input_is_survivable(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    out = _run_connection(server, [
+        # Non-PCM input format: error event, session stays usable.
+        {"type": "session.update", "session": {
+            "type": "realtime", "model": "q3o",
+            "audio": {"input": {"format": {"type": "audio/pcmu"}}},
+        }},
+        # Odd-length payload: dropped, so the buffer stays empty.
+        {"type": "input_audio_buffer.append",
+         "audio": base64.b64encode(b"\x00\x10\x20").decode("ascii")},
+        {"type": "input_audio_buffer.commit"},
+    ])
+    types = [e["type"] for e in out]
+    assert types == ["error", "session.updated", "error"]
+    assert out[0]["error"]["code"] == "unsupported_audio_format"
+    assert out[2]["error"]["code"] == "input_audio_buffer_commit_empty"
+    assert not server.submitted
+
+
+def test_realtime_stop_mid_turn(tmp_path):
+    ctx = _Ctx()
+    server = _FakeRealtimeServer([
+        _chunk("text", b"partial"),
+        _chunk("audio", b"\x01\x02"),
+    ], tmp_path, stop_ctx=ctx, stop_after=1)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o"}},
+        {"type": "input_audio_buffer.append",
+         "audio": base64.b64encode(PCM).decode("ascii")},
+        {"type": "input_audio_buffer.commit"},
+    ])
+    types = [e["type"] for e in out]
+    # The first chunk made it out; the turn then observed the stop and
+    # claimed no completed response.
+    assert "response.output_audio_transcript.delta" in types
+    assert "response.done" not in types
+    assert server.aborted
