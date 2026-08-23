@@ -72,7 +72,7 @@ def test_outputs_are_real_tensors_the_worker_can_count(engine):
     out = engine.execute_batch(_batch(["r0", "r1"]))
     for rid in ("r0", "r1"):
         assert rid in out.per_request_output_tensors
-        for name, tensors in out.per_request_output_tensors[rid].items():
+        for tensors in out.per_request_output_tensors[rid].values():
             assert tensors and isinstance(tensors[0], torch.Tensor)
             # The worker's token accounting is tensor.numel(); a zero-element
             # tensor would silently count as no token.
@@ -144,8 +144,8 @@ def test_delay_uses_the_cost_table_when_present(tmp_path):
 
 
 def test_install_redirects_every_engine_factory():
-    from mstar.worker import engine_manager as em
     from mstar.sim.hollow import install
+    from mstar.worker import engine_manager as em
 
     kv_before = dict(em.ENGINE_TYPE_FACTORIES)
     stateless_before = dict(em.STATELESS_FLAVOR_FACTORIES)
