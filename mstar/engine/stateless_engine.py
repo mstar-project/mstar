@@ -502,6 +502,17 @@ class StatelessEngine(BaseEngine):
             launch_started_event.set()
         if self.enable_profile:
             batch.exec_timings.fwd_start = time.perf_counter()
+            batch.exec_timings.record_shape(
+                real_bs=len(batch.request_ids),
+                real_num_tokens=sum(
+                    getattr(i, "input_seq_len", 0) or 0 for i in inputs
+                ),
+                padded_bs=len(batch.request_ids),
+                padded_num_tokens=sum(
+                    getattr(i, "input_seq_len", 0) or 0 for i in inputs
+                ),
+                mode="eager",
+            )
         outputs = submodule.forward_batched(
             graph_walk=batch.graph_walk,
             engine_inputs=engine_inputs,
@@ -545,6 +556,17 @@ class StatelessEngine(BaseEngine):
             # Batch-level fwd_start: stamp once, on the first rid's launch.
             if self.enable_profile and batch.exec_timings.fwd_start is None:
                 batch.exec_timings.fwd_start = time.perf_counter()
+                batch.exec_timings.record_shape(
+                    real_bs=len(batch.request_ids),
+                    real_num_tokens=sum(
+                        getattr(i, "input_seq_len", 0) or 0 for i in inputs
+                    ),
+                    padded_bs=len(batch.request_ids),
+                    padded_num_tokens=sum(
+                        getattr(i, "input_seq_len", 0) or 0 for i in inputs
+                    ),
+                    mode="sequential",
+                )
             outputs[rid] = submodule.forward(
                 graph_walk=batch.graph_walk,
                 engine_inputs=engine_inputs,

@@ -26,6 +26,8 @@ from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
+from mstar.sim.steplog import make_record as make_step_record
+from mstar.sim.steplog import writer_for_worker as _step_log_writer
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -105,6 +107,30 @@ class EvictionPolicy(Enum):
     """Strategy for choosing which request to offload to CPU on OOM."""
     LRU = "lru"              # least-recently-used (by execution time)
     MOST_PAGES = "most_pages"  # request holding the most GPU pages
+
+
+
+def _sum_kv_len(batch: NodeBatch) -> int | None:
+    """Total KV context across a batch's requests, after the step.
+
+    Reads the seq_info the engine's ``finalize_batch`` mirrors back onto
+    ``per_request_info``. Sums the "main" label only: CFG branch labels are
+    separate caches whose lengths track main, and counting them would double
+    the reported context. Returns None when no request carried seq_info
+    (a stateless node, which has no KV at all).
+    """
+    total = 0
+    found = False
+    for info in batch.per_request_info.values():
+        per_label = getattr(info, "per_label_seq_info", None)
+        if per_label is None:
+            continue
+        for label_map in per_label.info.values():
+            seq_info = label_map.get("main")
+            if seq_info is not None:
+                total += seq_info.seq_len
+                found = True
+    return total if found else None
 
 
 class Worker:
@@ -271,6 +297,13 @@ class Worker:
             node_engine_types=node_engine_types,
         )
         self.engine_manager.set_alloc_write_policies(write_policy)
+
+        # Per-step trace (mstar.sim.steplog). Opt-in via MSTAR_STEP_LOG and
+        # only meaningful with profiling on, since it reports the CUDA-event
+        # GPU time and the engine's CPU phase spans.
+        self._step_log = _step_log_writer(worker_id) if self.enable_prof else None
+        self._model_name_for_log = type(model).__name__ if model is not None else ""
+
         logger.info(
             "Worker %s: store write policy = %s", worker_id, write_policy.value
         )
@@ -1174,6 +1207,21 @@ class Worker:
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
 
+
+    def _tp_size_for(self, node_name: str) -> int:
+        """TP world size for a node, or 1 when it isn't tensor-parallel."""
+        try:
+            return self.parallel_groups.get_tp_config_for_node(node_name).world_size
+        except Exception:
+            return 1
+
+    def _sp_size_for(self, node_name: str) -> int:
+        """Ulysses SP world size for a node, or 1 when it isn't sequence-parallel."""
+        try:
+            return self.parallel_groups.get_sp_config_for_node(node_name).world_size
+        except Exception:
+            return 1
+
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1223,7 +1271,12 @@ class Worker:
         try:
             output = engine.execute_with_max_batch_size(node_batch)
             if torch.cuda.is_available():
-                event = torch.cuda.Event()
+                # enable_timing only when profiling: it is what lets
+                # _postprocess_batch pair this event with the engine's
+                # gpu_start_event for a true GPU-busy measurement. Timing
+                # events are marginally more expensive to record, so the
+                # serving path keeps the cheap untimed event.
+                event = torch.cuda.Event(enable_timing=self.enable_prof)
                 event.record(torch.cuda.default_stream(self.device))
                 output.completion_event = event
             return output
@@ -1700,7 +1753,50 @@ class Worker:
                 torch.cuda.default_stream().synchronize()
 
         if self.enable_prof:
-            batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
+            timings = batch_N.node_batch.exec_timings
+            timings.fwd_end = time.perf_counter()
+            # True GPU-busy time for this step. Both events are on the
+            # default stream and the completion event has already been
+            # synchronized above, so elapsed_time is safe and adds no
+            # further sync. The window covers the engine's whole forward
+            # (all sub-batches of a split launch).
+            start_event = timings.gpu_start_event
+            if start_event is not None and output.completion_event is not None:
+                try:
+                    timings.gpu_time = (
+                        start_event.elapsed_time(output.completion_event) / 1e3
+                    )
+                except RuntimeError:
+                    # Event not recorded (engine returned before any launch)
+                    # or timing disabled — leave gpu_time unset rather than
+                    # failing a serving step over instrumentation.
+                    timings.gpu_time = None
+
+            # KV context this step ran against: summed over the batch's
+            # requests, read after finalize_batch mirrored the engine's
+            # seq_info back onto per_request_info. This is the POST-step
+            # length (decode has already advanced by one token).
+            timings.kv_len_total = _sum_kv_len(batch_N.node_batch)
+
+            if self._step_log is not None:
+                try:
+                    self._step_log.write(make_step_record(
+                        worker_id=self.worker_id,
+                        node=batch_N.node_name,
+                        graph_walk=batch_N.graph_walk,
+                        request_ids=batch_N.node_batch.request_ids,
+                        timings=timings,
+                        model=self._model_name_for_log,
+                        tp_size=self._tp_size_for(batch_N.node_name),
+                        sp_size=self._sp_size_for(batch_N.node_name),
+                        requires_cfg=any(
+                            getattr(i, "requires_cfg", False)
+                            for i in batch_N.node_batch.per_request_info.values()
+                        ),
+                        wall_end=timings.fwd_end,
+                    ))
+                except Exception:
+                    logger.exception("step-log write failed")
 
         if self.enable_nvtx:
             range_pop(synchronize=False)

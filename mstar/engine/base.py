@@ -234,6 +234,30 @@ class BaseEngine(ABC):
         """
         return
 
+    def record_gpu_start(self, batch: NodeBatch) -> None:
+        """Record the CUDA event that opens this step's GPU-time window.
+
+        Called by the template immediately before ``execute_forward``. The
+        worker closes the window with the completion event it already
+        records after the forward, and computes the elapsed time on the
+        sync it already performs — so this adds one event record per step
+        and no synchronization.
+
+        No-op unless profiling is on and CUDA is available. Idempotent per
+        batch: for a forward split by ``execute_with_max_batch_size`` the
+        first sub-batch's event is kept, which is the one that brackets the
+        whole split forward.
+        """
+        if not self.enable_profile:
+            return
+        if batch.exec_timings.gpu_start_event is not None:
+            return
+        if not torch.cuda.is_available():
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(torch.cuda.default_stream())
+        batch.exec_timings.gpu_start_event = event
+
     def execute_batch(self, batch: NodeBatch) -> NodeOutput:
         """Template method: prepare → plan → forward → postprocess.
 
@@ -241,17 +265,39 @@ class BaseEngine(ABC):
         recovery, finally-block state writebacks) may override this entirely
         and call the hooks themselves to keep the cleanup invariant intact.
         """
-        if self.enable_profile and batch.exec_timings.start is None:
+        prof = self.enable_profile
+        if prof and batch.exec_timings.start is None:
             batch.exec_timings.start = time.perf_counter()
+
+        t = time.perf_counter() if prof else 0.0
         prepared = self.prepare_batch(batch)
+        if prof:
+            now = time.perf_counter()
+            batch.exec_timings.prepare_s += now - t
+            t = now
         if not prepared.active_request_ids:
             return NodeOutput(
                 per_request_output_tensors={rid: {} for rid in batch.request_ids},
                 failed_requests=dict(prepared.failed_requests),
             )
         planned = self.plan_batch(prepared)
+        if prof:
+            now = time.perf_counter()
+            batch.exec_timings.plan_s += now - t
+            t = now
+        # Bracket the step's GPU work: this event goes on the default stream
+        # before the first launch of execute_forward, and the worker pairs it
+        # with the completion event it records after the whole (possibly
+        # split) forward. Only the first sub-batch's event is kept.
+        self.record_gpu_start(batch)
         output = self.execute_forward(planned)
+        if prof:
+            now = time.perf_counter()
+            batch.exec_timings.launch_s += now - t
+            t = now
         self.postprocess_batch(planned, output)
+        if prof:
+            batch.exec_timings.sample_s += time.perf_counter() - t
         # Empty output slots for skipped rids keep worker bookkeeping consistent.
         output.per_request_output_tensors.update(
             {rid: {} for rid in prepared.skipped_rids}

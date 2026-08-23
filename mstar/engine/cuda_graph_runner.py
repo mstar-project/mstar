@@ -1278,6 +1278,18 @@ class CudaGraphRunner:
             raise RuntimeError(
                 f"CudaGraphData for {key} has no slots — capture failed silently?"
             )
+
+        # Record the bucket this step actually replays into. The GPU pays for
+        # (key.bs, key.num_tokens), not the real shape — padding waste is real
+        # work — so this is the shape a cost model keys on.
+        if exec_timings is not None:
+            exec_timings.record_shape(
+                real_bs=real_bs,
+                real_num_tokens=real_num_tokens,
+                padded_bs=key.bs,
+                padded_num_tokens=key.num_tokens,
+                mode="graph",
+            )
         if slot is None:
             # Caller didn't reserve. Advance the counter ourselves so the
             # next reservation lands on the OTHER slot.
@@ -2274,6 +2286,20 @@ class StatelessCudaGraphRunner:
         static_inputs = self.static_inputs[key]
         static_output = self.static_outputs[key]
         dummy_rids = self.dummy_rids[key]
+
+        # Stateless captures bucket on batch size only; token count is
+        # whatever the fixed-shape inputs carry, so real == padded there.
+        if exec_timings is not None:
+            num_tokens = sum(
+                getattr(inp, "input_seq_len", 0) or 0 for inp in inputs
+            )
+            exec_timings.record_shape(
+                real_bs=actual_bs,
+                real_num_tokens=num_tokens,
+                padded_bs=padded_bs,
+                padded_num_tokens=num_tokens,
+                mode="graph",
+            )
 
         engine_inputs = ModelInputsFromEngine(
             request_ids=request_ids,

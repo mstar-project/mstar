@@ -26,6 +26,7 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
+from mstar.profile.export import append_profile_json
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils.logging_config import quiet_noisy_loggers
 
@@ -170,6 +171,7 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        log_stats_json: str | None = None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -180,6 +182,10 @@ class APIServer:
         # (optional) appends the report to a file instead of only stdout.
         self.log_stats = log_stats
         self.log_stats_file = log_stats_file
+        # ``log_stats_json`` additionally appends one machine-readable JSON
+        # object per request (mstar.profile.export) for validation/calibration
+        # harnesses; the pretty print is unaffected.
+        self.log_stats_json = log_stats_json
 
         # Kept so the OpenAI-compatible layer can look up the per-model adapter
         # (``model_name``) and query model-level metadata such as the audio
@@ -649,6 +655,14 @@ class APIServer:
         except Exception:
             logger.exception("Failed to emit request profile for %s", req.profile.rid)
 
+        if self.log_stats_json:
+            try:
+                append_profile_json(req.profile, self.log_stats_json)
+            except Exception:
+                logger.exception(
+                    "Failed to write JSON profile for %s", req.profile.rid
+                )
+
     def abort_request(self, request_id: str) -> None:
         """Stop GPU work for a request the client abandoned and drop its state."""
         with self.request_lock:
@@ -879,6 +893,12 @@ def main(argv: list[str] | None = None):
         help="Print per-request profiling stats when each request finishes",
     )
     parser.add_argument(
+        "--log-stats-json", type=str, default=None,
+        help="Append per-request profiling stats to this file as JSON Lines "
+             "(implies --log-stats). Machine-readable counterpart of "
+             "--log-stats-file.",
+    )
+    parser.add_argument(
         "--log-stats-file", type=str, default=None,
         help="Append per-request profiling stats to this file (implies --log-stats)",
     )
@@ -920,7 +940,11 @@ def main(argv: list[str] | None = None):
     )
 
     global api_server
-    log_stats = args.log_stats or args.log_stats_file is not None
+    log_stats = (
+        args.log_stats
+        or args.log_stats_file is not None
+        or args.log_stats_json is not None
+    )
     api_server = APIServer(
         socket_path_prefix=args.socket_path_prefix,
         upload_dir=args.upload_dir,
@@ -931,6 +955,7 @@ def main(argv: list[str] | None = None):
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
+        log_stats_json=args.log_stats_json,
     )
 
     # Spawn conductor in a separate process

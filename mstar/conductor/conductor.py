@@ -472,7 +472,9 @@ class Conductor:
                 p.join(timeout=5)
         self._worker_processes.clear()
 
-    def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
+    def _assign_worker_graphs_to_workers(
+        self, rng: "np.random.Generator | None" = None,
+    ) -> dict[str, list[str]]:
         """
         For a request, assign worker graphs to workers. DP picks are
         coordinated by ``_group_id`` so all wgs derived from the same
@@ -480,10 +482,17 @@ class Conductor:
         two wgs sharing a TP group could end up on different DP replicas
         and break model topology.
 
+        ``rng`` is a per-request generator seeded from the request's own
+        seed, so an identical trace replayed twice places identically.
+        Passing None falls back to the process-global RNG (previous
+        behavior); the serving path always passes one.
+
         TODO: smarter assignment that minimizes cross-graph-walk tensor
         transfer (e.g., bias toward keeping prefill→decode handoff local
         for the same request).
         """
+        if rng is None:
+            rng = np.random.default_rng()
         # _group_id -> chosen DP-replica index within that group's ranks
         group_id_to_replica_idx: dict[int, int] = {}
         result = {}
@@ -494,13 +503,13 @@ class Conductor:
                 # and SP all-to-all collectives stay in sync. Picking a single TP
                 # row here would desync the SP all-to-all across rows.
                 replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg._instance_ranks)),
+                    wg._group_id, int(rng.integers(len(wg._instance_ranks))),
                 )
                 ranks = wg._instance_ranks[replica_idx]
                 result[wg_id] = [f"worker_{r}" for r in ranks]
             else:
                 replica_idx = group_id_to_replica_idx.setdefault(
-                    wg._group_id, np.random.randint(len(wg.ranks)),
+                    wg._group_id, int(rng.integers(len(wg.ranks))),
                 )
                 result[wg_id] = [f"worker_{wg.ranks[replica_idx]}"]
         return result
@@ -658,7 +667,6 @@ class Conductor:
         """Actually dispatch a request to workers (no admission check)."""
         logger.debug("Conductor ingesting request %s", body.request_id)
         ingest_time = time.perf_counter()
-        worker_graph_to_workers = self._assign_worker_graphs_to_workers()
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
@@ -666,6 +674,13 @@ class Conductor:
         # otherwise derive a stable seed from the request id.
         explicit_seed = model_kwargs.get("seed")
         seed = int(explicit_seed) if explicit_seed is not None else _req_id_to_seed(body.request_id)
+
+        # Seed DP-replica placement from the request's seed so replaying a
+        # trace reproduces the same placement. Offset keeps the placement
+        # stream independent of the sampling stream that also uses ``seed``.
+        worker_graph_to_workers = self._assign_worker_graphs_to_workers(
+            np.random.default_rng(seed ^ 0x5F37_5A86)
+        )
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
