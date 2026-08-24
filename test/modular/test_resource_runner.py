@@ -382,14 +382,13 @@ def test_admit_validates_the_step():
 
 
 def test_v1_kv_layer_imports_without_kv_store_or_the_conductor():
-    """``v1`` exists to replace ``kv_store.py``; importing it must not drag
-    in the module it replaces, nor the conductor and sampling kernels behind
-    it. Run in a subprocess because sys.modules is shared across the pytest
+    """``v1`` replaced ``kv_store.py``, which is now deleted; importing v1 must
+    still not drag in the conductor and sampling kernels that sat behind it.
+    Run in a subprocess because sys.modules is shared across the pytest
     session (and conftest stubs triton in-process)."""
     probe = (
         "import sys, mstar.engine.v1.kv_manager, mstar.engine.resources;"
         "leaked = [m for m in ("
-        "  'mstar.engine.kv_store',"
         "  'mstar.conductor.request_info',"
         "  'mstar.communication.tensors',"
         "  'triton',"

@@ -15,7 +15,6 @@ from pathlib import Path
 import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.base import EngineType
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
@@ -101,15 +100,6 @@ def test_pi05_action_gen_is_loop_with_action_output_emission():
     assert isinstance(body, GraphNode) and body.name == "LLM"
     assert {e.name for e in body.outputs} == {"noisy_actions", "timestep_index"}
     assert all(e.next_node == "LLM" for e in body.outputs)
-
-
-def test_pi05_node_engine_types():
-    model = _make_model()
-    types = model.get_node_engine_types()
-    assert types == {
-        "vit_encoder": EngineType.STATELESS,
-        "LLM": EngineType.KV_CACHE,
-    }
 
 
 def test_pi05_kv_cache_config_matches_pi05_config():
