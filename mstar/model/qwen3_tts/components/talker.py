@@ -83,9 +83,6 @@ class Qwen3TTSTalkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        *,
-        label: str,
-        layer_idx: int,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
