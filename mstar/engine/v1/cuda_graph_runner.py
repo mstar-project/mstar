@@ -105,10 +105,6 @@ class CudaGraphSlot:
     dummy_rids: list[str]
     dummy_metadata: dict[str, CurrentForwardPassInfo]
     config_idx: int
-    # Cached at capture time: True iff any dummy_rid in static_outputs has a
-    # key besides "logits". When False, output remap can skip the per-rid
-    # collection loop entirely.
-    has_non_logit_outputs: bool = False
 
 
 @dataclass
@@ -494,16 +490,6 @@ class CudaGraphRunner:
         dummy_rids, dummy_metadata, config_idx,
     ) -> CudaGraphSlot:
         """Wrap one slot's capture artifacts into a CudaGraphSlot."""
-        has_non_logit = False
-        if isinstance(output, dict):
-            for k, v in output.items():
-                if k == "__batched_logits__":
-                    continue
-                if isinstance(v, dict) and any(
-                    out_key != "logits" for out_key in v.keys()
-                ):
-                    has_non_logit = True
-                    break
         return CudaGraphSlot(
             graph=graph,
             static_inputs=static_inputs,
@@ -512,7 +498,6 @@ class CudaGraphRunner:
             dummy_rids=list(dummy_rids),
             dummy_metadata=dict(dummy_metadata),
             config_idx=config_idx,
-            has_non_logit_outputs=has_non_logit,
         )
 
     # ── Replay ──────────────────────────────────────────────────────────

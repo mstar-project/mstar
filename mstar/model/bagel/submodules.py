@@ -17,6 +17,7 @@ from mstar.engine.resources.step import (
     AttentionStep,
     KVStep,
     PositionStep,
+    PostSample,
     SamplerStep,
     Segment,
     SubmoduleStep,
@@ -451,6 +452,12 @@ class LLMSubmodule(ARNodeSubmodule):
     # combined plan; see declare_step.
     CFG_BATCHED_LABEL = "_cfg_batched"
 
+    # The forward hands its logits to the engine rather than sampling inline:
+    # stacked under the sentinel on the batched path, per-rid on the eager one.
+    # Both name the same "sampler" resource, and the batched view wins when the
+    # forward emitted it.
+    POST_SAMPLE = [PostSample("__batched_logits__"), PostSample("logits")]
+
     _NODE_TO_CFG_LABEL = NODE_TO_CFG_LABEL
 
     def __init__(
@@ -764,13 +771,18 @@ class LLMSubmodule(ARNodeSubmodule):
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
-            steps["sampler"] = SamplerStep(prefill_tracked_tokens={
-                rid: inp.input_ids
-                for rid, inp in zip(request_ids, inputs, strict=True)
-                if inp.input_ids is not None
-            })
-        elif graph_walk == "decode":
-            steps["sampler"] = SamplerStep()
+            steps["sampler"] = SamplerStep(
+                post_sample=self.POST_SAMPLE,
+                prefill_tracked_tokens={
+                    rid: inp.input_ids
+                    for rid, inp in zip(request_ids, inputs, strict=True)
+                    if inp.input_ids is not None
+                },
+            )
+        elif graph_walk in ("decode", "prefill_vit"):
+            # prefill_vit is the last walk before decode for an image prompt,
+            # so it samples the first token too (prefill_vae never does).
+            steps["sampler"] = SamplerStep(post_sample=self.POST_SAMPLE)
 
         steps.update({
             "kv": KVStep(

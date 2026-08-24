@@ -1472,9 +1472,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         """Batched Talker forward shared between ``talker_decode``, ``talker_prefill``, and ``talker_last_prefill``.
 
         Decode path (1 token per request, ``hidden`` shape ``(bs, hidden)``):
-          Runs the full LLM + codec_head + suppress_mask via _forward_decode_like
-          and emits per-rid {last_hidden, logits} entries plus a ``__batched_logits__``
-          sentinel for the runner's sample-once fast path.
+          Runs the full LLM + codec_head + suppress_mask via _forward_decode_like,
+          samples inline through the injected samplers, and emits per-rid
+          {talker_input_embeds, codec_tokens, new_token} entries.
 
         Prefill path (``talker_prefill``; multi-token-per-request, ``hidden``
         shape ``(total_tokens, hidden)``): Runs only the LLM backbone, and
