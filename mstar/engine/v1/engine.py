@@ -806,12 +806,20 @@ class Engine:
         # so the whole batch samples in one call instead of per-rid.
         batched_logits = raw_outputs.get("__batched_logits__")
         if batched_logits is not None and sampler is not None:
+            if lease is not None and sampler.expects_padded_batch:
+                # The graph sampler's params cover the whole padded slot, so
+                # the padding rows have to go in with the real ones.
+                rows = lease.bucket.bs
+                sample_ids = out_ids[:rows]
+            else:
+                rows = len(request_ids)
+                sample_ids = request_ids
             # FlashInfer reuses its sampling output buffer across calls, so a
             # view held past the next step aliases that step's token. The clone
             # snapshots this step's value.
             sampled = sampler.sample(
-                request_ids, batched_logits[:len(request_ids)]
-            ).clone()
+                sample_ids, batched_logits[:rows]
+            )[:len(request_ids)].clone()
             outputs = {
                 rid: {"new_token": [view]}
                 for rid, view in zip(request_ids, sampled.split(1), strict=True)

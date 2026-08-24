@@ -301,6 +301,14 @@ class SamplerResource(Resource):
 
     ### Submodule-level functionality
 
+    @property
+    def expects_padded_batch(self) -> bool:
+        """Whether `sample` this step goes through the CUDA-graph sampler, whose
+        per-row params were gathered for the slot's padded bs — it must be handed
+        every padded row. The eager sampler keys off request ids, so it takes the
+        real batch only."""
+        return self._cg_sampler is not None
+
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ):

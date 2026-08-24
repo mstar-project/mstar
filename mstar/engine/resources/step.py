@@ -134,11 +134,26 @@ class PositionStep(ResourceStep):
     # so the step declares the grouping once, on KVStep
 
 
+@dataclass
+class PostSample:
+    in_key: str
+    batched: bool = None
+    out_key: str = "new_token"
+
+    def __post_init__(self):
+        if self.batched is None:
+            # TODO: replace with re match
+            if self.in_key.startswith("__") and self.in_key.endswith("__"):
+                self.batched = True
+            else:
+                self.batched = False
+
 @dataclass(frozen=True)
 class SamplerStep(ResourceStep):
     apply_penalty: bool = True
     # rid -> prefill tokens for the repetition penalty
     prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory=dict)
+    post_sample: list[PostSample] = field(default_factory=list)
 
 
 # moved here
