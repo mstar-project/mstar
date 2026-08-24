@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.v1.convenience import AttentionCallable
 from mstar.model.components.norm import RMSNorm
 
 
@@ -145,6 +146,9 @@ class Attention(nn.Module):
         self.attn = resources[self._attn_key]
         self.kv = resources[self._kv_key]
         self.pos = None if self._pos_key is None else resources[self._pos_key]
+        # One callable per layer is fine here: unlike cosmos3 it is never passed
+        # into a traced function, so nothing specializes on its identity.
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
 
     def _apply_rope(
         self,
@@ -169,29 +173,15 @@ class Attention(nn.Module):
             old_context_len=self.rope_old_context_len,
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        label: str,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        """``label`` and ``layer_idx`` are what the old facade carried as a
-        cursor (``set_active_label`` / ``set_layer_idx``); the caller that set
-        the cursor passes them here instead."""
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The label and layer index are cursors on the resources, set by the
+        caller running the layer stack (``attend.bind_step`` once, then
+        ``attend.set_layer_idx`` per layer) rather than passed in per call."""
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self._apply_rope(q, k, label)
-        # the paged backends read K/V back out of the pages, so the write has
-        # to land before the attend; a backend that takes the fresh K/V
-        # straight into its kernel says so and skips it
-        if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
-        attn_output = self.attn.run(
-            q, label, self.kv.layer_view(layer_idx),
-            k=k, v=v, layer_idx=layer_idx,
-        )
+        q, k = self._apply_rope(q, k, self.attend.label)
+        attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
 
@@ -270,12 +260,21 @@ class CrossAttention(nn.Module):
             key = self.cross.context_cache_key
         self.context_kv = resources[key]
 
-    def forward(
-        self, hidden_states: torch.Tensor, *, label: str, layer_idx: int,
-    ) -> torch.Tensor:
+    # Same cursor API as AttentionCallable, so a layer loop drives self- and
+    # cross-attention the same way. Not an AttentionCallable itself: nothing is
+    # written here, and the context cache is a different resource.
+    def bind_step(self, label: str) -> None:
+        self.cross.set_default_label(label)
+
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self.context_kv.set_default_layer_idx(layer_idx)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Label and layer index come off the resources' cursors; see
+        ``Attention.forward``."""
         num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
         # nothing is written here: the context was written once at encode time
-        attn = self.cross.run(q, label, self.context_kv.layer_view(layer_idx))
+        attn = self.cross.run(q, kv_cache_layer=self.context_kv.layer_view())
         attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.out_proj(attn)

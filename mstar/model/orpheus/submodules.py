@@ -6,7 +6,6 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.kv_store import PositionInfo
 from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
 from mstar.engine.v1.attention_manager import AttentionManager
 from mstar.engine.v1.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
@@ -68,7 +67,6 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        pos_info: dict[str, PositionInfo] = {},
         **kwargs,
     ) -> ARNodeInputs:
         return ARNodeInputs(
@@ -213,6 +211,11 @@ class SNACDecoderSubmodule(NodeSubmodule):
     single SNAC forward pass when all windows have the same frame count.
     """
 
+    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
+    # stateless engine, stated directly now that the v1 engine reads these.
+    disable_torch_compile = True
+    disable_autocast = True
+
     def __init__(self, snac_model: nn.Module, config: OrpheusModelConfig):
         super().__init__()
         self.snac_model = snac_model
@@ -222,10 +225,6 @@ class SNACDecoderSubmodule(NodeSubmodule):
         self.config = config
 
         self._orig_seq_len = {}
-
-    def get_stateless_flavor(self) -> str:
-        # SNAC runs in fp32 with no autocast and no torch.compile.
-        return "audio_codec"
 
     # _tokens_to_codes pads to multiples of 28 tokens then reshapes to
     # (N_frames, 4, 7); for a single streaming window this is 1 frame.
@@ -270,7 +269,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             input_seq_len=tokens.shape[0]
         )
 
-    def can_batch(self, batch: ExecutingBatch, inputs: list[ARNodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[ARNodeInputs]) -> bool:
         return True
 
     def preprocess(

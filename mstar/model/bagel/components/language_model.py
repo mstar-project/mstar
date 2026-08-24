@@ -13,6 +13,8 @@
 from typing import Optional
 
 import torch
+
+from mstar.engine.v1.convenience import AttentionCallable
 from torch import nn
 from transformers.activations import ACT2FN
 
@@ -148,12 +150,12 @@ class BagelAttentionMoT(nn.Module):
         self.attn = resources["attn"]
         self.kv = resources["kv"]
         self.pos = resources["rope"]
+        # see Attention.bind_resources
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
 
     def forward(
         self,
         query_sequence: torch.Tensor,
-        layer_idx: int,
-        label: str,
         mode="und",
         static_vae_idxs=True,
         vae_token_indexes=None,
@@ -216,17 +218,13 @@ class BagelAttentionMoT(nn.Module):
 
         # RoPE: pos_ids planned from the step declaration before the LLM forward
         query_states, key_states = self.pos.apply_qk(
-            query_states, key_states, label=label, rope_theta=self.rope_theta,
+            query_states, key_states, label=self.attend.label,
+            rope_theta=self.rope_theta,
         )
 
         # Paged attention: the plan (page alloc, FlashInfer index tensors)
         # was driven from the step declaration before the LLM forward
-        if self.attn.requires_kv_write:
-            self.kv.write_kv(key_states, value_states, layer_idx=layer_idx, label=label)
-        attn_output = self.attn.run(
-            query_states, label, self.kv.layer_view(layer_idx),
-            k=key_states, v=value_states, layer_idx=layer_idx,
-        )
+        attn_output = self.attend(query_states, key_states, value_states)
 
         attn_output = attn_output.reshape(-1, self.hidden_size)
 
@@ -270,8 +268,6 @@ class BagelMoTDecoderLayer(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        layer_idx: int,
-        label: str,
         mode="und",
         static_vae_idxs=True,
         vae_token_indexes=None,
@@ -303,8 +299,6 @@ class BagelMoTDecoderLayer(nn.Module):
         # Self Attention
         query_sequence = self.self_attn(
             query_sequence=query_sequence,
-            layer_idx=layer_idx,
-            label=label,
             mode=mode,
             static_vae_idxs=static_vae_idxs,
             vae_token_indexes=vae_token_indexes,
@@ -387,14 +381,14 @@ class BagelLanguageModel(nn.Module):
                     static_vae_idxs=static_vae_idxs
                 )
 
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for _layer_idx, decoder_layer in enumerate(self.layers):
-            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
-            # try to specialize on the layer_idx int
-            decoder_layer.self_attn.kv.set_layer_idx(_layer_idx)
+            decoder_layer.self_attn.attend.set_layer_idx(_layer_idx)
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
-                layer_idx=None,
-                label=label,
                 **extra_inputs,
             )
 

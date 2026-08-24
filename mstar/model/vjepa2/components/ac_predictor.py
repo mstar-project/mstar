@@ -20,6 +20,8 @@ Key differences from the masked predictor:
 from __future__ import annotations
 
 import torch
+
+from mstar.engine.v1.convenience import AttentionCallable
 import torch.nn.functional as F
 from torch import nn
 
@@ -132,7 +134,6 @@ class ACRoPEAttention(nn.Module):
         action_tokens: int,
         t_0: int = 0,
         label: str | None = None,
-        layer_idx: int = 0,
         # Pre-computed position tensors for the cached path.  When provided
         # (CUDA-graph path), they are static GPU buffers already on device and
         # no torch.arange / torch.full calls happen inside the captured region.
@@ -151,8 +152,6 @@ class ACRoPEAttention(nn.Module):
                 x=x,
                 d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
                 action_tokens=action_tokens,
-                label=label,
-                layer_idx=layer_idx,
             )
         b, n, c = x.size()
 
@@ -233,8 +232,6 @@ class ACRoPEAttention(nn.Module):
         w_pos: torch.Tensor,               # [H*W]  — width positions
         time_pos: torch.Tensor | None,     # [action_tokens] or None
         action_tokens: int,
-        label: str,
-        layer_idx: int,
     ) -> torch.Tensor:
         """Single-frame cached attention with pre-computed position tensors.
 
@@ -298,18 +295,15 @@ class ACRoPEAttention(nn.Module):
         k = k.reshape(b * n, self.num_heads, hd)
         v = v.reshape(b * n, self.num_heads, hd)
 
-        if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
-        x = self.attn.run(
-            q, label, self.kv.layer_view(layer_idx),
-            k=k, v=v, layer_idx=layer_idx,
-        )
+        x = self.attend(q, k, v)
         x = x.reshape(b, n, c)
         return self.proj(x)
 
     def bind_resources(self, resources: dict) -> None:
         self.attn = resources.get("attn", self.attn)
         self.kv = resources.get("kv", self.kv)
+        # see Attention.bind_resources
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
 
 
 class ACBlock(nn.Module):
@@ -343,7 +337,6 @@ class ACBlock(nn.Module):
         action_tokens: int,
         t_0: int = 0,
         label: str | None = None,
-        layer_idx: int = 0,
         d_pos: torch.Tensor | None = None,
         h_pos: torch.Tensor | None = None,
         w_pos: torch.Tensor | None = None,
@@ -352,7 +345,6 @@ class ACBlock(nn.Module):
         x = x + self.attn(
             self.norm1(x), attn_mask=attn_mask, t=t, h=h, w=w,
             action_tokens=action_tokens, t_0=t_0, label=label,
-            layer_idx=layer_idx,
             d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
         )
         x = x + self.mlp(self.norm2(x))
@@ -520,11 +512,12 @@ class VisionTransformerPredictorAC(nn.Module):
             h_pos   = static_pos_bufs["h_pos"]
             w_pos   = static_pos_bufs["w_pos"]
             time_pos = static_pos_bufs.get("time_pos")
+            if label is not None:
+                # cursors on the shared resources; see AttentionCallable
+                blocks[0].attn.attend.bind_step(label)
             for blk_num, blk in enumerate(blocks):
                 if label is not None:
-                    # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
-                    # try to specialize on the layer_idx int
-                    blk.attn.kv.set_layer_idx(blk_num)
+                    blk.attn.attend.set_layer_idx(blk_num)
                 x = blk(
                     x,
                     attn_mask=None,
@@ -532,7 +525,6 @@ class VisionTransformerPredictorAC(nn.Module):
                     h=gh, w=gw,
                     action_tokens=cond_tokens,
                     label=label,
-                    layer_idx=None,
                     d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
                 )
             return x
@@ -574,11 +566,12 @@ class VisionTransformerPredictorAC(nn.Module):
                 t_0, self.grid_height, self.grid_width, cond_tokens, x.device, x.dtype
             )
 
+        if label is not None:
+            # cursors on the shared resources; see AttentionCallable
+            self.predictor_blocks[0].attn.attend.bind_step(label)
         for blk_num, blk in enumerate(self.predictor_blocks):
             if label is not None:
-                # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
-                # try to specialize on the layer_idx int
-                blk.attn.kv.set_layer_idx(blk_num)
+                blk.attn.attend.set_layer_idx(blk_num)
             x = blk(
                 x,
                 attn_mask=attn_mask,
@@ -588,7 +581,6 @@ class VisionTransformerPredictorAC(nn.Module):
                 action_tokens=cond_tokens,
                 t_0=t_0,
                 label=label,
-                layer_idx=None,
                 d_pos=d_pos, h_pos=h_pos, w_pos=w_pos, time_pos=time_pos,
             )
 

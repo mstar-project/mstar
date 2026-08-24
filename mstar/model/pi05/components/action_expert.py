@@ -98,15 +98,14 @@ class Pi05ActionExpert(nn.Module):
         *,
         label: str,
     ) -> torch.Tensor:
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, layer in enumerate(self.layers):
-            # Set layer_idx on the KV resource and pass None so inductor doesn't
-            # specialize on the int.
-            layer.self_attn.kv.set_layer_idx(layer_idx)
+            layer.self_attn.attend.set_layer_idx(layer_idx)
             query_sequence = layer(
-                hidden_states=query_sequence,
-                adarms_cond=adarms_cond,
-                label=label,
-                layer_idx=None,
+                hidden_states=query_sequence, adarms_cond=adarms_cond,
             )
         out, _ = self.norm(query_sequence, adarms_cond)
         return out

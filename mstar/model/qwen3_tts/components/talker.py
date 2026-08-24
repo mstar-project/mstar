@@ -90,7 +90,7 @@ class Qwen3TTSTalkerLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
-            hidden_states, label=label, layer_idx=layer_idx,
+            hidden_states,
         )
         hidden_states = residual + hidden_states
 
@@ -126,14 +126,15 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         label: str,
     ) -> torch.Tensor:
         hidden_states = input_embeds
+        # Which of the node's KV streams the layers write (`label`) and which
+        # layer of it are cursors on the shared resources: bind the label once,
+        # advance the index per layer. Passing them as arguments instead would
+        # make inductor specialize on the int. The resources own the pages, so
+        # module code stays clear of the allocator.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, layer in enumerate(self.layers):
-            # The layer names which of the node's KV streams it is writing
-            # (`label`) and which layer of it (`layer_idx`); the resources it
-            # calls own the pages, so module code stays clear of the allocator.
-            # Set layer_idx on the KV resource and pass None so inductor doesn't
-            # specialize on the int.
-            layer.self_attn.kv.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states, label=label, layer_idx=None)
+            layer.self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states = layer(hidden_states)
         # Sequence lengths still advance once per forward, after every layer
         # wrote K/V for the same packed range — the runner does it now, on the
         # step this forward was declared from.

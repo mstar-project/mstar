@@ -21,7 +21,6 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.kv_store import PositionInfo
 from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
 from mstar.engine.v1.attention_manager import FlashInferManager
 from mstar.engine.v1.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
@@ -1231,7 +1230,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        pos_info: dict[str, PositionInfo] = {},
         **kwargs
     ) -> ARNodeInputs:
         device = self.get_device()
@@ -1662,10 +1660,6 @@ class Code2WavSubmodule(NodeSubmodule):
 
         self.full_seqlen = self.config.code2wav.codec_left_context_frames + \
             self.config.code2wav.codec_chunk_frames
-
-    def get_stateless_flavor(self) -> str:
-        # Code2Wav vocoder runs in fp32 with no autocast and no torch.compile.
-        return "audio_codec"
 
     def cleanup_request(self, request_id):
         self._first_chunk_emitted.discard(request_id)

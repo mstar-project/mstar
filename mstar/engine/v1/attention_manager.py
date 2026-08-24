@@ -10,7 +10,7 @@ from typing import Any, NamedTuple
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CGSlotKey, Resource
+from mstar.engine.resources.base import AttentionResource, CGSlotKey
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
 from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
 from mstar.engine.v1.attention_wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
@@ -61,28 +61,11 @@ class AttentionSpec(NodeResourceSpec):
             self.kv_config.page_size = page_size
 
 
-class AttentionManager(Resource):
+class AttentionManager(AttentionResource):
     # Remains abstract except for build; will build based
     # on the attention backend
 
-    # Cursors mirroring the KV resource's: a caller running a whole layer stack
-    # under one label/index sets them once instead of threading them through
-    # every `run`. Explicit arguments still supersede. Class-level so every
-    # backend gets them without touching its __init__.
-    _default_label: str = "main"
-    _default_layer_idx: int | None = None
-
-    def set_default_label(self, label: str):
-        self._default_label = label
-
-    def set_default_layer_idx(self, layer_idx: int):
-        self._default_layer_idx = layer_idx
-
-    def reset_defaults(self):
-        """Cleared each plan so a step that never binds cannot inherit the
-        previous step's cursor (mirrors KVManager.plan)."""
-        self._default_label = "main"
-        self._default_layer_idx = None
+    # Label / layer cursors come from `AttentionResource`; `run` resolves them.
 
     @classmethod
     def build(
@@ -306,7 +289,7 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
-        self.reset_defaults()
+        self.reset_default_cursors()
         assert not ctx.is_preplan or ctx.slot_lease is not None, (
             "preplan requires a cuda graph step: eager wrappers share one "
             "workspace per label with the forward still in flight"
@@ -454,7 +437,7 @@ class CrossAttentionSpec(NodeResourceSpec):
             self.kv_config.page_size = page_size
 
 
-class CrossAttentionManager(Resource):
+class CrossAttentionManager(AttentionResource):
     # Remains abstract except for build; will build based
     # on the attention backend
 
@@ -567,6 +550,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        self.reset_default_cursors()
         assert not ctx.is_preplan or ctx.slot_lease is not None, (
             "preplan requires a cuda graph step: the eager wrapper for a label "
             "persists and would be replanned under the in-flight forward"
@@ -773,11 +757,13 @@ class FlashInferCrossManager(CrossAttentionManager):
 
 
     def run(
-        self, q: torch.Tensor, label: str,
-        kv_cache_layer: torch.Tensor
+        self, q: torch.Tensor, label: str | None = None,
+        kv_cache_layer: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's cross attention. ``kv_cache_layer`` is a layer of the
         *context* cache; nothing is written to it here."""
+        if label is None:
+            label = self._default_label
         return torch.ops.mstar.flashinfer_attend(
             self._attend_handle, label, q, kv_cache_layer,
         )
@@ -917,7 +903,7 @@ class DenseAttentionManager(AttentionManager):
             del self._prefix_cache[key]
 
     def plan(self, step: AttentionStep, ctx: StepContext):
-        self.reset_defaults()
+        self.reset_default_cursors()
         assert ctx.slot_lease is None and not ctx.is_preplan, (
             "dense attention is eager-only: the prefix gather and the "
             "concatenation allocate and are shaped by the step, so there is "

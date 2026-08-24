@@ -104,17 +104,11 @@ class Qwen3OmniTalkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        layer_idx: int | None = None,
-        label: str | None = None,
     ) -> torch.Tensor:
         # ---------- self-attention with pre-norm ----------
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            layer_idx=layer_idx,
-            label=label,
-        )
+        hidden_states = self.self_attn(hidden_states=hidden_states)
         hidden_states = residual + hidden_states
 
         # ---------- MoE FFN with pre-norm ----------
@@ -162,15 +156,13 @@ class Qwen3OmniTalkerLanguageModel(nn.Module):
         label: str = "main",
     ) -> torch.Tensor:
         hidden_states = input_embeds
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.layers):
-            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
-            # try to specialize on the layer_idx int
-            decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
-            hidden_states = decoder_layer(
-                hidden_states=hidden_states,
-                layer_idx=None,
-                label=label,
-            )
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states = decoder_layer(hidden_states=hidden_states)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -337,10 +329,11 @@ class Qwen3OmniCodePredictorInnerModel(nn.Module):
         """
         Just runs the inner layers; does NOT run embedding.
         """
+        # cursors on the shared resources; see AttentionCallable
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.layers):
-            hidden_states = decoder_layer(
-                hidden_states, label=label, layer_idx=layer_idx,
-            )
+            self.layers[layer_idx].self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states = decoder_layer(hidden_states)
         hidden_states = self.norm(hidden_states)
         # the advance is the runner's now, off the step declaration
         return hidden_states

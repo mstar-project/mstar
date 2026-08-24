@@ -12,7 +12,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
+from mstar.engine.v1.engine import ExecutingBatch
 from mstar.engine.resources.step import (
     AttentionStep,
     KVStep,
@@ -180,7 +180,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         features = features + self.vit_pos_embed(packed_position_ids)
         return {"img_emb": [features]}
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         # Opt-in via MSTAR_VIT_BATCHING=1. Off by default because flashattn
         # varlen reductions across packed images produce small bf16 drift,
         # which at greedy temperature=0 can flip downstream LLM argmax.
@@ -1338,7 +1338,7 @@ class LLMSubmodule(ARNodeSubmodule):
         return None
 
     def can_batch(
-        self, batch: NodeBatch, model_inputs: list[NodeInputs]
+        self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ):
         return batch.graph_walk in ["decode", "prefill_text", "prefill_vit"]
 

@@ -105,16 +105,12 @@ class Qwen3OmniThinkerLayer(nn.Module):
         hidden_states: torch.Tensor,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
-        layer_idx: int | None = None,
-        label: str | None = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [tokens, hidden_size]
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE.
-            layer_idx: this layer's index in the stack.
-            label: the plan key this layer's attention runs against.
 
         Returns:
             hidden_states: [tokens, hidden_size]
@@ -126,8 +122,6 @@ class Qwen3OmniThinkerLayer(nn.Module):
             hidden_states,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
-            layer_idx=layer_idx,
-            label=label,
         )
         hidden_states = residual + hidden_states
 
@@ -222,16 +216,16 @@ class Qwen3OmniThinkerModel(nn.Module):
         layer_0_embed = hidden_states.clone()
         layer_n_hidden = None
 
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.model.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.model.layers):
-            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
-            # try to specialize on the layer_idx int
-            decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
                 cos_sin_3d=cos_sin_3d,
                 mrope_section=mrope_section,
-                layer_idx=None,
-                label=label,
             )
 
             # add visual features to the hidden states of first several layers

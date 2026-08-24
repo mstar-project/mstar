@@ -6,7 +6,7 @@ from typing import Any, NamedTuple
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import AttentionResource, CGSlotSpec, PublishedInfo
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -308,7 +308,7 @@ class KVSpec(NodeResourceSpec):
                 setattr(self.config, name, value)
 
 
-class KVManager(Resource):
+class KVManager(AttentionResource):
     def __init__(
         self,
         cfg: KVConfig,
@@ -355,8 +355,7 @@ class KVManager(Resource):
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
         self._cg_max_seq_len = 0
         self._current_plan_states: dict[str, KVPlanState] = {}
-        self._current_layer_idx: int = 0
-        self._default_label: str = "main"
+        self.reset_default_cursors()
 
         self._preplan_states: dict[str, KVPlanState] = {}
         self._preplanned = False
@@ -629,8 +628,7 @@ class KVManager(Resource):
             "KV preplan is already pending; clear_preplan before planning a "
             "different step ahead"
         )
-        self._current_layer_idx = 0
-        self._default_label = "main"
+        self.reset_default_cursors()
         if self._preplanned:
             self._current_plan_states = self._preplan_states
             res = self._cached_plan_output
@@ -941,17 +939,14 @@ class KVManager(Resource):
         return AllocResult()
 
     ### Submodule-level functionality
-    # Cursors: a caller that runs a whole layer stack under one label (or one
-    # layer index) sets it once here instead of threading it through every
-    # call. An explicit argument still supersedes the default.
-    def set_default_layer_idx(self, layer_idx: int):
-        self._current_layer_idx = layer_idx
+    # Label / layer cursors come from `AttentionResource`; the readers resolve
+    # them. TODO: rename the `set_layer_idx` call sites and drop this alias.
+    set_layer_idx = AttentionResource.set_default_layer_idx
 
-    # TODO: rename the call sites and drop this alias.
-    set_layer_idx = set_default_layer_idx
-
-    def set_default_label(self, label: str):
-        self._default_label = label
+    def reset_default_cursors(self) -> None:
+        super().reset_default_cursors()
+        # unlike attention, every read here needs a usable index
+        self._default_layer_idx = 0
 
     @torch.compiler.disable
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:
@@ -960,7 +955,7 @@ class KVManager(Resource):
         handed to `AttentionManager::run`. in `kv_manager` so storage mechanics
         are opaque to layers"""
         if layer_idx is None:
-            layer_idx = self._current_layer_idx
+            layer_idx = self._default_layer_idx
         return self.kv_cache.layer_view(layer_idx)
 
     @torch.compiler.disable
@@ -970,7 +965,7 @@ class KVManager(Resource):
         [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1).
         """
         if layer_idx is None:
-            layer_idx = self._current_layer_idx
+            layer_idx = self._default_layer_idx
         if plan_label is None:
             plan_label = self._default_label
         plan_state = self._current_plan_states[plan_label]
@@ -992,7 +987,7 @@ class KVManager(Resource):
         caller wants today, and skipping it keeps the write a pure mutation.
         """
         if layer_idx is None:
-            layer_idx = self._current_layer_idx
+            layer_idx = self._default_layer_idx
         if label is None:
             label = self._default_label
         plan_state = self._current_plan_states[label]

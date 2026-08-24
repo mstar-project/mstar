@@ -41,7 +41,6 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.base import EngineType
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.v1.attention_manager import AttentionConfig, AttentionSpec
 from mstar.engine.v1.kv_cache import KVConfig
@@ -699,18 +698,6 @@ class BagelModel(Model):
         logger.info(f"Successfully loaded in BAGEL submodule for {node_name}")
         self._submodule_cache[node_name] = submodule
         return submodule
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {
-            "vit_encoder": EngineType.STATELESS,
-            "vae_encoder": EngineType.STATELESS,
-            "init_latents": EngineType.STATELESS,
-            "LLM": EngineType.KV_CACHE,
-            "LLM_cfg_text": EngineType.KV_CACHE,
-            "LLM_cfg_img": EngineType.KV_CACHE,
-            "combine_cfg": EngineType.STATELESS,
-            "vae_decoder": EngineType.STATELESS,
-        }
 
     def get_worker_graphs(self, config_path: str):
         import yaml

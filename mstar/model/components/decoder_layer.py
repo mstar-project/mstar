@@ -53,18 +53,10 @@ class DecoderLayer(nn.Module):
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        label: str,
-        layer_idx: int,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states, label=label, layer_idx=layer_idx,
-        )
+        hidden_states = self.self_attn(hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -97,16 +89,11 @@ class GatedDecoderLayer(nn.Module):
         self.post_attention_layernorm = post_attention_layernorm
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        adarms_cond: torch.Tensor,
-        *,
-        label: str,
-        layer_idx: int,
+        self, hidden_states: torch.Tensor, adarms_cond: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
         normed, gate = self.input_layernorm(hidden_states, adarms_cond)
-        attn_out = self.self_attn(normed, label=label, layer_idx=layer_idx)
+        attn_out = self.self_attn(normed)
         hidden_states = _gated_residual(residual, attn_out, gate)
 
         residual = hidden_states

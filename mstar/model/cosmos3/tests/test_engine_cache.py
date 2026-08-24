@@ -26,6 +26,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 import torch.nn.functional as F
 
+from mstar.engine.resources.base import AttentionResource
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import (
     AdmitOutcome,
@@ -96,9 +97,16 @@ class _SdpaResources:
         self.attn.causal = causal
 
 
-class _SdpaKV:
+class _SdpaKV(AttentionResource):
     """The ``kv`` half: per-(label, layer) K/V, plus the plan grouping every
-    other resource reads off ``ctx.plan_results``."""
+    other resource reads off ``ctx.plan_results``.
+
+    An AttentionResource so it carries the same label/layer cursors the real
+    one does — that is what layers reach it through."""
+
+    @classmethod
+    def build(cls, *args, **kwargs):
+        raise NotImplementedError("test stub")
 
     def __init__(self):
         self.committed: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -140,10 +148,16 @@ class _SdpaKV:
         self.committed.update(self.pending)
         self.pending = {}
 
-    def layer_view(self, layer_idx):
+    def layer_view(self, layer_idx=None):
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
         return layer_idx
 
-    def write_kv(self, k, v, layer_idx, label):
+    def write_kv(self, k, v, layer_idx=None, label=None):
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
+        if label is None:
+            label = self._default_label
         for source_label, k_part, v_part in self._split(label, k, v):
             self.pending[(source_label, layer_idx)] = (k_part, v_part)
 
@@ -155,10 +169,14 @@ class _SdpaKV:
             offset += span
 
 
-class _SdpaAttention:
+class _SdpaAttention(AttentionResource):
     """The ``attn`` half: sdpa over [committed prefix | this step's K/V]."""
 
     requires_kv_write = True
+
+    @classmethod
+    def build(cls, *args, **kwargs):
+        raise NotImplementedError("test stub")
 
     def __init__(self, kv):
         self._kv = kv
@@ -197,7 +215,11 @@ class _SdpaAttention:
             return self._sdpa(q, torch.cat([pk, k], 0), torch.cat([pv, v], 0), self.causal)
         return self._sdpa(q, k, v, self.causal)
 
-    def run(self, q, label, kv_cache_layer, k=None, v=None, layer_idx=None):
+    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
+        if label is None:
+            label = self._default_label
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
         groups = self._kv.groups[label]
         if len(groups) == 1:
             return self._attend_label(groups[0][0], layer_idx, q, k, v)

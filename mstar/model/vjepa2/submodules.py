@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
+from mstar.engine.v1.engine import ExecutingBatch
 
 from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SubmoduleStep
 from mstar.engine.v1.cuda_graph_config import PiecewiseBatchedConfig, PiecewiseCallInputs, PiecewiseCaptureShape, PiecewiseCudaGraphConfig
@@ -110,7 +110,7 @@ class VJepa2EncoderSubmodule(NodeSubmodule):
 
     def can_batch(
         self,
-        batch: NodeBatch,
+        batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ):
         # Route B=1 through the sequential ``forward`` (proven sequential path).
@@ -307,7 +307,7 @@ class VJepa2PredictorSubmodule(ARNodeSubmodule):
 
     def can_batch(
         self,
-        batch: NodeBatch,
+        batch: ExecutingBatch,
         model_inputs: list[ARNodeInputs],
     ) -> bool:
         # B=1 → sequential forward; see VJepa2EncoderSubmodule.can_batch
@@ -526,7 +526,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
     # NodeSubmodule ABC
     # ------------------------------------------------------------------
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[ARNodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[ARNodeInputs]) -> bool:
         """Batch only when every request is at the same rollout iter AND
         their encoder_hidden shapes agree.
 
@@ -726,7 +726,7 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
         self.predictor = predictor
         self.config = config
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[ARNodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[ARNodeInputs]) -> bool:
         # B=1 → sequential forward.  See VJepa2EncoderSubmodule.can_batch
         # for the rationale — AC ViT-g warm-forward_batched measured ~20×
         # slower than warm-forward on the same input shape, so routing
@@ -996,7 +996,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     # NodeSubmodule ABC
     # ------------------------------------------------------------------
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[ARNodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[ARNodeInputs]) -> bool:
         """Same rule as masked rollout: B >= 2, shape-homogeneous across
         ``encoder_hidden`` / ``actions`` / ``states`` (+ optional
         ``extrinsics``), and same ``iter_idx`` for every rid.

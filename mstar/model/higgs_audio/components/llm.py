@@ -90,12 +90,12 @@ class HiggsAudioLLM(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = input_embeds
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.layers):
-            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
-            # try to specialize on the layer_idx int
-            decoder_layer.self_attn.kv.set_layer_idx(layer_idx)
-            hidden_states = decoder_layer(
-                hidden_states=hidden_states, label=label, layer_idx=None,
-            )
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states = decoder_layer(hidden_states=hidden_states)
         # the advance is the runner's now, off the step declaration
         return self.norm(hidden_states)

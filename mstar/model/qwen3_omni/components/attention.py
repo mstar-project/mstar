@@ -103,9 +103,6 @@ class Qwen3OmniAttention(ParallelAttention):
         hidden_states: torch.Tensor,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
-        *,
-        layer_idx: int,
-        label: str,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
@@ -116,13 +113,8 @@ class Qwen3OmniAttention(ParallelAttention):
             cos, sin = cos_sin_3d
             q, k = apply_interleaved_mrope(q, k, cos, sin)
         else:
-            q, k = self._apply_rope(q, k, label)
+            q, k = self._apply_rope(q, k, self.attend.label)
 
-        if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
-        attn_output = self.attn.run(
-            q, label, self.kv.layer_view(layer_idx),
-            k=k, v=v, layer_idx=layer_idx,
-        )
+        attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

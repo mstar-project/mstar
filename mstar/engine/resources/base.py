@@ -172,6 +172,37 @@ class Resource(ABC):
         return
 
 
+class AttentionResource(Resource):
+    """A resource a layer stack calls per layer, under one plan label.
+
+    Adds the label / layer-index cursors: a caller running the whole stack sets
+    them once instead of threading them through every call, and an explicit
+    argument still supersedes. Class-level defaults so a subclass picks them up
+    without touching its __init__; subclasses that read them clear them in
+    `plan`, so a step that never binds cannot inherit the previous step's.
+
+    The KV, attention and cross-attention resources; not the sampler or the
+    position resource, which are called once per step rather than per layer.
+    """
+
+    _default_label: str = "main"
+    _default_layer_idx: int | None = None
+
+    @property
+    def default_label(self) -> str:
+        return self._default_label
+
+    def set_default_label(self, label: str) -> None:
+        self._default_label = label
+
+    def set_default_layer_idx(self, layer_idx: int) -> None:
+        self._default_layer_idx = layer_idx
+
+    def reset_default_cursors(self) -> None:
+        self._default_label = "main"
+        self._default_layer_idx = None
+
+
 class PublishedInfo(ABC):
     @abstractmethod
     def update(self, other: "PublishedInfo") -> None:

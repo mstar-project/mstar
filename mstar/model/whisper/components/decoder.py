@@ -68,24 +68,14 @@ class WhisperDecoderLayer(nn.Module):
         self.fc1 = nn.Linear(config.d_model, config.decoder_ffn_dim)
         self.fc2 = nn.Linear(config.decoder_ffn_dim, config.d_model)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        label: str,
-        layer_idx: int,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = residual + self.self_attn(
-            hidden_states, label=label, layer_idx=layer_idx,
-        )
+        hidden_states = residual + self.self_attn(hidden_states)
 
         residual = hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
-        hidden_states = residual + self.encoder_attn(
-            hidden_states, label=label, layer_idx=layer_idx,
-        )
+        hidden_states = residual + self.encoder_attn(hidden_states)
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -139,7 +129,7 @@ class WhisperDecoderModel(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             cross_attn = layer.encoder_attn
             k, v = cross_attn.compute_kv(encoder_states)
-            cross_attn.context_kv.set_layer_idx(layer_idx)
+            cross_attn.context_kv.set_default_layer_idx(layer_idx)
             cross_attn.context_kv.write_kv(k, v, label=CONTEXT_LABEL)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -153,14 +143,16 @@ class WhisperDecoderModel(nn.Module):
         label: str,
     ) -> torch.Tensor:
         hidden_states = input_embeds
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int. Both
+        # caches need the index: the self-attention's and the (separate)
+        # encoder-context one.
+        self.layers[0].self_attn.attend.bind_step(label)
+        self.layers[0].encoder_attn.bind_step(label)
         for layer_idx, layer in enumerate(self.layers):
-            # NOTE: Set layer_idx here and pass in layer_idx=None so that inductor doesn't
-            # try to specialize on the layer_idx int. Both caches need it: the
-            # self-attention's and the (separate) encoder-context one.
-            layer.self_attn.kv.set_layer_idx(layer_idx)
-            layer.encoder_attn.context_kv.set_layer_idx(layer_idx)
-            hidden_states = layer(
-                hidden_states, label=label, layer_idx=None,
-            )
+            layer.self_attn.attend.set_layer_idx(layer_idx)
+            layer.encoder_attn.set_layer_idx(layer_idx)
+            hidden_states = layer(hidden_states)
         # the advance is the runner's now, off the step declaration
         return self.layer_norm(hidden_states)

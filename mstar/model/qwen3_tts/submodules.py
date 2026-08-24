@@ -759,7 +759,11 @@ class CodecSubmodule(ARNodeSubmodule):
     emitted; the neural decoder itself has no cross-call state.
     """
 
+    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
+    # stateless engine, stated directly now that the v1 engine reads these.
     disable_torch_compile = True
+    disable_autocast = True
+
     # The official 114M-parameter decoder materializes large fixed-shape
     # activations while CUDA graphs are captured.  Capturing bs=16 exhausts an
     # H100 once Talker weights and the CodePredictor graphs are resident, so
@@ -781,9 +785,6 @@ class CodecSubmodule(ARNodeSubmodule):
             *config.codec.upsampling_ratios,
         ):
             self.total_upsample *= factor
-
-    def get_stateless_flavor(self) -> str:
-        return "audio_codec"
 
     def prepare_inputs(
         self,

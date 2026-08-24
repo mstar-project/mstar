@@ -165,10 +165,6 @@ class Cosmos3PackedMoTAttention(nn.Module):
         if sp_group is None:
             sp_group = CommGroup.trivial()
         self.sp_group = sp_group
-        # resources this layer calls, resolved at load; see
-        # components/attention.py and NodeSubmodule.bind_node_resources
-        self.attn = None
-        self.kv = None
         tp_size = comm_group.world_size
         sp_size = sp_group.world_size
         # Ulysses sequence parallelism redistributes heads across the SP group
@@ -272,34 +268,15 @@ class Cosmos3PackedMoTAttention(nn.Module):
     # The understanding prefill must go through a paged backend, because the
     # denoise steps read its K/V back out of the pages; the denoise steps
     # themselves recompute their K/V every step and only reuse that frozen
-    # prefix, which is what the dense backend is for. So `forward_und` uses
-    # the paged resource it bound here, and `forward_gen` takes whichever one
-    # the step declared (see Cosmos3Model.get_node_resources and
-    # Cosmos3DiTSubmodule.declare_step).
+    # prefix, which is what the dense backend is for. Hence the two callables
+    # the transformer passes down: `_und_attend` on the paged resource, and
+    # `_gen_attend` on whichever the step declared (see
+    # Cosmos3Model.get_node_resources and Cosmos3DiTSubmodule.declare_step).
     # ------------------------------------------------------------------
-
-    def bind_resources(self, resources: dict) -> None:
-        self.attn = resources["attn"]
-        self.kv = resources["kv"]
-
-    def _attend_cached(
-        self, attn, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        *, layer_idx: int, label: str,
-    ) -> torch.Tensor:
-        """One layer's cached attention over ``attn``. The dense backend takes
-        the fresh K/V straight into its kernel and writes no pages, which is
-        the whole point of it for denoise; the paged backends need the write
-        first."""
-        if attn.requires_kv_write:
-            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
-        return attn.run(
-            q, label, self.kv.layer_view(layer_idx),
-            k=k, v=v, layer_idx=layer_idx,
-        )
 
     def forward_und(
         self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        layer_idx: int, label: str,
+        attend: AttentionCallable,
     ) -> torch.Tensor:
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
         q = self.norm_q(self.to_q(und_seq).view(-1, H, D))
@@ -315,14 +292,10 @@ class Cosmos3PackedMoTAttention(nn.Module):
             q = sp_head_slice(self.sp_group, q)
             k = sp_head_slice(self.sp_group, k)
             v = sp_head_slice(self.sp_group, v)
-            out = self._attend_cached(
-                self.attn, q, k, v, layer_idx=layer_idx, label=label,
-            )
+            out = attend(q, k, v)
             out = sp_head_gather(self.sp_group, out).reshape(-1, H * D)
         else:
-            out = self._attend_cached(
-                self.attn, q, k, v, layer_idx=layer_idx, label=label,
-            ).reshape(-1, H * D)
+            out = attend(q, k, v).reshape(-1, H * D)
         return self.to_out(out)
 
     def forward_gen(
@@ -406,12 +379,10 @@ class Cosmos3MoTDecoderLayer(nn.Module):
 
     def forward_und(
         self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        layer_idx: int, label: str,
+        attend: AttentionCallable,
     ) -> torch.Tensor:
         und_norm = self.input_layernorm(und_seq)
-        attn_out = self.self_attn.forward_und(
-            und_norm, cos, sin, layer_idx, label
-        )
+        attn_out = self.self_attn.forward_und(und_norm, cos, sin, attend)
         residual = und_seq + attn_out
         return residual + self.mlp(self.post_attention_layernorm(residual))
 
@@ -493,6 +464,7 @@ class Cosmos3OmniTransformer(nn.Module):
         # One shared attend callable for the whole GEN stack, built at bind
         # time; see AttentionCallable for why it must not be per layer.
         self._gen_attend: AttentionCallable | None = None
+        self._und_attend: AttentionCallable | None = None
         self.norm = RMSNorm(h, eps=config.rms_norm_eps)
         self.norm_moe_gen = RMSNorm(h, eps=config.rms_norm_eps)
         self.rotary_emb = Cosmos3RotaryEmbedding(
@@ -531,6 +503,9 @@ class Cosmos3OmniTransformer(nn.Module):
         # is traced per identity of this object (see AttentionCallable). The
         # per-step GEN resource is rebound through `bind_step` instead.
         self._gen_attend = AttentionCallable(
+            kv=resources["kv"], attn=resources["attn"]
+        )
+        self._und_attend = AttentionCallable(
             kv=resources["kv"], attn=resources["attn"]
         )
 
@@ -886,8 +861,13 @@ class Cosmos3OmniTransformer(nn.Module):
         this K/V back out of the pages, so it has to land there."""
         und_seq = self.embed_tokens(input_ids)
         cos, sin = self._rotary(position_ids, und_seq.device, und_seq.dtype)
+        # Its own callable, not the GEN one: UND always runs on the bound paged
+        # resource, while GEN rebinds whichever the step picked.
+        attend = self._und_attend
+        attend.bind_step(label)
         for i, layer in enumerate(self.layers):
-            und_seq = layer.forward_und(und_seq, cos, sin, i, label)
+            attend.set_layer_idx(i)
+            und_seq = layer.forward_und(und_seq, cos, sin, attend)
 
     def _sp_run_gen_layers(self, gen_seq, cos, sin, label, attn, prefer_all_gather=False):
         """Run the generation layer stack, sequence-parallel-sharded across the
@@ -906,8 +886,8 @@ class Cosmos3OmniTransformer(nn.Module):
         # `attn` and `label` hold for the whole stack, so they go on the shared
         # attend once rather than through every layer call; only the layer index
         # advances. Off the call signature they cannot make the callable vary
-        # per layer (see AttentionCallable), and the index stops being a live int that
-        # inductor specializes the layer body on.
+        # per layer (see AttentionCallable), and the index stops being a live
+        # int that inductor specializes the layer body on.
         attend = self._gen_attend
         attend.bind_step(attn=attn, label=label)
         if sp.world_size == 1:

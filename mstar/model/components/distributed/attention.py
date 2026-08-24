@@ -28,6 +28,7 @@ from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from mstar.engine.v1.convenience import AttentionCallable
 from mstar.model.components.norm import RMSNorm
 
 
@@ -134,6 +135,8 @@ class ParallelAttention(nn.Module):
         self.attn = resources.get(self._attn_key)
         self.kv = resources.get(self._kv_key)
         self.pos = None if self._pos_key is None else resources.get(self._pos_key)
+        # see Attention.bind_resources
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
 
     def _apply_rope(
         self,
@@ -155,22 +158,13 @@ class ParallelAttention(nn.Module):
             old_context_len=self.rope_old_context_len,
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        label: str,
-        layer_idx: int,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Label and layer index come off the resources' cursors; see
+        ``Attention.forward``."""
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self._apply_rope(q, k, label)
-        if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v, layer_idx=layer_idx, label=label)
-        attn_output = self.attn.run(
-            q, label, self.kv.layer_view(layer_idx),
-            k=k, v=v, layer_idx=layer_idx,
-        )
+        q, k = self._apply_rope(q, k, self.attend.label)
+        attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

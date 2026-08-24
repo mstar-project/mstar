@@ -14,6 +14,10 @@ class AttentionCallable:
     as Dynamo specializes ``ulysses_attention`` on the identity of its 
     `run_attention` argument, so a per-layer callable retraces that frame once
     per layer and blows the recompile limit.
+
+    That sharing is why the label is one cursor for the whole stack. No model
+    varies its label per layer today; one that needs to should thread the label
+    explicitly rather than use this.
     """
 
     def __init__(self, kv: KVManager, attn: AttentionManager | None=None):
@@ -29,6 +33,15 @@ class AttentionCallable:
         )
         self.attn.set_default_label(label)
         self.kv.set_default_label(label)
+
+    @property
+    def label(self) -> str:
+        """This step's label. Read through to the resource, not stored here, so
+        one instance can drive a whole stack of per-layer callables — and so a
+        layer that no longer takes a label as an argument can still reach it
+        (the position resource carries no cursor, so `apply_qk` is passed this).
+        """
+        return self.kv.default_label
 
     def set_layer_idx(self, layer_idx: int) -> None:
         self.attn.set_default_layer_idx(layer_idx)

@@ -459,18 +459,6 @@ class NodeSubmodule(torch.nn.Module):
     def max_batch_size(self, graph_walk: str):
         return None
 
-    def get_stateless_flavor(self) -> str:
-        """Flavor key picked up by ``EngineManager`` when this submodule's
-        node is declared ``EngineType.STATELESS``. The flavor selects which
-        ``StatelessEngineConfig`` factory drives engine construction
-        (autocast, force_float32, torch.compile, piecewise runner).
-
-        Default: ``"enc_dec"`` — the most common stateless flavor (encoders,
-        vae decoders, etc.). Audio-codec submodules that need no autocast
-        and float32 weights override this to return ``"audio_codec"``.
-        """
-        return "enc_dec"
-
     def get_autocast_dtype(self) -> torch.dtype | None:
         """Per-submodule autocast dtype override for the engine's forward
         wrap. The engine consults this on each ``execute_batch`` and uses
