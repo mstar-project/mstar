@@ -23,7 +23,11 @@ the same per-model adapters the native ``/v1`` routes use, submitted via
   ``ModelStreamInfer`` gRPC route) translated through a per-model
   :data:`TENSOR_SPECS` entry (:class:`TensorBridge`); pi05 maps camera
   frames + state + prompt onto the multipart shape ``/generate`` takes
-  and returns the action trajectory as one Float32 tensor.
+  and returns the action trajectory as one Float32 tensor; vjepa2_ac
+  maps an encoded context clip + action/state trajectories onto the
+  same shape and returns predicted latent grids — one batched
+  response by default, one response per rollout step when the
+  request parameters ask for ``stream_rollout``.
 """
 
 from __future__ import annotations
@@ -756,7 +760,7 @@ class Pi05TensorSpec:
             ],
         }
 
-    def submit_args(self, tensors: dict[str, dict], upload_dir) -> SubmitArgs:
+    def submit_args(self, tensors: dict[str, dict], upload_dir, parameters=None) -> SubmitArgs:
         import numpy as np
         from PIL import Image
 
@@ -824,14 +828,158 @@ class Pi05TensorSpec:
             "data": {"data_type": "Float32", "values": actions.tolist()},
         }]
 
+    def aggregate_chunks(self, parameters) -> bool:
+        return False
+
+
+def _parameter_value(value):
+    """Unwrap a KServe request parameter. The frontend forwards values
+    tagged by variant ({"int64": 4}, {"bool": True}, ...); plain scalars
+    pass through unchanged."""
+    if isinstance(value, dict) and len(value) == 1:
+        return next(iter(value.values()))
+    return value
+
+
+class VJepa2AcTensorSpec:
+    """vjepa2_ac: a context clip plus per-timestep action/state
+    trajectories in, predicted latent grids out. The encoded video file
+    rides a Bytes tensor verbatim into the multipart shape ``/generate``
+    takes; ``rollout_horizon`` and ``stream_rollout`` ride the request
+    parameters map into model_kwargs. Emission defaults to one batched
+    response (safe for unary ModelInfer, which rejects multiple
+    responses); ``stream_rollout`` selects one response per rollout step
+    for ModelStreamInfer clients."""
+
+    # Baked into the AC ViT-g weights; latent chunks reshape to
+    # [n_tokens, hidden_size].
+    hidden_size = 1408
+
+    def model_config(self, served_model_name: str) -> dict:
+        return {
+            "name": served_model_name,
+            "inputs": [
+                # One element: the encoded video file bytes (any container
+                # the server's decoder can probe).
+                {"name": "video", "data_type": "Bytes", "shape": [1]},
+                {"name": "actions", "data_type": "Float32", "shape": [-1, -1]},
+                {"name": "states", "data_type": "Float32", "shape": [-1, -1]},
+            ],
+            "outputs": [
+                {"name": "latents", "data_type": "Float32", "shape": [-1, self.hidden_size]},
+            ],
+        }
+
+    @staticmethod
+    def _trajectory(tensor: dict, name: str) -> list[list[float]]:
+        shape = [int(d) for d in tensor["metadata"]["shape"]]
+        if len(shape) != 2 or shape[0] < 1 or shape[1] < 1:
+            raise ValueError(f"'{name}' must be [timesteps, dim] float32, got shape {shape}")
+        rows, dim = shape
+        values = [float(v) for v in tensor["data"]["values"]]
+        return [values[i * dim : (i + 1) * dim] for i in range(rows)]
+
+    def submit_args(self, tensors: dict[str, dict], upload_dir, parameters=None) -> SubmitArgs:
+        video = tensors.get("video")
+        actions = tensors.get("actions")
+        states = tensors.get("states")
+        if video is None or actions is None or states is None:
+            raise ValueError("vjepa2_ac needs 'video', 'actions' and 'states' input tensors")
+
+        video_values = video["data"]["values"]
+        if len(video_values) != 1:
+            raise ValueError("'video' must hold exactly one encoded-file element")
+        video_bytes = bytes(video_values[0])
+        if not video_bytes:
+            raise ValueError("'video' element is empty")
+
+        action_rows = self._trajectory(actions, "actions")
+        state_rows = self._trajectory(states, "states")
+        if (len(action_rows), len(action_rows[0])) != (len(state_rows), len(state_rows[0])):
+            raise ValueError(
+                "'actions' and 'states' must share one [timesteps, dim] shape, got "
+                f"{actions['metadata']['shape']} vs {states['metadata']['shape']}"
+            )
+
+        upload_dir = Path(upload_dir)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        path = upload_dir / f"tensor_{uuid.uuid4().hex}.mp4"
+        path.write_bytes(video_bytes)
+
+        model_kwargs = {"actions": action_rows, "states": state_rows}
+        parameters = parameters or {}
+        horizon = _parameter_value(parameters.get("rollout_horizon"))
+        if horizon is not None:
+            model_kwargs["rollout_horizon"] = int(horizon)
+        stream = _parameter_value(parameters.get("stream_rollout"))
+        if stream is not None:
+            model_kwargs["stream_rollout"] = bool(stream)
+
+        return SubmitArgs(
+            file_paths={"video": [str(path)]},
+            input_modalities=["video"],
+            output_modalities=["video"],
+            model_kwargs=model_kwargs,
+        )
+
+    def output_tensors(self, chunk) -> list[dict] | None:
+        if chunk.modality != "video":
+            return None
+        import numpy as np
+
+        latents = np.frombuffer(chunk.data, dtype="<f4")
+        if latents.size == 0 or latents.size % self.hidden_size:
+            raise ValueError(
+                f"latent chunk holds {latents.size} float32 values, "
+                f"not a non-empty multiple of {self.hidden_size}"
+            )
+        tokens = latents.size // self.hidden_size
+        return [{
+            "metadata": {
+                "name": "latents",
+                "data_type": "Float32",
+                "shape": [tokens, self.hidden_size],
+            },
+            "data": {"data_type": "Float32", "values": latents.tolist()},
+        }]
+
+    def aggregate_chunks(self, parameters) -> bool:
+        # The engine emits one latent chunk per rollout iteration in both
+        # walks; only a stream_rollout client wants them as separate
+        # responses. Everyone else gets one merged response, which is what
+        # a unary ModelInfer requires.
+        return not bool(_parameter_value((parameters or {}).get("stream_rollout")))
+
 
 TENSOR_SPECS = {
     "pi05": Pi05TensorSpec(),
+    "vjepa2_ac": VJepa2AcTensorSpec(),
 }
 
 
 def get_tensor_spec(model_name: str):
     return TENSOR_SPECS.get(model_name)
+
+
+def _merge_tensor(merged: dict, tensor: dict) -> None:
+    """Concatenate a chunk's tensor onto the accumulated one of the same
+    name (leading dimension grows; trailing dims and dtype must match)."""
+    name = tensor["metadata"]["name"]
+    existing = merged.get(name)
+    if existing is None:
+        merged[name] = tensor
+        return
+    old_meta, new_meta = existing["metadata"], tensor["metadata"]
+    if (old_meta["shape"][1:] != new_meta["shape"][1:]
+            or old_meta["data_type"] != new_meta["data_type"]):
+        raise ValueError(
+            f"cannot aggregate chunks of {name!r}: "
+            f"{old_meta['shape']} vs {new_meta['shape']}"
+        )
+    old_meta["shape"] = [
+        old_meta["shape"][0] + new_meta["shape"][0], *old_meta["shape"][1:]
+    ]
+    existing["data"]["values"].extend(tensor["data"]["values"])
 
 
 class TensorBridge:
@@ -844,10 +992,17 @@ class TensorBridge:
 
     async def generate(self, request: dict, context=None):
         named = {t["metadata"]["name"]: t for t in request.get("tensors", [])}
-        args = self.spec.submit_args(named, self.server.upload_dir)
+        parameters = request.get("parameters") or {}
+        args = self.spec.submit_args(named, self.server.upload_dir, parameters)
+        # An aggregating spec folds every mapped chunk into ONE response —
+        # required for unary ModelInfer when the engine emits multiple
+        # chunks per request. Non-aggregating requests get one response
+        # per mapped chunk (ModelStreamInfer territory).
+        aggregate = self.spec.aggregate_chunks(parameters)
         rid = _submit(self.server, args, prefix="tensor")
         produced = False
         cancelled = False
+        merged: dict[str, dict] = {}
         try:
             async for chunk in self.server.iter_result_chunks(rid):
                 if context is not None and context.is_stopped():
@@ -856,7 +1011,12 @@ class TensorBridge:
                 if chunk.modality == "error":
                     raise RuntimeError(chunk.data.decode("utf-8", "replace"))
                 tensors = self.spec.output_tensors(chunk)
-                if tensors:
+                if not tensors:
+                    continue
+                if aggregate:
+                    for tensor in tensors:
+                        _merge_tensor(merged, tensor)
+                else:
                     produced = True
                     yield {
                         "id": request.get("id"),
@@ -865,5 +1025,12 @@ class TensorBridge:
                     }
         finally:
             self.server.abort_request(rid)
+        if merged and not cancelled:
+            produced = True
+            yield {
+                "id": request.get("id"),
+                "model": request.get("model") or self.served_model_name,
+                "tensors": list(merged.values()),
+            }
         if not produced and not cancelled:
             raise RuntimeError("no tensor output produced")

@@ -157,6 +157,19 @@ def test_register_model_in_process(tmp_path):
                 needs=[],
                 tensor_model_config=TENSOR_SPECS["pi05"].model_config("citest-vla"),
             )
+            # Same contract for the vjepa2_ac declaration (Bytes input,
+            # two open dims).
+            tensor_wm = runtime.endpoint("mstar.citest_wm.generate_tensor")
+            await register_model(
+                ModelInput.Tensor,
+                ModelType.TensorBased,
+                tensor_wm,
+                model_dir,
+                "citest-wm",
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+                tensor_model_config=TENSOR_SPECS["vjepa2_ac"].model_config("citest-wm"),
+            )
         finally:
             runtime.shutdown()
 

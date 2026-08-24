@@ -474,3 +474,203 @@ def test_tensor_stop_before_output(tmp_path):
     # "no output" error — a cancel is not a failure — and the abort ran.
     assert out == []
     assert server.aborted
+
+
+# ----------------------------------------------------------------------
+# tensor bridge: vjepa2_ac (seam double; no engine)
+# ----------------------------------------------------------------------
+
+VJEPA2_D = 1408
+
+
+def _vjepa2_trajectories(rows=4, dim=7):
+    # Integer-valued floats survive the float32 round-trip exactly.
+    actions = [[float(i * 10 + j) for j in range(dim)] for i in range(rows)]
+    states = [[float(i * 10 + j + 100) for j in range(dim)] for i in range(rows)]
+    return actions, states
+
+
+def _vjepa2_request(video=b"ftyp-not-a-real-mp4", actions=None, states=None,
+                    parameters=None, req_id="vj-1"):
+    default_a, default_s = _vjepa2_trajectories()
+    actions = actions if actions is not None else default_a
+    states = states if states is not None else default_s
+    a = np.asarray(actions, dtype="<f4")
+    s = np.asarray(states, dtype="<f4")
+    tensors = [
+        _tensor("video", "Bytes", [1], [list(video)]),
+        _tensor("actions", "Float32", list(a.shape), a.flatten().tolist()),
+        _tensor("states", "Float32", list(s.shape), s.flatten().tolist()),
+    ]
+    return {"id": req_id, "model": "vjepa2_ac",
+            "parameters": parameters or {}, "tensors": tensors}
+
+
+def _run_vjepa2(server, request, ctx=None):
+    bridge = TensorBridge(server, TENSOR_SPECS["vjepa2_ac"], "vjepa2_ac")
+    ctx = ctx or server._stop_ctx or _Ctx()
+
+    async def collect():
+        out = []
+        async for response in bridge.generate(request, ctx):
+            out.append(response)
+        return out
+
+    return asyncio.run(collect())
+
+
+def test_vjepa2_spec_registry_and_config():
+    assert get_tensor_spec("vjepa2_ac") is TENSOR_SPECS["vjepa2_ac"]
+    config = TENSOR_SPECS["vjepa2_ac"].model_config("served-name")
+    assert config["name"] == "served-name"
+    assert [(t["name"], t["data_type"], t["shape"]) for t in config["inputs"]] == [
+        ("video", "Bytes", [1]),
+        ("actions", "Float32", [-1, -1]),
+        ("states", "Float32", [-1, -1]),
+    ]
+    assert config["outputs"] == [
+        {"name": "latents", "data_type": "Float32", "shape": [-1, VJEPA2_D]},
+    ]
+
+
+def test_vjepa2_full_request(tmp_path):
+    latents = (np.arange(6 * VJEPA2_D, dtype="<f4") / 1000).reshape(6, VJEPA2_D)
+    server = _FakeRealtimeServer([_chunk("video", latents.tobytes())], tmp_path)
+    video = b"ftyp-not-a-real-mp4" * 3
+    actions, states = _vjepa2_trajectories()
+    request = _vjepa2_request(video=video,
+                              parameters={"rollout_horizon": {"int64": 3}})
+
+    out = _run_vjepa2(server, request)
+
+    assert len(out) == 1
+    assert out[0]["id"] == "vj-1" and out[0]["model"] == "vjepa2_ac"
+    (result,) = out[0]["tensors"]
+    assert result["metadata"] == {
+        "name": "latents", "data_type": "Float32", "shape": [6, VJEPA2_D],
+    }
+    got = np.array(result["data"]["values"], dtype="<f4").reshape(6, VJEPA2_D)
+    assert np.array_equal(got, latents)
+
+    sub = server.submitted[0]
+    assert sub["text"] is None
+    assert sub["input_modalities"] == ["video"]
+    assert sub["output_modalities"] == ["video"]
+    assert sub["model_kwargs"]["actions"] == actions
+    assert sub["model_kwargs"]["states"] == states
+    assert sub["model_kwargs"]["rollout_horizon"] == 3
+    (path,) = sub["file_paths"]["video"]
+    assert path.endswith(".mp4")
+    assert Path(path).read_bytes() == video
+    assert Path(path).parent == Path(tmp_path)
+    assert server.aborted
+
+
+def test_vjepa2_batched_rollout_aggregates(tmp_path):
+    # The engine emits one chunk per rollout iteration even in the batched
+    # walk; without stream_rollout they must fold into ONE response.
+    steps = [np.full((2, VJEPA2_D), float(i), dtype="<f4") for i in range(3)]
+    server = _FakeRealtimeServer(
+        [_chunk("video", s.tobytes()) for s in steps], tmp_path
+    )
+    out = _run_vjepa2(server, _vjepa2_request(
+        parameters={"rollout_horizon": {"int64": 3}}
+    ))
+    assert len(out) == 1
+    (result,) = out[0]["tensors"]
+    assert result["metadata"]["shape"] == [6, VJEPA2_D]
+    got = np.array(result["data"]["values"], dtype="<f4").reshape(3, 2, VJEPA2_D)
+    for i in range(3):
+        assert np.all(got[i] == float(i))
+
+
+def test_vjepa2_streaming_rollout(tmp_path):
+    steps = [np.full((2, VJEPA2_D), float(i), dtype="<f4") for i in range(3)]
+    server = _FakeRealtimeServer(
+        [_chunk("video", s.tobytes()) for s in steps], tmp_path
+    )
+    out = _run_vjepa2(server, _vjepa2_request(parameters={
+        "rollout_horizon": {"int64": 3}, "stream_rollout": {"bool": True},
+    }))
+    assert len(out) == 3
+    for i, response in enumerate(out):
+        (result,) = response["tensors"]
+        assert result["metadata"]["shape"] == [2, VJEPA2_D]
+        assert result["data"]["values"][0] == float(i)
+    kwargs = server.submitted[0]["model_kwargs"]
+    assert kwargs["rollout_horizon"] == 3
+    assert kwargs["stream_rollout"] is True
+
+
+def test_vjepa2_plain_parameter_values(tmp_path):
+    # Untagged scalars (tests, future HTTP route) unwrap the same way.
+    server = _FakeRealtimeServer(
+        [_chunk("video", np.zeros(VJEPA2_D, dtype="<f4").tobytes())], tmp_path
+    )
+    _run_vjepa2(server, _vjepa2_request(
+        parameters={"rollout_horizon": 2, "stream_rollout": True}
+    ))
+    kwargs = server.submitted[0]["model_kwargs"]
+    assert kwargs["rollout_horizon"] == 2
+    assert kwargs["stream_rollout"] is True
+
+
+def test_vjepa2_defaults_to_single_pass(tmp_path):
+    server = _FakeRealtimeServer(
+        [_chunk("video", np.zeros(VJEPA2_D, dtype="<f4").tobytes())], tmp_path
+    )
+    out = _run_vjepa2(server, _vjepa2_request())
+    assert out[0]["tensors"][0]["metadata"]["shape"] == [1, VJEPA2_D]
+    assert set(server.submitted[0]["model_kwargs"]) == {"actions", "states"}
+
+
+def test_vjepa2_video_bytes_as_bytestring(tmp_path):
+    server = _FakeRealtimeServer(
+        [_chunk("video", np.zeros(VJEPA2_D, dtype="<f4").tobytes())], tmp_path
+    )
+    request = _vjepa2_request()
+    request["tensors"][0]["data"]["values"] = [b"raw-container-bytes"]
+    _run_vjepa2(server, request)
+    (path,) = server.submitted[0]["file_paths"]["video"]
+    assert Path(path).read_bytes() == b"raw-container-bytes"
+
+
+def test_vjepa2_missing_inputs_error(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    request = _vjepa2_request()
+    request["tensors"] = request["tensors"][:2]  # drop states
+    with pytest.raises(ValueError, match="states"):
+        _run_vjepa2(server, request)
+    assert not server.submitted and not server.aborted
+
+
+def test_vjepa2_bad_trajectory_shape_error(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    request = _vjepa2_request()
+    request["tensors"][1]["metadata"]["shape"] = [28]  # flattened, not [n, d]
+    with pytest.raises(ValueError, match="timesteps"):
+        _run_vjepa2(server, request)
+    assert not server.submitted
+
+
+def test_vjepa2_trajectory_mismatch_error(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    actions, states = _vjepa2_trajectories(rows=3)
+    request = _vjepa2_request(actions=actions, states=states[:2])
+    with pytest.raises(ValueError, match="share"):
+        _run_vjepa2(server, request)
+    assert not server.submitted
+
+
+def test_vjepa2_empty_video_error(tmp_path):
+    server = _FakeRealtimeServer([], tmp_path)
+    with pytest.raises(ValueError, match="empty"):
+        _run_vjepa2(server, _vjepa2_request(video=b""))
+    assert not server.submitted
+
+
+def test_vjepa2_misaligned_latent_bytes(tmp_path):
+    server = _FakeRealtimeServer([_chunk("video", b"\x00" * 4)], tmp_path)
+    with pytest.raises(ValueError, match="multiple of 1408"):
+        _run_vjepa2(server, _vjepa2_request())
+    assert server.aborted
