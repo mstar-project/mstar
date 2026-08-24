@@ -31,6 +31,7 @@ from diffusers.models.embeddings import Timesteps
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.v1.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -326,7 +327,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        attend: "_GenAttend",
+        attend: AttentionCallable,
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
@@ -416,7 +417,7 @@ class Cosmos3MoTDecoderLayer(nn.Module):
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        attend: "_GenAttend",
+        attend: AttentionCallable,
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
@@ -426,52 +427,6 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         )
         residual = gen_seq + attn_out
         return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
-
-
-class _GenAttend:
-    """The ``(q, k, v)`` callable ``ulysses_attention`` takes, over the cached
-    K/V — the GEN pathway's ``_attend_cached``, with attn/label/layer_idx moved
-    onto the resources' cursors.
-
-    One instance per transformer, deliberately *not* one per layer. Dynamo
-    specializes ``ulysses_attention`` on the identity of its ``run_attention``
-    argument, so a per-layer callable retraces that frame once per layer and
-    blows the recompile limit; a per-call one (a ``functools.partial``, or a
-    freshly bound method) is worse still — it is deallocated as soon as the call
-    returns, invalidating the guard every single step. Mid-CUDA-graph-capture
-    such a recompile is fatal: dynamo snapshots the RNG state, which is illegal
-    while recording.
-
-    Everything it reads is shared across the stack — ``bind_node_resources``
-    hands every layer the same KV and attention resources — so one instance is
-    correct as well as necessary.
-    """
-
-    def __init__(self):
-        self.kv = None
-        # The step picks the GEN attention resource (dense or paged), so unlike
-        # `kv` this is rebound per step rather than fixed at load.
-        self.attn = None
-
-    def bind_resources(self, resources: dict) -> None:
-        self.kv = resources["kv"]
-        self.attn = resources["attn"]
-
-    def bind_step(self, attn, label: str) -> None:
-        self.attn = attn
-        attn.set_default_label(label)
-        self.kv.set_default_label(label)
-
-    def set_layer_idx(self, layer_idx: int) -> None:
-        self.attn.set_default_layer_idx(layer_idx)
-        self.kv.set_default_layer_idx(layer_idx)
-
-    def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.attn.requires_kv_write:
-            self.kv.write_kv(k, v)
-        return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
 
 class DomainAwareLinear(nn.Module):
@@ -535,9 +490,9 @@ class Cosmos3OmniTransformer(nn.Module):
             )
             for _ in range(config.num_hidden_layers)
         )
-        # One shared attend callable for the whole GEN stack; see _GenAttend.
-        # Plain attribute, not a child module — it holds resources, not params.
-        self._gen_attend = _GenAttend()
+        # One shared attend callable for the whole GEN stack, built at bind
+        # time; see AttentionCallable for why it must not be per layer.
+        self._gen_attend: AttentionCallable | None = None
         self.norm = RMSNorm(h, eps=config.rms_norm_eps)
         self.norm_moe_gen = RMSNorm(h, eps=config.rms_norm_eps)
         self.rotary_emb = Cosmos3RotaryEmbedding(
@@ -572,9 +527,12 @@ class Cosmos3OmniTransformer(nn.Module):
             self.action_modality_embed = nn.Parameter(torch.zeros(h))
 
     def bind_resources(self, resources: dict) -> None:
-        # `_gen_attend` is not a child module, so the `bind_node_resources`
-        # walk does not reach it on its own.
-        self._gen_attend.bind_resources(resources)
+        # Built once here, not per layer, and not per step: `ulysses_attention`
+        # is traced per identity of this object (see AttentionCallable). The
+        # per-step GEN resource is rebound through `bind_step` instead.
+        self._gen_attend = AttentionCallable(
+            kv=resources["kv"], attn=resources["attn"]
+        )
 
     # ------------------------------------------------------------------
     # Pure-tensor packing/unpacking helpers (ported from diffusers).
@@ -948,10 +906,10 @@ class Cosmos3OmniTransformer(nn.Module):
         # `attn` and `label` hold for the whole stack, so they go on the shared
         # attend once rather than through every layer call; only the layer index
         # advances. Off the call signature they cannot make the callable vary
-        # per layer (see _GenAttend), and the index stops being a live int that
+        # per layer (see AttentionCallable), and the index stops being a live int that
         # inductor specializes the layer body on.
         attend = self._gen_attend
-        attend.bind_step(attn, label)
+        attend.bind_step(attn=attn, label=label)
         if sp.world_size == 1:
             for i, layer in enumerate(self.layers):
                 attend.set_layer_idx(i)

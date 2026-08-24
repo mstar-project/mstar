@@ -74,11 +74,15 @@ class _SdpaResources:
 
     def bind(self, module):
         """Bind these into a bare transformer, the way
-        ``NodeSubmodule.bind_node_resources`` does for a served node."""
+        ``NodeSubmodule.bind_node_resources`` does for a served node.
+
+        Unlike that walk, the root is bound too: there the root is the
+        submodule, which takes its resources separately, but here it is the
+        transformer, which binds the shared attend callable."""
         resources = self.as_dict()
         for child in module.modules():
             bind = getattr(child, "bind_resources", None)
-            if bind is not None and child is not module:
+            if bind is not None:
                 bind(resources)
 
     def plan(self, plan_label, groups, causal):
