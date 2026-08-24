@@ -23,7 +23,6 @@ dim and the out / down projections row-shard their input and all-reduce.
 
 from __future__ import annotations
 
-import functools
 import math
 
 import torch
@@ -169,6 +168,13 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # components/attention.py and NodeSubmodule.bind_node_resources
         self.attn = None
         self.kv = None
+        # The attention resource the GEN pathway runs on this step; the step
+        # picks it (dense or paged), so it is not fixed at bind time.
+        self._gen_attn = None
+        # Bound once and stored: dynamo weakrefs the callable it guards on, and
+        # `self._attend_gen` builds a *new* bound method per access that dies
+        # with the call. See `_attend_gen`.
+        self._attend_gen_fn = self._attend_gen
         tp_size = comm_group.world_size
         sp_size = sp_group.world_size
         # Ulysses sequence parallelism redistributes heads across the SP group
@@ -297,6 +303,36 @@ class Cosmos3PackedMoTAttention(nn.Module):
             k=k, v=v, layer_idx=layer_idx,
         )
 
+    def bind_gen_step(self, attn, label: str) -> None:
+        """Bind the GEN pathway's per-step attention resource and label. The
+        layer index is set per iteration by ``set_gen_layer_idx``."""
+        self._gen_attn = attn
+        attn.set_default_label(label)
+        self.kv.set_default_label(label)
+
+    def set_gen_layer_idx(self, layer_idx: int) -> None:
+        self._gen_attn.set_default_layer_idx(layer_idx)
+        self.kv.set_default_layer_idx(layer_idx)
+
+    def _attend_gen(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        """``_attend_cached`` reduced to the ``(q, k, v)`` callable
+        ``ulysses_attention`` takes; attn/label/layer_idx come from the cursors
+        above.
+
+        Always pass it as ``self._attend_gen_fn``, never as
+        ``self._attend_gen``. Dynamo guards the traced frame on a weakref to
+        this callable, and anything built per call — a ``functools.partial``, or
+        a freshly bound method — dies when the call returns, invalidating the
+        guard and recompiling every step. Mid-CUDA-graph-capture that recompile
+        is fatal: dynamo snapshots the RNG state, which is illegal while
+        recording."""
+        attn = self._gen_attn
+        if attn.requires_kv_write:
+            self.kv.write_kv(k, v)
+        return attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
+
     def forward_und(
         self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         layer_idx: int, label: str,
@@ -327,7 +363,6 @@ class Cosmos3PackedMoTAttention(nn.Module):
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        layer_idx: int, label: str, attn,
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
@@ -344,11 +379,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # denoise forward sets prefer_all_gather (the all-to-all does not replay
         # from a CUDA graph; all-gather does).
         out = ulysses_attention(
-            self.sp_group, q, k, v,
-            functools.partial(
-                self._attend_cached, attn, layer_idx=layer_idx, label=label,
-            ),
-            seq_sizes,
+            self.sp_group, q, k, v, self._attend_gen_fn, seq_sizes,
             prefer_all_gather=prefer_all_gather,
         ).reshape(-1, H * D)
         return self.to_add_out(out)
@@ -421,14 +452,12 @@ class Cosmos3MoTDecoderLayer(nn.Module):
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        layer_idx: int, label: str, attn,
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
         gen_norm = self.input_layernorm_moe_gen(gen_seq)
         attn_out = self.self_attn.forward_gen(
-            gen_norm, cos, sin, layer_idx, label, attn,
-            seq_sizes, prefer_all_gather
+            gen_norm, cos, sin, seq_sizes, prefer_all_gather
         )
         residual = gen_seq + attn_out
         return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
@@ -897,17 +926,26 @@ class Cosmos3OmniTransformer(nn.Module):
         scatter + rank-order gather preserves the exact token order (including a
         packed ``[cond | uncond]`` CFG batch)."""
         sp = self.sp_group
+        # `attn` and `label` hold for the whole stack, so they are bound once
+        # on the resources rather than threaded through every layer call; the
+        # layer index is set per iteration. Keeping them off the call signature
+        # is what lets one stored callable serve every layer (see `_attend_gen`),
+        # and keeps inductor from specializing the layer body on the index.
+        for layer in self.layers:
+            layer.self_attn.bind_gen_step(attn, label)
         if sp.world_size == 1:
             for i, layer in enumerate(self.layers):
-                gen_seq = layer.forward_gen(gen_seq, cos, sin, i, label, attn)
+                layer.self_attn.set_gen_layer_idx(i)
+                gen_seq = layer.forward_gen(gen_seq, cos, sin)
             return gen_seq
         seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
         gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
         cos = scatter_sequence(sp, cos, seq_sizes)
         sin = scatter_sequence(sp, sin, seq_sizes)
         for i, layer in enumerate(self.layers):
+            layer.self_attn.set_gen_layer_idx(i)
             gen_seq = layer.forward_gen(
-                gen_seq, cos, sin, i, label, attn, seq_sizes, prefer_all_gather
+                gen_seq, cos, sin, seq_sizes, prefer_all_gather
             )
         return gather_sequence(sp, gen_seq, seq_sizes)
 

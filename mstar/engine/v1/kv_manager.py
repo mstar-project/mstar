@@ -356,6 +356,7 @@ class KVManager(Resource):
         self._cg_max_seq_len = 0
         self._current_plan_states: dict[str, KVPlanState] = {}
         self._current_layer_idx: int = 0
+        self._default_label: str = "main"
 
         self._preplan_states: dict[str, KVPlanState] = {}
         self._preplanned = False
@@ -629,6 +630,7 @@ class KVManager(Resource):
             "different step ahead"
         )
         self._current_layer_idx = 0
+        self._default_label = "main"
         if self._preplanned:
             self._current_plan_states = self._preplan_states
             res = self._cached_plan_output
@@ -939,8 +941,17 @@ class KVManager(Resource):
         return AllocResult()
 
     ### Submodule-level functionality
-    def set_layer_idx(self, layer_idx: int):
+    # Cursors: a caller that runs a whole layer stack under one label (or one
+    # layer index) sets it once here instead of threading it through every
+    # call. An explicit argument still supersedes the default.
+    def set_default_layer_idx(self, layer_idx: int):
         self._current_layer_idx = layer_idx
+
+    # TODO: rename the call sites and drop this alias.
+    set_layer_idx = set_default_layer_idx
+
+    def set_default_label(self, label: str):
+        self._default_label = label
 
     @torch.compiler.disable
     def layer_view(self, layer_idx: int=None) -> torch.Tensor:
@@ -953,13 +964,15 @@ class KVManager(Resource):
         return self.kv_cache.layer_view(layer_idx)
 
     @torch.compiler.disable
-    def read_kv(self, layer_idx: int=None, plan_label: str="main") -> torch.Tensor:
+    def read_kv(self, layer_idx: int=None, plan_label: str=None) -> torch.Tensor:
         """
         The slots this step's plan writes, e.g. for NHD:
         [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1).
         """
         if layer_idx is None:
             layer_idx = self._current_layer_idx
+        if plan_label is None:
+            plan_label = self._default_label
         plan_state = self._current_plan_states[plan_label]
         n = plan_state.total_tokens
         return self.kv_cache.read_tokens(
@@ -971,7 +984,7 @@ class KVManager(Resource):
     @torch.compiler.disable
     def write_kv(
         self, k: torch.Tensor, v: torch.Tensor,
-        layer_idx: int=None, label: str="main", return_tensor: bool = False,
+        layer_idx: int=None, label: str=None, return_tensor: bool = False,
     ) -> torch.Tensor | None:
         """Write K, V into this step's planned slots.
 
@@ -980,6 +993,8 @@ class KVManager(Resource):
         """
         if layer_idx is None:
             layer_idx = self._current_layer_idx
+        if label is None:
+            label = self._default_label
         plan_state = self._current_plan_states[label]
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(

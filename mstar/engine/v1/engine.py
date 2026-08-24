@@ -5,7 +5,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import torch
 
@@ -44,6 +44,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SubmoduleManagement:
     submodule: NodeSubmodule
+    forward: Callable
+    forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
     cuda_graph_runner: CudaGraphRunner | None = None
@@ -240,6 +242,8 @@ class Engine:
             }
             self._submodules[node_name] = SubmoduleManagement(
                 submodule=submodule,
+                forward=submodule.forward,
+                forward_batched=submodule.forward_batched,
                 joint_comm_group=parallel_groups.get_joint_group_for_node(node_name),
                 resources=resources
             )
@@ -263,12 +267,12 @@ class Engine:
                 continue
 
             try:
-                submodule.forward = torch.compile(
+                submodule_mgmt.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=None,
                 )
-                submodule.forward_batched = torch.compile(
+                submodule_mgmt.forward_batched = torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=None,
@@ -619,7 +623,7 @@ class Engine:
             range_push("engine.forward")
         try:
             raw = self._forward(
-                batch, submodule, cg_runner, engine_inputs, preprocessed,
+                batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                 lease, running_batched, request_ids, release_event,
             )
         finally:
@@ -639,7 +643,7 @@ class Engine:
     def _forward(
         self,
         batch: ExecutingBatch,
-        submodule: NodeSubmodule,
+        submodule_mgmt: SubmoduleManagement,
         cg_runner,
         engine_inputs: ModelInputsFromEngine,
         preprocessed: dict[str, Any],
@@ -661,14 +665,14 @@ class Engine:
         if release_event is not None:
             release_event.set()
         if running_batched:
-            return submodule.forward_batched(
+            return submodule_mgmt.forward_batched(
                 graph_walk, engine_inputs=engine_inputs, **preprocessed
             )
         assert len(request_ids) == 1, (
             "the unbatched forward takes one request; batch of "
             f"{len(request_ids)} needs running_batched"
         )
-        return {request_ids[0]: submodule.forward(
+        return {request_ids[0]: submodule_mgmt.forward(
             graph_walk, engine_inputs=engine_inputs, **preprocessed
         )}
 

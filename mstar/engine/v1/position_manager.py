@@ -83,6 +83,10 @@ class PublishedPositionInfo(PublishedInfo):
 
 
 class PositionManager(Resource):
+    # NOTE: no `set_default_label` cursor here, unlike the KV and attention
+    # resources — nothing needs one yet. Add it if a caller has to thread a
+    # label through a whole layer stack to reach `apply_qk`.
+
     @classmethod
     def build(
         cls, spec: PositionSpec,

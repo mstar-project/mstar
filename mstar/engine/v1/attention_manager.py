@@ -65,6 +65,25 @@ class AttentionManager(Resource):
     # Remains abstract except for build; will build based
     # on the attention backend
 
+    # Cursors mirroring the KV resource's: a caller running a whole layer stack
+    # under one label/index sets them once instead of threading them through
+    # every `run`. Explicit arguments still supersede. Class-level so every
+    # backend gets them without touching its __init__.
+    _default_label: str = "main"
+    _default_layer_idx: int | None = None
+
+    def set_default_label(self, label: str):
+        self._default_label = label
+
+    def set_default_layer_idx(self, layer_idx: int):
+        self._default_layer_idx = layer_idx
+
+    def reset_defaults(self):
+        """Cleared each plan so a step that never binds cannot inherit the
+        previous step's cursor (mirrors KVManager.plan)."""
+        self._default_label = "main"
+        self._default_layer_idx = None
+
     @classmethod
     def build(
         cls, spec: AttentionSpec,
@@ -287,6 +306,7 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        self.reset_defaults()
         assert not ctx.is_preplan or ctx.slot_lease is not None, (
             "preplan requires a cuda graph step: eager wrappers share one "
             "workspace per label with the forward still in flight"
@@ -356,8 +376,8 @@ class FlashInferManager(AttentionManager):
         return hidden.index_select(0, last_token_indices)
 
     def run(
-        self, q: torch.Tensor, label: str,
-        kv_cache_layer: torch.Tensor,
+        self, q: torch.Tensor, label: str | None = None,
+        kv_cache_layer: torch.Tensor | None = None,
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
         layer_idx: int | None = None,
@@ -367,6 +387,8 @@ class FlashInferManager(AttentionManager):
         # planned wrapper carries the layout. Accepted and ignored so one
         # layer body serves either backend — see `requires_kv_write`.
         del k, v, layer_idx
+        if label is None:
+            label = self._default_label
         return torch.ops.mstar.flashinfer_attend(
             self._attend_handle, label, q, kv_cache_layer,
         )
@@ -895,6 +917,7 @@ class DenseAttentionManager(AttentionManager):
             del self._prefix_cache[key]
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        self.reset_defaults()
         assert ctx.slot_lease is None and not ctx.is_preplan, (
             "dense attention is eager-only: the prefix gather and the "
             "concatenation allocate and are shaped by the step, so there is "
@@ -985,8 +1008,8 @@ class DenseAttentionManager(AttentionManager):
 
     @torch.compiler.disable
     def run(
-        self, q: torch.Tensor, label: str,
-        kv_cache_layer: torch.Tensor,
+        self, q: torch.Tensor, label: str | None = None,
+        kv_cache_layer: torch.Tensor | None = None,
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
         layer_idx: int | None = None,
@@ -994,6 +1017,10 @@ class DenseAttentionManager(AttentionManager):
         """One layer's dense attention. ``k``/``v`` are this step's freshly
         projected K/V, packed in the plan's segment order; they are never
         written to the pages."""
+        if label is None:
+            label = self._default_label
+        if layer_idx is None:
+            layer_idx = self._default_layer_idx
         assert k is not None and v is not None and layer_idx is not None, (
             "dense attention runs on the step's own K/V: pass k, v and "
             "layer_idx (the layer writes nothing through the KV resource "
