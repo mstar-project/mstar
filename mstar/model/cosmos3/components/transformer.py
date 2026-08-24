@@ -168,13 +168,6 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # components/attention.py and NodeSubmodule.bind_node_resources
         self.attn = None
         self.kv = None
-        # The attention resource the GEN pathway runs on this step; the step
-        # picks it (dense or paged), so it is not fixed at bind time.
-        self._gen_attn = None
-        # Bound once and stored: dynamo weakrefs the callable it guards on, and
-        # `self._attend_gen` builds a *new* bound method per access that dies
-        # with the call. See `_attend_gen`.
-        self._attend_gen_fn = self._attend_gen
         tp_size = comm_group.world_size
         sp_size = sp_group.world_size
         # Ulysses sequence parallelism redistributes heads across the SP group
@@ -303,36 +296,6 @@ class Cosmos3PackedMoTAttention(nn.Module):
             k=k, v=v, layer_idx=layer_idx,
         )
 
-    def bind_gen_step(self, attn, label: str) -> None:
-        """Bind the GEN pathway's per-step attention resource and label. The
-        layer index is set per iteration by ``set_gen_layer_idx``."""
-        self._gen_attn = attn
-        attn.set_default_label(label)
-        self.kv.set_default_label(label)
-
-    def set_gen_layer_idx(self, layer_idx: int) -> None:
-        self._gen_attn.set_default_layer_idx(layer_idx)
-        self.kv.set_default_layer_idx(layer_idx)
-
-    def _attend_gen(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    ) -> torch.Tensor:
-        """``_attend_cached`` reduced to the ``(q, k, v)`` callable
-        ``ulysses_attention`` takes; attn/label/layer_idx come from the cursors
-        above.
-
-        Always pass it as ``self._attend_gen_fn``, never as
-        ``self._attend_gen``. Dynamo guards the traced frame on a weakref to
-        this callable, and anything built per call — a ``functools.partial``, or
-        a freshly bound method — dies when the call returns, invalidating the
-        guard and recompiling every step. Mid-CUDA-graph-capture that recompile
-        is fatal: dynamo snapshots the RNG state, which is illegal while
-        recording."""
-        attn = self._gen_attn
-        if attn.requires_kv_write:
-            self.kv.write_kv(k, v)
-        return attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
-
     def forward_und(
         self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
         layer_idx: int, label: str,
@@ -363,6 +326,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        attend: "_GenAttend",
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
@@ -379,7 +343,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # denoise forward sets prefer_all_gather (the all-to-all does not replay
         # from a CUDA graph; all-gather does).
         out = ulysses_attention(
-            self.sp_group, q, k, v, self._attend_gen_fn, seq_sizes,
+            self.sp_group, q, k, v, attend, seq_sizes,
             prefer_all_gather=prefer_all_gather,
         ).reshape(-1, H * D)
         return self.to_add_out(out)
@@ -452,15 +416,62 @@ class Cosmos3MoTDecoderLayer(nn.Module):
 
     def forward_gen(
         self, gen_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        attend: "_GenAttend",
         seq_sizes: list[int] | None = None,
         prefer_all_gather: bool = False,
     ) -> torch.Tensor:
         gen_norm = self.input_layernorm_moe_gen(gen_seq)
         attn_out = self.self_attn.forward_gen(
-            gen_norm, cos, sin, seq_sizes, prefer_all_gather
+            gen_norm, cos, sin, attend, seq_sizes, prefer_all_gather
         )
         residual = gen_seq + attn_out
         return residual + self.mlp_moe_gen(self.post_attention_layernorm_moe_gen(residual))
+
+
+class _GenAttend:
+    """The ``(q, k, v)`` callable ``ulysses_attention`` takes, over the cached
+    K/V — the GEN pathway's ``_attend_cached``, with attn/label/layer_idx moved
+    onto the resources' cursors.
+
+    One instance per transformer, deliberately *not* one per layer. Dynamo
+    specializes ``ulysses_attention`` on the identity of its ``run_attention``
+    argument, so a per-layer callable retraces that frame once per layer and
+    blows the recompile limit; a per-call one (a ``functools.partial``, or a
+    freshly bound method) is worse still — it is deallocated as soon as the call
+    returns, invalidating the guard every single step. Mid-CUDA-graph-capture
+    such a recompile is fatal: dynamo snapshots the RNG state, which is illegal
+    while recording.
+
+    Everything it reads is shared across the stack — ``bind_node_resources``
+    hands every layer the same KV and attention resources — so one instance is
+    correct as well as necessary.
+    """
+
+    def __init__(self):
+        self.kv = None
+        # The step picks the GEN attention resource (dense or paged), so unlike
+        # `kv` this is rebound per step rather than fixed at load.
+        self.attn = None
+
+    def bind_resources(self, resources: dict) -> None:
+        self.kv = resources["kv"]
+        self.attn = resources["attn"]
+
+    def bind_step(self, attn, label: str) -> None:
+        self.attn = attn
+        attn.set_default_label(label)
+        self.kv.set_default_label(label)
+
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self.attn.set_default_layer_idx(layer_idx)
+        self.kv.set_default_layer_idx(layer_idx)
+
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.attn.requires_kv_write:
+            self.kv.write_kv(k, v)
+        return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
 
 
 class DomainAwareLinear(nn.Module):
@@ -524,6 +535,9 @@ class Cosmos3OmniTransformer(nn.Module):
             )
             for _ in range(config.num_hidden_layers)
         )
+        # One shared attend callable for the whole GEN stack; see _GenAttend.
+        # Plain attribute, not a child module — it holds resources, not params.
+        self._gen_attend = _GenAttend()
         self.norm = RMSNorm(h, eps=config.rms_norm_eps)
         self.norm_moe_gen = RMSNorm(h, eps=config.rms_norm_eps)
         self.rotary_emb = Cosmos3RotaryEmbedding(
@@ -556,6 +570,11 @@ class Cosmos3OmniTransformer(nn.Module):
                 h, config.max_action_dim, config.num_embodiment_domains
             )
             self.action_modality_embed = nn.Parameter(torch.zeros(h))
+
+    def bind_resources(self, resources: dict) -> None:
+        # `_gen_attend` is not a child module, so the `bind_node_resources`
+        # walk does not reach it on its own.
+        self._gen_attend.bind_resources(resources)
 
     # ------------------------------------------------------------------
     # Pure-tensor packing/unpacking helpers (ported from diffusers).
@@ -926,26 +945,26 @@ class Cosmos3OmniTransformer(nn.Module):
         scatter + rank-order gather preserves the exact token order (including a
         packed ``[cond | uncond]`` CFG batch)."""
         sp = self.sp_group
-        # `attn` and `label` hold for the whole stack, so they are bound once
-        # on the resources rather than threaded through every layer call; the
-        # layer index is set per iteration. Keeping them off the call signature
-        # is what lets one stored callable serve every layer (see `_attend_gen`),
-        # and keeps inductor from specializing the layer body on the index.
-        for layer in self.layers:
-            layer.self_attn.bind_gen_step(attn, label)
+        # `attn` and `label` hold for the whole stack, so they go on the shared
+        # attend once rather than through every layer call; only the layer index
+        # advances. Off the call signature they cannot make the callable vary
+        # per layer (see _GenAttend), and the index stops being a live int that
+        # inductor specializes the layer body on.
+        attend = self._gen_attend
+        attend.bind_step(attn, label)
         if sp.world_size == 1:
             for i, layer in enumerate(self.layers):
-                layer.self_attn.set_gen_layer_idx(i)
-                gen_seq = layer.forward_gen(gen_seq, cos, sin)
+                attend.set_layer_idx(i)
+                gen_seq = layer.forward_gen(gen_seq, cos, sin, attend)
             return gen_seq
         seq_sizes = sp_seq_split(gen_seq.shape[0], sp.world_size)
         gen_seq = scatter_sequence(sp, gen_seq, seq_sizes)
         cos = scatter_sequence(sp, cos, seq_sizes)
         sin = scatter_sequence(sp, sin, seq_sizes)
         for i, layer in enumerate(self.layers):
-            layer.self_attn.set_gen_layer_idx(i)
+            attend.set_layer_idx(i)
             gen_seq = layer.forward_gen(
-                gen_seq, cos, sin, seq_sizes, prefer_all_gather
+                gen_seq, cos, sin, attend, seq_sizes, prefer_all_gather
             )
         return gather_sequence(sp, gen_seq, seq_sizes)
 
