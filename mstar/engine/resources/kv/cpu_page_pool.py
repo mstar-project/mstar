@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.v1.kv_cache import KVCache, KVConfig, PageAllocator
+from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
 
 logger = logging.getLogger(__name__)
 

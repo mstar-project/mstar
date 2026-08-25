@@ -11,7 +11,7 @@ step and does not try to. It suppresses only the off-graph mask traffic — bs x
 inert whenever every resident ``repetition_penalty`` is 1.0. The numerics of the
 kernel itself are covered by ``cudagraph_sampler_test.py`` (GPU).
 
-Runs on CPU; ``mstar.utils.sampling`` imports triton at module scope, so the
+Runs on CPU; ``mstar.engine.resources.sampler.utils`` imports triton at module scope, so the
 whole module skips where triton isn't installed.
 
     pytest test/sampling_test/test_penalty_gate.py
@@ -29,7 +29,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     SlotLease,
     StepContext,
 )
-from mstar.engine.v1.sampler import SamplerResource, SamplingReqConfig  # noqa: E402
+from mstar.engine.resources.sampler.resource import SamplerResource, SamplingReqConfig  # noqa: E402
 
 VOCAB = 64
 

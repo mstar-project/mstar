@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SlotLease, StepContext
-from mstar.engine.v1.attention_manager import (
+from mstar.engine.resources.attn.manager import (
     AttentionConfig,
     AttentionManager,
     AttentionSpec,
@@ -27,8 +27,8 @@ from mstar.engine.v1.attention_manager import (
     FlashInferManager,
     _fa3_unavailable_reason,
 )
-from mstar.engine.v1.kv_cache import KVConfig
-from mstar.engine.v1.kv_manager import KVPlanOutput, SequenceView
+from mstar.engine.resources.kv.cache import KVConfig
+from mstar.engine.resources.kv.manager import KVPlanOutput, SequenceView
 
 PAGE_SIZE = 4
 NUM_KV_HEADS = 2
@@ -275,7 +275,7 @@ def kv_manager(monkeypatch):
     """A KVManager over a CPU cache. Its transfer engine registers the cache
     for CUDA IPC at construction, which needs a GPU and has nothing to do with
     page bookkeeping, so it is stubbed out."""
-    from mstar.engine.v1 import kv_manager as kv_manager_module
+    from mstar.engine.resources.kv import manager as kv_manager_module
 
     monkeypatch.setattr(
         kv_manager_module, "KVTransferManager", lambda info, kv_cache: None

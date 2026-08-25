@@ -31,7 +31,7 @@ from diffusers.models.embeddings import Timesteps
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.v1.convenience import AttentionCallable
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     RowParallelLinear,

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from mstar.engine.v1.convenience import AttentionCallable
+from mstar.engine.resources.convenience import AttentionCallable
 import torch.nn.functional as F
 from torch import nn
 

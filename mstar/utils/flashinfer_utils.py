@@ -35,7 +35,7 @@ def run_rms_norm(
     layer's ``input_layernorm`` — which makes the layer body a frame dynamo
     recompiles once per layer.
     """
-    from mstar.engine.v1.attention_wrappers import flashinfer_rmsnorm
+    from mstar.engine.resources.attn.wrappers import flashinfer_rmsnorm
 
     del flashinfer_rmsnorm  # imported for its registration side effect
     return torch.ops.mstar.flashinfer_rmsnorm(input, weight, eps, rms_norm_dtype)

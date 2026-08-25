@@ -8,7 +8,7 @@ from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SamplerStep, StepContext
-from mstar.utils.sampling import CudaGraphableSampler, Sampler, SamplerBuffers
+from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
 
 
 @dataclass
@@ -51,7 +51,7 @@ class SamplingReqConfig(ResourceReqConfig):
 
 
 class SamplerResource(Resource):
-    # TODO: this is  a light wrapper around mstar/utils/sampling.py. In the future,
+    # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.
     def __init__(
         self,

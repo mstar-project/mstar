@@ -5,8 +5,8 @@ import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.resources.spec import ResourceReqConfig
-from mstar.engine.v1.engine import Engine
-from mstar.engine.v1.kv_transfer import TransferEngineInfo
+from mstar.engine.engine import Engine
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)

@@ -39,13 +39,13 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.v1.attention_manager import (
+from mstar.engine.resources.attn.manager import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
 )
-from mstar.engine.v1.kv_cache import KVConfig
-from mstar.engine.v1.kv_manager import KVReqConfig, KVSpec
+from mstar.engine.resources.kv.cache import KVConfig
+from mstar.engine.resources.kv.manager import KVReqConfig, KVSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,

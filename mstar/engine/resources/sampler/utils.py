@@ -11,7 +11,7 @@ CUDA graph compatible: no Python control flow branches — uses masking
 to handle greedy vs sampled requests in the same batch.
 
 Usage:
-    from mstar.utils.sampling import sample_tokens
+    from mstar.engine.resources.sampler.utils import sample_tokens
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 

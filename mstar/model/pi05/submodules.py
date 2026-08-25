@@ -25,12 +25,12 @@ from mstar.engine.resources.step import (
     Segment,
     SubmoduleStep,
 )
-from mstar.engine.v1.cuda_graph_config import (
+from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     CudaGraphConfig,
     PackedCudaGraphConfig,
 )
-from mstar.engine.v1.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert

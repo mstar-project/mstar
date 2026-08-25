@@ -14,7 +14,7 @@ from typing import Optional
 
 import torch
 
-from mstar.engine.v1.convenience import AttentionCallable
+from mstar.engine.resources.convenience import AttentionCallable
 from torch import nn
 from transformers.activations import ACT2FN
 

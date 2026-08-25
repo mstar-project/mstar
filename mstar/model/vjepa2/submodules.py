@@ -28,11 +28,11 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.v1.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 
 from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SubmoduleStep
-from mstar.engine.v1.cuda_graph_config import PiecewiseBatchedConfig, PiecewiseCallInputs, PiecewiseCaptureShape, PiecewiseCudaGraphConfig
-from mstar.engine.v1.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine.cuda_graph_config import PiecewiseBatchedConfig, PiecewiseCallInputs, PiecewiseCaptureShape, PiecewiseCudaGraphConfig
+from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor

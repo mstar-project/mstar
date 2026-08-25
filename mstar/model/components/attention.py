@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.v1.convenience import AttentionCallable
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.norm import RMSNorm
 
 

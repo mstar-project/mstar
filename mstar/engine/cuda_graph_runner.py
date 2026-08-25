@@ -11,7 +11,7 @@ from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import CGSlotSpec, Resource
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
-from mstar.engine.v1.cuda_graph_config import (
+from mstar.engine.cuda_graph_config import (
     CudaGraphConfig,
     CudaGraphConfigType,
     PiecewiseCallInputs,

@@ -21,7 +21,7 @@ Requires a GPU + flashinfer.
 
 import torch
 
-from mstar.utils.sampling import (
+from mstar.engine.resources.sampler.utils import (
     MultiSamplerBuffers,
     MultiSamplingConfig,
     SamplingConfig,

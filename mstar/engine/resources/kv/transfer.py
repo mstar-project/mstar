@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
-from mstar.engine.v1.kv_cache import KVCache, KVLayout
+from mstar.engine.resources.kv.cache import KVCache, KVLayout
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import (

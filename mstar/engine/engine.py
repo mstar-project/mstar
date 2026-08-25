@@ -23,13 +23,13 @@ from mstar.engine.resources.step import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.engine.v1.cuda_graph_runner import (
+from mstar.engine.cuda_graph_runner import (
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
     autocast_scope,
 )
-from mstar.engine.v1.kv_transfer import TransferEngineInfo
-from mstar.engine.v1.sampler import SamplerResource
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.submodule_base import (
     LazyRequestStates,
     ModelInputsFromEngine,

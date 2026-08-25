@@ -39,7 +39,7 @@ from mstar.engine.resources.step import (
     Segment,
     SubmoduleStep,
 )
-from mstar.engine.v1.cuda_graph_config import (
+from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     PackedCudaGraphConfig,
 )

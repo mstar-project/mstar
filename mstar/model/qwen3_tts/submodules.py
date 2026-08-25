@@ -42,7 +42,7 @@ from mstar.engine.resources.step import (
     Segment,
     SubmoduleStep,
 )
-from mstar.engine.v1.cuda_graph_config import (
+from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     CudaGraphConfig,
     PiecewiseBatchedConfig,
@@ -50,8 +50,8 @@ from mstar.engine.v1.cuda_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseCudaGraphConfig,
 )
-from mstar.engine.v1.engine import ExecutingBatch
-from mstar.engine.v1.sampler import SamplerResource
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,

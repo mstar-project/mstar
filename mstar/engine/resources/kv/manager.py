@@ -17,9 +17,9 @@ from mstar.engine.resources.step import (
     StepContext,
     group_by_plan_label,
 )
-from mstar.engine.v1.cpu_page_pool import CPUPagePool
-from mstar.engine.v1.kv_cache import KVCache, KVConfig, PageAllocator
-from mstar.engine.v1.kv_transfer import KVTransferManager, TransferEngineInfo
+from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
+from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
+from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 
 
 @dataclass
@@ -165,6 +165,11 @@ def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,
 ) -> PagedIndptrs:
+    # TODO: ~90% of this is the four `torch.tensor(list)` conversions. Holding
+    # `CacheStream.page_indices` as a doubling int32 numpy array instead makes
+    # the pages copy a memcpy: measured 52us -> 13us at bs=16/1024 pages, for
+    # +0.3us on the per-step append. Not done because page_indices also crosses
+    # publish/ZMQ, offload/reload, forks and the CPU pool.
     qo_indptr = [0]
     kv_indptr = [0]
     all_pages: list[int] = []

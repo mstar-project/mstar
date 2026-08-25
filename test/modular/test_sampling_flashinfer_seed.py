@@ -4,7 +4,7 @@ The Talker samples stochastically (temperature ~0.9, top_k ~50) under CUDA-graph
 capture. ``CudaGraphableSampler.sample`` passes per-request philox
 ``seed``/``offset`` as captured int tensors and advances ``offset_buf += 1``
 in-graph so each replay steps the RNG (see the comments in
-``mstar/utils/sampling.py`` about a frozen offset never reaching EOS).
+``mstar/engine/resources/sampler/utils.py`` about a frozen offset never reaching EOS).
 
 This requires a FlashInfer build whose ``*_sampling_from_probs`` binding accepts
 tensor seed/offset under graph capture. FlashInfer 0.6.3 rejected tensors at the
@@ -147,7 +147,7 @@ def test_aux_sampling_config_is_live_after_capture():
     and so froze temperature/top_k/top_p into the captured kernel launch.
     """
     _flashinfer_or_skip()
-    from mstar.utils.sampling import (
+    from mstar.engine.resources.sampler.utils import (
         MultiSamplerBuffers,
         MultiSamplingConfig,
         SamplingConfig,

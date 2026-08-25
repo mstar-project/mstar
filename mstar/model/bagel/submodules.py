@@ -12,7 +12,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.v1.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import (
     AttentionStep,
     KVStep,
@@ -22,7 +22,7 @@ from mstar.engine.resources.step import (
     Segment,
     SubmoduleStep,
 )
-from mstar.engine.v1.cuda_graph_config import (
+from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     PackedCudaGraphConfig,
 )

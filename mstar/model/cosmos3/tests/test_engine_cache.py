@@ -304,7 +304,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources.base import build_resource
-    from mstar.engine.v1.kv_transfer import TransferEngineInfo
+    from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
     prev_backend = model.config.attention_backend
     if backend is not None:
@@ -784,7 +784,7 @@ def _run_cuda_graph_denoise(ctx):
     branches), returning the final latents."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
     from mstar.distributed.communication import CommGroup, JointGroups
-    from mstar.engine.v1.cuda_graph_runner import CudaGraphRunner
+    from mstar.engine.cuda_graph_runner import CudaGraphRunner
 
     model, dit = ctx["model"], ctx["dit"]
     device, dtype = ctx["device"], ctx["dtype"]

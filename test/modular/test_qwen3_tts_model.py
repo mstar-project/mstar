@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.v1.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,

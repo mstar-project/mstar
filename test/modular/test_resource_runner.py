@@ -387,7 +387,7 @@ def test_v1_kv_layer_imports_without_kv_store_or_the_conductor():
     Run in a subprocess because sys.modules is shared across the pytest
     session (and conftest stubs triton in-process)."""
     probe = (
-        "import sys, mstar.engine.v1.kv_manager, mstar.engine.resources;"
+        "import sys, mstar.engine.resources.kv.manager, mstar.engine.resources;"
         "leaked = [m for m in ("
         "  'mstar.conductor.request_info',"
         "  'mstar.communication.tensors',"

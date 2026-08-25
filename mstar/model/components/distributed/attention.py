@@ -28,7 +28,7 @@ from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.engine.v1.convenience import AttentionCallable
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.norm import RMSNorm
 
 

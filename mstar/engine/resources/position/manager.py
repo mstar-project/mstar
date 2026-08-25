@@ -15,10 +15,10 @@ from mstar.engine.resources.step import (
     PositionStep,
     StepContext,
 )
-from mstar.engine.v1.attention_wrappers import (
+from mstar.engine.resources.attn.wrappers import (
     rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
-from mstar.engine.v1.kv_manager import KVPlanOutputs, SequenceView
+from mstar.engine.resources.kv.manager import KVPlanOutputs, SequenceView
 
 
 class PosBackend(Enum):

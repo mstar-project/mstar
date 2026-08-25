@@ -1,7 +1,7 @@
 import torch
 
-from mstar.engine.v1.attention_manager import AttentionManager
-from mstar.engine.v1.kv_manager import KVManager
+from mstar.engine.resources.attn.manager import AttentionManager
+from mstar.engine.resources.kv.manager import KVManager
 
 
 class AttentionCallable:   

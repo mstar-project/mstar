@@ -25,10 +25,10 @@ import torch
 
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import StepContext
-from mstar.engine.v1.kv_cache import KVConfig
-from mstar.engine.v1.kv_manager import KVManager
-from mstar.engine.v1.kv_transfer import TransferEngineInfo
-from mstar.engine.v1.position_manager import PositionConfig, RopeManager
+from mstar.engine.resources.kv.cache import KVConfig
+from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.position.manager import PositionConfig, RopeManager
 from mstar.model.bagel.submodules import LLMSubmodule, active_labels
 from mstar.model.submodule_base import ARNodeInputs
 

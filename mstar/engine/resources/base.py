@@ -13,11 +13,11 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, Resou
 if TYPE_CHECKING:
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
-    from mstar.engine.v1.cuda_graph_config import (
+    from mstar.engine.cuda_graph_config import (
         CudaGraphConfig,
         PiecewiseCudaGraphConfig,
     )
-    from mstar.engine.v1.kv_transfer import TransferEngineInfo
+    from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
 
 @dataclass(frozen=True)
@@ -217,7 +217,7 @@ def build_resource(
     kv_dtype: torch.dtype
 ) -> Resource:
     if spec.resource_type == ResourceType.KV_CACHE:
-        from mstar.engine.v1.kv_manager import KVManager
+        from mstar.engine.resources.kv.manager import KVManager
         return KVManager.build(
             spec=spec,
             device=device,
@@ -226,14 +226,14 @@ def build_resource(
             dtype=kv_dtype
         )
     if spec.resource_type == ResourceType.SAMPLER:
-        from mstar.engine.v1.sampler import SamplerResource
+        from mstar.engine.resources.sampler.resource import SamplerResource
         return SamplerResource.build(
             spec=spec,
             device=device,
             joint_comm_group=joint_comm_group
         )
     if spec.resource_type == ResourceType.ATTENTION:
-        from mstar.engine.v1.attention_manager import AttentionManager
+        from mstar.engine.resources.attn.manager import AttentionManager
         return AttentionManager.build(
             spec=spec,
             device=device,
@@ -241,7 +241,7 @@ def build_resource(
             dtype=kv_dtype
         )
     if spec.resource_type == ResourceType.CROSS_ATTENTION:
-        from mstar.engine.v1.attention_manager import CrossAttentionManager
+        from mstar.engine.resources.attn.manager import CrossAttentionManager
         return CrossAttentionManager.build(
             spec=spec,
             device=device,
@@ -249,7 +249,7 @@ def build_resource(
             dtype=kv_dtype
         )
     if spec.resource_type == ResourceType.POSITIONS:
-        from mstar.engine.v1.position_manager import PositionManager
+        from mstar.engine.resources.position.manager import PositionManager
         return PositionManager.build(
             spec=spec, device=device
         )

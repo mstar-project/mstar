@@ -23,7 +23,7 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.utils.sampling import SamplingConfig
+from mstar.engine.resources.sampler.utils import SamplingConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
