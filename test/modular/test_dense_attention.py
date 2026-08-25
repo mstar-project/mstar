@@ -247,7 +247,7 @@ class TestBackendSelection:
         """...and degrades to the paged backend when it is not: the two are
         drop-in for each other, so a missing wheel costs speed, not serving."""
         spec = AttentionSpec(
-            label="attn",
+            resource_key="attn",
             nodes={"llm"},
             config=AttentionConfig(kv_cache="kv", backend=AttnBackend.DENSE),
             kv_config=_kv_config(),

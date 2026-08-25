@@ -354,12 +354,12 @@ class OrpheusModel(Model):
         )
         return [
             KVSpec(
-                label=KV_CACHE,
+                resource_key=KV_CACHE,
                 nodes={"LLM"},
                 config=kv_config
             ),
             AttentionSpec(
-                label=ATTN,
+                resource_key=ATTN,
                 nodes={"LLM"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE,
@@ -367,13 +367,13 @@ class OrpheusModel(Model):
                 kv_config=kv_config
             ),
             SamplerSpec(
-                label=SAMPLER,
+                resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True
             ),
             PositionSpec(
-                label=ROPE,
+                resource_key=ROPE,
                 nodes={"LLM"},
                 config=PositionConfig(
                     kv_cache=KV_CACHE,

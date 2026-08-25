@@ -319,7 +319,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
     groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
     transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
     resources = {
-        spec.label: build_resource(
+        spec.resource_key: build_resource(
             spec, torch.device(device), groups, transfer, dtype,
         )
         for spec in specs

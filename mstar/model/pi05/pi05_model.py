@@ -405,14 +405,14 @@ class Pi05Model(Model):
             num_qo_heads=self.config.num_qo_heads,
         )
         return [
-            KVSpec(label=LLM_KV, nodes={"LLM"}, config=kv_config),
+            KVSpec(resource_key=LLM_KV, nodes={"LLM"}, config=kv_config),
             AttentionSpec(
-                label=LLM_ATTN, nodes={"LLM"},
+                resource_key=LLM_ATTN, nodes={"LLM"},
                 config=AttentionConfig(kv_cache=LLM_KV),
                 kv_config=kv_config,
             ),
             PositionSpec(
-                label=LLM_POS, nodes={"LLM"},
+                resource_key=LLM_POS, nodes={"LLM"},
                 config=PositionConfig(kv_cache=LLM_KV),
             ),
         ]

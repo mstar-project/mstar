@@ -199,13 +199,13 @@ class Engine:
 
             if not parallel_groups.all_in_same_group(spec.nodes):
                 raise ValueError(
-                    f"Resource spec {spec.label} nodes {spec.nodes} "
+                    f"Resource spec {spec.resource_key} nodes {spec.nodes} "
                     f"must all be in the same parallel (tp x sp) group"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(
                 next(iter(relevant_nodes))
             )
-            self._resources[spec.label] = build_resource(
+            self._resources[spec.resource_key] = build_resource(
                 spec=spec,
                 device=device,
                 joint_comm_group=joint_comm_group,
@@ -214,7 +214,7 @@ class Engine:
             )
 
             for node in relevant_nodes:
-                node_to_resources.setdefault(node, []).append(spec.label)
+                node_to_resources.setdefault(node, []).append(spec.resource_key)
 
         self._runner = StepRunner(
             self._resources,

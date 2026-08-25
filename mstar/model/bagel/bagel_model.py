@@ -622,20 +622,20 @@ class BagelModel(Model):
         kv_config = self._kv_config()
         nodes = set(self._LLM_NODES)
         return [
-            KVSpec(label="kv", nodes=nodes, config=kv_config),
+            KVSpec(resource_key="kv", nodes=nodes, config=kv_config),
             AttentionSpec(
-                label="attn", nodes=nodes,
+                resource_key="attn", nodes=nodes,
                 config=AttentionConfig(kv_cache="kv"),
                 kv_config=kv_config,
             ),
             PositionSpec(
-                label="rope", nodes=nodes,
+                resource_key="rope", nodes=nodes,
                 config=PositionConfig(
                     kv_cache="kv", rope_theta=self.config.rope_theta,
                 ),
             ),
             SamplerSpec(
-                label="sampler", nodes=nodes,
+                resource_key="sampler", nodes=nodes,
                 vocab_size=self.config.vocab_size,
             ),
         ]

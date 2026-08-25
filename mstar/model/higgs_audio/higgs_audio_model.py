@@ -120,21 +120,21 @@ class HiggsAudioModel(Model):
             max_num_pages=256,
         )
         return [
-            KVSpec(label=KV_CACHE, nodes={"LLM"}, config=kv_config),
+            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=kv_config),
             AttentionSpec(
-                label=ATTN, nodes={"LLM"},
+                resource_key=ATTN, nodes={"LLM"},
                 config=AttentionConfig(kv_cache=KV_CACHE),
                 kv_config=kv_config,
             ),
             PositionSpec(
-                label=ROPE, nodes={"LLM"},
+                resource_key=ROPE, nodes={"LLM"},
                 config=PositionConfig(
                     kv_cache=KV_CACHE,
                     rope_theta=self.config.rope_theta,
                 ),
             ),
             SamplerSpec(
-                label=SAMPLER, nodes={"LLM"},
+                resource_key=SAMPLER, nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
                 # ASR transcription: the reference decodes greedily and
                 # exposes no penalty knob, so no seen-token buffers.

@@ -215,9 +215,9 @@ class Cosmos3Model(Model):
             num_qo_heads=self.config.num_attention_heads,
         )
         specs: list[NodeResourceSpec] = [
-            KVSpec(label=KV_CACHE, nodes={DIT_NODE}, config=kv_config),
+            KVSpec(resource_key=KV_CACHE, nodes={DIT_NODE}, config=kv_config),
             AttentionSpec(
-                label=ATTN,
+                resource_key=ATTN,
                 nodes={DIT_NODE},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER,
@@ -227,7 +227,7 @@ class Cosmos3Model(Model):
         ]
         if self.config.attention_backend == "dense_gen":
             specs.append(AttentionSpec(
-                label=ATTN_GEN,
+                resource_key=ATTN_GEN,
                 nodes={DIT_NODE},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.DENSE,

@@ -243,23 +243,23 @@ class Qwen3TTSModel(Model):
             num_qo_heads=talker.num_attention_heads,
         )
         return [
-            KVSpec(label=TALKER_KV, nodes={"Talker"}, config=talker_kv),
+            KVSpec(resource_key=TALKER_KV, nodes={"Talker"}, config=talker_kv),
             AttentionSpec(
-                label=TALKER_ATTN, nodes={"Talker"},
+                resource_key=TALKER_ATTN, nodes={"Talker"},
                 config=AttentionConfig(kv_cache=TALKER_KV),
                 kv_config=talker_kv,
             ),
             PositionSpec(
-                label=TALKER_POS, nodes={"Talker"},
+                resource_key=TALKER_POS, nodes={"Talker"},
                 config=PositionConfig(kv_cache=TALKER_KV),
             ),
             SamplerSpec(
-                label=TALKER_SAMPLER, nodes={"Talker"},
+                resource_key=TALKER_SAMPLER, nodes={"Talker"},
                 vocab_size=talker.vocab_size,
                 enable_repetion_penalty=True,
             ),
             SamplerSpec(
-                label=CODE_PRED_SAMPLER, nodes={"Talker"},
+                resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                 vocab_size=cp.vocab_size,
                 enable_repetion_penalty=False,
             ),

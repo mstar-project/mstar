@@ -182,17 +182,17 @@ class Qwen3OmniModel(Model):
 
         return [
             KVSpec(
-                label=THINKER_KV,
+                resource_key=THINKER_KV,
                 nodes={"Thinker"},
                 config=thinker_kv
             ),
             KVSpec(
-                label=TALKER_KV,
+                resource_key=TALKER_KV,
                 nodes={"Talker"},
                 config=talker_kv
             ),
             AttentionSpec(
-                label=THINKER_ATTN,
+                resource_key=THINKER_ATTN,
                 nodes={"Thinker"},
                 config=AttentionConfig(
                     kv_cache=THINKER_KV
@@ -200,7 +200,7 @@ class Qwen3OmniModel(Model):
                 kv_config=thinker_kv
             ),
             AttentionSpec(
-                label=TALKER_ATTN,
+                resource_key=TALKER_ATTN,
                 nodes={"Talker"},
                 config=AttentionConfig(
                     kv_cache=TALKER_KV
@@ -208,33 +208,33 @@ class Qwen3OmniModel(Model):
                 kv_config=talker_kv
             ),
             PositionSpec(
-                label=THINKER_POS,
+                resource_key=THINKER_POS,
                 nodes={"Thinker"},
                 config=PositionConfig(
                     kv_cache=THINKER_KV
                 )
             ),
             PositionSpec(
-                label=TALKER_POS,
+                resource_key=TALKER_POS,
                 nodes={"Talker"},
                 config=PositionConfig(
                     kv_cache=TALKER_KV
                 )
             ),
             SamplerSpec(
-                label=THINKER_SAMPLER,
+                resource_key=THINKER_SAMPLER,
                 nodes={"Thinker"},
                 vocab_size=self.config.thinker_text.vocab_size,
                 enable_repetion_penalty=True,
             ),
             SamplerSpec(
-                label=TALKER_SAMPLER,
+                resource_key=TALKER_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.talker_text.vocab_size,
                 enable_repetion_penalty=True,
             ),
             SamplerSpec(
-                label=CODE_PRED_SAMPLER,
+                resource_key=CODE_PRED_SAMPLER,
                 nodes={"Talker"},
                 vocab_size=self.config.code_predictor.vocab_size,
                 enable_repetion_penalty=False,

@@ -377,7 +377,7 @@ class KVManager(AttentionResource):
     ):
         return cls(
             cfg=spec.config,
-            name=spec.label,
+            name=spec.resource_key,
             device=device,
             joint_comm_group=joint_comm_group,
             transfer_engine_info=transfer_engine_info,

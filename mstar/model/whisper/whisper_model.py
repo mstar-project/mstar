@@ -139,18 +139,18 @@ class WhisperModel(Model):
             max_num_pages=192,
         )
         return [
-            KVSpec(label=KV_CACHE, nodes={"decoder"}, config=kv_config),
+            KVSpec(resource_key=KV_CACHE, nodes={"decoder"}, config=kv_config),
             AttentionSpec(
-                label=ATTN, nodes={"decoder"},
+                resource_key=ATTN, nodes={"decoder"},
                 config=AttentionConfig(kv_cache=KV_CACHE),
                 kv_config=kv_config,
             ),
             KVSpec(
-                label=CROSS_KV_CACHE, nodes={"decoder"},
+                resource_key=CROSS_KV_CACHE, nodes={"decoder"},
                 config=context_kv_config,
             ),
             CrossAttentionSpec(
-                label=CROSS_ATTN, nodes={"decoder"},
+                resource_key=CROSS_ATTN, nodes={"decoder"},
                 config=CrossAttentionConfig(
                     kv_cache=CROSS_KV_CACHE,
                     query_kv_cache=KV_CACHE,
@@ -159,13 +159,13 @@ class WhisperModel(Model):
                 kv_config=context_kv_config,
             ),
             PositionSpec(
-                label=POS, nodes={"decoder"},
+                resource_key=POS, nodes={"decoder"},
                 # No RoPE: this exists for the position counter, whose planned
                 # ids drive the learned ``embed_positions`` lookup.
                 config=PositionConfig(kv_cache=KV_CACHE),
             ),
             SamplerSpec(
-                label=SAMPLER, nodes={"decoder"},
+                resource_key=SAMPLER, nodes={"decoder"},
                 vocab_size=self.config.vocab_size,
                 # ASR transcription decodes greedily; no seen-token buffers.
                 enable_repetion_penalty=False,

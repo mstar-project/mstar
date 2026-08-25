@@ -296,12 +296,12 @@ class VJepa2Model(Model):
         )
         return [
             KVSpec(
-                label=KV_CACHE,
+                resource_key=KV_CACHE,
                 nodes={"rollout_predictor"},
                 config=kv
             ),
             AttentionSpec(
-                label=ATTN,
+                resource_key=ATTN,
                 nodes={"rollout_predictor"},
                 config=AttentionConfig(
                     kv_cache=KV_CACHE

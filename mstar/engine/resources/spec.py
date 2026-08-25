@@ -22,7 +22,7 @@ class ResourceType(IntEnum):
 
 @dataclass
 class NodeResourceSpec(ABC):
-    label: str
+    resource_key: str
     nodes: set[str]
 
     def __post_init__(self):
