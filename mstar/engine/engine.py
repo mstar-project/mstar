@@ -1,7 +1,6 @@
 
 
 import logging
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -12,24 +11,22 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.resources.base import Resource, build_resource
-from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import (
-    AdmitFailedReason,
-    AllocationFailed,
-    PostSample,
-    SlotLease,
-    StepContext,
-    SubmoduleStep,
-)
 from mstar.engine.cuda_graph_runner import (
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
     autocast_scope,
 )
+from mstar.engine.resources.base import Resource, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.step import (
+    AdmitFailedReason,
+    AllocationFailed,
+    SlotLease,
+    StepContext,
+    SubmoduleStep,
+)
 from mstar.model.submodule_base import (
     LazyRequestStates,
     ModelInputsFromEngine,
@@ -406,7 +403,7 @@ class Engine:
                 self._autocast_dtype_for(self._submodules[batch.node_name].submodule)
             ):
                 # a caller that pre-planned already reserved one; otherwise take it here
-                lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)  
+                lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
                 # admit/plan/commit assume the whole batch reaches the forward
                 # in order; an unbatchable walk with >1 request can't, so each
                 # request runs its own full cycle and merges.
@@ -456,7 +453,7 @@ class Engine:
                 range_push("engine.collect_outputs")
             try:
                 return self._collect_outputs(
-                    batch, submodule_mgmt, lease, raw, inputs, req_info,
+                    submodule_mgmt, lease, raw, inputs, req_info,
                     request_ids=batch.request_ids,
                     step_request_ids=batch.step_context.request_ids,
                 )
@@ -500,7 +497,7 @@ class Engine:
                     continue
                 launched = True
                 merged.update(self._collect_outputs(
-                    batch, submodule_mgmt, None, raw, [inp], req_info,
+                    submodule_mgmt, None, raw, [inp], req_info,
                     request_ids=[rid], step_request_ids=(rid,),
                 ))
             finally:
@@ -769,7 +766,6 @@ class Engine:
 
     def _collect_outputs(
         self,
-        batch: ExecutingBatch,
         submodule_mgmt: SubmoduleManagement,
         lease: SlotLease | None,
         raw_outputs: dict,
@@ -778,9 +774,8 @@ class Engine:
         request_ids: list[str],
         step_request_ids: tuple[str, ...],
     ) -> dict[str, NameToTensorList]:
-        """Per-rid outputs for the real requests: sample the logits keys the
-        step declared as ``post_sample``, drop the padding rows, and map a
-        captured graph's keys back to real ids.
+        """Per-rid outputs for the real requests: drop the padding rows and map
+        a captured graph's keys back to real ids.
 
         A captured forward emits its per-rid entries under the slot's padding
         ids (those were the batch at capture time), so entry ``i`` belongs to
@@ -793,115 +788,14 @@ class Engine:
         )
         outputs: dict[str, NameToTensorList] = {}
 
-        specs = self._post_sample_specs(batch.step, submodule_mgmt)
-        # Every declared in_key belongs to the sampler, so the per-rid merge
-        # below drops it rather than passing it through.
-        consumed = {spec.in_key for _, spec in specs}
-        # A batched spec stacks the whole batch under one sentinel key: it
-        # samples in one call, and covers its out_key for the per-rid specs.
-        covered: set[str] = set()
-        for sampler, spec in specs:
-            logits = raw_outputs.get(spec.in_key) if spec.batched else None
-            if logits is None:
-                continue
-            self._sample_into(
-                outputs, sampler, spec, logits, lease, request_ids, out_ids,
-            )
-            covered.add(spec.out_key)
-        pending = [
-            (sampler, spec) for sampler, spec in specs
-            if not spec.batched and spec.out_key not in covered
-        ]
-
         self._merge_per_rid(
-            outputs, raw_outputs, request_ids, out_ids,
-            submodule, req_info, consumed,
+            outputs, raw_outputs, request_ids, out_ids, submodule, req_info,
         )
-        for sampler, spec in pending:
-            logits = self._gather_per_rid(
-                raw_outputs, spec, lease, sampler, request_ids, out_ids,
-            )
-            if logits is not None:
-                self._sample_into(
-                    outputs, sampler, spec, logits, lease, request_ids, out_ids,
-                )
         self._merge_unpacked(
             outputs, raw_outputs, request_ids, submodule,
             inputs[:len(request_ids)], req_info,
         )
         return outputs
-
-    @staticmethod
-    def _post_sample_specs(
-        step: SubmoduleStep | None, submodule_mgmt: SubmoduleManagement,
-    ) -> list[tuple[SamplerResource, PostSample]]:
-        """The step's ``post_sample`` specs paired with the sampler resource
-        each one names. Specs whose key isn't a sampler are dropped."""
-        if step is None:
-            return []
-        specs = []
-        for key, spec in step.post_sample():
-            sampler = submodule_mgmt.resources.get(key)
-            if isinstance(sampler, SamplerResource):
-                specs.append((sampler, spec))
-        return specs
-
-    @staticmethod
-    def _sampler_rows(
-        sampler: SamplerResource,
-        lease: SlotLease | None,
-        request_ids: list[str],
-        out_ids: list[str],
-    ) -> tuple[list[str], int]:
-        """The ids and row count this step's sampler must be handed.
-
-        The CUDA-graph sampler's per-row params were gathered for the slot's
-        padded bs, so it takes the padding rows too; the eager one keys off
-        request ids and takes the real batch only.
-        """
-        if lease is not None and sampler.expects_padded_batch:
-            return out_ids[:lease.bucket.bs], lease.bucket.bs
-        return request_ids, len(request_ids)
-
-    def _sample_into(
-        self,
-        outputs: dict[str, NameToTensorList],
-        sampler: SamplerResource,
-        spec: PostSample,
-        logits: torch.Tensor,
-        lease: SlotLease | None,
-        request_ids: list[str],
-        out_ids: list[str],
-    ) -> None:
-        """Sample one ``[rows, vocab]`` batch and write a token per real rid."""
-        ids, rows = self._sampler_rows(sampler, lease, request_ids, out_ids)
-        # FlashInfer reuses its sampling output buffer across calls, so a view
-        # held past the next step aliases that step's token. The clone snapshots
-        # this step's value.
-        sampled = sampler.sample(ids, logits[:rows])[:len(request_ids)].clone()
-        for rid, view in zip(request_ids, sampled.split(1), strict=True):
-            outputs.setdefault(rid, {})[spec.out_key] = [view]
-
-    def _gather_per_rid(
-        self,
-        raw_outputs: dict,
-        spec: PostSample,
-        lease: SlotLease | None,
-        sampler: SamplerResource,
-        request_ids: list[str],
-        out_ids: list[str],
-    ) -> torch.Tensor | None:
-        """Stack a per-rid ``post_sample`` key into one batch of logits, in
-        batch order. None if any row the sampler needs is missing."""
-        _, rows = self._sampler_rows(sampler, lease, request_ids, out_ids)
-        gathered = []
-        for out_id in out_ids[:rows]:
-            value = raw_outputs.get(out_id)
-            value = value.get(spec.in_key) if isinstance(value, dict) else None
-            if value is None:
-                return None
-            gathered.append(value[0] if isinstance(value, list) else value)
-        return torch.cat(gathered, dim=0) if gathered else None
 
     def _merge_per_rid(
         self,
@@ -911,11 +805,8 @@ class Engine:
         out_ids: list[str],
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
-        consumed: set[str],
     ) -> None:
-        """Fold the forward's per-rid entries into ``outputs``, skipping the
-        keys the step handed to a sampler (``_gather_per_rid`` reads those
-        straight off ``raw_outputs``)."""
+        """Fold the forward's per-rid entries into ``outputs``."""
         for rid, out_id in zip(request_ids, out_ids, strict=False):
             rid_out = raw_outputs.get(out_id)
             if not isinstance(rid_out, dict):
@@ -925,8 +816,6 @@ class Engine:
             rid_out = submodule.filter_batched_output(req_info.get(rid), rid_out)
             merged = outputs.setdefault(rid, {})
             for key, value in rid_out.items():
-                if key in consumed:
-                    continue
                 if isinstance(value, list):
                     merged[key] = [t.clone() for t in value]
                 elif isinstance(value, torch.Tensor):

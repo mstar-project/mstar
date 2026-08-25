@@ -12,19 +12,18 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_config import (
+    BatchedCudaGraphConfig,
+    PackedCudaGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import (
     AttentionStep,
     KVStep,
     PositionStep,
-    PostSample,
     SamplerStep,
     Segment,
     SubmoduleStep,
-)
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
 )
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
@@ -48,6 +47,11 @@ from mstar.model.submodule_base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Private key the LLM's inner forwards hand their logits back under; `forward`
+# and `forward_batched` sample it and never emit it. Only they know whether a
+# sampled token is one flat entry or one per request.
+_LOGITS = "_logits"
 
 # The LLM nodes' walks, and the CFG branch each node owns. Module level
 # because both the submodule (per step) and the model (per request, in
@@ -452,13 +456,38 @@ class LLMSubmodule(ARNodeSubmodule):
     # combined plan; see declare_step.
     CFG_BATCHED_LABEL = "_cfg_batched"
 
-    # The forward hands its logits to the engine rather than sampling inline:
-    # stacked under the sentinel on the batched path, per-rid on the eager one.
-    # Both name the same "sampler" resource, and the batched view wins when the
-    # forward emitted it.
-    POST_SAMPLE = [PostSample("__batched_logits__"), PostSample("logits")]
-
     _NODE_TO_CFG_LABEL = NODE_TO_CFG_LABEL
+
+    def _sample_tokens(
+        self, request_ids: list[str], logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """One token per row of this step's ``[rows, vocab]`` logits.
+
+        ``request_ids`` is the batch the forward ran on, so under capture it is
+        the slot's padding ids and ``logits`` has the padded row count — which
+        is what the graph sampler's per-row params were gathered for. The
+        engine maps the entries back onto the real ids.
+        """
+        tokens = self.node_resources["sampler"].sample(request_ids, logits)
+        # FlashInfer reuses its sampling output buffer across calls, so a view
+        # held past the next step aliases that step's token.
+        return tokens.clone()
+
+    def _sample_one(
+        self, request_ids: list[str], logits: torch.Tensor,
+    ) -> NameToTensorList:
+        """The single-request forward's output shape: one flat name -> tensors."""
+        return {"new_token": [self._sample_tokens(request_ids, logits)]}
+
+    def _sample_per_request(
+        self, request_ids: list[str], logits: torch.Tensor,
+    ) -> dict[str, NameToTensorList]:
+        """The batched forward's output shape: rid -> that rid's outputs."""
+        tokens = self._sample_tokens(request_ids, logits)
+        return {
+            rid: {"new_token": [token]}
+            for rid, token in zip(request_ids, tokens.split(1), strict=True)
+        }
 
     def __init__(
         self,
@@ -772,7 +801,6 @@ class LLMSubmodule(ARNodeSubmodule):
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
             steps["sampler"] = SamplerStep(
-                post_sample=self.POST_SAMPLE,
                 prefill_tracked_tokens={
                     rid: inp.input_ids
                     for rid, inp in zip(request_ids, inputs, strict=True)
@@ -782,7 +810,7 @@ class LLMSubmodule(ARNodeSubmodule):
         elif graph_walk in ("decode", "prefill_vit"):
             # prefill_vit is the last walk before decode for an image prompt,
             # so it samples the first token too (prefill_vae never does).
-            steps["sampler"] = SamplerStep(post_sample=self.POST_SAMPLE)
+            steps["sampler"] = SamplerStep()
 
         steps.update({
             "kv": KVStep(
@@ -838,20 +866,28 @@ class LLMSubmodule(ARNodeSubmodule):
 
         logger.debug("Running BAGEL LLM for graph walk %s", graph_walk)
 
-        if graph_walk == "prefill_text":
-            return self._forward_prefill_text(**kwargs)
-        elif graph_walk == "prefill_vit":
-            return self._forward_prefill_vit(**kwargs)
-        elif graph_walk == "prefill_vae":
+        # The walks that never sample return straight out.
+        if graph_walk == "prefill_vae":
             return self._forward_prefill_vae(**kwargs)
-        elif graph_walk == "decode":
-            return self._forward_decode(**kwargs)
         elif graph_walk == "image_gen":
             return self._forward_image_gen(**kwargs)
         elif graph_walk == "image_gen_cfg":
             return self._forward_image_gen_single_branch(**kwargs)
+
+        if graph_walk == "prefill_text":
+            out = self._forward_prefill_text(**kwargs)
+        elif graph_walk == "prefill_vit":
+            out = self._forward_prefill_vit(**kwargs)
+        elif graph_walk == "decode":
+            out = self._forward_decode(**kwargs)
         else:
             raise ValueError(f"Unknown LLM graph walk: {graph_walk!r}")
+
+        # A prefill hands back logits only when it is meant to sample this step
+        # (`sample_prefill_token`); decode always does.
+        if _LOGITS in out:
+            return self._sample_one(engine_inputs.request_ids, out.pop(_LOGITS)[0])
+        return out
 
     def _forward_prefill_text(
         self, input_ids: torch.Tensor,
@@ -889,9 +925,10 @@ class LLMSubmodule(ARNodeSubmodule):
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
             last_hidden = hidden.index_select(0, last_token_indices)
             logits = self.lm_head(last_hidden)
-            return {
-                "logits": [logits]
-            }
+            # `_LOGITS` is the private handoff to whichever dispatcher called:
+            # the shape of a sampled token is `forward` vs `forward_batched`'s
+            # to decide, and this one runs under both.
+            return {_LOGITS: [logits]}
         return {}
 
     def _forward_prefill_vit(
@@ -920,9 +957,7 @@ class LLMSubmodule(ARNodeSubmodule):
             last_token_indices = (qo_indptr_buf[1:] - 1).long()  # (padded_bs,)
             last_hidden = hidden.index_select(0, last_token_indices)
             logits = self.lm_head(last_hidden)
-            return {
-                "logits": [logits]
-            }
+            return {_LOGITS: [logits]}
         return {}
 
     def _forward_prefill_vae(
@@ -988,9 +1023,7 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
         logits = self.lm_head(hidden[-1:])
-        return {
-            "logits": [logits],
-        }
+        return {_LOGITS: [logits]}
 
     @staticmethod
     def _apply_timestep_shift(t: torch.Tensor, shift: float) -> torch.Tensor:
@@ -1255,8 +1288,7 @@ class LLMSubmodule(ARNodeSubmodule):
         request_ids = engine_inputs.request_ids
 
         if graph_walk == "decode":
-            return self._forward_decode_batched(
-                request_ids=request_ids,
+            out = self._forward_decode_batched(
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
             )
@@ -1268,11 +1300,6 @@ class LLMSubmodule(ARNodeSubmodule):
                 sample_prefill_token=True,
                 **kwargs
             )
-            if "logits" in out:
-                out["__batched_logits__"] = out.pop("logits")[0]
-                for i, rid in enumerate(request_ids):
-                    out[rid] = {"logits": [out["__batched_logits__"][i]]}
-            return out
         elif graph_walk == "prefill_vit":
             out = self._forward_prefill_vit(
                 input_embeds=input_embeds,
@@ -1280,29 +1307,27 @@ class LLMSubmodule(ARNodeSubmodule):
                 sample_prefill_token=sample_token,
                 **kwargs
             )
-            if "logits" in out:
-                out["__batched_logits__"] = out.pop("logits")[0]
-                for i, rid in enumerate(request_ids):
-                    out[rid] = {"logits": [out["__batched_logits__"][i]]}
-            return out
         else:
             raise ValueError(f"Batched forward not supported for graph walk: {graph_walk!r}")
 
+        # Every walk reaching here samples, except a prefill_vit with
+        # `sample_prefill_token` off, which hands back no logits.
+        if _LOGITS in out:
+            # one `[bs, vocab]` sample for the whole batch, split per request
+            return self._sample_per_request(request_ids, out.pop(_LOGITS)[0])
+        return out
+
     def _forward_decode_batched(
         self,
-        request_ids: list[str],
         input_ids: torch.Tensor,
         requires_cfg: bool = False,
-    ) -> dict[str, NameToTensorList]:
+    ) -> NameToTensorList:
         """Batched decode: all requests generate 1 token each.
 
         1. Concatenate embeddings: [N, hidden] where N = num_requests
         2. Single LLM forward over the batch (batched attention)
         3. If any request requires CFG, run a second pass for cfg_img
-        4. Per-request lm_head -> logits
-
-        Returns logits per request. Token sampling is done by the engine
-        post-forward (outside CUDA graph capture).
+        4. lm_head -> one [N, vocab] logits tensor, sampled by the caller
         """
         # 1. Embed and concatenate
         embs = self.embed_tokens(input_ids)
@@ -1320,16 +1345,9 @@ class LLMSubmodule(ARNodeSubmodule):
                 label="cfg_img",
             )
 
-        # 4. Per-request lm_head -> logits (no sampling — done post-forward)
-        logits = self.lm_head(hidden)
-
-        # Expose the stacked [B, V] tensor under a sentinel key so the CUDA
-        # graph runner can sample directly without concatenating per-rid slices.
-        out: dict = {
-            rid: {"logits": [logits[i:i+1]]} for i, rid in enumerate(request_ids)
-        }
-        out["__batched_logits__"] = logits
-        return out
+        # 4. lm_head over the whole batch: one [N, vocab] tensor, so the batch
+        # samples in one call rather than per-rid slice by slice.
+        return {_LOGITS: [self.lm_head(hidden)]}
 
 
     def _wrap_with_boi_eoi(self, emb: torch.Tensor) -> torch.Tensor:

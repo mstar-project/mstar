@@ -1,6 +1,5 @@
 
 import itertools
-import re
 from collections.abc import KeysView
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
@@ -107,17 +106,6 @@ class SubmoduleStep:
     def __contains__(self, key: str) -> bool:
         return key in self.steps
 
-    def post_sample(self) -> "list[tuple[str, PostSample]]":
-        """(resource key, spec) for every logits key this step asked the engine
-        to sample, in declaration order. The key names the sampler resource, so
-        a node with more than one sampler stays unambiguous."""
-        return [
-            (key, spec)
-            for key, step in self.steps.items()
-            if isinstance(step, SamplerStep)
-            for spec in step.post_sample
-        ]
-
 """perhaps move below to distinct files/location per resource kind"""
 
 @dataclass(frozen=True)
@@ -146,40 +134,11 @@ class PositionStep(ResourceStep):
     # so the step declares the grouping once, on KVStep
 
 
-# A forward's batch-wide outputs sit at the top level of its output dict under
-# a `__sentinel__` name; anything else is a per-rid entry.
-_BATCHED_KEY = re.compile(r"^__\w+__$")
-
-
-@dataclass
-class PostSample:
-    """One logits key the forward hands back for the engine to sample.
-
-    ``batched``: ``in_key`` is a batch-wide ``[bs, vocab]`` tensor under the
-    top-level sentinel convention, so the whole batch samples in one call;
-    otherwise it is a per-rid entry, gathered in batch order first. Defaults to
-    whichever the name implies.
-
-    Declaring a key here also makes it the sampler's: it is consumed, never
-    passed through to the node's outputs. Several specs may share an
-    ``out_key`` (a forward that emits both a batched and a per-rid view of the
-    same logits) — the batched one wins when the forward actually emitted it.
-    """
-    in_key: str
-    batched: bool = None
-    out_key: str = "new_token"
-
-    def __post_init__(self):
-        if self.batched is None:
-            self.batched = bool(_BATCHED_KEY.match(self.in_key))
-
-
 @dataclass(frozen=True)
 class SamplerStep(ResourceStep):
     apply_penalty: bool = True
     # rid -> prefill tokens for the repetition penalty
     prefill_tracked_tokens: dict[str, torch.Tensor] = field(default_factory=dict)
-    post_sample: list[PostSample] = field(default_factory=list)
 
 
 # moved here

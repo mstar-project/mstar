@@ -23,12 +23,12 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.step import StepContext
 from mstar.engine.resources.kv.cache import KVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import PositionConfig, RopeManager
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import StepContext
 from mstar.model.bagel.submodules import LLMSubmodule, active_labels
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -72,7 +72,6 @@ class _Harness:
         self.submodule = types.SimpleNamespace(
             node_name="LLM",
             CFG_BATCHED_LABEL=LLMSubmodule.CFG_BATCHED_LABEL,
-            POST_SAMPLE=LLMSubmodule.POST_SAMPLE,
             _get_active_labels=lambda walk, cfg: active_labels(walk, cfg, "LLM"),
         )
 

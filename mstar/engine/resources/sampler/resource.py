@@ -6,9 +6,9 @@ import torch
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import Resource
+from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SamplerStep, StepContext
-from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
 
 
 @dataclass
@@ -301,17 +301,16 @@ class SamplerResource(Resource):
 
     ### Submodule-level functionality
 
-    @property
-    def expects_padded_batch(self) -> bool:
-        """Whether `sample` this step goes through the CUDA-graph sampler, whose
-        per-row params were gathered for the slot's padded bs — it must be handed
-        every padded row. The eager sampler keys off request ids, so it takes the
-        real batch only."""
-        return self._cg_sampler is not None
-
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ):
+        """One token per row of ``logits``, in ``request_ids`` order.
+
+        Called from the forward, so the batch it ran on is the batch to hand
+        here: under capture that is the slot's padded rows and its dummy ids,
+        which is what the graph sampler's per-row params were gathered for.
+        The eager sampler keys off request ids and sees the real batch only.
+        """
         if self._cg_sampler is not None:
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
