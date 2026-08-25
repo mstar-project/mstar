@@ -72,6 +72,7 @@ class _Harness:
         self.submodule = types.SimpleNamespace(
             node_name="LLM",
             CFG_BATCHED_LABEL=LLMSubmodule.CFG_BATCHED_LABEL,
+            POST_SAMPLE=LLMSubmodule.POST_SAMPLE,
             _get_active_labels=lambda walk, cfg: active_labels(walk, cfg, "LLM"),
         )
 

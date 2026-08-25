@@ -40,14 +40,14 @@ class _Stub(Resource):
         plan_value=None,
         admit_outcome: AdmitOutcome | None = None,
         published=None,
-        narrowed=None,
+        retrieve_outcome: AdmitOutcome | None = None,
     ):
         self.name = name
         self._deps = set(deps)
         self._plan_value = plan_value if plan_value is not None else f"{name}-plan"
         self._admit_outcome = admit_outcome
         self._published = published
-        self._narrowed = narrowed
+        self._retrieve_outcome = retrieve_outcome
         self.calls: list[str] = []
         # plan_results as this resource saw it when its own plan ran
         self.deps_seen: dict | None = None
@@ -69,9 +69,11 @@ class _Stub(Resource):
         self.calls.append("admit")
         return self._admit_outcome or AdmitOutcome(ok=True)
 
-    def narrow(self, step, ctx):
-        self.calls.append("narrow")
-        return self._narrowed
+    # declared on the class, not patched onto an instance: the runner settles
+    # who can actually retrieve by comparing against `Resource.admit_retrieve`
+    def admit_retrieve(self, rid, node_name, graph_walk, published):
+        self.calls.append(f"retrieve:{rid}:{published}")
+        return self._retrieve_outcome or AdmitOutcome(ok=True)
 
     def plan(self, step, ctx):
         self.calls.append("plan")
@@ -100,11 +102,13 @@ def _ctx(request_ids=("r1",), slot=0):
 
 def _step(keys, segments=(("r1", "main", 1),), ctx=None):
     segs = tuple(Segment(*s) for s in segments)
-    return SubmoduleStep(
-        ctx=ctx or _ctx(),
-        segments=segs,
+    step = SubmoduleStep(
+        segments=list(segs),
         steps={key: KVStep(segments=segs) for key in keys},
     )
+    # the step is frozen; the engine owns this one field
+    step.set_ctx(ctx or _ctx())
+    return step
 
 
 # --- topo_sort -------------------------------------------------------------
@@ -233,33 +237,6 @@ def test_admit_is_ready_when_every_resource_is():
     assert (outcome.ok, outcome.ready) == (True, True)
 
 
-# --- narrow ----------------------------------------------------------------
-
-
-def test_narrow_returns_the_same_step_when_nothing_narrows():
-    runner = StepRunner({"kv": _Stub("kv")})
-    step = _step(["kv"])
-    assert runner.narrow(step) is step
-
-
-def test_narrow_replaces_only_the_steps_that_narrowed():
-    narrowed = KVStep(segments=(Segment("r1", "main", 0),))
-    kv = _Stub("kv", narrowed=narrowed)
-    attn = _Stub("attn", deps=("kv",))
-    runner = StepRunner({"attn": attn, "kv": kv})
-
-    step = _step(["kv", "attn"])
-    out = runner.narrow(step)
-
-    assert out is not step
-    assert out.get("kv") is narrowed
-    assert out.get("attn") is step.get("attn")
-    assert out.segments == step.segments, (
-        "narrow rewrites per-resource steps only; whether the authoritative "
-        "batch layout follows is the open bucket-ordering question"
-    )
-
-
 # --- commit / publish ------------------------------------------------------
 
 
@@ -304,14 +281,30 @@ def test_ingest_request_routes_overrides_by_resource_key():
     assert sampler.calls == ["ingest:r1:None"], "no override for this key"
 
 
-def test_admit_retrieve_short_circuits_and_aggregates_ready():
-    kv = _Stub("kv")
-    kv.admit_retrieve = lambda rid, node, walk, pub: AdmitOutcome(ok=True, ready=False)
-    runner = StepRunner({"kv": kv, "sampler": _Stub("sampler")})
+def test_admit_retrieve_aggregates_ready_and_routes_published_by_key():
+    kv = _Stub("kv", retrieve_outcome=AdmitOutcome(ok=True, ready=False))
+    sampler = _Stub("sampler")
+    runner = StepRunner({"kv": kv, "sampler": sampler})
 
     outcome = runner.admit_retrieve("r1", "llm", "decode", {"kv": "published"})
 
     assert (outcome.ok, outcome.ready) == (True, False)
+    assert kv.calls == ["retrieve:r1:published"]
+    assert sampler.calls == ["retrieve:r1:None"], "one pending resource does not stop the sweep"
+
+
+def test_admit_retrieve_short_circuits_on_failure():
+    kv = _Stub("kv", retrieve_outcome=AdmitOutcome(ok=False, reason=AllocationFailed(
+        message="no", pages_short=1, label="main", request_id="r1",
+    )))
+    sampler = _Stub("sampler")
+    runner = StepRunner({"kv": kv, "sampler": sampler})
+
+    outcome = runner.admit_retrieve("r1", "llm", "decode", None)
+
+    assert not outcome.ok
+    assert isinstance(outcome.reason, AllocationFailed)
+    assert sampler.calls == [], "the sweep stops at the first failure"
 
 
 def test_build_cuda_graph_buffers_reaches_every_resource():
@@ -337,61 +330,36 @@ def test_unknown_resource_key_in_a_step_is_an_error():
 
 
 def test_resource_step_without_segments_inherits_the_batch_layout():
-    segs = (Segment("r1", "main", 1), Segment("r2", "main", 1))
-    step = SubmoduleStep(ctx=_ctx(), segments=segs, steps={"sampler": KVStep()})
-    assert step.segments_for("sampler") == segs
+    segs = [Segment("r1", "main", 1), Segment("r2", "main", 1)]
+    step = SubmoduleStep(segments=segs, steps={"sampler": KVStep()})
+    assert step.get("sampler").segments == segs
 
 
-def test_validate_accepts_an_order_preserving_subsequence():
-    a, b, c = Segment("r1", "main", 1), Segment("r2", "main", 1), Segment("r3", "main", 1)
-    SubmoduleStep(
-        ctx=_ctx(), segments=(a, b, c), steps={"cross": KVStep(segments=(a, c))},
-    ).validate()
+def test_a_resource_step_keeps_its_own_segments():
+    segs = [Segment("r1", "main", 1), Segment("r2", "main", 1)]
+    own = (segs[0],)
+    step = SubmoduleStep(segments=segs, steps={"cross": KVStep(segments=own)})
+    assert step.get("cross").segments is own
 
 
-def test_validate_rejects_a_reordered_subsequence():
-    a, b, c = Segment("r1", "main", 1), Segment("r2", "main", 1), Segment("r3", "main", 1)
-    step = SubmoduleStep(
-        ctx=_ctx(), segments=(a, b, c), steps={"cross": KVStep(segments=(c, a))},
-    )
-    with pytest.raises(ValueError, match="order-preserving"):
-        step.validate()
+# --- the kv layer's import surface -----------------------------------------
 
 
-def test_validate_rejects_a_segment_outside_the_batch_layout():
-    a = Segment("r1", "main", 1)
-    step = SubmoduleStep(
-        ctx=_ctx(), segments=(a,), steps={"cross": KVStep(segments=(Segment("r9", "x", 1),))},
-    )
-    with pytest.raises(ValueError, match="not an order-preserving"):
-        step.validate()
-
-
-def test_admit_validates_the_step():
-    runner = StepRunner({"kv": _Stub("kv")})
-    step = SubmoduleStep(
-        ctx=_ctx(),
-        segments=(Segment("r1", "main", 1),),
-        steps={"kv": KVStep(segments=(Segment("r9", "ghost", 1),))},
-    )
-    with pytest.raises(ValueError, match="order-preserving"):
-        runner.admit(step)
-
-
-# --- the kv_store severance ------------------------------------------------
-
-
-def test_v1_kv_layer_imports_without_kv_store_or_the_conductor():
-    """``v1`` replaced ``kv_store.py``, which is now deleted; importing v1 must
-    still not drag in the conductor and sampling kernels that sat behind it.
+def test_kv_layer_imports_without_the_conductor_or_the_sampling_kernels():
+    """The KV resource must not drag in the conductor or the sampler, which
+    would put ZMQ and the Triton kernels behind every import of a cache.
     Run in a subprocess because sys.modules is shared across the pytest
-    session (and conftest stubs triton in-process)."""
+    session (and conftest stubs triton in-process).
+
+    ``triton`` itself is not in the list: ``mstar.engine.__init__`` touches
+    ``torch._dynamo``, which imports it whatever we do here.
+    """
     probe = (
         "import sys, mstar.engine.resources.kv.manager, mstar.engine.resources;"
         "leaked = [m for m in ("
         "  'mstar.conductor.request_info',"
         "  'mstar.communication.tensors',"
-        "  'triton',"
+        "  'mstar.engine.resources.sampler.utils',"
         ") if m in sys.modules];"
         "print(','.join(leaked))"
     )
@@ -400,4 +368,4 @@ def test_v1_kv_layer_imports_without_kv_store_or_the_conductor():
         capture_output=True, text=True, timeout=180, check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "", f"v1 pulled in {result.stdout.strip()}"
+    assert result.stdout.strip() == "", f"kv pulled in {result.stdout.strip()}"

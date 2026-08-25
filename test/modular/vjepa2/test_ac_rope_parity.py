@@ -276,13 +276,18 @@ class DummyAttention:
             _fix_shapes_for_attn(k), \
             _fix_shapes_for_attn(v)
 
-DEVICE = torch.device('cuda:3')
-dummy_attn = DummyAttention(device=DEVICE)
-x = torch.randn(2, 16*16+4, 128, device=DEVICE)
-t0 = 5
+def test_ac_rope_bnhd_matches_the_bhnd_reference():
+    """The AC predictor's [B, N, H, D] rope must agree with the [B, H, N, D]
+    reference it replaced, on q, k and v alike."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dummy_attn = DummyAttention(device=device)
+    x = torch.randn(2, 16 * 16 + 4, 128, device=device)
+    t0 = 5
 
-q2, k2, v2 = dummy_attn.forward_cached_old(x, t0, h=16, w=16, action_tokens=4)
-q, k, v = dummy_attn.forward_cached(x, t0, h=16, w=16, action_tokens=4)
-print((q - q2).abs().max())
-(print(v - v2).abs().max())
-(print(k - k2).abs().max())
+    q2, k2, v2 = dummy_attn.forward_cached_old(x, t0, h=16, w=16, action_tokens=4)
+    q, k, v = dummy_attn.forward_cached(x, t0, h=16, w=16, action_tokens=4)
+
+    for name, got, want in (("q", q, q2), ("k", k, k2), ("v", v, v2)):
+        assert torch.allclose(got, want, atol=1e-4), (
+            f"{name} differs by {(got - want).abs().max().item()}"
+        )
