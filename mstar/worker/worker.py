@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 import sys
@@ -2077,6 +2078,19 @@ class Worker:
         # engine's ``warmup``. The follower can't service the message
         # yet, but the leader will sit on the first NCCL collective.
         self.parallel_groups.barrier_all()
+
+        # Everything tracked right now — weights, capture buffers, wrapper
+        # state — lives for the process, so gen2 gains nothing by walking it
+        # every cycle. Collect first so nothing garbage gets made permanent,
+        # then move the rest out of GC's reach. Refcounting still frees these,
+        # and objects created after this stay fully collected; only a cycle
+        # alive at this instant would now be retained.
+        gc.collect()
+        gc.freeze()
+        logger.info(
+            "Worker %s: gc.freeze() after warmup — %d objects moved to the "
+            "permanent generation", self.worker_id, gc.get_freeze_count(),
+        )
 
         # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
