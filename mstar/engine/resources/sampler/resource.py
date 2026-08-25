@@ -1,53 +1,18 @@
 
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import Resource
+from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.sampler.config import (
+    SamplerSpec,
+    SamplerStep,
+    SamplingReqConfig,
+)
 from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SamplerStep, StepContext
-
-
-@dataclass
-class SamplerSpec(NodeResourceSpec):
-    vocab_size: int | None # must be set for enabled_repetion_penalty
-    # Capability, not intent: whether this node's sampling kernel is *able* to
-    # apply a repetition penalty, which decides both the seen-token buffers and
-    # the kernel variant baked into the captured graph. Whether the penalty
-    # actually runs on a given step is settled per step from the resident
-    # requests' `repetition_penalty` — see `SamplerResource.admit`.
-    enable_repetion_penalty: bool = True
-
-    @property
-    def resource_type(self):
-        return ResourceType.SAMPLER
-
-
-@dataclass
-class SamplingReqConfig(ResourceReqConfig):
-    temperature: float = 0.6
-    top_k: int = 0
-    top_p: float = 1
-    ignore_eos: bool = False # used for benchmark parity
-    repetition_penalty: float = 1
-    _seed: int = 0 # set by the conductor
-
-    @property
-    def resource_type(self):
-        return ResourceType.SAMPLER
-
-    def apply_conductor_config(
-        self, seed: int=0,
-        **kwargs
-    ):
-        self._seed = seed
-
-    @property
-    def seed(self):
-        return self._seed
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 
 
 class SamplerResource(Resource):
@@ -116,17 +81,12 @@ class SamplerResource(Resource):
         return self._track_seen_tokens and bool(self._penalty_rids)
 
     @classmethod
-    def build(
-        cls, spec: SamplerSpec,
-        device: torch.device,
-        joint_comm_group: JointGroups | None,
-        **engine_kwargs
-    ):
+    def build(cls, spec: SamplerSpec, info: EngineResourceInfo):
         return cls(
             vocab_size=spec.vocab_size,
             enable_repetion_penalty=spec.enable_repetion_penalty,
-            device=device,
-            comm_group=joint_comm_group
+            device=info.device,
+            comm_group=info.joint_comm_group,
         )
 
     def build_cuda_graph_buffers(

@@ -43,15 +43,8 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
-    Segment,
-    SubmoduleStep,
-)
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,

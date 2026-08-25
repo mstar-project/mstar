@@ -16,17 +16,19 @@ from mstar.engine.cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
     autocast_scope,
 )
-from mstar.engine.resources.base import Resource, build_resource
-from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import (
+from mstar.engine.resources import (
     AdmitFailedReason,
     AllocationFailed,
+    NodeResourceSpec,
+    Resource,
+    ResourceReqConfig,
     SlotLease,
     StepContext,
+    StepRunner,
     SubmoduleStep,
 )
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.submodule_base import (
     LazyRequestStates,
     ModelInputsFromEngine,
@@ -206,11 +208,13 @@ class Engine:
                 next(iter(relevant_nodes))
             )
             self._resources[spec.resource_key] = build_resource(
-                spec=spec,
-                device=device,
-                joint_comm_group=joint_comm_group,
-                transfer_engine_info=transfer_engine_info,
-                kv_dtype=kv_cache_type
+                spec,
+                EngineResourceInfo(
+                    device=device,
+                    joint_comm_group=joint_comm_group,
+                    transfer_engine_info=transfer_engine_info,
+                    kv_dtype=kv_cache_type,
+                ),
             )
 
             for node in relevant_nodes:

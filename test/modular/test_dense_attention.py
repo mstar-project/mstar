@@ -17,18 +17,25 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources.attn.manager import (
+from mstar.engine.resources import (
     AttentionConfig,
-    AttentionManager,
     AttentionSpec,
+    AttentionStep,
     AttnBackend,
+    KVConfig,
+    KVStep,
+    Segment,
+    SlotLease,
+    StepContext,
+)
+from mstar.engine.resources.attn.manager import (
+    AttentionManager,
     DenseAttentionManager,
     FlashInferManager,
     _fa3_unavailable_reason,
 )
-from mstar.engine.resources.kv.cache import KVConfig
+from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.manager import KVPlanOutput, SequenceView
-from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SlotLease, StepContext
 
 PAGE_SIZE = 4
 NUM_KV_HEADS = 2
@@ -252,7 +259,9 @@ class TestBackendSelection:
             config=AttentionConfig(kv_cache="kv", backend=AttnBackend.DENSE),
             kv_config=_kv_config(),
         )
-        manager = AttentionManager.build(spec, device=torch.device("cpu"))
+        manager = AttentionManager.build(
+            spec, EngineResourceInfo(device=torch.device("cpu"))
+        )
         expected = (
             DenseAttentionManager if _fa3_unavailable_reason() is None
             else FlashInferManager

@@ -36,7 +36,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor

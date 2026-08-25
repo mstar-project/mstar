@@ -2,10 +2,10 @@
 
 import queue
 import threading
-from dataclasses import dataclass
-from enum import Enum
 
 import torch
+
+from mstar.engine.resources.kv.config import KVConfig, KVLayout
 
 
 class PageAllocator:
@@ -80,47 +80,6 @@ def _kv_scatter_nhd_fake(
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
 ) -> None:
     return None
-
-
-class KVLayout(Enum):
-    NHD = "NHD"
-    # TODO: can add more, like HND, MLA
-
-@dataclass
-class KVConfig:
-    num_layers: int
-    num_kv_heads: int
-    head_dim: int
-    max_seq_len: int
-    max_num_pages: int = 2048
-    page_size: int = 128
-    num_qo_heads: int = None
-    layout: KVLayout=KVLayout.NHD
-    # pages of pinned host memory to keep for offloading; 0 disables it
-    cpu_offload_pages: int = 0
-
-    def __post_init__(self):
-        if self.num_qo_heads is None:
-            self.num_qo_heads = self.num_kv_heads
-        self._unsharded_kv_heads = self.num_kv_heads
-        self._unsharded_qo_heads = self.num_qo_heads
-
-    def shard(self, num_shards: int) -> None:
-        """Narrow the head counts to one rank's slice.
-
-        Idempotent because one KVConfig is shared by the KV resource and the
-        attention resources planned against it, and each shards on construction.
-        ``num_shards`` is the instance world size (tp * sp): Ulysses SP
-        all-to-alls heads, so attention runs at head-degree tp*sp.
-        """
-        from mstar.distributed.utils import divide
-
-        if num_shards >= self._unsharded_kv_heads:
-            # fewer KV heads than ranks — every rank holds a replicated head
-            self.num_kv_heads = 1
-        else:
-            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
-        self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
 
 
 class KVCache:

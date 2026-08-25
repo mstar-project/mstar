@@ -13,8 +13,8 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.sampler.utils import SamplingConfig
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,

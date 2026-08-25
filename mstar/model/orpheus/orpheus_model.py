@@ -28,12 +28,18 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
-from mstar.engine.resources.attn.manager import AttentionConfig, AttentionSpec
-from mstar.engine.resources.kv.cache import KVConfig
-from mstar.engine.resources.kv.manager import KVSpec
-from mstar.engine.resources.position.manager import PositionConfig, PositionSpec
-from mstar.engine.resources.sampler.resource import SamplerSpec, SamplingReqConfig
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model

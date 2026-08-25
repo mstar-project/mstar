@@ -9,15 +9,10 @@ what those configs already describe.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import IntEnum
+from typing import TYPE_CHECKING
 
-
-class ResourceType(IntEnum):
-    KV_CACHE = 0
-    SAMPLER = 1
-    ATTENTION = 2
-    CROSS_ATTENTION = 3
-    POSITIONS = 4
+if TYPE_CHECKING:
+    from mstar.engine.resources.base import Resource
 
 
 @dataclass
@@ -31,8 +26,13 @@ class NodeResourceSpec(ABC):
 
     @property
     @abstractmethod
-    def resource_type(self) -> ResourceType:
-        pass
+    def resource_class(self) -> "type[Resource]":
+        """What builds this spec. Imported inside the property, so declaring a
+        resource stays free of the manager and its kernels.
+
+        The builder, not necessarily the class built: an attention spec names
+        `AttentionManager`, whose `build` picks a backend subclass.
+        """
 
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from a deployment's YAML.
@@ -49,13 +49,10 @@ class NodeResourceSpec(ABC):
         return
 
 
-
-class ResourceReqConfig(ABC):
-    @property
-    @abstractmethod
-    def resource_type(self) -> ResourceType:
-        pass
+class ResourceReqConfig:
+    """Per-request parameters for one resource, carried on the request and
+    handed to that resource at ingest. Keyed by resource key, so it needs no
+    tag of its own — a marker base, with no contract beyond the hook below."""
 
     def apply_conductor_config(self, **kwargs):
         return
-

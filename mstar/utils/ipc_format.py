@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources.base import PublishedInfo
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import RxInfo, TxInfo

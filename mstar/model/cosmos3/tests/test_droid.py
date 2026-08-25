@@ -139,7 +139,7 @@ def test_droid_loader_shape_coverage() -> None:
 
 @needs_droid
 def test_droid_sound_pathway_disabled() -> None:
-    from mstar.engine.resources.kv.manager import KVSpec
+    from mstar.engine.resources import KVSpec
     from mstar.model.cosmos3 import constants
 
     model = Cosmos3Model(model_path_hf=str(DROID_DIR))

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.base import PublishedInfo
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,

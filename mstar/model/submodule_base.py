@@ -11,8 +11,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources.base import Resource
-from mstar.engine.resources.step import SubmoduleStep
+from mstar.engine.resources import Resource, SubmoduleStep
 
 if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig

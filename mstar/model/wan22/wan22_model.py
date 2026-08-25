@@ -39,7 +39,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,

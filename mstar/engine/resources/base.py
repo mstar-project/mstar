@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
+from mstar.distributed.communication import JointGroups
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
@@ -47,14 +47,25 @@ class CGSlotKey:
     label: str
 
 
+@dataclass(frozen=True)
+class EngineResourceInfo:
+    """What the engine has to offer a resource at build time.
+
+    One struct rather than per-kind keyword arguments: a resource takes what it
+    needs and ignores the rest, and a name that does not exist here is a
+    TypeError rather than something silently swallowed by a ``**kwargs``.
+    """
+    device: torch.device
+    joint_comm_group: JointGroups | None = None
+    transfer_engine_info: "TransferEngineInfo | None" = None
+    kv_dtype: torch.dtype = torch.bfloat16
+
+
 class Resource(ABC):
     @classmethod
     @abstractmethod
     def build(
-        cls, spec: NodeResourceSpec,
-        device: torch.device,
-        comm_group: CommGroup | None,
-        **engine_kwargs
+        cls, spec: NodeResourceSpec, info: EngineResourceInfo,
     ) -> "Resource":
         ...
 
@@ -209,47 +220,5 @@ class PublishedInfo(ABC):
         ...
 
 
-def build_resource(
-    spec: NodeResourceSpec,
-    device: torch.device,
-    joint_comm_group: JointGroups,
-    transfer_engine_info: TransferEngineInfo,
-    kv_dtype: torch.dtype
-) -> Resource:
-    if spec.resource_type == ResourceType.KV_CACHE:
-        from mstar.engine.resources.kv.manager import KVManager
-        return KVManager.build(
-            spec=spec,
-            device=device,
-            joint_comm_group=joint_comm_group,
-            transfer_engine_info=transfer_engine_info,
-            dtype=kv_dtype
-        )
-    if spec.resource_type == ResourceType.SAMPLER:
-        from mstar.engine.resources.sampler.resource import SamplerResource
-        return SamplerResource.build(
-            spec=spec,
-            device=device,
-            joint_comm_group=joint_comm_group
-        )
-    if spec.resource_type == ResourceType.ATTENTION:
-        from mstar.engine.resources.attn.manager import AttentionManager
-        return AttentionManager.build(
-            spec=spec,
-            device=device,
-            joint_comm_group=joint_comm_group,
-            dtype=kv_dtype
-        )
-    if spec.resource_type == ResourceType.CROSS_ATTENTION:
-        from mstar.engine.resources.attn.manager import CrossAttentionManager
-        return CrossAttentionManager.build(
-            spec=spec,
-            device=device,
-            joint_comm_group=joint_comm_group,
-            dtype=kv_dtype
-        )
-    if spec.resource_type == ResourceType.POSITIONS:
-        from mstar.engine.resources.position.manager import PositionManager
-        return PositionManager.build(
-            spec=spec, device=device
-        )
+def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource:
+    return spec.resource_class.build(spec, info)

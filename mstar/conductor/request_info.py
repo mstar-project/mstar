@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
-from mstar.engine.resources.base import PublishedInfo
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources import PublishedInfo, ResourceReqConfig
 from mstar.graph.loop_indices import NestedLoopIndices
 
 

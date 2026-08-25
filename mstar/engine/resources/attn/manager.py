@@ -4,15 +4,19 @@ import functools
 import logging
 import os
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, NamedTuple
 
 import torch
 
-from mstar.distributed.communication import JointGroups
+from mstar.engine.resources.attn.config import (
+    AttentionSpec,
+    AttentionStep,
+    AttnBackend,
+    CrossAttentionSpec,
+)
 from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
-from mstar.engine.resources.base import AttentionResource, CGSlotKey
-from mstar.engine.resources.kv.cache import KVConfig
+from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo
+from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.manager import (
     SINK_PAGE,
     KVPlanOutput,
@@ -20,45 +24,9 @@ from mstar.engine.resources.kv.manager import (
     PagedIndptrs,
     SequenceView,
 )
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
-from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
+from mstar.engine.resources.step import SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
-
-
-class AttnBackend(Enum):
-    FLASHINFER = "flashinfer"
-    DENSE = "dense"
-
-@dataclass
-class AttentionConfig:
-    kv_cache: str # name of the KV cache
-    backend: AttnBackend=AttnBackend.FLASHINFER
-    flashinfer_backend: str = "auto"
-
-
-@dataclass
-class AttentionSpec(NodeResourceSpec):
-    config: AttentionConfig
-    kv_config: KVConfig
-
-    @property
-    def resource_type(self):
-        return ResourceType.ATTENTION
-
-    def apply_yaml_overrides(
-        self,
-        max_num_pages: int | None = None,
-        page_size: int | None = None,
-        **kwargs,
-    ):
-        """Track the cache's geometry: the wrappers are planned against it, so
-        a deployment that resizes the cache resizes these too."""
-        del kwargs  # keys meant for other resources
-        if max_num_pages is not None:
-            self.kv_config.max_num_pages = max_num_pages
-        if page_size is not None:
-            self.kv_config.page_size = page_size
 
 
 class AttentionManager(AttentionResource):
@@ -68,17 +36,11 @@ class AttentionManager(AttentionResource):
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
 
     @classmethod
-    def build(
-        cls, spec: AttentionSpec,
-        device: torch.device,
-        joint_comm_group: JointGroups | None = None,
-        dtype=torch.bfloat16,
-        **engine_kwargs
-    ):
+    def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
         # the wrappers are planned against per-rank head counts; idempotent, so
         # sharing one KVConfig with the KV resource is fine (KVConfig.shard)
-        if joint_comm_group is not None:
-            spec.kv_config.shard(joint_comm_group.world_size)
+        if info.joint_comm_group is not None:
+            spec.kv_config.shard(info.joint_comm_group.world_size)
         backend = spec.config.backend
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
@@ -91,8 +53,8 @@ class AttentionManager(AttentionResource):
             if reason is None:
                 return DenseAttentionManager(
                     kv_cache=spec.config.kv_cache,
-                    device=device,
-                    dtype=dtype,
+                    device=info.device,
+                    dtype=info.kv_dtype,
                     kv_config=spec.kv_config,
                 )
             _warn_dense_fallback(reason)
@@ -101,8 +63,8 @@ class AttentionManager(AttentionResource):
         if backend == AttnBackend.FLASHINFER:
             return FlashInferManager(
                 kv_cache=spec.config.kv_cache,
-                device=device,
-                dtype=dtype,
+                device=info.device,
+                dtype=info.kv_dtype,
                 kv_config=spec.kv_config,
                 backend=spec.config.flashinfer_backend,
             )
@@ -390,78 +352,28 @@ class QueryPacking(NamedTuple):
     qo_indptr: torch.Tensor  # int32, CPU
 
 
-@dataclass
-class CrossAttentionConfig:
-    """Cross-attention against a context written once and never extended.
-
-    ``kv_cache`` names the KV resource holding the encoder context;
-    ``query_kv_cache`` names the decoder's KV resource, whose plan defines
-    this step's query packing. They may be the same resource when the
-    context shares the decoder's head config — the context then lives in it
-    under its own ``context_label``. They differ when it does not, which is
-    the usual case (an encoder's head count rarely matches the decoder's).
-
-    ``query_kv_cache=None`` covers the query side having no KV cache at all
-    (nothing is cached across steps on it): the packing then comes off the
-    cross-attention step's own segments, one qo entry per segment in
-    declared order.
-    """
-    kv_cache: str  # name of the KV cache holding the context
-    query_kv_cache: str | None = None  # KV cache driving the queries, if any
-    context_label: str = "context"
-    backend: AttnBackend = AttnBackend.FLASHINFER
-    flashinfer_backend: str = "auto"
-
-
-@dataclass
-class CrossAttentionSpec(NodeResourceSpec):
-    config: CrossAttentionConfig
-    # head config of the *context* cache, which need not match the decoder's
-    kv_config: KVConfig
-
-    @property
-    def resource_type(self):
-        return ResourceType.CROSS_ATTENTION
-
-    def apply_yaml_overrides(
-        self,
-        max_num_pages: int | None = None,
-        page_size: int | None = None,
-        **kwargs,
-    ):
-        """Track the context cache's geometry; see ``AttentionSpec``."""
-        del kwargs  # keys meant for other resources
-        if max_num_pages is not None:
-            self.kv_config.max_num_pages = max_num_pages
-        if page_size is not None:
-            self.kv_config.page_size = page_size
-
-
 class CrossAttentionManager(AttentionResource):
     # Remains abstract except for build; will build based
     # on the attention backend
 
     @classmethod
-    def build(
-        cls, spec: CrossAttentionSpec,
-        device: torch.device,
-        joint_comm_group: JointGroups | None = None,
-        dtype=torch.bfloat16,
-        **engine_kwargs
-    ):
+    def build(cls, spec: CrossAttentionSpec, info: EngineResourceInfo):
         # the context cache's own head counts; see AttentionManager.build
-        if joint_comm_group is not None:
-            spec.kv_config.shard(joint_comm_group.world_size)
+        if info.joint_comm_group is not None:
+            spec.kv_config.shard(info.joint_comm_group.world_size)
         if spec.config.backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,
                 query_kv_cache=spec.config.query_kv_cache,
                 context_label=spec.config.context_label,
-                device=device,
-                dtype=dtype,
+                device=info.device,
+                dtype=info.kv_dtype,
                 kv_config=spec.kv_config,
                 backend=spec.config.flashinfer_backend,
             )
+        raise ValueError(
+            f"Unknown cross attention backend {spec.config.backend!r}"
+        )
 
 
 class FlashInferCrossManager(CrossAttentionManager):

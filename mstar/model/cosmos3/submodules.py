@@ -37,12 +37,7 @@ from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     PackedCudaGraphConfig,
 )
-from mstar.engine.resources.step import (
-    AttentionStep,
-    KVStep,
-    Segment,
-    SubmoduleStep,
-)
+from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,

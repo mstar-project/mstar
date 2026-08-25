@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 import torch
 
-from mstar.engine.resources.step import SubmoduleStep
+from mstar.engine.resources import SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 

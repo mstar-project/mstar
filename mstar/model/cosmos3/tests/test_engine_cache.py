@@ -26,13 +26,9 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 import torch.nn.functional as F
 
+from mstar.engine.resources import AdmitOutcome, StepContext, StepRunner
 from mstar.engine.resources.base import AttentionResource
-from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.step import (
-    AdmitOutcome,
-    StepContext,
-    group_by_plan_label,
-)
+from mstar.engine.resources.kv.manager import group_by_plan_label
 from mstar.model.cosmos3.submodules import ATTN, KV_CACHE
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -303,7 +299,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
     path the engine takes, minus the worker around it."""
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.distributed.communication import CommGroup, JointGroups
-    from mstar.engine.resources.base import build_resource
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
     prev_backend = model.config.attention_backend
@@ -320,7 +316,13 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
     transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
     resources = {
         spec.resource_key: build_resource(
-            spec, torch.device(device), groups, transfer, dtype,
+            spec,
+            EngineResourceInfo(
+                device=torch.device(device),
+                joint_comm_group=groups,
+                transfer_engine_info=transfer,
+                kv_dtype=dtype,
+            ),
         )
         for spec in specs
     }

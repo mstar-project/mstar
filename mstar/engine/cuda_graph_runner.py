@@ -16,9 +16,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseConfigType,
     PiecewiseCudaGraphConfig,
 )
-from mstar.engine.resources.base import CGSlotSpec, Resource
-from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)

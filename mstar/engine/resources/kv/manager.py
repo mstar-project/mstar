@@ -1,3 +1,4 @@
+import itertools
 import threading
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
@@ -6,20 +7,57 @@ from typing import Any, NamedTuple
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import AttentionResource, CGSlotSpec, PublishedInfo
-from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
+from mstar.engine.resources.base import (
+    AttentionResource,
+    CGSlotSpec,
+    EngineResourceInfo,
+    PublishedInfo,
+)
+from mstar.engine.resources.kv.cache import KVCache, PageAllocator
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitOutcome,
     AllocationFailed,
-    KVStep,
     Segment,
     StepContext,
-    group_by_plan_label,
 )
+
+
+def group_by_plan_label(
+    segments: tuple[Segment, ...],
+    combined_labels: dict[tuple[str, ...], str],
+) -> dict[str, list[Segment]]:
+    """Segments per plan label in order of packed forward view
+
+    combined plan concats source labels in label major order. standalone keeps
+    og batch order. KV should be sole producer of this ordering and eveyrone else
+    will read `plan` output of KV
+
+    NOTE: combined key with a source label with no segments in step will cause KeyError
+    """
+    label_to_segments: dict[str, list[Segment]] = {}
+    for segment in segments:
+        label_to_segments.setdefault(segment.label, []).append(segment)
+
+    sources = set(itertools.chain.from_iterable(combined_labels))
+    grouped: dict[str, list[Segment]] = {
+        plan_label: [
+            segment
+            for label in source_labels
+            for segment in label_to_segments[label]
+        ]
+        for source_labels, plan_label in combined_labels.items()
+    }
+
+    grouped.update(
+        (label, label_segments)
+        for label, label_segments in label_to_segments.items()
+        if label not in sources
+    )
+    return grouped
 
 
 @dataclass
@@ -260,59 +298,6 @@ class KVPlanState:
         self.total_tokens = n
 
 
-@dataclass
-class KVReqConfig(ResourceReqConfig):
-    # NOTE: this may need to be refined
-    needed_labels: list[str] | None = None
-    needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
-    needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
-
-    @property
-    def resource_type(self):
-        return ResourceType.KV_CACHE
-
-    def apply_conductor_config(self, **kwargs):
-        # does nothing rn; here because declaredb y abstract
-        del kwargs
-
-    def get_labels(self, node: str, walk: str):
-        if (node, walk) in self.needed_labels_per_node_walk:
-            return self.needed_labels_per_node_walk[(node, walk)]
-        if node in self.needed_labels_per_node:
-            return self.needed_labels_per_node[node]
-        if self.needed_labels is not None:
-            return self.needed_labels
-        return ["main"]
-
-
-@dataclass
-class KVSpec(NodeResourceSpec):
-    config: KVConfig
-
-    @property
-    def resource_type(self):
-        return ResourceType.KV_CACHE
-
-    def apply_yaml_overrides(
-        self,
-        max_num_pages: int | None = None,
-        page_size: int | None = None,
-        max_seq_len: int | None = None,
-        cpu_offload_pages: int | None = None,
-        **kwargs,
-    ):
-        """How much cache this deployment gets, and how it is cut up."""
-        del kwargs  # keys meant for other resources
-        for name, value in (
-            ("max_num_pages", max_num_pages),
-            ("page_size", page_size),
-            ("max_seq_len", max_seq_len),
-            ("cpu_offload_pages", cpu_offload_pages),
-        ):
-            if value is not None:
-                setattr(self.config, name, value)
-
-
 class KVManager(AttentionResource):
     def __init__(
         self,
@@ -367,21 +352,14 @@ class KVManager(AttentionResource):
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
     @classmethod
-    def build(
-        cls, spec: KVSpec,
-        device: torch.device,
-        joint_comm_group: JointGroups | None,
-        transfer_engine_info: TransferEngineInfo,
-        dtype=torch.bfloat16,
-        **kwargs
-    ):
+    def build(cls, spec: KVSpec, info: EngineResourceInfo):
         return cls(
             cfg=spec.config,
             name=spec.resource_key,
-            device=device,
-            joint_comm_group=joint_comm_group,
-            transfer_engine_info=transfer_engine_info,
-            dtype=dtype
+            device=info.device,
+            joint_comm_group=info.joint_comm_group,
+            transfer_engine_info=info.transfer_engine_info,
+            dtype=info.kv_dtype,
         )
 
     def build_cuda_graph_buffers(

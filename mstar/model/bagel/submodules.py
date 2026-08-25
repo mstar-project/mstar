@@ -17,14 +17,7 @@ from mstar.engine.cuda_graph_config import (
     PackedCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources.step import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
-    Segment,
-    SubmoduleStep,
-)
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,

@@ -25,7 +25,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
-from mstar.engine.resources.spec import ResourceReqConfig
+from mstar.engine.resources import ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
