@@ -325,6 +325,8 @@ class Sampler(BaseSampler):
                 device=self.device
             )
 
+    # sampling runs inside the forward; nothing here is worth tracing
+    @torch.compiler.disable
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
