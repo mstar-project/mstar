@@ -28,14 +28,14 @@ from mstar.engine.resources import (
     SlotLease,
     StepContext,
 )
-from mstar.engine.resources.attn.manager import (
-    AttentionManager,
+from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.attn.dense import (
     DenseAttentionManager,
-    FlashInferManager,
     _fa3_unavailable_reason,
 )
+from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.manager import KVPlanOutput, SequenceView
+from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
 
 PAGE_SIZE = 4
 NUM_KV_HEADS = 2

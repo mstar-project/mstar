@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 from mstar.engine.resources import AdmitOutcome, StepContext, StepRunner
 from mstar.engine.resources.base import AttentionResource
-from mstar.engine.resources.kv.manager import group_by_plan_label
+from mstar.engine.resources.kv.plan import group_by_plan_label
 from mstar.model.cosmos3.submodules import ATTN, KV_CACHE
 from mstar.model.submodule_base import ModelInputsFromEngine
 

@@ -1,6 +1,6 @@
 import torch
 
-from mstar.engine.resources.attn.manager import AttentionManager
+from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv.manager import KVManager
 
 

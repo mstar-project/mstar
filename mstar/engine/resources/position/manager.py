@@ -6,17 +6,17 @@ from dataclasses import dataclass, field
 
 import torch
 
-from mstar.engine.resources.attn.wrappers import (
-    rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
-)
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
-from mstar.engine.resources.kv.manager import KVPlanOutputs, SequenceView
+from mstar.engine.resources.kv.plan import KVPlanOutputs, SequenceView
 from mstar.engine.resources.position.config import (
     PosBackend,
     PositionConfig,
     PositionSpec,
     PositionStep,
     PosScheme,
+)
+from mstar.engine.resources.position.rope import (
+    rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
 )
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 

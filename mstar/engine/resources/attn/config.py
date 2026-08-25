@@ -35,7 +35,7 @@ class AttentionSpec(NodeResourceSpec):
 
     @property
     def resource_class(self) -> "type[Resource]":
-        from mstar.engine.resources.attn.manager import AttentionManager
+        from mstar.engine.resources.attn.base import AttentionManager
 
         return AttentionManager
 
@@ -85,7 +85,7 @@ class CrossAttentionSpec(NodeResourceSpec):
 
     @property
     def resource_class(self) -> "type[Resource]":
-        from mstar.engine.resources.attn.manager import CrossAttentionManager
+        from mstar.engine.resources.attn.cross import CrossAttentionManager
 
         return CrossAttentionManager
 
