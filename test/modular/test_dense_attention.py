@@ -17,7 +17,6 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SlotLease, StepContext
 from mstar.engine.resources.attn.manager import (
     AttentionConfig,
     AttentionManager,
@@ -29,6 +28,7 @@ from mstar.engine.resources.attn.manager import (
 )
 from mstar.engine.resources.kv.cache import KVConfig
 from mstar.engine.resources.kv.manager import KVPlanOutput, SequenceView
+from mstar.engine.resources.step import AttentionStep, KVStep, Segment, SlotLease, StepContext
 
 PAGE_SIZE = 4
 NUM_KV_HEADS = 2

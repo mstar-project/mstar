@@ -9,7 +9,6 @@ from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import WorkerGraphsManager
 
-
 logger = logging.getLogger(__name__)
 
 

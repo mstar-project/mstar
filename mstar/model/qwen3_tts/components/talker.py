@@ -21,7 +21,6 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.utils.attention import decode_attn_nhd
 from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_KV,
@@ -29,6 +28,7 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
+from mstar.utils.attention import decode_attn_nhd
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames

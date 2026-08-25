@@ -16,8 +16,8 @@ from mstar.engine.resources.step import SubmoduleStep
 
 if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
-    from mstar.engine.engine import ExecutingBatch
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.engine.engine import ExecutingBatch
 
 
 @dataclass

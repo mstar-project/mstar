@@ -23,13 +23,13 @@ pytest.importorskip("triton")
 
 import torch  # noqa: E402
 
+from mstar.engine.resources.sampler.resource import SamplerResource, SamplingReqConfig  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     BucketKey,
     SamplerStep,
     SlotLease,
     StepContext,
 )
-from mstar.engine.resources.sampler.resource import SamplerResource, SamplingReqConfig  # noqa: E402
 
 VOCAB = 64
 

@@ -4,14 +4,14 @@ from mstar.engine.resources.attn.manager import AttentionManager
 from mstar.engine.resources.kv.manager import KVManager
 
 
-class AttentionCallable:   
+class AttentionCallable:
     """A convenience wrapper around kv and attn that wraps the KV write and
     attention call in one pure-tensor function, with helper methods for
     setting layer and label information.
 
     Must be used for  ``ulysses_attention``, which expects such a pure tensor
     callable. Recommended to use instance per transformer, *not* one per layer,
-    as Dynamo specializes ``ulysses_attention`` on the identity of its 
+    as Dynamo specializes ``ulysses_attention`` on the identity of its
     `run_attention` argument, so a per-layer callable retraces that frame once
     per layer and blows the recompile limit.
 
@@ -22,7 +22,7 @@ class AttentionCallable:
 
     def __init__(self, kv: KVManager, attn: AttentionManager | None=None):
         self.kv = kv
-        # Can be changed at runtime, e.g., for a model that switches 
+        # Can be changed at runtime, e.g., for a model that switches
         self.attn = attn
 
     def bind_step(self, label: str, attn: AttentionManager | None = None) -> None:

@@ -10,10 +10,8 @@ from typing import Any, NamedTuple
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import AttentionResource, CGSlotKey
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
-from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
 from mstar.engine.resources.attn.wrappers import FlashInferDecodeWrapper, FlashInferPrefillWrapper
+from mstar.engine.resources.base import AttentionResource, CGSlotKey
 from mstar.engine.resources.kv.cache import KVConfig
 from mstar.engine.resources.kv.manager import (
     SINK_PAGE,
@@ -22,6 +20,8 @@ from mstar.engine.resources.kv.manager import (
     PagedIndptrs,
     SequenceView,
 )
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
+from mstar.engine.resources.step import AttentionStep, SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
 

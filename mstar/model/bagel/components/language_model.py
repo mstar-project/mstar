@@ -13,11 +13,10 @@
 from typing import Optional
 
 import torch
-
-from mstar.engine.resources.convenience import AttentionCallable
 from torch import nn
 from transformers.activations import ACT2FN
 
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.bagel.config import BagelModelConfig
 from mstar.model.components import FusedColumnLinear, FusedGatedMLP
 from mstar.utils.flashinfer_utils import run_rms_norm

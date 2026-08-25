@@ -21,9 +21,9 @@ from mstar.communication.tensors import NameToTensorList, create_tensor_communic
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine.resources.step import StepContext
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices

@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.engine import Engine
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)

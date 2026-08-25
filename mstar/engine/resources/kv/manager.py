@@ -7,6 +7,9 @@ import torch
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import AttentionResource, CGSlotSpec, PublishedInfo
+from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
+from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
+from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, ResourceType
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -17,9 +20,6 @@ from mstar.engine.resources.step import (
     StepContext,
     group_by_plan_label,
 )
-from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
-from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 
 
 @dataclass
@@ -425,7 +425,7 @@ class KVManager(AttentionResource):
     ) -> AdmitOutcome:
         if published is None:
             return ADMIT_OK
-    
+
         if published.world_size != self._world_size:
             raise RuntimeError(
                 "KV cache transfer across TP world size is currently disallowed"

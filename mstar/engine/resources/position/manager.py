@@ -7,7 +7,11 @@ from enum import Enum
 
 import torch
 
+from mstar.engine.resources.attn.wrappers import (
+    rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
+)
 from mstar.engine.resources.base import CGSlotKey, PublishedInfo, Resource
+from mstar.engine.resources.kv.manager import KVPlanOutputs, SequenceView
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceType
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -15,10 +19,6 @@ from mstar.engine.resources.step import (
     PositionStep,
     StepContext,
 )
-from mstar.engine.resources.attn.wrappers import (
-    rope_apply_qk_inplace,  # noqa: F401  (registers mstar::rope_apply_qk_inplace)
-)
-from mstar.engine.resources.kv.manager import KVPlanOutputs, SequenceView
 
 
 class PosBackend(Enum):

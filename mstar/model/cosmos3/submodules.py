@@ -33,15 +33,15 @@ from dataclasses import dataclass
 
 import torch
 
+from mstar.engine.cuda_graph_config import (
+    BatchedCudaGraphConfig,
+    PackedCudaGraphConfig,
+)
 from mstar.engine.resources.step import (
     AttentionStep,
     KVStep,
     Segment,
     SubmoduleStep,
-)
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
 )
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,

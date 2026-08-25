@@ -28,20 +28,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources.step import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
-    Segment,
-    SubmoduleStep,
-)
 from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     CudaGraphConfig,
@@ -52,6 +44,14 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.step import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SubmoduleStep,
+)
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,

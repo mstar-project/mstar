@@ -21,11 +21,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
-from mstar.engine.resources.attn.manager import FlashInferManager
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources.attn.manager import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.step import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.components.rope import (
     compute_3d_cos_sin,
@@ -35,7 +35,18 @@ from mstar.model.qwen3_omni.components.rope import (
     get_rope_index_vision,
 )
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor, Qwen3OmniTalkerModel
-from mstar.model.qwen3_omni.config import CODE_PRED_SAMPLER, TALKER_ATTN, TALKER_KV, TALKER_POS, TALKER_SAMPLER, THINKER_ATTN, THINKER_KV, THINKER_POS, THINKER_SAMPLER, Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import (
+    CODE_PRED_SAMPLER,
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    TALKER_SAMPLER,
+    THINKER_ATTN,
+    THINKER_KV,
+    THINKER_POS,
+    THINKER_SAMPLER,
+    Qwen3OmniModelConfig,
+)
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -563,7 +574,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     advance=pos_advance
                 )
             },
-            
+
         )
 
     def preprocess(

@@ -8,9 +8,6 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import CGSlotSpec, Resource
-from mstar.engine.resources.runner import StepRunner
-from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.engine.cuda_graph_config import (
     CudaGraphConfig,
     CudaGraphConfigType,
@@ -19,6 +16,9 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseConfigType,
     PiecewiseCudaGraphConfig,
 )
+from mstar.engine.resources.base import CGSlotSpec, Resource
+from mstar.engine.resources.runner import StepRunner
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)

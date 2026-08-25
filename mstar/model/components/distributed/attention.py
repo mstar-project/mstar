@@ -24,11 +24,11 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.norm import RMSNorm
 
 

@@ -38,7 +38,6 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.attn.manager import (
     AttentionConfig,
     AttentionSpec,
@@ -46,6 +45,7 @@ from mstar.engine.resources.attn.manager import (
 )
 from mstar.engine.resources.kv.cache import KVConfig
 from mstar.engine.resources.kv.manager import KVReqConfig, KVSpec
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,

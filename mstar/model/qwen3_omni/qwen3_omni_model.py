@@ -40,17 +40,27 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.attn.manager import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv.cache import KVConfig
 from mstar.engine.resources.kv.manager import KVSpec
 from mstar.engine.resources.position.manager import PositionConfig, PositionSpec
 from mstar.engine.resources.sampler.resource import SamplerSpec, SamplingReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
-from mstar.model.qwen3_omni.config import CODE_PRED_SAMPLER, TALKER_ATTN, TALKER_KV, TALKER_POS, TALKER_SAMPLER, THINKER_ATTN, THINKER_KV, THINKER_POS, THINKER_SAMPLER
+from mstar.model.qwen3_omni.config import (
+    CODE_PRED_SAMPLER,
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    TALKER_SAMPLER,
+    THINKER_ATTN,
+    THINKER_KV,
+    THINKER_POS,
+    THINKER_SAMPLER,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy

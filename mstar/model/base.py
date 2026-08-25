@@ -13,6 +13,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -23,7 +24,6 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.engine.resources.sampler.utils import SamplingConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048

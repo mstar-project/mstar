@@ -183,7 +183,7 @@ class JointGroups:
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         tensor = self.tp_group.broadcast(tensor, src)
         return self.sp_group.broadcast(tensor, src)
-                
+
 
 
 @dataclass
@@ -317,7 +317,7 @@ class WorkerParallelGroups:
             self.get_instance_world_size_for_node(node) == 1  \
                 for node in nodes
         )): # all nodes have no parallelism
-            return True 
+            return True
         return len({
             (
                 id(self.get_tp_config_for_node(node)),
