@@ -53,16 +53,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Router/frontend bookkeeping fields and OpenAI-standard fields with no M*
-# mapping. Both are dropped before validation so they don't leak into
-# model_kwargs through the extra-field passthrough (documented extra_body
-# knobs such as top_k / repetition_penalty still flow).
+# Dropped before validation so they don't reach model_kwargs through the
+# extra-field passthrough. The protocol models use extra="allow", so any
+# field that is neither typed nor stripped flows to the model verbatim —
+# that is how documented extra_body knobs (top_k, repetition_penalty,
+# ignore_eos) reach a model. Two tiers:
+#   - Dynamo router/frontend envelope fields: never model input.
+#   - OpenAI-standard fields with no M* mapping: stripped so they don't
+#     pollute model_kwargs. When a model starts consuming one of these
+#     from model_kwargs, delete it here and it flows through.
 _STRIP_KEYS = {
+    # Dynamo envelope / bookkeeping
     "routing", "output_options", "sampling_options", "stop_conditions",
     "token_ids", "batch_token_ids", "bootstrap_info", "multi_modal_data",
     "guided_decoding", "chat_template_kwargs", "chat_template_args",
     "nvext", "extra_args", "annotations", "trace", "disaggregated_params",
-    "backend_instance_id", "ignore_eos", "min_tokens", "eos_token_ids",
+    "backend_instance_id",
+    # OpenAI-standard, no M* mapping today
+    "min_tokens", "eos_token_ids",
     "stream_options", "frequency_penalty", "presence_penalty", "logit_bias",
     "logprobs", "top_logprobs", "tools", "tool_choice", "parallel_tool_calls",
     "response_format", "user", "store", "metadata", "service_tier",

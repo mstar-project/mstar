@@ -39,6 +39,21 @@ def test_clean_strips_bookkeeping_keeps_knobs():
     assert not {"routing", "nvext", "stop_conditions", "user"} & body.keys()
 
 
+def test_clean_keeps_ignore_eos_flowing_to_model_kwargs():
+    # Models read ignore_eos from model_kwargs (benchmark parity), so it
+    # must survive cleaning and reach model_kwargs through the adapter.
+    from mstar.api_server.openai.protocol import ChatCompletionRequest
+
+    body = _clean({"messages": [], "ignore_eos": True, "min_tokens": 5})
+    assert body["ignore_eos"] is True and "min_tokens" not in body
+
+    req = ChatCompletionRequest.model_validate(
+        {"messages": [{"role": "user", "content": "hi"}], "ignore_eos": True}
+    )
+    args = ADAPTER_REGISTRY["qwen3_omni"].chat_to_request(req, None)
+    assert args.model_kwargs["ignore_eos"] is True
+
+
 def test_image_body_flattens_nvext_and_rejects_url():
     body = _image_body({
         "prompt": "x", "model": "m", "size": "512x512",
