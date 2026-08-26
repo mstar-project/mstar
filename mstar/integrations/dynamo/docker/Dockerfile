@@ -13,6 +13,11 @@
 #   --build-arg CUDA_IMAGE=docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04
 #   --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu130
 #   --build-arg FLASH_ATTN_WHEEL=...cu13torch2.9...  (see docs/installation.rst)
+#
+# The CUDA 12.8 default is a host-compatibility floor, not a preference:
+# a cu12.8 image runs on both r570 and r580+ driver hosts, while a CUDA 13
+# image needs r580+. Flip the default once the deployment fleet's driver
+# floor moves past r570.
 
 # A -devel base is required at runtime, not just at build time: the vendored
 # MoE align kernel and FlashInfer both JIT-compile CUDA kernels on first use
