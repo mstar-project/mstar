@@ -103,6 +103,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.cp_config = config.talker.code_predictor
         self.num_codes = config.talker.num_code_groups
         self._suppress_mask: torch.Tensor | None = None
+        self._decode_last_token_indices: torch.Tensor | None = None
+
         # Lazy frame-local CodePredictor KV scratch, overwritten every step.
         self._cp_kv_cache: torch.Tensor | None = None
 
@@ -120,25 +122,41 @@ class TalkerSubmodule(ARNodeSubmodule):
             self._suppress_mask = mask
         return self._suppress_mask
 
-    def _get_batch_suppress_mask(
+    def _get_batch_suppress_eos(
         self, inputs: list[ARNodeInputs]
     ) -> torch.Tensor:
-        """Apply input-carried minimum-length EOS suppression to the base mask.
+        """Pack the input-carried minimum-length EOS flags for this batch.
 
         CUDA Graph replay calls ``preprocess`` with capture-slot dummy request
         ids, so looking up request state here would permanently observe a new
         request at frame zero. ``prepare_inputs`` runs with the real request and
         carries the dynamic flag as a tensor instead.
         """
-        mask = self._get_suppress_mask().unsqueeze(0).expand(
-            len(inputs), -1
-        ).clone()
+        flags = [item.tensor_inputs["suppress_eos"] for item in inputs]
+        packed = flags[0] if len(flags) == 1 else torch.cat(flags)
+        return packed.to(device=self.get_device(), dtype=torch.bool)
+
+    def _get_decode_last_token_indices(self, batch_size: int) -> torch.Tensor:
+        """Return cached packed-sequence indices for one-token decode rows."""
+        if self._decode_last_token_indices is None:
+            self._decode_last_token_indices = torch.arange(
+                self.MAX_BATCH_SIZE,
+                dtype=torch.long,
+                device=self.get_device(),
+            )
+        return self._decode_last_token_indices[:batch_size]
+
+    def _mask_invalid_logits(
+        self, logits: torch.Tensor, suppress_eos: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the static codec mask and the per-request EOS decision."""
+        logits = logits.masked_fill(
+            self._get_suppress_mask().unsqueeze(0), float("-inf")
+        )
         eos = self.talker_config.codec_eos_token_id
-        if 0 <= eos < mask.shape[1]:
-            mask[:, eos] = torch.cat([
-                item.tensor_inputs["suppress_eos"] for item in inputs
-            ]).to(device=mask.device, dtype=torch.bool)
-        return mask
+        if 0 <= eos < logits.shape[1]:
+            logits[:, eos].masked_fill_(suppress_eos, float("-inf"))
+        return logits
 
     def _get_cp_kv_cache(self, batch_size: int) -> torch.Tensor:
         """Frame-local CodePredictor scratch cache, sliced to this micro-batch.
@@ -346,16 +364,36 @@ class TalkerSubmodule(ARNodeSubmodule):
         request back to the hidden state used for codec-group-0 prediction.
         FlashInfer receives separate sequence lengths and KV page tables.
         """
-        del graph_walk, engine_inputs
+
+        del engine_inputs
         seq_lens = [item.input_seq_len for item in inputs]
-        return {
-            "input_embeds": torch.cat([
-                item.input_embeds for item in inputs if item.input_embeds is not None
-            ], dim=0),
-            "last_token_indices": (
+        input_embeds = [
+            item.input_embeds for item in inputs if item.input_embeds is not None
+        ]
+        if graph_walk == "talker_decode":
+            if any(seq_len != 1 for seq_len in seq_lens):
+                raise ValueError("Qwen3-TTS decode expects one token per request")
+            # one token per request, so the indices are a fixed arange and a
+            # single-request batch is already packed
+            packed_embeds = (
+                input_embeds[0]
+                if len(input_embeds) == 1
+                else torch.cat(input_embeds, dim=0)
+            )
+            last_token_indices = self._get_decode_last_token_indices(len(inputs))
+        else:
+            packed_embeds = torch.cat(input_embeds, dim=0)
+            last_token_indices = (
                 torch.tensor(seq_lens, device=self.get_device()).cumsum(0) - 1
-            ),
-            "suppress_mask": self._get_batch_suppress_mask(inputs),
+            )
+
+        # Materialize the persistent base mask before CUDA Graph capture. Only
+        # the per-request EOS flags need to cross the replay input boundary.
+        self._get_suppress_mask()
+        return {
+            "input_embeds": packed_embeds,
+            "last_token_indices": last_token_indices,
+            "suppress_eos": self._get_batch_suppress_eos(inputs),
         }
 
     def declare_step(
@@ -393,7 +431,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
-        suppress_mask: torch.Tensor,
+        suppress_eos: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Produce one complete codec frame for every request in the batch.
 
@@ -406,10 +444,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         hidden = self.model(input_embeds, label="main")
         last_hidden = hidden.index_select(0, last_token_indices)
         logits = self.model.codec_head(last_hidden)
-        logits = logits.masked_fill(suppress_mask, float("-inf"))
+        logits = self._mask_invalid_logits(logits, suppress_eos)
+
         talker_sampler: SamplerResource = engine_inputs.resources[TALKER_SAMPLER]
         code_pred_sampler: SamplerResource = engine_inputs.resources[CODE_PRED_SAMPLER]
         request_ids = engine_inputs.request_ids
+
         # The repetition penalty applies to group 0 only (its SamplerStep sets
         # apply_penalty); the depth loop's sampler declares no penalty.
         layer0_codes = talker_sampler.sample(request_ids, logits)
@@ -453,7 +493,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         codec_embed_sum = codec_embed.clone()
 
         cp_cache = self._get_cp_kv_cache(batch_size)
-        pos = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        pos = torch.zeros(batch_size, 1, dtype=torch.int32, device=device)
         # Position 0 conditions the depth decoder on the Talker hidden state.
         # Each following position consumes the previous group's embedding.
         self.code_predictor.forward_depth_unrolled(
@@ -526,12 +566,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
-        suppress_mask: torch.Tensor,
+        suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> NameToTensorList:
         del graph_walk, kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_mask
+            engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         return {name: [tensor] for name, tensor in output.items()}
 
@@ -541,12 +581,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
-        suppress_mask: torch.Tensor,
+        suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, NameToTensorList]:
         del graph_walk, kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_mask
+            engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         return {
             request_id: {

@@ -28,7 +28,7 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
     Qwen3TTSTalkerConfig,
 )
-from mstar.utils.attention import decode_attn_nhd
+from mstar.utils.attention import apply_rope_pos_ids, decode_attn_nhd
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames
@@ -220,34 +220,6 @@ class Qwen3TTSCodePredictorInnerModel(nn.Module):
         ])
 
 
-def _apply_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    position_ids: torch.Tensor,
-    theta: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the checkpoint's non-interleaved RoPE to grouped Q/K tensors."""
-    head_dim = q.shape[-1]
-    inv_freq = 1.0 / (
-        theta ** (
-            torch.arange(0, head_dim, 2, device=q.device, dtype=torch.float32)
-            / head_dim
-        )
-    )
-    angles = position_ids.to(torch.float32).unsqueeze(-1) * inv_freq
-    cos = torch.cat([angles.cos(), angles.cos()], dim=-1).unsqueeze(2)
-    sin = torch.cat([angles.sin(), angles.sin()], dim=-1).unsqueeze(2)
-
-    def rotate_half(x: torch.Tensor) -> torch.Tensor:
-        first, second = x.chunk(2, dim=-1)
-        return torch.cat([-second, first], dim=-1)
-
-    return (
-        q * cos.to(q.dtype) + rotate_half(q) * sin.to(q.dtype),
-        k * cos.to(k.dtype) + rotate_half(k) * sin.to(k.dtype),
-    )
-
-
 class Qwen3TTSCodePredictor(nn.Module):
     """Five-layer decoder that predicts codec groups 1 through 15.
 
@@ -297,7 +269,7 @@ class Qwen3TTSCodePredictor(nn.Module):
         kv_cache: torch.Tensor,
         cache_pos: int,
     ) -> torch.Tensor:
-        """Run all CodePredictor layers for one or more adjacent depth tokens.
+        """Run all CodePredictor layers for one depth token.
 
         ``kv_cache`` layout is ``[layers, batch, K/V, groups, kv_heads,
         head_dim]``. Unlike Talker cache, it is frame-local scratch space:
@@ -305,6 +277,10 @@ class Qwen3TTSCodePredictor(nn.Module):
         """
         hidden_states = inputs_embeds
         batch_size, seq_len, _ = hidden_states.shape
+        if seq_len != 1:
+            raise ValueError("CodePredictor decode expects exactly one token")
+        end = cache_pos + seq_len
+        flat_position_ids = position_ids.reshape(-1).to(torch.int32)
 
         for layer_idx, layer in enumerate(self.model.layers):
             residual = hidden_states
@@ -318,19 +294,31 @@ class Qwen3TTSCodePredictor(nn.Module):
             k = k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
             v = v.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
             q, k = attn._apply_qk_norm(q, k)
-            q, k = _apply_rope(
-                q, k, position_ids, float(attn.rope_theta)
+            # A stride-aware Triton kernel fuses both half rotations. The
+            # previous tensor expression launched multiple elementwise and
+            # concatenation kernels in every one of the 5 layers × 16 groups.
+            q, k = apply_rope_pos_ids(
+                q.reshape(batch_size * seq_len, attn.num_heads, attn.head_dim),
+                k.reshape(
+                    batch_size * seq_len,
+                    attn.num_kv_heads,
+                    attn.head_dim,
+                ),
+                flat_position_ids,
+                float(attn.rope_theta),
             )
+            q = q.view(batch_size, seq_len, attn.num_heads, attn.head_dim)
+            k = k.view(batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
 
-            # Append this depth position, then attend over the prefix. Read the
-            # full fixed-shape cache and mask to `end` inside decode_attn_nhd
-            # (compiler-disabled), so torch.compile doesn't recompile per
-            # cache_pos the way a variable ``[:end]`` slice would.
-            end = cache_pos + seq_len
+            # Append this depth position, then attend over the prefix already
+            # generated within the same codec frame.
             kv_cache[layer_idx, :, 0, cache_pos:end].copy_(k)
             kv_cache[layer_idx, :, 1, cache_pos:end].copy_(v)
             attn_output = decode_attn_nhd(
-                q, kv_cache[layer_idx, :, 0], kv_cache[layer_idx, :, 1], end,
+                q,
+                kv_cache[layer_idx, :, 0],
+                kv_cache[layer_idx, :, 1],
+                end,
             )
             attn_output = attn_output.reshape(batch_size, seq_len, -1)
             hidden_states = residual + attn.o_proj(attn_output)
