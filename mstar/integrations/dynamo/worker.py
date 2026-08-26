@@ -120,75 +120,48 @@ def serve(server: APIServer, model_name: str, args) -> None:
     served = args.served_model_name or model_name
     bridge = RequestBridge(server, adapter, served) if adapter is not None else None
 
+    # One entry per registered surface: (endpoint suffix, model input,
+    # model type, handler, bidirectional, extra register_model kwargs).
+    # Every surface registers under the same served name: the frontend
+    # keeps one worker set per (model, type), so each type routes to its
+    # own endpoint while sharing the name.
+    specs = []
+    if model_type is not None:
+        specs.append(("", ModelInput.Text, model_type, bridge.generate, False, {}))
+    if supports_videos:
+        specs.append(("_videos", ModelInput.Text, ModelType.Videos,
+                      bridge.videos, False, {}))
+    if supports_realtime:
+        realtime_bridge = RealtimeBridge(server, adapter, served)
+        specs.append(("_realtime", ModelInput.Text, ModelType.Realtime,
+                      realtime_bridge.generate, True, {}))
+    if tensor_spec is not None:
+        tensor_bridge = TensorBridge(server, tensor_spec, served)
+        specs.append(("_tensor", ModelInput.Tensor, ModelType.TensorBased,
+                      tensor_bridge.generate, False,
+                      {"tensor_model_config": tensor_spec.model_config(served)}))
+
     @dynamo_worker()
     async def _run(runtime: DistributedRuntime):
         surfaces = []
-        if model_type is not None:
-            endpoint = runtime.endpoint(f"{args.namespace}.{args.component}.{args.endpoint}")
+        for suffix, model_input, surface_type, handler, bidirectional, extra in specs:
+            endpoint = runtime.endpoint(
+                f"{args.namespace}.{args.component}.{args.endpoint}{suffix}"
+            )
             await register_model(
-                ModelInput.Text,
-                model_type,
+                model_input,
+                surface_type,
                 endpoint,
                 args.model_path,
                 served,
                 worker_type=WorkerType.Aggregated,
                 needs=[],
+                **extra,
             )
-            surfaces.append((f"{args.endpoint}={model_type}",
-                             endpoint.serve_endpoint(bridge.generate, graceful_shutdown=True)))
-        if supports_videos:
-            # Registered under the same served name: the frontend keeps one
-            # worker set per (model, type), so the videos surface routes here
-            # while chat/images keep the endpoint above.
-            video_ep = runtime.endpoint(
-                f"{args.namespace}.{args.component}.{args.endpoint}_videos"
-            )
-            await register_model(
-                ModelInput.Text,
-                ModelType.Videos,
-                video_ep,
-                args.model_path,
-                served,
-                worker_type=WorkerType.Aggregated,
-                needs=[],
-            )
-            surfaces.append((f"{args.endpoint}_videos={ModelType.Videos}",
-                             video_ep.serve_endpoint(bridge.videos, graceful_shutdown=True)))
-        if supports_realtime:
-            realtime_bridge = RealtimeBridge(server, adapter, served)
-            realtime_ep = runtime.endpoint(
-                f"{args.namespace}.{args.component}.{args.endpoint}_realtime"
-            )
-            await register_model(
-                ModelInput.Text,
-                ModelType.Realtime,
-                realtime_ep,
-                args.model_path,
-                served,
-                worker_type=WorkerType.Aggregated,
-                needs=[],
-            )
-            surfaces.append((f"{args.endpoint}_realtime={ModelType.Realtime}",
-                             realtime_ep.serve_bidirectional_endpoint(
-                                 realtime_bridge.generate, graceful_shutdown=True)))
-        if tensor_spec is not None:
-            tensor_bridge = TensorBridge(server, tensor_spec, served)
-            tensor_ep = runtime.endpoint(
-                f"{args.namespace}.{args.component}.{args.endpoint}_tensor"
-            )
-            await register_model(
-                ModelInput.Tensor,
-                ModelType.TensorBased,
-                tensor_ep,
-                args.model_path,
-                served,
-                worker_type=WorkerType.Aggregated,
-                needs=[],
-                tensor_model_config=tensor_spec.model_config(served),
-            )
-            surfaces.append((f"{args.endpoint}_tensor={ModelType.TensorBased}",
-                             tensor_ep.serve_endpoint(
-                                 tensor_bridge.generate, graceful_shutdown=True)))
+            serve_fn = (endpoint.serve_bidirectional_endpoint if bidirectional
+                        else endpoint.serve_endpoint)
+            surfaces.append((f"{args.endpoint}{suffix}={surface_type}",
+                             serve_fn(handler, graceful_shutdown=True)))
         logger.info(
             "MSTAR_DYNAMO_READY model=%s component=%s.%s surfaces=%s",
             served, args.namespace, args.component,
