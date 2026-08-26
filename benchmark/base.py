@@ -232,6 +232,57 @@ class Qwen3Omni(Model):
         }
 
 
+class MingFlashOmni(Model):
+    """Ming-flash-omni-2.0 (inclusionAI) — Ling-2.0 sparse-MoE omni model
+    (100B total / 6B active params).
+
+    Wire shape mirrors :class:`Qwen3Omni`: standard OpenAI
+    ``/v1/chat/completions`` with multimodal content parts. The role remap from
+    OpenAI's ``user``/``assistant``/``system`` to Ming's internal
+    ``HUMAN``/``ASSISTANT``/``SYSTEM`` is not done here — M*'s native port does
+    it in ``MingFlashOmniModel.process_prompt`` (Ming's own
+    ``BailingMM2Processor.apply_chat_template`` asserts on lowercase roles),
+    and the vllm-omni backend gets it from the jinja chat_template in
+    ``tokenizer_config.json``. So the benchmark sends the standard OpenAI shape
+    unchanged against either ``--inference-system``.
+    """
+
+    def get_hf_url(self):
+        return "inclusionAI/Ming-flash-omni-2.0"
+
+    def get_openai_system_message(self) -> Optional[dict]:
+        # Ming's cookbook defaults to ``sys_prompt_exp=None`` /
+        # ``use_cot_system_prompt=False`` — there is no required "You are Ming…"
+        # preamble like Qwen3-Omni's, and the chat template fills in whatever
+        # internal system text the model wants. Sending one here would only
+        # override the model's own default.
+        return None
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # Cap thinker output at 256 tokens for cross-system fairness — same
+        # rationale as Qwen3Omni. Both spellings are sent so the cap survives
+        # whichever ``--inference-system`` is in use: ``max_tokens`` (OpenAI)
+        # and ``max_output_tokens`` (M*'s native kwarg). Greedy decoding comes
+        # from the payload-level ``temperature=0.0``; the talker's sampling
+        # defaults stay server-side.
+        return {
+            "max_tokens": 256,
+            "max_output_tokens": 256,
+        }
+
+    def get_supported_modalities(self):
+        return {
+            RequestType.T2T,
+            RequestType.T2S,
+            RequestType.I2T,
+            RequestType.I2S,
+            RequestType.A2T,
+            RequestType.A2S,
+            RequestType.V2T,
+            RequestType.V2S,
+        }
+
+
 class Qwen3TTS(Model):
     """Qwen3-TTS CustomVoice benchmark metadata for native M* requests."""
 
@@ -328,6 +379,7 @@ class ModelType(Enum):
     ORPHEUS = "orpheus"
     QWEN3OMNI = "qwen3omni"
     QWEN3TTS = "qwen3_tts"
+    MING_FLASH_OMNI = "ming_flash_omni"
     PI05 = "pi05"
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
@@ -342,6 +394,8 @@ class ModelType(Enum):
             return Qwen3Omni(**kwargs)
         if self == ModelType.QWEN3TTS:
             return Qwen3TTS(**kwargs)
+        if self == ModelType.MING_FLASH_OMNI:
+            return MingFlashOmni(**kwargs)
         if self == ModelType.PI05:
             return Pi05(**kwargs)
         if self == ModelType.VJEPA2AC:

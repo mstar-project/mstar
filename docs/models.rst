@@ -28,6 +28,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``ming_flash_omni`` *(Beta)*
+     - ``inclusionAI/Ming-flash-omni-2.0``
+     - Omni-modal (text/image/audio/video in, text/audio/image out): Ling-2.0
+       sparse-MoE Thinker (100B total / 6B active) + vision/audio encoders +
+       CFM Talker. Needs 8 GPUs (Thinker TP=8). Beta / un-optimized.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -110,6 +115,48 @@ The benchmark stops on the model's natural codec EOS by default. Use
 fixed-length decode throughput rather than end-user latency.
 The first process-local request can include eager FlashInfer kernel JIT, so
 keep the warmup requests enabled when reporting steady-state latency.
+
+Ming-flash-omni (``ming_flash_omni``)
+-------------------------------------
+
+``inclusionAI/Ming-flash-omni-2.0`` — text/image/audio/video in, text/audio (and,
+where the checkpoint ships the imagegen sub-config, image) out. The graph has
+four nodes: a ``Thinker`` (Ling-2.0 sparse MoE, 100B total / 6B active,
+``KV_CACHE`` + TP), stateless ``vision_encoder`` and ``audio_encoder`` towers,
+and a stateless CFM ``Talker`` that wraps its own AudioVAE.
+
+.. code-block:: bash
+
+   pip install -e ".[ming_flash_omni]"
+   mstar-serve --config configs/ming_flash_omni.yaml --port 8000
+
+Two deploys ship:
+
+- ``configs/ming_flash_omni.yaml`` — full omni. Thinker TP=8 across 8 GPUs;
+  encoders + Talker colocate on rank 0.
+- ``configs/ming_flash_omni_thinker_only.yaml`` — text out only, no Talker.
+  Still TP=8: TP=4 has been measured to OOM at ~78.5/80 GB per rank while
+  streaming the 42 checkpoint shards.
+
+Eight GPUs is the supported layout — the ~238 GB checkpoint does not fit in
+fewer at bf16. A deploy that omits a node cannot serve the walks that need it;
+those walks are skipped during worker-graph division rather than failing the
+launch, which is what makes the thinker-only config work against the same model
+class.
+
+Two Ming-specific seams are worth knowing:
+
+- **Roles.** Ming ships two chat templates. ``process_prompt`` renders through
+  the tokenizer's jinja template, which accepts OpenAI ``user``/``assistant``/
+  ``system`` and rewrites them to Ming's ``HUMAN``/``ASSISTANT``/``SYSTEM``. The
+  Python-side ``BailingMM2Processor.apply_chat_template`` asserts on lowercase
+  roles, so it is used for feature extraction only.
+- **The Thinker→Talker bridge passes detokenized text**, re-tokenized with the
+  talker's own tokenizer, so the Talker behaves as a near-standalone TTS
+  partition fed by a streaming connection.
+
+Bring-up scripts (launcher + t2t / a2t / t2s requests) live in
+``test/ming_flash_omni/``.
 
 Cosmos3 environment requirements
 --------------------------------

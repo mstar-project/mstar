@@ -193,8 +193,18 @@ def _dispatch(
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Pick fused-Triton if available, otherwise the naive loop."""
-    if _HAS_FUSED and hidden_states.is_cuda:
+    """Pick fused-Triton if available, otherwise the naive loop.
+
+    The fused kernel only accepts half-precision activations (it asserts on
+    the dtype), so an fp32 forward — full-precision reference runs, CPU-ish
+    unit tests on a CUDA device — takes the naive loop, which is dtype
+    agnostic.
+    """
+    if (
+        _HAS_FUSED
+        and hidden_states.is_cuda
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+    ):
         return _fused_experts(
             hidden_states, gate_up_proj, down_proj,
             routing_weights, selected_experts,
