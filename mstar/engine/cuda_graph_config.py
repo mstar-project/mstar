@@ -223,6 +223,13 @@ class PiecewiseCudaGraphConfig(ABC):
     # replay so in-graph sampling stays per-request.
     uses_sampler: bool = False
     plan_fn: Callable[["BatchedCacheManager", PiecewiseCaptureShape], None] | None = None
+    # (5) attention planning without a KV cache, for regions running FlashInfer
+    #     ragged varlen: the plan is host-side, so it cannot live in the graph.
+    #     make_attn_state builds one wrapper per bucket (needs use_cuda_graph=True
+    #     so replanning reuses the captured index buffers); plan_attn_fn replans it
+    #     before each replay. Ignored when uses_kv_cache is True.
+    make_attn_state: Callable[[PiecewiseCaptureShape], Any] | None = None
+    plan_attn_fn: Callable[[Any, PiecewiseCaptureShape, list[int]], None] | None = None
     # Whether the runner advances cache seq_lens (Python-only, post-replay) after
     # each ``run``. True suits the common case where the captured region consumes
     # its planned tokens once per step. Set False when the caller advances the
