@@ -839,12 +839,45 @@ class Simulator:
         w.gpu_busy_s += cost.gpu_s
         w.cpu_busy_s += build_s + after_s
         w.steps += 1
+
+        # A lockstep instance runs the same step on every one of its ranks.
+        # Only the leader's timeline gates progress, but the followers' GPUs
+        # are just as busy — leaving them idle would report a TP=2 deployment
+        # as half-utilized and let the simulator schedule work onto a GPU
+        # that is actually mid-collective.
+        for follower in self._followers(items):
+            if follower == rank:
+                continue
+            fw = self.workers.get(follower)
+            if fw is None:
+                continue
+            fw.gpu_free_s = max(fw.gpu_free_s, gpu_end)
+            fw.cpu_free_s = max(fw.cpu_free_s, cpu_done)
+            fw.gpu_busy_s += cost.gpu_s
+            fw.cpu_busy_s += build_s + after_s
+            fw.steps += 1
         self.step_count += 1
         self.step_counts_by_key[(node, walk)] = (
             self.step_counts_by_key.get((node, walk), 0) + 1
         )
 
         self.cal.push(post_end, EventType.STEP_DONE, (rank, node, walk, items))
+
+    def _followers(self, items: list[ReadyItem]) -> set[int]:
+        """Every rank of the lockstep instances this batch runs on."""
+        ranks: set[int] = set()
+        for item in items:
+            req = self.requests.get(item.rid)
+            if req is None:
+                continue
+            assigned = req.wg_ranks.get(item.wg_id)
+            if assigned:
+                ranks.update(assigned)
+            else:
+                wg = self._wg_by_id(item.wg_id)
+                if wg is not None:
+                    ranks.update(wg.ranks)
+        return ranks
 
     def _batch_shape(
         self, node: str, walk: str, reqs: list[SimRequest]
