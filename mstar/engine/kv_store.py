@@ -164,15 +164,27 @@ class KVRequestState:
     # sequence length of the in-distributed-store KV cache
     is_paused: bool = False
 
-    # Lazily-filled {layer_idx: (k_pref, v_pref)} contiguous copies of the frozen
-    # text-prefix K/V, used by the dense generation-attention path. The prefix is
-    # written once at prefill and immutable through denoise (text tokens get no
-    # timestep embedding; the dense path never writes generation K/V to pages), so
-    # it is gathered once and reused across steps rather than re-gathered from the
-    # paged cache every step. Reset to None by _new_state()
-    # (add_request/reset_label/remove_request) — exactly when the prefix pages are
-    # (re)allocated — so it needs no manual invalidation.
+    # Lazily-filled {"epoch": int, "layers": {layer_idx: (k_pref, v_pref)}}
+    # contiguous copies of the committed-prefix K/V, used by the dense
+    # generation-attention path. For a static prefix (text written once at
+    # prefill, immutable through denoise) it is gathered once and reused
+    # across steps; when the committed content mutates mid-request (windowed
+    # generation appends/evicts per window) the recorded epoch falls behind
+    # prefix_epoch and the dense path re-gathers from the live pages — once
+    # per mutation, amortized over the steps between them. Reset to None by
+    # _new_state() (add_request/reset_label/remove_request) and by
+    # release_oldest (freed pages may be reused before the next gather).
     dense_prefix_kv: dict | None = None
+
+    # Windowed-generation bookkeeping (PagedAllocationManager.protect_prefix /
+    # release_oldest): the first protected_prefix_tokens of the stream are never
+    # releasable; released_tokens counts tokens compacted out of the front so
+    # far; prefix_epoch increments on every committed-content mutation (append
+    # via advance_seq_len(s), partial release) so caches of prefix-derived
+    # views can detect staleness instead of assuming a write-once prefix.
+    protected_prefix_tokens: int = 0
+    released_tokens: int = 0
+    prefix_epoch: int = 0
 
     def get_pos_info(self):
         return PositionInfo(
@@ -660,6 +672,64 @@ class PagedAllocationManager:
                 self.page_allocator.free(state.page_indices)
             self.request_states[request_id][label] = self._new_state()
 
+    def protect_prefix(self, request_id: str, label: str, num_tokens: int) -> None:
+        """Mark the first ``num_tokens`` of the label's stream as never
+        releasable (e.g. a text prefix that must survive while older
+        generated context is evicted). Set once, after the prefix commits;
+        idempotent at the same value."""
+        with self._lock:
+            state = self.request_states[request_id][label]
+            if num_tokens < 0 or num_tokens > state.seq_len:
+                raise ValueError(
+                    f"protect_prefix({num_tokens}) outside committed seq_len "
+                    f"{state.seq_len} for request {request_id!r} label {label!r}"
+                )
+            if state.released_tokens:
+                raise ValueError(
+                    f"protect_prefix must precede any release_oldest for "
+                    f"request {request_id!r} label {label!r}"
+                )
+            if state.protected_prefix_tokens not in (0, num_tokens):
+                raise ValueError(
+                    f"protected prefix already {state.protected_prefix_tokens} "
+                    f"tokens for request {request_id!r} label {label!r}, "
+                    f"got {num_tokens}"
+                )
+            state.protected_prefix_tokens = num_tokens
+
+    def release_oldest(self, request_id: str, label: str, num_tokens: int) -> int:
+        """Free the oldest unprotected tokens of a live request, whole pages
+        only, compacting the page list so the remaining stream stays
+        contiguous in page-list order.
+
+        The freed span starts at the first page fully past the protected
+        prefix; a page straddling the protection boundary and the partially
+        written tail page are never freed, so the realized release can fall
+        short of ``num_tokens`` by up to a page — callers re-offer the
+        shortfall on their next call. ``seq_len`` drops by exactly the freed
+        token count; ``position_id_start`` is untouched (it describes token
+        0, which is protected and never moves). Returns tokens freed.
+        """
+        self.wait_for_retrieves(request_id, label)
+        with self._lock:
+            state = self.request_states[request_id][label]
+            page_size = self.config.page_size
+            first = (state.protected_prefix_tokens + page_size - 1) // page_size
+            releasable = state.seq_len // page_size - first
+            k = min(num_tokens // page_size, releasable)
+            if k <= 0:
+                return 0
+            freed = state.page_indices[first : first + k]
+            del state.page_indices[first : first + k]
+            state.seq_len -= k * page_size
+            state.released_tokens += k * page_size
+            state.prefix_epoch += 1
+            # The dense fast path's cached prefix clone may include freed
+            # tokens; drop it so the next gather rebuilds from live pages.
+            state.dense_prefix_kv = None
+            self.page_allocator.free(freed)
+            return k * page_size
+
     def cleanup(self):
         self._kv_transfer_engine.shutdown()
 
@@ -705,6 +775,9 @@ class PagedAllocationManager:
             cpu_pool.offload_pages(
                 request_id, label, self.kv_cache,
                 state.page_indices, state.seq_len, state.position_id_start,
+                protected_prefix_tokens=state.protected_prefix_tokens,
+                released_tokens=state.released_tokens,
+                prefix_epoch=state.prefix_epoch,
             )
             with self._lock:
                 freed += len(state.page_indices)
@@ -722,10 +795,13 @@ class PagedAllocationManager:
                 gpu_pages = self.page_allocator.allocate(n_pages)
                 state = self.get_state(request_id, label)
                 state.page_indices = gpu_pages
-                seq_len, pos_id = cpu_pool.reload_pages(
+                restored = cpu_pool.reload_pages(
                     request_id, label, self.kv_cache, gpu_pages,
                 )
-                state.seq_len = seq_len
-                state.position_id_start = pos_id
+                state.seq_len = restored.seq_len
+                state.position_id_start = restored.position_id_start
+                state.protected_prefix_tokens = restored.protected_prefix_tokens
+                state.released_tokens = restored.released_tokens
+                state.prefix_epoch = restored.prefix_epoch
         cpu_pool.sync()
 
