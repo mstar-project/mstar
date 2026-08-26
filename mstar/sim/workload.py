@@ -19,9 +19,10 @@ cross-system comparison.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from mstar.sim.des import SimRequest
+from mstar.sim.request_inputs import InputSpec, build_input_signals, token_count_for
 
 
 @dataclass
@@ -34,10 +35,23 @@ class WorkloadSpec:
     concurrency: int = 8  # closed_loop / offline batch size
     prompt_tokens: int = 64
     output_tokens: int = 128
+    #: What each request carries in and asks for. Models branch on this —
+    #: an image-output request walks a different path than a text one — so
+    #: it is part of the workload, not a detail of the client.
+    inputs: InputSpec = field(default_factory=InputSpec)
     #: Per-request jitter on the lengths, as a fraction of the mean. 0 keeps
     #: every request identical, which makes a first comparison easier to read.
     length_jitter: float = 0.0
     seed: int = 0
+
+    def __post_init__(self) -> None:
+        # Keep the convenience scalars and the InputSpec in agreement: the
+        # spec is what the model sees, so a caller setting only the scalars
+        # must still get the request they asked for.
+        if self.inputs.prompt_tokens != self.prompt_tokens:
+            self.inputs.prompt_tokens = self.prompt_tokens
+        if self.inputs.output_tokens != self.output_tokens:
+            self.inputs.output_tokens = self.output_tokens
 
     def describe(self) -> str:
         if self.mode == "online":
@@ -48,7 +62,7 @@ class WorkloadSpec:
             pace = f"offline waves of {self.concurrency}"
         return (
             f"{self.num_requests} requests, {pace}, "
-            f"prompt~{self.prompt_tokens} tok, output~{self.output_tokens} tok"
+            f"{self.inputs.describe()}"
         )
 
 
@@ -76,11 +90,22 @@ def build_requests(spec: WorkloadSpec) -> list[SimRequest]:
             hi = int(mean * (1 + spec.length_jitter))
             return max(1, rng.randint(lo, hi))
 
+        ispec = replace(
+            spec.inputs,
+            prompt_tokens=jitter(spec.inputs.prompt_tokens),
+            output_tokens=jitter(spec.inputs.output_tokens),
+        )
         reqs.append(SimRequest(
             rid=f"req-{i:05d}",
             arrival_s=arrival,
-            prompt_tokens=jitter(spec.prompt_tokens),
-            target_output_tokens=jitter(spec.output_tokens),
+            # Media contributes prefill tokens too, so the backbone's prompt
+            # length is not the text length for a multimodal request.
+            prompt_tokens=token_count_for(ispec),
+            target_output_tokens=ispec.output_tokens,
+            input_modalities=list(ispec.input_modalities),
+            output_modalities=list(ispec.output_modalities),
+            model_kwargs=dict(ispec.model_kwargs),
+            input_signals=build_input_signals(ispec),
         ))
     return reqs
 

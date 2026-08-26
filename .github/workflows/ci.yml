@@ -79,4 +79,6 @@ jobs:
           pip install triton
           pip install --no-deps -e .
       - name: Sim unit tests
-        run: pytest test/modular/test_sim_stepdb.py test/modular/test_sim_harvest.py test/modular/test_sim_des.py -v
+        run: pytest test/modular/test_sim_stepdb.py test/modular/test_sim_harvest.py \
+               test/modular/test_sim_des.py test/modular/test_sim_hollow.py \
+               test/modular/test_sim_walks.py -v

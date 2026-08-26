@@ -97,16 +97,40 @@ class Deployment:
         return "\n".join(lines)
 
 
+#: Tokenizer attributes a stub may safely answer. Every one is a token
+#: *identity* — which id means end-of-sequence, which ids are special. The
+#: simulator never tokenizes and never inspects token values, so these cannot
+#: reach a graph shape, a placement, or a step cost. Anything outside this set
+#: is refused, because a model that truly needs the tokenizer to build its
+#: graph must not be simulated against a fabricated one.
+_INERT_TOKENIZER_ATTRS: dict[str, Any] = {
+    "all_special_ids": [],
+    "all_special_tokens": [],
+    "additional_special_tokens": [],
+    "eos_token_id": 0,
+    "bos_token_id": 0,
+    "pad_token_id": 0,
+    "unk_token_id": 0,
+    "eos_token": "",
+    "bos_token": "",
+    "pad_token": "",
+    "vocab_size": 0,
+    "model_max_length": 0,
+    "padding_side": "right",
+}
+
+
 class _StubTokenizer:
     """Stands in for a tokenizer the simulator will never call.
 
-    Raises on any attribute access other than the handful of harmless
-    introspection ones, so if a model *does* depend on tokenization during
-    graph construction, that surfaces as a clear error here rather than as a
-    silently wrong simulation.
+    Answers the inert metadata reads above and raises on everything else, so
+    a model that genuinely depends on tokenization while building its graph
+    surfaces as a clear error rather than as a silently wrong simulation.
     """
 
     def __getattr__(self, name: str):
+        if name in _INERT_TOKENIZER_ATTRS:
+            return _INERT_TOKENIZER_ATTRS[name]
         raise RuntimeError(
             f"the simulator stubbed out this model's tokenizer, but the model "
             f"asked for tokenizer.{name}. Construct the deployment with real "

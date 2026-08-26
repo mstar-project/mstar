@@ -13,52 +13,21 @@ What is modeled rather than imported is *how long things take*: the worker's
 two-lane (GPU / CPU) pipeline, the conductor hop, and tensor transfers. Step
 costs are looked up in the measured stepdb.
 
-## Known gap: walk sequencing is not yet imported
+## Walk sequencing
 
-The conductor asks the model which walk comes next via
-``get_partition_forward_pass_args``. This simulator does **not** call it —
-:meth:`Simulator._next_walk` uses a name heuristic instead (a walk whose name
-contains "decode" repeats; anything else hands off to one that does). That is
-correct for a prefill→decode autoregressive pipeline and wrong for every model
-whose request advances through a longer chain:
+Which walk follows which is the model's decision, taken through the same two
+calls the conductor makes — ``get_initial_forward_pass_args`` to open a
+request and ``get_partition_forward_pass_args`` after each completed pass —
+and applied per partition, since a backbone can be mid-decode while a codec
+partition is still draining an earlier chunk. The inputs those calls return
+are real ``GraphEdge`` objects, so seeding a walk is the model's decision too
+rather than a guess about which nodes look like entry points.
 
-===================  ==========================================================
-works                orpheus, qwen3_tts, whisper — prefill/decode (+ a
-                     streaming codec consumer, which is driven by ChunkPolicy
-                     rather than by walk transitions)
-does not work        bagel (image_gen, prefill_vit/vae never run), qwen3_omni
-                     (Talker and Code2Wav never run), pi05 (action_gen),
-                     wan22 (video_gen), vjepa2 (rollout), cosmos3
-===================  ==========================================================
+The only thing layered on top is the conductor's own length cap, which stands
+in for EOS: a simulator has no sampled tokens to inspect, so a request stops
+at the workload's target length — what a measured run with a pinned
+``max_tokens`` produces.
 
-For the models in the second row the simulation completes but only covers the
-first leg of the pipeline, which understates the work — the failure is silent
-in the metrics and visible only in ``step_counts_by_key``. Closing it means
-driving the real transition function, which needs ``CurrentForwardPassInfo``
-and per-partition state plumbed through the simulator.
-
-## The worker timing model
-
-A real worker runs one GPU stream and one busy main thread, and overlaps them
-with a one-deep speculation pipeline: while GPU(N) runs, the CPU builds batch
-N+1; after GPU(N) lands, it submits N+1 and only then postprocesses N. So the
-steady-state cadence is ``max(GPU, CPU)`` rather than their sum.
-
-This is modeled with two serial resources per worker and these dependencies::
-
-    cpu_submit(N)  →  gpu(N)  →  cpu_post(N)
-
-CPU work for a step is ``prepare + plan + launch`` before the launch and
-``sample`` after it, both measured per step, plus a fixed per-step worker
-overhead (routing, tensor bookkeeping, ZMQ) taken from the config. Because
-both lanes are serial and the submit of N+1 does not wait for the post of N to
-finish before the GPU can start, the loop settles at ``max(gpu, cpu)`` — the
-behavior the real pipeline exists to produce — without hard-coding it.
-
-The model deliberately does *not* reproduce the speculation machinery
-step-for-step (fairness peeks, plan-thread gating, slot double-buffering). It
-reproduces the resource structure those mechanisms exist to create. The
-residual is what validation measures.
 """
 
 from __future__ import annotations
@@ -165,14 +134,29 @@ class Calendar:
 
 @dataclass
 class SimRequest:
-    """One request in flight."""
+    """One request in flight.
+
+    Mirrors the conductor's ``RequestData``: state is held **per partition**,
+    because that is the granularity the model's transition function works at.
+    A speech model's backbone can be mid-decode while its codec partition is
+    still consuming an earlier chunk, and the request is finished only when
+    every partition says it is.
+    """
 
     rid: str
     arrival_s: float
-    #: Requested output length; the workload sets it and EOS is modeled as
-    #: reaching it, since a simulator has no token values to inspect.
+    #: Generated length in autoregressive steps. A simulator cannot read
+    #: sampled tokens, so this stands in for EOS — the same thing a measured
+    #: run with a pinned ``max_tokens`` produces.
     target_output_tokens: int
     prompt_tokens: int = 0
+    #: What the request carries in and asks for; the model's own transition
+    #: logic branches on these.
+    input_modalities: list[str] = field(default_factory=lambda: ["text"])
+    output_modalities: list[str] = field(default_factory=lambda: ["text"])
+    model_kwargs: dict = field(default_factory=dict)
+    #: Descriptors for the tensors ``process_prompt`` would have produced.
+    input_signals: dict[str, list[Any]] = field(default_factory=dict)
 
     admitted_s: float | None = None
     ingest_s: float | None = None
@@ -184,12 +168,19 @@ class SimRequest:
     #: Not every model flags one per decode step — Orpheus flags only the
     #: prefill's first token — so this is reporting, not the stop condition.
     output_tokens: int = 0
-    #: Autoregressive steps executed for this request. This is the generated
-    #: token count in the sense ``max_tokens`` means, and what EOS is modeled
-    #: against.
+    #: Autoregressive steps executed for this request.
     decode_steps: int = 0
     #: Per-modality chunk emission times as seen by the client.
     chunks: list[tuple[str, float]] = field(default_factory=list)
+
+    # ── conductor-level state, one entry per partition ───────────────────
+    #: partition name -> the real ``PartitionState`` the model mutates
+    partition_states: dict[str, Any] = field(default_factory=dict)
+    #: "from->to" -> the real ``StreamingConnectionState``
+    streaming_connections: dict[str, Any] = field(default_factory=dict)
+    #: Tensors the conductor is holding across forward passes; the model
+    #: reads this to build each pass's inputs.
+    persist_signals: dict[str, list[Any]] = field(default_factory=dict)
 
     #: worker graph id -> its WorkerGraphIO for this request
     graph_ios: dict[str, Any] = field(default_factory=dict)
@@ -197,11 +188,14 @@ class SimRequest:
     wg_ranks: dict[str, list[int]] = field(default_factory=dict)
     #: worker graph id -> the walk it belongs to
     wg_walk: dict[str, str] = field(default_factory=dict)
+    #: worker graph id -> the partition that owns it
+    wg_partition: dict[str, str] = field(default_factory=dict)
+    #: partition -> the walk it is currently executing
+    partition_walk: dict[str, str] = field(default_factory=dict)
     #: (consumer node) -> items buffered from a streaming producer, and the
     #: model's own ChunkPolicy deciding when a chunk is ready.
     stream_buffers: dict[str, int] = field(default_factory=dict)
     stream_policies: dict[str, Any] = field(default_factory=dict)
-    current_walk: str = ""
     fwd_index: int = 0
     #: KV context length, advanced as the request decodes.
     kv_len: int = 0
@@ -281,6 +275,24 @@ class SimWorker:
 
 # ── Simulator ────────────────────────────────────────────────────────────
 
+
+def _synthetic_pointer(edge: Any) -> Any:
+    """A descriptor standing in for a tensor the simulator never materialized.
+
+    Edges routed inside the simulator carry no ``tensor_info`` — there are no
+    tensors — but a model reading a persisted signal expects a pointer it can
+    inspect. Dims are unknown here and reported as such rather than invented,
+    so a model that sizes work off them will fail loudly instead of quietly
+    computing from a fabricated shape.
+    """
+    from mstar.graph.base import TensorPointerInfo
+
+    return TensorPointerInfo(
+        dims=[], dtype="float32", nbytes=0, address=0, stride=[],
+        uuid=f"sim-{edge.name}", source_session_id="sim", source_entity="worker",
+    )
+
+
 class Simulator:
     """Drives a deployment through a workload in virtual time."""
 
@@ -322,6 +334,10 @@ class Simulator:
 
         self.coverage = Coverage.EXACT
         self.missing_keys: dict[str, int] = {}
+        #: Transition-function failures, by call site. A model that cannot
+        #: answer for a request is a modeling gap worth reporting, not a
+        #: crash worth losing the whole run over.
+        self.model_errors: dict[str, int] = {}
         self.step_count = 0
         #: (node, walk) -> steps executed, the V1 validation gate's input.
         self.step_counts_by_key: dict[tuple[str, str], int] = {}
@@ -420,61 +436,213 @@ class Simulator:
             req.admitted_s = self.cal.now
             req.ingest_s = self.cal.now
             self.active.add(rid)
-            self._start_walk(req, self._initial_walk(req))
+            self._ingest(req)
 
-    def _initial_walk(self, req: SimRequest) -> str:
-        """First walk of the request.
+    # ── the conductor's request protocol, driven for real ────────────────
 
-        Uses the model's declared initial walk for its first partition, which
-        is what the conductor reads at ingest.
+    def _ingest(self, req: SimRequest) -> None:
+        """Kick off every partition, exactly as ``_do_ingest_request`` does.
+
+        The model is asked for each partition's opening move. A partition
+        that plays no part in this request answers ``request_done`` — that is
+        how a speech model's codec partition stays idle for a text-only
+        request without anyone special-casing it here.
         """
+        from mstar.conductor.request_info import (
+            CurrentForwardConductorMetadata,
+            PartitionState,
+            StreamingConnectionState,
+        )
+
+        req.persist_signals = dict(req.input_signals)
+
+        for conn in (getattr(self.dep.partition_topology, "connections", None) or []):
+            key = f"{conn.from_partition}->{conn.to_partition}"
+            req.streaming_connections[key] = StreamingConnectionState(
+                from_partition=conn.from_partition,
+                to_partition=conn.to_partition,
+                edge_name=conn.edge_name,
+            )
+
         for p in self.dep.partitions:
-            initial = getattr(p, "initial_walk", None)
-            if initial:
-                return initial
-        # Fall back to any walk that looks like a prefill entry point.
-        for name in self.dep.walk_to_wgs:
-            if "prefill" in name:
-                return name
-        return next(iter(self.dep.walk_to_wgs))
+            req.partition_states[p.name] = PartitionState(
+                partition_name=p.name,
+                metadata=CurrentForwardConductorMetadata(
+                    input_modalities=list(req.input_modalities),
+                    output_modalities=list(req.output_modalities),
+                    graph_walk="",
+                    is_prefill=True,
+                ),
+                random_seed=abs(hash(req.rid)) % (2 ** 31),
+            )
 
-    def _start_walk(self, req: SimRequest, walk: str) -> None:
-        """Instantiate this walk's worker graphs for the request and seed them.
+        for p in self.dep.partitions:
+            pstate = req.partition_states[p.name]
+            try:
+                fwd = self.dep.model.get_initial_forward_pass_args(
+                    partition_name=p.name,
+                    input_modalities=list(req.input_modalities),
+                    output_modalities=list(req.output_modalities),
+                    input_signals=req.input_signals,
+                    model_kwargs=dict(req.model_kwargs),
+                )
+            except Exception as exc:
+                # A model that cannot open this request is a modeling gap, not
+                # a simulator crash: record it, leave the partition idle, and
+                # let the run report which requests never started.
+                logger.warning(
+                    "%s: get_initial_forward_pass_args failed for partition "
+                    "%s (%s); leaving it idle", self.dep.model_key, p.name, exc,
+                )
+                self.model_errors[f"initial:{p.name}"] = (
+                    self.model_errors.get(f"initial:{p.name}", 0) + 1
+                )
+                pstate.is_done = True
+                continue
 
-        Deep-copies each section exactly as ``WorkerGraphQueues.add_request``
-        does — per-request graph state (loop counters, readiness) must not be
-        shared between requests.
-        """
+            pstate.is_done = bool(fwd.request_done)
+            pstate.metadata = fwd.full_metadata
+            pstate.metadata.kwargs.update(fwd.step_metadata)
+            if pstate.is_done:
+                continue
+            self._enter_walk(req, p.name, fwd.full_metadata.graph_walk, fwd.inputs)
 
-        previous = req.current_walk
-        req.current_walk = walk
-        wgs = self.dep.walk_to_wgs.get(walk, [])
-        if not wgs:
+        if all(ps.is_done for ps in req.partition_states.values()):
             self._finish(req)
+
+    def _advance_partition(self, req: SimRequest, partition: str) -> None:
+        """Ask the model what this partition does next — ``_process_done_forward``.
+
+        Everything about which walk follows which is the model's decision,
+        including the length cap the conductor applies on top of it. Nothing
+        here inspects walk names.
+        """
+        pstate = req.partition_states.get(partition)
+        if pstate is None or pstate.is_done or req.done:
             return
 
-        # Drop the finished walk's graphs. Streaming-consumer graphs belong to
-        # a different partition and keep running across the producer's walk
-        # transitions, so they are kept.
+        incoming = [
+            c for c in req.streaming_connections.values()
+            if c.to_partition == partition
+        ]
+        try:
+            fwd = self.dep.model.get_partition_forward_pass_args(
+                partition_name=partition,
+                partition_metadata=pstate.metadata,
+                persist_signals=req.persist_signals,
+                incoming_connections=incoming,
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s: get_partition_forward_pass_args failed for partition %s "
+                "(%s); ending it", self.dep.model_key, partition, exc,
+            )
+            self.model_errors[f"advance:{partition}"] = (
+                self.model_errors.get(f"advance:{partition}", 0) + 1
+            )
+            fwd = None
+
+        if fwd is None:
+            self._end_partition(req, partition)
+            return
+
+        pstate.metadata = fwd.full_metadata
+        pstate.metadata.kwargs.update(fwd.step_metadata)
+        pstate.fwd_pass_number += 1
+        pstate.random_seed += 1
+
+        request_done = bool(fwd.request_done)
+        # The conductor's own cap, applied on top of the model's answer. A
+        # simulator has no sampled tokens, so the workload's target length is
+        # the stand-in for EOS.
+        if req.decode_steps >= req.target_output_tokens:
+            request_done = True
+
+        if request_done:
+            self._end_partition(req, partition)
+            return
+
+        self._enter_walk(req, partition, fwd.full_metadata.graph_walk, fwd.inputs)
+
+    def _end_partition(self, req: SimRequest, partition: str) -> None:
+        """Mark a partition finished and tell its consumers, as the conductor does."""
+        pstate = req.partition_states.get(partition)
+        if pstate is None or pstate.is_done:
+            return
+        pstate.is_done = True
+        for conn in req.streaming_connections.values():
+            if conn.from_partition == partition:
+                conn.producer_done = True
+                # A consumer may have work left to do once its producer stops
+                # (draining its buffer, or continuing on its own); give it a
+                # chance to react rather than cutting it off.
+                self.cal.push(
+                    self.cal.now + self.timing.conductor_hop_s,
+                    EventType.CONDUCTOR,
+                    ("advance", req.rid, conn.to_partition),
+                )
+        if all(ps.is_done for ps in req.partition_states.values()):
+            self._finish(req)
+
+    def _enter_walk(
+        self, req: SimRequest, partition: str, walk: str, inputs: list | None,
+    ) -> None:
+        """Instantiate a partition's next walk and seed it with the model's inputs.
+
+        ``inputs`` are the ``GraphEdge`` objects the model itself returned —
+        the same objects the conductor forwards to workers — so seeding is
+        the model's decision, not a guess about which nodes look like entry
+        points. When the model returns none, the walk is self-triggering
+        (a streaming consumer waiting on its buffer) and is left to be woken
+        by an arriving chunk.
+        """
+        if not walk:
+            return
+        wgs = [
+            wg for wg in self.dep.walk_to_wgs.get(walk, [])
+            if self._wg_partition(wg, walk) == partition
+        ]
+        if not wgs:
+            # No worker graph for this partition's walk: nothing to run.
+            self._end_partition(req, partition)
+            return
+
+        previous = req.partition_walk.get(partition)
+        req.partition_walk[partition] = walk
+
+        # Retire this partition's previous graphs; other partitions keep theirs.
         if previous and previous != walk:
             for wg_id in [
-                i for i, w in req.wg_walk.items()
-                if w == previous and not self._is_stream_consumer(i)
+                i for i, pn in req.wg_partition.items()
+                if pn == partition and req.wg_walk.get(i) == previous
             ]:
                 req.graph_ios.pop(wg_id, None)
                 req.wg_walk.pop(wg_id, None)
+                req.wg_partition.pop(wg_id, None)
 
         for wg in wgs:
-            self._instantiate(req, wg, walk)
-            # Seed by ingesting the inputs the graph declares as external.
-            # Going through ingest_input (rather than forcing a node onto the
-            # ready list) is what keeps the registry's readiness, loop, and
-            # completion bookkeeping correct — the same reason the real
-            # worker routes every arriving edge through it.
-            io = req.graph_ios[wg.wg_id]
-            for edge in self._entry_edges(io):
-                io.ingest_input(edge)
+            self._instantiate(req, wg, walk, partition)
+
+        if not inputs:
+            return
+
+        # Route the model's declared inputs through ingest_input, which is
+        # what keeps each graph's readiness, loop, and completion bookkeeping
+        # correct — the same path the real worker uses for arriving edges.
+        for edge in inputs:
+            for wg in wgs:
+                io = req.graph_ios.get(wg.wg_id)
+                if io is not None and io.ingest_input(edge):
+                    break
+        for wg in wgs:
             self._drain_ready(req, wg)
+
+    def _wg_partition(self, wg: SimWorkerGraph, walk: str) -> str:
+        """Which partition owns a worker graph, via the walk it belongs to."""
+        for p in self.dep.partitions:
+            if walk in getattr(p, "graph_walks", set()):
+                return p.name
+        return "default"
 
     def _pick_instance(self, wg: SimWorkerGraph, req: SimRequest) -> list[int]:
         """Choose a DP replica, seeded per request like the real conductor."""
@@ -514,7 +682,10 @@ class Simulator:
             if node in io.nodes
         ]
 
-    def _instantiate(self, req: SimRequest, wg: SimWorkerGraph, walk: str) -> Any:
+    def _instantiate(
+        self, req: SimRequest, wg: SimWorkerGraph, walk: str,
+        partition: str | None = None,
+    ) -> Any:
         """Create (or recreate) this request's copy of one worker graph.
 
         Deep-copies the section exactly as ``WorkerGraphQueues.add_request``
@@ -526,6 +697,9 @@ class Simulator:
         io = WorkerGraphIO(copy.deepcopy(wg.section), wg_id=wg.wg_id)
         req.graph_ios[wg.wg_id] = io
         req.wg_walk[wg.wg_id] = walk
+        req.wg_partition[wg.wg_id] = (
+            partition if partition is not None else self._wg_partition(wg, walk)
+        )
         if wg.wg_id not in req.wg_ranks:
             req.wg_ranks[wg.wg_id] = self._pick_instance(wg, req)
         return io
@@ -552,9 +726,11 @@ class Simulator:
             if io is not None and node_name in io.nodes:
                 return source_wg_id, self._wg_by_id(source_wg_id)
 
-        for wg_id, io in req.graph_ios.items():
-            if node_name in io.nodes and req.wg_walk.get(wg_id) == req.current_walk:
-                return wg_id, self._wg_by_id(wg_id)
+        source_partition = req.wg_partition.get(source_wg_id) if source_wg_id else None
+        if source_partition:
+            for wg_id, io in req.graph_ios.items():
+                if node_name in io.nodes and req.wg_partition.get(wg_id) == source_partition:
+                    return wg_id, self._wg_by_id(wg_id)
 
         for wg_id, io in req.graph_ios.items():
             if node_name in io.nodes:
@@ -601,7 +777,7 @@ class Simulator:
                 # streaming consumer runs its own walk (an audio codec's
                 # chunk walk) while the producer is mid-decode, and pricing
                 # its steps under the producer's walk would miss the table.
-                walk=req.wg_walk.get(wg.wg_id, req.current_walk),
+                walk=req.wg_walk.get(wg.wg_id, ""),
                 wg_id=wg.wg_id, ready_s=self.cal.now,
             ))
         self.cal.push(self.cal.now, EventType.WORKER_POLL, leader)
@@ -748,6 +924,17 @@ class Simulator:
             if getattr(edge, "conductor_new_token", False):
                 req.output_tokens += 1
 
+            # Absorb persisted tensors, as the conductor does when a worker
+            # graph reports done. Models read these back by name to build the
+            # next pass's inputs — Qwen3-Omni's Talker, for instance, needs
+            # the embeds its Thinker produced — so a request whose persist
+            # signals are missing cannot advance past the handoff.
+            if getattr(edge, "persist", False):
+                req.persist_signals[edge.name] = (
+                    list(edge.tensor_info) if edge.tensor_info
+                    else [_synthetic_pointer(edge)]
+                )
+
             if edge.next_node == EMIT_TO_CLIENT:
                 self._emit(req, edge)
                 continue
@@ -785,13 +972,29 @@ class Simulator:
                 (req.rid, dest_wg_id, edge, req.wg_walk.get(dest_wg_id, walk)),
             )
 
-        # This graph finished its walk → ask the model what comes next. Only
-        # the walk the conductor is driving advances the request; a streaming
-        # consumer finishing a chunk is not a walk transition.
+        # This graph finished its walk. Every partition advances through the
+        # same call the conductor makes — including a streaming consumer,
+        # whose model decides whether another chunk follows.
         io = req.graph_ios.get(wg_id)
         if io is not None and io.wg_state_registry.is_done:
-            if req.wg_walk.get(wg_id) == req.current_walk:
-                self._walk_complete(req, walk)
+            partition = req.wg_partition.get(wg_id)
+            if partition and self._partition_walk_done(req, partition):
+                self.cal.push(
+                    self.cal.now + self.timing.conductor_hop_s,
+                    EventType.CONDUCTOR,
+                    ("advance", req.rid, partition),
+                )
+
+    def _partition_walk_done(self, req: SimRequest, partition: str) -> bool:
+        """True when every graph of this partition's current walk has finished."""
+        ids = [i for i, pn in req.wg_partition.items() if pn == partition]
+        if not ids:
+            return False
+        return all(
+            (io := req.graph_ios.get(i)) is not None
+            and io.wg_state_registry.is_done
+            for i in ids
+        )
 
     def _stream_arrival(
         self, req: SimRequest, edge: Any, dest_wg: SimWorkerGraph
@@ -867,56 +1070,22 @@ class Simulator:
             req.first_chunk_s = t
         req.last_chunk_s = t
 
-    def _walk_complete(self, req: SimRequest, walk: str) -> None:
-        """Ask the model for the next walk, through the conductor hop."""
-        self.cal.push(
-            self.cal.now + self.timing.conductor_hop_s,
-            EventType.CONDUCTOR,
-            ("walk_done", req.rid, walk),
-        )
-
     def _on_conductor(self, payload: Any) -> None:
         if payload is None:
             self._admit_waiting()
             return
-        kind, rid, walk = payload
+        kind, rid, arg = payload
         if kind == "ingest":
             self.waiting.append(rid)
             self._admit_waiting()
             return
-        if kind != "walk_done":
-            return
         req = self.requests.get(rid)
         if req is None or req.done:
             return
-
-        req.fwd_index += 1
-        next_walk = self._next_walk(req, walk)
-        if next_walk is None:
-            self._finish(req)
+        if kind == "advance":
+            req.fwd_index += 1
+            self._advance_partition(req, arg)
             self._admit_waiting()
-            return
-        self._start_walk(req, next_walk)
-
-    def _next_walk(self, req: SimRequest, walk: str) -> str | None:
-        """The model's transition function decides; length caps override it.
-
-        The real conductor calls ``get_partition_forward_pass_args`` and also
-        force-stops at ``max_output_tokens``. A simulator cannot inspect token
-        values, so EOS is modeled as reaching the request's target length —
-        which is exactly what a benchmark run with ``--ignore-eos`` produces,
-        and what the workload spec describes.
-        """
-        if req.decode_steps >= req.target_output_tokens:
-            return None
-        # A decode walk keeps running until the length cap; other walks hand
-        # off to the decode walk if one exists.
-        if "decode" in walk:
-            return walk
-        for name in self.dep.walk_to_wgs:
-            if "decode" in name:
-                return name
-        return None
 
     def _finish(self, req: SimRequest) -> None:
         if req.done:

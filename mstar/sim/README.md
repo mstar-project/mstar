@@ -76,6 +76,12 @@ mstar simulate --config configs/orpheus.yaml --db orpheus.db \
                --prompt-tokens 41 --output-tokens 740
 ```
 
+Multimodal requests are described with an `InputSpec` (input/output
+modalities, image size, video frames, audio length), because the model's own
+transition logic branches on them: Bagel sizes the image it generates from
+the input image's dims, and Qwen3-Omni routes to a vision or audio prefill
+depending on what arrived.
+
 `--output-tokens` is **autoregressive steps**, not client-visible chunks. For
 a codec model these differ by the codec's tokens-per-frame (Orpheus emits one
 audio chunk per 7 decode steps), so read the ratio off a measured run rather
@@ -102,6 +108,39 @@ errors that cancel:
 * **V3 end-to-end** — TTFT and E2E distributions, compared as distributions.
   Per-request pairing is not attempted: DP replica choice and batch
   composition make an individual request's fate incomparable between runs.
+
+## Model coverage
+
+Nothing here is per-model. Placement, walk graphs, engine types, streaming
+policies and — since the transition work — *walk sequencing* all come from
+the model's own code, so a new model is supported the moment it is
+registered. What a new model needs is data, not code: a profiling capture to
+fill its cost table.
+
+Every shipped model runs its declared chain end to end:
+
+| model | request | walks executed |
+| --- | --- | --- |
+| orpheus | text→audio | prefill → decode → snac_chunk |
+| qwen3_tts | text→audio | talker_prefill → talker_decode → codec_chunk |
+| whisper | audio→text | prefill → decode |
+| higgs_audio | audio→text | prefill_audio → decode |
+| bagel | text→text | prefill_text → decode |
+| bagel | text→image | prefill_text → image_gen |
+| bagel | image→text | prefill_text → prefill_vit → decode |
+| bagel | image+text→image | prefill_text → prefill_vit → prefill_vae → image_gen |
+| qwen3_omni | text→audio | prefill_text → thinker_decode → talker_prefill → talker_last_prefill → talker_decode → code2wav_chunk |
+| qwen3_omni | image→text | prefill_text → prefill_vision → thinker_decode |
+| qwen3_omni | audio→text | prefill_audio → prefill_text → thinker_decode |
+| pi05 | image+text→action | prefill → action_gen |
+| wan22 | text→video | encode_text → video_gen |
+| wan22 | image→video | encode_text → encode_image → video_gen_i2v |
+| cosmos3 | text→video | prefill → video_gen |
+| vjepa2 | video→video | prefill_video |
+
+A request's modalities decide the chain, so state them — see `InputSpec`.
+Asking for `["text"]` out of an image model simulates a captioning request,
+not an image-generation one.
 
 ## What is modeled, and how
 
@@ -192,14 +231,11 @@ real-GPU runs.
 * **Model-version-scoped rows.** A step's cost bakes in the submodule code and
   the capture bucket lists. Re-harvest after a model change.
 * **Host-specific CPU terms.** Calibration measures the machine it ran on.
-* **Model coverage.** Placement, graph, engine types and streaming policies
-  load for every registered model, and the cost table and instrumentation are
-  model-agnostic. But *walk sequencing* is still a name heuristic rather than
-  the model's own transition function, so only prefill→decode pipelines
-  (orpheus, qwen3_tts, whisper) simulate end to end. For bagel, qwen3_omni,
-  pi05, wan22, vjepa2 and cosmos3 the run completes having executed only the
-  first leg — silent in the metrics, visible in `step_counts_by_key`. See the
-  table in `des.py`'s module docstring.
+* **Validation depth varies by model.** Every registered model simulates its
+  real walk chain (see *Model coverage* above), but only Orpheus has been
+  scored against measured hardware. For the others the *semantics* are the
+  model's own; the *numbers* are only as good as their cost tables, which
+  have to be captured per model.
 * **Codec batch aggregation** is the largest known semantic residual among the
   models that do work: the simulator batches a streaming consumer somewhat
   more than the real system does.
