@@ -67,6 +67,14 @@ worker overhead. Each comes from a specific pair of checkpoints, so an
 implausible number points at one identifiable stage. Without this file the
 simulator uses documented placeholders and **says so in every report**.
 
+The per-step overhead is measured as *cadence* — how much longer one
+step-to-step interval is than `max(gpu, cpu)` explains — not as a step's own
+`total_s` minus that. `total_s` spans the engine call, which under async
+scheduling overlaps the next step; treating the leftover as extra serial
+overhead double-counts work that already ran in parallel. On a model whose
+Python cost is large next to its GPU time that inflated the term ~15x and
+pushed predicted latency 35% high.
+
 ### 4. Predict
 
 ```bash
@@ -232,10 +240,10 @@ real-GPU runs.
   the capture bucket lists. Re-harvest after a model change.
 * **Host-specific CPU terms.** Calibration measures the machine it ran on.
 * **Validation depth varies by model.** Every registered model simulates its
-  real walk chain (see *Model coverage* above), but only Orpheus has been
-  scored against measured hardware. For the others the *semantics* are the
-  model's own; the *numbers* are only as good as their cost tables, which
-  have to be captured per model.
+  real walk chain, but only Orpheus and Qwen3-TTS have been scored against
+  measured hardware (E2E within 3% and 16% respectively, at concurrency 4 on
+  an H200). For the others the *semantics* are the model's own; the *numbers*
+  are only as good as their cost tables, which have to be captured per model.
 * **Codec batch aggregation** is the largest known semantic residual among the
   models that do work: the simulator batches a streaming consumer somewhat
   more than the real system does.
