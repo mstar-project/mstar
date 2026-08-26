@@ -82,7 +82,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
         prefill_tokens = {}
         if graph_walk == "prefill":
             prefill_tokens = {
-                rid: inp.input_ids for rid, inp in zip(request_ids, inputs)
+                rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)
             }
         return SubmoduleStep(
             segments=[
@@ -90,7 +90,7 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
                     request_id=rid,
                     label="main",
                     span=inp.input_seq_len,
-                ) for rid, inp in zip(request_ids, inputs)
+                ) for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps={
                 KV_CACHE: KVStep(),

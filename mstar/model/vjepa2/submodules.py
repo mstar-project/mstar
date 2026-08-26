@@ -952,7 +952,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             return SubmoduleStep(
                 segments=[
                     Segment(request_id=rid, label="main", span=seq_len)
-                    for rid, seq_len in zip(request_ids, seq_lens)
+                    for rid, seq_len in zip(request_ids, seq_lens, strict=True)
                 ],
                 steps={
                     KV_CACHE: KVStep(),

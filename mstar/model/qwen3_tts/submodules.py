@@ -383,7 +383,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs)
+                for rid, inp in zip(request_ids, inputs, strict=True)
             ],
             steps=steps,
         )
