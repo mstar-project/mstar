@@ -192,9 +192,17 @@ real-GPU runs.
 * **Model-version-scoped rows.** A step's cost bakes in the submodule code and
   the capture bucket lists. Re-harvest after a model change.
 * **Host-specific CPU terms.** Calibration measures the machine it ran on.
-* **Codec batch aggregation** is the largest known semantic residual: the
-  simulator batches a streaming consumer somewhat more than the real system
-  does.
+* **Model coverage.** Placement, graph, engine types and streaming policies
+  load for every registered model, and the cost table and instrumentation are
+  model-agnostic. But *walk sequencing* is still a name heuristic rather than
+  the model's own transition function, so only prefill→decode pipelines
+  (orpheus, qwen3_tts, whisper) simulate end to end. For bagel, qwen3_omni,
+  pi05, wan22, vjepa2 and cosmos3 the run completes having executed only the
+  first leg — silent in the metrics, visible in `step_counts_by_key`. See the
+  table in `des.py`'s module docstring.
+* **Codec batch aggregation** is the largest known semantic residual among the
+  models that do work: the simulator batches a streaming consumer somewhat
+  more than the real system does.
 * **TTFT reads slightly low**, because scheduler and queueing overhead outside
   the measured terms is not modeled. Under-prediction is the expected
   direction; do not tune the cost model to close it.

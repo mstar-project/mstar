@@ -6,14 +6,36 @@ Everything that decides *what runs when* comes from mstar's own code:
 * graph readiness, loop iteration, and EOS handling — the real
   :class:`~mstar.graph.graph_io.WorkerGraphIO`, one deep copy per
   (request, worker graph), exactly as the worker does;
-* walk sequencing — the model's own ``get_initial_forward_pass_args`` and
-  ``get_partition_forward_pass_args``;
 * placement — the real ``get_worker_graphs`` over the deployment YAML;
 * streaming cadence — the model's own ``ChunkPolicy`` objects.
 
 What is modeled rather than imported is *how long things take*: the worker's
 two-lane (GPU / CPU) pipeline, the conductor hop, and tensor transfers. Step
 costs are looked up in the measured stepdb.
+
+## Known gap: walk sequencing is not yet imported
+
+The conductor asks the model which walk comes next via
+``get_partition_forward_pass_args``. This simulator does **not** call it —
+:meth:`Simulator._next_walk` uses a name heuristic instead (a walk whose name
+contains "decode" repeats; anything else hands off to one that does). That is
+correct for a prefill→decode autoregressive pipeline and wrong for every model
+whose request advances through a longer chain:
+
+===================  ==========================================================
+works                orpheus, qwen3_tts, whisper — prefill/decode (+ a
+                     streaming codec consumer, which is driven by ChunkPolicy
+                     rather than by walk transitions)
+does not work        bagel (image_gen, prefill_vit/vae never run), qwen3_omni
+                     (Talker and Code2Wav never run), pi05 (action_gen),
+                     wan22 (video_gen), vjepa2 (rollout), cosmos3
+===================  ==========================================================
+
+For the models in the second row the simulation completes but only covers the
+first leg of the pipeline, which understates the work — the failure is silent
+in the metrics and visible only in ``step_counts_by_key``. Closing it means
+driving the real transition function, which needs ``CurrentForwardPassInfo``
+and per-partition state plumbed through the simulator.
 
 ## The worker timing model
 
