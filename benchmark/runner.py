@@ -452,7 +452,12 @@ class Benchmark:
         # max_concurrency don't bottleneck on aiohttp's default 100/host limit.
         connector_limit = max(100, (self.config.max_concurrency or 1) + 10)
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300),
+            # Per-request inactivity budget, NOT a whole-session deadline: a
+            # sweep runs many requests (sequentially, in offline mode) on one
+            # session, so a ``total`` deadline expires mid-sweep and
+            # spuriously fails every remaining request. ``sock_read`` resets
+            # on each streamed chunk, so a healthy request never trips it.
+            timeout=aiohttp.ClientTimeout(total=None, sock_read=120),
             connector=aiohttp.TCPConnector(limit=connector_limit),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
