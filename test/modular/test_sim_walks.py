@@ -265,3 +265,40 @@ def test_token_budget_caps_a_repeating_walk(target, expect_more_than):
     sim, req = _run(dep, target=target)
     assert sim.step_counts_by_key[("Na", "alpha")] >= expect_more_than
     assert req.decode_steps <= target + 2
+
+
+def test_a_partition_with_work_in_flight_is_not_ended():
+    """A consumer draining its last chunk must not be cut off.
+
+    When a producer finishes it signals its consumers, and the consumer is
+    asked whether it is done. If that question is answered while the
+    consumer still has a step on the GPU, the step's output — for a codec,
+    the request's only audio — is discarded.
+    """
+    dep = _chain_deployment()
+    db = _db(dep)
+    sim = Simulator(dep, db)
+    req = SimRequest(rid="r0", arrival_s=0.0, target_output_tokens=50, prompt_tokens=4)
+    sim.submit(req)
+    sim.run(max_events=200)
+
+    req.partition_inflight["default"] = 1
+    before = req.partition_states["default"].is_done
+    sim._advance_partition(req, "default")
+    assert req.partition_states["default"].is_done == before
+    db.close()
+
+
+def test_emitted_chunks_wait_for_the_gpu_step_that_made_them():
+    # Routing runs on the CPU lane and can finish before the GPU does; a
+    # client-visible chunk must still not be reported early.
+    dep = _chain_deployment()
+    db = _db(dep, gpu_s=0.050)
+    sim = Simulator(dep, db)
+    req = SimRequest(rid="r0", arrival_s=0.0, target_output_tokens=50, prompt_tokens=4)
+    sim.submit(req)
+    sim.run(max_events=200000)
+    assert req.chunks
+    _, first = req.chunks[0]
+    assert first >= 0.050
+    db.close()

@@ -60,6 +60,10 @@ class Deployment:
     partition_topology: Any
     max_concurrent_requests: int | None
     max_output_tokens: int
+    #: Bytes of KV cache one token occupies, summed over the model's cache
+    #: configs. Used to price a prefill→decode handoff, where the whole
+    #: context has to move between GPUs.
+    kv_bytes_per_token: int = 0
 
     def workers(self) -> list[str]:
         return [f"worker_{r}" for r in self.ranks]
@@ -159,6 +163,28 @@ def _construct_without_tokenizer(
         transformers.AutoTokenizer.from_pretrained = real
 
 
+def _kv_bytes_per_token(model: Any) -> int:
+    """KV bytes one token occupies, from the model's own cache configs.
+
+    Two tensors (K and V) per layer, each ``num_kv_heads × head_dim``
+    elements. Dtype is taken as 2 bytes: mstar allocates the cache in the
+    model's autocast dtype, which is 16-bit for every shipped model.
+    Returns 0 when the model declares no KV cache — a pure diffusion or
+    encoder deployment has no context to hand off.
+    """
+    total = 0
+    try:
+        configs = model.get_kv_cache_config() or []
+    except Exception:
+        return 0
+    for cfg in configs:
+        layers = getattr(cfg, "num_layers", 0) or 0
+        heads = getattr(cfg, "num_kv_heads", 0) or 0
+        dim = getattr(cfg, "head_dim", 0) or 0
+        total += 2 * layers * heads * dim * 2
+    return total
+
+
 def _section_node_names(section: Any) -> list[str]:
     """Node names inside a graph section, in declaration order."""
     try:
@@ -244,6 +270,7 @@ def load_deployment(
     }
 
     return Deployment(
+        kv_bytes_per_token=_kv_bytes_per_token(model),
         model_key=key,
         model=model,
         config_path=config_path,

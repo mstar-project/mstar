@@ -192,6 +192,9 @@ class SimRequest:
     wg_partition: dict[str, str] = field(default_factory=dict)
     #: partition -> the walk it is currently executing
     partition_walk: dict[str, str] = field(default_factory=dict)
+    #: partition -> steps dispatched but not yet completed. A partition with
+    #: work in flight must not be ended, or its output is thrown away.
+    partition_inflight: dict[str, int] = field(default_factory=dict)
     #: (consumer node) -> items buffered from a streaming producer, and the
     #: model's own ChunkPolicy deciding when a chunk is ready.
     stream_buffers: dict[str, int] = field(default_factory=dict)
@@ -331,6 +334,10 @@ class Simulator:
         # is what stops a codec consumer from batching every request in
         # lockstep with the backbone.
         self.preprocess_free_s = 0.0
+
+        #: GPU completion time of the step being postprocessed, so an emit
+        #: is never reported before its computation finished.
+        self._gpu_end_of_current_step = 0.0
 
         self.coverage = Coverage.EXACT
         self.missing_keys: dict[str, int] = {}
@@ -520,6 +527,12 @@ class Simulator:
         pstate = req.partition_states.get(partition)
         if pstate is None or pstate.is_done or req.done:
             return
+        if req.partition_inflight.get(partition, 0) > 0:
+            # A step is still on the GPU. Ending the partition now would
+            # discard whatever that step is about to emit — for a codec
+            # draining its final chunk, that is the request's only audio.
+            # Its own completion will advance it.
+            return
 
         incoming = [
             c for c in req.streaming_connections.values()
@@ -573,6 +586,18 @@ class Simulator:
         for conn in req.streaming_connections.values():
             if conn.from_partition == partition:
                 conn.producer_done = True
+                # The consumer drains whatever is still buffered, even though
+                # the chunk policy's window was never met. Without this a
+                # short request never runs its codec at all: a 126-token
+                # generation cannot fill a 300-token window, yet the real
+                # deployment still emits audio for it.
+                if self._flush_stream(req, conn):
+                    # Keep the consumer open until it has run that chunk, or
+                    # the request would finish underneath the flush and the
+                    # audio would never be produced.
+                    consumer = req.partition_states.get(conn.to_partition)
+                    if consumer is not None:
+                        consumer.is_done = False
                 # A consumer may have work left to do once its producer stops
                 # (draining its buffer, or continuing on its own); give it a
                 # chance to react rather than cutting it off.
@@ -583,6 +608,31 @@ class Simulator:
                 )
         if all(ps.is_done for ps in req.partition_states.values()):
             self._finish(req)
+
+    def _flush_stream(self, req: SimRequest, conn: Any) -> bool:
+        """Deliver a final partial chunk to a streaming consumer.
+
+        Returns whether anything was scheduled.
+        """
+        from mstar.graph.base import GraphEdge
+
+        scheduled = False
+        for key, buffered in list(req.stream_buffers.items()):
+            node, _, name = key.partition(":")
+            if name != conn.edge_name or buffered <= 0:
+                continue
+            req.stream_buffers[key] = 0
+            dest_wg_id, dest_wg = self._find_or_instantiate_dest(req, node)
+            if dest_wg_id is None or dest_wg is None:
+                continue
+            self.cal.push(
+                self.cal.now + self.timing.control_msg_s,
+                EventType.TRANSFER_DONE,
+                (req.rid, dest_wg_id, GraphEdge(next_node=node, name=name),
+                 req.wg_walk.get(dest_wg_id, "")),
+            )
+            scheduled = True
+        return scheduled
 
     def _enter_walk(
         self, req: SimRequest, partition: str, walk: str, inputs: list | None,
@@ -610,6 +660,14 @@ class Simulator:
         previous = req.partition_walk.get(partition)
         req.partition_walk[partition] = walk
 
+        # Prefill/decode disaggregation: when a partition's walk moves to a
+        # different GPU, the KV context it built has to follow. The real
+        # engine pulls it page-by-page per layer over RDMA before the first
+        # decode step can run, and a simulator that skips it reports a
+        # disaggregated deployment as free of the very cost that motivates
+        # measuring it.
+        handoff_s = self._kv_handoff_s(req, partition, previous, wgs)
+
         # Retire this partition's previous graphs; other partitions keep theirs.
         if previous and previous != walk:
             for wg_id in [
@@ -635,7 +693,38 @@ class Simulator:
                 if io is not None and io.ingest_input(edge):
                     break
         for wg in wgs:
-            self._drain_ready(req, wg)
+            self._drain_ready(req, wg, not_before=self.cal.now + handoff_s)
+
+    def _kv_handoff_s(
+        self, req: SimRequest, partition: str, previous: str | None,
+        wgs: list[SimWorkerGraph],
+    ) -> float:
+        """Time to move a request's KV context to the walk's new GPUs.
+
+        Zero unless the partition actually changed GPUs and the node it runs
+        keeps a KV cache — a stateless encoder has nothing to carry, and a
+        colocated walk transition moves nothing.
+        """
+        if not previous or self.dep.kv_bytes_per_token <= 0:
+            return 0.0
+        prev_ranks = {
+            r
+            for wg_id, pn in req.wg_partition.items()
+            if pn == partition and req.wg_walk.get(wg_id) == previous
+            for r in (req.wg_ranks.get(wg_id) or [])
+        }
+        new_ranks = {r for wg in wgs for r in (req.wg_ranks.get(wg.wg_id) or wg.ranks)}
+        if not prev_ranks or not new_ranks or prev_ranks == new_ranks:
+            return 0.0
+        if not any(
+            self.dep.node_engine_types.get(n) == "kv_cache"
+            for wg in wgs for n in wg.node_names
+        ):
+            return 0.0
+        nbytes = req.kv_len * self.dep.kv_bytes_per_token
+        if nbytes <= 0:
+            return 0.0
+        return self.timing.transfer_s(nbytes)
 
     def _wg_partition(self, wg: SimWorkerGraph, walk: str) -> str:
         """Which partition owns a worker graph, via the walk it belongs to."""
@@ -754,8 +843,15 @@ class Simulator:
                     return wg
         return None
 
-    def _drain_ready(self, req: SimRequest, wg: SimWorkerGraph) -> None:
-        """Move every newly-ready node of this graph onto its worker's queue."""
+    def _drain_ready(
+        self, req: SimRequest, wg: SimWorkerGraph, not_before: float | None = None,
+    ) -> None:
+        """Move every newly-ready node of this graph onto its worker's queue.
+
+        ``not_before`` delays when the work counts as ready — used for a KV
+        handoff, where the context has to land on the new GPU before the
+        first step there can run.
+        """
         io = req.graph_ios.get(wg.wg_id)
         if io is None:
             return
@@ -778,9 +874,12 @@ class Simulator:
                 # chunk walk) while the producer is mid-decode, and pricing
                 # its steps under the producer's walk would miss the table.
                 walk=req.wg_walk.get(wg.wg_id, ""),
-                wg_id=wg.wg_id, ready_s=self.cal.now,
+                wg_id=wg.wg_id,
+                ready_s=max(self.cal.now, not_before or 0.0),
             ))
-        self.cal.push(self.cal.now, EventType.WORKER_POLL, leader)
+        self.cal.push(
+            max(self.cal.now, not_before or 0.0), EventType.WORKER_POLL, leader
+        )
 
     # ── worker execution ─────────────────────────────────────────────────
 
@@ -831,8 +930,6 @@ class Simulator:
         # serialize the two lanes and turn every predicted step into
         # gpu + cpu, inflating every latency downstream.
         cpu_done = gpu_start + after_s
-        # Outputs are routable only once both lanes have finished.
-        post_end = max(gpu_end, cpu_done)
 
         w.gpu_free_s = gpu_end
         w.cpu_free_s = cpu_done
@@ -861,7 +958,25 @@ class Simulator:
             self.step_counts_by_key.get((node, walk), 0) + 1
         )
 
-        self.cal.push(post_end, EventType.STEP_DONE, (rank, node, walk, items))
+        # Routing fires when the CPU lane is free, not when the GPU step
+        # lands. The real worker speculatively builds the next batch while
+        # the current one is still on the GPU (worker.py:1084-1098); gating
+        # the next build on GPU completion would serialize the two lanes and
+        # make every step cost build + gpu instead of max(gpu, cpu).
+        #
+        # ``gpu_end`` rides along so anything the client can actually observe
+        # — an emitted token or audio chunk — is still held until the GPU
+        # has produced it.
+        for item in items:
+            r = self.requests.get(item.rid)
+            if r is not None:
+                pn = r.wg_partition.get(item.wg_id)
+                if pn:
+                    r.partition_inflight[pn] = r.partition_inflight.get(pn, 0) + 1
+
+        self.cal.push(
+            cpu_done, EventType.STEP_DONE, (rank, node, walk, items, gpu_end)
+        )
 
     def _followers(self, items: list[ReadyItem]) -> set[int]:
         """Every rank of the lockstep instances this batch runs on."""
@@ -901,13 +1016,24 @@ class Simulator:
             kv += r.kv_len
         return tokens, kv
 
-    def _on_step_done(self, rank: int, node: str, walk: str, items: list[ReadyItem]) -> None:
+    def _on_step_done(
+        self, rank: int, node: str, walk: str, items: list[ReadyItem],
+        gpu_end: float = 0.0,
+    ) -> None:
         w = self.workers[rank]
         w.busy = False
+        self._gpu_end_of_current_step = gpu_end
 
         for item in items:
             req = self.requests.get(item.rid)
-            if req is None or req.done:
+            if req is None:
+                continue
+            partition = req.wg_partition.get(item.wg_id)
+            if partition:
+                req.partition_inflight[partition] = max(
+                    0, req.partition_inflight.get(partition, 0) - 1
+                )
+            if req.done:
                 continue
             io = req.graph_ios.get(item.wg_id)
             if io is None:
@@ -1095,8 +1221,14 @@ class Simulator:
             self._drain_ready(req, wg)
 
     def _emit(self, req: SimRequest, edge: Any) -> None:
-        """A token/chunk reaches the client after the delivery path's latency."""
-        t = self.cal.now + self.timing.control_msg_s + self.timing.client_delivery_s
+        """A token/chunk reaches the client after the delivery path's latency.
+
+        Held until the GPU step that produced it has actually landed — the
+        CPU may have finished routing first, but nothing observable can
+        precede the computation.
+        """
+        produced_at = max(self.cal.now, getattr(self, "_gpu_end_of_current_step", 0.0))
+        t = produced_at + self.timing.control_msg_s + self.timing.client_delivery_s
         modality = getattr(edge, "output_modality", None) or "text"
         req.chunks.append((modality, t))
         if req.first_chunk_s is None:
@@ -1133,14 +1265,20 @@ class Simulator:
 
     # ── main loop ────────────────────────────────────────────────────────
 
-    def run(self, max_events: int = 5_000_000, until_s: float | None = None) -> None:
+    def run(
+        self, max_events: int = 5_000_000, until_s: float | None = None,
+        stop_on_completion: bool = False,
+    ) -> None:
         handlers: dict[EventType, Callable[[Any], None]] = {
             EventType.ARRIVAL: self._on_arrival,
             EventType.CONDUCTOR: self._on_conductor,
             EventType.WORKER_POLL: self._worker_poll,
         }
         n = 0
+        finished_at_entry = len(self.finished)
         while n < max_events:
+            if stop_on_completion and len(self.finished) > finished_at_entry:
+                return
             ev = self.cal.pop()
             if ev is None:
                 break

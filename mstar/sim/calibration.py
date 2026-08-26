@@ -42,6 +42,34 @@ def _median(xs: list[float]) -> float | None:
     return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
+#: Step-to-step intervals longer than this are treated as the worker having
+#: been idle, not as per-step overhead.
+_MAX_STEP_GAP_S = 0.5
+
+
+def _cadence_residuals(steps: list[dict]) -> list[float]:
+    """Per-step time not explained by max(gpu, cpu), from observed cadence."""
+    by_worker: dict[str, list[dict]] = {}
+    for s in steps:
+        if s.get("t_start") is None or s.get("gpu_s") is None:
+            continue
+        by_worker.setdefault(s.get("worker", ""), []).append(s)
+
+    out: list[float] = []
+    for records in by_worker.values():
+        records.sort(key=lambda r: r["t_start"])
+        for a, b in zip(records, records[1:], strict=False):
+            interval = b["t_start"] - a["t_start"]
+            if interval <= 0 or interval > _MAX_STEP_GAP_S:
+                continue
+            cpu = sum(
+                a.get(k) or 0.0
+                for k in ("prepare_s", "plan_s", "launch_s", "sample_s")
+            )
+            out.append(max(0.0, interval - max(a["gpu_s"], cpu)))
+    return out
+
+
 def calibrate(
     profile_paths: list[str],
     step_log_paths: list[str] | None = None,
@@ -98,20 +126,22 @@ def calibrate(
         tm.client_delivery_s = max(v, 0.0)
         diag["client_delivery_s_n"] = len(deliver)
 
-    # Per-step worker overhead: measured wall time for a step minus what the
-    # engine accounts for. The engine's phases overlap the GPU under
-    # speculation, so the residual is taken against max(gpu, cpu) — the same
-    # composition the simulator uses — and floored at zero.
-    residuals = []
-    for s in steps:
-        total = s.get("total_s")
-        gpu = s.get("gpu_s")
-        if total is None or gpu is None:
-            continue
-        cpu = sum(
-            s.get(k) or 0.0 for k in ("prepare_s", "plan_s", "launch_s", "sample_s")
-        )
-        residuals.append(max(0.0, total - max(gpu, cpu)))
+    # Per-step worker overhead, measured as *cadence*: how much longer one
+    # step-to-step interval on a worker is than max(gpu, cpu) accounts for.
+    #
+    # The tempting basis — a step's own ``total_s`` minus max(gpu, cpu) — is
+    # wrong, and expensively so. ``total_s`` spans the engine call, which
+    # under async scheduling overlaps the *next* step; treating the leftover
+    # as additional serial overhead double-counts work that already ran in
+    # parallel. On a model whose per-step Python cost is large relative to
+    # its GPU time that inflated the term by an order of magnitude and pushed
+    # predicted latency 35% high.
+    #
+    # Consecutive starts on one worker measure the real thing. Intervals
+    # longer than ``_MAX_STEP_GAP_S`` are dropped as idle rather than
+    # counted as overhead — a worker waiting for work is not a worker
+    # paying a cost.
+    residuals = _cadence_residuals(steps)
     if (v := _median(residuals)) is not None:
         tm.worker_step_overhead_s = v
         diag["worker_step_overhead_s_n"] = len(residuals)

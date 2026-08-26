@@ -128,7 +128,11 @@ def drive(sim, spec: WorkloadSpec) -> None:
     if spec.mode == "closed_loop":
         pending = list(reqs)
         in_flight = 0
-        # Prime the pipe, then replace each completion with a new request.
+        # A closed-loop client holds N requests in flight and sends the next
+        # one the moment one returns. Running to a completion at a time
+        # (rather than draining everything and starting a fresh wave) is what
+        # makes that true: a wave-based driver would put every request in
+        # lockstep and batch them far more tightly than the real client does.
         while pending or in_flight:
             while pending and in_flight < spec.concurrency:
                 r = pending.pop(0)
@@ -136,10 +140,17 @@ def drive(sim, spec: WorkloadSpec) -> None:
                 sim.submit(r)
                 in_flight += 1
             before = len(sim.finished)
-            sim.run()
+            sim.run(stop_on_completion=bool(pending))
             done = len(sim.finished) - before
-            if done == 0 and not pending:
-                break
+            if done == 0:
+                if not pending:
+                    break
+                # Nothing completed and nothing left to admit: drain instead
+                # of spinning.
+                sim.run()
+                done = len(sim.finished) - before
+                if done == 0:
+                    break
             in_flight = max(0, in_flight - done)
         return
 
