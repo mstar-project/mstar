@@ -100,6 +100,23 @@ class TimestepEmbedder(nn.Module):
             persistent=False,
         )
 
+    def _apply(self, fn, recurse=True):
+        # Module dtype conversion must not quantize the sinusoidal frequencies.
+        self._buffers.pop("timestep_freqs")
+        result = super()._apply(fn, recurse=recurse)
+        device = self.mlp[0].weight.device
+        half = self.frequency_embedding_size // 2
+        if device.type == "meta":
+            frequencies = torch.empty(half, dtype=torch.float32, device=device)
+        else:
+            frequencies = torch.exp(
+                -math.log(10000)
+                * torch.arange(half, dtype=torch.float32)
+                / half
+            ).to(device=device)
+        self._buffers["timestep_freqs"] = frequencies
+        return result
+
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
         """
@@ -127,7 +144,7 @@ class TimestepEmbedder(nn.Module):
             t_freq = torch.cat(
                 [t_freq, torch.zeros_like(t_freq[:, :1])], dim=-1
             )
-        return self.mlp(t_freq.float())
+        return self.mlp(t_freq)
 
 
 class BagelMLPconnector(nn.Module):
