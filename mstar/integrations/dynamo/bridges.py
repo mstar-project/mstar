@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import time
 import uuid
@@ -171,7 +172,19 @@ class RequestBridge:
     # ------------------------------------------------------------------
 
     async def _chat(self, request: dict, context):
-        req = ChatCompletionRequest.model_validate(_clean(request))
+        body = _clean(request)
+        modalities = body.get("modalities")
+        if modalities and set(modalities) != {"text"}:
+            # Dynamo's chat stream delta carries no audio/image fields, so
+            # non-text chat output cannot reach the client here. Don't run
+            # the model for outputs that would be dropped — speech lives on
+            # /v1/audio/speech, live audio on /v1/realtime.
+            logger.warning(
+                "chat request asked for modalities %s; forcing text-only on this endpoint",
+                modalities,
+            )
+            body["modalities"] = ["text"]
+        req = ChatCompletionRequest.model_validate(body)
         args = self.adapter.chat_to_request(req, self.server.upload_dir)
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
@@ -186,11 +199,9 @@ class RequestBridge:
             }
 
         cancelled = False
+        dropped: set[str] = set()
         try:
-            async for chunk in self.server.iter_result_chunks(rid):
-                if context is not None and context.is_stopped():
-                    cancelled = True
-                    break
+            async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "text":
                     yield envelope({
                         "role": "assistant",
@@ -198,12 +209,18 @@ class RequestBridge:
                     })
                 elif chunk.modality == "error":
                     raise RuntimeError(chunk.data.decode("utf-8", "replace"))
-                # audio/image chat outputs need a richer delta mapping; the
-                # chat bridge is text-first for now.
+                else:
+                    dropped.add(chunk.modality)
+            cancelled = _client_gone(context)
             if not cancelled:
                 yield envelope({"role": "assistant", "content": ""}, finish="stop")
         finally:
             self.server.abort_request(rid)
+            if dropped:
+                logger.info(
+                    "request %s produced non-text chunks (%s) that chat deltas cannot carry",
+                    rid, ", ".join(sorted(dropped)),
+                )
             logger.info("request %s finished (cancelled=%s)", rid, cancelled)
 
     # ------------------------------------------------------------------
@@ -227,9 +244,7 @@ class RequestBridge:
         rid = self._submit(args, prefix="img")
         images: list[bytes] = []
         try:
-            async for chunk in self.server.iter_result_chunks(rid):
-                if context is not None and context.is_stopped():
-                    break
+            async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "image":
                     images.append(chunk.data)
                 elif chunk.modality == "error":
@@ -237,6 +252,8 @@ class RequestBridge:
         finally:
             self.server.abort_request(rid)
 
+        if _client_gone(context):
+            raise RuntimeError("request cancelled")
         if not images:
             raise RuntimeError("no image produced")
         return {
@@ -261,9 +278,7 @@ class RequestBridge:
         rid = self._submit(args, prefix="speech")
         pcm = bytearray()
         try:
-            async for chunk in self.server.iter_result_chunks(rid):
-                if context is not None and context.is_stopped():
-                    break
+            async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "audio":
                     pcm.extend(chunk.data)
                 elif chunk.modality == "error":
@@ -271,6 +286,8 @@ class RequestBridge:
         finally:
             self.server.abort_request(rid)
 
+        if _client_gone(context):
+            raise RuntimeError("request cancelled")
         if not pcm:
             raise RuntimeError("no audio produced")
         from mstar.api_server import media_io
@@ -307,9 +324,7 @@ class RequestBridge:
         videos: list[bytes] = []
         audios = []
         try:
-            async for chunk in self.server.iter_result_chunks(rid):
-                if context is not None and context.is_stopped():
-                    break
+            async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "video":
                     videos.append(chunk.data)
                 elif chunk.modality == "audio":
@@ -319,6 +334,8 @@ class RequestBridge:
         finally:
             self.server.abort_request(rid)
 
+        if _client_gone(context):
+            raise RuntimeError("request cancelled")
         if not videos:
             raise RuntimeError("no video produced")
         # Mirror the native videos route: a sound request also emits a raw PCM
@@ -374,6 +391,64 @@ def _submit(server: APIServer, args: SubmitArgs, prefix: str) -> str:
     )
     logger.info("request %s submitted (out=%s)", rid, args.output_modalities)
     return rid
+
+
+def _client_gone(context) -> bool:
+    """True once the caller stopped the request or dropped the connection."""
+    if context is None:
+        return False
+    if context.is_stopped():
+        return True
+    is_killed = getattr(context, "is_killed", None)
+    return bool(is_killed is not None and is_killed())
+
+
+async def _stream_chunks(server: APIServer, rid: str, context):
+    """Yield result chunks until the stream ends or the client goes away.
+
+    Checking for cancellation only when a chunk arrives is not enough:
+    media requests emit nothing until the work is nearly done, so an
+    abandoned generation would run to completion while queued requests
+    wait behind it. Racing the context's killed-or-stopped future cancels
+    between chunks too, and catches dropped connections that never flip
+    ``is_stopped()``. Callers distinguish exhaustion from cancellation
+    via :func:`_client_gone`.
+    """
+    waiter = getattr(context, "async_killed_or_stopped", None) if context is not None else None
+    stop = asyncio.ensure_future(waiter()) if waiter is not None else None
+    chunks = aiter(server.iter_result_chunks(rid))
+    try:
+        while True:
+            if _client_gone(context):
+                return
+            if stop is None:
+                try:
+                    chunk = await anext(chunks)
+                except StopAsyncIteration:
+                    return
+                if _client_gone(context):
+                    return
+                yield chunk
+                continue
+            next_chunk = asyncio.ensure_future(anext(chunks))
+            done, _ = await asyncio.wait(
+                {next_chunk, stop}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if next_chunk not in done:
+                next_chunk.cancel()
+                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                    await next_chunk
+                return
+            try:
+                chunk = next_chunk.result()
+            except StopAsyncIteration:
+                return
+            if stop.done() or _client_gone(context):
+                return
+            yield chunk
+    finally:
+        if stop is not None:
+            stop.cancel()
 
 
 # ----------------------------------------------------------------------
@@ -1009,13 +1084,9 @@ class TensorBridge:
         aggregate = self.spec.aggregate_chunks(parameters)
         rid = _submit(self.server, args, prefix="tensor")
         produced = False
-        cancelled = False
         merged: dict[str, dict] = {}
         try:
-            async for chunk in self.server.iter_result_chunks(rid):
-                if context is not None and context.is_stopped():
-                    cancelled = True
-                    break
+            async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "error":
                     raise RuntimeError(chunk.data.decode("utf-8", "replace"))
                 tensors = self.spec.output_tensors(chunk)
@@ -1033,6 +1104,7 @@ class TensorBridge:
                     }
         finally:
             self.server.abort_request(rid)
+        cancelled = _client_gone(context)
         if merged and not cancelled:
             produced = True
             yield {

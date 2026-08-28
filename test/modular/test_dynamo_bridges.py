@@ -16,6 +16,7 @@ from mstar.api_server.openai.protocol import SpeechRequest, VideoGenerationReque
 from mstar.integrations.dynamo.bridges import (
     TENSOR_SPECS,
     RealtimeBridge,
+    RequestBridge,
     TensorBridge,
     _clean,
     _image_body,
@@ -209,6 +210,35 @@ def _chunk(modality, data):
     return SimpleNamespace(modality=modality, data=data, metadata={})
 
 
+class _AsyncCtx(_Ctx):
+    """Context double with the killed-or-stopped future the runtime provides."""
+
+    def __init__(self, fire_after=0.01):
+        super().__init__()
+        self.fire_after = fire_after
+        self.killed = False
+
+    def is_killed(self):
+        return self.killed
+
+    async def _fire(self):
+        await asyncio.sleep(self.fire_after)
+        self.killed = True
+        return True
+
+    def async_killed_or_stopped(self):
+        return asyncio.ensure_future(self._fire())
+
+
+class _BlockingServer(_FakeRealtimeServer):
+    """Server double whose result stream never emits — a media request
+    mid-generation."""
+
+    async def iter_result_chunks(self, request_id):
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+
 def test_realtime_full_turn(tmp_path):
     server = _FakeRealtimeServer([
         _chunk("text", b"hello"),
@@ -328,6 +358,47 @@ def test_realtime_stop_mid_turn(tmp_path):
     # claimed no completed response.
     assert "response.output_audio_transcript.delta" in types
     assert "response.done" not in types
+    assert server.aborted
+
+
+# ----------------------------------------------------------------------
+# request bridge (seam double; no engine)
+# ----------------------------------------------------------------------
+
+def test_chat_forces_text_only_output(tmp_path):
+    server = _FakeRealtimeServer([
+        _chunk("text", b"hi"),
+        _chunk("audio", b"\x00\x01"),
+    ], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+
+    async def run():
+        return [out async for out in bridge.generate({
+            "messages": [{"role": "user", "content": "hello"}],
+            "modalities": ["text", "audio"],
+        }, _Ctx())]
+
+    out = asyncio.run(run())
+    # Dynamo chat deltas cannot carry audio: the request is coerced to
+    # text-only before the engine runs, and stray non-text chunks drop
+    # without erroring the stream.
+    assert server.submitted[0]["output_modalities"] == ["text"]
+    contents = [o["choices"][0]["delta"].get("content") for o in out]
+    assert "hi" in contents
+    assert out[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_images_cancel_before_first_chunk(tmp_path):
+    # Media requests emit nothing until nearly done; a client that goes
+    # away mid-generation must still cancel promptly.
+    server = _BlockingServer([], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")
+
+    async def run():
+        return await bridge._images({"prompt": "a cat", "model": "bagel"}, _AsyncCtx())
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        asyncio.run(run())
     assert server.aborted
 
 
@@ -487,6 +558,13 @@ def test_tensor_stop_before_output(tmp_path):
     out = _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)))
     # Stopped after the first (non-action) chunk: no response, no
     # "no output" error — a cancel is not a failure — and the abort ran.
+    assert out == []
+    assert server.aborted
+
+
+def test_tensor_cancel_before_first_chunk(tmp_path):
+    server = _BlockingServer([], tmp_path)
+    out = _run_tensor(server, _pi05_request(_pi05_frames(cameras=1)), ctx=_AsyncCtx())
     assert out == []
     assert server.aborted
 
