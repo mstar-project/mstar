@@ -578,7 +578,11 @@ class BagelModel(Model):
             think_mode = kwargs.get("think_mode", self.config.think_mode)
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
-            parts = prompt_parts or parts_from_modalities(input_modalities, prompt)
+            parts = parts_from_modalities(
+                input_modalities,
+                [p.text or "" for p in prompt_parts if p.modality == TEXT]
+                if prompt_parts is not None else prompt,
+            )
             if tensors is not None:
                 check_attachments(
                     parts, {"image": len(tensors.get("image_inputs", []))},
