@@ -28,6 +28,8 @@ ARG CUDA_IMAGE=docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
 FROM ${CUDA_IMAGE} AS serve
 
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+# Keep torch below 2.13 when overriding: newer Inductor buffer allocation
+# breaks CUDA-graph capture.
 ARG TORCH_VERSION=2.9.1
 ARG TORCHVISION_VERSION=0.24.1
 ARG TORCHAUDIO_VERSION=2.9.1
