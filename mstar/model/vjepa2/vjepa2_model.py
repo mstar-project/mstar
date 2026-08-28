@@ -37,7 +37,13 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.resources import AttentionConfig, AttentionSpec, KVConfig, KVSpec
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -282,9 +288,11 @@ class VJepa2Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self):
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        # only the AC predictor caches K/V across steps; the masked one is
+        # a one-shot forward with nothing for the engine to build
         if self.config.predictor_kind != "ac":
-            return
+            return []
         kv = KVConfig(
             num_layers=self.config.ac_predictor.depth,
             num_kv_heads=self.config.ac_predictor.num_heads,

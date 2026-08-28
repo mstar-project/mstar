@@ -40,7 +40,7 @@ class EngineManager:
         resources via ``get_node_resources``; the KV cache's shape rides on
         the latter, so there is no separate cache config.
         """
-        specs = model.get_node_resources() or []
+        specs = model.get_node_resources()
         # One block reaches every spec; each takes the keys it recognizes.
         # Named ``kv_cache`` because that is what deployments have always
         # tuned here, and what every existing config file writes.

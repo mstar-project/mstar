@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -272,7 +272,7 @@ class ModelInputsFromEngine:
         return self.per_request_info[self.request_ids[0]]
 
 
-class NodeSubmodule(torch.nn.Module):
+class NodeSubmodule(torch.nn.Module, ABC):
     """Base class for a model's compute units: defines the prepare_inputs →
     preprocess → forward(_batched) contract the engines drive."""
 

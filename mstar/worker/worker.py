@@ -737,7 +737,8 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _try_offload_cold_request(
-        self, node_name: str, batch_ids: set[str]
+        self, node_name: str, batch_ids: set[str],
+        affected_resources: set[str] | None= None
     ) -> str | None:
         """Offload one request's state for ``node_name``, freeing room to retry.
 
@@ -753,6 +754,13 @@ class Worker:
             rid for (rid, node) in self._last_active
             if node == node_name and not engine.is_offloaded(node_name, rid)
         ]
+
+        # a request admitted but not yet run holds no pages: offloading it
+        # frees nothing and the retry would re-pick it
+        candidates = [
+            rid for rid in candidates if engine.reclaimable(node_name, rid, affected_resources)
+        ]
+
         if not candidates:
             return None
 
@@ -772,9 +780,13 @@ class Worker:
     def _select_eviction_victim(
         self, node_name: str, candidates: list[str]
     ) -> str:
-        """Pick a victim from *candidates* under ``self.eviction_policy``."""
-        # LRU: oldest last_active first. A candidate the worker has never run
-        # sorts oldest, which is what we want — it is holding state and idle.
+        """Pick a victim from *candidates*.
+
+        LRU only today; ``EvictionPolicy`` has no other member yet. Oldest
+        last_active first — a candidate the worker has never run sorts oldest,
+        which is what we want once the caller has filtered out the ones
+        holding nothing.
+        """
         return min(
             candidates,
             key=lambda rid: self._last_active.get((rid, node_name), 0.0),
@@ -1227,7 +1239,13 @@ class Worker:
         the path isn't exercised; revisit when we light up offload + TP.
         """
         batch_ids = set(batch.node_objects.keys())
-        victim_id = self._try_offload_cold_request(node_batch.node_name, batch_ids)
+        # scope the eviction to whichever resource actually ran out, when the
+        # admit named one
+        failed = node_batch.failed_resource
+        victim_id = self._try_offload_cold_request(
+            node_batch.node_name, batch_ids,
+            affected_resources=None if failed is None else {failed},
+        )
 
         # Push all batch nodes back to their queues
         for request_id, node in batch.node_objects.items():

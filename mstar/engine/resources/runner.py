@@ -12,7 +12,12 @@ from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, SubmoduleStep
+from mstar.engine.resources.step import (
+    FULL_ADMIT_OK,
+    AdmitOutcome,
+    FullAdmitOutcome,
+    SubmoduleStep,
+)
 from mstar.utils.profiler import range_pop, range_push
 
 
@@ -182,7 +187,7 @@ class StepRunner:
     def admit_retrieve(
         self, rid: str, node_name: str, graph_walk: str,
         published: Mapping[str, PublishedInfo] | None = None,
-    ) -> AdmitOutcome:
+    ) -> FullAdmitOutcome:
         """bring published state in
 
         gives `ready=False` when still has inflights; shortcircuit on failure
@@ -202,13 +207,15 @@ class StepRunner:
                 None if published is None else published.get(key),
             )
             if not outcome.ok:
-                return outcome
+                return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
-        return ADMIT_OK if ready else AdmitOutcome(ok=True, ready=False)
+        return FULL_ADMIT_OK if ready else FullAdmitOutcome(
+            AdmitOutcome(ok=True, ready=False)
+        )
 
 
 
-    def admit(self, step: SubmoduleStep) -> AdmitOutcome:
+    def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """reserve capacity for step"""
         ready = True
         for key in self._keys_for(step):
@@ -220,9 +227,11 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
-                return outcome
+                return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
-        return ADMIT_OK if ready else AdmitOutcome(ok=True, ready=False)
+        return FULL_ADMIT_OK if ready else FullAdmitOutcome(
+            AdmitOutcome(ok=True, ready=False)
+        )
 
     def plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan in dependency order
@@ -241,7 +250,7 @@ class StepRunner:
                     range_pop()
         return results
 
-    def pre_admit(self, step: SubmoduleStep) -> AdmitOutcome:
+    def pre_admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """admit over the pre-planning subset, a step ahead
 
         the later full `admit` covers the rest; these resources see their own
@@ -256,9 +265,11 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
-                return outcome
+                return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
-        return ADMIT_OK if ready else AdmitOutcome(ok=True, ready=False)
+        return FULL_ADMIT_OK if ready else FullAdmitOutcome(
+            AdmitOutcome(ok=True, ready=False)
+        )
 
     def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan the pre-planning subset, a step ahead

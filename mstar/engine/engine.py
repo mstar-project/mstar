@@ -101,6 +101,8 @@ class ExecutingBatch:
 
     allocation_failed: AllocationFailed | None = None
     admit_error: AdmitFailedReason | None = None
+    # the resource that ran out, so an eviction can be scoped to it
+    failed_resource: str | None = None
 
     # This step's per-rid outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
@@ -155,8 +157,11 @@ class ExecutingBatch:
             if rid not in rids
         }
 
-    def register_admit_error(self, reason: AdmitFailedReason):
+    def register_admit_error(
+        self, reason: AdmitFailedReason, failed_resource: str | None = None,
+    ):
         self.admit_error = reason
+        self.failed_resource = failed_resource
         if isinstance(reason, AllocationFailed):
             self.allocation_failed = reason
 
@@ -396,6 +401,14 @@ class Engine:
         nvtx = self._enable_nvtx
         if self._enable_profile and batch.exec_timings.start is None:
             batch.exec_timings.start = time.perf_counter()
+        # Every request vetoed this step (`prepare_inputs` returned None) or
+        # failed preparing, so there is no forward to run. Reaching one anyway
+        # dies on an empty `inputs`; the walk's next step is scheduled as usual.
+        if not batch.request_ids:
+            batch.outputs = {}
+            batch.outputs_ready.set()
+            batch.release_waiters()
+            return batch.outputs
         if nvtx:
             range_push(
                 f"engine.{batch.node_name}.{batch.step_context.graph_walk}"
@@ -568,7 +581,9 @@ class Engine:
                 if nvtx:
                     range_pop()
             if not admit_outcome.ok:
-                batch.register_admit_error(admit_outcome.reason)
+                batch.register_admit_error(
+                    admit_outcome.reason, admit_outcome.failed_resource,
+                )
                 return None, step
             if nvtx:
                 # promoted = a pre-plan was consumed; fresh = planned inline
@@ -1087,6 +1102,18 @@ class Engine:
             resource.reload(request_id)
             for resource in self._submodules[node_name].resources.values()
             if resource.supports_eviction and resource.is_offloaded(request_id)
+        )
+
+    def reclaimable(self, node_name: str, request_id: str, affected_resources: set[str] | None=None) -> int:
+        """What this node's resources could reclaim from the request. 0 means
+        offloading it would free nothing, so it is not a candidate."""
+        submod_mgmt = self._submodules[node_name]
+        if affected_resources is None:
+            affected_resources = submod_mgmt.resources.keys()
+        return sum(
+            self._resources[res].reclaimable(request_id)
+            for res in affected_resources if res in submod_mgmt.resources \
+                and self._resources[res].supports_eviction
         )
 
     def offload_priority(

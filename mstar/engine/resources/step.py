@@ -124,3 +124,30 @@ class AdmitOutcome(NamedTuple):
 # Every resource's admit returns this on the common path, several times a
 # step; nothing reads identity, so hand back one instance rather than build it.
 ADMIT_OK = AdmitOutcome(ok=True, ready=True)
+
+
+class FullAdmitOutcome(NamedTuple):
+    """What the runner answers with: one resource's outcome, plus which
+    resource gave it.
+
+    A resource doesn't know the key it is registered under, so the runner —
+    which does — names it on the way out. The caller needs it to scope an
+    eviction to the resource that actually ran out.
+    """
+    outcome: AdmitOutcome
+    failed_resource: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome.ok
+
+    @property
+    def ready(self) -> bool:
+        return self.outcome.ready
+
+    @property
+    def reason(self) -> AdmitFailedReason | None:
+        return self.outcome.reason
+
+
+FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)

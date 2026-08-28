@@ -82,6 +82,7 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         self._async_reader = transfer_engine.get_async_reader(
             kv_cache.device
         )
+        self._shut_down = False
 
     def get_kv_transfer_info(self) -> MooncakeKVTransferInfo:
         return self._transfer_info
@@ -117,6 +118,10 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         return self._async_reader.submit(mooncake_read_info)
 
     def shutdown(self):
+        # unregister_memory is the one step that isn't safely repeatable
+        if self._shut_down:
+            return
+        self._shut_down = True
         self._async_reader.shutdown()
         self._transfer_engine.unregister_memory(
             self._kv_cache.data_ptr()

@@ -1565,6 +1565,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     def cleanup_request(self, request_id: str) -> None:
         """Remove per-request state when a request completes."""
+        super().cleanup_request(request_id)
         self._eos_embed_sent.discard(request_id)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
@@ -1673,6 +1674,7 @@ class Code2WavSubmodule(NodeSubmodule):
             self.config.code2wav.codec_chunk_frames
 
     def cleanup_request(self, request_id):
+        super().cleanup_request(request_id)
         self._first_chunk_emitted.discard(request_id)
         self._latest_seq_len.pop(request_id, None)
 

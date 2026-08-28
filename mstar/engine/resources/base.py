@@ -145,6 +145,15 @@ class Resource(ABC):
         """Bring it back. False when it doesn't fit on device yet."""
         return True
 
+    def reclaimable(self, rid: str) -> int:
+        """What `offload` would free, in whatever this resource counts.
+
+        0 means the request holds nothing worth taking, so it is not an
+        eviction candidate however cold it is. Distinct from
+        `get_offload_priority`, which orders candidates rather than sizing them.
+        """
+        return 0
+
     def get_offload_priority(self, rid: str) -> float:
         """How much this resource wants ``rid`` gone, higher being more.
 

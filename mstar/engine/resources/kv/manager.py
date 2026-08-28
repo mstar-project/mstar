@@ -603,15 +603,24 @@ class KVManager(AttentionResource):
         self._cpu_pool.sync()
         return True
 
+    def reclaimable(self, rid: str) -> int:
+        """Device pages the request is holding; 0 once offloaded, and for one
+        admitted but not yet run."""
+        streams = self._streams.get(rid)
+        if streams is None:
+            return 0
+        return sum(len(stream.page_indices) for stream in streams.values())
+
     def get_offload_priority(self, rid: str) -> float:
         """Device pages the request is holding — the most reclaimable first."""
-        if rid not in self._streams:
-            return 0.0
-        return float(sum(
-            len(stream.page_indices) for stream in self._streams[rid].values()
-        ))
+        return float(self.reclaimable(rid))
 
     def publish(self, request_id: str):
+        # `remove_request` can pop the streams from another thread between the
+        # forward and finalize; nothing to publish then
+        streams = self._streams.get(request_id)
+        if streams is None:
+            return None
         res = PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size,
             seq_info={
@@ -619,7 +628,7 @@ class KVManager(AttentionResource):
                     seq_len=stream.stored_len,
                     latest_kv_transfer_info=self._transfer.get_kv_transfer_info(),
                     page_indices=stream.page_indices
-                ) for label, stream in self._streams[request_id].items()
+                ) for label, stream in streams.items()
             }
         )
         return res
