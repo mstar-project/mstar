@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import multiprocessing as mp
-from typing import TYPE_CHECKING
+import signal
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 import yaml
 
@@ -35,6 +37,17 @@ if TYPE_CHECKING:
     from mstar.api_server.entrypoint import APIServer
 
 logger = logging.getLogger(__name__)
+
+
+class _Surface(NamedTuple):
+    """One Dynamo registration: an endpoint suffix plus how to serve it."""
+
+    suffix: str
+    model_input: Any
+    model_type: Any
+    handler: Callable
+    bidirectional: bool = False
+    register_kwargs: dict | None = None
 
 
 def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
@@ -120,48 +133,55 @@ def serve(server: APIServer, model_name: str, args) -> None:
     served = args.served_model_name or model_name
     bridge = RequestBridge(server, adapter, served) if adapter is not None else None
 
-    # One entry per registered surface: (endpoint suffix, model input,
-    # model type, handler, bidirectional, extra register_model kwargs).
     # Every surface registers under the same served name: the frontend
     # keeps one worker set per (model, type), so each type routes to its
     # own endpoint while sharing the name.
     specs = []
     if model_type is not None:
-        specs.append(("", ModelInput.Text, model_type, bridge.generate, False, {}))
+        specs.append(_Surface("", ModelInput.Text, model_type, bridge.generate))
     if supports_videos:
-        specs.append(("_videos", ModelInput.Text, ModelType.Videos,
-                      bridge.videos, False, {}))
+        specs.append(_Surface("_videos", ModelInput.Text, ModelType.Videos,
+                              bridge.videos))
     if supports_realtime:
         realtime_bridge = RealtimeBridge(server, adapter, served)
-        specs.append(("_realtime", ModelInput.Text, ModelType.Realtime,
-                      realtime_bridge.generate, True, {}))
+        specs.append(_Surface("_realtime", ModelInput.Text, ModelType.Realtime,
+                              realtime_bridge.generate, bidirectional=True))
     if tensor_spec is not None:
         tensor_bridge = TensorBridge(server, tensor_spec, served)
-        specs.append(("_tensor", ModelInput.Tensor, ModelType.TensorBased,
-                      tensor_bridge.generate, False,
-                      {"tensor_model_config": tensor_spec.model_config(served)}))
+        specs.append(_Surface(
+            "_tensor", ModelInput.Tensor, ModelType.TensorBased,
+            tensor_bridge.generate,
+            register_kwargs={"tensor_model_config": tensor_spec.model_config(served)},
+        ))
 
     @dynamo_worker()
     async def _run(runtime: DistributedRuntime):
+        # docker stop and pod evictions send SIGTERM; as PID 1 the default
+        # disposition drops it, abandoning in-flight requests and leaving
+        # the endpoint registered. Route it into the runtime's graceful
+        # shutdown (SIGINT already unwinds via KeyboardInterrupt).
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(signal.SIGTERM, runtime.shutdown)
         surfaces = []
-        for suffix, model_input, surface_type, handler, bidirectional, extra in specs:
+        for surface in specs:
             endpoint = runtime.endpoint(
-                f"{args.namespace}.{args.component}.{args.endpoint}{suffix}"
+                f"{args.namespace}.{args.component}.{args.endpoint}{surface.suffix}"
             )
             await register_model(
-                model_input,
-                surface_type,
+                surface.model_input,
+                surface.model_type,
                 endpoint,
                 args.model_path,
                 served,
                 worker_type=WorkerType.Aggregated,
                 needs=[],
-                **extra,
+                **(surface.register_kwargs or {}),
             )
-            serve_fn = (endpoint.serve_bidirectional_endpoint if bidirectional
+            serve_fn = (endpoint.serve_bidirectional_endpoint if surface.bidirectional
                         else endpoint.serve_endpoint)
-            surfaces.append((f"{args.endpoint}{suffix}={surface_type}",
-                             serve_fn(handler, graceful_shutdown=True)))
+            surfaces.append((f"{args.endpoint}{surface.suffix}={surface.model_type}",
+                             serve_fn(surface.handler, graceful_shutdown=True)))
         logger.info(
             "MSTAR_DYNAMO_READY model=%s component=%s.%s surfaces=%s",
             served, args.namespace, args.component,
