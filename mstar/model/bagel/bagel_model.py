@@ -583,6 +583,12 @@ class BagelModel(Model):
                 [p.text or "" for p in prompt_parts if p.modality == TEXT]
                 if prompt_parts is not None else prompt,
             )
+            unsupported = {p.modality for p in parts} - {TEXT, "image"}
+            if unsupported:
+                raise ValueError(
+                    f"BAGEL has no encoder for {', '.join(sorted(unsupported))}; "
+                    "it accepts image attachments only"
+                )
             if tensors is not None:
                 check_attachments(
                     parts, {"image": len(tensors.get("image_inputs", []))},

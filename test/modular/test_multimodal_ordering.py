@@ -246,6 +246,12 @@ def test_interleaved_layout_prefills_end_to_end(bagel):
     ]
 
 
+def test_bagel_refuses_an_attachment_it_has_no_encoder_for(bagel):
+    """An audio part would otherwise be encoded as an image and answered."""
+    with pytest.raises(ValueError, match="no encoder for audio"):
+        bagel.process_prompt("describe it", ["audio", "text"], ["text"])
+
+
 def test_bagel_skips_a_part_it_cannot_prefill(caplog):
     """A part with no matching input is skipped and logged, not raised.
 
