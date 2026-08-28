@@ -1109,6 +1109,8 @@ class Engine:
 
     def remove_request(self, request_id: str) -> None:
         self._runner.remove_request(request_id)
+        for submodule_mgmt in self._submodules.values():
+            submodule_mgmt.submodule.cleanup_request(request_id)
 
     def shutdown(self):
         for resource in self._resources.values():
