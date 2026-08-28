@@ -251,7 +251,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
             BatchedCudaGraphConfig(
                 capture_graph_walk="snac_chunk",
                 single_request_inputs=dummy,
-                caps_eager_batch_size=[1, 2, 4, 8, 16]
+                capture_batch_sizes=[1, 2, 4, 8, 16]
             ),
         ]
 
