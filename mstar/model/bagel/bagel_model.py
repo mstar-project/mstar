@@ -72,6 +72,7 @@ from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
+    check_attachments,
     check_plan,
     find_media_spans,
     parts_from_modalities,
@@ -578,6 +579,10 @@ class BagelModel(Model):
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
             parts = prompt_parts or parts_from_modalities(input_modalities, prompt)
+            if tensors is not None:
+                check_attachments(
+                    parts, {"image": len(tensors.get("image_inputs", []))},
+                )
 
             if think_mode and is_understanding:
                 system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"

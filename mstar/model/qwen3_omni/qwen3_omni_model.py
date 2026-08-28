@@ -48,6 +48,7 @@ from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAn
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
+    check_attachments,
     check_plan,
     find_media_spans,
     parts_from_modalities,
@@ -1048,6 +1049,7 @@ class Qwen3OmniModel(Model):
         """
         result: NameToTensorList = {}
 
+        attached = tensors is not None
         if tensors is None:
             tensors = {}
 
@@ -1104,6 +1106,12 @@ class Qwen3OmniModel(Model):
             [p.text or "" for p in prompt_parts if p.modality == TEXT]
             if prompt_parts is not None else prompt,
         )
+        if attached:
+            check_attachments(parts, {
+                "image": len(raw_image_inputs),
+                "audio": len(raw_audio_inputs),
+                "video": len(raw_video_inputs),
+            })
         content = [
             {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
             else {"type": part.modality, part.modality: ""}

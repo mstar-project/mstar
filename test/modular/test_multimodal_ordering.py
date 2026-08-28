@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from mstar.api_server.openai.adapters import flatten_messages
-from mstar.model.multimodal import PromptPart, parts_from_modalities, prefill_plan
+from mstar.model.multimodal import (
+    PromptPart,
+    check_attachments,
+    parts_from_modalities,
+    prefill_plan,
+)
 
 
 def _mods(plan):
@@ -90,6 +95,37 @@ def test_plan_carries_each_segment_text():
         ("text", "A"), ("image", None), ("text", "B"), ("image", None),
         ("text", None),
     ]
+
+
+@pytest.mark.parametrize(("layout", "counts", "wanted"), [
+    (["image", "image", "text"], {"image": 1}, "declares 2 image"),
+    (["image", "text", "image"], {"image": 1}, "declares 2 image"),
+    (["image", "text"], {"image": 2}, "declares 1 image"),
+    (["text"], {"image": 1}, "declares 0 image"),
+    (["audio", "text"], {"image": 1}, "declares 1 audio"),
+])
+def test_a_layout_that_does_not_match_its_attachments_is_refused(
+    layout, counts, wanted,
+):
+    """The count the caller declared has to be the count that arrived.
+
+    ``check_plan`` cannot catch these: it compares the plan against a prompt
+    rendered from the same parts, so the placeholders always agree with the
+    layout however many attachments were uploaded.
+    """
+    with pytest.raises(ValueError, match=wanted):
+        check_attachments(parts_from_modalities(layout), counts)
+
+
+@pytest.mark.parametrize(("layout", "counts"), [
+    (["text"], {}),
+    (["image", "text"], {"image": 1}),
+    (["image", "image", "text"], {"image": 2}),
+    (["image", "audio", "text"], {"image": 1, "audio": 1}),
+    (["text"], {"image": 0, "audio": 0, "video": 0}),
+])
+def test_a_matching_layout_passes(layout, counts):
+    check_attachments(parts_from_modalities(layout), counts)
 
 
 class _StubTokenizer:

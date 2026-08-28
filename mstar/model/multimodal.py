@@ -172,6 +172,28 @@ def split_around_spans(
     return segments
 
 
+def check_attachments(parts: list[PromptPart], counts: dict[str, int]) -> None:
+    """Fail loudly when the layout and the attachments that arrived disagree.
+
+    :func:`check_plan` compares the plan against the prompt it rendered, but
+    both sides come from the same parts — a layout claiming two images renders
+    two placeholders and scans two spans whatever was uploaded. Only the caller
+    knows how many attachments the request actually carried, so it checks here,
+    at intake, where the failure can still be answered with a 400.
+    """
+    declared: dict[str, int] = {}
+    for part in parts:
+        if part.modality != TEXT:
+            declared[part.modality] = declared.get(part.modality, 0) + 1
+    for modality in sorted(set(declared) | set(counts)):
+        want, got = declared.get(modality, 0), counts.get(modality, 0)
+        if want != got:
+            raise ValueError(
+                f"multimodal input mismatch: the layout declares {want} "
+                f"{modality} input(s), the request carries {got}"
+            )
+
+
 def check_plan(plan: list[PromptPart], spans: list[MediaSpan], n_text: int) -> None:
     """Fail loudly when the rendered prompt disagrees with the plan.
 
