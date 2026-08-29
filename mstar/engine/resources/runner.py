@@ -8,6 +8,7 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping
+import logging
 from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
@@ -19,6 +20,8 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.utils.profiler import range_pop, range_push
+
+logger = logging.getLogger(__name__)
 
 
 def topo_sort(resources: Mapping[str, Resource]) -> tuple[str, ...]:
@@ -207,6 +210,10 @@ class StepRunner:
                 None if published is None else published.get(key),
             )
             if not outcome.ok:
+                logger.warning(
+                    "Admit + retrieve for resource %s failed with error: %s",
+                    key, outcome.reason.message
+                )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FullAdmitOutcome(
@@ -227,6 +234,10 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
+                logger.warning(
+                    "Admit for resource %s failed with error: %s",
+                    key, outcome.reason.message
+                )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FullAdmitOutcome(
@@ -265,6 +276,10 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
             if not outcome.ok:
+                logger.warning(
+                    "Admit for pre-planning resource %s failed with error: %s",
+                    key, outcome.reason.message
+                )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FullAdmitOutcome(

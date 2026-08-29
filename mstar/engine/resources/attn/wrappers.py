@@ -1,7 +1,7 @@
 """FlashInfer utility wrappers for batched paged attention.
 
 Provides:
-- run_rms_norm / run_attention: simple single-request helpers
+- flashinfer_rmsnorm: RMS norm behind a custom op
 - FlashInferPrefillWrapper: batched prefill with paged KV cache, optional CUDA graph mode
 - FlashInferDecodeWrapper: batched decode with paged KV cache, optional CUDA graph mode
 
@@ -66,9 +66,8 @@ def _flashinfer_rmsnorm_fake(
 class FlashInferPrefillWrapper:
     """Batched prefill attention with paged KV cache.
 
-    Wraps flashinfer.BatchPrefillWithPagedKVCacheWrapper with:
-    - Pre-computed token_to_page / token_to_cache for vectorized KV writes
-    - Optional CUDA graph mode with static buffers
+    Wraps flashinfer.BatchPrefillWithPagedKVCacheWrapper with optional
+    CUDA graph mode using static buffers. KV writes are the KVManager's job.
 
     Args:
         workspace_buffer: FlashInfer workspace (256MB+ recommended)

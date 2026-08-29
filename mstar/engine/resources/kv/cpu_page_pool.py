@@ -137,6 +137,19 @@ class CPUPagePool:
         self.page_allocator.free(state.cpu_page_indices)
         return state
 
+    def discard(self, rid: str, label: str) -> None:
+        """Drop a stream that was copied here but never committed to.
+
+        The offload aborted after the copy, so the device pages stay live and
+        these host pages go back to the pool.
+        """
+        state = self.offloaded.get(rid, {}).pop(label, None)
+        if state is None:
+            return
+        if not self.offloaded[rid]:
+            del self.offloaded[rid]
+        self.page_allocator.free(state.cpu_page_indices)
+
     def num_pages(self, rid: str, label: str) -> int:
         state = self.offloaded.get(rid, {}).get(label)
         return 0 if state is None else len(state.cpu_page_indices)

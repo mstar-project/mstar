@@ -88,6 +88,9 @@ class RopeManager(PositionManager):
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
 
+    def reset_request(self, rid: str, free: bool=False):
+        self._counters[rid].clear()
+
     def publish(self, request_id: str) -> "PublishedPositionInfo | None":
         counters = self._counters.get(request_id)
         if not counters:

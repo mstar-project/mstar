@@ -22,7 +22,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import StepContext
+from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.graph_io import format_graph_edge_list
@@ -1214,6 +1214,32 @@ class Worker:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
+    def _handle_admit_failure(
+        self, batch: ScheduledBatch, node_batch: ExecutingBatch
+    ) -> None:
+        """Re-queue a batch whose admit refused it, so the step can be retried.
+
+        Every admit failure needs the push-back; only an ``AllocationFailed``
+        also needs an eviction. ``RequestOffloading`` means the rid is already
+        on its way to the host, so evicting anything else is wasted work — the
+        retry is gated on ``check_ready`` reloading it.
+        """
+        reason = node_batch.admit_error
+        if isinstance(reason, AllocationFailed):
+            self._handle_allocation_failure(batch, node_batch)
+            return
+
+        for request_id, node in batch.node_objects.items():
+            wg_id = batch.request_to_worker_graph[request_id]
+            self.worker_graphs_manager.queues[wg_id].push_back_node(
+                request_id, node
+            )
+        logger.info(
+            "Admit refused node=%s walk=%s (%s): re-queued %d requests",
+            batch.node_name, batch.graph_walk,
+            type(reason).__name__, len(batch.node_objects),
+        )
+
     def _handle_allocation_failure(
         self, batch: ScheduledBatch, node_batch: ExecutingBatch
     ) -> None:
@@ -2365,11 +2391,12 @@ class Worker:
                                         self._return_speculative_streaming_edge(rid, edge)
                                 speculation = None
 
-                    if pending.node_batch.allocation_failed:
-                        # KV-cache OOM on pending. ``_handle_allocation_failure``
-                        # offloads or holds the failed rids and pushes their
-                        # GraphNodes back to the scheduler queue.
-                        self._handle_allocation_failure(
+                    if pending.node_batch.admit_error is not None:
+                        # Admit refused pending, so no forward ran.
+                        # ``_handle_admit_failure`` pushes the GraphNodes back
+                        # to the scheduler queue, and on KV-cache OOM also
+                        # offloads or holds the failed rids.
+                        self._handle_admit_failure(
                             pending.batch, pending.node_batch
                         )
                         for node in pending.batch.node_objects.values():
@@ -2448,11 +2475,11 @@ class Worker:
                             self._reset_skip_plan_flags(speculation.node_batch)
 
                     # Post-process N (routing stage) — runs concurrently with
-                    # GPU(N+1) if we submitted one above. Skipped on
-                    # allocation_failed since the output tensors aren't valid;
-                    # ``_handle_allocation_failure`` already rehabilitated the
+                    # GPU(N+1) if we submitted one above. Skipped on any admit
+                    # failure since the output tensors aren't valid;
+                    # ``_handle_admit_failure`` already rehabilitated the
                     # failed rids upstream.
-                    if not pending.node_batch.allocation_failed:
+                    if pending.node_batch.admit_error is None:
                         with self._span("worker.postprocess_batch"):
                             self._postprocess_batch(pending, outputs)
 

@@ -27,8 +27,10 @@ from mstar.engine.resources.kv.plan import (
 from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
+    AdmitFailedReason,
     AdmitOutcome,
     AllocationFailed,
+    RequestOffloading,
     Segment,
     StepContext,
 )
@@ -83,6 +85,18 @@ class CacheStream:
             self.page_indices.clear()
 
 
+@dataclass
+class ClaimedStream:
+    """A stream an in-progress offload has taken ownership of, and the state
+    its host copy was made from."""
+    label: str
+    pages: list[int]
+    generation: int
+    stored_len: int
+    position: int
+    released: int
+
+
 LabelToStream = dict[str, CacheStream]
 
 @dataclass
@@ -126,7 +140,7 @@ class PublishedKVInfo(PublishedInfo):
 @dataclass
 class AllocResult:
     success: bool = True
-    error: AllocationFailed | None = None
+    error: AdmitFailedReason | None = None
 
 
 @dataclass
@@ -523,48 +537,143 @@ class KVManager(AttentionResource):
         return self._cpu_pool is not None
 
     def is_offloaded(self, rid: str) -> bool:
-        return self._cpu_pool is not None and self._cpu_pool.is_offloaded(rid)
+        """True from the moment an offload claims the request, not just once
+        its pages are on the host.
+
+        ``check_ready`` gates admission on this, so the window where the copy
+        is still in flight must not look schedulable — and the worker's victim
+        filter must not pick a request that is already on its way out.
+        """
+        if self._cpu_pool is None:
+            return False
+        if self._cpu_pool.is_offloaded(rid):
+            return True
+        return any(
+            stream.offloaded for stream in self._streams.get(rid, {}).values()
+        )
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns pages freed.
 
         A stream whose pages don't fit on the host keeps them, so a partial
         offload still frees whatever did fit.
+
+        Device pages go back to the arena only once every stream has been
+        copied: a step admitted before the claim can still run its fork copy,
+        and that copy reads one of these streams.
         """
         if self._cpu_pool is None or rid not in self._streams:
             return 0
-        freed = 0
-        for label in list(self._streams.get(rid, {})):
-            with self._lock:
-                stream = self._streams[rid].get(label)
-                if stream is None or stream.offloaded or not stream.page_indices:
-                    continue
-                read_future = stream.read_future
-                pages = list(stream.page_indices)
-                geom = (stream.stored_len, stream.position, stream.released)
-            # blocking work OUTSIDE the lock: drain the in-flight read, copy the
-            # pages to host, sync so the release can't precede the copy
-            if read_future is not None:
-                wait([read_future])
-            moved = self._cpu_pool.offload_stream(
-                rid=rid, label=label,
-                gpu_kv_cache=self.kv_cache.tensor,
-                gpu_page_indices=pages,
-                stored_len=geom[0], position=geom[1], released=geom[2],
-            )
+        claimed, read_futures = self._claim_for_offload(rid)
+        if not claimed:
+            return 0
+        released: set[str] = set()
+        try:
+            # blocking work OUTSIDE the lock: drain the in-flight reads, then
+            # copy each claimed stream to host
+            if read_futures:
+                wait(read_futures)
+            moved = [
+                claim for claim in claimed
+                if self._cpu_pool.offload_stream(
+                    rid=rid, label=claim.label,
+                    gpu_kv_cache=self.kv_cache.tensor,
+                    gpu_page_indices=claim.pages,
+                    stored_len=claim.stored_len, position=claim.position,
+                    released=claim.released,
+                )
+            ]
             if not moved:
-                continue
+                return 0
+            # sync so the release can't precede the copy
             self._cpu_pool.sync()
-            with self._lock:
-                stream = self._streams[rid].get(label)
-                if stream is None:
+            freed, released = self._commit_offload(rid, moved)
+            return freed
+        finally:
+            self._abandon_claims(
+                rid, [c.label for c in claimed if c.label not in released]
+            )
+
+    def _claim_for_offload(
+        self, rid: str
+    ) -> tuple[list[ClaimedStream], list[Future]]:
+        """Take ownership of every offloadable stream of ``rid``.
+
+        Claiming all of them under one lock is what makes each ``pages``
+        complete: `_alloc` refuses a claimed stream, so nothing can extend one
+        behind us while the copies run.
+        """
+        claimed: list[ClaimedStream] = []
+        read_futures: list[Future] = []
+        with self._lock:
+            for label, stream in self._streams.get(rid, {}).items():
+                if stream.offloaded or not stream.page_indices:
                     continue
-                freed += len(pages)
-                self._arena.release(pages)
-                stream.page_indices = []
                 stream.offloaded = True
+                claimed.append(ClaimedStream(
+                    label=label,
+                    pages=list(stream.page_indices),
+                    generation=stream.generation,
+                    stored_len=stream.stored_len,
+                    position=stream.position,
+                    released=stream.released,
+                ))
+                if stream.read_future is not None:
+                    read_futures.append(stream.read_future)
+        return claimed, read_futures
+
+    def _commit_offload(
+        self, rid: str, moved: list[ClaimedStream]
+    ) -> tuple[int, set[str]]:
+        """Free the device pages of streams whose host copy is good.
+
+        All-or-nothing over the request: a stream mutated while the lock was
+        down (a fork copy is the one writer the `_alloc` guard can't catch) may
+        have a torn host copy, and that fork's source is one of these streams,
+        so the whole request stays on device rather than half of it.
+        """
+        with self._lock:
+            streams = self._streams.get(rid, {})
+            for claim in moved:
+                stream = streams.get(claim.label)
+                if stream is None or stream.generation != claim.generation:
+                    # removed, or written to behind us. Releasing nothing here
+                    # leaves every claim for `_abandon_claims` to undo.
+                    return 0, set()
+            freed = 0
+            for claim in moved:
+                stream = streams[claim.label]
+                freed += len(claim.pages)
+                self._arena.release(claim.pages)
+                stream.page_indices = []
                 stream.reset()
-        return freed
+            return freed, {claim.label for claim in moved}
+
+    def _abandon_claims(self, rid: str, labels: list[str]) -> None:
+        """Undo claims that never became an offload.
+
+        Drops any host copy already made for them — a raise mid-copy would
+        otherwise leave one behind, and `reload` would then hand the stream
+        fresh pages while it still holds its own.
+        """
+        with self._lock:
+            streams = self._streams.get(rid, {})
+            for label in labels:
+                self._cpu_pool.discard(rid, label)
+                stream = streams.get(label)
+                if stream is not None:
+                    stream.offloaded = False
+
+    @staticmethod
+    def _offloading_message(rid: str, label: str) -> RequestOffloading:
+        return RequestOffloading(
+            message=(
+                f"request {rid!r} stream {label!r} is being offloaded to host "
+                "memory; retry once it has been reloaded"
+            ),
+            label=label,
+            request_id=rid,
+        )
 
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
@@ -732,9 +841,14 @@ class KVManager(AttentionResource):
         # TODO: handle realloc
         if from_label not in self._streams[rid]:
             return AllocResult()
+        from_stream = self._streams[rid][from_label]
+        if from_stream.offloaded:
+            # the target is a fresh stream an offload never claimed, so refuse
+            # here: `_apply_fork` would copy from a source whose pages are gone
+            return AllocResult(success=False, error=self._offloading_message(rid, from_label))
         self._ensure_label(rid, to_label)
         return self._alloc(
-            rid, to_label, self._streams[rid][from_label].stored_len + extra
+            rid, to_label, from_stream.stored_len + extra
         )
 
     def _apply_fork(self, rid: str, from_label: str, to_label: str) -> None:
@@ -763,20 +877,28 @@ class KVManager(AttentionResource):
         with self._lock:
             self._ensure_label(request_id, label)
             stream = self._streams[request_id][label]
+            if stream.offloaded:
+                # an offload claimed this stream: its pages are on their way to
+                # the host, and `reload` is the only path that may re-take them
+                return AllocResult(
+                    success=False, error=self._offloading_message(request_id, label)
+                )
             num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
             num_new_pages = num_pages_needed - len(stream.page_indices)
             if num_new_pages > 0:
                 new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None:
+                    pages_short = num_new_pages - self._arena.num_free
                     return AllocResult(
                         success=False,
                         error=AllocationFailed(
-                            pages_short=num_new_pages - self._arena.num_free,
+                            pages_short=pages_short,
                             request_id=request_id,
                             label=label,
                             message=(
                                 f"Not enough free pages: requested {num_new_pages}, "
-                                f"available {self._arena.num_free}"
+                                f"available {self._arena.num_free} for request {request_id}, "
+                                f"label {label}."
                             ),
                         )
                     )

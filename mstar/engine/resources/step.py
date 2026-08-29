@@ -115,6 +115,17 @@ class AllocationFailed(AdmitFailedReason):
     request_id: str
 
 
+@dataclass
+class RequestOffloading(AdmitFailedReason):
+    """The request's state is moving to host memory; retry once it is back.
+
+    Distinct from `AllocationFailed` because the answer is different: nothing
+    needs evicting, the caller just re-drives the step once `reload` has run.
+    """
+    label: str
+    request_id: str
+
+
 class AdmitOutcome(NamedTuple):
     ok: bool
     ready: bool = True

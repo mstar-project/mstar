@@ -12,6 +12,10 @@ import yaml
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
+from mstar.engine.resources.attn.wrappers import (
+    FlashInferDecodeWrapper,
+    FlashInferPrefillWrapper,
+)
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
@@ -28,10 +32,6 @@ from mstar.model.registry import HF_MODELS, MODEL_REGISTRY
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.utils.flashinfer_utils import (
-    FlashInferDecodeWrapper,
-    FlashInferPrefillWrapper,
-)
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "qwen3tts.yaml"
 

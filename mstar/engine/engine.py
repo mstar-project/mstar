@@ -18,7 +18,6 @@ from mstar.engine.cuda_graph_runner import (
 )
 from mstar.engine.resources import (
     AdmitFailedReason,
-    AllocationFailed,
     NodeResourceSpec,
     Resource,
     ResourceReqConfig,
@@ -99,7 +98,6 @@ class ExecutingBatch:
     # the rest of it runs.
     failed_requests: dict[str, str] = field(default_factory=dict)
 
-    allocation_failed: AllocationFailed | None = None
     admit_error: AdmitFailedReason | None = None
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
@@ -162,8 +160,6 @@ class ExecutingBatch:
     ):
         self.admit_error = reason
         self.failed_resource = failed_resource
-        if isinstance(reason, AllocationFailed):
-            self.allocation_failed = reason
 
     def lease_slot(self, slot_lease: SlotLease):
         self.step_context.slot_lease = slot_lease
@@ -729,7 +725,10 @@ class Engine:
         place those itself.
         """
         outputs = self.exec(batch)
-        self.postprocess_batch(batch, outputs)
+        # A failed admit means no forward ran and every rid's outputs are empty,
+        # so the tail has nothing to consume; the worker re-drives the step.
+        if batch.admit_error is None:
+            self.postprocess_batch(batch, outputs)
         return outputs
 
     def check_stop_for_batch(
