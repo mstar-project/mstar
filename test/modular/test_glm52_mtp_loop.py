@@ -772,13 +772,20 @@ def test_mtp_acceptance_log_per_position(caplog):
     assert "POST-final-norm" in post_line
 
 
-def test_graph_config_getters_stop_the_load_heartbeat():
-    """Both capture-config getters must kill the load heartbeat BEFORE any
-    capture: under cudaStreamCaptureModeGlobal the heartbeat's cuBLAS mm
-    from its own thread both fails and invalidates an in-flight capture
-    (2026-08-20 arm U1: an mtp_trunk bucket capture died on two ranks and
-    every request hung in NCCL for the rest of the box hold)."""
+def test_graph_config_getters_keep_the_load_heartbeat():
+    """Neither capture-config getter may stop the load heartbeat: the tick
+    has to outlive graph capture. The box reaper SIGTERMs a process with no
+    attributed GPU activity at ~30 min of age and capture ends right there
+    (+28..+31 min on 2026-08-28: 3 of 7 launches lost rank 0 to a clean
+    SystemExit seconds after its last captured bucket). Capturing in
+    thread_local mode (cuda_graph_runner._CAPTURE_ERROR_MODE) is what makes
+    a foreign-thread tick legal during capture; the first real forward is
+    where the tick stops (``_stop_load_heartbeat`` in the forward paths)."""
     import threading
+
+    from mstar.engine.cuda_graph_runner import _CAPTURE_ERROR_MODE
+
+    assert _CAPTURE_ERROR_MODE == "thread_local"
 
     cfg = _mtp_cfg(2)
     model = Glm52ForCausalLM(cfg)
@@ -787,10 +794,10 @@ def test_graph_config_getters_stop_the_load_heartbeat():
     stop = threading.Event()
     sub.set_load_heartbeat_stop(stop)
     sub.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.bfloat16)
-    assert stop.is_set(), "piecewise config getter must stop the heartbeat"
+    assert not stop.is_set(), "piecewise config getter must NOT stop the heartbeat"
 
     sub2 = Glm52LLMSubmodule(model, cfg)
     stop2 = threading.Event()
     sub2.set_load_heartbeat_stop(stop2)
     sub2.get_cuda_graph_configs(torch.device("cpu"))
-    assert stop2.is_set(), "full-graph config getter must stop the heartbeat"
+    assert not stop2.is_set(), "full-graph config getter must NOT stop the heartbeat"

@@ -52,6 +52,21 @@ from mstar.utils.sampling import (
 
 logger = logging.getLogger(__name__)
 
+# cudaStreamCaptureModeThreadLocal: only the CAPTURING thread's CUDA calls are
+# policed while a capture is open. Under the default Global mode a
+# "potentially unsafe" call (cudaMalloc, event/stream query, synchronize)
+# from ANY thread of the process fails AND invalidates the in-flight capture:
+# that is how glm52's load-liveness heartbeat (a torch.mm on its own stream
+# from its own thread) killed an mtp_trunk bucket capture on 2026-08-20. The
+# capture-time work in this runner is single-threaded, so the narrower mode
+# records exactly the same graphs; it just stops unrelated threads — liveness
+# ticks, loggers, side-stream readbacks — from being able to break a capture.
+# The glm52 loader needs that: the coriander reaper SIGTERMs a process that
+# holds GPU memory with no attributed activity at ~30 min of age, and the
+# capture phase (~5 min, ends at +30) is exactly where the tick used to stop
+# (3 silent rank-0 exits in 7 launches on 2026-08-28).
+_CAPTURE_ERROR_MODE = "thread_local"
+
 
 DEFAULT_AR_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
@@ -720,7 +735,10 @@ class CudaGraphRunner:
 
                 graph = torch.cuda.CUDAGraph()
                 with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-                    with torch.cuda.graph(graph, pool=self.memory_pool):
+                    with torch.cuda.graph(
+                        graph, pool=self.memory_pool,
+                        capture_error_mode=_CAPTURE_ERROR_MODE,
+                    ):
                         output = run_forward()
                 torch.cuda.synchronize()
 
@@ -2279,7 +2297,10 @@ class StatelessCudaGraphRunner:
         stream.synchronize()
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.memory_pool, stream=stream):
+        with torch.cuda.graph(
+            graph, pool=self.memory_pool, stream=stream,
+            capture_error_mode=_CAPTURE_ERROR_MODE,
+        ):
             static_output = fwd(
                 graph_walk=config.capture_graph_walk,
                 engine_inputs=engine_inputs,
@@ -2656,7 +2677,10 @@ class PiecewiseCudaGraphRunner:
 
         graph = torch.cuda.CUDAGraph()
         with torch.amp.autocast("cuda", enabled=True, dtype=self.autocast_dtype):
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            with torch.cuda.graph(
+                graph, pool=self.memory_pool,
+                capture_error_mode=_CAPTURE_ERROR_MODE,
+            ):
                 static_out = self._normalize_output(run_fn())
         torch.cuda.synchronize()
 
