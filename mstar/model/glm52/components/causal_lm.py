@@ -12,6 +12,7 @@ from mstar.model.glm52.components.language_model import (
     build_lm_head,
     build_rmsnorm,
 )
+from mstar.model.glm52.components.rope import Glm52RotaryEmbedding
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.dsa import Glm52DsaForwardContext
 
@@ -29,6 +30,10 @@ class Glm52LanguageModel(nn.Module):
             ]
         )
         self.norm = build_rmsnorm(config)
+        # cos/sin for the whole forward are computed ONCE here and handed to
+        # every layer (rope_cos_sin) — same dims/base as each layer's own
+        # rotary, which stays the fallback for single-layer callers.
+        self.rotary = Glm52RotaryEmbedding(rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
 
     def forward(
         self,
@@ -52,10 +57,12 @@ class Glm52LanguageModel(nn.Module):
         re-attributed by 474a95e9 to the read plan never loading the MTP
         weights; do not cite it as pairing evidence.)"""
         hidden_states = self.embed_tokens(input_ids)
+        rope_cos_sin = self.rotary.cos_sin(position_ids)
         for layer_idx, decoder_layer in enumerate(self.layers):
             cache_handle.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
-                hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx
+                hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx,
+                rope_cos_sin=rope_cos_sin,
             )
         cache_handle.advance_seq_lens()
         normed = self.norm(hidden_states)

@@ -36,11 +36,13 @@ class Glm52DecoderLayer(nn.Module):
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
         dsa_ctx: Glm52DsaForwardContext | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
-            hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx)
+            hidden_states, cache_handle, position_ids, dsa_ctx=dsa_ctx,
+            rope_cos_sin=rope_cos_sin)
         hidden_states = residual + hidden_states
 
         residual = hidden_states

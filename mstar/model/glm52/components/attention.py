@@ -143,6 +143,7 @@ class Glm52MLAAttention(nn.Module):
         position_ids: torch.Tensor,
         dsa_selection: torch.Tensor | None = None,
         dsa_ctx: Glm52DsaForwardContext | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``dsa_selection``: optional ``(T, index_topk)`` int rows from
         ``Glm52Indexer.compute_selection`` (-1 = padding). When given, the
@@ -167,7 +168,8 @@ class Glm52MLAAttention(nn.Module):
                     "absorbed path takes the engine dsa_ctx instead"
                 )
             return self._forward_absorbed(
-                hidden_states, cache_handle, position_ids, dsa_ctx)
+                hidden_states, cache_handle, position_ids, dsa_ctx,
+                rope_cos_sin=rope_cos_sin)
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
 
@@ -182,7 +184,7 @@ class Glm52MLAAttention(nn.Module):
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # shared MQA rope key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe)
+        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe, cos_sin=rope_cos_sin)
 
         q = torch.cat([q_nope, q_pe], dim=-1)  # (T, H, Dqk)
         k_pe = k_pe.expand(num_tokens, h, self.qk_rope_head_dim)
@@ -212,6 +214,7 @@ class Glm52MLAAttention(nn.Module):
         cache_handle: BatchedCacheManager,
         position_ids: torch.Tensor,
         dsa_ctx: Glm52DsaForwardContext | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Run MLA over the compressed latent cache after folding kv_b into Q/O."""
         if self.w_kc is None or self.w_vc is None:
@@ -247,7 +250,7 @@ class Glm52MLAAttention(nn.Module):
         kv_c = self.kv_a_layernorm(kv_a).view(num_tokens, 1, self.kv_lora_rank)  # (T,1,L)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # (T,1,Drope) shared MQA key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe)
+        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe, cos_sin=rope_cos_sin)
 
         # None-guarded here (not just inside _dsa_update) so the default
         # flag-off path never crosses the compiler.disable boundary — dynamo

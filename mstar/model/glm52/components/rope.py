@@ -39,8 +39,27 @@ class Glm52RotaryEmbedding(nn.Module):
             self._inv_freq_cache = cached
         return cached
 
+    def cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(cos, sin)`` for ``position_ids``, each ``(T, 1, rotary_dim)`` fp32.
+
+        Every decoder layer rotates with the SAME positions, so the model
+        computes this once per forward and hands it down (``rope_cos_sin``)
+        instead of each of the 78 layers redoing outer/cos/sin/repeat —
+        ~6 launches × 77 layers per decode step. Same ops, same order as the
+        per-layer path: bit-identical.
+        """
+        inv_freq = self._get_inv_freq(position_ids.device)
+        freqs = torch.outer(position_ids.float(), inv_freq)  # (T, rotary_dim/2)
+        cos = freqs.cos().repeat_interleave(2, dim=-1).unsqueeze(-2)
+        sin = freqs.sin().repeat_interleave(2, dim=-1).unsqueeze(-2)
+        return cos, sin
+
     def forward(
-        self, position_ids: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor
+        self,
+        position_ids: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rotate the pe slices.
 
@@ -48,13 +67,12 @@ class Glm52RotaryEmbedding(nn.Module):
             position_ids: ``(tokens,)`` int positions.
             q_pe: ``(tokens, num_heads, rotary_dim)``.
             k_pe: ``(tokens, 1, rotary_dim)`` (shared MQA rope key).
+            cos_sin: the precomputed ``cos_sin(position_ids)``; computed here
+                when None (single-layer callers such as the MTP plane).
         Returns:
             rotated ``(q_pe, k_pe)`` in the input dtypes.
         """
-        inv_freq = self._get_inv_freq(position_ids.device)
-        freqs = torch.outer(position_ids.float(), inv_freq)  # (T, rotary_dim/2)
-        cos = freqs.cos().repeat_interleave(2, dim=-1).unsqueeze(-2)
-        sin = freqs.sin().repeat_interleave(2, dim=-1).unsqueeze(-2)
+        cos, sin = self.cos_sin(position_ids) if cos_sin is None else cos_sin
 
         q32, k32 = q_pe.float(), k_pe.float()
         q_rot = q32 * cos + rotate_gptj(q32) * sin
