@@ -1021,9 +1021,6 @@ class Conductor:
         pstate.current_worker_graph_ids = set()
         pstate.wg_rank_completions = {}
         pstate.fwd_pass_number += 1
-        pstate.random_seed += 1
-        for cfg in request_data.resource_configs.values():
-            cfg.apply_conductor_config(seed=pstate.random_seed)
 
         self._set_partition_worker_graph_ids(
             request_id, partition_name, fwd_args.full_metadata.graph_walk,
