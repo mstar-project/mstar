@@ -217,6 +217,8 @@ class SamplerResource(Resource):
         # static config only: safe to pre-plan (unchanged step to step). A
         # preplan leases a different slot, so this is disjoint from the in-flight
         # forward's buffers.
+        # Real rids: gather_static pads to padded_bs itself (the tail reads
+        # slot 0, a defaults row) and gates the scatter-back on the real count.
         self._cg_buffers.gather_static(ctx.request_ids, padded_bs, cg_slot)
         sampler = self._cg_buffers.sampler_for(padded_bs, cg_slot)
         if ctx.is_preplan:

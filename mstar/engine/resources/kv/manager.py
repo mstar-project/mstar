@@ -331,7 +331,7 @@ class KVManager(AttentionResource):
         # against a concurrent reset/remove/commit on another thread
         with self._lock:
             for (from_label, to_label), extra in forks:
-                for rid in ctx.request_ids:
+                for rid in ctx.padded_request_ids:
                     alloc_res = self._reserve_fork(
                         rid, from_label, to_label,
                         extra=0 if not extra else extra.get((rid, from_label), 0),
@@ -488,7 +488,7 @@ class KVManager(AttentionResource):
             self.clear_preplan()
             return res
         for (from_label, to_label) in step.pre_forks:
-            for rid in ctx.request_ids:
+            for rid in ctx.padded_request_ids:
                 self._apply_fork(rid, from_label, to_label)
         res = KVPlanOutputs(
             {
@@ -526,7 +526,7 @@ class KVManager(AttentionResource):
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
-                for rid in ctx.request_ids:
+                for rid in ctx.padded_request_ids:
                     self._apply_fork(rid, from_label, to_label)
         # TODO: handle retention policy, free pages if not commit
 

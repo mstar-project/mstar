@@ -60,8 +60,6 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
-    # real request ids (the ones in step_context may have dummy req ids)
-    request_ids: list[str]
     per_request_info: Mapping[str, CurrentForwardPassInfo]
     step_context: StepContext
 
@@ -124,6 +122,19 @@ class ExecutingBatch:
 
     # Per-step wall-clock, for the worker's profiler
     exec_timings: ExecTimings = field(default_factory=ExecTimings)
+
+    @property
+    def request_ids(self):
+        return self.step_context.request_ids
+
+    @request_ids.setter
+    def request_ids(self, rids):
+        if tuple(rids) != tuple(self.step_context.request_ids):
+            # any padded list was built over the old set, so it now names rids
+            # this step no longer runs; exec rebuilds it under a lease, and
+            # until then `padded_request_ids` falls back to these
+            self.step_context.set_padded_rids(None)
+        self.step_context.request_ids = rids
 
     @property
     def graph_walk(self) -> str:
@@ -467,7 +478,9 @@ class Engine:
             req_info = cg_runner.step_metadata(
                 lease, batch.request_ids, batch.per_request_info
             )
-            batch.step_context.request_ids = cg_runner.step_ids(lease, batch.request_ids)
+            batch.step_context.set_padded_rids(
+                cg_runner.step_ids(lease, batch.request_ids)
+            )
 
         try:
             raw, batch.step = self._drive_step(
@@ -486,7 +499,7 @@ class Engine:
                 return self._collect_outputs(
                     submodule_mgmt, lease, raw, inputs, req_info,
                     request_ids=batch.request_ids,
-                    step_request_ids=batch.step_context.request_ids,
+                    step_request_ids=batch.step_context.padded_request_ids,
                 )
             finally:
                 if self._enable_nvtx:
@@ -525,7 +538,7 @@ class Engine:
                 )
                 if raw is None:
                     merged[rid] = {}
-                    continue
+                    break
                 launched = True
                 merged.update(self._collect_outputs(
                     submodule_mgmt, None, raw, [inp], req_info,
@@ -559,7 +572,7 @@ class Engine:
         nvtx = self._enable_nvtx
         cg_runner = submodule_mgmt.cuda_graph_runner
         submodule = submodule_mgmt.submodule
-        rids = list(ctx.request_ids)
+        rids = list(ctx.padded_request_ids)
 
         if step is None:
             if nvtx:
@@ -1023,10 +1036,12 @@ class Engine:
             if batch.inputs is None
             else cg_runner.pad_inputs(lease, batch.inputs)
         )
-        batch.step_context.request_ids = cg_runner.step_ids(lease, batch.request_ids)
+        batch.step_context.set_padded_rids(
+            cg_runner.step_ids(lease, batch.request_ids)
+        )
         step = submodule_mgmt.submodule.declare_step(
             graph_walk=batch.step_context.graph_walk,
-            request_ids=batch.step_context.request_ids,
+            request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
         )
         if step is None:

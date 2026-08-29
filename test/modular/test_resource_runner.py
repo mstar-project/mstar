@@ -392,3 +392,65 @@ def test_kv_layer_imports_without_the_conductor_or_the_sampling_kernels():
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "", f"kv pulled in {result.stdout.strip()}"
+
+
+# --- real vs padded request ids --------------------------------------------
+#
+# A captured replay runs the batch padded to its bucket's size with dummy rows,
+# so a step carries two rid lists. They live in one place — `request_ids` is the
+# real batch, `padded_request_ids` the replay's — and the padded one falls back
+# to the real one wherever no padding applies.
+
+
+def test_padded_request_ids_default_to_the_real_ones():
+    """The eager path never pads, and must not need to say so."""
+    ctx = _ctx(request_ids=("a", "b"))
+
+    assert ctx.padded_request_ids == ("a", "b")
+
+
+def test_padded_request_ids_are_kept_once_set():
+    ctx = _ctx(request_ids=("a", "b"))
+
+    ctx.set_padded_rids(("a", "b", "__dummy__"))
+
+    assert ctx.request_ids == ("a", "b")
+    assert ctx.padded_request_ids == ("a", "b", "__dummy__")
+
+
+def test_dropping_a_rid_invalidates_the_padded_list():
+    """The padded list names the dropped rid, so it cannot outlive the drop.
+
+    Exec rebuilds it under a lease; until then the fallback is the real ids,
+    which is the answer that cannot run a request the step just dropped.
+    """
+    from mstar.engine.engine import ExecutingBatch
+
+    ctx = _ctx(request_ids=("a", "b"))
+    batch = ExecutingBatch(
+        node_name="llm", per_request_info={"a": object(), "b": object()},
+        step_context=ctx,
+    )
+    batch.step_context.set_padded_rids(("a", "b", "__dummy__"))
+
+    batch.drop_rids({"b"})
+
+    assert batch.request_ids == ["a"]
+    assert ctx.padded_request_ids == ["a"], "the padded list outlived the drop"
+
+
+def test_reassigning_the_same_rids_keeps_the_padded_list():
+    """Only an actual change invalidates it — a no-op write must not throw
+    away padding the step is still going to replay against."""
+    from mstar.engine.engine import ExecutingBatch
+
+    ctx = _ctx(request_ids=("a", "b"))
+    batch = ExecutingBatch(
+        node_name="llm", per_request_info={}, step_context=ctx,
+    )
+    padded = ("a", "b", "__dummy__")
+    batch.step_context.set_padded_rids(padded)
+
+    batch.request_ids = ["a", "b"]
+
+    assert ctx.padded_request_ids == padded

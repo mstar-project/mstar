@@ -842,7 +842,6 @@ class Worker:
         """
         return ExecutingBatch(
             node_name=node_name,
-            request_ids=request_ids,
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids or set(),

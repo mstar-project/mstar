@@ -679,7 +679,6 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     batch = ExecutingBatch(
         node_name="Talker",
         step_context=_step_context("talker_decode", ["a", "b"]),
-        request_ids=["a", "b"],
         per_request_input_tensors={},
         per_request_info=info,
     )
@@ -703,8 +702,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     packed = submodule.preprocess(
         "talker_decode",
         ModelInputsFromEngine(
-            request_ids=["a", "b"],
-            per_request_info=info,
+                per_request_info=info,
             cache_manager=cache_manager,
         ),
         model_inputs,
@@ -922,7 +920,6 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     batch = ExecutingBatch(
         node_name="Codec",
         step_context=_step_context("codec_chunk", ["a", "b"]),
-        request_ids=["a", "b"],
         per_request_input_tensors={},
         per_request_info={},
     )

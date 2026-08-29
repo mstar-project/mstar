@@ -157,7 +157,7 @@ class RopeManager(PositionManager):
         # disjoint from the ones the in-flight forward reads
         # a stream forked off another starts at the source's position, so
         # mirror the forks KV just applied before any counter is read below
-        self._apply_forks(plan_outputs.pre_forks, ctx.request_ids)
+        self._apply_forks(plan_outputs.pre_forks, ctx.padded_request_ids)
 
         pos_ids_out = self._preplan_pos_ids if ctx.is_preplan else self._current_pos_ids
         pos_ids_out.clear()
@@ -181,7 +181,7 @@ class RopeManager(PositionManager):
         # where KV applies them
         plan_outputs = ctx.plan_results.get(self._kv_cache_name)
         if plan_outputs is not None:
-            self._apply_forks(plan_outputs.post_forks, ctx.request_ids)
+            self._apply_forks(plan_outputs.post_forks, ctx.padded_request_ids)
 
     def _apply_forks(
         self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],

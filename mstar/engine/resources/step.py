@@ -1,5 +1,5 @@
 
-from collections.abc import KeysView
+from collections.abc import KeysView, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
@@ -52,7 +52,7 @@ class SlotLease:
 class StepContext:
     # engine-only. mutable: the engine pads `request_ids` and fills the lease
     # in once a slot is chosen, on the context the batch already carries
-    request_ids: tuple[str, ...]
+    request_ids: Sequence[str]
     graph_walk: str
     slot: int
     capture: bool
@@ -63,6 +63,18 @@ class StepContext:
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
     slot_lease: SlotLease | None = None
+    # `request_ids` padded with dummy rids to a capture bucket's batch size;
+    # None outside a captured replay, where the two are the same
+    _padded_request_ids: Sequence[str] | None = None
+
+    @property
+    def padded_request_ids(self) -> Sequence[str]:
+        if self._padded_request_ids is None:
+            return self.request_ids
+        return self._padded_request_ids
+
+    def set_padded_rids(self, padded_rids: Sequence[str] | None):
+        self._padded_request_ids = padded_rids
 
 
 @dataclass(frozen=True)
