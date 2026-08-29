@@ -11,6 +11,8 @@ Pins the properties the rest of the protocol is built on:
 3. There is NO cancel/commit message type: voids are derived from state that
    is identical on every rank, never signalled (see the ``ScheduleTPNode``
    docstring and ``tp_async_sim.py`` for why a signalled retract is unsafe).
+   The only other message is ``TPNoSpeculation`` — "no head from step s" —
+   which carries no verdict, only the absence of a head.
 
 The *semantics* (void-only, symmetric derivation) are enforced by the CPU
 model checker in ``tp_async_sim.py``; these tests only pin the carrier.
@@ -28,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.utils.ipc_format import (  # noqa: E402
     ScheduleTPNode,
+    TPNoSpeculation,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -62,6 +65,17 @@ def test_no_cancel_or_commit_message_type():
     assert "CANCEL_SPEC" not in names
     assert "COMMIT_SPEC" not in names
     assert "SCHEDULE_TP" in names
+    assert "TP_NO_SPEC" in names
+
+
+def test_no_spec_marker_names_the_step_and_round_trips():
+    import pickle
+
+    msg = TPNoSpeculation("n", "decode", spec_from_seq=6)
+    wrapped = WorkerMessage(message_type=WorkerMessageType.TP_NO_SPEC, body=msg)
+    back = pickle.loads(pickle.dumps(wrapped))
+    assert back.message_type is WorkerMessageType.TP_NO_SPEC
+    assert back.body == msg and back.body.spec_from_seq == 6
 
 
 def test_wrapped_head_dispatches_on_schedule_tp():

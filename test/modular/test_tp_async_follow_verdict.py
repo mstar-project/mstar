@@ -8,7 +8,7 @@ serial path with a continuing rid whose loop ended at N — a batch the serial
 readiness check can never build, while the leader runs it (one wasted
 forward) and then hangs in the collective. So:
 
-* the leader ALWAYS sends one of {speculative head from N, empty "no-spec"
+* the leader ALWAYS sends one of {speculative head from N, ``TPNoSpeculation``
   marker for N} for every lockstep step it looked at speculating from;
 * the follower's ``_resolve_follow_speculation`` waits (bounded by that
   send) for exactly one of them right after await(N): builds the head via the
@@ -33,7 +33,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
+from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 
@@ -78,7 +78,11 @@ def _stub():
 
     def _process_messages():
         while stub.communicator.inbox:
-            stub._register_tp_follow(stub.communicator.inbox.pop(0))
+            msg = stub.communicator.inbox.pop(0)
+            if isinstance(msg, TPNoSpeculation):
+                stub._register_tp_nospec(msg)
+            else:
+                stub._register_tp_follow(msg)
 
     def _try_follow(pending):
         # like the real one: a successful build consumes the FIFO head
@@ -92,6 +96,7 @@ def _stub():
     stub._process_messages = _process_messages
     stub._try_follow_speculation = _try_follow
     stub._register_tp_follow = lambda m: Worker._register_tp_follow(stub, m)
+    stub._register_tp_nospec = lambda m: Worker._register_tp_nospec(stub, m)
     stub._close_tp_follow_step = lambda p: Worker._close_tp_follow_step(stub, p)
     stub._resolve_follow_speculation = (
         lambda p, o, arm: Worker._resolve_follow_speculation(stub, p, o, arm)
@@ -118,17 +123,14 @@ def _head(rids, seq, from_seq):
 
 
 def _nospec(from_seq):
-    return ScheduleTPNode(
-        node_name=NODE, graph_walk=WALK, request_ids=[],
-        speculative=True, spec_seq=-1, spec_from_seq=from_seq,
-    )
+    return TPNoSpeculation(node_name=NODE, graph_walk=WALK, spec_from_seq=from_seq)
 
 
 # ------------------------------------------------------------- registration
 
 def test_nospec_marker_is_recorded_and_never_queued():
     s = _stub()
-    s._register_tp_follow(_nospec(4))
+    s._register_tp_nospec(_nospec(4))
     assert 4 in s._tp_nospec
     assert s.scheduler.peek_tp_follow() is None
 
@@ -158,21 +160,29 @@ def test_plain_and_unrelated_speculative_messages_queue_normally():
     assert list(s.scheduler.tp_batches_pending_schedule) == [plain, h]
 
 
-def test_flag_off_still_swallows_empty_markers_but_queues_heads_verbatim():
-    """A rank running with the flag off must not crash on an empty marker
-    (the serial path indexes request_ids[0]) and must not second-guess."""
+def test_flag_off_ignores_markers_and_queues_heads_verbatim():
+    """A rank running with the flag off records nothing and never
+    second-guesses a head: the serial path runs whatever the leader sent."""
     s = _stub()
     s.tp_async_sched = False
-    s._register_tp_follow(_nospec(4))
+    s._register_tp_nospec(_nospec(4))
+    assert 4 not in s._tp_nospec
     h = _head(["r0"], seq=5, from_seq=4)
     s._register_tp_follow(h)
     assert s.scheduler.peek_tp_follow() is h
 
 
+def test_empty_schedule_message_is_dropped_not_queued():
+    """Defensive: the serial path indexes request_ids[0]."""
+    s = _stub()
+    s._register_tp_follow(ScheduleTPNode(NODE, WALK, [], spec_seq=3))
+    assert s.scheduler.peek_tp_follow() is None
+
+
 def test_nospec_store_is_bounded():
     s = _stub()
     for i in range(Worker._TP_NOSPEC_KEEP + 10):
-        s._register_tp_follow(_nospec(i))
+        s._register_tp_nospec(_nospec(i))
     assert len(s._tp_nospec) == Worker._TP_NOSPEC_KEEP
     assert 0 not in s._tp_nospec and 9 not in s._tp_nospec
     assert Worker._TP_NOSPEC_KEEP + 9 in s._tp_nospec
@@ -193,7 +203,7 @@ def test_resolve_builds_a_queued_head_and_arms_it():
 
 def test_resolve_goes_serial_on_the_marker_without_waiting():
     s = _stub()
-    s._register_tp_follow(_nospec(4))
+    s._register_tp_nospec(_nospec(4))
     got = s._resolve_follow_speculation(_pending(4), _output(), lambda sp: None)
     assert got is None
     assert s.communicator.waits == 0
