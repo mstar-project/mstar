@@ -308,6 +308,7 @@ def test_admit_retrieve_short_circuits_on_failure():
 
 
 def test_build_cuda_graph_buffers_reaches_every_resource():
+    """No node map: the sweep stays global, as it was before scoping."""
     kv, sampler = _Stub("kv"), _Stub("sampler")
     runner = StepRunner({"kv": kv, "sampler": sampler})
 
@@ -315,6 +316,28 @@ def test_build_cuda_graph_buffers_reaches_every_resource():
 
     assert kv.calls == ["cg_buffers:2:8:64"]
     assert sampler.calls == ["cg_buffers:2:8:64"]
+
+
+def test_build_cuda_graph_buffers_is_scoped_to_the_capturing_node():
+    """A node's capture must not size a resource it never plans against.
+
+    Buffers are allocated per node at warmup; letting one node's slot count and
+    batch size reach another's resource over-allocates at best, and at worst
+    reallocates a buffer whose address a captured graph already holds.
+    """
+    kv, sampler, other = _Stub("kv"), _Stub("sampler"), _Stub("other")
+    runner = StepRunner(
+        {"kv": kv, "sampler": sampler, "other": other},
+        node_resources={"llm": ["kv", "sampler"], "codec": ["other"]},
+    )
+
+    runner.build_cuda_graph_buffers(
+        slots=[object(), object()], max_bs=8, max_seq_len=64, node_name="llm",
+    )
+
+    assert kv.calls == ["cg_buffers:2:8:64"]
+    assert sampler.calls == ["cg_buffers:2:8:64"]
+    assert other.calls == [], "another node's resource was sized by this capture"
 
 
 # --- the step envelope -----------------------------------------------------

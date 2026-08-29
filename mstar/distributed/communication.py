@@ -313,17 +313,23 @@ class WorkerParallelGroups:
         return self.get_joint_group_for_node(node).world_size
 
     def all_in_same_group(self, nodes: list[str]) -> bool:
-        if all((
-            self.get_instance_world_size_for_node(node) == 1  \
-                for node in nodes
-        )): # all nodes have no parallelism
-            return True
-        return len({
-            (
-                id(self.get_tp_config_for_node(node)),
-                id(self.get_sp_config_for_node(node))
-            ) for node in nodes
-        }) == 1
+        """Whether every node shares one (tp, sp) group.
+
+        Per dimension, and only where someone parallelizes: unregistered reads
+        as the single-rank group, so a TP-only run would otherwise be rejected
+        for "differing" on SP. By membership, not identity — the lazy getters
+        mint a fresh group per node (and would cache one for a remote node).
+        """
+        for per_node in (self.node_to_tp_group, self.node_to_sp_group):
+            members = [
+                tuple(group.group_members) if group is not None else (0,)
+                for group in (per_node.get(node) for node in nodes)
+            ]
+            if all(len(m) == 1 for m in members):
+                continue
+            if len(set(members)) != 1:
+                return False
+        return True
 
     def barrier_all(self) -> None:
         """Global barrier across every worker process in the run.

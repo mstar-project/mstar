@@ -43,15 +43,25 @@ class AttentionSpec(NodeResourceSpec):
         self,
         max_num_pages: int | None = None,
         page_size: int | None = None,
+        backend: str | AttnBackend | None = None,
+        flashinfer_backend: str | None = None,
         **kwargs,
     ):
         """Track the cache's geometry: the wrappers are planned against it, so
-        a deployment that resizes the cache resizes these too."""
+        a deployment that resizes the cache resizes these too.
+
+        Which kernel to run is the deployment's call as much as the model's —
+        an image that cannot build FA3 pins FA2 here.
+        """
         del kwargs  # keys meant for other resources
         if max_num_pages is not None:
             self.kv_config.max_num_pages = max_num_pages
         if page_size is not None:
             self.kv_config.page_size = page_size
+        if backend is not None:
+            self.config.backend = AttnBackend(backend)
+        if flashinfer_backend is not None:
+            self.config.flashinfer_backend = flashinfer_backend
 
 
 @dataclass
@@ -93,14 +103,20 @@ class CrossAttentionSpec(NodeResourceSpec):
         self,
         max_num_pages: int | None = None,
         page_size: int | None = None,
+        backend: str | AttnBackend | None = None,
+        flashinfer_backend: str | None = None,
         **kwargs,
     ):
-        """Track the context cache's geometry; see ``AttentionSpec``."""
+        """Track the context cache's geometry and backend; see ``AttentionSpec``."""
         del kwargs  # keys meant for other resources
         if max_num_pages is not None:
             self.kv_config.max_num_pages = max_num_pages
         if page_size is not None:
             self.kv_config.page_size = page_size
+        if backend is not None:
+            self.config.backend = AttnBackend(backend)
+        if flashinfer_backend is not None:
+            self.config.flashinfer_backend = flashinfer_backend
 
 
 @dataclass(frozen=True)

@@ -142,10 +142,13 @@ class Attention(nn.Module):
 
     def bind_resources(self, resources: dict) -> None:
         """Resolve the resources this layer calls. See
-        ``NodeSubmodule.bind_node_resources``."""
-        self.attn = resources[self._attn_key]
-        self.kv = resources[self._kv_key]
-        self.pos = None if self._pos_key is None else resources[self._pos_key]
+        ``NodeSubmodule.bind_node_resources``.
+
+        ``.get``: a layer may be bound on a node that owns only some of them.
+        """
+        self.attn = resources.get(self._attn_key)
+        self.kv = resources.get(self._kv_key)
+        self.pos = None if self._pos_key is None else resources.get(self._pos_key)
         # One callable per layer is fine here: unlike cosmos3 it is never passed
         # into a traced function, so nothing specializes on its identity.
         self.attend = AttentionCallable(kv=self.kv, attn=self.attn)

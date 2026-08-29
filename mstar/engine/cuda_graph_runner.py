@@ -161,6 +161,8 @@ class CudaGraphRunner:
         self._next_slot = 0
 
         self._memory_pool = None
+        # set by prepare_for_capture; capture reuses it rather than re-deriving
+        self._prepared_slot_specs: list[CGSlotSpec] | None = None
 
         # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
         # by _intern_static_buffer on the first capture. Smaller-bucket captures
@@ -237,6 +239,27 @@ class CudaGraphRunner:
             if walk != spec.config.capture_graph_walk
         ]
 
+    def prepare_for_capture(self) -> list[CGSlotSpec]:
+        """Claim the static buffers this runner's captures will read.
+
+        Split from the capture so every runner claims first: nodes share
+        resources, and a build driven by a later node would move buffers an
+        earlier node's graphs already baked in.
+        """
+        if self._prepared_slot_specs is None:
+            slot_specs = self._get_slot_specs()
+            # reverse sort based on batch size, then total tokens (largest first)
+            slot_specs.sort(key=lambda s: (s.bs, s.num_tokens), reverse=True)
+            max_seq_len = max((
+                spec.bucket.num_tokens for spec in slot_specs
+            ), default=1)
+            self._step_runner.build_cuda_graph_buffers(
+                slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len,
+                node_name=self._submodule_name,
+            )
+            self._prepared_slot_specs = slot_specs
+        return self._prepared_slot_specs
+
     def warmup_and_capture(self):
         """Capture graphs for all configs and batch sizes."""
         if self._device is None or not torch.cuda.is_available():
@@ -247,16 +270,7 @@ class CudaGraphRunner:
         self._memory_pool = torch.cuda.graphs.graph_pool_handle()
         mem_before = torch.cuda.memory_allocated(self._device)
 
-        slot_specs = self._get_slot_specs()
-        # reverse sort based on batch size, then total tokens (largest first)
-        slot_specs.sort(key=lambda s: (s.bs, s.num_tokens), reverse=True)
-
-        max_seq_len = max((
-            spec.bucket.num_tokens for spec in slot_specs
-        ), default=1)
-        self._step_runner.build_cuda_graph_buffers(
-            slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len
-        )
+        slot_specs = self.prepare_for_capture()
 
         for spec in slot_specs:
             self._comm_group.tp_group.barrier()
@@ -823,6 +837,7 @@ class PiecewiseCudaGraphRunner:
         device: torch.device,
         autocast_dtype: torch.dtype | None,
         joint_comm_group: JointGroups | None = None,
+        node_name: str | None = None,
     ):
         self._label = label
         self._config = config
@@ -831,6 +846,9 @@ class PiecewiseCudaGraphRunner:
         self._device = device
         self._autocast_dtype = autocast_dtype
         self._comm_group = joint_comm_group
+        # scopes buffer allocation; `label` carries it but mangled with the region
+        self._node_name = node_name
+        self._prepared_shapes: list | None = None
 
         self._capture_batch_sizes = sorted(
             config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
@@ -855,6 +873,26 @@ class PiecewiseCudaGraphRunner:
 
     # ── Capture ─────────────────────────────────────────────────────────
 
+    def prepare_for_capture(self) -> list:
+        """Claim this region's static buffers; see ``CudaGraphRunner``."""
+        if self._prepared_shapes is None:
+            shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
+            if shapes:
+                self._step_runner.build_cuda_graph_buffers(
+                    [
+                        CGSlotSpec(
+                            bucket=self._bucket(shape), slot=self.SLOT,
+                            config=self._config,
+                        )
+                        for shape in shapes
+                    ],
+                    max_bs=max(shape.bs for shape in shapes),
+                    max_seq_len=max(shape.total_tokens for shape in shapes),
+                    node_name=self._node_name,
+                )
+            self._prepared_shapes = shapes
+        return self._prepared_shapes
+
     def warmup_and_capture(self) -> None:
         if self._device is None or not torch.cuda.is_available():
             logger.warning(
@@ -865,19 +903,9 @@ class PiecewiseCudaGraphRunner:
         torch.cuda.set_device(self._device)
         self._memory_pool = torch.cuda.graphs.graph_pool_handle()
 
-        shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
+        shapes = self.prepare_for_capture()
         if not shapes:
             return
-        self._step_runner.build_cuda_graph_buffers(
-            [
-                CGSlotSpec(
-                    bucket=self._bucket(shape), slot=self.SLOT, config=self._config,
-                )
-                for shape in shapes
-            ],
-            max_bs=max(shape.bs for shape in shapes),
-            max_seq_len=max(shape.total_tokens for shape in shapes),
-        )
 
         # largest bucket first, matching the full-forward runner
         for shape in sorted(

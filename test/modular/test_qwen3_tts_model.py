@@ -12,6 +12,8 @@ import yaml
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
+from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
@@ -146,17 +148,26 @@ def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     assert HF_MODELS["qwen3_tts"] == {
         "model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     }
-    kv_configs = model.get_kv_cache_config()
-    assert len(kv_configs) == 1
-    kv = kv_configs[0]
-    assert kv.nodes == ["Talker"]
+    specs = model.get_node_resources()
+    kv_specs = [spec for spec in specs if isinstance(spec, KVSpec)]
+    assert len(kv_specs) == 1
+    kv_spec = kv_specs[0]
+    assert kv_spec.nodes == {"Talker"}
+    kv = kv_spec.config
     assert kv.num_layers == model.config.talker.num_hidden_layers
     assert kv.num_kv_heads == model.config.talker.num_key_value_heads
     assert kv.num_qo_heads == model.config.talker.num_attention_heads
     assert kv.head_dim == model.config.talker.head_dim
-    assert kv.flashinfer_backend == "auto"
     serving_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     assert serving_config["kv_cache"]["flashinfer_backend"] == "fa2"
+
+    # the model default is "auto"; the deployment pins FA2 because the image
+    # cannot build the FA3 JIT kernels, so the override has to reach attention
+    attn = next(spec for spec in specs if isinstance(spec, AttentionSpec))
+    assert attn.config.flashinfer_backend == "auto"
+    for spec in specs:
+        spec.apply_yaml_overrides(**serving_config["kv_cache"])
+    assert attn.config.flashinfer_backend == "fa2"
 
     worker_graphs = model.get_worker_graphs(str(CONFIG_PATH))
     by_walk = {

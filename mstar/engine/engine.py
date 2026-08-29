@@ -282,9 +282,11 @@ class Engine:
         return None if submodule.disable_autocast else self._autocast_dtype
 
     def warmup(self) -> None:
+        cg_runners: dict[str, CudaGraphRunner] = {}
+        piecewise: dict[str, dict[str, PiecewiseCudaGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
-            runner = CudaGraphRunner(
+            cg_runners[node_name] = CudaGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
                 resources=submodule_mgmt.resources,
@@ -294,13 +296,30 @@ class Engine:
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 enable_nvtx=self._enable_nvtx
             )
+            piecewise[node_name] = self._build_piecewise_runners(
+                node_name, submodule_mgmt
+            )
+
+        # Every runner claims its static buffers before any of them captures:
+        # nodes share resources, so a build driven by a later node would move
+        # buffers an earlier node's graphs already recorded the address of.
+        for node_name in self._submodules:
+            cg_runners[node_name].prepare_for_capture()
+            for runner in piecewise[node_name].values():
+                runner.prepare_for_capture()
+
+        for node_name, submodule_mgmt in self._submodules.items():
+            runner = cg_runners[node_name]
             runner.warmup_and_capture()
             if runner.any_graphs:
                 submodule_mgmt.cuda_graph_runner = runner
 
-            submodule_mgmt.piecewise_runners = self._build_piecewise_runners(
-                node_name, submodule_mgmt
-            )
+            captured: dict[str, PiecewiseCudaGraphRunner] = {}
+            for label, pw_runner in piecewise[node_name].items():
+                pw_runner.warmup_and_capture()
+                if pw_runner.any_graphs:
+                    captured[label] = pw_runner
+            submodule_mgmt.piecewise_runners = captured
 
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
@@ -312,10 +331,10 @@ class Engine:
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement,
     ) -> dict[str, PiecewiseCudaGraphRunner]:
-        """One runner per region the submodule declares, warmed up.
+        """One runner per region the submodule declares, not yet captured.
 
-        A region whose capture fails is left out, so its forward takes the
-        eager path for that label.
+        The caller captures them, and drops a region whose capture failed so
+        its forward takes the eager path for that label.
         """
         node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
         configs = submodule_mgmt.submodule.get_piecewise_cuda_graph_configs(
@@ -334,10 +353,9 @@ class Engine:
                 device=self._device,
                 autocast_dtype=node_dtype,
                 joint_comm_group=submodule_mgmt.joint_comm_group,
+                node_name=node_name,
             )
-            runner.warmup_and_capture()
-            if runner.any_graphs:
-                runners[label] = runner
+            runners[label] = runner
         return runners
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:

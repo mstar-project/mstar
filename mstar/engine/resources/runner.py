@@ -99,6 +99,9 @@ class StepRunner:
         # falls back to the full sweep, which is the un-scoped behaviour.
         self._node_retrieve_order = self._per_node(node_resources, self._retrieve_order)
         self._node_publish_order = self._per_node(node_resources, self._publish_order)
+        # capture-time buffer allocation, likewise scoped: a node's runner has
+        # no business sizing a resource it never plans against
+        self._node_order = self._per_node(node_resources, list(self._order))
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -341,9 +344,14 @@ class StepRunner:
 
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+        node_name: str | None = None,
     ) -> None:
-        """resources preallocate the static buffers captured replays will read"""
-        for key in self._order:
+        """resources preallocate the static buffers captured replays will read
+
+        Swept over ``node_name``'s own resources: another node's slot count and
+        batch size say nothing about a resource this node's graphs never touch.
+        """
+        for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].build_cuda_graph_buffers(
                 slots, max_bs, max_seq_len
             )

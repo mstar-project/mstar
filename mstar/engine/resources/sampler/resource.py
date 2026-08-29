@@ -102,10 +102,10 @@ class SamplerResource(Resource):
             and cg_slots <= self._cg_slots
         ):
             return
-        self._cg_max_bs = max_bs
+        self._cg_max_bs = max(max_bs, self._cg_max_bs)
         self._cg_slots = max(cg_slots, self._cg_slots)
         self._cg_buffers = SamplerBuffers.allocate(
-            max_batch_size=max_bs, device=self._device,
+            max_batch_size=self._cg_max_bs, device=self._device,
             tp_group=self._comm_group,
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
