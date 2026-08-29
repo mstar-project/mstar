@@ -129,12 +129,27 @@ class Glm52MoEGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
+        # fp32 copy of ``weight`` built once by ``finalize_weights`` (called
+        # from the MoE block's process_weights_after_loading). Without it the
+        # forward cast the (E, hidden) bf16 router to fp32 on every layer of
+        # every step: 6.3 MB written × 75 layers = 470 MB/step and 75 kernel
+        # launches for a value that never changes. Plain attribute, not a
+        # buffer, so model.to(bf16) cannot downcast it (rope inv_freq
+        # precedent). Bit-identical: the same fp32 values, computed once.
+        self._weight_fp32: torch.Tensor | None = None
+
+    def finalize_weights(self) -> None:
+        """Cache the fp32 router weight; call after the weights are loaded."""
+        self._weight_fp32 = self.weight.detach().float()
 
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         h = hidden_states.reshape(-1, self.hidden_size).float()
-        scores = F.linear(h, self.weight.float()).sigmoid()  # (T, E)
+        w = self._weight_fp32
+        if w is None or w.device != self.weight.device:
+            w = self.weight.float()
+        scores = F.linear(h, w).sigmoid()  # (T, E)
 
         biased = scores + self.e_score_correction_bias.unsqueeze(0)
         topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
@@ -381,6 +396,7 @@ class Glm52SparseMoeBlock(nn.Module):
         """Resolve reference-vs-fused dispatch on the real device (kimi
         quant_kernel semantics: explicit "triton" must not silently
         downgrade; "auto" probes; "reference" keeps the bitwise loop)."""
+        self.gate.finalize_weights()
         if not self.fp8_experts:
             return
         dev = torch.device(device) if device is not None else torch.device("cpu")
