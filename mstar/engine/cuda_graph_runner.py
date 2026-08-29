@@ -67,6 +67,29 @@ logger = logging.getLogger(__name__)
 # (3 silent rank-0 exits in 7 launches on 2026-08-28).
 _CAPTURE_ERROR_MODE = "thread_local"
 
+# torch.compile mode for the CAPTURED forward. "max-autotune-no-cudagraphs"
+# (the historical default) autotunes every GEMM between cuBLAS and Inductor's
+# Triton templates — and at decode shapes (M=4) the autotuner's warm-L2
+# benchmark picks Triton templates that run at ~2x the time of cuBLAS's
+# split-K kernels when the weights stream from HBM (1-GPU per-rank bench,
+# 2026-08-29: dense GEMMs 14.6 us Triton vs 7.5 us nvjet; trunk -8 % with
+# TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN). MSTAR_GRAPH_COMPILE_MODE
+# selects the mode ("default" = cuBLAS GEMMs + Inductor fusion, seconds to
+# compile); MSTAR_INDUCTOR_GEMM_BACKENDS (e.g. "ATEN") restricts autotuning.
+_COMPILE_MODE = os.environ.get("MSTAR_GRAPH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+_GEMM_BACKENDS = os.environ.get("MSTAR_INDUCTOR_GEMM_BACKENDS", "")
+if _GEMM_BACKENDS:
+    import torch._inductor.config as _inductor_config
+
+    _inductor_config.max_autotune_gemm_backends = _GEMM_BACKENDS
+
+
+def _compile_kwargs() -> dict:
+    kw = {"fullgraph": False, "dynamic": False}
+    if _COMPILE_MODE != "default":
+        kw["mode"] = _COMPILE_MODE
+    return kw
+
 
 DEFAULT_AR_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
@@ -700,12 +723,7 @@ class CudaGraphRunner:
                 # graph (finished in the submodule ``postprocess``).
                 forward = getattr(submodule, config.capture_forward_method)
                 if config.compile:
-                    forward = torch.compile(
-                        forward,
-                        mode="max-autotune-no-cudagraphs",
-                        fullgraph=False,
-                        dynamic=False,
-                    )
+                    forward = torch.compile(forward, **_compile_kwargs())
                 spec.engine_inputs.sampler.applied_penalty_in_graph = False
 
                 def run_forward(
@@ -2275,12 +2293,7 @@ class StatelessCudaGraphRunner:
 
         fwd = submodule.forward_batched
         if config.compile:
-            fwd = torch.compile(
-                fwd,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
-            )
+            fwd = torch.compile(fwd, **_compile_kwargs())
 
         # Warmup and capture on the shared side stream (see warmup_and_capture
         # for why). The stream is created in warmup_and_capture before the
@@ -2635,12 +2648,7 @@ class PiecewiseCudaGraphRunner:
     ) -> None:
         fn = self.config.capture_fn
         if self.config.compile:
-            fn = torch.compile(
-                fn,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
-            )
+            fn = torch.compile(fn, **_compile_kwargs())
 
         # TODO: in the future, consider inputting a ModelInputsFromEngine struct
         # instead of inputting static_cm and sampler separately
