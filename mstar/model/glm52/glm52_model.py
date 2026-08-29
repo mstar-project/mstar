@@ -84,11 +84,19 @@ def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
         # the 64x64 version ticking). ~2.7 ms of matmul every 50 ms.
         # 0.25 s cadence: 20 wakeups/s of GIL churn measurably taxed the
         # loader's hot python loop (~2.5x slower load); 4/s with ~13 ms of
-        # matmul still samples ~5% utilization — visible, near-free.
+        # matmul sampled ~5% utilization — which the box's gpu-management
+        # daemon (/opt/gpu-management-prod, read 2026-08-29) counts as IDLE:
+        # a process is "active" only when its own per-process SM util is
+        # > 10% (proc_active_util_percent), sampled every 10 s, and it
+        # SIGTERMs after the idle threshold (~30 min observed). Rank 0 is
+        # the rank that waits on the CPU through load + capture (the others
+        # spin in NCCL kernels, which sample as busy), hence "rank 0 dies at
+        # +30:33..+33:59". 14 x 2.7 ms per 250 ms ~= 15% — over the line
+        # with margin, still 4 wakeups/s.
         a = torch.ones(8192, 8192, device=device, dtype=torch.bfloat16)
         while not stop.wait(0.25):
             try:
-                for _ in range(5):
+                for _ in range(14):
                     torch.mm(a, a)
             except torch.AcceleratorError:
                 # A CUDA graph capture is in flight somewhere in the process
