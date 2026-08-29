@@ -330,6 +330,16 @@ def fused_experts_fp8(
     # The per-K-tile rescale in the kernel is exact only when each K tile is
     # exactly one quant group, so the shape-picked BLOCK_SIZE_K is overridden.
     config["BLOCK_SIZE_K"] = block_k
+    # get_default_config's M <= E branch ignores N, so the down GEMM (N=hidden,
+    # 12x the gate/up N) used to inherit the gate/up tiles. At decode shapes
+    # the two launches want different tiles: a 64-config sweep at GLM-5.2's
+    # per-rank shape (T=4, K=8, E=256, H=6144, I=256; env/bench_fused_moe_config.py,
+    # 2026-08-29, all candidates bit-identical to the default) measured
+    # gate/up 31.4 -> 28.2 us and down 22.0 -> 15.8 us in-graph.
+    config_down = dict(config)
+    if num_tokens <= 16:
+        config.update(BLOCK_SIZE_N=64, GROUP_SIZE_M=8, num_warps=4, num_stages=5)
+        config_down.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=1, num_warps=4, num_stages=2)
     compute_type = _tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
@@ -392,7 +402,7 @@ def fused_experts_fp8(
         num_tokens_post_padded=num_tokens_post_padded,
         mul_routed_weight=True,
         top_k=1,
-        config=config,
+        config=config_down,
         compute_type=compute_type,
         block_shape=block_size,
     )
