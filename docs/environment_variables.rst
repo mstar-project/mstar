@@ -153,6 +153,21 @@ captured) decode.
    * - Variable
      - Default
      - Meaning
+   * - ``MSTAR_GRAPH_COMPILE_MODE``
+     - ``max-autotune-no-cudagraphs``
+     - ``torch.compile`` mode for the forward captured by the piecewise /
+       full-graph runners (``mstar/engine/cuda_graph_runner.py``). ``default``
+       keeps Inductor's fusion but takes cuBLAS for every GEMM and skips
+       autotuning: at decode shapes (M=4) max-autotune's warm-L2 benchmark
+       picks Triton GEMM templates that run 2× slower than cuBLAS's split-K
+       kernels once the weights stream from HBM — measured −8 % on the GLM-5.2
+       trunk at per-rank dims, capture 130 s → 27 s. Any mode string
+       ``torch.compile`` accepts.
+   * - ``MSTAR_INDUCTOR_GEMM_BACKENDS``
+     - unset
+     - When set (e.g. ``ATEN`` or ``ATEN,TRITON``), restricts Inductor's
+       ``max_autotune_gemm_backends`` for the captured forward; only matters
+       under an autotuning compile mode.
    * - ``MSTAR_GLM52_GRAPH_COMPILE``
      - ``1``
      - Capture the ``torch.compile``'d forward into the CUDA graphs. ``0``
