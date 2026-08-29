@@ -264,6 +264,17 @@ run_arm() {
   # trusted. Not a tripwire: withholding it would lose real data.
   ( while :; do others_on_gpus >> "$out/contention.txt" 2>/dev/null; sleep 30; done ) &
   local sampler=$!
+  # Second sampler: SM/mem clocks, power, temperature, host load. The
+  # 2026-08-28 re-measurements of the 08-19 tree came in 6 % low (89–90 vs
+  # 95.26) with "shared box: none" — the GPU sampler above cannot see a
+  # down-clocked GPU or a 400+ load average on the host side of the step,
+  # so record both and let the reader attribute a delta instead of guessing.
+  ( while :; do
+      { date -u +%H:%M:%S; cut -d' ' -f1-3 /proc/loadavg; \
+        nvidia-smi --query-gpu=index,clocks.sm,clocks.mem,power.draw,temperature.gpu,utilization.gpu,clocks_throttle_reasons.active \
+                   --format=csv,noheader,nounits 2>/dev/null | tr '\n' ';'; } | tr '\n' ' ' >> "$out/clocks.txt"
+      echo >> "$out/clocks.txt"; sleep 10; done ) &
+  local clocks_sampler=$!
   (
     # Pin the baseline OFF explicitly (not `unset`): as of 2026-08-11 the code
     # default for both flags is ON, so arm A must force them off to measure the
@@ -290,7 +301,7 @@ run_arm() {
     env | grep -E '^(MSTAR_GLM52|MSTAR_TP_|MSTAR_PHASE)' | sort > "$out/env.txt"
     HOLD_MIN=0 bash "$D/m3-sweep2.sh" "$K"
   )
-  kill "$sampler" 2>/dev/null
+  kill "$sampler" "$clocks_sampler" 2>/dev/null
   local sweep; sweep=$(cat "$D/m3-sweep.done" 2>/dev/null || echo MISSING)
   say "arm $arm sweep marker: $sweep"
   local shared="none"
@@ -353,6 +364,11 @@ run_arm() {
     echo "pairing   : ${tag:-MISSING} (want $want_tag)"
     echo "sweep     : $sweep"
     echo "shared box: $shared"
+    # loadavg(1m) min–max and the median SM clock of GPU 0 over the arm.
+    if [ -s "$out/clocks.txt" ]; then
+      echo "host load : $(awk '{print $2}' "$out/clocks.txt" | sort -n | sed -n '1p;$p' | tr '\n' '–' | sed 's/–$//')"
+      echo "sm clock  : gpu0 p50 $(awk -F';' '{split($1,a,", "); print a[2]}' "$out/clocks.txt" | grep -E '^[0-9]+$' | sort -n | awk '{v[NR]=$1} END{if(NR) print v[int((NR+1)/2)]; else print "n/a"}') MHz (max 1980)"
+    fi
   } > "$out/summary.txt"
 
   local bad=0
