@@ -19,7 +19,6 @@ any idle GPU:
     CUDA_VISIBLE_DEVICES=<idle> .venv/bin/python env/bench_fused_moe_grid.py
 """
 import argparse
-import time
 
 import torch
 import triton

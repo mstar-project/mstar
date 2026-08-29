@@ -246,7 +246,7 @@ def main() -> None:
         fn(default_cfg)
         torch.cuda.synchronize()
         ref_out = out_buf.clone()
-        default_us[name] = bench_graph(lambda: fn(default_cfg), a.capture_n, a.iters)
+        default_us[name] = bench_graph(lambda fn=fn: fn(default_cfg), a.capture_n, a.iters)
         print(f"  default: BN={default_cfg['BLOCK_SIZE_N']} GM={default_cfg['GROUP_SIZE_M']} "
               f"W=auto S=auto -> {default_us[name]:8.2f} us/launch (in-graph; reference for "
               "bit-identity)")
@@ -280,7 +280,7 @@ def main() -> None:
 
             ok = torch.equal(out_buf, ref_out)
             try:
-                us = bench_graph(lambda cfg=cfg: fn(cfg), a.capture_n, a.iters)
+                us = bench_graph(lambda cfg=cfg, fn=fn: fn(cfg), a.capture_n, a.iters)
             except Exception as e:
                 reason = f"graph capture: {str(e).splitlines()[0][:150]}"
                 skips.append((bn, gm, nw, ns, reason))
