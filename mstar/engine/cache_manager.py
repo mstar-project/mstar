@@ -392,6 +392,15 @@ class BatchedCacheManager(ABC):
             output: [total_tokens, num_q_heads, head_dim]
         """
 
+    # Host-side planning stages pos_ids through pinned memory
+    # (pinned_staging.pinned -> torch.empty(pin_memory=True)). When a
+    # submodule's plan path runs inside the torch.compile'd forward, dynamo
+    # inlines this method and inductor tries to lower the pinned CPU alloc
+    # onto CUDA: "LoweringException: AssertionError: Only CPU tensors can be
+    # pinned", which failed 8 of 20 requests per GLM-5.2 MTP arm (2368 tokens
+    # instead of 3264, 2026-08-20 and 08-28). Same fence as set_active_label /
+    # set_layer_idx above: planning is never part of a traced graph.
+    @torch.compiler.disable
     def plan_rope(
         self,
         seq_lens: list[int],
