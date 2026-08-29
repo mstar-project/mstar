@@ -45,7 +45,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import StepKernelTrace, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
@@ -143,6 +143,9 @@ class Worker:
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
+        # Per-kernel trace of a window of GPU-thread executes; inert unless
+        # MSTAR_PROFILE_STEPS is set (see StepKernelTrace).
+        self._step_trace = StepKernelTrace(worker_id)
 
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
@@ -1237,6 +1240,7 @@ class Worker:
                 synchronize=False,
             )
         output: NodeOutput | None = None
+        self._step_trace.before_execute()
         try:
             output = engine.execute_with_max_batch_size(node_batch)
             if torch.cuda.is_available():
@@ -1245,6 +1249,7 @@ class Worker:
                 output.completion_event = event
             return output
         finally:
+            self._step_trace.after_execute()
             # Safety net: ensure advance_event fires even if the engine
             # raised before reaching ``advance_seq_lens`` inside
             # ``_run_basic_batched``. Without this, a plan_executor waiting
