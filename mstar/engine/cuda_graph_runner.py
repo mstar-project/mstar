@@ -74,9 +74,11 @@ _CAPTURE_ERROR_MODE = "thread_local"
 # split-K kernels when the weights stream from HBM (1-GPU per-rank bench,
 # 2026-08-29: dense GEMMs 14.6 us Triton vs 7.5 us nvjet; trunk -8 % with
 # TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN). MSTAR_GRAPH_COMPILE_MODE
-# selects the mode ("default" = cuBLAS GEMMs + Inductor fusion, seconds to
-# compile); MSTAR_INDUCTOR_GEMM_BACKENDS (e.g. "ATEN") restricts autotuning.
-_COMPILE_MODE = os.environ.get("MSTAR_GRAPH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+# selects the mode; the default is now "default" (cuBLAS GEMMs + Inductor
+# fusion, seconds to compile) — TP8 arm R 2026-08-29: 90.03 -> 96.97 tok/s with
+# it (+ hoist + rope-skip), 3264 tokens bit-exact. "max-autotune-no-cudagraphs"
+# is one env var away; MSTAR_INDUCTOR_GEMM_BACKENDS restricts its autotuning.
+_COMPILE_MODE = os.environ.get("MSTAR_GRAPH_COMPILE_MODE", "default")
 _GEMM_BACKENDS = os.environ.get("MSTAR_INDUCTOR_GEMM_BACKENDS", "")
 if _GEMM_BACKENDS:
     import torch._inductor.config as _inductor_config
