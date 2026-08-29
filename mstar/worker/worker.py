@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 import time as _time
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
@@ -27,6 +27,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -284,9 +285,8 @@ class Worker:
         # itself (its forward raised). A follower awaiting step s resolves
         # exactly one of {a head with spec_from_seq == s, s in this set}
         # before it post-processes s, so it never has to guess whether the
-        # leader speculated. Bounded FIFO of seqs (see _TP_NOSPEC_KEEP).
-        self._tp_nospec_from: set[int] = set()
-        self._tp_nospec_order: deque[int] = deque()
+        # leader speculated. Bounded: old seqs age out.
+        self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
         if self.tp_async_sched and self.parallel_nodes:
             logger.info(
                 "Worker %s: TP async scheduling ON for %s (%s)",
@@ -1955,18 +1955,8 @@ class Worker:
             tp_seq=head.spec_seq,
         )
 
+    # How many "no speculative head from step s" seqs a follower remembers.
     _TP_NOSPEC_KEEP = 1024
-
-    def _note_tp_nospec(self, spec_from_seq: int) -> None:
-        """Remember that no speculative head will (or may) follow leader step
-        ``spec_from_seq`` on this follower — either the leader said so, or
-        this rank closed the step itself. Bounded."""
-        if spec_from_seq in self._tp_nospec_from:
-            return
-        self._tp_nospec_from.add(spec_from_seq)
-        self._tp_nospec_order.append(spec_from_seq)
-        while len(self._tp_nospec_order) > self._TP_NOSPEC_KEEP:
-            self._tp_nospec_from.discard(self._tp_nospec_order.popleft())
 
     def _register_tp_follow(self, message: ScheduleTPNode) -> None:
         """SCHEDULE_TP arrival. An EMPTY speculative head is the leader's
@@ -1977,11 +1967,11 @@ class Worker:
         never ran it either. Everything else queues as before."""
         if message.speculative and not message.request_ids:
             if self.tp_async_sched:
-                self._note_tp_nospec(message.spec_from_seq)
+                self._tp_nospec.add(message.spec_from_seq)
             return  # never queue an empty batch, flag or no flag
         if (
             self.tp_async_sched and message.speculative
-            and message.spec_from_seq in self._tp_nospec_from
+            and message.spec_from_seq in self._tp_nospec
         ):
             logger.debug(
                 "Worker %s: dropped speculative head seq %d (parent %d closed)",
@@ -1996,7 +1986,7 @@ class Worker:
         too, and the leader dropped its speculation without submitting it).
         Drop such a head if it already arrived; make sure one arriving later
         is dropped on arrival."""
-        self._note_tp_nospec(pending.tp_seq)
+        self._tp_nospec.add(pending.tp_seq)
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
             self.scheduler.pop_tp_follow_head()
@@ -2032,7 +2022,7 @@ class Worker:
         t0 = _time.perf_counter()
         last_warn = t0
         while True:
-            if s in self._tp_nospec_from:
+            if s in self._tp_nospec:
                 return None
             head = self.scheduler.peek_tp_follow()
             if head is not None and head.speculative and head.spec_from_seq == s:

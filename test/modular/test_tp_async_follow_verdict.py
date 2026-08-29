@@ -32,6 +32,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
@@ -66,9 +67,7 @@ def _stub():
     stub = types.SimpleNamespace()
     stub.worker_id = "w1"
     stub.tp_async_sched = True
-    stub._tp_nospec_from = set()
-    stub._tp_nospec_order = __import__("collections").deque()
-    stub._TP_NOSPEC_KEEP = Worker._TP_NOSPEC_KEEP
+    stub._tp_nospec = RecentSet(Worker._TP_NOSPEC_KEEP)
     stub.scheduler = MicroScheduler(
         engine_manager=_FakeEngineManager(), parallel_leader_nodes=set(),
     )
@@ -92,7 +91,6 @@ def _stub():
 
     stub._process_messages = _process_messages
     stub._try_follow_speculation = _try_follow
-    stub._note_tp_nospec = lambda s: Worker._note_tp_nospec(stub, s)
     stub._register_tp_follow = lambda m: Worker._register_tp_follow(stub, m)
     stub._close_tp_follow_step = lambda p: Worker._close_tp_follow_step(stub, p)
     stub._resolve_follow_speculation = (
@@ -131,7 +129,7 @@ def _nospec(from_seq):
 def test_nospec_marker_is_recorded_and_never_queued():
     s = _stub()
     s._register_tp_follow(_nospec(4))
-    assert 4 in s._tp_nospec_from
+    assert 4 in s._tp_nospec
     assert s.scheduler.peek_tp_follow() is None
 
 
@@ -174,10 +172,10 @@ def test_flag_off_still_swallows_empty_markers_but_queues_heads_verbatim():
 def test_nospec_store_is_bounded():
     s = _stub()
     for i in range(Worker._TP_NOSPEC_KEEP + 10):
-        s._note_tp_nospec(i)
-    assert len(s._tp_nospec_from) == Worker._TP_NOSPEC_KEEP
-    assert 0 not in s._tp_nospec_from and 9 not in s._tp_nospec_from
-    assert Worker._TP_NOSPEC_KEEP + 9 in s._tp_nospec_from
+        s._register_tp_follow(_nospec(i))
+    assert len(s._tp_nospec) == Worker._TP_NOSPEC_KEEP
+    assert 0 not in s._tp_nospec and 9 not in s._tp_nospec
+    assert Worker._TP_NOSPEC_KEEP + 9 in s._tp_nospec
 
 
 # ----------------------------------------------------------------- resolve
