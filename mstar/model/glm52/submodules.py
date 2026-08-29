@@ -972,7 +972,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         text_inputs = inputs["text_inputs"][0]
         if self.config.mtp_num_draft_tokens > 0:
             rid = fwd_info.request_id
-            sampling = fwd_info.sampling_config["LLM"]
+            # Since main's #201 (MultiSampler, merged here 2026-08-21) a node's
+            # per-request config is a MultiSamplingConfig {main, aux}; the
+            # greedy-only guard and ignore_eos read the main sampler's params.
+            # (Every request failed here with AttributeError on the box,
+            # 2026-08-28 — the CPU tests faked the pre-#201 shape.)
+            sampling = fwd_info.sampling_config["LLM"].main
             # v1 is greedy-only: decode drafts and verification bypass the
             # engine sampler, so temperature would be silently ignored and a
             # repetition penalty moves even the greedy argmax (prefill would
@@ -1841,7 +1846,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             tokens = outputs["new_token"][0]
             last = int(tokens[-1])
             is_eos = last in self.config.eos_token_ids
-            ignore_eos = request_info.sampling_config["LLM"].ignore_eos
+            ignore_eos = request_info.sampling_config["LLM"].main.ignore_eos
             generated = self._mtp_emitted.get(request_id, 0)
             if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
                 return {"decode_loop"}
@@ -1849,7 +1854,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         token = outputs["new_token"][0].item()
         # GLM-5.2 defines three stop ids: <|endoftext|>, <|user|>, <|observation|>.
         is_eos = token in self.config.eos_token_ids
-        ignore_eos = request_info.sampling_config["LLM"].ignore_eos
+        ignore_eos = request_info.sampling_config["LLM"].main.ignore_eos
         # Total generated = 1 prefill-emitted token + (iters + 1) decode
         # tokens. Counting only decode iters against max_tokens made every
         # length-capped completion one token long — measured in the M1 diff

@@ -209,13 +209,18 @@ def _mtp_cfg(k: int) -> Glm52ModelConfig:
 
 
 def _fwd_info(max_tokens: int, ignore_eos: bool) -> SimpleNamespace:
-    # Models the full SamplingConfig contract: the MTP prepare_inputs
-    # guard reads temperature/repetition_penalty (greedy-only refusal).
+    # Models the engine's per-request contract since main's #201: a node's
+    # entry is a MultiSamplingConfig {main, aux}; the MTP prepare_inputs
+    # guard reads temperature/repetition_penalty off ``.main`` (greedy-only
+    # refusal). A flat SamplingConfig here would pass while the box fails.
     return SimpleNamespace(
         request_id="r0",
         max_tokens=max_tokens,
         sampling_config={"LLM": SimpleNamespace(
-            ignore_eos=ignore_eos, temperature=0.0, repetition_penalty=1,
+            main=SimpleNamespace(
+                ignore_eos=ignore_eos, temperature=0.0, repetition_penalty=1,
+            ),
+            aux={},
         )},
         dynamic_loop_iter_counts={},
     )

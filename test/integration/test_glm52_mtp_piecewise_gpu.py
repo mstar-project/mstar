@@ -60,7 +60,7 @@ from mstar.model.glm52.submodules import (
     Glm52LLMSubmodule,
 )
 from mstar.model.submodule_base import ModelInputsFromEngine
-from mstar.utils.sampling import Sampler, SamplingConfig
+from mstar.utils.sampling import MultiSamplingConfig, Sampler, SamplingConfig
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -149,9 +149,9 @@ def _fwd_info(cfg, rid, max_tokens):
     return CurrentForwardPassInfo(
         request_id=rid, graph_walk="decode", requires_cfg=False, fwd_index=0,
         random_seed=0, max_tokens=max_tokens,
-        sampling_config={"LLM": SamplingConfig(
+        sampling_config={"LLM": MultiSamplingConfig(main=SamplingConfig(
             vocab_size=cfg.vocab_size, ignore_eos=True, temperature=0.0,
-            repetition_penalty=1.0)},
+            repetition_penalty=1.0))},
         dynamic_loop_iter_counts={},
     )
 

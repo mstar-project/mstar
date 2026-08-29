@@ -15,7 +15,7 @@ from mstar.graph.base import Loop
 from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
-from mstar.utils.sampling import SamplingConfig
+from mstar.utils.sampling import MultiSamplingConfig, SamplingConfig
 
 
 def _make_model() -> Glm52Model:
@@ -335,7 +335,8 @@ def _fwd_info(max_tokens=100, ignore_eos=False, iters=0) -> CurrentForwardPassIn
         fwd_index=0,
         random_seed=0,
         max_tokens=max_tokens,
-        sampling_config={"LLM": SamplingConfig(ignore_eos=ignore_eos)},
+        sampling_config={"LLM": MultiSamplingConfig(
+            main=SamplingConfig(ignore_eos=ignore_eos))},
         dynamic_loop_iter_counts={"decode_loop": iters},
     )
 

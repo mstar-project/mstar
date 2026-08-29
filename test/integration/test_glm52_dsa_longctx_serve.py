@@ -50,7 +50,7 @@ from mstar.model.glm52.config import Glm52ModelConfig
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
-from mstar.utils.sampling import Sampler, SamplingConfig
+from mstar.utils.sampling import MultiSamplingConfig, Sampler, SamplingConfig
 
 DEVICE = torch.device("cuda")
 TOPK = 8
@@ -192,8 +192,8 @@ def _fwd_info(max_tokens, cfg):
     return CurrentForwardPassInfo(
         request_id="r0", graph_walk="decode", requires_cfg=False, fwd_index=0,
         random_seed=0, max_tokens=max_tokens,
-        sampling_config={"LLM": SamplingConfig(vocab_size=cfg.vocab_size,
-                                               ignore_eos=True)},
+        sampling_config={"LLM": MultiSamplingConfig(main=SamplingConfig(
+            vocab_size=cfg.vocab_size, ignore_eos=True))},
         dynamic_loop_iter_counts={},
     )
 
