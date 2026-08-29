@@ -83,16 +83,20 @@ def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
         # measured the hard way (third external kill, offset +33:59, with
         # the 64x64 version ticking). ~2.7 ms of matmul every 50 ms.
         # 0.25 s cadence: 20 wakeups/s of GIL churn measurably taxed the
-        # loader's hot python loop (~2.5x slower load); 4/s with ~13 ms of
-        # matmul sampled ~5% utilization — which the box's gpu-management
-        # daemon (/opt/gpu-management-prod, read 2026-08-29) counts as IDLE:
-        # a process is "active" only when its own per-process SM util is
-        # > 10% (proc_active_util_percent), sampled every 10 s, and it
-        # SIGTERMs after the idle threshold (~30 min observed). Rank 0 is
-        # the rank that waits on the CPU through load + capture (the others
-        # spin in NCCL kernels, which sample as busy), hence "rank 0 dies at
-        # +30:33..+33:59". 14 x 2.7 ms per 250 ms ~= 15% — over the line
-        # with margin, still 4 wakeups/s.
+        # loader's hot python loop (~2.5x slower load).
+        #
+        # What the reaper actually measures (coriander's gpu-management
+        # daemon, read 2026-08-29): per-process SM utilization from NVML
+        # (nvmlDeviceGetProcessUtilization) every 10 s; a process counts as
+        # active only above 10%, or if a same-user process on the SAME GPU
+        # is. Rank 0 waits on the CPU through load + capture while the other
+        # ranks spin in NCCL kernels (sampled as busy) — hence rank 0 is the
+        # one killed. With all 8 ranks holding a context on GPU 0, NVML
+        # attributes only ~1/3 of a process's wall-clock kernel time to it:
+        # this tick at 14 matmuls (~90 ms per 250 ms wall) still read 4-6%
+        # on 2026-08-29. It keeps the process visibly alive but does NOT
+        # clear the line by itself; a same-user keeper process on rank 0's
+        # GPU during load + capture does (env/gpu0_keeper.py).
         a = torch.ones(8192, 8192, device=device, dtype=torch.bfloat16)
         while not stop.wait(0.25):
             try:
