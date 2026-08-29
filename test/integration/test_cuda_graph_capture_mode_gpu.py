@@ -7,10 +7,14 @@ thread (the allocator's event queries, a ``synchronize``) fails and
 invalidates whatever capture is open in the process. The runner now captures
 in ``thread_local`` mode, which polices only the capturing thread.
 
-The foreign thread here hammers ``torch.cuda.synchronize()`` — always unsafe
-under a global-mode capture — while the main thread captures a graph long
-enough for the race to be certain. With ``global`` the capture dies; with
-``thread_local`` it records and replays the right numbers.
+The foreign thread here does what the heartbeat does — ``torch.mm`` on its own
+non-blocking stream — plus a ``stream.synchronize()`` on that stream, a
+"potentially unsafe" call that global-mode capture forbids from every thread
+and thread_local mode allows from every thread but the capturing one. (A
+``torch.cuda.synchronize()`` is NOT a valid stand-in: a device-wide sync
+touches the legacy stream and is illegal during any capture, in any mode.)
+With ``global`` the capture dies; with ``thread_local`` it records and replays
+the right numbers and the foreign thread sees no error.
 """
 import threading
 
@@ -32,11 +36,14 @@ def _capture_under_foreign_syncs(mode: str) -> torch.Tensor:
     def _foreign():
         s = torch.cuda.Stream()
         a = torch.ones(2048, 2048, device=device, dtype=torch.bfloat16)
+        with torch.cuda.stream(s):
+            torch.mm(a, a)  # cuBLAS workspace / handle for this stream, outside the race
+        s.synchronize()
         while not stop.is_set():
             try:
                 with torch.cuda.stream(s):
                     torch.mm(a, a)
-                torch.cuda.synchronize()
+                s.synchronize()
             except BaseException as e:  # noqa: BLE001 — recorded, asserted below
                 errors.append(e)
 
@@ -81,5 +88,5 @@ def test_global_mode_is_broken_by_foreign_thread_cuda_calls():
     """Documents WHY thread_local: the same capture under global mode dies.
     If this ever passes, the capture got short enough to win the race —
     lengthen it, do not delete the test."""
-    with pytest.raises(RuntimeError):
+    with pytest.raises((RuntimeError, AssertionError)):
         _capture_under_foreign_syncs("global")
