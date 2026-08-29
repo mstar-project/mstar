@@ -385,6 +385,23 @@ def fused_moe_kernel_fp8_w8a8(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+def _grid_rows(sorted_token_ids: torch.Tensor, topk_ids: torch.Tensor, block_m: int) -> int:
+    """Rows of the M grid: the padded slot count, clamped for small batches.
+
+    ``moe_align_block_size`` sizes ``sorted_token_ids`` for the WORST case —
+    one partial tile per expert, ``tokens*top_k + E*(block_m-1)`` slots — but
+    each (token, expert) slot opens at most one partial tile, so
+    ``topk_ids.numel() * block_m`` slots always cover ``num_tokens_post_padded``
+    (vLLM's small-batch clamp, generalised to both GEMMs). At GLM-5.2's k=3
+    decode shape (32 slots, E=256, BLOCK_M=16) that is 512 rows instead of
+    3872: the down GEMM launches 6,144 CTAs instead of 46,464, 75 layers per
+    step, every removed CTA an early-exit that still had to be scheduled.
+    The value is ALSO the kernel's ``EM`` argument — the grouped pid swizzle
+    must see the same row count the grid was sized from.
+    """
+    return min(sorted_token_ids.shape[0], topk_ids.numel() * block_m)
+
+
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -429,9 +446,11 @@ def invoke_fused_moe_kernel(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
+    EM = _grid_rows(sorted_token_ids, topk_ids, config["BLOCK_SIZE_M"])
+
     def grid(META):
         return (
-            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            triton.cdiv(EM, META["BLOCK_SIZE_M"])
             * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
         )
 
@@ -448,7 +467,7 @@ def invoke_fused_moe_kernel(
         num_tokens_post_padded,
         B.shape[1],
         K,
-        sorted_token_ids.shape[0],
+        EM,
         topk_ids.numel(),
         A.stride(0),
         A.stride(1),
@@ -493,10 +512,11 @@ def invoke_fused_moe_kernel_w4a16(
     assert sorted_token_ids.stride(0) == 1
 
     N = B_packed.shape[1]
+    EM = _grid_rows(sorted_token_ids, topk_ids, config["BLOCK_SIZE_M"])
 
     def grid(META):
         return (
-            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            triton.cdiv(EM, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
@@ -516,7 +536,7 @@ def invoke_fused_moe_kernel_w4a16(
         num_tokens_post_padded,
         N,
         K,
-        sorted_token_ids.shape[0],
+        EM,
         topk_ids.numel(),
         A.stride(0),
         A.stride(1),
@@ -576,10 +596,11 @@ def invoke_fused_moe_kernel_fp8_w8a8(
 
     N = B.shape[1]
     K = B.shape[2]
+    EM = _grid_rows(sorted_token_ids, topk_ids, config["BLOCK_SIZE_M"])
 
     def grid(META):
         return (
-            triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+            triton.cdiv(EM, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
@@ -597,7 +618,7 @@ def invoke_fused_moe_kernel_fp8_w8a8(
         num_tokens_post_padded,
         N,
         K,
-        sorted_token_ids.shape[0],
+        EM,
         topk_ids.numel(),
         A.stride(0),
         A.stride(1),
