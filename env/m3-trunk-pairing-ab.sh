@@ -227,6 +227,10 @@ run_arm() {
     # caveat as F.
     G) label="F + MSTAR_TP_ALLREDUCE=symm_multimem (NVLS all-reduce for <=512 KB messages)"
        want_tag="POST-final-norm (vLLM convention)" ;;
+    H) label="G + MSTAR_GLM52_MTP_PHASE_PREPARE=1 (slot-0 plan + sync inputs hoisted above the verify readback)"
+       want_tag="POST-final-norm (vLLM convention)" ;;
+    R) label="H + MSTAR_GLM52_PLAN_ROPE=0 (skip the dead rope plans)"
+       want_tag="POST-final-norm (vLLM convention)" ;;
     *) say "unknown arm '$arm'"; echo "UNKNOWN-ARM" > "$out/verdict.txt"; return 1 ;;
   esac
 
@@ -296,6 +300,16 @@ run_arm() {
       G) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
                 MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
                 MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_TP_ALLREDUCE=symm_multimem \
+                MSTAR_PHASE_TIMING=200 MSTAR_GLM52_MTP_STEP_TIMING=200 ;;
+      H) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
+                MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
+                MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_TP_ALLREDUCE=symm_multimem \
+                MSTAR_GLM52_MTP_PHASE_PREPARE=1 \
+                MSTAR_PHASE_TIMING=200 MSTAR_GLM52_MTP_STEP_TIMING=200 ;;
+      R) export MSTAR_GLM52_MTP_PAIR_POSTNORM=1 MSTAR_GLM52_MTP_CAPTURE_SYNC=1 \
+                MSTAR_GLM52_MTP_CAPTURE_PREFILL=1 MSTAR_GLM52_MTP_PREFILL_DRAFTS=1 \
+                MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_TP_ALLREDUCE=symm_multimem \
+                MSTAR_GLM52_MTP_PHASE_PREPARE=1 MSTAR_GLM52_PLAN_ROPE=0 \
                 MSTAR_PHASE_TIMING=200 MSTAR_GLM52_MTP_STEP_TIMING=200 ;;
     esac
     env | grep -E '^(MSTAR_GLM52|MSTAR_TP_|MSTAR_PHASE|MSTAR_PROFILE)' | sort > "$out/env.txt"
