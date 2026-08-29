@@ -143,12 +143,13 @@ class Worker:
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
-        # Per-kernel trace of a window of GPU-thread executes; inert unless
-        # MSTAR_PROFILE_STEPS is set (see StepKernelTrace).
-        self._step_trace = StepKernelTrace(worker_id)
 
         if self.device.type == "cuda" and self.device.index is not None:
             torch.cuda.set_device(self.device)
+        # Per-kernel trace of a window of GPU-thread executes; inert unless
+        # MSTAR_PROFILE_STEPS is set (see StepKernelTrace). After set_device:
+        # when armed it initialises CUPTI on THIS worker's GPU up front.
+        self._step_trace = StepKernelTrace(worker_id, device=self.device)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on

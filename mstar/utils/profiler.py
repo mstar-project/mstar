@@ -83,7 +83,7 @@ class StepKernelTrace:
     window ends with a device synchronize.
     """
 
-    def __init__(self, worker_id: str) -> None:
+    def __init__(self, worker_id: str, device: "torch.device | None" = None) -> None:
         spec = os.environ.get("MSTAR_PROFILE_STEPS", "")
         self.enabled = bool(spec)
         self._n = 0
@@ -98,6 +98,19 @@ class StepKernelTrace:
             os.environ.get("MSTAR_PROFILE_DIR") or os.environ.get("TMPDIR") or "/tmp"
         )
         self.worker_id = worker_id
+        if not self.nsys and device is not None and device.type == "cuda":
+            # Load and initialise CUPTI now, on this worker's GPU, so that
+            # opening the real window mid-benchmark costs milliseconds, not
+            # the ~1 s first-time CUPTI setup that would land in one request's
+            # ITL and move the run's tok/s.
+            from torch.profiler import ProfilerActivity, profile
+
+            with torch.cuda.device(device):
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]):
+                    torch.ones(1, device=device).add_(1)
+                    torch.cuda.synchronize(device)
+            logger.info("StepKernelTrace: armed for executes %d..%d (CUPTI warm)",
+                        self.first, self.first + self.count - 1)
 
     def before_execute(self) -> None:
         if not self.enabled or self._n != self.first:
