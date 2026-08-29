@@ -29,10 +29,8 @@ class ScheduledBatch:
     node_objects: dict[str,GraphNode]
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[str, str] = None
-    # TP async scheduling: the leader's broadcast seq this batch was scheduled
-    # from (``ScheduleTPNode.spec_seq``). -1 for batches that did not come off
-    # the TP-follow FIFO. A follower keeps it on the in-flight PendingBatch so
-    # a later speculative head can be matched by ``spec_from_seq``.
+    # TP async scheduling: the ``ScheduleTPNode.spec_seq`` this batch came off
+    # the TP-follow FIFO with; -1 otherwise. A head's ``spec_from_seq`` matches it.
     tp_seq: int = -1
 
 
@@ -142,14 +140,9 @@ class MicroScheduler:
     ):
         self.tp_batches_pending_schedule.append(message)
 
-    # ---- TP-follow FIFO accessors for the follower's async-scheduling path ----
-    #
-    # A follower that mirrors the leader's speculation needs to look at the
-    # head without popping it (to decide whether it can build early), pop it
-    # once it has committed to building, and — when its own step-N verdict says
-    # the leader's speculation is void — drop or shrink the head so the serial
-    # path never tries to run a batch the leader will not run. All three keep
-    # FIFO order; none of them touches anything but the head.
+    # TP-follow FIFO accessors for the follower's async-scheduling path: peek
+    # the head to decide whether it can be built early, pop it once committed
+    # to building (or dropping) it. FIFO order is never disturbed.
 
     def peek_tp_follow(self) -> ScheduleTPNode | None:
         if not self.tp_batches_pending_schedule:
@@ -158,9 +151,6 @@ class MicroScheduler:
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         return self.tp_batches_pending_schedule.popleft()
-
-    def replace_tp_follow_head(self, message: ScheduleTPNode) -> None:
-        self.tp_batches_pending_schedule[0] = message
 
     def pop_ready_rids(
         self, worker_graphs_manager: WorkerGraphsManager,

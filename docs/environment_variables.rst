@@ -180,9 +180,12 @@ Worker scheduling
        completes. Removes the per-step serial build/plan from the group's
        critical path. Voids (allocation failure, per-rid failure, a
        continuing request without loop-back output) are derived by each
-       rank from replicated state, never signalled. ``0``: the serial
-       path — leader schedules after N, followers rebuild after the
-       broadcast.
+       rank from replicated state, never signalled. A comma-separated
+       list of node names (``thinker,talker``) enables it for those
+       parallel nodes only. ``0``: the serial path — leader schedules
+       after N, followers rebuild after the broadcast. Set it identically
+       on every rank; a follower whose leader runs without it falls back
+       to the serial protocol with a one-time warning.
    * - ``MSTAR_PRE_PLAN_SPEC``
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread

@@ -7,7 +7,7 @@ the same fakes ``test_tp_follow_targeted_gate.py`` uses:
 *all-or-nothing*. The follower rebuilds the leader's speculative head from the
 ids on the wire; if any fresh rid is not ready locally yet, NOTHING may be
 popped (the caller retries once readiness has progressed). The FIFO accessors
-(peek / pop / replace head) keep order and touch only the head. The serial
+(peek / pop head) keep order and touch only the head. The serial
 ``_try_schedule_tp_follow`` path now goes through the same pop and stamps the
 head's seq on the batch it returns.
 """
@@ -175,12 +175,8 @@ def test_fifo_accessors_touch_only_the_head_and_keep_order():
     sched.register_tp_follow(b)
 
     assert sched.peek_tp_follow() is a
-    a2 = ScheduleTPNode(NODE, WALK, ["r0"], speculative=True, spec_seq=1, spec_from_seq=0)
-    sched.replace_tp_follow_head(a2)
-    assert sched.peek_tp_follow() is a2
-    assert list(sched.tp_batches_pending_schedule) == [a2, b]
-
-    assert sched.pop_tp_follow_head() is a2
+    assert list(sched.tp_batches_pending_schedule) == [a, b]
+    assert sched.pop_tp_follow_head() is a
     assert sched.peek_tp_follow() is b
     assert sched.pop_tp_follow_head() is b
     assert sched.peek_tp_follow() is None

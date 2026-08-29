@@ -10,7 +10,7 @@ T = TypeVar("T", bound=Hashable)
 
 
 class RecentSet(Generic[T]):
-    """A set that keeps only the `maxlen` most recently added items.
+    """A set that keeps only the ``maxlen`` most recently added items.
 
     ``add`` and ``in`` are O(1). Once full, each add evicts the oldest item
     (FIFO). Re-adding a present item is a no-op and does not refresh its age.
