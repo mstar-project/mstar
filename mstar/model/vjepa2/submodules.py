@@ -1464,7 +1464,7 @@ class VJepa2MPCScorerSubmodule(NodeSubmodule):
             )
 
         costs = self._cost(predicted_hidden, goal_hidden)  # [K]
-        best = torch.argmin(costs).to(torch.int64)
+        best = torch.argmin(costs, keepdim=True).to(torch.int64)
         logger.info(
             "VJepa2MPCScorerSubmodule.forward: K=%d best=%d min_cost=%.4f max_cost=%.4f",
             int(predicted_hidden.size(0)),
