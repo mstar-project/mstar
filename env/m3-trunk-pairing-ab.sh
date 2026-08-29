@@ -298,7 +298,7 @@ run_arm() {
                 MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 MSTAR_TP_ALLREDUCE=symm_multimem \
                 MSTAR_PHASE_TIMING=200 MSTAR_GLM52_MTP_STEP_TIMING=200 ;;
     esac
-    env | grep -E '^(MSTAR_GLM52|MSTAR_TP_|MSTAR_PHASE)' | sort > "$out/env.txt"
+    env | grep -E '^(MSTAR_GLM52|MSTAR_TP_|MSTAR_PHASE|MSTAR_PROFILE)' | sort > "$out/env.txt"
     HOLD_MIN=0 bash "$D/m3-sweep2.sh" "$K"
   )
   kill "$sampler" "$clocks_sampler" 2>/dev/null
