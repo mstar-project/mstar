@@ -263,7 +263,7 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     generated, stopped = _run_generation(model, submodule, cfg, prompt_ids, MAX_TOKENS)
 
     assert stopped, "decode loop did not terminate via check_stop"
-    assert len(generated) == 1 + MAX_TOKENS, generated
+    assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
     out_bytes = model.postprocess(torch.tensor(generated), "text")
@@ -285,4 +285,4 @@ def test_serve_path_is_deterministic_fp8(tmp_path):
         for _ in range(2)
     ]
     assert runs[0] == runs[1], runs
-    assert len(runs[0]) == 1 + 5
+    assert len(runs[0]) == 5

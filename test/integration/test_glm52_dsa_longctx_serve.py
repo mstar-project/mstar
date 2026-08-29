@@ -55,7 +55,7 @@ from mstar.utils.sampling import MultiSamplingConfig, Sampler, SamplingConfig
 DEVICE = torch.device("cuda")
 TOPK = 8
 PROMPT_LEN = 6
-MAX_TOKENS = 14  # final context 6 + 14 = 20, far past topk
+MAX_TOKENS = 14  # 1 prefill + 13 decode tokens: final context 6 + 13 = 19, far past topk
 
 
 def _fill_layer(layer, cfg):
@@ -287,12 +287,12 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     # ---- (1) the sparse path serves and stops cleanly ------------------
     generated, stopped = _generate_greedy(submodule, cfg, prompt_ids, MAX_TOKENS)
     assert stopped, "decode loop did not terminate via check_stop"
-    assert len(generated) == 1 + MAX_TOKENS, generated
+    assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
     # k-store lifecycle on the real path: one row per token per FULL layer
     # (prefill 6 + one per decode forward), gone after retirement.
-    assert submodule._dsa_k_store.tokens("r0", 0) == PROMPT_LEN + MAX_TOKENS
+    assert submodule._dsa_k_store.tokens("r0", 0) == PROMPT_LEN + MAX_TOKENS - 1  # 6 prompt rows + 13 decode forwards
     assert submodule._dsa_k_store.tokens("r0", 1) == 0  # SHARED layer: none
     submodule.cleanup_request("r0")
     assert submodule._dsa_k_store.tracked_requests() == set()
