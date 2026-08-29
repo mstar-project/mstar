@@ -172,7 +172,8 @@ class CudaGraphRunner:
         # (config_idx, tensor_key) → the dim that carries the (bucket-varying)
         # seq length in that tensor's original layout. _intern_static_buffer
         # brings this dim to the front for storage (so smaller buckets reslice
-        # along dim 0) and inverts the move on return
+        # along dim 0) and inverts the move on return. Written once, by the
+        # first (largest) capture, and read by every later one — see there.
         self._static_buffer_seq_dims: dict[tuple[int, str], int] = {}
 
         # padding rows, keyed "<config_idx>_slot<slot>". Sized by the largest
@@ -478,8 +479,16 @@ class CudaGraphRunner:
         back on return, so the captured forward sees the original layout.
         """
         buf_key = (config_idx, key)
-        seq_dim = self._seq_dim(value, seq_len) if seq_len is not None else 0
-        self._static_buffer_seq_dims[buf_key] = seq_dim
+        if seq_len is None:
+            seq_dim = 0
+        elif buf_key in self._static_buffer_seq_dims:
+            # settled by the first (largest) capture. `_seq_dim` matches on
+            # size, so a smaller bucket's seq_len can collide with another axis
+            # — and the buffer is shared, so its layout cannot vary anyway
+            seq_dim = self._static_buffer_seq_dims[buf_key]
+        else:
+            seq_dim = self._seq_dim(value, seq_len)
+            self._static_buffer_seq_dims[buf_key] = seq_dim
         stored = value.movedim(seq_dim, 0) if seq_dim != 0 else value
         shared = self._shared_static_buffers.get(buf_key)
         if shared is None:
