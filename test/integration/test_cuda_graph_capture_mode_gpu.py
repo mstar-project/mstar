@@ -47,7 +47,9 @@ def _capture_under_foreign_syncs(mode: str) -> torch.Tensor:
             except BaseException as e:  # noqa: BLE001 — recorded, asserted below
                 errors.append(e)
 
-    x = torch.ones(1024, 1024, device=device)
+    # Contraction x = 0.5*I: y <- y@x + 1 converges to 2.0 from any start, so a
+    # 2000-iteration captured body stays finite and its replay is checkable.
+    x = torch.eye(1024, device=device) * 0.5
     static_in = torch.zeros_like(x)
     t = threading.Thread(target=_foreign, daemon=True)
     t.start()
@@ -66,7 +68,7 @@ def _capture_under_foreign_syncs(mode: str) -> torch.Tensor:
         static_in.copy_(torch.full_like(x, 0.5))
         g.replay()
         torch.cuda.synchronize()
-        return y.sum()
+        return y
     finally:
         stop.set()
         t.join(timeout=10)
@@ -81,7 +83,8 @@ def test_runner_captures_in_thread_local_mode():
 
 def test_capture_survives_foreign_thread_cuda_calls():
     out = _capture_under_foreign_syncs("thread_local")
-    assert torch.isfinite(out).all()
+    # replayed with the static input rewritten to 0.5: the fixed point is 2.0
+    assert torch.allclose(out, torch.full_like(out, 2.0)), out.flatten()[:4]
 
 
 def test_global_mode_is_broken_by_foreign_thread_cuda_calls():
