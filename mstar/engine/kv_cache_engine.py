@@ -414,7 +414,30 @@ class KVCacheEngine(BaseEngine):
         # startup, one rank will OOM while another won't and the next
         # NCCL collective will hang. The check is one ``all_gather`` of
         # a scalar per shared cache, fired once.
+        self._verify_shared_kv_caches_stay_in_one_tp_group()
         self._verify_tp_kv_symmetry()
+
+    def _verify_shared_kv_caches_stay_in_one_tp_group(self) -> None:
+        """A KV cache shared by several nodes must stay within one TP group.
+        Every per-step verdict on the TP path (admission, OOM, and under
+        ``MSTAR_TP_ASYNC_SCHED`` "is the speculated step void") is derived per
+        rank from allocator state assumed identical across the group; a node
+        outside the group mutates it asymmetrically and the next collective
+        hangs. Structural half of ``_verify_tp_kv_symmetry``; runs at warmup."""
+        users: dict[int, list[tuple[str, CommGroup]]] = {}
+        for node_name, submod_mgmt in self.submodule_management.items():
+            users.setdefault(id(submod_mgmt.kv_management), []).append(
+                (node_name, submod_mgmt.tp_group)
+            )
+        for members in users.values():
+            if all(group.world_size == 1 for _, group in members):
+                continue
+            if len({tuple(group.group_members) for _, group in members}) > 1:
+                raise RuntimeError(
+                    "KV cache shared across TP groups: "
+                    + ", ".join(f"{name} (ranks {group.group_members})" for name, group in members)
+                    + ". Give each group its own cache or put the nodes in the same group."
+                )
 
     def _verify_tp_kv_symmetry(self) -> None:
         """Assert ``num_free_pages`` is identical across every TP rank
