@@ -978,13 +978,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             out[rid] = rid_out
         return out
 
-    def get_needed_cache_labels(
-        self,
-        graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str]:
-        return ["main"]
-
     def postprocess(
         self, request_id: str,
         request_info: CurrentForwardPassInfo,

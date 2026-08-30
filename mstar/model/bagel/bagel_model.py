@@ -40,7 +40,7 @@ from PIL import Image
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -648,7 +648,8 @@ class BagelModel(Model):
         ]
 
     def get_request_resource_configs(
-        self, model_kwargs: dict | None = None,
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource knobs a new request is opened with.
 
@@ -661,7 +662,7 @@ class BagelModel(Model):
         from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
 
         model_kwargs = model_kwargs or {}
-        cfg = self._requires_cfg_for(model_kwargs)
+        cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.requires_cfg
         sampling = self.get_sampling_config("LLM", model_kwargs)
         return {
             # The KV resource reads this in admit_retrieve, to know which of a
@@ -681,18 +682,6 @@ class BagelModel(Model):
                 repetition_penalty=sampling.repetition_penalty,
             ),
         }
-
-    def _requires_cfg_for(self, model_kwargs: dict) -> bool:
-        """``_requires_cfg`` over a partial kwargs dict.
-
-        ``get_request_resource_configs`` runs on whatever the caller supplied,
-        so the guidance keys may be absent; absent means off.
-        """
-        return self._requires_cfg(
-            target_output=model_kwargs.get("target_output"),
-            cfg_img_scale=model_kwargs.get("cfg_img_scale", 0.0),
-            cfg_text_scale=model_kwargs.get("cfg_text_scale", 0.0),
-        )
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,

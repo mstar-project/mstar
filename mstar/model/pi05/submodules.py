@@ -364,13 +364,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         """
         return True
 
-    def get_needed_cache_labels(
-        self,
-        graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str] | None:
-        return ["main"]
-
     def _get_timestep_emb_fraction(self) -> torch.Tensor:
         if self._fraction is not None:
             return self._fraction

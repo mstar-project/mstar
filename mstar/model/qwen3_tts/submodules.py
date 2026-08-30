@@ -769,14 +769,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             return False
         return super().can_use_cuda_graphs(batch, model_inputs)
 
-    def get_needed_cache_labels(
-        self,
-        graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str]:
-        del graph_walk, per_request_info
-        return ["main"]
-
 
 # ===========================================================================
 # 2. CodecSubmodule - fixed-shape streaming waveform decode

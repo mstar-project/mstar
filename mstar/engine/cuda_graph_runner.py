@@ -273,7 +273,14 @@ class CudaGraphRunner:
 
         slot_specs = self.prepare_for_capture()
 
+        # bucket -> slot index -> (spec, captured slot). Registration is
+        # deferred to a whole bucket at a time: its slots are double buffers of
+        # one shape, so a bucket holding only some of them would silently hand
+        # pre-plan and replay the same buffers.
+        captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, CudaGraphSlot]]] = {}
         for spec in slot_specs:
+            # every rank barriers once per spec, pass or fail — a rank that
+            # stopped early here would leave the others waiting
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
 
@@ -286,18 +293,27 @@ class CudaGraphRunner:
                 )
                 continue
 
-            for key_spec in [spec, *self._get_addtl_slot_specs(spec)]:
-                self._register_slot(key_spec, slot)
+            captured.setdefault(spec.bucket, {})[spec.slot] = (spec, slot)
 
-            # pre-seed preplan inputs
+        for bucket_key, slots in captured.items():
+            if len(slots) != self._num_slots:
+                logger.warning(
+                    "Dropping CUDA graph bucket %s for %s: captured %d of %d "
+                    "slots, and a partial bucket cannot double-buffer",
+                    bucket_key, self._submodule_name, len(slots), self._num_slots,
+                )
+                continue
+            # by slot index, so a bucket's list position is its slot index
+            for slot_idx in sorted(slots):
+                spec, slot = slots[slot_idx]
+                for key_spec in [spec, *self._get_addtl_slot_specs(spec)]:
+                    self._register_slot(key_spec, slot)
             if self._num_slots > 1:
-                # can preplan
-                self.declare_inputs_for(SlotLease(
-                    slot=slot,
-                    bucket=spec.bucket
-                ))
+                # pre-seed preplan inputs; cached per bucket, so once is enough
+                self.declare_inputs_for(SlotLease(slot=0, bucket=bucket_key))
             logger.info(
-                "Captured CUDA graph for %s: %s", self._submodule_name, spec
+                "Captured CUDA graph for %s: %s (%d slots)",
+                self._submodule_name, bucket_key, len(slots),
             )
 
         mem_after = torch.cuda.memory_allocated(self._device)
@@ -309,9 +325,8 @@ class CudaGraphRunner:
             bucket = self._buckets[spec.bucket] = CudaGraphBucket(
                 config=spec.config, config_idx=spec.config_idx,
             )
-        # slots are captured in index order within a bucket, so append keeps
-        # list position == slot index; a failed capture drops the whole bucket
-        # slot rather than leaving a hole
+        # the caller registers a bucket's slots in index order, and only once
+        # all of them captured, so append keeps list position == slot index
         bucket.slots.append(slot)
 
     def _log_memory(self, mem_before: int, mem_after: int):
@@ -628,6 +643,8 @@ class CudaGraphRunner:
         # walk would build them fresh at replay instead of reusing the ones the
         # graph recorded addresses for — see `_get_addtl_slot_specs`.
         return SlotLease(
+            # a registered bucket always holds `_num_slots` slots — a partial
+            # capture is dropped whole — so this agrees with `_next_slot`'s wrap
             slot=slot % len(bucket.slots),
             bucket=replace(key, graph_walk=bucket.config.capture_graph_walk),
         )

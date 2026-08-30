@@ -28,6 +28,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome
 from mstar.model.submodule_base import (
     LazyRequestStates,
     ModelInputsFromEngine,
@@ -483,6 +484,17 @@ class Engine:
             )
 
         try:
+            admit, batch.step = self._declare_and_admit(
+                # padded: `inputs` was padded to the bucket above, and the
+                # model declares one segment per row it will run
+                batch, rids=batch.step_context.padded_request_ids, inputs=inputs,
+                submodule=submodule_mgmt.submodule,
+                ctx=batch.step_context,
+                nvtx=self._enable_nvtx, step=batch.step
+            )
+            if not admit.ok:
+                return {rid: {} for rid in batch.request_ids}
+
             raw, batch.step = self._drive_step(
                 batch, submodule_mgmt, batch.request_ids, inputs, req_info,
                 batch.step_context, lease, batch.running_batched,
@@ -519,26 +531,40 @@ class Engine:
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
-        merged: dict[str, NameToTensorList] = {}
+        merged: dict[str, NameToTensorList] = {rid: {} for rid in batch.request_ids}
         launched = False
+
+        # Step 1: loop through all of the requests for admit errors
+        steps: dict[str, SubmoduleStep] = {}
+        ctxs: dict[str, StepContext] = {}
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
-            req_info = {rid: batch.per_request_info[rid]}
-            ctx = StepContext(
+            ctxs[rid] = StepContext(
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
                 slot=0, capture=False,
             )
+            admit_outcome, steps[rid] = self._declare_and_admit(
+                batch, rids=[rid], inputs=[inp],
+                submodule=submodule_mgmt.submodule,
+                ctx=ctxs[rid], nvtx=nvtx
+            )
+            if not admit_outcome.ok:
+                return merged
+
+        # Step 2: drive step, plan -> forward -> commit loop
+        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
+            req_info = {rid: batch.per_request_info[rid]}
             if nvtx:
                 range_push(f"engine.per_request.{rid}")
             try:
                 raw, _ = self._drive_step(
-                    batch, submodule_mgmt, [rid], [inp], req_info, ctx,
+                    batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
                     lease=None, running_batched=False,
-                    step=None, set_launch=not launched,
+                    step=steps[rid], set_launch=not launched,
                 )
                 if raw is None:
                     merged[rid] = {}
-                    break
+                    continue
                 launched = True
                 merged.update(self._collect_outputs(
                     submodule_mgmt, None, raw, [inp], req_info,
@@ -549,6 +575,48 @@ class Engine:
                     range_pop()
         batch.commit_done.set()
         return merged
+
+    def _declare_and_admit(
+        self,
+        batch: ExecutingBatch,
+        rids: list[str],
+        inputs: list[NodeInputs],
+        submodule: NodeSubmodule,
+        nvtx: bool,
+        ctx: StepContext,
+        step: SubmoduleStep | None=None,
+    ) -> tuple[AdmitOutcome, SubmoduleStep]:
+        if step is None:
+            if nvtx:
+                range_push("engine.declare_step")
+            try:
+                step = submodule.declare_step(
+                    graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
+                )
+            finally:
+                if nvtx:
+                    range_pop()
+        if step is None:
+            # the submodule declared no step (a node owning no resources);
+            # there is nothing to admit, and the forward still runs
+            return ADMIT_OK, None
+        # admit reads the step's ctx, so bind it before the sweep rather than
+        # in `_drive_step`
+        step.set_ctx(ctx)
+
+        if nvtx:
+            range_push("engine.admit")
+        try:
+            admit_outcome = self._runner.admit(step)
+        finally:
+            if nvtx:
+                range_pop()
+
+        if not admit_outcome.ok:
+            batch.register_admit_error(
+                admit_outcome.reason, admit_outcome.failed_resource,
+            )
+        return admit_outcome, step
 
     def _drive_step(
         self,
@@ -574,17 +642,6 @@ class Engine:
         submodule = submodule_mgmt.submodule
         rids = list(ctx.padded_request_ids)
 
-        if step is None:
-            if nvtx:
-                range_push("engine.declare_step")
-            try:
-                step = submodule.declare_step(
-                    graph_walk=ctx.graph_walk, request_ids=rids, inputs=inputs,
-                )
-            finally:
-                if nvtx:
-                    range_pop()
-
         if step is not None:
             if lease is not None and step.cg_key_info != lease.bucket.cg_key_info:
                 # The slot was leased from `cg_key_info` before the step was
@@ -597,21 +654,8 @@ class Engine:
                     "cg_key_info() and declare_step disagree"
                 )
             step.set_ctx(ctx)
-            # TODO: skip the resources a pre-plan already admitted and planned.
-            # They no-op (and promote) internally today, so this re-drives the
-            # whole sweep to get the rest.
-            if nvtx:
-                range_push("engine.admit")
-            try:
-                admit_outcome = self._runner.admit(step)
-            finally:
-                if nvtx:
-                    range_pop()
-            if not admit_outcome.ok:
-                batch.register_admit_error(
-                    admit_outcome.reason, admit_outcome.failed_resource,
-                )
-                return None, step
+
+            # Admit was already done, can move on straight to plan
             if nvtx:
                 # promoted = a pre-plan was consumed; fresh = planned inline
                 range_push(

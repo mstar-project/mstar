@@ -293,13 +293,6 @@ class HiggsAudioLLMSubmodule(ARNodeSubmodule):
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    def get_needed_cache_labels(
-        self,
-        graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str]:
-        return ["main"]
-
     def postprocess(
         self,
         request_id: str,

@@ -18,42 +18,7 @@ class CurrentForwardConductorMetadata:
     kwargs: dict = field(default_factory=dict)
 
 
-# @dataclass
-# class SequenceInfo:
-#     seq_len: int
-#     pos_id: int
-
-#     # for tracking KV cache
-#     latest_kv_transfer_info: Any
-#     page_indices: list[int] = field(default_factory=list)
-
-
-# @dataclass
-# class PerLabelSeqInfo:
-#     # {(kv_cache_string,  rank) -> {label: SequenceInfo}}
-#     info: dict[tuple[str, int], dict[str, SequenceInfo]] = field(default_factory=dict)
-
-#     # kv cache str -> TP world size
-#     world_size: dict[str, int] = field(default_factory=dict)
-
-#     def update(self, other: "PerLabelSeqInfo"):
-#         for key, val in other.info.items():
-#             if key not in self.info:
-#                 self.info[key] = val
-#                 continue
-#             self.info[key] = {
-#                 **self.info[key],
-#                 **val
-#             }
-
-#     def get(self, kv_cache_str: str, rank: int) -> dict:
-#         return self.info.get((kv_cache_str, rank), {})
-
-#     def add(self, kv_cache_str: str, rank: int, world_size: int, cache_info: dict[str, SequenceInfo]):
-#         self.update(PerLabelSeqInfo(
-#             info={(kv_cache_str, rank): cache_info}
-#         ))
-#         self.world_size[kv_cache_str] = world_size
+DEFAULT_PARTITION = "default"
 
 
 @dataclass
@@ -80,7 +45,7 @@ class CurrentForwardPassInfo:
 
     # per_label_seq_info DEPRECATED
     # per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
-    partition_name: str = field(default="default")
+    partition_name: str = field(default=DEFAULT_PARTITION)
 
     # Per-loop stop indices; stop decisions come from each submodule's check_stop.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)

@@ -12,7 +12,7 @@ from mstar.engine.resources.sampler.config import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
+from mstar.engine.resources.step import StepContext
 
 
 class SamplerResource(Resource):
@@ -134,17 +134,8 @@ class SamplerResource(Resource):
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
-    def admit(self, step: SamplerStep, ctx: StepContext) -> AdmitOutcome:
-        """Settle this step's two penalty flags. Reserves nothing.
-
-        Both are read by `plan`, `commit` and `sample`, all of which run on the
-        non-preplan path — and `_drive_step` orders `admit` ahead of them, after
-        the previous step's `commit`. So one pair of flags is always the right
-        one and needs no preplan twin the way `_cg_sampler` does; the preplan
-        path only reaches `gather_static`, which never touches the mask.
-
-        Latching here rather than reading `_penalty_live` at each use also keeps
-        one step internally consistent when a request is removed mid-step.
+    def _set_penalty_flags(self, step: SamplerStep, ctx: StepContext):
+        """Settle this step's two penalty flags.
         """
         if not ctx.is_preplan:
             self._apply_penalty_this_step = (
@@ -156,7 +147,6 @@ class SamplerResource(Resource):
             if __debug__ and self._apply_penalty_this_step \
                     and not self._penalty_needed_this_step:
                 self._assert_penalty_inert(ctx)
-        return ADMIT_OK
 
     def _assert_penalty_inert(self, ctx: StepContext) -> None:
         """Skipping the mask is sound only while every penalty in the step is 1.0.
@@ -185,11 +175,7 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler = None
 
     def plan(self, step: SamplerStep, ctx: StepContext):
-        # The flags themselves are settled in `admit`. Recording prompt tokens
-        # is only worth it while something reads the mask: a request at penalty
-        # 1.0 whose prompt went unrecorded is unaffected, and a penalised
-        # request is resident (so `_penalty_live` is set) before its own prefill
-        # declares these tokens.
+        self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)

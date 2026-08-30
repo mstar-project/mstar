@@ -589,12 +589,14 @@ class Qwen3TTSModel(Model):
     # -----------------------------------------------------------------------
 
     def get_request_resource_configs(
-        self, model_kwargs: dict | None = None,
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         """Per-request sampling: Talker head (group 0) + CodePredictor (1-15).
 
         The CodePredictor's ``subtalker_*`` knobs drive its own sampler
         resource; ``*_dosample=False`` maps to temperature 0 (greedy)."""
+        del partition_fwd_args
         model_kwargs = model_kwargs or {}
         generation = self.config.generation
         do_sample = model_kwargs.get("do_sample", generation.do_sample)

@@ -8,6 +8,7 @@ import yaml
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
+    DEFAULT_PARTITION,
     CurrentForwardConductorMetadata,
     PartitionDefinition,
     StreamingConnectionState,
@@ -27,7 +28,6 @@ from mstar.graph.base import (
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
-
 
 @dataclass
 class TensorAndMetadata:
@@ -258,7 +258,7 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
-        partition = "default"
+        partition = DEFAULT_PARTITION
         for part in self.get_partitions():
             if graph_walk in part.graph_walks:
                 partition = part.name
@@ -368,7 +368,9 @@ class Model(ABC):
         pass
 
     def get_request_resource_configs(
-        self, model_kwargs: dict | None = None,
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         """Per-resource config a new request is opened with, by resource label.
 
@@ -376,7 +378,7 @@ class Model(ABC):
         CFG, retention. The conductor resolves this once per request and the
         engine hands each config to its resource at ingest.
         """
-        del model_kwargs
+        del model_kwargs, partition_fwd_args
         return {}
 
     def get_sampling_config(
@@ -550,7 +552,7 @@ class Model(ABC):
         """
         from mstar.streaming.topology import PartitionTopology
 
-        return PartitionTopology(partitions=["default"], connections=[])
+        return PartitionTopology(partitions=[DEFAULT_PARTITION], connections=[])
 
     def get_partitions(self) -> list[PartitionDefinition]:
         """Return partition definitions.
@@ -561,7 +563,7 @@ class Model(ABC):
         walks = set(self.get_graph_walk_graphs().keys())
         return [
             PartitionDefinition(
-                name="default",
+                name=DEFAULT_PARTITION,
                 graph_walks=walks,
                 initial_walk=None,
                 producer_partitions=[],

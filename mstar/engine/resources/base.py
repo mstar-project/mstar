@@ -97,6 +97,11 @@ class Resource(ABC):
     # Step lifecycle
 
     def admit(self, step: ResourceStep, ctx: StepContext) -> AdmitOutcome:
+        """
+        Reserve space for the given step. In the case where requests in a batch must
+        be executed sequentially, this may be called for all requests in a loop
+        before the per-request plan -> forward -> commit cycle.
+        """
         return ADMIT_OK
 
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:

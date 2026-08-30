@@ -604,12 +604,6 @@ class LLMSubmodule(ARNodeSubmodule):
             ),
         ]
 
-    def get_needed_cache_labels(
-        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str] | None:
-        cfg = any([info.requires_cfg for info in per_request_info.values()])
-        return self._get_active_labels(graph_walk, cfg)
-
     def _get_active_labels(self, graph_walk: str, cfg: bool):
         return active_labels(graph_walk, cfg, self.node_name)
 

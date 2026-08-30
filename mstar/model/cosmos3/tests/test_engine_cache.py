@@ -326,7 +326,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
         )
         for spec in specs
     }
-    overrides = model.get_request_resource_configs()
+    overrides = model.get_request_resource_configs(partition_fwd_args={})
     runner = StepRunner(resources)
     for rid in rids:
         runner.ingest_request(rid, overrides)

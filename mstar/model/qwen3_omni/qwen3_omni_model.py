@@ -248,8 +248,10 @@ class Qwen3OmniModel(Model):
         ]
 
     def get_request_resource_configs(
-        self, model_kwargs: dict | None = None,
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
         model_kwargs = model_kwargs or {}
 
         return {

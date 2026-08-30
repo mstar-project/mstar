@@ -245,7 +245,9 @@ class Cosmos3Model(Model):
         return specs
 
     def get_request_resource_configs(
-        self, model_kwargs: dict | None = None,
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         """Which cache labels a request is opened with.
 
@@ -254,7 +256,7 @@ class Cosmos3Model(Model):
         ``process_prompt`` resolves), and naming a label a request never
         writes costs nothing — labels are created on first write.
         """
-        del model_kwargs
+        del partition_fwd_args, model_kwargs
         return {
             KV_CACHE: KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL]),
         }

@@ -112,7 +112,7 @@ def test_wan22_declares_no_engine_resources():
     """Nothing here is cached across steps, so the engine builds nothing."""
     model = _make_model()
     assert model.get_node_resources() == []
-    assert model.get_request_resource_configs() == {}
+    assert model.get_request_resource_configs(partition_fwd_args={}) == {}
 
 
 def test_wan22_submodules_route_through_forward_batched():

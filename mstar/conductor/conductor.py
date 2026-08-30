@@ -324,7 +324,8 @@ class Conductor:
         )
 
     def _get_resource_configs(
-        self, model_kwargs: dict
+        self, model_kwargs: dict,
+        partition_fwd_args: dict[str, ForwardPassArgs]
     ) -> dict[str, ResourceReqConfig]:
         """The per-resource config each new request is opened with.
 
@@ -332,7 +333,9 @@ class Conductor:
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
         """
-        return self.model.get_request_resource_configs(model_kwargs)
+        return self.model.get_request_resource_configs(
+            partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
+        )
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
@@ -664,6 +667,12 @@ class Conductor:
                 edge_name=conn.edge_name,
             )
 
+        # Collect all worker_graph_ids per worker for the NewRequest
+        worker_to_worker_graph_ids: dict[str, list[str]] = defaultdict(list)
+        for wg_id, worker_ids in worker_graph_to_workers.items():
+            for worker_id in worker_ids:
+                worker_to_worker_graph_ids[worker_id].append(wg_id)
+
         request_data = RequestData(
             persist_signals=body.initial_signals,
             persist_signal_ref_cnt={},
@@ -674,19 +683,11 @@ class Conductor:
             partition_states=partition_states,
             partition_definitions=partition_definitions,
             streaming_connections=streaming_connections,
-            resource_configs=self._get_resource_configs(model_kwargs),
+            resource_configs={},
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
         )
-        for cfg in request_data.resource_configs.values():
-            cfg.apply_conductor_config(seed=seed)
         self.requests[body.request_id] = request_data
-
-        # Collect all worker_graph_ids per worker for the NewRequest
-        worker_to_worker_graph_ids: dict[str, list[str]] = defaultdict(list)
-        for wg_id, worker_ids in worker_graph_to_workers.items():
-            for worker_id in worker_ids:
-                worker_to_worker_graph_ids[worker_id].append(wg_id)
 
         # Kick off all partitions by calling get_initial_forward_pass_args per partition
         partition_fwd_args: dict[str, ForwardPassArgs] = {}
@@ -708,6 +709,14 @@ class Conductor:
                 body.request_id, p.name, fwd_args.full_metadata.graph_walk,
             )
             partition_fwd_args[p.name] = fwd_args
+
+        # after the initial fwd args: the configs are derived from them (BAGEL
+        # reads `requires_cfg` off the metadata the model just settled)
+        request_data.resource_configs = self._get_resource_configs(
+            model_kwargs, partition_fwd_args
+        )
+        for cfg in request_data.resource_configs.values():
+            cfg.apply_conductor_config(seed=seed)
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():

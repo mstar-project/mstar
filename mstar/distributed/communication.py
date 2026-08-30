@@ -264,6 +264,7 @@ class WorkerParallelGroups:
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
+            device_id=self.global_rank,
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
