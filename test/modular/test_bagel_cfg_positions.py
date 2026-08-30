@@ -192,3 +192,68 @@ def test_published_positions_travel_to_a_branch_on_another_node(harness):
     remote.rope.admit_retrieve(RID, "LLM_cfg_text", "image_gen_cfg", published)
 
     assert remote.positions() == harness.positions()
+
+
+# --- the forward and its declaration must read guidance the same way -------
+
+
+def _decode_capture_inputs(cfg_on: bool):
+    """The template rows a decode capture hands declare_step and preprocess."""
+    stub = types.SimpleNamespace(
+        PREFILL_TEXT_TOKEN_BUCKETS=LLMSubmodule.PREFILL_TEXT_TOKEN_BUCKETS,
+        PREFILL_TEXT_CAPTURE_BATCH_SIZES=(
+            LLMSubmodule.PREFILL_TEXT_CAPTURE_BATCH_SIZES
+        ),
+    )
+    configs = LLMSubmodule.get_cuda_graph_configs(stub, torch.device("cuda"))
+    config = next(
+        c for c in configs
+        if getattr(c, "capture_graph_walk", None) == "decode"
+        and c.additional_key_info is cfg_on
+    )
+    return config.get_node_inputs(1, 1)
+
+
+def _llm_stub():
+    """Everything `declare_step` and `preprocess` read off the submodule."""
+    return types.SimpleNamespace(
+        node_name="LLM",
+        CFG_BATCHED_LABEL=LLMSubmodule.CFG_BATCHED_LABEL,
+        _get_active_labels=lambda walk, cfg: active_labels(walk, cfg, "LLM"),
+        _batch_get_requires_cfg=LLMSubmodule._batch_get_requires_cfg.__get__(
+            object()
+        ),
+    )
+
+
+@pytest.mark.parametrize("cfg_on", [False, True], ids=["cfg_off", "cfg_on"])
+def test_capture_declares_and_forwards_the_same_guidance(cfg_on):
+    """The regression: `preprocess` read guidance off `per_request_info`, but
+    a capture passes `dummy_metadata` (always guidance-off) alongside template
+    rows that do carry it. So the cfg-on decode graph was recorded running the
+    cfg-off forward, under a step that declared the guidance branches.
+    """
+    submodule = _llm_stub()
+    inputs = _decode_capture_inputs(cfg_on)
+    assert any(bool(i.resource_step_info) for i in inputs) is cfg_on, (
+        "the capture template no longer carries the guidance flag"
+    )
+
+    step = LLMSubmodule.declare_step(submodule, "decode", [RID], inputs)
+    forwarded = LLMSubmodule.preprocess(
+        submodule, graph_walk="decode",
+        engine_inputs=types.SimpleNamespace(
+            # exactly what capture passes: `dummy_metadata`, always guidance-off
+            per_request_info={
+                RID: types.SimpleNamespace(
+                    step_metadata={}, requires_cfg=False,
+                )
+            },
+        ),
+        inputs=inputs,
+    )
+
+    assert step.cg_key_info is cfg_on, "the declaration lost the bucket's key"
+    assert forwarded["requires_cfg"] is cfg_on, (
+        "the forward disagrees with the step it was declared under"
+    )

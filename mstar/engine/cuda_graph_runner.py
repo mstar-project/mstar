@@ -294,6 +294,11 @@ class CudaGraphRunner:
                 continue
 
             captured.setdefault(spec.bucket, {})[spec.slot] = (spec, slot)
+            if  len(captured[spec.bucket]) == self._num_slots:
+                logger.info(
+                    "Captured CUDA graph for %s: %s (%d slots)",
+                    self._submodule_name, spec.bucket, self._num_slots
+                )
 
         for bucket_key, slots in captured.items():
             if len(slots) != self._num_slots:
@@ -311,10 +316,6 @@ class CudaGraphRunner:
             if self._num_slots > 1:
                 # pre-seed preplan inputs; cached per bucket, so once is enough
                 self.declare_inputs_for(SlotLease(slot=0, bucket=bucket_key))
-            logger.info(
-                "Captured CUDA graph for %s: %s (%d slots)",
-                self._submodule_name, bucket_key, len(slots),
-            )
 
         mem_after = torch.cuda.memory_allocated(self._device)
         self._log_memory(mem_before, mem_after)

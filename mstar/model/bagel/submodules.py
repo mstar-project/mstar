@@ -60,6 +60,16 @@ NODE_TO_CFG_LABEL = {
 }
 
 
+def requires_cfg_for_inputs(inputs: list) -> bool:
+    """Whether this batch runs the guidance branches, read off the rows.
+
+    `prepare_inputs` stamps it per request and a capture's template rows carry
+    it too, so this answers for a replay and for the capture that recorded it —
+    which the per-request info cannot (capture passes `dummy_metadata`).
+    """
+    return any(bool(inp.resource_step_info) for inp in inputs)
+
+
 def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     """Cache labels a node touches on this walk.
 
@@ -708,7 +718,7 @@ class LLMSubmodule(ARNodeSubmodule):
         ``NodeInputs.resource_step_info`` from ``prepare_inputs`` rather than
         being read off the batch here.
         """
-        requires_cfg = any(bool(inp.resource_step_info) for inp in inputs)
+        requires_cfg = requires_cfg_for_inputs(inputs)
         labels = self._get_active_labels(graph_walk, requires_cfg)
         spans = tuple(inp.input_seq_len for inp in inputs)
 
@@ -832,9 +842,10 @@ class LLMSubmodule(ARNodeSubmodule):
         # Concatenate lists of tensors into single tensors for each input name
         result = ARNodeInputs.collate(inputs, stacking_method=StackingMethod.CAT)
         result["seq_lens"] = [inp.input_seq_len for inp in inputs]
-        result["requires_cfg"] = self._batch_get_requires_cfg(
-            engine_inputs.per_request_info
-        )
+        # Off the inputs, the same way `declare_step` reads it, so the forward
+        # and the step it was declared under cannot disagree during capture, which
+        # passes in dummy metadata
+        result["requires_cfg"] = requires_cfg_for_inputs(inputs)
         result["sample_token"] = any([
             info.step_metadata.get("sample_prefill_token", True) \
                 for info in engine_inputs.per_request_info.values()
