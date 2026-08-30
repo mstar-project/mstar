@@ -662,7 +662,7 @@ class BagelModel(Model):
         from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
 
         model_kwargs = model_kwargs or {}
-        cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.requires_cfg
+        cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
         sampling = self.get_sampling_config("LLM", model_kwargs)
         return {
             # The KV resource reads this in admit_retrieve, to know which of a
@@ -945,7 +945,7 @@ class BagelModel(Model):
     ) -> dict:
         return {
             "is_prefill": full_metadata.is_prefill,
-            "requires_cfg": full_metadata.requires_cfg,
+            "requires_cfg": full_metadata.kwargs["requires_cfg"],
             "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
             "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
             "cfg_interval": full_metadata.kwargs["cfg_interval"],
@@ -1095,12 +1095,12 @@ class BagelModel(Model):
             "think_mode": think_mode,
             **params,  # CFG params  + gen width / height
         }
+        kwargs["requires_cfg"] = self._requires_cfg(**kwargs)
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk=first_graph_walk,
             is_prefill=bool(schedule),
-            requires_cfg=self._requires_cfg(**kwargs),
             kwargs=kwargs,
         )
         step_metadata =  self._get_step_metadata(full_metadata)

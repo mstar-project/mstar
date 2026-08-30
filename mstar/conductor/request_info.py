@@ -14,7 +14,6 @@ class CurrentForwardConductorMetadata:
     is_prefill: bool
     input_modalities: list[str] = field(default_factory=list)
     output_modalities: list[str] = field(default_factory=list)
-    requires_cfg: bool = field(default=False)
     kwargs: dict = field(default_factory=dict)
 
 
