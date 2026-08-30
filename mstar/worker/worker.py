@@ -303,6 +303,13 @@ class Worker:
                 worker_id, tp_async_on,
                 "follower" if self.is_tp_follower else "leader",
             )
+        elif self.tp_async_sched and self.parallel_nodes:
+            logger.warning(
+                "Worker %s: MSTAR_TP_ASYNC_SCHED=%r names none of this worker's "
+                "parallel nodes %s; running the serial protocol",
+                worker_id, os.environ.get("MSTAR_TP_ASYNC_SCHED"),
+                sorted(self.parallel_nodes),
+            )
 
         self.scheduler = MicroScheduler(
             self.engine_manager,
@@ -1406,6 +1413,30 @@ class Worker:
         return self.tp_async_sched and (
             self.tp_async_nodes is None or node_name in self.tp_async_nodes
         )
+
+    def _verify_tp_async_sched_agrees(self) -> None:
+        """Every rank of a lockstep instance must run the same protocol for
+        its node. The flag is per-rank env, and a mismatch is not a graceful
+        fallback: a follower waits for a decision the leader never sends, or
+        the leader submits a head the serial follower cannot build. One
+        all_gather of a scalar per parallel node, at startup."""
+        for node in sorted(self.parallel_nodes):
+            local = torch.tensor(
+                [int(self._tp_async_for(node))], dtype=torch.int64, device=self.device,
+            )
+            for group in (
+                self.parallel_groups.get_tp_config_for_node(node),
+                self.parallel_groups.get_sp_config_for_node(node),
+            ):
+                if group.world_size == 1:
+                    continue
+                values = group.all_gather(local, dim=0).cpu().tolist()
+                if any(v != values[0] for v in values):
+                    raise RuntimeError(
+                        f"MSTAR_TP_ASYNC_SCHED disagrees across the ranks of {node!r} "
+                        f"(ranks {group.group_members}: async={values}); set it "
+                        "identically on every rank of the instance."
+                    )
     def _is_tp_lead_pending(self, pending: PendingBatch) -> bool:
         """True when ``pending`` is a lockstep-parallel batch this worker LEADS
         under TP async scheduling (callers have already checked
@@ -2523,6 +2554,7 @@ class Worker:
         # reaches warmup at the same wall-clock instant, so subgroup
         # bootstrap completes within the retry budget.
         self.parallel_groups.barrier_all()
+        self._verify_tp_async_sched_agrees()
 
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
