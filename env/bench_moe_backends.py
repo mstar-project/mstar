@@ -179,7 +179,7 @@ def main():
         ref = R.fused_experts_fp8(x, w1, w2, w1s, w2s, tw, tid, block_size=(BLOCK, BLOCK))
         assert ref.shape == (T, H) and ref.dtype == torch.bfloat16
 
-        def mstar():
+        def mstar(x=x, w1=w1, w2=w2, w1s=w1s, w2s=w2s, tw=tw, tid=tid):
             R.fused_experts_fp8(x, w1, w2, w1s, w2s, tw, tid, block_size=(BLOCK, BLOCK))
 
         # ---- FlashInfer ------------------------------------------------
@@ -201,7 +201,7 @@ def main():
             fc1s = w1s if name == "w13" else swap_halves(w1s)
             variants[name] = (fc1.contiguous(), fc1s.contiguous())
 
-        def fi_call(fc1, fc1s, out):
+        def fi_call(fc1, fc1s, out, *, x=x, tid_fi=tid_fi, tw_fi=tw_fi, w2=w2, w2s=w2s, T=T, ws=ws):
             r = cutlass_fused_moe(
                 input=x,
                 token_selected_experts=tid_fi,
@@ -237,7 +237,7 @@ def main():
         print(f"  -> matching layout: {best}  (ref |max|={results[best]['ref_absmax']:.4g})")
         fc1, fc1s = variants[best]
 
-        def fi():
+        def fi(fc1=fc1, fc1s=fc1s, out_buf=out_buf):
             fi_call(fc1, fc1s, out_buf)
 
         # ---- timings ---------------------------------------------------
@@ -266,7 +266,8 @@ def main():
                 mod = get_cutlass_fused_moe_module("90")
                 ml_out = torch.empty(T * E, H, device=dev, dtype=torch.bfloat16)
 
-                def fi_ml():
+                def fi_ml(mod=mod, ml_out=ml_out, x=x, tid_fi=tid_fi, tw_fi=tw_fi, fc1=fc1,
+                          w2=w2, fc1s=fc1s, w2s=w2s, T=T):
                     mod.cutlass_fused_moe(
                         ml_out, x, tid_fi, tw_fi, fc1, None, w2, None,
                         torch.bfloat16, [fc1s, w2s], None, None, None, None, True,

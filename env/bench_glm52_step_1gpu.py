@@ -210,7 +210,7 @@ def build_model(cfg, seed: int):
                 p.data.fill_(1.0)
             elif p.dtype.is_floating_point:
                 p.data.normal_(0, 0.02)
-        for name, b in model.named_buffers():
+        for _name, b in model.named_buffers():
             # w_kc/w_vc/fused_qkv_a_proj_weight are None until
             # process_weights_after_loading builds them; anything else that
             # survived to_empty is uninitialised memory.
@@ -317,7 +317,7 @@ def drain_phase_timer(sub) -> list[tuple[str, float, float]]:
     timer._pending = None
     marks[-1][1].synchronize()
     out = []
-    for (_n0, e0, h0), (n1, e1, h1) in zip(marks, marks[1:]):
+    for (_n0, e0, h0), (n1, e1, h1) in zip(marks, marks[1:], strict=False):
         out.append((n1, e0.elapsed_time(e1), (h1 - h0) * 1e3))
     return out
 
@@ -467,7 +467,7 @@ def summarise_trace(trace_json: Path, top: int) -> list[str]:
     r = subprocess.run(
         [sys.executable, str(script), str(trace_json), "--top", str(top),
          "--launches"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,
     )
     if r.returncode != 0:
         return [f"(kernel_trace_summary.py failed: {r.stderr.strip()[:400]})"]

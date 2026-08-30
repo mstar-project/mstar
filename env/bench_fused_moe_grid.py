@@ -46,11 +46,13 @@ def bench(fn, iters=200, graph=False):
     for _ in range(10):
         run()
     torch.cuda.synchronize()
-    t0 = torch.cuda.Event(enable_timing=True); t1 = torch.cuda.Event(enable_timing=True)
+    t0 = torch.cuda.Event(enable_timing=True)
+    t1 = torch.cuda.Event(enable_timing=True)
     t0.record()
     for _ in range(iters):
         run()
-    t1.record(); torch.cuda.synchronize()
+    t1.record()
+    torch.cuda.synchronize()
     return t0.elapsed_time(t1) * 1000.0 / (iters * per)  # us per call
 
 
@@ -110,17 +112,25 @@ def main():
             mul_routed_weight=True, top_k=1, config=cfg, compute_type=ct, block_shape=(bn, bk))
 
     # correctness of the emulated clamp: identical outputs
-    up(em_full); ref1 = c1.clone(); up(em_clamp); assert torch.equal(ref1, c1)
-    down(em_full); ref3 = c3.clone(); down(em_clamp); assert torch.equal(ref3, c3)
+    up(em_full)
+    ref1 = c1.clone()
+    up(em_clamp)
+    assert torch.equal(ref1, c1)
+    down(em_full)
+    ref3 = c3.clone()
+    down(em_clamp)
+    assert torch.equal(ref3, c3)
 
-    ctas = lambda em, n: triton.cdiv(em, bm) * triton.cdiv(n, cfg["BLOCK_SIZE_N"])
+    def ctas(em, n):
+        return triton.cdiv(em, bm) * triton.cdiv(n, cfg["BLOCK_SIZE_N"])
     print(f"shape: tokens={T} top_k={K} E={E} H={H} I/rank={I} | BLOCK_M={bm} BLOCK_N={cfg['BLOCK_SIZE_N']} "
           f"| valid slots {n_valid} | EM full {em_full} -> clamp {em_clamp}")
     print(f"{'launch':<12}{'EM':>6}{'CTAs':>8}{'eager us':>10}{'graph us':>10}")
     total = {}
     for name, fn, n in (("up (gate)", up, 2 * I), ("down", down, H)):
         for tag, em in (("full", em_full), ("clamp", em_clamp)):
-            e = bench(lambda: fn(em)); g = bench(lambda: fn(em), graph=True)
+            e = bench(lambda fn=fn, em=em: fn(em))
+            g = bench(lambda fn=fn, em=em: fn(em), graph=True)
             total[tag] = total.get(tag, 0.0) + g
             print(f"{name:<12}{em:>6}{ctas(em, n):>8}{e:>10.1f}{g:>10.1f}")
     d = total["full"] - total["clamp"]
