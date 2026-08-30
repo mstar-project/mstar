@@ -64,7 +64,6 @@ def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPas
     """
     info = CurrentForwardPassInfo(
         graph_walk="prefill_video_rollout",
-        requires_cfg=False,
         fwd_index=0,
         random_seed=0,
         max_tokens=0,

@@ -248,7 +248,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
     md = {"height": H, "width": W, "num_frames": FRAMES, "fps": 24.0,
           "guidance_scale": GS, "num_inference_steps": STEPS, "generate_sound": True}
     fwd = CurrentForwardPassInfo(
-        request_id=rid, graph_walk="prefill", requires_cfg=True,
+        request_id=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
     )
     text_inputs = [

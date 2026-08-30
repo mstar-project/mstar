@@ -430,7 +430,6 @@ def _fwd_info(requested_steps: int, iter_count: int) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id="r0",
         graph_walk=Wan22Model.VIDEO_GEN_WALK,
-        requires_cfg=False,
         fwd_index=0,
         random_seed=0,
         max_tokens=0,

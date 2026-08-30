@@ -246,8 +246,7 @@ def test_capture_declares_and_forwards_the_same_guidance(cfg_on):
             # exactly what capture passes: `dummy_metadata`, always guidance-off
             per_request_info={
                 RID: types.SimpleNamespace(
-                    step_metadata={}, requires_cfg=False,
-                )
+                    step_metadata={},                 )
             },
         ),
         inputs=inputs,

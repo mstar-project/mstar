@@ -41,7 +41,6 @@ def dummy_metadata(
         rid: CurrentForwardPassInfo(
             request_id=rid,
             graph_walk=graph_walk,
-            requires_cfg=False,
             fwd_index=0,
             random_seed=0,
             max_tokens=1,

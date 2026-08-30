@@ -748,7 +748,6 @@ class Conductor:
                         step_metadata=fwd_args.step_metadata,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
-                        requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
                         resource_configs=request_data.resource_configs
@@ -1065,7 +1064,6 @@ class Conductor:
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         resource_publish_info=pstate.resource_publish_info,
-                        requires_cfg=fwd_args.full_metadata.requires_cfg,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
                         resource_configs=request_data.resource_configs,
@@ -1102,7 +1100,6 @@ class Conductor:
                         graph_walk=pstate.metadata.graph_walk or "",
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
-                        requires_cfg=False,
                         partition_name=consumer_partition_name,
                         max_tokens=request_data.max_output_tokens,
                         resource_configs=request_data.resource_configs

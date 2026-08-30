@@ -945,6 +945,7 @@ class BagelModel(Model):
     ) -> dict:
         return {
             "is_prefill": full_metadata.is_prefill,
+            "requires_cfg": full_metadata.requires_cfg,
             "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
             "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
             "cfg_interval": full_metadata.kwargs["cfg_interval"],

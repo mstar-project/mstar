@@ -41,7 +41,6 @@ def _fwd_info(graph_walk: str, partition: str = "default", fwd_index: int = 0):
     return CurrentForwardPassInfo(
         request_id="rid",
         graph_walk=graph_walk,
-        requires_cfg=False,
         fwd_index=fwd_index,
         random_seed=0,
         max_tokens=128,

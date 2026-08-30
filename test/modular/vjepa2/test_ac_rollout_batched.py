@@ -62,7 +62,6 @@ def _request_info(rid: str, iter_idx: int = 0) -> CurrentForwardPassInfo:
     info = CurrentForwardPassInfo(
         request_id=rid,
         graph_walk="prefill_video_rollout",
-        requires_cfg=False,
         fwd_index=0,
         random_seed=0,
         max_tokens=0,

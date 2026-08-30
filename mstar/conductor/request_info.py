@@ -29,7 +29,6 @@ class CurrentForwardPassInfo:
     """
     request_id: str
     graph_walk: str
-    requires_cfg: bool
     fwd_index: int
     random_seed: int
     max_tokens: int

@@ -641,7 +641,9 @@ class LLMSubmodule(ARNodeSubmodule):
         # What `declare_step` needs but cannot see: whether this request runs
         # the guidance branches. It is per-request, so it travels with the
         # request's inputs rather than being read off the batch later.
-        node_inputs.resource_step_info = fwd_info.requires_cfg
+        node_inputs.resource_step_info = fwd_info.step_metadata.get(
+            "requires_cfg", False
+        )
 
         if graph_walk == "prefill_text":
             node_inputs.input_ids = inputs["text_inputs"][0]
@@ -1264,7 +1266,7 @@ class LLMSubmodule(ARNodeSubmodule):
 
     def _batch_get_requires_cfg(self, per_request_info: dict[str, CurrentForwardPassInfo]):
         return any(
-            info.requires_cfg
+            info.step_metadata.get("requires_cfg", False)
             for info in per_request_info.values()
         )
 

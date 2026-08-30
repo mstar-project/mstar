@@ -163,7 +163,6 @@ def _fwd_info(graph_walk: str, step_metadata: dict, seed: int) -> CurrentForward
     return CurrentForwardPassInfo(
         request_id="equiv-r0",
         graph_walk=graph_walk,
-        requires_cfg=False,
         fwd_index=0,
         random_seed=seed,
         max_tokens=0,
