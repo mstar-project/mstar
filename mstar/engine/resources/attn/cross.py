@@ -158,7 +158,9 @@ class FlashInferCrossManager(CrossAttentionManager):
         plan_states.clear()
         for plan_label, packing in self._query_packings(step, ctx).items():
             indptrs = self._build_indptrs(packing, context_views, plan_label)
-            state_key, wrapper = self._wrapper_for(plan_label, ctx)
+            state_key, wrapper = self._wrapper_for(
+                plan_label, ctx, num_rows=indptrs.qo_indptr.shape[0] - 1,
+            )
 
             # The context pages are immutable once written, so between steps
             # only the query side moves; when neither moved the whole plan is
@@ -310,8 +312,11 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
 
     def _wrapper_for(
-        self, plan_label: str, ctx: StepContext
+        self, plan_label: str, ctx: StepContext, num_rows: int,
     ) -> tuple[Any, AttentionWrapper]:
+        """``num_rows`` is this label's qo_indptr row count — bucket.bs for an
+        ordinary label, more when the query plan combines labels. See
+        ``FlashInferManager._cg_wrapper``."""
         if ctx.slot_lease is not None:
             lease = ctx.slot_lease
             key = CGSlotKey(
@@ -324,7 +329,7 @@ class FlashInferCrossManager(CrossAttentionManager):
                     workspace_buffer=self._workspaces.get(
                         plan_label, lease.slot
                     ),
-                    batch_size=lease.bucket.bs,
+                    batch_size=num_rows,
                     max_total_tokens=lease.bucket.num_tokens,
                     use_cuda_graph=True,
                     **self._wrapper_kv_kwargs,

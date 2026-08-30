@@ -28,12 +28,22 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
-class _Barrier:
-    def __init__(self):
+class _Group:
+    """A one-rank comm group, or a two-rank one whose peer's flags are given."""
+
+    def __init__(self, peer_flags: list[bool] | None = None):
         self.count = 0
+        self.world_size = 1 if peer_flags is None else 2
+        self._peer = peer_flags
 
     def barrier(self):
         self.count += 1
+
+    def all_gather(self, tensor, dim=0):
+        del dim
+        peer = torch.tensor(self._peer, dtype=tensor.dtype, device=tensor.device)
+        # rank-major, matching CommGroup.all_gather
+        return torch.cat([tensor, peer])
 
 
 class _FakeRunner:
@@ -41,8 +51,12 @@ class _FakeRunner:
 
     warmup_and_capture = CudaGraphRunner.warmup_and_capture
     _register_slot = CudaGraphRunner._register_slot
+    _buckets_captured_everywhere = CudaGraphRunner._buckets_captured_everywhere
 
-    def __init__(self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2):
+    def __init__(
+        self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
+        peer_flags: list[bool] | None = None,
+    ):
         self._device = torch.device("cuda")
         self._submodule_name = "node"
         self._num_slots = num_slots
@@ -50,7 +64,7 @@ class _FakeRunner:
         self._fail = fail
         self._buckets = {}
         self._memory_pool = None
-        self.barrier = _Barrier()
+        self.barrier = _Group(peer_flags)
         self._comm_group = SimpleNamespace(
             tp_group=self.barrier, sp_group=self.barrier
         )
@@ -137,6 +151,50 @@ def test_every_rank_barriers_once_per_spec_whatever_happens():
     assert failed.barrier.count == clean.barrier.count == 2 * len(_specs(
         walks=("decode", "prefill")
     ))
+
+
+@requires_cuda
+def test_a_bucket_another_rank_dropped_is_dropped_here_too():
+    """Capture failure is per-rank. If this rank kept a bucket the peer
+    dropped, it would lease and replay while the peer ran eager — and a
+    captured region holding a collective hangs on the mismatch."""
+    runner = _FakeRunner(
+        _specs(walks=("decode", "prefill")),
+        # local captures both; the peer failed the second bucket
+        peer_flags=[True, False],
+    )
+
+    runner.warmup_and_capture()
+
+    assert [key.graph_walk for key in runner._buckets] == ["decode"]
+
+
+@requires_cuda
+def test_a_bucket_this_rank_dropped_stays_dropped_when_the_peer_kept_it():
+    runner = _FakeRunner(
+        _specs(walks=("decode", "prefill")),
+        fail={("decode", 1)},
+        peer_flags=[True, True],
+    )
+
+    runner.warmup_and_capture()
+
+    assert [key.graph_walk for key in runner._buckets] == ["prefill"]
+
+
+@requires_cuda
+def test_ranks_agree_on_the_full_candidate_list_not_just_local_successes():
+    """The reduced vector is ordered by the configs, which every rank shares,
+    so a rank that captured nothing still lines its flags up with the rest."""
+    runner = _FakeRunner(
+        _specs(walks=("decode", "prefill")),
+        fail={("decode", 0), ("decode", 1), ("prefill", 0), ("prefill", 1)},
+        peer_flags=[True, True],
+    )
+
+    runner.warmup_and_capture()
+
+    assert runner._buckets == {}
 
 
 @requires_cuda

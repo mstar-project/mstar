@@ -33,6 +33,31 @@ def autocast_scope(dtype: torch.dtype | None):
     )
 
 
+def agree_across_ranks(
+    comm_group: JointGroups | None, flags: list[bool], device: torch.device,
+) -> list[bool]:
+    """AND each flag across every rank of the joint group.
+
+    Capture failure is per-rank: a rank that keeps a graph another rank
+    dropped replays it while the other runs eager, which hangs as soon as the
+    captured region holds a collective. Callers pass an order derived from the
+    configs, which are identical on every rank.
+    """
+    groups = [] if comm_group is None else [
+        comm_group.tp_group, comm_group.sp_group
+    ]
+    if not flags or all(group.world_size == 1 for group in groups):
+        return flags
+    gathered = torch.tensor(flags, dtype=torch.int64, device=device)
+    for group in groups:
+        if group.world_size > 1:
+            # all_gather is rank-major, so the min down dim 0 is the AND
+            gathered = group.all_gather(gathered, dim=0).reshape(
+                group.world_size, -1
+            ).amin(dim=0)
+    return [bool(value) for value in gathered.tolist()]
+
+
 def dummy_metadata(
     rids: list[str], graph_walk: str,
 ) -> dict[str, CurrentForwardPassInfo]:
@@ -299,11 +324,12 @@ class CudaGraphRunner:
                     self._submodule_name, spec.bucket, self._num_slots
                 )
 
+        agreed = self._buckets_captured_everywhere(slot_specs, captured)
         for bucket_key, slots in captured.items():
-            if len(slots) != self._num_slots:
+            if bucket_key not in agreed:
                 logger.warning(
                     "Dropping CUDA graph bucket %s for %s: captured %d of %d "
-                    "slots, and a partial bucket cannot double-buffer",
+                    "slots here, or fewer on another rank",
                     bucket_key, self._submodule_name, len(slots), self._num_slots,
                 )
                 continue
@@ -318,6 +344,33 @@ class CudaGraphRunner:
 
         mem_after = torch.cuda.memory_allocated(self._device)
         self._log_memory(mem_before, mem_after)
+
+    def _buckets_captured_everywhere(
+        self,
+        slot_specs: list[CGSlotSpec],
+        captured: Mapping[BucketKey, Mapping[int, Any]],
+    ) -> set[BucketKey]:
+        """The buckets every rank captured in full.
+
+        Capture failure is a per-rank event, so a rank that keeps a bucket
+        another rank dropped will lease and replay it while the other runs
+        eager — and a captured region holding a collective then hangs. The
+        candidate list comes from the configs, which are identical on every
+        rank, so agreeing is one flag per bucket reduced in that order.
+        """
+        order: list[BucketKey] = []
+        seen: set[BucketKey] = set()
+        for spec in slot_specs:
+            if spec.bucket not in seen:
+                seen.add(spec.bucket)
+                order.append(spec.bucket)
+
+        agreed = agree_across_ranks(
+            self._comm_group,
+            [len(captured.get(key, ())) == self._num_slots for key in order],
+            self._device,
+        )
+        return {key for key, ok in zip(order, agreed, strict=True) if ok}
 
     def _register_slot(self, spec: CGSlotSpec, slot: CudaGraphSlot) -> None:
         bucket = self._buckets.get(spec.bucket)
@@ -934,9 +987,11 @@ class PiecewiseCudaGraphRunner:
             return
 
         # largest bucket first, matching the full-forward runner
-        for shape in sorted(
+        ordered = sorted(
             shapes, key=lambda s: (s.bs, s.total_tokens), reverse=True
-        ):
+        )
+        captured: list[bool] = []
+        for shape in ordered:
             # keep ranks in lockstep: the region may hold collectives, and a
             # rank still in pre-capture setup would mismatch one already in the
             # warmup forward
@@ -945,15 +1000,32 @@ class PiecewiseCudaGraphRunner:
                 self._comm_group.sp_group.barrier()
             try:
                 self._capture_one(shape)
+                captured.append(True)
                 logger.info(
                     "PiecewiseCudaGraphRunner[%s]: captured bs=%d total_tokens=%d",
                     self._label, shape.bs, shape.total_tokens,
                 )
             except Exception:
+                captured.append(False)
                 logger.warning(
                     "PiecewiseCudaGraphRunner[%s]: failed to capture bs=%d "
                     "total_tokens=%d", self._label, shape.bs, shape.total_tokens,
                     exc_info=True,
+                )
+
+        # `ordered` comes from the config, so every rank agrees on the order
+        for shape, ok in zip(
+            ordered,
+            agree_across_ranks(self._comm_group, captured, self._device),
+            strict=True,
+        ):
+            if ok:
+                continue
+            if self._graphs.pop((shape.bs, shape.total_tokens), None) is not None:
+                logger.warning(
+                    "PiecewiseCudaGraphRunner[%s]: dropping bs=%d total_tokens=%d, "
+                    "captured here but not on every rank",
+                    self._label, shape.bs, shape.total_tokens,
                 )
 
     def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
