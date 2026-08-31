@@ -1493,8 +1493,8 @@ class Worker:
         # the normal scheduler path.
         fresh_batch = self.scheduler.get_next_batch(
             self.worker_graphs_manager,
-            target_node_name=spec_node_info.node_name,
-            target_graph_walk=batch_N.graph_walk,
+            target=(spec_node_info.node_name, batch_N.graph_walk),
+            pre_existing_batch_size=len(continuing)
         )
 
         if fresh_batch is not None:
@@ -1725,7 +1725,9 @@ class Worker:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.
             # Fail it here and take it out of the batch before the routing
-            # loops below touch it.
+            # loops below touch it. Only ever the ones `check_stop_for_batch`
+            # just added: the caller already reported (and cleared) the rids
+            # that failed in prepare_inputs / postprocess.
             failed = dict(batch_N.node_batch.failed_requests)
             self._drop_failed_rids(batch_N, outputs, failed)
             self._fail_requests(failed)
@@ -1990,6 +1992,10 @@ class Worker:
             pending.batch.node_objects.pop(rid, None)
             pending.batch.request_to_worker_graph.pop(rid, None)
             pending.node_batch.per_request_info.pop(rid, None)
+            # Clear what we just reported, so a later stage that fails more
+            # rids (check_stop, below the forward) can tell its own from these
+            # and doesn't report them to the conductor twice.
+            pending.node_batch.failed_requests.pop(rid, None)
         pending.node_batch.request_ids = [
             rid for rid in pending.node_batch.request_ids
             if rid not in failed_requests
@@ -2225,7 +2231,7 @@ class Worker:
             samples = sorted((k, v) for k, v in list(phase_buf.items()) if v)
             parts = []
             for name, vs in samples:
-                vs.sort()
+                vs = sorted(vs)
                 n = len(vs)
                 p50 = vs[n // 2] * 1000
                 p95 = vs[min(n - 1, int(n * 0.95))] * 1000
@@ -2418,9 +2424,6 @@ class Worker:
                         spec_node_batch = speculation.node_batch
                         if not speculation.is_yield_away:
                             self._thread_outputs_to_speculative(speculation, outputs)
-                        engine = self.engine_manager.get_engine(
-                            spec_node_batch.node_name
-                        )
                         # set node._speculatively_scheduled to true, so that it doesn't
                         # accidentally get put on the ready queue while already executing
                         for node in spec_batch.node_objects.values():
@@ -2533,8 +2536,6 @@ class Worker:
                 # Nothing speculated this batch, so prepare it here. The GPU
                 # thread then admits, plans and runs it inline; the slot is
                 # leased inside exec, once the token count is known.
-                fallthrough_engine = self.engine_manager.get_engine(batch.node_name)
-
                 # send messages to follower ranks if relevant
                 self.maybe_send_zmq_to_tp_followers(node_batch)
 

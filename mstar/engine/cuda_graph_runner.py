@@ -729,14 +729,14 @@ class CudaGraphRunner:
     def pad_inputs(
         self, lease: SlotLease, inputs: list[NodeInputs],
     ) -> list[NodeInputs]:
-        """Real inputs plus the rows that bring the batch to capture shape.
+        """Real inputs plus the rows that bring the batch to capture batch size.
+        Set the length to zero so no new pages are allocated for dummy requests.
         """
         num_pad = lease.bucket.bs - len(inputs)
         if num_pad <= 0:
             return list(inputs)
-        budget = lease.bucket.num_tokens - sum(inp.input_seq_len for inp in inputs)
         padding = self._buckets[lease.bucket].config.get_node_inputs(
-            num_pad, max(budget, 0)
+            num_pad, 0
         )
         return [*inputs, *padding]
 

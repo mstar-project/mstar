@@ -242,6 +242,11 @@ class Engine:
         )
 
         for node_name, submodule in submodules.items():
+            # Inference only. `exec` is under no_grad, but `prepare_inputs` and
+            # `postprocess_batch` are not, so anything they derive from a
+            # parameter would build a graph and pin its intermediates — for the
+            # whole request, once stashed in a `PerRequestState`.
+            submodule.requires_grad_(False)
             resources = {
                 label: self._resources[label] for label in node_to_resources.get(node_name, [])
             }
@@ -409,10 +414,10 @@ class Engine:
                 node_inputs.append(req_inputs)
 
         batch.register_prepare_batch(node_inputs)
+        batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
         )
-        batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
 
     def exec(
         self, batch: ExecutingBatch
