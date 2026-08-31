@@ -93,6 +93,7 @@ def test_result_reads_drain_ahead_of_preprocess():
         profile_queue=queue.Queue(),
         cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(),
+        reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(),
         stop_event=stop,
         communicator=_RecordingCommunicator(),
@@ -138,7 +139,9 @@ class _StubPreprocessWorker:
     def received_final_chunks(self, rid, final_outputs):
         return self.final
 
-    def cleanup_request(self, rid):
+    def finished_reading(self, rid):
+        # New teardown: the API server signals READS_DONE to the conductor
+        # instead of cleaning up locally; the conductor drives the hard cleanup.
         self.cleaned.append(rid)
 
 

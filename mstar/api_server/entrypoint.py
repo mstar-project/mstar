@@ -345,15 +345,17 @@ class APIServer:
                 req.event.set()
                 # Snapshot the data worker's tx/rx now: the request is done (all
                 # final chunks received), so the worker thread is no longer mutating
-                # this rid's transport state, and we must read it before
-                # cleanup_request drops it. Extends so it combines with the
-                # conductor's worker-side transfers (set in the request_complete
-                # handler).
+                # this rid's transport state, and we must read it before the hard
+                # cleanup drops it. Extends so it combines with the conductor's
+                # worker-side transfers (set in the request_complete handler).
                 if self.log_stats:
                     profile = req.profile
                     profile.tx_info.extend(self.preprocess_worker.get_tx_info(rid))
                     profile.rx_info.extend(self.preprocess_worker.get_rx_info(rid))
-            self.preprocess_worker.cleanup_request(rid)
+            # We're done delivering this request's outputs (all chunks in, or the
+            # TTL gave up): tell the conductor via READS_DONE. It drives the hard
+            # cleanup with a RemoveRequest once every reader has drained.
+            self.preprocess_worker.finished_reading(rid)
             self.recently_completed.pop(rid, None)
 
     def _process_messages(self) -> None:

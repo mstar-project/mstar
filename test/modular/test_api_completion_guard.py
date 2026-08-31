@@ -52,15 +52,23 @@ def test_preprocess_failure_emits_error_chunk():
     wt.out_queue = queue.Queue()
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
+    wt.abort_request_queue = queue.Queue()
+    wt.reads_done_queue = queue.Queue()
+    wt.discard_tensor_queue = queue.Queue()
     wt.stop_event = threading.Event()
     wt.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
     cleaned = []
     wt.tensor_manager = SimpleNamespace(
-        cleanup_request=cleaned.append, get_ready_tensors=lambda: {}
+        force_cleanup_request=cleaned.append,
+        has_inflight_reads=lambda rid: False,
+        get_ready_tensors=lambda: {},
     )
     wt.model = _RejectingModel()
     wt.device = "cpu"
     wt.tensor_uuid_to_metadata_per_request = {}
+    wt.request_model_kwargs = {}
+    wt._draining_rids = set()
+    wt._reads_done_sent = set()
 
     wt.in_queue.put(PreprocessInput(
         request_id="r1", text="x", file_paths=None,
