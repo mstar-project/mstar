@@ -444,7 +444,7 @@ class KVManager(AttentionResource):
 
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
-        ctx: StepContext
+        ctx: StepContext, lease,
     ):
         for label, indptrs in plan_output.items():
             if indptrs.is_decode:
@@ -455,9 +455,9 @@ class KVManager(AttentionResource):
                     indptrs.cuda_indptrs,
                     total_tokens=indptrs.get_total_len()
                 )
-            if ctx.slot_lease is not None:
-                static_state = self._static_plan_state(ctx.slot_lease.slot, label)
-                static_state.copy_(plan_state, ctx.slot_lease.bucket.num_tokens)
+            if lease is not None:
+                static_state = self._static_plan_state(lease.slot, label)
+                static_state.copy_(plan_state, lease.bucket.num_tokens)
                 plan_state = static_state
             if ctx.is_preplan:
                 self._preplan_states[label] = plan_state
@@ -500,7 +500,7 @@ class KVManager(AttentionResource):
             pre_forks=step.pre_forks,
             post_forks=step.post_forks,
         )
-        self._setup_plan_states(res, ctx)
+        self._setup_plan_states(res, ctx, ctx.slot_lease)
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = res

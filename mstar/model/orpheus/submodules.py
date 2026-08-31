@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -8,7 +9,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
@@ -77,7 +78,10 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     def declare_step(
         self, graph_walk: str,
         request_ids: list[str],
-        inputs: list[ARNodeInputs]
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
     ):
         prefill_tokens = {}
         if graph_walk == "prefill":

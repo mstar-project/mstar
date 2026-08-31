@@ -21,6 +21,7 @@ branch.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -36,12 +37,15 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
 from mstar.model.vjepa2.config import ATTN, KV_CACHE, VJepa2Config
+
+# the AC predictor's transformer block loop, as a piecewise capture region
+BLOCK_LOOP_REGION = "block_loop"
 
 logger = logging.getLogger(__name__)
 
@@ -961,10 +965,13 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             )
 
         return {
-            "block_loop": PiecewiseBatchedConfig(
+            BLOCK_LOOP_REGION: PiecewiseBatchedConfig(
                 capture_fn=self._block_loop_capture,
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
+                # take the slot before the outer declaration, so it can leave
+                # this region's KV to the runner
+                lease_before_step=True,
                 seq_len=capture_seq_len,
                 forward_kwargs={"cond_tokens": cond_tokens},
                 capture_batch_sizes=[1, 2, 4, 8],
@@ -995,6 +1002,46 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         default ``num_output_frames=2 = 1 tubelet``.
         """
         return self._grid_size * self._grid_size
+
+    def _step_tokens(self, n_ctxt: int) -> int:
+        """Tokens one rollout step writes for a request.
+
+        The predictor interleaves ``cond_tokens`` action/state (+extrinsics)
+        embeddings ahead of each frame's spatial tokens, so the sequence is
+        ``T * (cond_tokens + grid²)`` — the same count the capture buckets on.
+        """
+        ac = self.config.ac_predictor
+        cond_tokens = 3 if ac.use_extrinsics else 2
+        grid_sq = self._window_tokens()
+        return (n_ctxt // grid_sq) * (cond_tokens + grid_sq)
+
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep | None:
+        """The rollout step's KV, when the block loop runs inline.
+
+        The region declares its own work whenever it holds a slot, so this
+        only covers the eager path — which had no declaration at all: nothing
+        reserved its pages, so running out of KV surfaced as a RuntimeError
+        from inside the forward instead of an admit failure the worker can
+        push back and evict for.
+        """
+        del graph_walk, slot_lease
+        if (piecewise_leases or {}).get(BLOCK_LOOP_REGION):
+            return None
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            steps={KV_CACHE: KVStep(), ATTN: AttentionStep(causal=False)},
+        )
 
     # ------------------------------------------------------------------
     # NodeSubmodule ABC
@@ -1058,6 +1105,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             tensor_inputs["extrinsics"] = _ensure_lead_batch_dim(inputs["extrinsics"][0], 3)[:, iter_idx:iter_idx+1]
 
         return ARNodeInputs(
+            input_seq_len=self._step_tokens(encoder_hidden.shape[1]),
             input_embeds=encoder_hidden,
             tensor_inputs=tensor_inputs
         )
@@ -1138,6 +1186,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 states,
                 extrinsics=extrinsics,
                 t_0=t_0,
+                # without this every block takes plain SDPA and writes no K/V,
+                # leaving a gap in `main` that the declared span counted
+                label="main",
             )
 
         # Per-step LayerNorm — matches the upstream notebook's step_predictor
@@ -1166,7 +1217,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             t_0=request_info.dynamic_loop_iter_counts.get("rollout_loop", 0),
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
-            runner=engine_inputs.piecewise_runners.get("block_loop"),
+            runner=engine_inputs.piecewise_runners.get(BLOCK_LOOP_REGION),
         )
 
         logger.info(
@@ -1208,7 +1259,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
             t_0=iter_idx,
             extrinsics=extrinsics,
             request_ids=engine_inputs.request_ids,
-            runner=engine_inputs.piecewise_runners.get("block_loop"),
+            runner=engine_inputs.piecewise_runners.get(BLOCK_LOOP_REGION),
         )
 
         return {

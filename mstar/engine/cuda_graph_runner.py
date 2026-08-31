@@ -419,8 +419,10 @@ class CudaGraphRunner:
         dummy_inputs = config.get_node_inputs(spec.bs, spec.num_tokens)
         engine_inputs = self._dummy_engine_inputs(dummy_rids, walk)
 
+        lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
         step = self._submodule.declare_step(
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
+            slot_lease=lease,
         )
         if step is not None:
             step = replace(step, _ctx=StepContext(
@@ -428,7 +430,7 @@ class CudaGraphRunner:
                 graph_walk=walk,
                 slot=spec.slot,
                 capture=True,
-                slot_lease=SlotLease(slot=spec.slot, bucket=spec.bucket),
+                slot_lease=lease,
             ))
 
         engine_inputs.step = step
@@ -1188,6 +1190,24 @@ class PiecewiseCudaGraphRunner:
     def can_run(self, batch_size: int, total_tokens: int | None = None) -> bool:
         return self._resolve(batch_size, total_tokens) is not None
 
+    @property
+    def lease_before_step(self) -> bool:
+        """Whether this region takes its slot ahead of the declaration."""
+        return self._config.lease_before_step
+
+    def lease_slot(
+        self, batch_size: int, total_tokens: int | None = None,
+    ) -> SlotLease | None:
+        """The bucket this batch would replay on, asked before the forward.
+
+        Same question ``run`` settles per call, answered early so the outer
+        ``declare_step`` can plan the region's resources against it.
+        """
+        data = self._resolve(batch_size, total_tokens)
+        return None if data is None else SlotLease(
+            slot=self.SLOT, bucket=data.bucket
+        )
+
     def run(
         self,
         static_inputs: dict[str, torch.Tensor],
@@ -1200,8 +1220,6 @@ class PiecewiseCudaGraphRunner:
         Copies each real input into the runner-owned buffer of the same name,
         declares and plans the region's step over the padded batch, replays,
         then commits and returns the padded buffers behind a real-length view.
-        Under ``reuses_outer_plan`` the middle three are the outer step's job
-        and this only stages and replays.
 
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
@@ -1237,13 +1255,6 @@ class PiecewiseCudaGraphRunner:
                 # the padded tail is real compute for a BATCHED capture, so it
                 # reads whatever is here; zero rather than last step's values
                 buffer[n:].zero_()
-
-        if self._config.reuses_outer_plan:
-            # the outer step's plan is live and covers this region
-            data.graph.replay()
-            return PiecewiseOutput(
-                data.static_outputs, real_total_tokens if is_packed else real_bs
-            )
 
         step = None
         if request_ids is not None:

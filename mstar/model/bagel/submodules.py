@@ -5,6 +5,7 @@
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -17,7 +18,7 @@ from mstar.engine.cuda_graph_config import (
     PackedCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
     ImageTransform,
@@ -711,6 +712,9 @@ class LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
     ) -> SubmoduleStep | None:
         """This batch's step: which cache streams it touches, by how much,
         what backs them, and what commits.

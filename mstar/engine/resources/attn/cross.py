@@ -28,7 +28,7 @@ from mstar.engine.resources.kv.plan import (
     PagedIndptrs,
     SequenceView,
 )
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.step import SlotLease, StepContext
 
 
 class QueryPacking(NamedTuple):
@@ -136,7 +136,8 @@ class FlashInferCrossManager(CrossAttentionManager):
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         self.reset_default_cursors()
-        assert not ctx.is_preplan or ctx.slot_lease is not None, (
+        lease = ctx.slot_lease
+        assert not ctx.is_preplan or lease is not None, (
             "preplan requires a cuda graph step: the eager wrapper for a label "
             "persists and would be replanned under the in-flight forward"
         )
@@ -159,7 +160,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         for plan_label, packing in self._query_packings(step, ctx).items():
             indptrs = self._build_indptrs(packing, context_views, plan_label)
             state_key, wrapper = self._wrapper_for(
-                plan_label, ctx, num_rows=indptrs.qo_indptr.shape[0] - 1,
+                plan_label, lease, num_rows=indptrs.qo_indptr.shape[0] - 1,
             )
 
             # The context pages are immutable once written, so between steps
@@ -312,13 +313,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
 
     def _wrapper_for(
-        self, plan_label: str, ctx: StepContext, num_rows: int,
+        self, plan_label: str, lease: SlotLease | None, num_rows: int,
     ) -> tuple[Any, AttentionWrapper]:
         """``num_rows`` is this label's qo_indptr row count — bucket.bs for an
         ordinary label, more when the query plan combines labels. See
         ``FlashInferManager._cg_wrapper``."""
-        if ctx.slot_lease is not None:
-            lease = ctx.slot_lease
+        if lease is not None:
             key = CGSlotKey(
                 bucket=lease.bucket, slot=lease.slot, label=plan_label
             )

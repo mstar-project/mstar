@@ -142,7 +142,8 @@ class RopeManager(PositionManager):
             self._preplanned = False
             return self._current_pos_ids
 
-        assert not ctx.is_preplan or ctx.slot_lease is not None, (
+        lease = ctx.slot_lease
+        assert not ctx.is_preplan or lease is not None, (
             "preplan requires a cuda graph step: the eager path hands back a "
             "fresh tensor rather than writing a slot's buffer"
         )
@@ -165,7 +166,7 @@ class RopeManager(PositionManager):
             pos_ids = self._explicit_pos_ids(step, plan_label, len(plan_outputs))
             if pos_ids is None:
                 pos_ids = self._build_pos_ids(kv_out.views)
-            pos_ids_out[plan_label] = self._place(pos_ids, plan_label, ctx)
+            pos_ids_out[plan_label] = self._place(pos_ids, plan_label, lease)
         self._preplanned = ctx.is_preplan
         return pos_ids_out
 
@@ -230,17 +231,17 @@ class RopeManager(PositionManager):
         return torch.tensor(pos_ids, dtype=torch.long)
 
     def _place(
-        self, pos_ids: torch.Tensor, plan_label: str, ctx: StepContext
+        self, pos_ids: torch.Tensor, plan_label: str, lease
     ) -> torch.Tensor:
-        if ctx.slot_lease is None:
+        if lease is None:
             if pos_ids.device != self._device:
                 pos_ids = pos_ids.to(self._device, non_blocking=True)
             return pos_ids
 
         key = CGSlotKey(
-            bucket=ctx.slot_lease.bucket, slot=ctx.slot_lease.slot, label=plan_label
+            bucket=lease.bucket, slot=lease.slot, label=plan_label
         )
-        buffer = self._static_buffer(key, ctx.slot_lease.bucket.num_tokens)
+        buffer = self._static_buffer(key, lease.bucket.num_tokens)
         n = pos_ids.shape[0]
         assert n <= buffer.shape[0], (
             f"plan label {plan_label!r} carries {n} tokens but its captured "

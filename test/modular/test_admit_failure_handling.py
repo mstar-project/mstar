@@ -167,7 +167,10 @@ class _FakeExecEngine:
         self._submodules = {"node": SimpleNamespace(submodule=self)}
 
     # --- submodule surface
-    def declare_step(self, graph_walk, request_ids, inputs):
+    def _lease_piecewise_regions(self, node_name, step, inputs):
+        pass
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs):
         del graph_walk, inputs
         self.events.append(("declare", request_ids[0]))
         return SubmoduleStep(steps={}, segments=[])

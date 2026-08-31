@@ -1,5 +1,5 @@
 
-from collections.abc import KeysView, Sequence
+from collections.abc import KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
@@ -24,7 +24,6 @@ class Segment(NamedTuple):
 class ResourceStep:
     # Work for one resource, for one step
     segments: tuple[Segment, ...] | None = None
-
 
 @dataclass(frozen=True)
 class BucketKey:
@@ -63,6 +62,11 @@ class StepContext:
     # complete their plan stages
     plan_results: dict[str, Any] = field(default_factory=dict)
     slot_lease: SlotLease | None = None
+    # label -> the slot a piecewise region of this node holds for this step,
+    # for regions that opt into leasing ahead of the declaration. The region
+    # still declares and plans its own work; this only says who owns which
+    # resource, so `declare_step` can leave those to it.
+    piecewise_leases: "Mapping[str, SlotLease]" = field(default_factory=dict)
     # `request_ids` padded with dummy rids to a capture bucket's batch size;
     # None outside a captured replay, where the two are the same
     _padded_request_ids: Sequence[str] | None = None
@@ -75,6 +79,9 @@ class StepContext:
 
     def set_padded_rids(self, padded_rids: Sequence[str] | None):
         self._padded_request_ids = padded_rids
+
+    def set_piecewise_leases(self, leases: "Mapping[str, SlotLease]"):
+        self.piecewise_leases = leases
 
 
 @dataclass(frozen=True)

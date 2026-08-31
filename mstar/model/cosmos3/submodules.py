@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -37,7 +38,7 @@ from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     PackedCudaGraphConfig,
 )
-from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -368,7 +369,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if graph_walk in PREFILL_WALKS:
             return self._prepare_prefill(fwd_info, inputs, device)
         if graph_walk in GEN_WALKS:
-            return self._prepare_image_gen(fwd_info, inputs, device)
+            return self._prepare_image_gen(graph_walk, fwd_info, inputs, device)
         if graph_walk in SOUND_WALKS:
             return self._prepare_video_sound_gen(fwd_info, inputs, device)
         if graph_walk in ACTION_WALKS:
@@ -579,7 +580,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
         return node_inputs
 
-    def _prepare_image_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
+    def _prepare_image_gen(
+        self, graph_walk, fwd_info, inputs, device,
+    ) -> ARNodeInputs:
         st = self.request_states[fwd_info.request_id]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
@@ -626,7 +629,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"],
             tensor_inputs=tensors,
-            resource_step_info=self._step_info(IMAGE_GEN_WALK, st, step_index),
+            resource_step_info=self._step_info(graph_walk, st, step_index),
         )
 
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
@@ -714,6 +717,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
     ) -> SubmoduleStep:
         """This batch's step: which cache streams it touches, by how much, and
         which attention backend runs over them.
@@ -772,15 +778,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         spans = tuple(inp.input_seq_len for inp in inputs)
         infos = [self._gen_step_info(inp) for inp in inputs]
 
-        # Mirrors cg_key_info: one capture bucket shared by every row. A lease
-        # implies this branch, so the ones below only ever see the real batch
-        # — under a lease the padding rows carry the bucket's own key, which
-        # keeps `keys` a singleton and returns here.
+        # Mirrors cg_key_info: one capture bucket shared by every row. Under a
+        # lease the padding rows carry the bucket's own key, which keeps `keys`
+        # a singleton. The lease is what selects the branch, though — a key
+        # only says this batch *could* have been captured, and a bucket dropped
+        # at warmup leaves it set with nothing leased.
         keys = {info.capture_key for info in infos}
         capture_key = keys.pop() if len(keys) == 1 else None
-        attn_key = ATTN if capture_key is not None else self._eager_gen_attn_key()
+        captured = slot_lease is not None and capture_key is not None
+        attn_key = ATTN if captured else self._eager_gen_attn_key()
 
-        if capture_key is not None:
+        if captured:
             # The captured denoise graph has a fixed shape and always runs both
             # guidance branches — including outside a request's guidance
             # interval, which the eager path below honors. See `cg_key_info`.

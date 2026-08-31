@@ -12,7 +12,7 @@ from mstar.engine.resources.sampler.config import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.step import SlotLease, StepContext
 
 
 class SamplerResource(Resource):
@@ -185,7 +185,7 @@ class SamplerResource(Resource):
         # double-buffered — it must reflect the previous step's commit, so
         # gather it inline now, on the default stream, after that commit.
         if self._preplanned and not ctx.is_preplan:
-            self._gather_dynamic(ctx)
+            self._gather_dynamic(ctx, ctx.slot_lease)
             self._cg_sampler = self._preplan_cg_sampler
             self._preplan_cg_sampler = None
             self._preplanned = False
@@ -195,11 +195,12 @@ class SamplerResource(Resource):
         # before output collection); a preplan must leave the in-flight one be
         if not ctx.is_preplan:
             self._cg_sampler = None
-        if self._cg_buffers is None or ctx.slot_lease is None:
+        lease = ctx.slot_lease
+        if self._cg_buffers is None or lease is None:
             return
 
-        cg_slot = ctx.slot_lease.slot
-        padded_bs = ctx.slot_lease.bucket.bs
+        cg_slot = lease.slot
+        padded_bs = lease.bucket.bs
         # static config only: safe to pre-plan (unchanged step to step). A
         # preplan leases a different slot, so this is disjoint from the in-flight
         # forward's buffers.
@@ -212,18 +213,18 @@ class SamplerResource(Resource):
             self._preplanned = True
         else:
             # fresh inline (capture / no preplan): gather the per-step state too
-            self._gather_dynamic(ctx)
+            self._gather_dynamic(ctx, lease)
             self._cg_sampler = sampler
 
-    def _gather_dynamic(self, ctx: StepContext):
+    def _gather_dynamic(self, ctx: StepContext, lease: SlotLease):
         """Gather the per-step RNG offset + seen-token mask into this step's
         slot, inline so they reflect the previous step's committed tokens.
 
         The mask half is the expensive half and is skipped whenever the penalty
         is inert this step — see the flags in `__init__`. The RNG offset is
         always gathered: it advances in-graph every step regardless."""
-        cg_slot = ctx.slot_lease.slot
-        padded_bs = ctx.slot_lease.bucket.bs
+        cg_slot = lease.slot
+        padded_bs = lease.bucket.bs
         if self._penalty_needed_this_step:
             self._cg_buffers.stage_seen_token_masks(
                 request_ids=ctx.request_ids,

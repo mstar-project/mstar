@@ -120,7 +120,8 @@ class FlashInferManager(AttentionManager):
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         self.reset_default_cursors()
-        assert not ctx.is_preplan or ctx.slot_lease is not None, (
+        lease = ctx.slot_lease
+        assert not ctx.is_preplan or lease is not None, (
             "preplan requires a cuda graph step: eager wrappers share one "
             "workspace per label with the forward still in flight"
         )
@@ -146,9 +147,9 @@ class FlashInferManager(AttentionManager):
         plan_states.clear()
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
-            if ctx.slot_lease is not None:
+            if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
-                wrapper = self._cg_wrapper(ctx.slot_lease, label, num_rows)
+                wrapper = self._cg_wrapper(lease, label, num_rows)
             else:
                 is_decode = bool(
                     indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1

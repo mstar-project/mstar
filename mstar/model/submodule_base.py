@@ -11,7 +11,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import Resource, SubmoduleStep
+from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
 
 if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
@@ -380,6 +380,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[NodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
     ) -> SubmoduleStep | None:
         """Declare this batch's step for the runner to drive: which cache
         streams it touches, what spans they grow by, which plans back it,
@@ -391,7 +394,17 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
         ``request_ids`` pairs positionally with ``inputs``. Under a captured
         graph the batch is padded to the bucket's shape, so it carries the
-        padding rows' ids too — declare their segments like any other row."""
+        padding rows' ids too — declare their segments like any other row.
+
+        ``slot_lease`` is the slot this step will replay on, or None for an
+        eager step. A submodule whose declaration differs between the two
+        (cosmos3 packs both guidance branches into one plan for the captured
+        shape) must key off this, not off its own capture key: the key says
+        the batch *could* be captured, the lease says it was.
+
+        ``piecewise_leases`` names the regions of this node that hold a slot
+        for this step. Such a region declares, plans and commits its own work,
+        so a resource it owns must be left out of this declaration."""
         return None
 
     @abstractmethod

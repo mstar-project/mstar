@@ -11,6 +11,7 @@ Two submodules:
 
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -24,7 +25,7 @@ from mstar.engine.cuda_graph_config import (
     PackedCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
@@ -515,6 +516,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
     ) -> SubmoduleStep:
         """Bidirectional (prefix-LM) attention over the packed batch.
 

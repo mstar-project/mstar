@@ -253,7 +253,7 @@ class DenseAttentionManager(AttentionManager):
             "under this backend — see `requires_kv_write`)"
         )
         # `plan` refuses a leased slot, which covers every path that plans. A
-        # piecewise region declaring `reuses_outer_plan` never plans, so its
+        # a piecewise region that never plans would reach here and bake this
         # capture would reach here and bake this step's gather, its shapes and
         # the address of a cached prefix into the graph; the first invalidation
         # re-gathers into a new tensor the replay does not read. Silent, so
@@ -262,7 +262,7 @@ class DenseAttentionManager(AttentionManager):
             raise RuntimeError(
                 "dense attention cannot be captured: the prefix gather and "
                 "the concatenation are shaped by the step and allocate. A "
-                "piecewise region with `reuses_outer_plan` is the path that "
+                "piecewise region that does not plan is the path that "
                 "gets here — capture that region against the paged backend."
             )
         from fa3_fwd_interface import flash_attn_varlen_func

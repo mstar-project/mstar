@@ -253,7 +253,7 @@ def _forward_step(
         step_fwds = cg_runner.step_metadata(lease, real_ids, step_fwds)
         step_ids = cg_runner.step_ids(lease, real_ids)
 
-    step = dit.declare_step(walk, step_ids, inputs)
+    step = dit.declare_step(walk, step_ids, inputs, slot_lease=lease)
     if step is not None:
         step.set_ctx(StepContext(
             request_ids=tuple(step_ids), graph_walk=walk,

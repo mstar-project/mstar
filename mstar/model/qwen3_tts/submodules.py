@@ -27,7 +27,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -43,7 +43,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCudaGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
@@ -63,6 +63,9 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     NodeInputs,
 )
+
+# the CodePredictor depth loop, as a piecewise capture region
+DEPTH_LOOP_REGION = "code_predictor_loop"
 
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
@@ -401,22 +404,27 @@ class TalkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
     ) -> SubmoduleStep:
         """One causal step over the packed batch; both walks sample group 0.
 
-        CODE_PRED_SAMPLER only rides the captured ``talker_decode`` step, where
-        the depth loop runs inline and needs its cg-sampler. On eager paths
-        (prefill) the piecewise runner owns that sampler's plan/commit, so
-        declaring it here too would leave a stale cg-sampler for the outer
-        (unleased) commit to trip on.
+        CODE_PRED_SAMPLER belongs to whoever runs the depth loop. The region
+        declares it whenever it holds a slot for this step, so declaring it
+        here too would plan and commit it twice; when the region has no slot
+        the loop runs inline and this step owns it. Keyed off the lease rather
+        than the walk, which disagreed with ``_run_frame`` — that picks inline
+        vs piecewise from what the runner can actually serve.
         """
+        del slot_lease
         steps = {
             TALKER_KV: KVStep(),
             TALKER_ATTN: AttentionStep(causal=True),
             TALKER_POS: PositionStep(),
             TALKER_SAMPLER: SamplerStep(apply_penalty=True),
         }
-        if graph_walk == "talker_decode":
+        if not (piecewise_leases or {}).get(DEPTH_LOOP_REGION):
             steps[CODE_PRED_SAMPLER] = SamplerStep(apply_penalty=False)
         return SubmoduleStep(
             segments=[
@@ -545,7 +553,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         ``talker_prefill``, which is eager because it is variable-length. Left
         eager, this loop costs ~4x its captured time.
         """
-        runner = engine_inputs.piecewise_runners.get("code_predictor_loop")
+        runner = engine_inputs.piecewise_runners.get(DEPTH_LOOP_REGION)
         batch_size = layer0_codes.shape[0]
         if runner is None or not runner.can_run(batch_size=batch_size):
             return None
@@ -748,10 +756,13 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
 
         return {
-            "code_predictor_loop": PiecewiseBatchedConfig(
+            DEPTH_LOOP_REGION: PiecewiseBatchedConfig(
                 capture_fn=self._code_predictor_piecewise_capture,
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
+                # take the slot before the outer declaration, so it can leave
+                # CODE_PRED_SAMPLER to this region
+                lease_before_step=True,
                 seq_len=1,
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,

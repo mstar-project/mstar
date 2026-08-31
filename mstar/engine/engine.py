@@ -592,11 +592,14 @@ class Engine:
         step: SubmoduleStep | None=None,
     ) -> tuple[AdmitOutcome, SubmoduleStep]:
         if step is None:
+            self._maybe_lease_piecewise_regions(batch.node_name, ctx, inputs)
             if nvtx:
                 range_push("engine.declare_step")
             try:
                 step = submodule.declare_step(
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
+                    slot_lease=ctx.slot_lease,
+                    piecewise_leases=ctx.piecewise_leases,
                 )
             finally:
                 if nvtx:
@@ -622,6 +625,36 @@ class Engine:
                 admit_outcome.reason, admit_outcome.failed_resource,
             )
         return admit_outcome, step
+
+    def _maybe_lease_piecewise_regions(
+        self, node_name: str, ctx: StepContext, inputs: list[NodeInputs],
+    ) -> None:
+        """Take each opted-in region's slot, and report it on the context.
+
+        A region still declares, plans and commits its own step — its shape is
+        its own, and several regions can share a resource — but the outer
+        ``declare_step`` has to know which resources are already spoken for so
+        it doesn't declare them a second time. The lease is settled from the
+        same batch size and token count the region will resolve at replay, so
+        the two agree by construction.
+
+        Nothing to take when the whole forward replays: the region is baked
+        inside that graph and runs no Python, so the outer step owns its work.
+        """
+        runners = self._submodules[node_name].piecewise_runners
+        if not runners or ctx.slot_lease is not None:
+            return
+        bs = len(inputs)
+        total_tokens = sum(inp.input_seq_len for inp in inputs)
+        leases = {}
+        for label, runner in runners.items():
+            if not runner.lease_before_step:
+                continue
+            lease = runner.lease_slot(bs, total_tokens)
+            if lease is not None:
+                leases[label] = lease
+        if leases:
+            ctx.set_piecewise_leases(leases)
 
     def _drive_step(
         self,
@@ -1092,6 +1125,7 @@ class Engine:
             graph_walk=batch.step_context.graph_walk,
             request_ids=batch.step_context.padded_request_ids,
             inputs=inputs,
+            slot_lease=lease,
         )
         if step is None:
             return False

@@ -209,13 +209,11 @@ class PiecewiseCudaGraphConfig(ABC):
     # from the submodule's `declare_step` because the region's shape is its
     # own: the runner admits, plans, and commits it per replay.
     declare_step: Callable[[list[str], list[int]], SubmoduleStep | None] | None = None
-    # Set when the outer forward's step already planned this region's work over
-    # this same padded shape and lease; the runner then declares and plans only
-    # at capture, and each replay rides the live plan. Wrong here is silent: the
-    # region would read whatever plan the resources currently hold.
-    # TODO: the runner can't see the outer lease to check the two agree. Thread
-    # it through `run` once the forward carries its step context.
-    reuses_outer_plan: bool = False
+    # Take this region's slot before the outer `declare_step` runs, and report
+    # it on the step context. The region still declares, plans and commits its
+    # own work; the lease only tells the outer declaration which resources are
+    # already spoken for, so it can leave them out.
+    lease_before_step: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
     # None => defer to the runner's default batch-size buckets

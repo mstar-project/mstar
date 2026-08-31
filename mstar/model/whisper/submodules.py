@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -19,7 +20,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SubmoduleStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -192,6 +193,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
     ) -> SubmoduleStep:
         context_segments = tuple(
             Segment(
@@ -288,11 +292,21 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             )]
         }
 
+    # Prefill isn't captured, so the engine's capture cap doesn't bound it and
+    # `can_batch` would take the whole ready set. A set too big for the context
+    # cache can't be admitted; with offload configured it evicts and retries,
+    # without it there is nothing to evict and the batch reforms identically.
+    MAX_BATCH_SIZE = 16
+
     def can_batch(
         self, batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        del graph_walk
+        return self.MAX_BATCH_SIZE
 
     def forward_batched(
         self,
