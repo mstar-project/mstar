@@ -30,10 +30,12 @@ from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
+    DrainRequest,
     FailRequests,
     InputSignals,
     MessageSource,
     NewRequest,
+    ReadsDone,
     RemoveRequest,
     ScheduleTPNode,
     SetupDone,
@@ -293,6 +295,14 @@ class Worker:
         #   PendingLoopStop.
         self._in_flight_rids: set[str] = set()
         self._pending_removes: set[str] = set()
+        # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
+        # behind an in-flight GPU step; _draining_rids have stopped reading and
+        # persist until REMOVE_REQUEST (so no read can restart after READS_DONE);
+        # _reads_done_sent tracks which have already ACKed.
+        self._pending_drains: set[str] = set()
+        self._draining_rids: set[str] = set()
+        self._reads_done_sent: set[str] = set()
+
         self._pending_loop_stops: set[PendingLoopStop] = set()
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
@@ -415,6 +425,9 @@ class Worker:
     # ------------------------------------------------------------------
 
     def _add_new_request(self, body: NewRequest) -> None:
+        if body.request_id in self._draining_rids:
+            # Being torn down (out-of-order NEW after DRAIN); don't start reads.
+            return
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         now = _time.monotonic()
         for node_name in self.engine_manager.lru_tracked_nodes():
@@ -501,15 +514,96 @@ class Worker:
                     )
                 )
 
+        # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
+        # ignoring ref counts / persist. Safe because the conductor only sends
+        # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
+        # on the abort/fail path via a prior DrainRequest, on the happy path
+        # once the api server finished reading the outputs.
+        self._draining_rids.discard(body.request_id)
+        self._pending_drains.discard(body.request_id)
+        self._reads_done_sent.discard(body.request_id)
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
-        self.tensor_manager.cleanup_request(body.request_id)
+        self.tensor_manager.force_cleanup_request(body.request_id)
         self.profile_info.pop_request(body.request_id)
         self.streaming_buffers.pop(body.request_id, None)
         self.scheduler.clear_rid(body.request_id)
 
         for node_name in self.engine_manager.lru_tracked_nodes():
             self._last_active.pop((body.request_id, node_name), None)
+
+    def _drain_request(self, body: DrainRequest) -> None:
+        """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
+        then ACK READS_DONE once its in-flight reads finish. The hard cleanup
+        (force_cleanup_request) waits for the conductor's REMOVE_REQUEST, sent
+        only after every reader has ACKed."""
+        if self.is_tp_follower and body.source not in (
+            MessageSource.TP_RANK_0, MessageSource.SELF
+        ):
+            return  # honor only the leader's forwarded drain, like REMOVE_REQUEST
+
+        # Defer behind an in-flight GPU step, same as REMOVE_REQUEST: clearing
+        # the scheduler while a step references the rid would race the GPU thread.
+        if body.request_id in self._in_flight_rids:
+            self._pending_drains.add(body.request_id)
+            return
+
+        self._begin_drain(body.request_id)
+
+    def _begin_drain(self, request_id: str) -> None:
+        # Fan the drain to TP followers so each rank drains and ACKs its own
+        # READS_DONE (the conductor waits on every rank).
+        cfg = self.worker_graphs_manager.per_request_info.get(request_id)
+        if cfg is not None:
+            followers: set[str] = set()
+            for group in cfg.sharding_config.groups:
+                if group.tp_size > 1 and group._tp_rank == 0:
+                    followers.update(group._workers[1:])
+            for worker in followers:
+                self.communicator.send(
+                    worker, msg=WorkerMessage(
+                        message_type=WorkerMessageType.DRAIN_REQUEST,
+                        body=DrainRequest(
+                            request_id=request_id,
+                            source=MessageSource.TP_RANK_0,
+                        )
+                    )
+                )
+
+        # Stop initiating new GPU work; new reads are gated on _draining_rids.
+        # Keep engine / tensor state until REMOVE_REQUEST.
+        self.scheduler.clear_rid(request_id)
+        self._draining_rids.add(request_id)
+        self._complete_drain_if_ready(request_id)
+
+    def _complete_drain_if_ready(self, request_id: str) -> None:
+        """ACK READS_DONE once no async read for the rid is still in flight.
+        The rid stays in _draining_rids (reads gated) until REMOVE_REQUEST."""
+        if request_id not in self._draining_rids:
+            return
+        if request_id in self._reads_done_sent:
+            return
+        if self.tensor_manager.has_inflight_reads(request_id):
+            return  # let get_ready_tensors resolve the futures; retry next iter
+        self._reads_done_sent.add(request_id)
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.READS_DONE,
+                body=ReadsDone(
+                    request_id=request_id, entity_id=self.worker_id
+                ),
+            ),
+        )
+
+    def _apply_pending_drains(self, in_flight_rids: set[str]) -> None:
+        """Begin drains that were deferred behind an in-flight GPU step, and
+        re-check draining rids whose reads may now have finished."""
+        for rid in [r for r in self._pending_drains if r not in in_flight_rids]:
+            self._pending_drains.discard(rid)
+            self._begin_drain(rid)
+        for rid in list(self._draining_rids):
+            self._complete_drain_if_ready(rid)
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
@@ -519,6 +613,10 @@ class Worker:
             )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
+        # Draining for teardown: don't start new reads for this rid. The
+        # producer's segment may be unlinked once every reader ACKs READS_DONE.
+        if body.request_id in self._draining_rids:
+            return
         logger.debug(
             "Received new signals %s at worker %s for request %s",
             format_graph_edge_list(body.inputs), self.worker_id, body.request_id
@@ -637,6 +735,8 @@ class Worker:
                 continue
             if message.message_type == WorkerMessageType.NEW_REQUEST:
                 self._add_new_request(message.body)
+            elif message.message_type == WorkerMessageType.DRAIN_REQUEST:
+                self._drain_request(message.body)
             elif message.message_type == WorkerMessageType.REMOVE_REQUEST:
                 self._remove_request(message.body)
             elif message.message_type == WorkerMessageType.INPUT_SIGNALS:
@@ -2238,6 +2338,7 @@ class Worker:
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
+                self._apply_pending_drains(self._in_flight_rids)
 
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()
@@ -2510,6 +2611,7 @@ class Worker:
                     # are safe to apply now.
                     in_flight = set(spec_pending.batch.node_objects.keys()) if spec_pending else set()
                     self._apply_pending_removes_safe_to_drop(in_flight)
+                    self._apply_pending_drains(in_flight)
                     _set_pending(None)
 
                 if spec_pending is not None:

@@ -30,6 +30,7 @@ class MessageBody:
 
 class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
+    DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
     UNPERSIST_TENSORS = "unpersist"
@@ -54,6 +55,14 @@ class MessageSource(IntEnum):
 
 @dataclass
 class RemoveRequest(MessageBody):
+    request_id: str
+    source: int = MessageSource.CONDUCTOR
+
+
+@dataclass
+class DrainRequest(MessageBody):
+    # Phase-1 teardown: stop reading this request and confirm no reads remain.
+    # Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.
     request_id: str
     source: int = MessageSource.CONDUCTOR
 
@@ -109,6 +118,7 @@ class ConductorMessageType(Enum):
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
     FAIL_REQUESTS = "fail_requests"
+    READS_DONE = "reads_done"
 
 
 @dataclass
@@ -147,6 +157,14 @@ class SetupDone(MessageBody):
 @dataclass
 class AbortRequest(MessageBody):
     request_id: str
+
+
+@dataclass
+class ReadsDone(MessageBody):
+    """An entity confirming it has no in-flight reads for a request and will
+    start none — the conductor's gate before sending the hard RemoveRequest."""
+    request_id: str
+    entity_id: str
 
 
 @dataclass
