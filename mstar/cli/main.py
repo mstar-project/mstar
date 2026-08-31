@@ -31,6 +31,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
+    "qwenvl": "qwenvl.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -81,7 +82,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\")",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni"):
+    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "qwenvl"):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")

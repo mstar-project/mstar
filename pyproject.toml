@@ -106,6 +106,20 @@ qwen3_tts = [
     "transformers>=4.57.3",
 ]
 
+qwenvl = [
+    # Serving needs FlashInfer, but its CUDA-only transitive wheels cannot be
+    # resolved on macOS where the CPU/reference integration tests run.
+    "flashinfer-python>=0.6.4; sys_platform == 'linux'",
+    "huggingface-hub",
+    # Mooncake only publishes Linux wheels. It is optional for local model
+    # correctness/parity tests and is not needed by the QwenVL model graph.
+    "mooncake-transfer-engine; sys_platform == 'linux'",
+    "Pillow",
+    "safetensors",
+    # Qwen3-VL-MoE and its DeepStack vision output landed in Transformers 4.57.
+    "transformers>=4.57.3,<5",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python>=0.6.4",
