@@ -16,7 +16,6 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.worker import Worker
 
-
 # ── worker ──────────────────────────────────────────────────────────────────
 
 def _worker(
@@ -37,7 +36,7 @@ def _worker(
     w._pending_removes = set()
     w._last_active = {}
     w.streaming_buffers = {}
-    w.scheduler = SimpleNamespace(clear_rid=lambda rid: w.cleared.append(rid))
+    w.scheduler = SimpleNamespace(clear_rid=lambda rid: w.cleared.append(rid)) # noqa: PLW0108
     w.worker_graphs_manager = SimpleNamespace(
         per_request_info={
             rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
@@ -51,7 +50,7 @@ def _worker(
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
         has_inflight_reads=lambda rid: inflight_reads,
-        force_cleanup_request=lambda rid: w.forced.append(rid),
+        force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
     )
     return w
 
@@ -157,7 +156,7 @@ def _preprocess(inflight_reads=False):
     wt.communicator = SimpleNamespace(send=lambda e, m: wt.sent.append((e, m)))
     wt.tensor_manager = SimpleNamespace(
         has_inflight_reads=lambda rid: inflight_reads,
-        force_cleanup_request=lambda rid: wt.forced.append(rid),
+        force_cleanup_request=lambda rid: wt.forced.append(rid), # noqa: PLW0108
     )
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
