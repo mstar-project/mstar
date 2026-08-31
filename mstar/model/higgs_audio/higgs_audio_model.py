@@ -122,7 +122,8 @@ class HiggsAudioModel(Model):
             num_qo_heads=self.config.num_attention_heads,
             # ~2k tokens per ASR request (prompt + 12.5 audio embeds/s +
             # transcript); 256 pages = 32k tokens ≈ 16 concurrent
-            # requests at ~3.7 GB.
+            # requests at ~3.7 GB, less whatever the decode capture's
+            # padding rows hold (one page each, on first use).
             max_num_pages=256,
         )
         return [

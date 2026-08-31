@@ -108,6 +108,12 @@ class DummyRowPool:
             for resource in self._resources.values():
                 resource.reset_request(rid, free=free)
 
+    def release_all(self) -> None:
+        """Hand back every padding row's storage once capture is done: a
+        replay pads with zero-length rows, so it is capture-time residue."""
+        for rids in self._held.values():
+            self.reset(rids, free=True)
+
 
 @dataclass
 class CudaGraphSlot:
@@ -341,6 +347,8 @@ class CudaGraphRunner:
             if self._num_slots > 1:
                 # pre-seed preplan inputs; cached per bucket, so once is enough
                 self.declare_inputs_for(SlotLease(slot=0, bucket=bucket_key))
+
+        self._dummy_rows.release_all()
 
         mem_after = torch.cuda.memory_allocated(self._device)
         self._log_memory(mem_before, mem_after)

@@ -69,6 +69,10 @@ class _FakeRunner:
             tp_group=self.barrier, sp_group=self.barrier
         )
         self.declared: list = []
+        self._dummy_rows = SimpleNamespace(
+            released=False,
+            release_all=lambda: setattr(self._dummy_rows, "released", True),
+        )
 
     def prepare_for_capture(self):
         return self._specs
@@ -195,6 +199,17 @@ def test_ranks_agree_on_the_full_candidate_list_not_just_local_successes():
     runner.warmup_and_capture()
 
     assert runner._buckets == {}
+
+
+@requires_cuda
+def test_capture_hands_the_padding_rows_pages_back():
+    """A capture gives its padding rows real spans; a replay pads with
+    zero-length ones, so that storage is residue the traffic should get."""
+    runner = _FakeRunner(_specs())
+
+    runner.warmup_and_capture()
+
+    assert runner._dummy_rows.released
 
 
 @requires_cuda
