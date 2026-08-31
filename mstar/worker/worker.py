@@ -585,6 +585,8 @@ class Worker:
             return
         if self.tensor_manager.has_inflight_reads(request_id):
             return  # let get_ready_tensors resolve the futures; retry next iter
+        if self.scheduler.tp_batches_pending_schedule[request_id] > 0:
+            return # need to wait for TP follow batches to drain
         self._reads_done_sent.add(request_id)
         self.communicator.send(
             "conductor",
@@ -996,7 +998,7 @@ class Worker:
             final_stream_rids=final_stream_rids,
         )
 
-    def maybe_send_zmq_to_tp_followers(
+    def _maybe_send_zmq_to_tp_followers(
         self, node_batch: NodeBatch
     ):
         if node_batch.node_name not in self.parallel_nodes or \
@@ -2420,7 +2422,7 @@ class Worker:
                             )
 
                             # send messages to follower ranks if relevant
-                            self.maybe_send_zmq_to_tp_followers(node_batch)
+                            self._maybe_send_zmq_to_tp_followers(node_batch)
                     if speculation is not None:
                         # Reserve the double-buffer slot for batch_(N+1) NOW
                         # so both pre-plan and replay (queued below) target
@@ -2668,7 +2670,7 @@ class Worker:
                 fallthrough_engine.reserve_replay_slot(node_batch)
 
                 # send messages to follower ranks if relevant
-                self.maybe_send_zmq_to_tp_followers(node_batch)
+                self._maybe_send_zmq_to_tp_followers(node_batch)
 
                 # Attach a fresh advance_event so the next iter's
                 # plan_executor (if it speculates) can wait on this batch's
