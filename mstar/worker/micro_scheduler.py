@@ -1,6 +1,6 @@
 import logging
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -142,6 +142,10 @@ class MicroScheduler:
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: set[str] = set()
 
+        # rid -> number of tp follow batches in the queue. Used in the fail/abort
+        # path, where we need to drain the TP queue before aborting
+        self.pending_tp_follow_count: dict[str, int] = {}
+
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
@@ -170,6 +174,8 @@ class MicroScheduler:
         self, message: ScheduleTPNode
     ):
         self.tp_batches_pending_schedule.append(message)
+        for rid in message.request_ids:
+            self.pending_tp_follow_count[rid] += 1
 
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
@@ -226,6 +232,11 @@ class MicroScheduler:
                 assert len(popped) == 1
                 node_objects[rid] = popped[0]
                 request_to_worker_graph[rid] = wgid
+
+        for rid in first_tp_node.request_ids:
+            self.tp_batches_pending_schedule[rid] -= 1
+            if self.tp_batches_pending_schedule[rid] <= 0:
+                self.tp_batches_pending_schedule.pop(rid)
 
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(
@@ -666,4 +677,5 @@ class MicroScheduler:
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
+        self.tp_batches_pending_schedule.pop(rid, None)
 

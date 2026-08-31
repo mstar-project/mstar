@@ -538,6 +538,8 @@ class Worker:
             return
         if self.tensor_manager.has_inflight_reads(request_id):
             return  # let get_ready_tensors resolve the futures; retry next iter
+        if self.scheduler.tp_batches_pending_schedule[request_id] > 0:
+            return # need to wait for TP follow batches to drain
         self._reads_done_sent.add(request_id)
         self.communicator.send(
             "conductor",
@@ -2662,7 +2664,7 @@ class Worker:
                 # thread then admits, plans and runs it inline; the slot is
                 # leased inside exec, once the token count is known.
                 # send messages to follower ranks if relevant
-                self.maybe_send_zmq_to_tp_followers(node_batch)
+                self._maybe_send_zmq_to_tp_followers(node_batch)
 
                 future = gpu_executor.submit(
                     self._execute_on_gpu_thread, batch, node_batch, None,
