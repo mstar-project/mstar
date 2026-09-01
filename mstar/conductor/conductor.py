@@ -960,17 +960,7 @@ class Conductor:
         request_data = self.requests[request_id]
         request_data.conductor_finish_time = time.perf_counter()
 
-        # Unpersist anything still held, with correct ref counts, so producers
-        # reclaim it as the final reads ACK — before the hard teardown.
-        still_persisted = [
-            info
-            for infos in request_data.persist_signals.values()
-            for info in infos
-        ]
-        if still_persisted:
-            self._un_persist_tensors(request_id, still_persisted)
-
-        # Tell the client immediately (no added completion latency).
+        # Tell the client first, so nothing below adds to completion latency.
         self.communicator.send(
             "api_server",
             APIServerMessage(
@@ -986,6 +976,16 @@ class Conductor:
                 )
             )
         )
+
+        # Unpersist anything still held, with correct ref counts, so producers
+        # reclaim it as the final reads ACK — before the hard teardown.
+        still_persisted = [
+            info
+            for infos in request_data.persist_signals.values()
+            for info in infos
+        ]
+        if still_persisted:
+            self._un_persist_tensors(request_id, still_persisted)
 
         # Workers are done reading (the graph finished); the only remaining
         # reader is the preprocess worker still delivering outputs. Defer the
