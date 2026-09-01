@@ -570,9 +570,9 @@ class Worker:
                     )
                 )
 
-        # Stop initiating new GPU work; new reads are gated on _draining_rids.
-        # Keep engine / tensor state until REMOVE_REQUEST.
-        self.scheduler.clear_rid(request_id)
+        # Stop new leader work but keep draining committed TP batches (failed_rids
+        # is exactly this gate); keep engine/tensor/queue state until REMOVE.
+        self.scheduler.fail_rids({request_id})
         self._draining_rids.add(request_id)
         self._complete_drain_if_ready(request_id)
 
@@ -585,8 +585,8 @@ class Worker:
             return
         if self.tensor_manager.has_inflight_reads(request_id):
             return  # let get_ready_tensors resolve the futures; retry next iter
-        if self.scheduler.tp_batches_pending_schedule[request_id] > 0:
-            return # need to wait for TP follow batches to drain
+        if self.scheduler.pending_tp_follow_count.get(request_id, 0) > 0:
+            return  # wait for committed TP-follow batches to drain first
         self._reads_done_sent.add(request_id)
         self.communicator.send(
             "conductor",

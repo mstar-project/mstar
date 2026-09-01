@@ -20,13 +20,14 @@ from mstar.worker.worker import Worker
 
 def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
-    pending_drains=(), inflight_reads=False, is_follower=False,
+    pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(),
 ):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w.is_tp_follower = is_follower
     w.sent = []
     w.cleared = []
+    w.failed = set()
     w.forced = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
     w._in_flight_rids = set(in_flight)
@@ -36,7 +37,11 @@ def _worker(
     w._pending_removes = set()
     w._last_active = {}
     w.streaming_buffers = {}
-    w.scheduler = SimpleNamespace(clear_rid=lambda rid: w.cleared.append(rid)) # noqa: PLW0108
+    w.scheduler = SimpleNamespace(
+        clear_rid=lambda rid: w.cleared.append(rid),  # noqa: PLW0108
+        fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
+        pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
+    )
     w.worker_graphs_manager = SimpleNamespace(
         per_request_info={
             rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
@@ -68,7 +73,8 @@ def test_drain_acks_reads_done_when_no_inflight_reads():
 
     assert "X" in w._draining_rids  # reads gated until REMOVE
     assert "X" in w._reads_done_sent
-    assert "X" in w.cleared  # scheduler stopped from starting new work
+    assert "X" in w.failed  # scheduler stopped from starting new leader work
+    assert "X" not in w.cleared  # but state kept until REMOVE
     acks = _reads_done(w)
     assert len(acks) == 1
     assert acks[0].body.request_id == "X"
@@ -82,6 +88,19 @@ def test_drain_waits_for_inflight_reads_then_acks():
 
     # Async reads finish; the run-loop hook re-checks and now ACKs.
     w.tensor_manager.has_inflight_reads = lambda rid: False
+    Worker._apply_pending_drains(w, set())
+    assert len(_reads_done(w)) == 1
+
+
+def test_drain_waits_for_committed_tp_follow_batches():
+    """A queued TP-follow batch (leader already sent the ZMQ) must drain before
+    READS_DONE, or REMOVE tears the worker-graph queues out from under it."""
+    w = _worker(tp_follow=("X",))
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._draining_rids and not _reads_done(w)
+
+    # The follow batch gets scheduled; count drops to 0.
+    w.scheduler.pending_tp_follow_count.pop("X")
     Worker._apply_pending_drains(w, set())
     assert len(_reads_done(w)) == 1
 

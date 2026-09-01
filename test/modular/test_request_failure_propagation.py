@@ -305,6 +305,7 @@ def _scheduler():
     s.held_until = {}
     s.pending_removes = set()
     s.tp_batches_pending_schedule = []
+    s.pending_tp_follow_count = {}
     s.engine_manager = SimpleNamespace(
         get_engine=lambda name: SimpleNamespace(check_ready=lambda *a: True)
     )
