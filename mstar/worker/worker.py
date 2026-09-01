@@ -985,7 +985,14 @@ class Worker:
                 request_id, outputs.persist
             )
 
-        if outputs.new_token_outputs:
+        # Only the tp-leader computes new-token counts: the conductor consumes
+        # ``new_token_counts`` exclusively from ``is_first_tp_rank`` messages
+        # (see conductor.py — ``if body.is_first_tp_rank``), and for a replicated
+        # (non-persisted) EMIT_TO_CLIENT + conductor_new_token edge the token
+        # tensor is only kept alive on rank 0. Without this gate the 7 non-leader
+        # ranks call get_tensor() on an already-dereferenced/GC'd uuid and crash
+        # with KeyError.
+        if outputs.new_token_outputs and outputs.is_first_tp_rank:
             name_to_count: dict[str, int] = {}
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_count:

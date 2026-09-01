@@ -122,6 +122,10 @@ class KVCacheConfig:
     # FA3 on Hopper; models can pin ``fa2`` when their deployment toolchain
     # cannot compile the Hopper JIT kernels.
     flashinfer_backend: str = "auto"
+    # For "mla_absorb", whose scale is based on qk_head_dim rather than latent width.
+    softmax_scale: float | None = None
+    # For "mla_absorb": split combined latent head_dim into ckv + kpe.
+    mla_ckv_dim: int | None = None
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -728,4 +732,3 @@ class PagedAllocationManager:
                 state.seq_len = seq_len
                 state.position_id_start = pos_id
         cpu_pool.sync()
-
