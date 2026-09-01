@@ -11,7 +11,7 @@ from mstar.api_server.openai._util import now, rid
 logger = logging.getLogger(__name__)
 
 
-async def create_videos(api, model_name, adapter, req):  # noqa: ARG001
+async def create_videos(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
     args = adapter.video_to_request(req, api.upload_dir)
     request_id = rid("vid")
 
@@ -25,7 +25,7 @@ async def create_videos(api, model_name, adapter, req):  # noqa: ARG001
         request_id=request_id,
     )
 
-    chunks = await api.collect_results(request_id)
+    chunks = await api.collect_results(request_id, raw_request)
     # Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the
     # image endpoint's b64_json shape. A sound request additionally emits a raw
     # 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one

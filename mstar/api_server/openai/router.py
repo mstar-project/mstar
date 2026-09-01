@@ -120,12 +120,12 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
 
 
 @router.post("/v1/videos/generations")
-async def videos_generations(request: VideoGenerationRequest):
+async def videos_generations(request: VideoGenerationRequest, raw_request: Request):
     api, model_name, adapter, err = _resolve("supports_videos")
     if err is not None:
         return err
     try:
-        result = await serving_videos.create_videos(api, model_name, adapter, request)
+        result = await serving_videos.create_videos(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
         return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
