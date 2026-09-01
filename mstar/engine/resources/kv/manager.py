@@ -30,6 +30,7 @@ from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitFailedReason,
     AdmitOutcome,
+    AdmitRuntimeError,
     AllocationFailed,
     RequestOffloading,
     Segment,
@@ -75,6 +76,9 @@ class CacheStream:
     retention: RetentionPolicy | None = None
     read_pending: bool = False
     read_future: Future | None = None
+    # a failed retrieve, latched: the future is consumed once, but every later
+    # readiness check has to keep reporting the stream as unusable
+    read_error: BaseException | None = None
     offloaded: bool = False
     generation: int = 0
 
@@ -281,8 +285,14 @@ class KVManager(AttentionResource):
             return ADMIT_OK
 
         if published.world_size != self._world_size:
-            raise RuntimeError(
-                "KV cache transfer across TP world size is currently disallowed"
+            # terminal for this request, not for the worker serving it
+            return AdmitOutcome(
+                ok=False, ready=False,
+                reason=AdmitRuntimeError(
+                    "KV cache transfer across TP world size is currently "
+                    f"disallowed (published {published.world_size}, "
+                    f"local {self._world_size})"
+                ),
             )
         needed_labels = self._overrides[rid].get_labels(node_name, graph_walk)
         # one critical section: reading stored_len, comparing to published, and
@@ -292,7 +302,10 @@ class KVManager(AttentionResource):
             for label, seq_info in published.get(self._rank).items():
                 if label not in needed_labels:
                     continue
-                if not self._check_ready(rid, label):
+                label_ready, failed = self._check_ready(rid, label)
+                if failed is not None:
+                    return AdmitOutcome(ok=False, ready=False, reason=failed)
+                if not label_ready:
                     # read already in progress: admitted, just not ready yet
                     return AdmitOutcome(ok=True, ready=False)
 
@@ -326,7 +339,12 @@ class KVManager(AttentionResource):
                 stream.read_pending = fut is not None
                 stream.stored_len = new_len
 
-            ready = all(self._check_ready(rid, label) for label in needed_labels)
+            ready = True
+            for label in needed_labels:
+                label_ready, failed = self._check_ready(rid, label)
+                if failed is not None:
+                    return AdmitOutcome(ok=False, ready=False, reason=failed)
+                ready = ready and label_ready
         return AdmitOutcome(
             ok=True, ready=ready
         )
@@ -834,15 +852,30 @@ class KVManager(AttentionResource):
                 self._streams[rid][label] = CacheStream()
             return self._streams[rid][label]
 
-    def _check_ready(self, rid: str, label: str):
+    def _check_ready(
+        self, rid: str, label: str
+    ) -> tuple[bool, AdmitRuntimeError | None]:
+        """(ready, terminal failure). A failed retrieve is latched on the
+        stream: the future can only be read once, but every later check has to
+        keep reporting the stream as unusable."""
         if label not in self._streams[rid]:
-            return True
+            return True, None
         stream = self._streams[rid][label]
         if stream.read_future is not None and stream.read_future.done():
-            stream.read_future.result()
-            stream.read_future = None
-            stream.read_pending = False
-        return not stream.read_pending
+            future, stream.read_future = stream.read_future, None
+            try:
+                future.result()
+            except Exception as e:
+                stream.read_error = e
+            else:
+                stream.read_pending = False
+        if stream.read_error is not None:
+            err = stream.read_error
+            return False, AdmitRuntimeError(
+                f"KV retrieve for request {rid} label {label!r} failed: "
+                f"{type(err).__name__}: {err}"
+            )
+        return not stream.read_pending, None
 
     @staticmethod
     def _label_growth(step: KVStep) -> dict[tuple[str, str], int]:

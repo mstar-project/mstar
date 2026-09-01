@@ -224,7 +224,6 @@ class Cosmos3Model(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER,
                 ),
-                kv_config=kv_config,
             ),
         ]
         if self.config.attention_backend == "dense_gen":
@@ -234,7 +233,6 @@ class Cosmos3Model(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.DENSE,
                 ),
-                kv_config=kv_config,
             ))
         elif self.config.attention_backend != "flashinfer":
             raise ValueError(

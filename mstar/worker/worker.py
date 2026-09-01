@@ -2260,6 +2260,10 @@ class Worker:
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
+                # Requests a resource declared unservable during last pass's
+                # readiness scans. They are in no batch, so nothing else would
+                # ever fail them.
+                self._fail_requests(self.scheduler.take_admit_errors())
 
                 # 1. CPU preamble — overlaps with GPU(N).
                 # synchronize=False on every range so torch.cuda.synchronize()

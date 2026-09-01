@@ -312,7 +312,6 @@ class VJepa2Model(Model):
                 config=AttentionConfig(
                     kv_cache=KV_CACHE
                 ),
-                kv_config=kv
             ),
         ]
 

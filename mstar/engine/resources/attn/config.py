@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
@@ -31,7 +30,11 @@ class AttentionConfig:
 @dataclass
 class AttentionSpec(NodeResourceSpec):
     config: AttentionConfig
-    kv_config: KVConfig
+
+    def depends_on(self) -> set[str]:
+        # the wrappers are planned against the cache's geometry, and it has to
+        # be the same KVConfig the KV resource holds
+        return {self.config.kv_cache}
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -41,23 +44,15 @@ class AttentionSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(
         self,
-        max_num_pages: int | None = None,
-        page_size: int | None = None,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
-        **kwargs,
     ):
-        """Track the cache's geometry: the wrappers are planned against it, so
-        a deployment that resizes the cache resizes these too.
+        """Which kernel to run is the deployment's call as much as the
+        model's — an image that cannot build FA3 pins FA2 here.
 
-        Which kernel to run is the deployment's call as much as the model's —
-        an image that cannot build FA3 pins FA2 here.
+        Cache geometry is not repeated here: it belongs to the KV resource
+        this spec depends on, and is tuned under that resource's own block.
         """
-        del kwargs  # keys meant for other resources
-        if max_num_pages is not None:
-            self.kv_config.max_num_pages = max_num_pages
-        if page_size is not None:
-            self.kv_config.page_size = page_size
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:
@@ -90,8 +85,13 @@ class CrossAttentionConfig:
 @dataclass
 class CrossAttentionSpec(NodeResourceSpec):
     config: CrossAttentionConfig
-    # head config of the *context* cache, which need not match the decoder's
-    kv_config: KVConfig
+
+    def depends_on(self) -> set[str]:
+        # the context cache, whose head config need not match the decoder's
+        keys = {self.config.kv_cache}
+        if self.config.query_kv_cache is not None:
+            keys.add(self.config.query_kv_cache)
+        return keys
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -101,18 +101,10 @@ class CrossAttentionSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(
         self,
-        max_num_pages: int | None = None,
-        page_size: int | None = None,
         backend: str | AttnBackend | None = None,
         flashinfer_backend: str | None = None,
-        **kwargs,
     ):
-        """Track the context cache's geometry and backend; see ``AttentionSpec``."""
-        del kwargs  # keys meant for other resources
-        if max_num_pages is not None:
-            self.kv_config.max_num_pages = max_num_pages
-        if page_size is not None:
-            self.kv_config.page_size = page_size
+        """Which kernel to run against the context cache; see ``AttentionSpec``."""
         if backend is not None:
             self.config.backend = AttnBackend(backend)
         if flashinfer_backend is not None:

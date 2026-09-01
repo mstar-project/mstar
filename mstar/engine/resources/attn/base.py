@@ -30,10 +30,11 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
-        # the wrappers are planned against per-rank head counts; idempotent, so
-        # sharing one KVConfig with the KV resource is fine (KVConfig.shard)
+        # the KV resource's own config, not a copy; per-rank head counts, and
+        # `shard` is idempotent so both builders can call it
+        kv_config = info.dependency(spec.config.kv_cache).config
         if info.joint_comm_group is not None:
-            spec.kv_config.shard(info.joint_comm_group.world_size)
+            kv_config.shard(info.joint_comm_group.world_size)
         backend = spec.config.backend
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
@@ -54,7 +55,7 @@ class AttentionManager(AttentionResource):
                     kv_cache=spec.config.kv_cache,
                     device=info.device,
                     dtype=info.kv_dtype,
-                    kv_config=spec.kv_config,
+                    kv_config=kv_config,
                 )
             _warn_dense_fallback(reason)
             backend = AttnBackend.FLASHINFER
@@ -66,7 +67,7 @@ class AttentionManager(AttentionResource):
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
                 dtype=info.kv_dtype,
-                kv_config=spec.kv_config,
+                kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
             )
         raise ValueError(f"Unknown attention backend {backend!r}")

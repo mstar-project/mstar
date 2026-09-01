@@ -633,7 +633,6 @@ class BagelModel(Model):
             AttentionSpec(
                 resource_key="attn", nodes=nodes,
                 config=AttentionConfig(kv_cache="kv"),
-                kv_config=kv_config,
             ),
             PositionSpec(
                 resource_key="rope", nodes=nodes,

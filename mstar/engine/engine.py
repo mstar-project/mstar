@@ -18,6 +18,7 @@ from mstar.engine.cuda_graph_runner import (
 )
 from mstar.engine.resources import (
     AdmitFailedReason,
+    FullAdmitOutcome,
     NodeResourceSpec,
     Resource,
     ResourceReqConfig,
@@ -28,7 +29,12 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome
+from mstar.engine.resources.spec import resolve_spec_dependencies
+from mstar.engine.resources.step import (
+    ADMIT_OK,
+    FULL_ADMIT_NOT_READY,
+    AdmitOutcome,
+)
 from mstar.model.submodule_base import (
     LazyRequestStates,
     ModelInputsFromEngine,
@@ -207,6 +213,7 @@ class Engine:
 
         node_names = set(submodules.keys())
         node_to_resources = {}
+        specs_by_key = resolve_spec_dependencies(specs)
         for spec in specs:
             relevant_nodes = spec.nodes & node_names
             if len(relevant_nodes) == 0:
@@ -227,6 +234,9 @@ class Engine:
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
+                    dependencies={
+                        key: specs_by_key[key] for key in spec.depends_on()
+                    },
                 ),
             )
 
@@ -1000,7 +1010,7 @@ class Engine:
     def check_ready(
         self, node_name: str, request_id: str,
         request_info: CurrentForwardPassInfo,
-    ) -> bool:
+    ) -> FullAdmitOutcome:
         """Whether this node can run the request now.
 
         An offloaded request is brought back first; it stays not-ready until
@@ -1008,17 +1018,20 @@ class Engine:
         on OOM, to evict). Then each resource takes in whatever the request
         published elsewhere — a KV transfer from a prefill worker, say — and
         reports whether that has landed.
+
+        The outcome, not a bool: a resource can report the request
+        unservable (``AdmitRuntimeError``), and the caller has to fail it
+        rather than scan it again forever.
         """
         if self.is_offloaded(node_name, request_id) and not self.reload_request(
             node_name, request_id
         ):
-            return False
-        out = self._runner.admit_retrieve(
+            return FULL_ADMIT_NOT_READY
+        return self._runner.admit_retrieve(
             rid=request_id, node_name=node_name,
             graph_walk=request_info.graph_walk,
             published=request_info.resource_publish_info,
         )
-        return out.ok and out.ready
 
     def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:
         """Lease the slot this batch will replay on, before it is dispatched.

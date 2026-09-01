@@ -413,7 +413,6 @@ class Pi05Model(Model):
             AttentionSpec(
                 resource_key=LLM_ATTN, nodes={"LLM"},
                 config=AttentionConfig(kv_cache=LLM_KV),
-                kv_config=kv_config,
             ),
             PositionSpec(
                 resource_key=LLM_POS, nodes={"LLM"},

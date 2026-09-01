@@ -203,7 +203,6 @@ class Qwen3OmniModel(Model):
                 config=AttentionConfig(
                     kv_cache=THINKER_KV
                 ),
-                kv_config=thinker_kv
             ),
             AttentionSpec(
                 resource_key=TALKER_ATTN,
@@ -211,7 +210,6 @@ class Qwen3OmniModel(Model):
                 config=AttentionConfig(
                     kv_cache=TALKER_KV
                 ),
-                kv_config=talker_kv
             ),
             PositionSpec(
                 resource_key=THINKER_POS,

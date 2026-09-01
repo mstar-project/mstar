@@ -11,18 +11,22 @@ import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import StepContext
+from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
 )
 from mstar.model.qwen3_tts.config import (
+    CODE_PRED_SAMPLER,
+    TALKER_ATTN,
+    TALKER_SAMPLER,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
     Qwen3TTSModelConfig,
@@ -159,14 +163,13 @@ def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     assert kv.num_qo_heads == model.config.talker.num_attention_heads
     assert kv.head_dim == model.config.talker.head_dim
     serving_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    assert serving_config["kv_cache"]["flashinfer_backend"] == "fa2"
+    assert serving_config["resources"][TALKER_ATTN]["flashinfer_backend"] == "fa2"
 
     # the model default is "auto"; the deployment pins FA2 because the image
     # cannot build the FA3 JIT kernels, so the override has to reach attention
     attn = next(spec for spec in specs if isinstance(spec, AttentionSpec))
     assert attn.config.flashinfer_backend == "auto"
-    for spec in specs:
-        spec.apply_yaml_overrides(**serving_config["kv_cache"])
+    apply_yaml_overrides(specs, serving_config)
     assert attn.config.flashinfer_backend == "fa2"
 
     worker_graphs = model.get_worker_graphs(str(CONFIG_PATH))
@@ -362,10 +365,11 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     assert talker.full_metadata.graph_walk == "talker_prefill"
     assert [edge.name for edge in talker.inputs] == list(pointers)
     assert talker.full_metadata.kwargs["talker_max_tokens"] == 12
-    # Residual-group sampling rides the aux sampling config, not step metadata.
+    # Residual-group sampling rides the code predictor's own per-request
+    # sampler config, not step metadata.
     assert "subtalker_sampling" not in talker.step_metadata
-    aux = model.get_aux_sampling_configs("Talker", {"subtalker_top_k": 7})
-    assert aux["code_predictor"].top_k == 7
+    configs = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
+    assert configs[CODE_PRED_SAMPLER].top_k == 7
 
     codec = model.get_initial_forward_pass_args(
         "Codec",
@@ -533,6 +537,7 @@ def test_qwen3_tts_prefill_frame_counts_toward_generation_limit():
     outputs = {"new_token": [torch.tensor(1)]}
     request_info = SimpleNamespace(
         step_metadata={"talker_max_tokens": 1},
+        resource_configs={},
         max_tokens=8192,
     )
 
@@ -556,9 +561,7 @@ def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
     ])]}
     request_info = SimpleNamespace(
         step_metadata={"talker_max_tokens": 100},
-        sampling_config={
-            "Talker": SimpleNamespace(ignore_eos=False),
-        },
+        resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=False)},
         max_tokens=8192,
     )
 
@@ -583,9 +586,7 @@ def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
     )]}
     request_info = SimpleNamespace(
         step_metadata={"talker_max_tokens": 100},
-        sampling_config={
-            "Talker": SimpleNamespace(ignore_eos=True),
-        },
+        resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=True)},
         max_tokens=8192,
     )
 
@@ -639,18 +640,11 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
         SimpleNamespace(request_id="real"),
         {"talker_input_embeds": [torch.zeros(1, config.talker.hidden_size)]},
     )
-    cache_manager = SimpleNamespace(
-        set_active_label=lambda label: None,
-        plan_attention=lambda **kwargs: None,
-        plan_rope=lambda **kwargs: None,
-    )
-
     packed = submodule.preprocess(
         "talker_decode",
         ModelInputsFromEngine(
             request_ids=["__graph_dummy__"],
             per_request_info={},
-            cache_manager=cache_manager,
         ),
         [prepared],
     )
@@ -694,16 +688,11 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert submodule.disable_torch_compile is True
     assert submodule.can_batch(batch, model_inputs)
     assert submodule.can_use_cuda_graphs(batch, model_inputs)
-    cache_manager = SimpleNamespace(
-        set_active_label=lambda label: None,
-        plan_attention=lambda **kwargs: None,
-        plan_rope=lambda **kwargs: None,
-    )
     packed = submodule.preprocess(
         "talker_decode",
         ModelInputsFromEngine(
-                per_request_info=info,
-            cache_manager=cache_manager,
+            request_ids=["a", "b"],
+            per_request_info=info,
         ),
         model_inputs,
     )
@@ -788,42 +777,46 @@ def test_qwen3_tts_code_predictor_uses_decode_attn_nhd(monkeypatch):
     assert rope_calls[0][2] == torch.int32
 
 
-def test_qwen3_tts_aux_sampling_config_drives_code_predictor():
-    """Residual groups are configured through the ``code_predictor`` aux config,
-    which the engine turns into its own per-request sampler buffers."""
+def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
+    """Residual groups are configured through the code predictor's own sampler
+    resource, which the engine opens per-request buffers for."""
     model = _make_model()
     generation = model.config.generation
 
-    default = model.get_aux_sampling_configs("Talker")["code_predictor"]
+    default = model.get_request_resource_configs({})[CODE_PRED_SAMPLER]
     assert default.temperature == generation.subtalker_temperature
     assert default.top_k == generation.subtalker_top_k
     assert default.top_p == generation.subtalker_top_p
-    # No penalty on the depth loop => no seen-token mask buffers for this label.
-    assert default.vocab_size is None
+    # No penalty on the depth loop.
+    assert default.repetition_penalty == 1
 
-    overridden = model.get_aux_sampling_configs(
-        "Talker",
+    overridden = model.get_request_resource_configs(
+        {},
         {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
-    )["code_predictor"]
+    )[CODE_PRED_SAMPLER]
     assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
 
     # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
-    greedy = model.get_aux_sampling_configs(
-        "Talker", {"subtalker_dosample": False}
-    )["code_predictor"]
+    greedy = model.get_request_resource_configs(
+        {}, {"subtalker_dosample": False}
+    )[CODE_PRED_SAMPLER]
     assert greedy.temperature == 0.0
 
-    # Only the Talker owns an aux sampler.
-    assert model.get_aux_sampling_configs("Codec") == {}
+    # Two samplers, one per head; only the Talker's carries a vocab for the
+    # repetition penalty (see get_node_resources).
+    configs = model.get_request_resource_configs({})
+    assert set(configs) == {TALKER_SAMPLER, CODE_PRED_SAMPLER}
+    specs = {
+        spec.resource_key: spec for spec in model.get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert specs[TALKER_SAMPLER].vocab_size is not None
+    assert specs[CODE_PRED_SAMPLER].enable_repetion_penalty is False
 
-    # The bundle the engines actually consume.
-    multi = model.resolve_sampling_configs("Talker", {})
-    assert multi.main.vocab_size is not None
-    assert set(multi.aux) == {"code_predictor"}
-    multi.set_seed(99)
-    assert multi.main.seed == 99
-    # Aux stream is seeded independently of the Talker's.
-    assert multi.aux["code_predictor"].seed != 99
+    # The conductor seeds each stream; they are seeded independently.
+    configs[TALKER_SAMPLER].apply_conductor_config(seed=99)
+    assert configs[TALKER_SAMPLER].seed == 99
+    assert configs[CODE_PRED_SAMPLER].seed != 99
 
 
 class _FakeCodecDecoder(torch.nn.Module):

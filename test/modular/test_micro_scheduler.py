@@ -20,6 +20,13 @@ sys.path.insert(0, ".")
 
 import pytest
 
+from mstar.engine.resources.step import (
+    FULL_ADMIT_NOT_READY,
+    FULL_ADMIT_OK,
+    AdmitOutcome,
+    AdmitRuntimeError,
+    FullAdmitOutcome,
+)
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
 NODE = "LLM"
@@ -62,9 +69,11 @@ class _Manager:
 
 
 class _Engine:
-    def __init__(self, max_bs=None, not_ready=frozenset()):
+    def __init__(self, max_bs=None, not_ready=frozenset(), unservable=frozenset()):
         self._max_bs = max_bs
         self.not_ready = set(not_ready)
+        # rids a resource rejects outright, as opposed to "not yet"
+        self.unservable = set(unservable)
 
     def get_max_batch_size(self, node_name, graph_walk):
         del node_name, graph_walk
@@ -72,7 +81,17 @@ class _Engine:
 
     def check_ready(self, node_name, rid, fwd_info):
         del node_name, fwd_info
-        return rid not in self.not_ready
+        if rid in self.unservable:
+            return FullAdmitOutcome(
+                AdmitOutcome(
+                    ok=False, ready=False,
+                    reason=AdmitRuntimeError(f"{rid} is doomed"),
+                ),
+                "kv",
+            )
+        if rid in self.not_ready:
+            return FULL_ADMIT_NOT_READY
+        return FULL_ADMIT_OK
 
 
 def _scheduler(engine: _Engine) -> MicroScheduler:
@@ -306,3 +325,44 @@ def test_split_off_first_accepts_an_empty_exclusion(exclude):
 
     assert list(first.node_objects) == ["r0", "r1"]
     assert list(rest.node_objects) == ["r2"]
+
+
+# ── terminal admit failures ─────────────────────────────────────────────
+
+
+def test_an_unservable_rid_is_parked_for_the_worker_to_fail():
+    """A resource that rejects a request outright (a failed KV transfer) must
+    not leave it rescanned forever: the rid is dropped from scheduling and
+    handed to the worker, which reports it to the conductor."""
+    sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
+
+    batch = sched.get_next_batch(_Manager(["r0", "r1"]))
+
+    assert list(batch.node_objects) == ["r1"]
+    assert sched.failed_rids == {"r0"}
+    errors = sched.take_admit_errors()
+    assert set(errors) == {"r0"}
+    assert "r0 is doomed" in errors["r0"]
+    # drained exactly once, so the worker does not re-report it every iteration
+    assert sched.take_admit_errors() == {}
+
+
+def test_an_unservable_rid_is_dropped_from_the_backlog():
+    sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
+    sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
+
+    batch = sched.get_next_batch(_Manager([]))
+
+    assert list(batch.node_objects) == ["r1"]
+    assert set(sched.take_admit_errors()) == {"r0"}
+    assert sched.backlog == {}
+
+
+def test_clearing_a_rid_forgets_its_undelivered_admit_error():
+    sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
+    sched.get_next_batch(_Manager(["r0"]))
+
+    sched.clear_rid("r0")
+
+    assert sched.take_admit_errors() == {}
+    assert sched.failed_rids == set()

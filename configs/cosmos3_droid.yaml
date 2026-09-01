@@ -5,8 +5,9 @@ max_seq_len: 8192
 # KV pool sizing, matching the Nano config: the checkpoint is Nano-sized and
 # still serves the full video paths (forward dynamics decodes a rollout
 # video), so it keeps the pool that covers single-request video at every tier.
-kv_cache:
-  max_num_pages: 1024
+resources:
+  kv:
+    max_num_pages: 1024
 # Denoise CUDA-graph capture knobs (serving). cuda_graph=false serves eager;
 # graph_max_latent_area caps which resolutions are captured (latent H*W). The
 # COSMOS3_DISABLE_CUDA_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars override.

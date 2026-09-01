@@ -23,6 +23,7 @@ from mstar.engine.resources import (
     AttentionStep,
     AttnBackend,
     KVConfig,
+    KVSpec,
     KVStep,
     Segment,
     SlotLease,
@@ -257,10 +258,18 @@ class TestBackendSelection:
             resource_key="attn",
             nodes={"llm"},
             config=AttentionConfig(kv_cache="kv", backend=AttnBackend.DENSE),
-            kv_config=_kv_config(),
         )
+        assert spec.depends_on() == {"kv"}
         manager = AttentionManager.build(
-            spec, EngineResourceInfo(device=torch.device("cpu"))
+            spec,
+            EngineResourceInfo(
+                device=torch.device("cpu"),
+                dependencies={
+                    "kv": KVSpec(
+                        resource_key="kv", nodes={"llm"}, config=_kv_config(),
+                    ),
+                },
+            ),
         )
         expected = (
             DenseAttentionManager if _fa3_unavailable_reason() is None

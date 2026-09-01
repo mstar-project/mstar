@@ -144,6 +144,14 @@ class RequestOffloading(AdmitFailedReason):
     label: str
     request_id: str
 
+@dataclass
+class AdmitRuntimeError(AdmitFailedReason):
+    """A resource cannot serve this request at all.
+
+    Terminal, unlike the two above: no eviction and no reload makes it go
+    away, so the caller's answer is to fail the request, not to retry it.
+    """
+
 
 class AdmitOutcome(NamedTuple):
     ok: bool
@@ -181,3 +189,5 @@ class FullAdmitOutcome(NamedTuple):
 
 
 FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
+# admitted, but something it needs has not landed yet: retry, don't fail
+FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))

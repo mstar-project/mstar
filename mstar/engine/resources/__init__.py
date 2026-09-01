@@ -40,10 +40,16 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import (
+    NodeResourceSpec,
+    ResourceReqConfig,
+    apply_yaml_overrides,
+    resolve_spec_dependencies,
+)
 from mstar.engine.resources.step import (
     AdmitFailedReason,
     AdmitOutcome,
+    AdmitRuntimeError,
     AllocationFailed,
     BucketKey,
     FullAdmitOutcome,
@@ -58,6 +64,7 @@ from mstar.engine.resources.step import (
 __all__ = [
     "AdmitFailedReason",
     "AdmitOutcome",
+    "AdmitRuntimeError",
     "AllocationFailed",
     "FullAdmitOutcome",
     "RequestOffloading",
@@ -92,5 +99,7 @@ __all__ = [
     "StepContext",
     "StepRunner",
     "SubmoduleStep",
+    "apply_yaml_overrides",
+    "resolve_spec_dependencies",
     "topo_sort",
 ]

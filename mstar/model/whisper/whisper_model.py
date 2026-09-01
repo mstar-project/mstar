@@ -146,7 +146,6 @@ class WhisperModel(Model):
             AttentionSpec(
                 resource_key=ATTN, nodes={"decoder"},
                 config=AttentionConfig(kv_cache=KV_CACHE),
-                kv_config=kv_config,
             ),
             KVSpec(
                 resource_key=CROSS_KV_CACHE, nodes={"decoder"},
@@ -159,7 +158,6 @@ class WhisperModel(Model):
                     query_kv_cache=KV_CACHE,
                     context_label=CONTEXT_LABEL,
                 ),
-                kv_config=context_kv_config,
             ),
             PositionSpec(
                 resource_key=POS, nodes={"decoder"},

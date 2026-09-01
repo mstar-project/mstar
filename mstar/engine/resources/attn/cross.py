@@ -45,8 +45,9 @@ class CrossAttentionManager(AttentionResource):
     @classmethod
     def build(cls, spec: CrossAttentionSpec, info: EngineResourceInfo):
         # the context cache's own head counts; see AttentionManager.build
+        kv_config = info.dependency(spec.config.kv_cache).config
         if info.joint_comm_group is not None:
-            spec.kv_config.shard(info.joint_comm_group.world_size)
+            kv_config.shard(info.joint_comm_group.world_size)
         if spec.config.backend == AttnBackend.FLASHINFER:
             return FlashInferCrossManager(
                 kv_cache=spec.config.kv_cache,
@@ -54,7 +55,7 @@ class CrossAttentionManager(AttentionResource):
                 context_label=spec.config.context_label,
                 device=info.device,
                 dtype=info.kv_dtype,
-                kv_config=spec.kv_config,
+                kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
             )
         raise ValueError(

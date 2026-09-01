@@ -253,7 +253,6 @@ class Qwen3TTSModel(Model):
             AttentionSpec(
                 resource_key=TALKER_ATTN, nodes={"Talker"},
                 config=AttentionConfig(kv_cache=TALKER_KV),
-                kv_config=talker_kv,
             ),
             PositionSpec(
                 resource_key=TALKER_POS, nodes={"Talker"},

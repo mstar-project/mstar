@@ -4,6 +4,8 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.base import GraphNode
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
@@ -108,6 +110,9 @@ class MicroScheduler:
         # RIDs that have failed but have not gone through the cleanup procedure;
         # these cannot be scheduled (unless this is a TP follower node)
         self.failed_rids: set[str] = set()
+        # rid -> message, for requests a resource declared unservable during a
+        # readiness check. Drained by the worker, which reports them onward.
+        self.admit_errors: dict[str, str] = {}
 
         # lockstep-parallel (TP / SP instance) scheduling
         self.parallel_leader_nodes = parallel_leader_nodes
@@ -200,8 +205,7 @@ class MicroScheduler:
             fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
             # check if the node is ready on the engine level
             # (e.g., for AR, whether the kv cache is read in)
-            engine = self.engine_manager.get_engine(first_tp_node.node_name)
-            if not engine.check_ready(first_tp_node.node_name, rid, fwd_info):
+            if not self._check_ready(first_tp_node.node_name, rid, fwd_info):
                 return
 
         node_objects = {}
@@ -320,8 +324,7 @@ class MicroScheduler:
                     fwd_info = worker_graphs_manager.get_fwd_info(request_id, node_partition)
                     # check if the node is ready on the engine level
                     # (e.g., for AR, whether the kv cache is read in)
-                    engine = self.engine_manager.get_engine(sname)
-                    if not engine.check_ready(sname, request_id, fwd_info):
+                    if not self._check_ready(sname, request_id, fwd_info):
                         continue
                     node_name_to_requests.setdefault(sname, []).append(
                         ReadyNodeEntry(request_id, worker_graph_id, graph_walk)
@@ -370,12 +373,19 @@ class MicroScheduler:
         worker_graphs_manager: WorkerGraphsManager,
     ):
         node_partition = worker_graphs_manager.get_partition_for_node(batch.node_name)
-        engine = self.engine_manager.get_engine(batch.node_name)
         not_ready_rids = {
-            rid for rid in batch.node_objects if not engine.check_ready(
-                batch.node_name, rid, worker_graphs_manager.get_fwd_info(rid, node_partition)
+            rid for rid in batch.node_objects if not self._check_ready(
+                batch.node_name, rid,
+                worker_graphs_manager.get_fwd_info(rid, node_partition),
             )
         }
+        # A failed rid is not "not ready yet": excluding it would put it
+        # straight back in the backlog. This chunk is out of `self.backlog`
+        # right now, so `_drop_backlogged_rid` cannot reach it.
+        for rid in not_ready_rids & self.failed_rids:
+            batch.node_objects.pop(rid, None)
+            batch.request_to_worker_graph.pop(rid, None)
+        not_ready_rids -= self.failed_rids
         return self._cap_batch_and_schedule(batch, max_bs, not_ready_rids)
 
 
@@ -548,11 +558,37 @@ class MicroScheduler:
                     if exclude_target is not None and (sname, graph_walk) == exclude_target:
                         continue
                     fwd_info = worker_graphs_manager.get_fwd_info(request_id, node_partition)
-                    engine = self.engine_manager.get_engine(sname)
-                    if not engine.check_ready(sname, request_id, fwd_info):
+                    if not self._check_ready(sname, request_id, fwd_info):
                         continue
                     return True
         return False
+
+    def _check_ready(
+        self, node_name: str, rid: str, fwd_info: CurrentForwardPassInfo,
+    ) -> bool:
+        """Engine-level readiness, with a terminal failure taken out of the
+        scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
+        fit) just comes back False; an ``AdmitRuntimeError`` never will, so the
+        rid is parked for the worker to fail instead of rescanned forever."""
+        engine = self.engine_manager.get_engine(node_name)
+        outcome = engine.check_ready(node_name, rid, fwd_info)
+        if isinstance(outcome.reason, AdmitRuntimeError):
+            logger.error(
+                "Request %s cannot be served on node %s by resource %s: %s",
+                rid, node_name, outcome.failed_resource, outcome.reason.message,
+            )
+            self.admit_errors[rid] = (
+                f"resource {outcome.failed_resource} rejected the request: "
+                f"{outcome.reason.message}"
+            )
+            self.fail_rids({rid})
+            return False
+        return outcome.ok and outcome.ready
+
+    def take_admit_errors(self) -> dict[str, str]:
+        """Hand the accumulated terminal admit failures to the caller, once."""
+        errors, self.admit_errors = self.admit_errors, {}
+        return errors
 
     def fail_rids(self, rids: set[str]) -> None:
         """Stop scheduling new work for requests reported to the conductor as
@@ -564,6 +600,7 @@ class MicroScheduler:
     def clear_rid(self, rid: str) -> None:
         """Forget all per-request scheduler state; called on REMOVE_REQUEST."""
         self.failed_rids.discard(rid)
+        self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
 

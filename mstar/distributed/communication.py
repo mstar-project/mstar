@@ -181,8 +181,21 @@ class JointGroups:
         return  self.tp_group.world_size * self.sp_group.world_size
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
-        tensor = self.tp_group.broadcast(tensor, src)
-        return self.sp_group.broadcast(tensor, src)
+        """Broadcast from joint rank ``src`` to the whole TP x SP block.
+
+        ``src`` is indexed like ``rank`` (row-major [sp][tp]); each subgroup
+        takes its own coordinate out of it, since ``CommGroup.broadcast``
+        indexes its own members. TP first: that fills src's SP row across
+        every TP column, which the SP pass then broadcasts down.
+        """
+        if not 0 <= src < self.world_size:
+            raise ValueError(
+                f"broadcast src {src} outside the joint group "
+                f"(world size {self.world_size})"
+            )
+        sp_src, tp_src = divmod(src, self.tp_group.world_size)
+        tensor = self.tp_group.broadcast(tensor, tp_src)
+        return self.sp_group.broadcast(tensor, sp_src)
 
 
 

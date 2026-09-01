@@ -131,7 +131,6 @@ class HiggsAudioModel(Model):
             AttentionSpec(
                 resource_key=ATTN, nodes={"LLM"},
                 config=AttentionConfig(kv_cache=KV_CACHE),
-                kv_config=kv_config,
             ),
             PositionSpec(
                 resource_key=ROPE, nodes={"LLM"},

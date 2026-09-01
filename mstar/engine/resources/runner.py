@@ -14,8 +14,8 @@ from typing import Any
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
+    FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
-    AdmitOutcome,
     FullAdmitOutcome,
     SubmoduleStep,
 )
@@ -219,9 +219,7 @@ class StepRunner:
                 )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
-        return FULL_ADMIT_OK if ready else FullAdmitOutcome(
-            AdmitOutcome(ok=True, ready=False)
-        )
+        return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
 
 
@@ -243,9 +241,7 @@ class StepRunner:
                 )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
-        return FULL_ADMIT_OK if ready else FullAdmitOutcome(
-            AdmitOutcome(ok=True, ready=False)
-        )
+        return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
     def plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan in dependency order
@@ -285,9 +281,7 @@ class StepRunner:
                 )
                 return FullAdmitOutcome(outcome, key)
             ready = ready and outcome.ready
-        return FULL_ADMIT_OK if ready else FullAdmitOutcome(
-            AdmitOutcome(ok=True, ready=False)
-        )
+        return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
     def pre_plan(self, step: SubmoduleStep) -> dict[str, Any]:
         """plan the pre-planning subset, a step ahead

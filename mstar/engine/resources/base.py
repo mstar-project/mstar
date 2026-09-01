@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -59,6 +60,19 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
+    # the specs this one named in `depends_on`, by resource key
+    dependencies: "Mapping[str, NodeResourceSpec]" = field(
+        default_factory=dict
+    )
+
+    def dependency(self, key: str) -> NodeResourceSpec:
+        spec = self.dependencies.get(key)
+        if spec is None:
+            raise KeyError(
+                f"resource {key!r} was not resolved; declare it in the "
+                "spec's `depends_on`"
+            )
+        return spec
 
 
 class Resource(ABC):

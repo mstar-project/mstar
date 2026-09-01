@@ -19,6 +19,8 @@ from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig, VJepa2Config
 
+from .fake_resources import bind_fake_resources
+
 try:
     from mstar.model.vjepa2.submodules import VJepa2ACRolloutPredictorSubmodule
 except (ImportError, AttributeError) as e:  # pragma: no cover - env-specific
@@ -65,7 +67,6 @@ def _request_info(rid: str, iter_idx: int = 0) -> CurrentForwardPassInfo:
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
-        sampling_config={},
     )
     info.dynamic_loop_iter_counts["rollout_loop"] = iter_idx
     info.step_metadata["rollout_horizon"] = 4
@@ -76,7 +77,6 @@ def _engine_inputs(rids: list[str]) -> ModelInputsFromEngine:
     return ModelInputsFromEngine(
         request_ids=rids,
         per_request_info={rid: _request_info(rid) for rid in rids},
-        cache_manager=None,
         piecewise_runners={},
     )
 
@@ -135,19 +135,30 @@ class TestACRolloutForwardBatched:
         encoder_hidden = torch.randn(2, n, d)
         actions = torch.randn(2, 1, 7)
         states = torch.randn(2, 1, 7)
+        # The rollout step attends under a plan label, so the blocks need KV +
+        # attention resources; rebound per call so no history carries over.
+        tokens_per_req = n + (3 if cfg.ac_predictor.use_extrinsics else 2)
 
-        with torch.no_grad():
-            pair = submodule.forward_batched(
+        def _run(rids, *, encoder_hidden, actions, states):
+            bind_fake_resources(submodule.predictor).plan(
+                [tokens_per_req] * len(rids)
+            )
+            return submodule.forward_batched(
                 graph_walk="prefill_video_rollout",
-                engine_inputs=_engine_inputs(["r0", "r1"]),
+                engine_inputs=_engine_inputs(rids),
                 encoder_hidden=encoder_hidden,
                 actions=actions,
                 states=states,
             )
+
+        with torch.no_grad():
+            pair = _run(
+                ["r0", "r1"],
+                encoder_hidden=encoder_hidden, actions=actions, states=states,
+            )
             singles = {
-                rid: submodule.forward_batched(
-                    graph_walk="prefill_video_rollout",
-                    engine_inputs=_engine_inputs([rid]),
+                rid: _run(
+                    [rid],
                     encoder_hidden=encoder_hidden[i : i + 1],
                     actions=actions[i : i + 1],
                     states=states[i : i + 1],

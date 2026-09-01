@@ -5,7 +5,7 @@ import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources import ResourceReqConfig
+from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.base import Model
 
@@ -41,14 +41,7 @@ class EngineManager:
         the latter, so there is no separate cache config.
         """
         specs = model.get_node_resources()
-        # One block reaches every spec; each takes the keys it recognizes.
-        # Named ``kv_cache`` because that is what deployments have always
-        # tuned here, and what every existing config file writes.
-        yaml_overrides = model_config.get("kv_cache", {})
-        if yaml_overrides:
-            for spec in specs:
-                spec.apply_yaml_overrides(**yaml_overrides)
-            logger.info("Resource specs after YAML overrides: %s", specs)
+        apply_yaml_overrides(specs, model_config)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
