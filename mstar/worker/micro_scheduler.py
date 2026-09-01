@@ -142,9 +142,11 @@ class MicroScheduler:
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: set[str] = set()
 
-        # rid -> number of tp follow batches in the queue. Used in the fail/abort
-        # path, where we need to drain the TP queue before aborting
-        self.pending_tp_follow_count: dict[str, int] = {}
+        # rid -> number of committed (ZMQ received) tp follow batches still
+        # queued. On the fail/abort path we drain these before ACKing READS_DONE
+        # so the worker graph queues aren't torn down while a follow still needs
+        # to pop from them.
+        self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
@@ -234,9 +236,9 @@ class MicroScheduler:
                 request_to_worker_graph[rid] = wgid
 
         for rid in first_tp_node.request_ids:
-            self.tp_batches_pending_schedule[rid] -= 1
-            if self.tp_batches_pending_schedule[rid] <= 0:
-                self.tp_batches_pending_schedule.pop(rid)
+            self.pending_tp_follow_count[rid] -= 1
+            if self.pending_tp_follow_count[rid] <= 0:
+                self.pending_tp_follow_count.pop(rid, None)
 
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(
@@ -678,4 +680,5 @@ class MicroScheduler:
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
         self.tp_batches_pending_schedule.pop(rid, None)
+        self.pending_tp_follow_count.pop(rid, None)
 

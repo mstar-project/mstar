@@ -31,8 +31,9 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
+from mstar.conductor.conductor import Conductor
 from mstar.profile.format import RequestProfile, RequestTiming
-from mstar.utils.ipc_format import ConductorMessageType, FailRequests
+from mstar.utils.ipc_format import ConductorMessageType, FailRequests, ReadsDone, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.worker import PendingBatch, Worker
 
@@ -158,6 +159,127 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
     )
     w._handle_main_loop_error(RuntimeError("boom"), (None, None), scheduled)
     assert set(w.sent[0][1].body.errors) == {"r1", "r2"}
+
+
+# ── scheduler ──────────────────────────────────────────────────────────────
+
+
+def _scheduler():
+    s = MicroScheduler.__new__(MicroScheduler)
+    s.failed_rids = set()
+    s.held_until = {}
+    s.pending_removes = set()
+    s.tp_batches_pending_schedule = []
+    s.pending_tp_follow_count = {}
+    s.engine_manager = SimpleNamespace(
+        get_engine=lambda name: SimpleNamespace(check_ready=lambda *a: True)
+    )
+    return s
+
+
+def _graphs_manager(rids):
+    return SimpleNamespace(
+        per_request_info={rid: object() for rid in rids},
+        queues={"wg": SimpleNamespace(
+            get_ready_node_names=lambda: {rid: ["node"] for rid in rids}
+        )},
+        get_partition_for_node=lambda name: "default",
+        get_graph_walk=lambda rid, part: "walk",
+        get_fwd_info=lambda rid, part: None,
+    )
+
+
+def test_failed_rid_is_not_reported_as_ready_work():
+    s = _scheduler()
+    mgr = _graphs_manager(["r1"])
+    assert s.has_ready_excluding(mgr, None) is True
+    s.fail_rids({"r1"})
+    assert s.has_ready_excluding(mgr, None) is False
+
+
+def test_clear_rid_releases_a_failed_request():
+    s = _scheduler()
+    s.fail_rids({"r1"})
+    s.held_until["r1"] = time.monotonic() + 100
+    s.clear_rid("r1")
+    assert s.failed_rids == set() and s.held_until == {}
+
+
+# ── conductor ──────────────────────────────────────────────────────────────
+
+
+def _conductor(rids):
+    c = Conductor.__new__(Conductor)
+    c.sent = []
+    c.communicator = SimpleNamespace(
+        send=lambda entity_id, msg: c.sent.append((entity_id, msg))
+    )
+    c.requests = {
+        rid: SimpleNamespace(worker_graph_to_workers={"wg": ["w0"]}) for rid in rids
+    }
+    c.draining = {}
+    c._early_reads_done = {}
+    c.waiting_queue = []
+    c._try_admit_waiting = lambda: None
+    return c
+
+
+def _drain_all(c, rid):
+    """Deliver READS_DONE from every participant so the barrier finalizes."""
+    for entity in ["w0", "api_server_preprocess_worker"]:
+        c._handle_reads_done(ReadsDone(request_id=rid, entity_id=entity))
+
+
+def test_conductor_tears_down_and_notifies_per_rid():
+    c = _conductor(["r1", "r2"])
+    c._fail_requests(FailRequests(errors={"r1": "boom", "r2": "bang"}))
+
+    # Phase 1: drain the readers first — nothing torn down or notified yet.
+    assert set(c.requests) == {"r1", "r2"}
+    drains = {
+        m.body.request_id for e, m in c.sent
+        if m.message_type == WorkerMessageType.DRAIN_REQUEST
+    }
+    assert drains == {"r1", "r2"}
+    assert not [m for e, m in c.sent if e == "api_server"]
+
+    # Phase 2: once every reader has drained, hard-remove and notify the client.
+    c.sent.clear()
+    _drain_all(c, "r1")
+    _drain_all(c, "r2")
+    assert c.requests == {}
+    removes = {
+        m.body.request_id for e, m in c.sent
+        if m.message_type == WorkerMessageType.REMOVE_REQUEST
+    }
+    assert removes == {"r1", "r2"}
+    failures = {
+        m.body.request_id: m.body for e, m in c.sent
+        if e == "api_server" and m.message_type == "request_failed"
+    }
+    assert failures["r1"].error_message == "boom"
+    assert failures["r2"].error_message == "bang"
+    assert failures["r1"].status == 500
+
+
+def test_duplicate_failure_report_is_ignored():
+    """Under TP every rank raises symmetrically and each reports it; only the
+    first report may start the teardown."""
+    c = _conductor(["r1"])
+    c._fail_requests(FailRequests(errors={"r1": "boom"}))
+    c.sent.clear()
+    c._fail_requests(FailRequests(errors={"r1": "boom"}))  # already draining
+    assert c.sent == []
+
+
+def test_one_unknown_rid_does_not_block_the_others():
+    c = _conductor(["r2"])
+    c._fail_requests(FailRequests(errors={"gone": "boom", "r2": "bang"}))
+    drains = {
+        m.body.request_id for e, m in c.sent
+        if m.message_type == WorkerMessageType.DRAIN_REQUEST
+    }
+    assert drains == {"r2"}
 
 
 # ── api server ─────────────────────────────────────────────────────────────
