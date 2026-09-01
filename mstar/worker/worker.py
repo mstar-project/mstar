@@ -337,14 +337,19 @@ class Worker:
             conn.edge_name for conn in self._my_consumer_connections
         }
 
-        # Build consumer node cache: edge_name -> next_node name
+        # Build consumer node cache: edge_name -> consuming node name.
+        # Recurse via get_nodes() so consumers nested inside a Loop / Sequential /
+        # Parallel are found too (a bare ``hasattr(section, 'input_names')`` only
+        # matches a walk that is itself a single top-level GraphNode, missing e.g.
+        # a decode Loop whose inner node consumes the streamed edge).
         self._consumer_node_cache: dict[str, str] = {}
         if self._my_consumer_connections and model:
             walks = model.get_graph_walk_graphs()
             for conn in self._my_consumer_connections:
                 for section in walks.values():
-                    if hasattr(section, 'input_names') and conn.edge_name in section.input_names:
-                        self._consumer_node_cache[conn.edge_name] = section.name
+                    for node in section.get_nodes().values():
+                        if conn.edge_name in node.input_names:
+                            self._consumer_node_cache[conn.edge_name] = node.name
 
     def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
         """Get the node names that belong to a partition."""
@@ -355,8 +360,14 @@ class Worker:
                 nodes = set()
                 for walk_name in pdef.graph_walks:
                     section = walks.get(walk_name)
-                    if section and hasattr(section, 'name'):
-                        nodes.add(section.name)
+                    if section is not None:
+                        # Recurse into the section so nodes nested in a Loop /
+                        # Sequential / Parallel are included — a bare
+                        # ``section.name`` would return the Loop's name (e.g.
+                        # "talker_decode_loop"), not the consuming node
+                        # ("eartts_talker"), so its StreamBuffer would never
+                        # be created (KeyError when routing the streamed edge).
+                        nodes.update(section.get_nodes().keys())
                 return list(nodes)
         return []
 
@@ -1716,6 +1727,22 @@ class Worker:
         engine = self.engine_manager.get_engine(batch_N.node_name)
         cpu_output = self._prematerialize_for_check_stop(output)
         stop_result = engine.check_stop_for_batch(batch_N.node_batch, cpu_output)
+
+        # Stream-terminated loop: a stream-consuming node inside a loop has no
+        # internal stop signal (unlike a self-EOS loop), so when it consumes the
+        # terminal chunk (_final_stream_chunk → final_stream_rids) end its
+        # enclosing loop. Without this the loop would spin to max_iters and the
+        # partition would never report done.
+        for rid in batch_N.node_batch.final_stream_rids:
+            try:
+                nested = self.worker_graphs_manager.get_nested_loop_idxs_for_node(
+                    rid, batch_N.partition, batch_N.node_name
+                )
+            except (KeyError, AttributeError):
+                continue
+            if nested.loop_name_order:
+                stop_result.stops.setdefault(rid, set()).add(nested.loop_name_order[-1])
+
         if stop_result.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.

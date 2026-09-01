@@ -506,6 +506,16 @@ class Loop(GraphSection):
         self.curr_iter += 1
         self.inner_registry.reset_for_iter()
         self._uncache_outputs()
+        # Re-arm pure-streaming inner nodes (no loop-back) so the poll can feed
+        # them the next streamed chunk on this new iteration. Walk up through
+        # any enclosing loops to the worker-graph registry that owns the
+        # ready_for_streaming set.
+        reg = self._managing_registry
+        while isinstance(reg, LoopStateRegistry):
+            reg = reg.loop._managing_registry
+        rearm = getattr(reg, "rearm_streaming", None)
+        if rearm is not None:
+            rearm(set(self.section.get_nodes().keys()))
 
     def ingest_external_input(self, graph_edge: GraphEdge):
         # track one copy of each external input for re-injection on the next iteration
@@ -778,6 +788,20 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         self.ready_for_streaming, self.ready_streaming_next_iter = (
             self.ready_streaming_next_iter, self.ready_for_streaming
         )
+
+    def rearm_streaming(self, node_names: set[str]):
+        """Re-add a loop's pure-streaming inner nodes to ``ready_for_streaming``.
+
+        Called when a Loop advances an iteration. A node whose inputs are ALL
+        streaming has no loop-back edge, so nothing re-injects into it across
+        iterations and ``register_ingested_input`` already dropped it from
+        ``ready_for_streaming`` when it consumed the previous chunk. Without
+        this the loop stalls after one item (the talker / codec stream-consuming
+        loops). Loop-back nodes are re-armed implicitly by their re-injected
+        inputs, so intersecting with ``only_streaming_inputs`` leaves them
+        untouched.
+        """
+        self.ready_for_streaming |= (node_names & self.only_streaming_inputs)
 
     def clear(self):
         super().clear()
