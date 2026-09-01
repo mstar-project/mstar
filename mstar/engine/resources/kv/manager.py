@@ -1,3 +1,4 @@
+import logging
 import threading
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
@@ -34,6 +35,8 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -260,8 +263,13 @@ class KVManager(AttentionResource):
         # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
         # or reset/remove on another thread (see `_lock`)
         with self._lock:
-            self._streams[rid] = {"main": CacheStream()}
-            self._overrides[rid] = overrides
+            # Idempotent: the conductor sends one NewRequest per partition, all
+            # carrying the same rid, so a worker serving two partitions ingests
+            # twice. Replacing the streams here reset `stored_len` under a node
+            # that had already filled them, and the request's publish info then
+            # named more tokens than the stream held.
+            self._streams.setdefault(rid, {"main": CacheStream()})
+            self._overrides.setdefault(rid, overrides)
 
     def admit_retrieve(
         self, rid: str,
@@ -292,6 +300,15 @@ class KVManager(AttentionResource):
                 new_len = seq_info.seq_len
                 old_len = stream.stored_len
                 if new_len <= old_len:
+                    continue
+                if seq_info.latest_kv_transfer_info == self._own_transfer_info():
+                    # This shouldn't happen: the pages already ARE in this cache;
+                    # opening our own IPC handle raises `invalid device context`
+                    logger.warning(
+                        "KV %s: skipping self-retrieve for %s label %s — "
+                        "published %d tokens but the stream holds %d",
+                        self.name, rid, label, new_len, old_len,
+                    )
                     continue
 
                 # _alloc takes a total length, not a delta
@@ -724,23 +741,29 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
+    def _own_transfer_info(self):
+        """This cache's transfer descriptor, as `publish` stamps it."""
+        return self._transfer.get_kv_transfer_info()
+
     def publish(self, request_id: str):
         # `remove_request` can pop the streams from another thread between the
         # forward and finalize; nothing to publish then
         streams = self._streams.get(request_id)
         if streams is None:
             return None
-        res = PublishedKVInfo.build_for_rank(
-            rank=self._rank, world_size=self._world_size,
-            seq_info={
+
+        transfer_info = self._own_transfer_info()
+        with self._lock:
+            seq_info = {
                 label: KVSequenceInfo(
                     seq_len=stream.stored_len,
-                    latest_kv_transfer_info=self._transfer.get_kv_transfer_info(),
-                    page_indices=stream.page_indices
+                    latest_kv_transfer_info=transfer_info,
+                    page_indices=list(stream.page_indices),
                 ) for label, stream in streams.items()
             }
+        return PublishedKVInfo.build_for_rank(
+            rank=self._rank, world_size=self._world_size, seq_info=seq_info,
         )
-        return res
 
     def reset_request(self, rid: str, free: bool=False):
         streams = self._streams.get(rid)
