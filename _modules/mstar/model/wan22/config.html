@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,33 +805,33 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.wan22.config</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Configuration for Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).</span>
+<span></span><span class="sd">"""Configuration for Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).</span>
 
 <span class="sd">The architecture values are facts of the ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``</span>
 <span class="sd">checkpoint, hardcoded so that constructing the model never touches the network.</span>
 <span class="sd">``Wan22Model._refresh_checkpoint_defaults`` re-reads ``flow_shift`` from the</span>
 <span class="sd">checkpoint at load time and hard-fails if the solver order or train-timestep</span>
 <span class="sd">count drift from what the inline UniPC port implements.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 
 <span class="c1"># The only variant implemented. ``Wan22Model.__init__`` rejects any other; the</span>
 <span class="c1"># A14B variants are a MoE dual-DiT and a separate piece of work.</span>
-<span class="n">WAN22_VARIANT_TI2V_5B</span> <span class="o">=</span> <span class="s2">&quot;ti2v_5b&quot;</span>
+<span class="n">WAN22_VARIANT_TI2V_5B</span> <span class="o">=</span> <span class="s2">"ti2v_5b"</span>
 
 
 <div class="viewcode-block" id="Wan22Config">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.wan22.config.html#mstar.model.wan22.config.Wan22Config">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Wan22Config</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wan2.2-TI2V-5B model configuration.</span>
+<span class="w">    </span><span class="sd">"""Wan2.2-TI2V-5B model configuration.</span>
 
 <span class="sd">    A single dense video DiT driven by UMT5-XXL embeddings, denoising Wan2.2-VAE</span>
 <span class="sd">    latents with UniPC. T2V and I2V share the one transformer: I2V injects the</span>
 <span class="sd">    encoded first frame into the latent grid and zeroes its per-token timestep,</span>
 <span class="sd">    rather than concatenating on the channel axis.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">variant</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">WAN22_VARIANT_TI2V_5B</span>
 
@@ -844,7 +846,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">text_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4096</span>
     <span class="n">freq_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span>
     <span class="n">rope_max_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span>
-    <span class="n">qk_norm</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;rms_norm_across_heads&quot;</span>
+    <span class="n">qk_norm</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"rms_norm_across_heads"</span>
     <span class="n">cross_attn_norm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span>
 
@@ -862,14 +864,14 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># Generation defaults, each overridable per request via model_kwargs. The</span>
     <span class="c1"># sampling knobs match the diffusers WanPipeline defaults; the size defaults to</span>
-    <span class="c1"># the checkpoint&#39;s native 720P tier (1280x704) rather than diffusers&#39; 832x480,</span>
+    <span class="c1"># the checkpoint's native 720P tier (1280x704) rather than diffusers' 832x480,</span>
     <span class="c1"># so a no-size request produces full-resolution output.</span>
     <span class="n">guidance_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">5.0</span>
     <span class="n">default_num_inference_steps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50</span>
     <span class="n">default_height</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">704</span>  <span class="c1"># must be a multiple of spatial_alignment</span>
     <span class="n">default_width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1280</span>  <span class="c1"># must be a multiple of spatial_alignment</span>
     <span class="n">default_num_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">81</span>  <span class="c1"># must be 4k+1</span>
-    <span class="n">default_negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">default_negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">video_fps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">24</span>
 
     <span class="c1"># Ceiling on the denoise loop; the per-request step count is clamped to it.</span>
@@ -881,25 +883,25 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># build with this False so the eager path stays the bit-exact reference.</span>
     <span class="n">compile_dit</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
-    <span class="c1"># VAE-decode tiling policy: &quot;auto&quot; decodes untiled when free VRAM comfortably</span>
+    <span class="c1"># VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably</span>
     <span class="c1"># exceeds the estimated untiled peak for the output size and tiles otherwise;</span>
-    <span class="c1"># &quot;tiled&quot;/&quot;untiled&quot; force a path. WAN22_VAE_DECODE_TILING overrides at runtime.</span>
-    <span class="n">vae_decode_tiling</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span>
+    <span class="c1"># "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.</span>
+    <span class="n">vae_decode_tiling</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">hidden_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;DiT hidden width (num_attention_heads * attention_head_dim).&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""DiT hidden width (num_attention_heads * attention_head_dim)."""</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_head_dim</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">spatial_alignment</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;(height, width) pixel multiples a request&#39;s size must satisfy — 32 each.</span>
+<span class="w">        </span><span class="sd">"""(height, width) pixel multiples a request's size must satisfy — 32 each.</span>
 
 <span class="sd">        The VAE downsamples a pixel dimension by 16 and the DiT then patchifies by</span>
 <span class="sd">        2, so only exact multiples of the product survive both. An unaligned size</span>
 <span class="sd">        has no clean failure inside the model, so it is rejected at the request</span>
 <span class="sd">        seam (``Wan22Model.process_prompt``).</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="k">return</span> <span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_factor_spatial</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">patch_size</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_factor_spatial</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">patch_size</span><span class="p">[</span><span class="mi">2</span><span class="p">],</span>
@@ -952,7 +954,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

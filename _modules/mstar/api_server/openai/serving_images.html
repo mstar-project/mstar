@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.serving_images</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;/v1/images/generations (text-to-image) and /v1/images/edits (image-to-image) handlers.&quot;&quot;&quot;</span>
+<span></span><span class="sd">"""/v1/images/generations (text-to-image) and /v1/images/edits (image-to-image) handlers."""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -824,19 +826,19 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># diffusions instead). Seeded requests follow the reference seed contract:</span>
     <span class="c1"># image i uses seed + i, so image 0 is bit-identical to the same request</span>
     <span class="c1"># with n=1; unseeded requests draw independent per-request seeds.</span>
-    <span class="n">n</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;n&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">1</span><span class="p">))</span>
-    <span class="n">seed</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">)</span>
+    <span class="n">n</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"n"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">1</span><span class="p">))</span>
+    <span class="n">seed</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">)</span>
     <span class="n">request_ids</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
         <span class="n">model_kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">seed</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">i</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">model_kwargs</span><span class="p">[</span><span class="s2">&quot;seed&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span> <span class="o">+</span> <span class="n">i</span>
-        <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">&quot;img&quot;</span><span class="p">)</span>
+            <span class="n">model_kwargs</span><span class="p">[</span><span class="s2">"seed"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">seed</span><span class="p">)</span> <span class="o">+</span> <span class="n">i</span>
+        <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"img"</span><span class="p">)</span>
         <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
             <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
             <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">model_kwargs</span><span class="p">,</span>
             <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
             <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
@@ -847,33 +849,33 @@ window.runMermaid = runMermaid;</script>
     <span class="k">for</span> <span class="n">request_id</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
         <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
         <span class="n">data</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span>
-            <span class="p">{</span><span class="s2">&quot;b64_json&quot;</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;ascii&quot;</span><span class="p">),</span> <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
+            <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
             <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span>
-            <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">&quot;image&quot;</span>
+            <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span>
         <span class="p">)</span>
-    <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;created&quot;</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">&quot;data&quot;</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">"created"</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
 
 
 
 <div class="viewcode-block" id="create_image_edit">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.create_image_edit">[docs]</a>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_image_edit</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">image_bytes</span><span class="p">,</span> <span class="n">image_filename</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
-    <span class="c1"># Persist the uploaded image so the model&#39;s loader can read it by path</span>
+    <span class="c1"># Persist the uploaded image so the model's loader can read it by path</span>
     <span class="c1"># (same contract as multipart uploads), then run the image-to-image edit.</span>
     <span class="n">upload_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">upload_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-    <span class="n">ext</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">splitext</span><span class="p">(</span><span class="n">image_filename</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span><span class="p">)[</span><span class="mi">1</span><span class="p">]</span> <span class="ow">or</span> <span class="s2">&quot;.png&quot;</span>
-    <span class="n">image_path</span> <span class="o">=</span> <span class="n">upload_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">uuid4</span><span class="p">()</span><span class="o">.</span><span class="n">hex</span><span class="si">}{</span><span class="n">ext</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">ext</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">splitext</span><span class="p">(</span><span class="n">image_filename</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">)[</span><span class="mi">1</span><span class="p">]</span> <span class="ow">or</span> <span class="s2">".png"</span>
+    <span class="n">image_path</span> <span class="o">=</span> <span class="n">upload_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">uuid4</span><span class="p">()</span><span class="o">.</span><span class="n">hex</span><span class="si">}{</span><span class="n">ext</span><span class="si">}</span><span class="s2">"</span>
     <span class="n">image_path</span><span class="o">.</span><span class="n">write_bytes</span><span class="p">(</span><span class="n">image_bytes</span><span class="p">)</span>
 
     <span class="n">args</span> <span class="o">=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">image_edit_to_request</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">image_path</span><span class="p">),</span> <span class="n">model_kwargs</span><span class="p">)</span>
-    <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">&quot;img&quot;</span><span class="p">)</span>
+    <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"img"</span><span class="p">)</span>
 
     <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
         <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
         <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
         <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
-        <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">],</span>
+        <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
         <span class="n">model_kwargs</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">,</span>
         <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
@@ -881,11 +883,11 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
     <span class="n">data</span> <span class="o">=</span> <span class="p">[</span>
-        <span class="p">{</span><span class="s2">&quot;b64_json&quot;</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;ascii&quot;</span><span class="p">),</span> <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
+        <span class="p">{</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">}</span>
         <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span>
-        <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">&quot;image&quot;</span>
+        <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span>
     <span class="p">]</span>
-    <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;created&quot;</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">&quot;data&quot;</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">"created"</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
 
 </pre></div>
 
@@ -934,7 +936,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -810,7 +812,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="format_graph_edge_list">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.format_graph_edge_list">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">format_graph_edge_list</span><span class="p">(</span><span class="n">lst</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-    <span class="k">return</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">([</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">next_node</span><span class="si">}</span><span class="s2">&quot;</span> <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">lst</span><span class="p">])</span></div>
+    <span class="k">return</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">([</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">next_node</span><span class="si">}</span><span class="s2">"</span> <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">lst</span><span class="p">])</span></div>
 
 
 
@@ -818,12 +820,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="WorkerGraphIO">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">WorkerGraphIO</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Primary interface between the worker execution loop and a computation graph.</span>
+<span class="w">    </span><span class="sd">"""Primary interface between the worker execution loop and a computation graph.</span>
 
 <span class="sd">    The worker calls ingest_input with arriving edges, reads ready_node_names to pick</span>
 <span class="sd">    a node to run, calls mark_node_complete, and routes the returned output edges.</span>
 <span class="sd">    register_loop_finish_signal handles externally-signalled loop termination (e.g. EOS).</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph</span><span class="p">:</span> <span class="n">GraphSection</span><span class="p">,</span>
         <span class="n">wg_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span>
@@ -874,14 +876,14 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_input</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">can_buffer</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">True</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Route an arriving edge to its destination node.</span>
+<span class="w">        </span><span class="sd">"""Route an arriving edge to its destination node.</span>
 
-<span class="sd">        Returns False when the edge isn&#39;t claimed here: ``next_node`` not in</span>
+<span class="sd">        Returns False when the edge isn't claimed here: ``next_node`` not in</span>
 <span class="sd">        this graph, OR the node exists but rejected the edge (name mismatch</span>
 <span class="sd">        / both ready slots full — see GraphNode.ingest_input). Callers should</span>
-<span class="sd">        treat the False return as &quot;try the next destination&quot; (cross-worker</span>
+<span class="sd">        treat the False return as "try the next destination" (cross-worker</span>
 <span class="sd">        routing or StreamBuffer re-queue).</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="k">if</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">[</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">]</span><span class="o">.</span><span class="n">ingest_input</span><span class="p">(</span>
@@ -894,10 +896,10 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">mark_node_complete</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeCompletionOutput</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Signal that a node has finished executing.</span>
+<span class="w">        </span><span class="sd">"""Signal that a node has finished executing.</span>
 
 <span class="sd">        The caller must route each edge in output_edges, skipping any in filtered_signals.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="n">prev_done_val</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">wg_state_registry</span><span class="o">.</span><span class="n">is_done</span>
         <span class="n">node</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span>
         <span class="n">completion</span> <span class="o">=</span> <span class="n">node</span><span class="o">.</span><span class="n">complete</span><span class="p">()</span>
@@ -917,14 +919,14 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_for_speculation</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span> <span class="n">source_node</span><span class="p">:</span> <span class="nb">str</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">SpeculativeNodeInfo</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Ingest an set of anticipated output edges into speculative buffers.</span>
+<span class="w">        </span><span class="sd">"""Ingest an set of anticipated output edges into speculative buffers.</span>
 
 <span class="sd">        Returns a list of nodes that are ready to be specilatively executed:</span>
 <span class="sd">        (A) if the same as source_node, that speculative &amp; next_iter &amp; streaming cover</span>
 <span class="sd">        all of the inputs.</span>
 
 <span class="sd">        (B) if not the same, that speculative &amp; inputs &amp; streaming cover the inputs.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="n">dest_nodes</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="n">next_iter_nodes</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
 
@@ -952,9 +954,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">check_next_iter</span><span class="o">=</span><span class="n">dest</span> <span class="o">==</span> <span class="n">source_node</span><span class="p">,</span>
                 <span class="n">allow_streaming</span><span class="o">=</span><span class="kc">True</span>
             <span class="p">):</span>
-                <span class="c1"># ``loop_name`` is the destination&#39;s enclosing loop — that&#39;s</span>
+                <span class="c1"># ``loop_name`` is the destination's enclosing loop — that's</span>
                 <span class="c1"># what callers need to inspect ``curr_iter`` / ``max_iters`` /</span>
-                <span class="c1"># ``_finish_signal`` for the loop-completion filter. Source&#39;s</span>
+                <span class="c1"># ``_finish_signal`` for the loop-completion filter. Source's</span>
                 <span class="c1"># loop is irrelevant once we know which node is the spec target.</span>
                 <span class="n">dest_reg</span> <span class="o">=</span> <span class="n">node</span><span class="o">.</span><span class="n">_managing_registry</span>
                 <span class="n">dest_loop_name</span> <span class="o">=</span> <span class="p">(</span>
@@ -973,7 +975,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="WorkerGraphIO.clear_speculative_inputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.graph_io.html#mstar.graph.graph_io.WorkerGraphIO.clear_speculative_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">clear_speculative_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Clear all speculative buffers — call when discarding a speculative schedule.&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""Clear all speculative buffers — call when discarding a speculative schedule."""</span>
         <span class="k">for</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nodes_with_speculative_inputs</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">speculative_signals</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_nodes_with_speculative_inputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
@@ -984,9 +986,9 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_loop_finish_signal</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">loop_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""</span>
 <span class="sd">        Registers an external loop finish signal (e.g., saw an EOS)</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="k">if</span> <span class="n">loop_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">loops</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">loops</span><span class="p">[</span><span class="n">loop_name</span><span class="p">]</span><span class="o">.</span><span class="n">register_finished</span><span class="p">()</span></div>
 
@@ -1103,7 +1105,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

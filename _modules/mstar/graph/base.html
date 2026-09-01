@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -812,11 +814,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.NodeAndGraphWalk">[docs]</a>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">NodeAndGraphWalk</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""</span>
 <span class="sd">    Pair of node name and graph walk, e.g., (LLM, decode) or (flow, image_gen).</span>
 <span class="sd">    graph_walk may be None for streaming-consumer lookups where the graph walk</span>
 <span class="sd">    is not known a priori.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">node</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span></div>
 
@@ -832,14 +834,14 @@ window.runMermaid = runMermaid;</script>
     <span class="n">address</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">stride</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="n">uuid</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># for indexing storage</span>
-    <span class="n">source_session_id</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># &quot;{HOSTNAME}:{client_engine.get_rpc_port()}&quot;</span>
+    <span class="n">source_session_id</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># "{HOSTNAME}:{client_engine.get_rpc_port()}"</span>
     <span class="n">source_entity</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># which {worker, api_server} the tensor is on</span>
     <span class="n">offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span> <span class="c1"># offset, in bytes, of the read (e.g., for in-transport sharding</span>
                     <span class="c1"># in tensor parallel configurations)</span>
     <span class="n">source_tp_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">source_tp_rank</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
 
-    <span class="c1"># SHM-arena transport (MSTAR_SHM_ARENA): the producer wrote this tensor&#39;s</span>
+    <span class="c1"># SHM-arena transport (MSTAR_SHM_ARENA): the producer wrote this tensor's</span>
     <span class="c1"># bytes at `shm_offset` inside the named arena segment. None for the</span>
     <span class="c1"># other transports (per-uuid files, Mooncake).</span>
     <span class="n">shm_segment</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -885,7 +887,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">conductor_new_token</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># counted by the conductor toward the output-token total</span>
     <span class="n">is_streaming</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># streaming edge: tokens accumulate at destination buffer</span>
     <span class="c1"># only for EMIT_TO_CLIENT</span>
-    <span class="n">output_modality</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>  <span class="c1"># text | image | video | audio</span>
+    <span class="n">output_modality</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">""</span><span class="p">)</span>  <span class="c1"># text | image | video | audio</span>
     <span class="n">_persist_for_loop</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
     <span class="c1"># set on a synthetic streaming-input edge carrying the final chunk, so the</span>
     <span class="c1"># consuming pass (not the earlier ingest) reports the partition done</span>
@@ -958,25 +960,25 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphSection.get_inputs_outputs">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_inputs_outputs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputsOutputs</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the I/O signature of this section.</span>
+<span class="w">        </span><span class="sd">"""Return the I/O signature of this section.</span>
 
 <span class="sd">        Construction-time only — used to derive Loop._external_inputs /</span>
 <span class="sd">        _loop_back_inputs. Not for runtime introspection.</span>
-<span class="sd">        &quot;&quot;&quot;</span></div>
+<span class="sd">        """</span></div>
 
 
 <div class="viewcode-block" id="GraphSection.get_nodes">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphSection.get_nodes">[docs]</a>
     <span class="nd">@abstractmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_nodes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">&quot;GraphNode&quot;</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Flat map of all GraphNodes in this section, keyed by name.&quot;&quot;&quot;</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_nodes</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"GraphNode"</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Flat map of all GraphNodes in this section, keyed by name."""</span></div>
 
 
 <div class="viewcode-block" id="GraphSection.get_loops">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphSection.get_loops">[docs]</a>
     <span class="nd">@abstractmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">get_loops</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">&quot;Loop&quot;</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Flat map of all Loops in this section, keyed by name.&quot;&quot;&quot;</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_loops</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"Loop"</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Flat map of all Loops in this section, keyed by name."""</span></div>
 </div>
 
 
@@ -985,12 +987,12 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">ReadySignals</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Readiness state for one &#39;slot&#39; of a GraphNode.</span>
+<span class="w">    </span><span class="sd">"""Readiness state for one 'slot' of a GraphNode.</span>
 
 <span class="sd">    Each node holds two instances — ready_signals (current iteration) and</span>
 <span class="sd">    ready_next_iter — so that loop-back inputs arriving during execution can</span>
 <span class="sd">    be buffered without overwriting the current slot.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">input_names</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">streaming_inputs</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
@@ -1018,9 +1020,9 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.update">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">):</span>
         <span class="k">assert</span> <span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="p">,</span> \
-            <span class="sa">f</span><span class="s2">&quot;Node </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node_name</span><span class="si">}</span><span class="s2"> does not take input named </span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">"Node </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node_name</span><span class="si">}</span><span class="s2"> does not take input named </span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span>
         <span class="k">assert</span> <span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">ready_inputs</span><span class="p">,</span> \
-            <span class="sa">f</span><span class="s2">&quot;Node </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node_name</span><span class="si">}</span><span class="s2"> already has ready input named </span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">"Node </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node_name</span><span class="si">}</span><span class="s2"> already has ready input named </span><span class="si">{</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_inputs</span><span class="p">[</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">edge</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
@@ -1051,17 +1053,17 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="ReadySignals.remove">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.remove">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">remove</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;GraphEdge | None&quot;</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Reverse ``update(edge)`` without dereferencing tensor_info.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">remove</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"GraphEdge | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Reverse ``update(edge)`` without dereferencing tensor_info.</span>
 
-<span class="sd">        Used by the worker&#39;s speculation rollback path when a streaming chunk</span>
+<span class="sd">        Used by the worker's speculation rollback path when a streaming chunk</span>
 <span class="sd">        was ingested for a readiness check and the rid was subsequently</span>
-<span class="sd">        dropped. The chunk is handed back to its StreamBuffer&#39;s uningested</span>
+<span class="sd">        dropped. The chunk is handed back to its StreamBuffer's uningested</span>
 <span class="sd">        cache; the StreamBuffer remains responsible for the tensor lifecycle,</span>
 <span class="sd">        so we must not dereference here.</span>
 
 <span class="sd">        Returns the removed edge, or None if no such name was present.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="n">edge</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ready_inputs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">edge_name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">edge</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
@@ -1083,21 +1085,21 @@ window.runMermaid = runMermaid;</script>
     <span class="n">input_names</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">outputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span>
     <span class="n">consumes_stream</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="c1"># When False, the worker&#39;s speculation gate (``_can_speculate``) refuses to</span>
+    <span class="c1"># When False, the worker's speculation gate (``_can_speculate``) refuses to</span>
     <span class="c1"># build a speculative N+1 batch for this node. Models opt out of spec for</span>
     <span class="c1"># nodes whose forward pass mutates global state in ways the spec path</span>
-    <span class="c1"># doesn&#39;t account for — e.g. BAGEL&#39;s flow-loop LLM / combine_cfg, where</span>
+    <span class="c1"># doesn't account for — e.g. BAGEL's flow-loop LLM / combine_cfg, where</span>
     <span class="c1"># the CFG-parallel branches need their KV caches snapshotted in lockstep.</span>
     <span class="n">enable_async_scheduling</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="c1"># Whether this node is currently speculatively being executed: if so, we</span>
-    <span class="c1"># don&#39;t want to queue it in a &quot;ready&quot; queue because it&#39;s already being</span>
+    <span class="c1"># don't want to queue it in a "ready" queue because it's already being</span>
     <span class="c1"># executed, but we do want to update everything else as normal.</span>
     <span class="n">_speculatively_scheduled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="n">_streaming_inputs</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
 
-    <span class="n">_managing_registry</span><span class="p">:</span> <span class="s2">&quot;GraphStateRegistry | None&quot;</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">_managing_registry</span><span class="p">:</span> <span class="s2">"GraphStateRegistry | None"</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># if the user inputs, e.g., a list, turn it into a set</span>
@@ -1145,11 +1147,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="GraphNode.ingest_input">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.ingest_input">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">can_buffer</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Try to ingest an arriving edge.</span>
+<span class="w">        </span><span class="sd">"""Try to ingest an arriving edge.</span>
 
 <span class="sd">        Returns True on success, False when the edge is rejected; e.g., this</span>
 <span class="sd">        is a streaming edge that we are not redy for and needs to get re-queued</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">next_node</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>
         <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="p">:</span>
@@ -1386,7 +1388,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">is_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">_finish_signal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
-    <span class="n">_managing_registry</span><span class="p">:</span> <span class="s2">&quot;GraphStateRegistry | None&quot;</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">_managing_registry</span><span class="p">:</span> <span class="s2">"GraphStateRegistry | None"</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># external inputs are saved so they can be re-injected at the start of each new iteration</span>
     <span class="n">_ingested_external_inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">_ingested_external_input_names</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
@@ -1449,20 +1451,20 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Loop.complete_iter">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.complete_iter">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">complete_iter</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Called when every entity in the loop&#39;s section has finished for this iteration.</span>
+<span class="w">        </span><span class="sd">"""Called when every entity in the loop's section has finished for this iteration.</span>
 
 <span class="sd">        If the loop is done (last iter or finish signal received): populates output</span>
 <span class="sd">        tensor_info from the cache, marks itself complete in the outer registry, and</span>
-<span class="sd">        returns the loop&#39;s declared outputs with loop-back signals in filtered_signals.</span>
+<span class="sd">        returns the loop's declared outputs with loop-back signals in filtered_signals.</span>
 <span class="sd">        Otherwise: advances curr_iter, resets the inner registry, and returns the</span>
 <span class="sd">        saved external inputs so they can be re-routed into the next iteration.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_iters</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">curr_iter</span> <span class="o">+</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_finish_signal</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">is_done</span> <span class="o">=</span> <span class="kc">True</span>
             <span class="c1"># Clear buffered loop-back inputs so no stale ready state lingers after termination.</span>
             <span class="c1"># Note: wg_state_registry.ready_next_iter may still hold node names added via</span>
             <span class="c1"># register_ingested_input before termination — cleaning those up is deferred</span>
-            <span class="c1"># (they&#39;re harmless since reset_for_iter won&#39;t be called after the loop is done).</span>
+            <span class="c1"># (they're harmless since reset_for_iter won't be called after the loop is done).</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">inner_registry</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_managing_registry</span><span class="o">.</span><span class="n">mark_entity_complete</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">outputs</span><span class="p">:</span>
@@ -1470,7 +1472,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">accumulated_outputs</span><span class="p">:</span>
                 <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="p">[])</span>
 
-            <span class="c1"># Don&#39;t dereference, becaue the tensors will be used downstream</span>
+            <span class="c1"># Don't dereference, becaue the tensors will be used downstream</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="k">return</span> <span class="n">NodeCompletionOutput</span><span class="p">(</span>
@@ -1494,13 +1496,13 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Loop.maybe_cache_output">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.maybe_cache_output">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">maybe_cache_output</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Snapshot tensor_info for any edge that matches a declared loop output.</span>
+<span class="w">        </span><span class="sd">"""Snapshot tensor_info for any edge that matches a declared loop output.</span>
 
-<span class="sd">        Called after every entity completion so the most recent iteration&#39;s</span>
+<span class="sd">        Called after every entity completion so the most recent iteration's</span>
 <span class="sd">        tensor_info is available when complete_iter populates self.outputs.</span>
 <span class="sd">        Accumulated output tensor_info is appended across iterations.</span>
-<span class="sd">        Deduplicates by name so multi-destination edges don&#39;t double-count.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        Deduplicates by name so multi-destination edges don't double-count.</span>
+<span class="sd">        """</span>
         <span class="n">seen_names</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">edges</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="n">seen_names</span><span class="p">:</span>
@@ -1544,8 +1546,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">_overlap</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_output_names</span> <span class="o">&amp;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_output_names</span>
         <span class="k">if</span> <span class="n">_overlap</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Loop.outputs and Loop.accumulated_outputs must be disjoint by name; &quot;</span>
-                <span class="sa">f</span><span class="s2">&quot;overlap: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">_overlap</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="sa">f</span><span class="s2">"Loop.outputs and Loop.accumulated_outputs must be disjoint by name; "</span>
+                <span class="sa">f</span><span class="s2">"overlap: </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">_overlap</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
             <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">inner_registry</span> <span class="o">=</span> <span class="n">LoopStateRegistry</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
 
@@ -1593,12 +1595,12 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_section</span><span class="p">:</span> <span class="n">GraphSection</span><span class="p">,</span>
     <span class="p">):</span>
-        <span class="c1"># &quot;Outer-level&quot; nodes and loops</span>
+        <span class="c1"># "Outer-level" nodes and loops</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphNode</span><span class="o">|</span><span class="n">Loop</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">_set_managed_entities</span><span class="p">(</span><span class="n">section</span><span class="p">:</span> <span class="n">GraphSection</span><span class="p">):</span>
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">GraphNode</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">Loop</span><span class="p">):</span>
-                <span class="c1"># stop here — Loop&#39;s inner entities are owned by its own LoopStateRegistry</span>
+                <span class="c1"># stop here — Loop's inner entities are owned by its own LoopStateRegistry</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="p">[</span><span class="n">section</span><span class="o">.</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">section</span>
                 <span class="k">return</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">Sequential</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">section</span><span class="p">,</span> <span class="n">Parallel</span><span class="p">)</span>
@@ -1613,7 +1615,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="GraphStateRegistry.mark_entity_complete">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphStateRegistry.mark_entity_complete">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">mark_entity_complete</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeCompletionOutput</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Record that an entity has finished; no-ops if already done (safeguard only).&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""Record that an entity has finished; no-ops if already done (safeguard only)."""</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_done</span> <span class="ow">and</span> <span class="n">entity_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_num_completed_entities</span> <span class="o">+=</span> <span class="mi">1</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">is_done</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_completed_entities</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_managed_entities</span>
@@ -1666,8 +1668,8 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_done</span><span class="p">:</span>
             <span class="n">loop_out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">complete_iter</span><span class="p">()</span>
             <span class="n">output</span><span class="o">.</span><span class="n">filtered_signals</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">loop_out</span><span class="o">.</span><span class="n">filtered_signals</span><span class="p">)</span>
-            <span class="c1"># strip loop-back edges from this entity&#39;s raw outputs, then append the</span>
-            <span class="c1"># loop&#39;s declared outputs (either the external outputs if done, or the</span>
+            <span class="c1"># strip loop-back edges from this entity's raw outputs, then append the</span>
+            <span class="c1"># loop's declared outputs (either the external outputs if done, or the</span>
             <span class="c1"># re-injected external inputs if advancing to the next iteration)</span>
             <span class="n">output</span><span class="o">.</span><span class="n">output_edges</span> <span class="o">=</span> <span class="p">[</span>
                 <span class="n">edge</span> <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">output</span><span class="o">.</span><span class="n">output_edges</span> \
@@ -1709,7 +1711,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_ingested_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">):</span>
         <span class="n">node</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">[</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">]</span>
         <span class="c1"># If node._speculatively_scheduled, the node is already executing as</span>
-        <span class="c1"># a spec batch. We don&#39;t want to double-queue it (either for the</span>
+        <span class="c1"># a spec batch. We don't want to double-queue it (either for the</span>
         <span class="c1"># current iter via ``ready_names`` or for the next iter via</span>
         <span class="c1"># ``ready_next_iter`` — both eventually feed the scheduler) so we</span>
         <span class="c1"># gate every queue add on the flag.</span>
@@ -1734,7 +1736,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.mark_entity_complete">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">mark_entity_complete</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeCompletionOutput</span><span class="p">:</span>
         <span class="c1"># Top-level entities have no outer loop to drive a reset_for_iter, so</span>
-        <span class="c1"># we clear the entity&#39;s ready_signals here so the same node can be</span>
+        <span class="c1"># we clear the entity's ready_signals here so the same node can be</span>
         <span class="c1"># ingested for a future forward pass without ingest_input falling</span>
         <span class="c1"># through to ready_next_iter</span>
         <span class="n">output</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">mark_entity_complete</span><span class="p">(</span><span class="n">entity_name</span><span class="p">)</span>
@@ -1817,7 +1819,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

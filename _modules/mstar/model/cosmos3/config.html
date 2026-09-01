@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.cosmos3.config</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Configuration for the Cosmos3 omni generator.</span>
+<span></span><span class="sd">"""Configuration for the Cosmos3 omni generator.</span>
 
 <span class="sd">A single ``Cosmos3Config`` describes every Cosmos3 checkpoint (Nano, Super,</span>
 <span class="sd">Policy-DROID, and the Super task variants). The checkpoints share one</span>
@@ -820,7 +822,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">Dataclass defaults mirror Cosmos3-Nano so a bare ``Cosmos3Config()`` is a</span>
 <span class="sd">valid Nano config without any file present.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -831,7 +833,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">:</span> <span class="nb">type</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Keep only the dict entries that name a field on the dataclass ``cls``.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Keep only the dict entries that name a field on the dataclass ``cls``."""</span>
     <span class="n">names</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">__dataclass_fields__</span><span class="o">.</span><span class="n">values</span><span class="p">()}</span>
     <span class="k">return</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">d</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">names</span><span class="p">}</span>
 
@@ -840,11 +842,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3VAEConfig">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3VAEConfig</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;The Wan2.2-TI2V-5B VAE (``AutoencoderKLWan``) parameters we need at the</span>
+<span class="w">    </span><span class="sd">"""The Wan2.2-TI2V-5B VAE (``AutoencoderKLWan``) parameters we need at the</span>
 <span class="sd">    serving layer. The full VAE module loads from the ``vae/`` subfolder via</span>
 <span class="sd">    diffusers; here we only track the latent geometry and the per-channel</span>
 <span class="sd">    normalization statistics the pipeline applies to/from latent space.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">z_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">48</span>
     <span class="n">scale_factor_spatial</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
@@ -858,7 +860,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Cosmos3VAEConfig.from_dict">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3VAEConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;Cosmos3VAEConfig&quot;</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3VAEConfig"</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">))</span></div>
 </div>
 
@@ -868,20 +870,20 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3SchedulerConfig">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3SchedulerConfig</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;UniPC multistep flow scheduler settings (``scheduler/scheduler_config``).</span>
+<span class="w">    </span><span class="sd">"""UniPC multistep flow scheduler settings (``scheduler/scheduler_config``).</span>
 
 <span class="sd">    The denoise loop drives a diffusers ``UniPCMultistepScheduler`` configured</span>
 <span class="sd">    from these fields; we do not re-implement the bh2 corrector.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
-    <span class="n">scheduler_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;unipc&quot;</span>
-    <span class="n">prediction_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;flow_prediction&quot;</span>
+    <span class="n">scheduler_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"unipc"</span>
+    <span class="n">prediction_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"flow_prediction"</span>
     <span class="n">predict_x0</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">solver_order</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2</span>
-    <span class="n">solver_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;bh2&quot;</span>
+    <span class="n">solver_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"bh2"</span>
     <span class="n">use_flow_sigmas</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">use_karras_sigmas</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="n">final_sigmas_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;zero&quot;</span>
+    <span class="n">final_sigmas_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"zero"</span>
     <span class="n">num_train_timesteps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1000</span>
     <span class="n">flow_shift</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
     <span class="n">sigma_min</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.147</span>
@@ -890,8 +892,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Cosmos3SchedulerConfig.from_dict">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3SchedulerConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;Cosmos3SchedulerConfig&quot;</span><span class="p">:</span>
-        <span class="c1"># diffusers stores the flow shift under &quot;flow_shift&quot;; keep the rest by name.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3SchedulerConfig"</span><span class="p">:</span>
+        <span class="c1"># diffusers stores the flow shift under "flow_shift"; keep the rest by name.</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">))</span></div>
 </div>
 
@@ -901,7 +903,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3Config">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3Config</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Cosmos3 generator configuration (one architecture, swappable weights).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Cosmos3 generator configuration (one architecture, swappable weights)."""</span>
 
     <span class="c1"># ----- dual-pathway MoT transformer (the DiT) -----</span>
     <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4096</span>
@@ -931,7 +933,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">timestep_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.001</span>
 
     <span class="c1"># ----- attention / norm style -----</span>
-    <span class="n">joint_attn_implementation</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;two_way&quot;</span>  <span class="c1"># GEN attends [UND|GEN]; UND causal, UND-only</span>
+    <span class="n">joint_attn_implementation</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"two_way"</span>  <span class="c1"># GEN attends [UND|GEN]; UND causal, UND-only</span>
     <span class="n">qk_norm_for_diffusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">qk_norm_for_text</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">use_moe</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>  <span class="c1"># MoT two-FFN split (mlp / mlp_moe_gen), NOT sparse experts</span>
@@ -944,8 +946,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">sound_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mi">64</span>
     <span class="n">sound_latent_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">25.0</span>
     <span class="n">temporal_compression_factor_sound</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
-    <span class="c1"># Sample rate of the checkpoint&#39;s AVAE sound tokenizer. Not in the</span>
-    <span class="c1"># transformer config; the tokenizer&#39;s own config.json is authoritative and</span>
+    <span class="c1"># Sample rate of the checkpoint's AVAE sound tokenizer. Not in the</span>
+    <span class="c1"># transformer config; the tokenizer's own config.json is authoritative and</span>
     <span class="c1"># cross-checked at load (sound_latent_fps == sample_rate / hop_size).</span>
     <span class="n">sound_sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">48000</span>
     <span class="c1"># Serve opt-in sound generation (the video_sound_gen walk + the</span>
@@ -962,14 +964,14 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># A request may override either; the value is clamped to ``max_inference_steps``.</span>
     <span class="n">num_inference_steps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">50</span>
     <span class="n">num_inference_steps_video</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">35</span>
-    <span class="c1"># Upper bound on the denoise loop&#39;s iteration count. The loop is built with</span>
+    <span class="c1"># Upper bound on the denoise loop's iteration count. The loop is built with</span>
     <span class="c1"># this many iterations and each request stops early at its own step count, so</span>
     <span class="c1"># one graph serves any per-request step count up to this cap.</span>
     <span class="n">max_inference_steps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">100</span>
     <span class="c1"># Default frames-per-second for video generation + mp4 playback (overridable</span>
     <span class="c1"># per request via ``fps``).</span>
     <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">24.0</span>
-    <span class="c1"># Default frame count for a video request that doesn&#39;t specify ``num_frames``</span>
+    <span class="c1"># Default frame count for a video request that doesn't specify ``num_frames``</span>
     <span class="c1"># (the Wan VAE downsamples time by 4, so latent frames = 1 + (n - 1) // 4).</span>
     <span class="n">num_frames_video</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">17</span>
     <span class="c1"># Action-request sampling defaults (all three action modes), following the</span>
@@ -994,56 +996,56 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># their bit-exact bounds on the eager step.</span>
     <span class="n">compile_denoise</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># KV-cache attention backend (a cache_manager.ATTENTION_BACKENDS key).</span>
-    <span class="c1"># &quot;dense_gen&quot; (default) runs eager single-request generation attention as</span>
+    <span class="c1"># "dense_gen" (default) runs eager single-request generation attention as</span>
     <span class="c1"># one dense FA3 varlen pass over [frozen text prefix | fresh gen tokens];</span>
     <span class="c1"># captured graphs and multi-request batches fall back to the paged</span>
-    <span class="c1"># FlashInfer path. &quot;flashinfer&quot; forces paged everywhere.</span>
-    <span class="n">attention_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;dense_gen&quot;</span>
+    <span class="c1"># FlashInfer path. "flashinfer" forces paged everywhere.</span>
+    <span class="n">attention_backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"dense_gen"</span>
 
     <span class="c1"># ----- sub-configs -----</span>
     <span class="n">vae</span><span class="p">:</span> <span class="n">Cosmos3VAEConfig</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">Cosmos3VAEConfig</span><span class="p">)</span>
     <span class="n">scheduler</span><span class="p">:</span> <span class="n">Cosmos3SchedulerConfig</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">Cosmos3SchedulerConfig</span><span class="p">)</span>
 
     <span class="c1"># ----- provenance -----</span>
-    <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
 
 <div class="viewcode-block" id="Cosmos3Config.from_transformer_dict">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3Config.from_transformer_dict">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_transformer_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;Cosmos3Config&quot;</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Build from a diffusers ``transformer/config.json`` dict alone.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_transformer_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3Config"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Build from a diffusers ``transformer/config.json`` dict alone.</span>
 
 <span class="sd">        Sub-configs are left at their defaults; use ``from_pretrained`` to also</span>
 <span class="sd">        populate VAE/scheduler from their sibling folders.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="n">kwargs</span> <span class="o">=</span> <span class="n">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
-        <span class="n">rope</span> <span class="o">=</span> <span class="n">d</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;rope_scaling&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
-        <span class="k">if</span> <span class="s2">&quot;mrope_section&quot;</span> <span class="ow">in</span> <span class="n">rope</span><span class="p">:</span>
-            <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;rope_axes_dim&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">rope</span><span class="p">[</span><span class="s2">&quot;mrope_section&quot;</span><span class="p">])</span>
-        <span class="k">if</span> <span class="s2">&quot;mrope_interleaved&quot;</span> <span class="ow">in</span> <span class="n">rope</span><span class="p">:</span>
-            <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;mrope_interleaved&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">rope</span><span class="p">[</span><span class="s2">&quot;mrope_interleaved&quot;</span><span class="p">])</span>
+        <span class="n">rope</span> <span class="o">=</span> <span class="n">d</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"rope_scaling"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="s2">"mrope_section"</span> <span class="ow">in</span> <span class="n">rope</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"rope_axes_dim"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">rope</span><span class="p">[</span><span class="s2">"mrope_section"</span><span class="p">])</span>
+        <span class="k">if</span> <span class="s2">"mrope_interleaved"</span> <span class="ow">in</span> <span class="n">rope</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"mrope_interleaved"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">rope</span><span class="p">[</span><span class="s2">"mrope_interleaved"</span><span class="p">])</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="Cosmos3Config.from_pretrained">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3Config.from_pretrained">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_pretrained</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;Cosmos3Config&quot;</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Load from a diffusers-layout checkpoint directory.&quot;&quot;&quot;</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_pretrained</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3Config"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Load from a diffusers-layout checkpoint directory."""</span>
         <span class="n">root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">local_dir</span><span class="p">)</span>
-        <span class="n">tcfg_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;transformer&quot;</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
+        <span class="n">tcfg_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"transformer"</span> <span class="o">/</span> <span class="s2">"config.json"</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">tcfg_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
-            <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;transformer/config.json not found under </span><span class="si">{</span><span class="n">root</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"transformer/config.json not found under </span><span class="si">{</span><span class="n">root</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">tcfg_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">cfg</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="n">from_transformer_dict</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">))</span>
         <span class="n">cfg</span><span class="o">.</span><span class="n">local_dir</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">root</span><span class="p">)</span>
 
-        <span class="n">vae_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;vae&quot;</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span>
+        <span class="n">vae_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"vae"</span> <span class="o">/</span> <span class="s2">"config.json"</span>
         <span class="k">if</span> <span class="n">vae_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
             <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">vae_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
                 <span class="n">cfg</span><span class="o">.</span><span class="n">vae</span> <span class="o">=</span> <span class="n">Cosmos3VAEConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">))</span>
 
-        <span class="n">sched_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">&quot;scheduler&quot;</span> <span class="o">/</span> <span class="s2">&quot;scheduler_config.json&quot;</span>
+        <span class="n">sched_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"scheduler"</span> <span class="o">/</span> <span class="s2">"scheduler_config.json"</span>
         <span class="k">if</span> <span class="n">sched_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
             <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">sched_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
                 <span class="n">cfg</span><span class="o">.</span><span class="n">scheduler</span> <span class="o">=</span> <span class="n">Cosmos3SchedulerConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">))</span>
@@ -1098,7 +1100,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

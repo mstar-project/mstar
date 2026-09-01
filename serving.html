@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -774,7 +774,7 @@ scoped to specific <code class="docutils literal notranslate"><span class="pre">
 <code class="docutils literal notranslate"><span class="pre">get_node_engine_types</span></code> (e.g. BAGEL’s <code class="docutils literal notranslate"><span class="pre">vit_encoder</span></code> / <code class="docutils literal notranslate"><span class="pre">vae_encoder</span></code> / <code class="docutils literal notranslate"><span class="pre">LLM</span></code>,
 Orpheus’s <code class="docutils literal notranslate"><span class="pre">LLM</span></code> / <code class="docutils literal notranslate"><span class="pre">snac_decoder</span></code>).</p>
 <p><strong>Single GPU.</strong> Everything on rank 0:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;bagel&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"bagel"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32768</span>
 <span class="nt">node_groups</span><span class="p">:</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">vit_encoder</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
@@ -794,7 +794,7 @@ prefill, decode, and image generation on three GPUs:</p>
 disaggregated. <code class="docutils literal notranslate"><span class="pre">configs/</span></code> ships several layouts per model (<code class="docutils literal notranslate"><span class="pre">*_single_gpu</span></code>,
 <code class="docutils literal notranslate"><span class="pre">*_colocated</span></code>, <code class="docutils literal notranslate"><span class="pre">*_pd_disaggregated</span></code>, <code class="docutils literal notranslate"><span class="pre">*_cfg_parallel</span></code>, …).</p>
 <p><strong>Tensor parallelism.</strong> Shard a node across GPUs with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> and that many <code class="docutils literal notranslate"><span class="pre">ranks</span></code>:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;orpheus&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"orpheus"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">131072</span>
 <span class="nt">node_groups</span><span class="p">:</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">],</span><span class="nt"> tp_size</span><span class="p">:</span><span class="w"> </span><span class="nv">2</span><span class="p p-Indicator">,</span><span class="nt"> graph_walks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">prefill</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">decode</span><span class="p p-Indicator">]}</span>
@@ -811,7 +811,7 @@ details.</p>
 <p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> are model parameters fixed at server start (not per request) — they are
 baked into the model’s config dataclass and into CUDA-graph captures. For example, the
 Pi0.5 DROID variant fixes the action horizon:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;pi05&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"pi05"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="nt">model_kwargs</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">action_horizon</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">15</span>
@@ -1006,7 +1006,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

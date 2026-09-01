@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.adapters</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Per-model translation between OpenAI-shaped requests and mstar&#39;s request path.</span>
+<span></span><span class="sd">"""Per-model translation between OpenAI-shaped requests and mstar's request path.</span>
 
 <span class="sd">The OpenAI endpoints are model-agnostic; everything model-specific lives here.</span>
 <span class="sd">An adapter translates an OpenAI request into :class:`SubmitArgs` (the arguments</span>
@@ -814,9 +816,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">``model_kwargs`` is non-standardized across models, so each adapter maps the</span>
 <span class="sd">standard OpenAI fields (``temperature``, ``top_p``, ``max_tokens``, ``seed``,</span>
 <span class="sd">``voice``, ``modalities`` …) onto the keys its model actually honors (see</span>
-<span class="sd">:func:`_apply_sampling`). Knobs that aren&#39;t OpenAI-standard (``top_k``,</span>
+<span class="sd">:func:`_apply_sampling`). Knobs that aren't OpenAI-standard (``top_k``,</span>
 <span class="sd">``repetition_penalty``, or model-namespaced keys like ``talker_top_p``) are not</span>
-<span class="sd">first-class fields — pass them via the OpenAI client&#39;s ``extra_body`` and they</span>
+<span class="sd">first-class fields — pass them via the OpenAI client's ``extra_body`` and they</span>
 <span class="sd">flow through verbatim as model_kwargs (see :func:`_passthrough`).</span>
 
 <span class="sd">Models whose outputs have no OpenAI-standard representation (robot actions from</span>
@@ -825,7 +827,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">SDK, and ``/v1/*`` returns 404 for them (they do not fall back to chat). New</span>
 <span class="sd">OpenAI-capable models opt in by adding an adapter and registering it in</span>
 <span class="sd">:data:`ADAPTER_REGISTRY`.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -851,7 +853,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">text</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">file_paths</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
-    <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">])</span>
+    <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
     <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
 
 
@@ -861,13 +863,13 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">flatten_messages</span><span class="p">(</span>
     <span class="n">messages</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">allow_remote</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities).</span>
+<span class="w">    </span><span class="sd">"""Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities).</span>
 
 <span class="sd">    Text parts across all messages are concatenated (newline-joined). Image /</span>
 <span class="sd">    audio / video content parts are persisted under ``upload_dir`` and grouped</span>
 <span class="sd">    by modality. (Multi-turn role structure is flattened — a v1 simplification;</span>
 <span class="sd">    the models here apply their own prompt formatting in ``process_prompt``.)</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">text_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="n">file_paths</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 
@@ -876,7 +878,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">for</span> <span class="n">msg</span> <span class="ow">in</span> <span class="n">messages</span> <span class="ow">or</span> <span class="p">[]:</span>
         <span class="c1"># Messages may be pydantic ChatMessage objects or plain dicts.</span>
-        <span class="n">content</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;content&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">content</span> <span class="o">=</span> <span class="n">msg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"content"</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="k">else</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">content</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">continue</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">content</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
@@ -886,44 +888,44 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">part</span> <span class="ow">in</span> <span class="n">content</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">part</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
                 <span class="k">continue</span>
-            <span class="n">ptype</span> <span class="o">=</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;type&quot;</span><span class="p">)</span>
-            <span class="k">if</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">&quot;text&quot;</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;text&quot;</span><span class="p">):</span>
-                    <span class="n">text_parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">part</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">])</span>
-            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">&quot;image_url&quot;</span><span class="p">:</span>
-                <span class="n">url</span> <span class="o">=</span> <span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;image_url&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;url&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+            <span class="n">ptype</span> <span class="o">=</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"type"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text"</span><span class="p">):</span>
+                    <span class="n">text_parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">part</span><span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
+            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">"image_url"</span><span class="p">:</span>
+                <span class="n">url</span> <span class="o">=</span> <span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"image_url"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"url"</span><span class="p">,</span> <span class="s2">""</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">url</span><span class="p">:</span>
                     <span class="n">mod</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">,</span> <span class="n">allow_remote</span><span class="o">=</span><span class="n">allow_remote</span><span class="p">)</span>
-                    <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span> <span class="ow">or</span> <span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
-            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">&quot;video_url&quot;</span><span class="p">:</span>  <span class="c1"># extension for video-capable models</span>
-                <span class="n">url</span> <span class="o">=</span> <span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;video_url&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;url&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+                    <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span> <span class="ow">or</span> <span class="s2">"image"</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">"video_url"</span><span class="p">:</span>  <span class="c1"># extension for video-capable models</span>
+                <span class="n">url</span> <span class="o">=</span> <span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"video_url"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"url"</span><span class="p">,</span> <span class="s2">""</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">url</span><span class="p">:</span>
                     <span class="n">mod</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">,</span> <span class="n">allow_remote</span><span class="o">=</span><span class="n">allow_remote</span><span class="p">)</span>
-                    <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span> <span class="ow">or</span> <span class="s2">&quot;video&quot;</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
-            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">&quot;audio_url&quot;</span><span class="p">:</span>  <span class="c1"># data:/http audio input (vllm-omni content style)</span>
-                <span class="n">url</span> <span class="o">=</span> <span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;audio_url&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;url&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+                    <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span> <span class="ow">or</span> <span class="s2">"video"</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">"audio_url"</span><span class="p">:</span>  <span class="c1"># data:/http audio input (vllm-omni content style)</span>
+                <span class="n">url</span> <span class="o">=</span> <span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"audio_url"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"url"</span><span class="p">,</span> <span class="s2">""</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">url</span><span class="p">:</span>
                     <span class="n">mod</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">,</span> <span class="n">allow_remote</span><span class="o">=</span><span class="n">allow_remote</span><span class="p">)</span>
-                    <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span> <span class="ow">or</span> <span class="s2">&quot;audio&quot;</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
-            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">&quot;input_audio&quot;</span><span class="p">:</span>  <span class="c1"># OpenAI-native audio input (base64 + format)</span>
-                <span class="n">ia</span> <span class="o">=</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;input_audio&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
-                <span class="n">data</span><span class="p">,</span> <span class="n">fmt</span> <span class="o">=</span> <span class="n">ia</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;data&quot;</span><span class="p">),</span> <span class="n">ia</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;format&quot;</span><span class="p">,</span> <span class="s2">&quot;wav&quot;</span><span class="p">)</span>
+                    <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span> <span class="ow">or</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">"input_audio"</span><span class="p">:</span>  <span class="c1"># OpenAI-native audio input (base64 + format)</span>
+                <span class="n">ia</span> <span class="o">=</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"input_audio"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+                <span class="n">data</span><span class="p">,</span> <span class="n">fmt</span> <span class="o">=</span> <span class="n">ia</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"data"</span><span class="p">),</span> <span class="n">ia</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"format"</span><span class="p">,</span> <span class="s2">"wav"</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">data</span><span class="p">:</span>
-                    <span class="n">mod</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">save_base64</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">fmt</span><span class="p">,</span> <span class="s2">&quot;audio&quot;</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+                    <span class="n">mod</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">save_base64</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">fmt</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
                     <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
 
     <span class="n">input_modalities</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">file_paths</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
-    <span class="n">text</span> <span class="o">=</span> <span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">text_parts</span><span class="p">)</span> <span class="k">if</span> <span class="n">text_parts</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="n">text</span> <span class="o">=</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">text_parts</span><span class="p">)</span> <span class="k">if</span> <span class="n">text_parts</span> <span class="k">else</span> <span class="kc">None</span>
     <span class="k">if</span> <span class="n">text</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">input_modalities</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;text&quot;</span><span class="p">)</span>
+        <span class="n">input_modalities</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">"text"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">input_modalities</span></div>
 
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Unknown request fields (e.g. from the OpenAI client&#39;s ``extra_body``)</span>
-<span class="sd">    flow through verbatim as model_kwargs.&quot;&quot;&quot;</span>
-    <span class="n">extra</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;model_extra&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+<span class="w">    </span><span class="sd">"""Unknown request fields (e.g. from the OpenAI client's ``extra_body``)</span>
+<span class="sd">    flow through verbatim as model_kwargs."""</span>
+    <span class="n">extra</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"model_extra"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
     <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">extra</span><span class="p">)</span>
 
 
@@ -931,14 +933,14 @@ window.runMermaid = runMermaid;</script>
     <span class="n">req</span><span class="p">,</span>
     <span class="n">mk</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
     <span class="o">*</span><span class="p">,</span>
-    <span class="n">temperature_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;temperature&quot;</span><span class="p">,</span>
-    <span class="n">top_p_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;top_p&quot;</span><span class="p">,</span>
-    <span class="n">max_tokens_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="s2">&quot;max_output_tokens&quot;</span><span class="p">,</span>
+    <span class="n">temperature_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"temperature"</span><span class="p">,</span>
+    <span class="n">top_p_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"top_p"</span><span class="p">,</span>
+    <span class="n">max_tokens_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="s2">"max_output_tokens"</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Map the OpenAI-standard sampling fields onto a model&#39;s ``model_kwargs``.</span>
+<span class="w">    </span><span class="sd">"""Map the OpenAI-standard sampling fields onto a model's ``model_kwargs``.</span>
 
 <span class="sd">    Behavior is common across models, but the target key names differ (e.g.</span>
-<span class="sd">    Qwen3-Omni&#39;s Thinker uses ``thinker_temperature`` and its Talker</span>
+<span class="sd">    Qwen3-Omni's Thinker uses ``thinker_temperature`` and its Talker</span>
 <span class="sd">    ``talker_temperature``), so callers pass them in. ``setdefault`` lets an</span>
 <span class="sd">    explicit ``extra_body`` value win over the standard field.</span>
 
@@ -948,18 +950,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    fields — send them via ``extra_body`` and they pass through :func:`_passthrough`.</span>
 <span class="sd">    ``seed`` is honored by the conductor, which uses it in place of the</span>
 <span class="sd">    request-id-derived RNG seed.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">temperature</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;temperature&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+<span class="sd">    """</span>
+    <span class="n">temperature</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"temperature"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">temperature</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">temperature_key</span><span class="p">,</span> <span class="n">temperature</span><span class="p">)</span>
-    <span class="n">top_p</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;top_p&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="n">top_p</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"top_p"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">top_p</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">top_p_key</span><span class="p">,</span> <span class="n">top_p</span><span class="p">)</span>
-    <span class="n">seed</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="n">seed</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">seed</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">seed</span><span class="p">)</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">seed</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">max_tokens_key</span><span class="p">:</span>
-        <span class="n">max_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;max_completion_tokens&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;max_tokens&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">max_tokens</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"max_completion_tokens"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"max_tokens"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">max_tokens</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">max_tokens_key</span><span class="p">,</span> <span class="n">max_tokens</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">mk</span>
@@ -968,48 +970,49 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="OpenAIAdapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">OpenAIAdapter</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Base adapter. A model subclasses this and implements the surfaces it</span>
+<span class="w">    </span><span class="sd">"""Base adapter. A model subclasses this and implements the surfaces it</span>
 <span class="sd">    supports; an unimplemented surface raises and the endpoint returns 404.</span>
 <span class="sd">    Models with no OpenAI-standard output have no adapter (see the module</span>
 <span class="sd">    docstring) and are reached only via ``/generate`` / the SDK.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="c1"># Each flag gates exactly one OpenAI surface:</span>
     <span class="n">supports_chat</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>     <span class="c1"># POST /v1/chat/completions</span>
     <span class="n">supports_speech</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/audio/speech</span>
     <span class="n">supports_images</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/images/generations and /v1/images/edits</span>
     <span class="n">supports_videos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/videos/generations</span>
+    <span class="n">supports_realtime</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># /v1/realtime (bidirectional speech WebSocket)</span>
 
 <div class="viewcode-block" id="OpenAIAdapter.chat_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">chat_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ChatCompletionRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
         <span class="c1"># Output modalities vary by model: e.g. Qwen3-Omni speech output also</span>
         <span class="c1"># emits text, whereas BAGEL chat is text-only.</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;chat is not supported by this model&quot;</span><span class="p">)</span></div>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"chat is not supported by this model"</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="OpenAIAdapter.speech_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">speech_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">SpeechRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;audio/speech is not supported by this model&quot;</span><span class="p">)</span></div>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"audio/speech is not supported by this model"</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="OpenAIAdapter.image_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.image_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">image_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;image generation is not supported by this model&quot;</span><span class="p">)</span></div>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"image generation is not supported by this model"</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="OpenAIAdapter.video_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">video_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;video generation is not supported by this model&quot;</span><span class="p">)</span></div>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"video generation is not supported by this model"</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="OpenAIAdapter.image_edit_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">image_edit_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">image_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">extra_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
-        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;image editing is not supported by this model&quot;</span><span class="p">)</span></div>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"image editing is not supported by this model"</span><span class="p">)</span></div>
 </div>
 
 
@@ -1017,12 +1020,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="BagelAdapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">BagelAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;BAGEL: text chat (text out) + text-to-image / image editing.</span>
+<span class="w">    </span><span class="sd">"""BAGEL: text chat (text out) + text-to-image / image editing.</span>
 
-<span class="sd">    BAGEL&#39;s ``get_sampling_config`` reads the model config, so per-request</span>
+<span class="sd">    BAGEL's ``get_sampling_config`` reads the model config, so per-request</span>
 <span class="sd">    ``temperature`` / ``top_p`` are not honored; ``max_output_tokens`` and</span>
 <span class="sd">    ``seed`` are.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">supports_chat</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">supports_images</span> <span class="o">=</span> <span class="kc">True</span>
@@ -1037,7 +1040,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">text</span><span class="o">=</span><span class="n">text</span><span class="p">,</span>
             <span class="n">file_paths</span><span class="o">=</span><span class="n">file_paths</span> <span class="ow">or</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">input_modalities</span><span class="o">=</span><span class="n">in_mods</span><span class="p">,</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
 
@@ -1046,12 +1049,12 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.image_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">image_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">],</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
 
@@ -1060,12 +1063,12 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.image_edit_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">image_edit_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">image_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">extra_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
         <span class="c1"># Image editing: the input image + prompt produce an edited image</span>
-        <span class="c1"># (BAGEL&#39;s I2I path). Extra kwargs (e.g. cfg_*_scale, seed) pass through.</span>
+        <span class="c1"># (BAGEL's I2I path). Extra kwargs (e.g. cfg_*_scale, seed) pass through.</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
-            <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">image_path</span><span class="p">]},</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">],</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">],</span>
+            <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="p">[</span><span class="n">image_path</span><span class="p">]},</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="nb">dict</span><span class="p">(</span><span class="n">extra_kwargs</span> <span class="ow">or</span> <span class="p">{}),</span>
         <span class="p">)</span></div>
 </div>
@@ -1075,24 +1078,25 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Qwen3OmniAdapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Qwen3OmniAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.</span>
+<span class="w">    </span><span class="sd">"""Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.</span>
 
 <span class="sd">    Sampling is split across three stages: the Thinker (text) takes</span>
-<span class="sd">    ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker&#39;s</span>
+<span class="sd">    ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker's</span>
 <span class="sd">    CodePredictor (residual codec groups) ``code_predictor_*``. Everything</span>
 <span class="sd">    except temperature/top_p is not an OpenAI field (``talker_top_k``,</span>
 <span class="sd">    ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those</span>
 <span class="sd">    via ``extra_body``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">supports_chat</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">supports_speech</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">supports_realtime</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_voice</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">audio_cfg</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;audio&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
-        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">audio_cfg</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="ow">and</span> <span class="n">audio_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;voice&quot;</span><span class="p">):</span>
-            <span class="k">return</span> <span class="n">audio_cfg</span><span class="p">[</span><span class="s2">&quot;voice&quot;</span><span class="p">]</span>
-        <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;voice&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">audio_cfg</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">audio_cfg</span><span class="p">,</span> <span class="nb">dict</span><span class="p">)</span> <span class="ow">and</span> <span class="n">audio_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"voice"</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">audio_cfg</span><span class="p">[</span><span class="s2">"voice"</span><span class="p">]</span>
+        <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"voice"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
 
 <div class="viewcode-block" id="Qwen3OmniAdapter.chat_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.chat_to_request">[docs]</a>
@@ -1100,12 +1104,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">in_mods</span> <span class="o">=</span> <span class="n">flatten_messages</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">messages</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
         <span class="c1"># Speech output also emits text, so request both modalities when audio is asked for.</span>
-        <span class="n">want_audio</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">modalities</span> <span class="ow">and</span> <span class="s2">&quot;audio&quot;</span> <span class="ow">in</span> <span class="n">req</span><span class="o">.</span><span class="n">modalities</span><span class="p">)</span>
-        <span class="n">out_mods</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="s2">&quot;audio&quot;</span><span class="p">]</span> <span class="k">if</span> <span class="n">want_audio</span> <span class="k">else</span> <span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">]</span>
-        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">,</span> <span class="n">temperature_key</span><span class="o">=</span><span class="s2">&quot;thinker_temperature&quot;</span><span class="p">,</span> <span class="n">top_p_key</span><span class="o">=</span><span class="s2">&quot;thinker_top_p&quot;</span><span class="p">)</span>
+        <span class="n">want_audio</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">modalities</span> <span class="ow">and</span> <span class="s2">"audio"</span> <span class="ow">in</span> <span class="n">req</span><span class="o">.</span><span class="n">modalities</span><span class="p">)</span>
+        <span class="n">out_mods</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">]</span> <span class="k">if</span> <span class="n">want_audio</span> <span class="k">else</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">]</span>
+        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">,</span> <span class="n">temperature_key</span><span class="o">=</span><span class="s2">"thinker_temperature"</span><span class="p">,</span> <span class="n">top_p_key</span><span class="o">=</span><span class="s2">"thinker_top_p"</span><span class="p">)</span>
         <span class="n">voice</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_voice</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">voice</span><span class="p">:</span>
-            <span class="n">mk</span><span class="p">[</span><span class="s2">&quot;voice&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">voice</span>
+            <span class="n">mk</span><span class="p">[</span><span class="s2">"voice"</span><span class="p">]</span> <span class="o">=</span> <span class="n">voice</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">text</span><span class="p">,</span>
             <span class="n">file_paths</span><span class="o">=</span><span class="n">file_paths</span> <span class="ow">or</span> <span class="kc">None</span><span class="p">,</span>
@@ -1121,14 +1125,14 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Qwen3-Omni is a chat model; /v1/audio/speech returns the audio of its</span>
         <span class="c1"># spoken response to ``input`` (the handler keeps only the audio).</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;voice&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="n">mk</span><span class="p">[</span><span class="s2">&quot;voice&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">voice</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"voice"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="p">[</span><span class="s2">"voice"</span><span class="p">]</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">voice</span>
         <span class="c1"># Talker (speech) sampling; max_tokens is not an OpenAI speech field.</span>
-        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">,</span> <span class="n">temperature_key</span><span class="o">=</span><span class="s2">&quot;talker_temperature&quot;</span><span class="p">,</span> <span class="n">top_p_key</span><span class="o">=</span><span class="s2">&quot;talker_top_p&quot;</span><span class="p">,</span> <span class="n">max_tokens_key</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">,</span> <span class="n">temperature_key</span><span class="o">=</span><span class="s2">"talker_temperature"</span><span class="p">,</span> <span class="n">top_p_key</span><span class="o">=</span><span class="s2">"talker_top_p"</span><span class="p">,</span> <span class="n">max_tokens_key</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">input</span><span class="p">,</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="s2">&quot;audio&quot;</span><span class="p">],</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
 </div>
@@ -1138,8 +1142,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="OrpheusAdapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OrpheusAdapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">OrpheusAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Orpheus: text-to-speech (audio out only). Honors temperature/top_p/seed</span>
-<span class="sd">    (its ``get_sampling_config`` reads model_kwargs).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Orpheus: text-to-speech (audio out only). Honors temperature/top_p/seed</span>
+<span class="sd">    (its ``get_sampling_config`` reads model_kwargs)."""</span>
 
     <span class="n">supports_speech</span> <span class="o">=</span> <span class="kc">True</span>
 
@@ -1147,13 +1151,13 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OrpheusAdapter.speech_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">speech_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">SpeechRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;voice&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="n">mk</span><span class="p">[</span><span class="s2">&quot;voice&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">voice</span>
-        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">,</span> <span class="n">temperature_key</span><span class="o">=</span><span class="s2">&quot;temperature&quot;</span><span class="p">,</span> <span class="n">top_p_key</span><span class="o">=</span><span class="s2">&quot;top_p&quot;</span><span class="p">,</span> <span class="n">max_tokens_key</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"voice"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="p">[</span><span class="s2">"voice"</span><span class="p">]</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">voice</span>
+        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">,</span> <span class="n">temperature_key</span><span class="o">=</span><span class="s2">"temperature"</span><span class="p">,</span> <span class="n">top_p_key</span><span class="o">=</span><span class="s2">"top_p"</span><span class="p">,</span> <span class="n">max_tokens_key</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">input</span><span class="p">,</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;audio&quot;</span><span class="p">],</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
 </div>
@@ -1163,12 +1167,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Cosmos3Adapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3Adapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;NVIDIA Cosmos3: text-to-image and text/image-to-video generation.</span>
+<span class="w">    </span><span class="sd">"""NVIDIA Cosmos3: text-to-image and text/image-to-video generation.</span>
 
-<span class="sd">    ``size`` (&quot;WxH&quot;) maps to the generation resolution; ``seed`` and any</span>
+<span class="sd">    ``size`` ("WxH") maps to the generation resolution; ``seed`` and any</span>
 <span class="sd">    extra knobs (``guidance_scale``, ``num_inference_steps``, ``negative_prompt``,</span>
 <span class="sd">    and for video ``num_frames`` / ``fps``) pass through via ``extra_body``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">supports_images</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">supports_videos</span> <span class="o">=</span> <span class="kc">True</span>
@@ -1177,14 +1181,14 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter.image_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">image_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"size"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">],</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
 
@@ -1193,47 +1197,47 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">video_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"size"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
         <span class="c1"># num_frames / fps are first-class video fields (not in extra_body).</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">num_frames</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">fps</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"num_frames"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"num_frames"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">num_frames</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"fps"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">fps</span><span class="p">)</span>
         <span class="c1"># Image-to-video: the conditioning frame (URL / data URI) is persisted and</span>
         <span class="c1"># loaded by the worker, which VAE-encodes it into the clean frame-0 anchor.</span>
         <span class="c1"># Video-to-video: the conditioning video is persisted the same way; the</span>
         <span class="c1"># worker VAE-encodes its prefix and pins the requested clean latent</span>
         <span class="c1"># frames (condition_frame_indexes_vision / condition_video_keep via</span>
         <span class="c1"># extra_body).</span>
-        <span class="n">image</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-        <span class="n">video</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;video&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"image"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">video</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"video"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">image</span> <span class="ow">and</span> <span class="n">video</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Provide either &#39;image&#39; or &#39;video&#39; conditioning, not both.&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Provide either 'image' or 'video' conditioning, not both."</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">image</span><span class="p">:</span>
             <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
                 <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
-                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
-                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">],</span>
-                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">],</span>
                 <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">if</span> <span class="n">video</span><span class="p">:</span>
             <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">video</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
                 <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
-                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;video&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
-                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">],</span>
-                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"video"</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">],</span>
                 <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
 </div>
@@ -1243,14 +1247,14 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Wan22Adapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Wan22Adapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Wan22Adapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wan2.2-TI2V-5B: text/image-to-video generation (video only).</span>
+<span class="w">    </span><span class="sd">"""Wan2.2-TI2V-5B: text/image-to-video generation (video only).</span>
 
-<span class="sd">    ``size`` (&quot;WxH&quot;) maps to the model&#39;s ``width`` / ``height`` kwargs; ``seed``</span>
+<span class="sd">    ``size`` ("WxH") maps to the model's ``width`` / ``height`` kwargs; ``seed``</span>
 <span class="sd">    and any extra knobs (``guidance_scale``, ``num_inference_steps``,</span>
 <span class="sd">    ``negative_prompt``) pass through via ``extra_body``. ``fps`` is a playback</span>
 <span class="sd">    rate (the mp4 container rate), not a generation knob — see</span>
 <span class="sd">    ``Wan22Model.postprocess``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">supports_videos</span> <span class="o">=</span> <span class="kc">True</span>
 
@@ -1258,41 +1262,41 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Wan22Adapter.video_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">video_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="c1"># Unlike cosmos3, the model has no &quot;size&quot; kwarg — its generation</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="c1"># Unlike cosmos3, the model has no "size" kwarg — its generation</span>
             <span class="c1"># knobs are width/height, so the adapter does the split here.</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="n">width</span><span class="p">,</span> <span class="n">height</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;x&quot;</span><span class="p">))</span>
+                <span class="n">width</span><span class="p">,</span> <span class="n">height</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"x"</span><span class="p">))</span>
             <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;size must be &#39;WxH&#39; (e.g. &#39;832x480&#39;); got </span><span class="si">{</span><span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;width&quot;</span><span class="p">,</span> <span class="n">width</span><span class="p">)</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;height&quot;</span><span class="p">,</span> <span class="n">height</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;seed&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"size must be 'WxH' (e.g. '832x480'); got </span><span class="si">{</span><span class="n">req</span><span class="o">.</span><span class="n">size</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"width"</span><span class="p">,</span> <span class="n">width</span><span class="p">)</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"height"</span><span class="p">,</span> <span class="n">height</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
         <span class="c1"># num_frames / fps are first-class video fields (not in extra_body).</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;num_frames&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">num_frames</span><span class="p">)</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">&quot;fps&quot;</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">fps</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"num_frames"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"num_frames"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">num_frames</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"fps"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">fps</span><span class="p">)</span>
         <span class="c1"># Image-to-video: the conditioning frame (URL / data URI) is persisted</span>
         <span class="c1"># and loaded by the worker, which VAE-encodes it into the frame-0</span>
         <span class="c1"># anchor. Wan2.2 has no video-conditioned mode.</span>
-        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;video&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Wan2.2 does not support &#39;video&#39; conditioning; provide &#39;image&#39; or neither.&quot;</span><span class="p">)</span>
-        <span class="n">image</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"video"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Wan2.2 does not support 'video' conditioning; provide 'image' or neither."</span><span class="p">)</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"image"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">image</span><span class="p">:</span>
             <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
                 <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
-                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
-                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;text&quot;</span><span class="p">],</span>
-                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">],</span>
                 <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
             <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
-            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">],</span>
-            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
 </div>
@@ -1302,13 +1306,13 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># Only models with an OpenAI-standard surface are registered. Action/world-model</span>
 <span class="c1"># models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.</span>
 <span class="n">ADAPTER_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">OpenAIAdapter</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">&quot;bagel&quot;</span><span class="p">:</span> <span class="n">BagelAdapter</span><span class="p">(),</span>
-    <span class="s2">&quot;qwen3_omni&quot;</span><span class="p">:</span> <span class="n">Qwen3OmniAdapter</span><span class="p">(),</span>
-    <span class="s2">&quot;orpheus&quot;</span><span class="p">:</span> <span class="n">OrpheusAdapter</span><span class="p">(),</span>
-    <span class="s2">&quot;cosmos3&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
-    <span class="s2">&quot;cosmos3_droid&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
-    <span class="s2">&quot;cosmos3_super&quot;</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
-    <span class="s2">&quot;wan22&quot;</span><span class="p">:</span> <span class="n">Wan22Adapter</span><span class="p">(),</span>
+    <span class="s2">"bagel"</span><span class="p">:</span> <span class="n">BagelAdapter</span><span class="p">(),</span>
+    <span class="s2">"qwen3_omni"</span><span class="p">:</span> <span class="n">Qwen3OmniAdapter</span><span class="p">(),</span>
+    <span class="s2">"orpheus"</span><span class="p">:</span> <span class="n">OrpheusAdapter</span><span class="p">(),</span>
+    <span class="s2">"cosmos3"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">"cosmos3_droid"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">"cosmos3_super"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">"wan22"</span><span class="p">:</span> <span class="n">Wan22Adapter</span><span class="p">(),</span>
 <span class="p">}</span>
 
 
@@ -1364,7 +1368,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

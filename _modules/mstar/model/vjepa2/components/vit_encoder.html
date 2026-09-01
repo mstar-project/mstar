@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.vjepa2.components.vit_encoder</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;V-JEPA 2 video encoder (ViT with 3D tubelet patches + 3D RoPE).</span>
+<span></span><span class="sd">"""V-JEPA 2 video encoder (ViT with 3D tubelet patches + 3D RoPE).</span>
 
 <span class="sd">Ports ``VJEPA2PatchEmbeddings3D``, ``VJEPA2Embeddings``, ``VJEPA2Encoder``</span>
 <span class="sd">from HuggingFace ``transformers/models/vjepa2/modeling_vjepa2.py``.</span>
@@ -816,7 +818,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    encoder.embeddings.patch_embeddings.proj.{weight,bias}</span>
 <span class="sd">    encoder.layer.{N}.*</span>
 <span class="sd">    encoder.layernorm.{weight,bias}</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -830,7 +832,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="apply_masks">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.vit_encoder.html#mstar.model.vjepa2.components.vit_encoder.apply_masks">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">apply_masks</span><span class="p">(</span><span class="n">tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">masks</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Gather per-row patch indices from ``tensor``.</span>
+<span class="w">    </span><span class="sd">"""Gather per-row patch indices from ``tensor``.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        tensor: ``[B, N, D]``.</span>
@@ -838,7 +840,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Returns:</span>
 <span class="sd">        ``[len(masks) * B, M, D]``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">all_masked</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">mask</span> <span class="ow">in</span> <span class="n">masks</span><span class="p">:</span>
         <span class="n">mask</span> <span class="o">=</span> <span class="n">mask</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tensor</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
@@ -971,7 +973,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

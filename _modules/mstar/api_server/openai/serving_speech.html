@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,12 +805,12 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.serving_speech</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;/v1/audio/speech handler (text-to-speech).</span>
+<span></span><span class="sd">"""/v1/audio/speech handler (text-to-speech).</span>
 
 <span class="sd">Non-streaming returns the full audio as a container blob (WAV by default).</span>
 <span class="sd">Streaming returns a single open-ended WAV response (header + PCM16 frames) as</span>
 <span class="sd">the audio is produced.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -822,9 +824,9 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.create_speech">[docs]</a>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">raw_request</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
     <span class="n">args</span> <span class="o">=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">speech_to_request</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
-    <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">&quot;speech&quot;</span><span class="p">)</span>
-    <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">get_output_sample_rate</span><span class="p">(</span><span class="s2">&quot;audio&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">24000</span>
-    <span class="n">fmt</span> <span class="o">=</span> <span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">response_format</span> <span class="ow">or</span> <span class="s2">&quot;wav&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+    <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"speech"</span><span class="p">)</span>
+    <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">get_output_sample_rate</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)</span> <span class="k">if</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">24000</span>
+    <span class="n">fmt</span> <span class="o">=</span> <span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">response_format</span> <span class="ow">or</span> <span class="s2">"wav"</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
 
     <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
         <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
@@ -839,12 +841,12 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
             <span class="n">_stream_wav</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">),</span>
-            <span class="n">media_type</span><span class="o">=</span><span class="s2">&quot;audio/wav&quot;</span><span class="p">,</span>
-            <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;Cache-Control&quot;</span><span class="p">:</span> <span class="s2">&quot;no-cache&quot;</span><span class="p">},</span>
+            <span class="n">media_type</span><span class="o">=</span><span class="s2">"audio/wav"</span><span class="p">,</span>
+            <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
         <span class="p">)</span>
 
     <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-    <span class="n">pcm</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">&quot;audio&quot;</span><span class="p">)</span>
+    <span class="n">pcm</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span><span class="p">)</span>
     <span class="n">audio_bytes</span><span class="p">,</span> <span class="n">mime</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">pcm16_to_container</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">fmt</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">Response</span><span class="p">(</span><span class="n">content</span><span class="o">=</span><span class="n">audio_bytes</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="n">mime</span><span class="p">)</span></div>
 
@@ -853,7 +855,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_wav</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">):</span>
     <span class="k">yield</span> <span class="n">media_io</span><span class="o">.</span><span class="n">wav_stream_header</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">)</span>
     <span class="k">async</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">&quot;audio&quot;</span> <span class="ow">and</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span> <span class="ow">and</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
             <span class="k">yield</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span>
 </pre></div>
 
@@ -902,7 +904,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

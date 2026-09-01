@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,12 +805,12 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.router</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;FastAPI routes for the OpenAI-compatible API.</span>
+<span></span><span class="sd">"""FastAPI routes for the OpenAI-compatible API.</span>
 
-<span class="sd">Endpoints stay model-agnostic: each looks up the loaded model&#39;s adapter, checks</span>
+<span class="sd">Endpoints stay model-agnostic: each looks up the loaded model's adapter, checks</span>
 <span class="sd">the surface is supported, and delegates to a serving handler. The native</span>
 <span class="sd">``/generate`` endpoint is unaffected.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -845,63 +847,63 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># via sys.modules (importing would re-execute the entrypoint module).</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
 
-    <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;mstar.api_server.entrypoint&quot;</span><span class="p">,</span> <span class="s2">&quot;__main__&quot;</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"mstar.api_server.entrypoint"</span><span class="p">,</span> <span class="s2">"__main__"</span><span class="p">):</span>
         <span class="n">mod</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">modules</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
-        <span class="n">api</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="s2">&quot;api_server&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="n">mod</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">api</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="s2">"api_server"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="n">mod</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">api</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">api</span>
     <span class="k">return</span> <span class="kc">None</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_error</span><span class="p">(</span><span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">type_</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;invalid_request_error&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">JSONResponse</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_error</span><span class="p">(</span><span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">type_</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"invalid_request_error"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">JSONResponse</span><span class="p">:</span>
     <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span>
         <span class="n">status_code</span><span class="o">=</span><span class="n">status</span><span class="p">,</span>
-        <span class="n">content</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;error&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;message&quot;</span><span class="p">:</span> <span class="n">message</span><span class="p">,</span> <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="n">type_</span><span class="p">,</span> <span class="s2">&quot;code&quot;</span><span class="p">:</span> <span class="n">status</span><span class="p">}},</span>
+        <span class="n">content</span><span class="o">=</span><span class="p">{</span><span class="s2">"error"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"message"</span><span class="p">:</span> <span class="n">message</span><span class="p">,</span> <span class="s2">"type"</span><span class="p">:</span> <span class="n">type_</span><span class="p">,</span> <span class="s2">"code"</span><span class="p">:</span> <span class="n">status</span><span class="p">}},</span>
     <span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_resolve</span><span class="p">(</span><span class="n">require</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return (api, model_name, adapter, error_response). ``error`` is non-None</span>
-<span class="sd">    when the loaded model can&#39;t serve ``require`` (e.g. &#39;supports_chat&#39;).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Return (api, model_name, adapter, error_response). ``error`` is non-None</span>
+<span class="sd">    when the loaded model can't serve ``require`` (e.g. 'supports_chat')."""</span>
     <span class="n">api</span> <span class="o">=</span> <span class="n">_api</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">api</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">_error</span><span class="p">(</span><span class="mi">503</span><span class="p">,</span> <span class="s2">&quot;Server not ready&quot;</span><span class="p">,</span> <span class="s2">&quot;server_error&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">_error</span><span class="p">(</span><span class="mi">503</span><span class="p">,</span> <span class="s2">"Server not ready"</span><span class="p">,</span> <span class="s2">"server_error"</span><span class="p">)</span>
     <span class="n">adapter</span> <span class="o">=</span> <span class="n">get_adapter</span><span class="p">(</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">adapter</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">api</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">_error</span><span class="p">(</span>
-            <span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Model </span><span class="si">{</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> has no OpenAI-compatible adapter; use POST /generate&quot;</span><span class="p">,</span> <span class="s2">&quot;model_not_found&quot;</span>
+            <span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Model </span><span class="si">{</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> has no OpenAI-compatible adapter; use POST /generate"</span><span class="p">,</span> <span class="s2">"model_not_found"</span>
         <span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="n">require</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">api</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">_error</span><span class="p">(</span>
-            <span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Model </span><span class="si">{</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> does not support this endpoint&quot;</span>
+            <span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Model </span><span class="si">{</span><span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> does not support this endpoint"</span>
         <span class="p">)</span>
     <span class="k">return</span> <span class="n">api</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="kc">None</span>
 
 
 <div class="viewcode-block" id="list_models">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.list_models">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;/v1/models&quot;</span><span class="p">)</span>
+<span class="nd">@router</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"/v1/models"</span><span class="p">)</span>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">list_models</span><span class="p">():</span>
     <span class="n">api</span> <span class="o">=</span> <span class="n">_api</span><span class="p">()</span>
-    <span class="n">name</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span> <span class="k">if</span> <span class="n">api</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="s2">&quot;unknown&quot;</span>
+    <span class="n">name</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model_name</span> <span class="k">if</span> <span class="n">api</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="s2">"unknown"</span>
     <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">ModelList</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="p">[</span><span class="n">ModelCard</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">name</span><span class="p">,</span> <span class="n">created</span><span class="o">=</span><span class="n">now</span><span class="p">())])</span><span class="o">.</span><span class="n">model_dump</span><span class="p">())</span></div>
 
 
 
 <div class="viewcode-block" id="chat_completions">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.chat_completions">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">&quot;/v1/chat/completions&quot;</span><span class="p">)</span>
+<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/chat/completions"</span><span class="p">)</span>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">chat_completions</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">ChatCompletionRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">&quot;supports_chat&quot;</span><span class="p">)</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_chat"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">err</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_chat</span><span class="o">.</span><span class="n">create_chat_completion</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — surface as an OpenAI error envelope</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;status_code&quot;</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;detail&quot;</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">&quot;server_error&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">request</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
-            <span class="n">result</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="s2">&quot;text/event-stream&quot;</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;Cache-Control&quot;</span><span class="p">:</span> <span class="s2">&quot;no-cache&quot;</span><span class="p">}</span>
+            <span class="n">result</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="s2">"text/event-stream"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">}</span>
         <span class="p">)</span>
     <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
 
@@ -909,69 +911,69 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="audio_speech">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.audio_speech">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">&quot;/v1/audio/speech&quot;</span><span class="p">)</span>
+<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/audio/speech"</span><span class="p">)</span>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">audio_speech</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">SpeechRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">&quot;supports_speech&quot;</span><span class="p">)</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_speech"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">err</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="k">return</span> <span class="k">await</span> <span class="n">serving_speech</span><span class="o">.</span><span class="n">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;status_code&quot;</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;detail&quot;</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">&quot;server_error&quot;</span><span class="p">)</span></div>
+        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span></div>
 
 
 
 <div class="viewcode-block" id="images_generations">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.images_generations">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">&quot;/v1/images/generations&quot;</span><span class="p">)</span>
+<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/images/generations"</span><span class="p">)</span>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">images_generations</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">&quot;supports_images&quot;</span><span class="p">)</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_images"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">err</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_images</span><span class="o">.</span><span class="n">create_images</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;status_code&quot;</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;detail&quot;</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">&quot;server_error&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
 
 
 
 <div class="viewcode-block" id="videos_generations">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.videos_generations">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">&quot;/v1/videos/generations&quot;</span><span class="p">)</span>
+<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/videos/generations"</span><span class="p">)</span>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">videos_generations</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">):</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">&quot;supports_videos&quot;</span><span class="p">)</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_videos"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">err</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_videos</span><span class="o">.</span><span class="n">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
         <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;status_code&quot;</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;detail&quot;</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">&quot;server_error&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
 
 
 
 <div class="viewcode-block" id="images_edits">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.images_edits">[docs]</a>
-<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">&quot;/v1/images/edits&quot;</span><span class="p">)</span>
+<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/images/edits"</span><span class="p">)</span>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">images_edits</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
     <span class="c1"># Multipart (image file + prompt + passthrough fields), parsed manually so</span>
     <span class="c1"># arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.</span>
-    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">&quot;supports_images&quot;</span><span class="p">)</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_images"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">err</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">form</span> <span class="o">=</span> <span class="k">await</span> <span class="n">request</span><span class="o">.</span><span class="n">form</span><span class="p">()</span>
-        <span class="n">image</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;image&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">image</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="s2">&quot;read&quot;</span><span class="p">):</span>
-            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="s2">&quot;images/edits requires an &#39;image&#39; file upload&quot;</span><span class="p">)</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"image"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">image</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="s2">"read"</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="s2">"images/edits requires an 'image' file upload"</span><span class="p">)</span>
         <span class="n">image_bytes</span> <span class="o">=</span> <span class="k">await</span> <span class="n">image</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
-        <span class="n">prompt</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span>
-        <span class="n">known</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;prompt&quot;</span><span class="p">,</span> <span class="s2">&quot;model&quot;</span><span class="p">,</span> <span class="s2">&quot;n&quot;</span><span class="p">,</span> <span class="s2">&quot;size&quot;</span><span class="p">,</span> <span class="s2">&quot;response_format&quot;</span><span class="p">}</span>
+        <span class="n">prompt</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"prompt"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">""</span>
+        <span class="n">known</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"prompt"</span><span class="p">,</span> <span class="s2">"model"</span><span class="p">,</span> <span class="s2">"n"</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="s2">"response_format"</span><span class="p">}</span>
         <span class="n">extra</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">form</span><span class="o">.</span><span class="n">multi_items</span><span class="p">():</span>
-            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">known</span> <span class="ow">or</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="s2">&quot;filename&quot;</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">known</span> <span class="ow">or</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">):</span>
                 <span class="k">continue</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">extra</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
@@ -983,12 +985,12 @@ window.runMermaid = runMermaid;</script>
             <span class="n">adapter</span><span class="p">,</span>
             <span class="n">prompt</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
             <span class="n">image_bytes</span><span class="o">=</span><span class="n">image_bytes</span><span class="p">,</span>
-            <span class="n">image_filename</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="s2">&quot;filename&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+            <span class="n">image_filename</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">extra</span><span class="p">,</span>
             <span class="n">raw_request</span><span class="o">=</span><span class="n">request</span><span class="p">,</span>
         <span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
-        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;status_code&quot;</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">&quot;detail&quot;</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">&quot;server_error&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
 
 </pre></div>
@@ -1038,7 +1040,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

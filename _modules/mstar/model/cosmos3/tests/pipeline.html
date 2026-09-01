@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,17 +805,17 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.cosmos3.tests.pipeline</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Fused generation pipeline for Cosmos3-Nano (text/image-to-image/video).</span>
+<span></span><span class="sd">"""Fused generation pipeline for Cosmos3-Nano (text/image-to-image/video).</span>
 
 <span class="sd">Runs the generator in one fused forward per denoising step (text + vision</span>
-<span class="sd">together), using mstar&#39;s DiT forward + packing and the imported diffusers UniPC</span>
+<span class="sd">together), using mstar's DiT forward + packing and the imported diffusers UniPC</span>
 <span class="sd">scheduler + Wan VAE. Intentionally simple (batch 1, sequential CFG); not the</span>
 <span class="sd">served path. Produces the same image/video as the diffusers</span>
 <span class="sd">``Cosmos3OmniPipeline`` on a fixed seed/prompt.</span>
 
 <span class="sd">``num_frames == 1`` is text-to-image; ``num_frames &gt; 1`` is text-to-video, and</span>
 <span class="sd">passing ``image`` anchors frame 0 to a conditioning frame (image-to-video).</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -829,38 +831,38 @@ window.runMermaid = runMermaid;</script>
 
 <span class="c1"># Transformer.forward static kwargs produced by build_static_inputs.</span>
 <span class="n">_TF_STATIC_FIELDS</span> <span class="o">=</span> <span class="p">(</span>
-    <span class="s2">&quot;input_ids&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;text_indexes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;position_ids&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;und_len&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;sequence_length&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;vision_token_shapes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;vision_sequence_indexes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;vision_mse_loss_indexes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;vision_noisy_frame_indexes&quot;</span><span class="p">,</span>
+    <span class="s2">"input_ids"</span><span class="p">,</span>
+    <span class="s2">"text_indexes"</span><span class="p">,</span>
+    <span class="s2">"position_ids"</span><span class="p">,</span>
+    <span class="s2">"und_len"</span><span class="p">,</span>
+    <span class="s2">"sequence_length"</span><span class="p">,</span>
+    <span class="s2">"vision_token_shapes"</span><span class="p">,</span>
+    <span class="s2">"vision_sequence_indexes"</span><span class="p">,</span>
+    <span class="s2">"vision_mse_loss_indexes"</span><span class="p">,</span>
+    <span class="s2">"vision_noisy_frame_indexes"</span><span class="p">,</span>
 <span class="p">)</span>
 
 <span class="c1"># Additional Transformer.forward static kwargs for joint video+action generation.</span>
 <span class="n">_TF_ACTION_STATIC_FIELDS</span> <span class="o">=</span> <span class="p">(</span>
-    <span class="s2">&quot;action_token_shapes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;action_sequence_indexes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;action_mse_loss_indexes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;action_noisy_frame_indexes&quot;</span><span class="p">,</span>
+    <span class="s2">"action_token_shapes"</span><span class="p">,</span>
+    <span class="s2">"action_sequence_indexes"</span><span class="p">,</span>
+    <span class="s2">"action_mse_loss_indexes"</span><span class="p">,</span>
+    <span class="s2">"action_noisy_frame_indexes"</span><span class="p">,</span>
 <span class="p">)</span>
 
 <span class="c1"># Additional Transformer.forward static kwargs for joint video+sound generation.</span>
 <span class="n">_TF_SOUND_STATIC_FIELDS</span> <span class="o">=</span> <span class="p">(</span>
-    <span class="s2">&quot;sound_token_shapes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;sound_sequence_indexes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;sound_mse_loss_indexes&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;sound_noisy_frame_indexes&quot;</span><span class="p">,</span>
+    <span class="s2">"sound_token_shapes"</span><span class="p">,</span>
+    <span class="s2">"sound_sequence_indexes"</span><span class="p">,</span>
+    <span class="s2">"sound_mse_loss_indexes"</span><span class="p">,</span>
+    <span class="s2">"sound_noisy_frame_indexes"</span><span class="p">,</span>
 <span class="p">)</span>
 
 
 <div class="viewcode-block" id="Cosmos3Pipeline">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.pipeline.html#mstar.model.cosmos3.tests.pipeline.Cosmos3Pipeline">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3Pipeline</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Fused t2i / t2v / i2v pipeline for Cosmos3-Nano.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Fused t2i / t2v / i2v pipeline for Cosmos3-Nano."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">transformer</span><span class="p">,</span> <span class="n">vae</span><span class="p">,</span> <span class="n">scheduler</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span> <span class="o">=</span> <span class="n">transformer</span>
@@ -880,27 +882,27 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># [-1,1], resized) — the same one the diffusers pipeline uses, for parity.</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">diffusers.video_processor</span><span class="w"> </span><span class="kn">import</span> <span class="n">VideoProcessor</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">video_processor</span> <span class="o">=</span> <span class="n">VideoProcessor</span><span class="p">(</span><span class="n">vae_scale_factor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_spatial</span><span class="p">,</span> <span class="n">resample</span><span class="o">=</span><span class="s2">&quot;bilinear&quot;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">video_processor</span> <span class="o">=</span> <span class="n">VideoProcessor</span><span class="p">(</span><span class="n">vae_scale_factor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_spatial</span><span class="p">,</span> <span class="n">resample</span><span class="o">=</span><span class="s2">"bilinear"</span><span class="p">)</span>
 
 <div class="viewcode-block" id="Cosmos3Pipeline.from_model">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.pipeline.html#mstar.model.cosmos3.tests.pipeline.Cosmos3Pipeline.from_model">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_model</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Build from a loaded ``Cosmos3Model`` (DiT + Wan VAE) + imported UniPC.&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""Build from a loaded ``Cosmos3Model`` (DiT + Wan VAE) + imported UniPC."""</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">diffusers</span><span class="w"> </span><span class="kn">import</span> <span class="n">UniPCMultistepScheduler</span>
 
-        <span class="n">transformer</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_submodule</span><span class="p">(</span><span class="s2">&quot;dit&quot;</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">transformer</span>
+        <span class="n">transformer</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_submodule</span><span class="p">(</span><span class="s2">"dit"</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">transformer</span>
         <span class="n">vae</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">_build_vae</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-        <span class="n">scheduler</span> <span class="o">=</span> <span class="n">UniPCMultistepScheduler</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">_ensure_repo</span><span class="p">()</span> <span class="o">/</span> <span class="s2">&quot;scheduler&quot;</span><span class="p">))</span>
+        <span class="n">scheduler</span> <span class="o">=</span> <span class="n">UniPCMultistepScheduler</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">_ensure_repo</span><span class="p">()</span> <span class="o">/</span> <span class="s2">"scheduler"</span><span class="p">))</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">transformer</span><span class="p">,</span> <span class="n">vae</span><span class="p">,</span> <span class="n">scheduler</span><span class="p">,</span> <span class="n">model</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="p">)</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_encode_video</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;[1,3,T,H,W] in [-1,1] -&gt; normalized latents [1,C,T_lat,H/16,W/16].</span>
+<span class="w">        </span><span class="sd">"""[1,3,T,H,W] in [-1,1] -&gt; normalized latents [1,C,T_lat,H/16,W/16].</span>
 
-<span class="sd">        Takes the distribution mode (``sample_mode=&quot;argmax&quot;``) and applies the</span>
+<span class="sd">        Takes the distribution mode (``sample_mode="argmax"``) and applies the</span>
 <span class="sd">        pipeline-side latent normalization, matching the diffusers oracle.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="n">in_dtype</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>
         <span class="n">dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="o">.</span><span class="n">dtype</span>
         <span class="n">mean</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_latents_mean</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
@@ -909,7 +911,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">((</span><span class="n">raw_mu</span> <span class="o">-</span> <span class="n">mean</span><span class="p">)</span> <span class="o">*</span> <span class="n">inv_std</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">in_dtype</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_decode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latents</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Latents [1,C,T,H,W] -&gt; pixels [1,3,T,H,W] in [0,1] (un-normalize + Wan VAE).&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""Latents [1,C,T,H,W] -&gt; pixels [1,3,T,H,W] in [0,1] (un-normalize + Wan VAE)."""</span>
         <span class="n">mean</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_latents_mean</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
         <span class="n">inv_std</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_latents_inv_std</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
         <span class="n">z</span> <span class="o">=</span> <span class="n">latents</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">vae</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="o">/</span> <span class="n">inv_std</span> <span class="o">+</span> <span class="n">mean</span>
@@ -917,12 +919,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="p">(</span><span class="n">decoded</span> <span class="o">/</span> <span class="mi">2</span> <span class="o">+</span> <span class="mf">0.5</span><span class="p">)</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_prepare_latents</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">image</span><span class="p">,</span> <span class="n">num_frames</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">generator</span><span class="p">,</span> <span class="n">latents</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Build the initial vision latents + whether frame 0 is a clean anchor.</span>
+<span class="w">        </span><span class="sd">"""Build the initial vision latents + whether frame 0 is a clean anchor.</span>
 
 <span class="sd">        For image-to-video the conditioning frame anchors latent frame 0 (clean,</span>
 <span class="sd">        VAE-encoded) and the remaining frames start from pure noise; otherwise the</span>
 <span class="sd">        whole tensor is noise. Mirrors the diffusers ``prepare_latents`` vision path.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">diffusers.utils.torch_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">randn_tensor</span>
 
         <span class="n">is_image</span> <span class="o">=</span> <span class="n">num_frames</span> <span class="o">==</span> <span class="mi">1</span>
@@ -970,7 +972,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-        <span class="n">negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+        <span class="n">negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
         <span class="n">image</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">num_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
         <span class="n">height</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
@@ -986,15 +988,15 @@ window.runMermaid = runMermaid;</script>
         <span class="n">condition_video</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">condition_frame_indexes</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;With ``generate_sound`` a jointly denoised AVAE-latent sound band</span>
+<span class="w">        </span><span class="sd">"""With ``generate_sound`` a jointly denoised AVAE-latent sound band</span>
 <span class="sd">        rides after the vision tokens (video-mode only); returns</span>
 <span class="sd">        ``(video_or_latents, sound_latents)`` with the final sound latents</span>
-<span class="sd">        ``[1, C, T]`` (decode them with the checkpoint&#39;s sound tokenizer).</span>
+<span class="sd">        ``[1, C, T]`` (decode them with the checkpoint's sound tokenizer).</span>
 
 <span class="sd">        ``condition_video`` (``[T, C, H, W]`` in [0, 1]) enables video-to-video:</span>
 <span class="sd">        the latent frames in ``condition_frame_indexes`` are pinned clean from</span>
-<span class="sd">        the video&#39;s VAE-encoded causal prefix and re-injected after every</span>
-<span class="sd">        scheduler step; the complement is denoised.&quot;&quot;&quot;</span>
+<span class="sd">        the video's VAE-encoded causal prefix and re-injected after every</span>
+<span class="sd">        scheduler step; the complement is denoised."""</span>
         <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span>
         <span class="n">cond_ids</span><span class="p">,</span> <span class="n">uncond_ids</span> <span class="o">=</span> <span class="n">tokenize_prompt</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">negative_prompt</span><span class="p">,</span> <span class="n">num_frames</span><span class="o">=</span><span class="n">num_frames</span><span class="p">,</span> <span class="n">height</span><span class="o">=</span><span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="o">=</span><span class="n">width</span><span class="p">,</span> <span class="n">fps</span><span class="o">=</span><span class="n">fps</span>
@@ -1012,7 +1014,7 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># Video-to-video: only the causal prefix feeding the pinned latent</span>
             <span class="c1"># frames is encoded (max(indexes)*tcf + 1 pixel frames, padded by</span>
             <span class="c1"># repeating the last frame); the complement keeps the noise drawn</span>
-            <span class="c1"># above (the serving path&#39;s RNG order).</span>
+            <span class="c1"># above (the serving path's RNG order).</span>
             <span class="n">cpf</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">condition_frame_indexes</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_temporal</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> <span class="n">num_frames</span><span class="p">)</span>
             <span class="n">clip</span> <span class="o">=</span> <span class="n">condition_video</span><span class="p">[:</span><span class="n">cpf</span><span class="p">]</span>
             <span class="k">if</span> <span class="n">clip</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;</span> <span class="n">cpf</span><span class="p">:</span>
@@ -1033,7 +1035,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">noisy_frames</span> <span class="o">=</span> <span class="p">[</span><span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">latent_shape</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span> <span class="k">if</span> <span class="n">f</span> <span class="ow">not</span> <span class="ow">in</span> <span class="nb">set</span><span class="p">(</span><span class="n">condition_frame_indexes</span><span class="p">)]</span>
 
         <span class="c1"># Sound noise is drawn after the video noise from the same generator</span>
-        <span class="c1"># (the serving path&#39;s RNG order).</span>
+        <span class="c1"># (the serving path's RNG order).</span>
         <span class="n">sound_latents</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">sound_frames</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">generate_sound</span><span class="p">:</span>
@@ -1063,13 +1065,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">fields</span> <span class="o">=</span> <span class="n">_TF_STATIC_FIELDS</span> <span class="o">+</span> <span class="p">(</span><span class="n">_TF_SOUND_STATIC_FIELDS</span> <span class="k">if</span> <span class="n">generate_sound</span> <span class="k">else</span> <span class="p">())</span>
         <span class="n">cond_static</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">cond</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">}</span>
         <span class="n">uncond_static</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">uncond</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">}</span>
-        <span class="n">num_noisy</span> <span class="o">=</span> <span class="n">cond</span><span class="p">[</span><span class="s2">&quot;num_noisy_vision_tokens&quot;</span><span class="p">]</span>
+        <span class="n">num_noisy</span> <span class="o">=</span> <span class="n">cond</span><span class="p">[</span><span class="s2">"num_noisy_vision_tokens"</span><span class="p">]</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">_forward</span><span class="p">(</span><span class="n">static</span><span class="p">,</span> <span class="n">vision_tokens</span><span class="p">,</span> <span class="n">vision_timesteps</span><span class="p">,</span> <span class="n">t</span><span class="p">):</span>
             <span class="n">kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">vision_tokens</span><span class="o">=</span><span class="n">vision_tokens</span><span class="p">,</span> <span class="n">vision_timesteps</span><span class="o">=</span><span class="n">vision_timesteps</span><span class="p">,</span> <span class="o">**</span><span class="n">static</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">generate_sound</span><span class="p">:</span>
-                <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;sound_tokens&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">sound_latents</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)]</span>
-                <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;sound_timesteps&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">sound_frames</span><span class="p">,),</span> <span class="n">t</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+                <span class="n">kwargs</span><span class="p">[</span><span class="s2">"sound_tokens"</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">sound_latents</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)]</span>
+                <span class="n">kwargs</span><span class="p">[</span><span class="s2">"sound_timesteps"</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">sound_frames</span><span class="p">,),</span> <span class="n">t</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
             <span class="n">preds_vision</span><span class="p">,</span> <span class="n">preds_sound</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
             <span class="k">return</span> <span class="n">preds_vision</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="p">(</span><span class="n">preds_sound</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">generate_sound</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
 
@@ -1129,20 +1131,20 @@ window.runMermaid = runMermaid;</script>
         <span class="n">num_inference_steps</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">30</span><span class="p">,</span>
         <span class="n">guidance_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
         <span class="n">flow_shift</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="p">,</span>
+        <span class="n">negative_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
         <span class="n">generator</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cond_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">uncond_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">return_video</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Joint video+action generation (forward_dynamics / inverse_dynamics / policy).</span>
+<span class="w">        </span><span class="sd">"""Joint video+action generation (forward_dynamics / inverse_dynamics / policy).</span>
 
 <span class="sd">        The conditioning video is VAE-encoded to clean anchor frames per ``mode``</span>
 <span class="sd">        (all frames for inverse-dynamics; frame 0 for forward-dynamics / policy).</span>
 <span class="sd">        Action tokens are clean conditioning for forward-dynamics, else noisy and</span>
 <span class="sd">        predicted. Returns the predicted action ``[1, action_chunk_size,</span>
 <span class="sd">        raw_action_dim]`` (and the decoded video when ``return_video``).</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">diffusers</span><span class="w"> </span><span class="kn">import</span> <span class="n">UniPCMultistepScheduler</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">diffusers.utils.torch_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">randn_tensor</span>
 
@@ -1168,9 +1170,9 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># --- action latents (noise drawn before the video noise, matching the</span>
         <span class="c1"># reference ordering so a shared seed reproduces the same sample). ---</span>
-        <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">&quot;forward_dynamics&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s2">"forward_dynamics"</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">action</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Cosmos3 forward_dynamics requires `action`.&quot;</span><span class="p">)</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Cosmos3 forward_dynamics requires `action`."</span><span class="p">)</span>
             <span class="n">act</span> <span class="o">=</span> <span class="n">action</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">act</span><span class="o">.</span><span class="n">ndim</span> <span class="o">==</span> <span class="mi">3</span><span class="p">:</span>
                 <span class="n">act</span> <span class="o">=</span> <span class="n">act</span><span class="o">.</span><span class="n">squeeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
@@ -1194,7 +1196,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># --- conditioning video latents (clean per mode) ---</span>
         <span class="k">if</span> <span class="n">video_latents</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">video</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Cosmos3 action generation requires `video` or `video_latents`.&quot;</span><span class="p">)</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Cosmos3 action generation requires `video` or `video_latents`."</span><span class="p">)</span>
             <span class="n">video_latents</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_video</span><span class="p">(</span><span class="n">video</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">))</span>
         <span class="n">cond_latent</span> <span class="o">=</span> <span class="n">video_latents</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
         <span class="n">latent_shape</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">cond_latent</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
@@ -1223,8 +1225,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">vae_scale_temporal</span><span class="p">,</span> <span class="n">fps</span><span class="p">,</span> <span class="n">action_fps</span><span class="p">,</span> <span class="n">action_offset</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="n">uncond_static</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">uncond</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">}</span>
-        <span class="n">num_noisy_v</span> <span class="o">=</span> <span class="n">cond</span><span class="p">[</span><span class="s2">&quot;num_noisy_vision_tokens&quot;</span><span class="p">]</span>
-        <span class="n">num_noisy_a</span> <span class="o">=</span> <span class="n">cond</span><span class="p">[</span><span class="s2">&quot;num_noisy_action_tokens&quot;</span><span class="p">]</span>
+        <span class="n">num_noisy_v</span> <span class="o">=</span> <span class="n">cond</span><span class="p">[</span><span class="s2">"num_noisy_vision_tokens"</span><span class="p">]</span>
+        <span class="n">num_noisy_a</span> <span class="o">=</span> <span class="n">cond</span><span class="p">[</span><span class="s2">"num_noisy_action_tokens"</span><span class="p">]</span>
         <span class="n">domain_t</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">domain_id</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
 
         <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">scheduler</span><span class="o">.</span><span class="n">timesteps</span><span class="p">:</span>
@@ -1310,7 +1312,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.pi05.kernels.image_normalize</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;GPU-side image range normalization without CPU–GPU sync.</span>
+<span></span><span class="sd">"""GPU-side image range normalization without CPU–GPU sync.</span>
 
 <span class="sd">Replaces the two blocking transfers in _prepare_one():</span>
 
@@ -820,12 +822,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">       applies x*2-1 if the range says [0,1], identity otherwise.</span>
 
 <span class="sd">The Triton kernel avoids materialising a CPU-visible boolean by</span>
-<span class="sd">keeping the &quot;needs_rescale&quot; predicate entirely in registers and</span>
+<span class="sd">keeping the "needs_rescale" predicate entirely in registers and</span>
 <span class="sd">using tl.where to select between the two outcomes per element.</span>
 
 <span class="sd">Falls back to the original sync-based path on CPU tensors or when</span>
 <span class="sd">Triton is not installed.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -849,12 +851,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">n_elements</span><span class="p">,</span>
         <span class="n">BLOCK_SIZE</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">,</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Rescale float32 elements from [0,1] to [-1,1] if the global</span>
+<span class="w">        </span><span class="sd">"""Rescale float32 elements from [0,1] to [-1,1] if the global</span>
 <span class="sd">        min/max (read from GPU memory) indicates the image is in that range.</span>
 
 <span class="sd">        Reads ``img_min`` and ``img_max`` from device pointers so the</span>
 <span class="sd">        decision is made entirely on the GPU — no host branch, no sync.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="n">g_min</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">img_min_ptr</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
         <span class="n">g_max</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">img_max_ptr</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
         <span class="c1"># True when pixel values are in the [0, 1] range (data_worker path).</span>
@@ -871,7 +873,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="normalize_float_images">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.pi05.kernels.image_normalize.html#mstar.model.pi05.kernels.image_normalize.normalize_float_images">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">normalize_float_images</span><span class="p">(</span><span class="n">images</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Detect and rescale float32 images from [0,1] to [-1,1], sync-free.</span>
+<span class="w">    </span><span class="sd">"""Detect and rescale float32 images from [0,1] to [-1,1], sync-free.</span>
 
 <span class="sd">    Intended to replace the inline range-check in _prepare_one() which</span>
 <span class="sd">    performs two CPU–GPU synchronisations via float(images.min()) and</span>
@@ -886,7 +888,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    Returns:</span>
 <span class="sd">        float32 tensor, same shape and device. Pixels in [0,1] are</span>
 <span class="sd">        remapped to [-1,1]; pixels already in [-1,1] are unchanged.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">if</span> <span class="n">images</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">images</span>
 
@@ -958,7 +960,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

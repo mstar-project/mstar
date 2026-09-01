@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -806,27 +808,27 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 
 <span class="c1"># Third-party libraries that log at INFO on essentially every operation and</span>
-<span class="c1"># drown out mstar&#39;s own INFO logs. huggingface_hub fetches weights/configs</span>
+<span class="c1"># drown out mstar's own INFO logs. huggingface_hub fetches weights/configs</span>
 <span class="c1"># through httpx (over httpcore/urllib3), which emits a line per HTTP request.</span>
 <span class="c1"># These are kept at WARNING so the global level can stay INFO without the noise.</span>
 <span class="n">_NOISY_LOGGERS</span> <span class="o">=</span> <span class="p">(</span>
-    <span class="s2">&quot;httpx&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;httpcore&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;urllib3&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;huggingface_hub&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;filelock&quot;</span><span class="p">,</span>
+    <span class="s2">"httpx"</span><span class="p">,</span>
+    <span class="s2">"httpcore"</span><span class="p">,</span>
+    <span class="s2">"urllib3"</span><span class="p">,</span>
+    <span class="s2">"huggingface_hub"</span><span class="p">,</span>
+    <span class="s2">"filelock"</span><span class="p">,</span>
 <span class="p">)</span>
 
 
 <div class="viewcode-block" id="quiet_noisy_loggers">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.logging_config.html#mstar.utils.logging_config.quiet_noisy_loggers">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">quiet_noisy_loggers</span><span class="p">(</span><span class="n">level</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">WARNING</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Raise chatty third-party loggers to ``level`` (default WARNING).</span>
+<span class="w">    </span><span class="sd">"""Raise chatty third-party loggers to ``level`` (default WARNING).</span>
 
 <span class="sd">    Per-logger levels are independent of the root level, so this suppresses the</span>
 <span class="sd">    per-request HTTP noise from weight downloads while mstar keeps a global INFO</span>
 <span class="sd">    level. Call once after ``logging.basicConfig`` in each process.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">_NOISY_LOGGERS</span><span class="p">:</span>
         <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="n">name</span><span class="p">)</span><span class="o">.</span><span class="n">setLevel</span><span class="p">(</span><span class="n">level</span><span class="p">)</span></div>
 
@@ -877,7 +879,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,15 +805,15 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.vjepa2.components.rope_utils</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;3D rotary position embedding helpers for V-JEPA 2.</span>
+<span></span><span class="sd">"""3D rotary position embedding helpers for V-JEPA 2.</span>
 
 <span class="sd">Ported verbatim from HuggingFace ``transformers/models/vjepa2/modeling_vjepa2.py``</span>
 <span class="sd">and upstream ``vjepa2/src/models/utils/modules.py``.  Both copies share the</span>
-<span class="sd">same frequency schedule and the same &quot;duplicate then rotate adjacent pair&quot;</span>
+<span class="sd">same frequency schedule and the same "duplicate then rotate adjacent pair"</span>
 <span class="sd">construction noted in the upstream comment as a pretraining-compatibility</span>
-<span class="sd">quirk.  Do not &quot;fix&quot; the `.repeat(..., 2)` to `.repeat_interleave(2)` — it</span>
+<span class="sd">quirk.  Do not "fix" the `.repeat(..., 2)` to `.repeat_interleave(2)` — it</span>
 <span class="sd">would break the pretrained weights.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -821,7 +823,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="rotate_queries_or_keys">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.rope_utils.html#mstar.model.vjepa2.components.rope_utils.rotate_queries_or_keys">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">rotate_queries_or_keys</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">pos</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Apply rotary embeddings along the last ``D`` dims of ``x``.</span>
+<span class="w">    </span><span class="sd">"""Apply rotary embeddings along the last ``D`` dims of ``x``.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        x: ``[B, num_heads, N, D]`` (or broadcastable) — queries or keys.</span>
@@ -829,7 +831,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Returns:</span>
 <span class="sd">        Rotated tensor, same shape as ``x``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">()</span>
 
     <span class="n">omega</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">D</span> <span class="o">//</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
@@ -918,7 +920,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

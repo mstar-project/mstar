@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -637,7 +637,7 @@ see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen
 </table>
 </div>
 <p>Combine extras as needed (keep <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> on every install):</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;.[bagel,audio,dev]&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[bagel,audio,dev]"</span>
 </pre></div>
 </div>
 <div class="admonition tip">
@@ -645,7 +645,7 @@ see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen
 <p>If you’re just getting started or have the disk/time to spare, <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> is the
 recommended install — it pulls every model family’s runtime so any model works out of
 the box, with no need to track which extra goes with which model:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;.[all,dev]&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[all,dev]"</span>
 </pre></div>
 </div>
 </div>
@@ -685,7 +685,7 @@ build from source (see <a class="reference internal" href="#no-matching-wheel-bu
 <code class="docutils literal notranslate"><span class="pre">&gt;=2.9.1</span></code>), so the wheel’s <code class="docutils literal notranslate"><span class="pre">torchX.Y</span></code> tag must match <strong>whatever torch you actually
 installed</strong>, and its <code class="docutils literal notranslate"><span class="pre">cu1x</span></code> must match that torch’s CUDA build — not your system toolkit.
 Check both first:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import torch; print(torch.__version__, torch.version.cuda)&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch; print(torch.__version__, torch.version.cuda)"</span>
 <span class="c1"># e.g. 2.12.1+cu130 13.0  -&gt;  torch2.12 / cu13</span>
 <span class="c1">#      2.9.1+cu128  12.8  -&gt;  torch2.9  / cu12</span>
 </pre></div>
@@ -699,16 +699,16 @@ own tag. Note the prebuilt wheels <strong>top out at</strong> <code class="docut
 build from source instead:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># torch built for CUDA 12.x (cu12)</span>
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="s2">&quot;https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl&quot;</span>
+<span class="w">  </span><span class="s2">"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"</span>
 
 <span class="c1"># torch built for CUDA 13.x (cu13)</span>
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="s2">&quot;https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl&quot;</span>
+<span class="w">  </span><span class="s2">"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"</span>
 </pre></div>
 </div>
 <p>Because it’s a binary wheel nothing compiles, so your <em>system</em> CUDA version is irrelevant —
 only the torch build matters. Verify with:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import flash_attn; print(flash_attn.__version__)&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import flash_attn; print(flash_attn.__version__)"</span>
 </pre></div>
 </div>
 <p>(An <code class="docutils literal notranslate"><span class="pre">undefined</span> <span class="pre">symbol</span></code> error on import means the wheel’s <code class="docutils literal notranslate"><span class="pre">cu1x</span></code> / <code class="docutils literal notranslate"><span class="pre">torchX.Y</span></code> tag doesn’t
@@ -737,8 +737,8 @@ isolated env that pulls a fresh (possibly different-minor) torch, defeating the 
 size the parallel compile, and it is not declared as a build dependency.</p></li>
 </ul>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>psutil
-<span class="nv">FLASH_ATTN_CUDA_ARCHS</span><span class="o">=</span><span class="s2">&quot;90&quot;</span><span class="w"> </span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>flash-attn<span class="o">==</span><span class="m">2</span>.8.3.post1<span class="w"> </span>--no-build-isolation
-python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import flash_attn; print(flash_attn.__version__)&quot;</span>
+<span class="nv">FLASH_ATTN_CUDA_ARCHS</span><span class="o">=</span><span class="s2">"90"</span><span class="w"> </span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>flash-attn<span class="o">==</span><span class="m">2</span>.8.3.post1<span class="w"> </span>--no-build-isolation
+python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import flash_attn; print(flash_attn.__version__)"</span>
 </pre></div>
 </div>
 </section>
@@ -750,7 +750,7 @@ your machine. <code class="docutils literal notranslate"><span class="pre">flash
 JIT-compiles on first use, both against your <em>system</em> CUDA — so a mismatch with torch’s
 CUDA breaks the build. The simplest fix is to let <code class="docutils literal notranslate"><span class="pre">uv</span></code> choose the right build
 automatically:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;.[all]&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[all]"</span>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> detects your driver (via <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code>) and selects the matching
@@ -764,7 +764,7 @@ requirement as already satisfied):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># pick the index for your CUDA toolkit: cu128 (CUDA 12.8), cu130 (CUDA 13.x), …</span>
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="nv">torch</span><span class="o">==</span><span class="m">2</span>.9.1<span class="w"> </span><span class="nv">torchvision</span><span class="o">==</span><span class="m">0</span>.24.1<span class="w"> </span><span class="nv">torchaudio</span><span class="o">==</span><span class="m">2</span>.9.1<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu128
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;.[all]&quot;</span>
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[all]"</span>
 </pre></div>
 </div>
 <p>Check your driver’s CUDA version with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span></code> and pick the closest build at
@@ -773,7 +773,7 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 </section>
 <section id="verify-the-install">
 <h2>Verify the install<a class="headerlink" href="#verify-the-install" title="Link to this heading">#</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mstar; print(&#39;mstar import OK&#39;)&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mstar; print('mstar import OK')"</span>
 mstar<span class="w"> </span>--help
 mstar-serve<span class="w"> </span>--help
 </pre></div>
@@ -800,7 +800,7 @@ maturin<span class="w"> </span>develop<span class="w"> </span>--release<span cla
 </div>
 <p>Build with <code class="docutils literal notranslate"><span class="pre">--release</span></code> — an unoptimized debug build (maturin’s default)
 costs real latency on the hot receive path. Verify with:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import mstar_rust; print(&#39;mstar_rust OK&#39;)&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mstar_rust; print('mstar_rust OK')"</span>
 pytest<span class="w"> </span>test/rust/test_rust_communicator.py
 </pre></div>
 </div>
@@ -835,7 +835,7 @@ system copy instead — and a 9.20 dispatcher paired with a ≥ 9.21 engine is t
 Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 installs
 (they use <code class="docutils literal notranslate"><span class="pre">nvidia-cudnn-cu13</span></code>).</p>
 <p>Fix — complete the environment’s own cuDNN so it never falls back to the system copy:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span>-U<span class="w"> </span><span class="s2">&quot;nvidia-cudnn-cu12&gt;=9.21&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span>-U<span class="w"> </span><span class="s2">"nvidia-cudnn-cu12&gt;=9.21"</span>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">--no-deps</span></code> leaves torch in place; pip may print a harmless warning that torch pins
@@ -941,7 +941,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

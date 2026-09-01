@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -698,7 +698,7 @@ automatically.</p></li>
 encoder and the Wan2.2-VAE, all four nodes stateless. The A14B (MoE dual-DiT)
 variants are <strong>not</strong> supported; <code class="docutils literal notranslate"><span class="pre">wan22</span></code> rejects any other variant explicitly.</p>
 <p>Install and serve on one GPU:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;.[wan22]&quot;</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[wan22]"</span>
 mstar<span class="w"> </span>serve<span class="w"> </span>wan22<span class="w">                              </span><span class="c1"># configs/wan22.yaml</span>
 <span class="c1"># or: mstar-serve --config configs/wan22.yaml --port 8000</span>
 </pre></div>
@@ -706,9 +706,9 @@ mstar<span class="w"> </span>serve<span class="w"> </span>wan22<span class="w"> 
 <p>Two routes are served. <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> is the native one (multipart form, like
 every other model); the mp4 comes back base64-encoded in <code class="docutils literal notranslate"><span class="pre">outputs.video[0].data</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8000/generate<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-F<span class="w"> </span><span class="s1">&#39;text=a fluffy cat walking across a sunlit floor&#39;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-F<span class="w"> </span><span class="s1">&#39;output_modalities=video&#39;</span><span class="w"> </span>-F<span class="w"> </span><span class="s1">&#39;streaming=false&#39;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-F<span class="w"> </span><span class="s1">&#39;model_kwargs={&quot;height&quot;:480,&quot;width&quot;:832,&quot;num_frames&quot;:33,&quot;num_inference_steps&quot;:50,&quot;guidance_scale&quot;:5.0}&#39;</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s1">'text=a fluffy cat walking across a sunlit floor'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s1">'output_modalities=video'</span><span class="w"> </span>-F<span class="w"> </span><span class="s1">'streaming=false'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s1">'model_kwargs={"height":480,"width":832,"num_frames":33,"num_inference_steps":50,"guidance_scale":5.0}'</span>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/videos/generations</span></code> is the OpenAI-shaped surface (JSON body, mp4 in
@@ -716,12 +716,12 @@ every other model); the mp4 comes back base64-encoded in <code class="docutils l
 the opposite order to the <code class="docutils literal notranslate"><span class="pre">height</span></code>/<code class="docutils literal notranslate"><span class="pre">width</span></code> kwargs above — and supplying an
 <code class="docutils literal notranslate"><span class="pre">image</span></code> (URL or data URI) turns the request into image-to-video:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-sS<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/videos/generations<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;prompt&quot;: &quot;a fluffy cat walking across a sunlit floor&quot;,</span>
-<span class="s1">       &quot;size&quot;: &quot;832x480&quot;, &quot;num_frames&quot;: 33, &quot;seed&quot;: 42,</span>
-<span class="s1">       &quot;num_inference_steps&quot;: 50, &quot;guidance_scale&quot;: 5.0}&#39;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import sys,json,base64; d=json.load(sys.stdin); \</span>
-<span class="s2">               open(&#39;out.mp4&#39;,&#39;wb&#39;).write(base64.b64decode(d[&#39;data&#39;][0][&#39;b64_json&#39;]))&quot;</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s1">'Content-Type: application/json'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">'{"prompt": "a fluffy cat walking across a sunlit floor",</span>
+<span class="s1">       "size": "832x480", "num_frames": 33, "seed": 42,</span>
+<span class="s1">       "num_inference_steps": 50, "guidance_scale": 5.0}'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import sys,json,base64; d=json.load(sys.stdin); \</span>
+<span class="s2">               open('out.mp4','wb').write(base64.b64decode(d['data'][0]['b64_json']))"</span>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">test/wan22/t2v_request.sh</span></code> and <code class="docutils literal notranslate"><span class="pre">i2v_request.sh</span></code> wrap these two calls.</p>
@@ -878,7 +878,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

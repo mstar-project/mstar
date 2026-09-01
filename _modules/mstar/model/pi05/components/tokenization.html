@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.pi05.components.tokenization</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Tokenization wrapper for Pi0.5: PaliGemma tokenizer + state discretization.&quot;&quot;&quot;</span>
+<span></span><span class="sd">"""Tokenization wrapper for Pi0.5: PaliGemma tokenizer + state discretization."""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 
@@ -817,7 +819,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="normalize_prompt">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.pi05.components.tokenization.html#mstar.model.pi05.components.tokenization.normalize_prompt">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">normalize_prompt</span><span class="p">(</span><span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Lowercase + strip whitespace, matching openpi&#39;s PaligemmaTokenizer.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Lowercase + strip whitespace, matching openpi's PaligemmaTokenizer."""</span>
     <span class="k">return</span> <span class="n">prompt</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span></div>
 
 
@@ -825,13 +827,13 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Pi05Tokenizer">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.pi05.components.tokenization.html#mstar.model.pi05.components.tokenization.Pi05Tokenizer">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Pi05Tokenizer</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wrapper around the HF PaliGemma tokenizer that also tokenizes robot state.</span>
+<span class="w">    </span><span class="sd">"""Wrapper around the HF PaliGemma tokenizer that also tokenizes robot state.</span>
 
 <span class="sd">    Robot state values are discretized into ``state_token_bins`` bins and mapped</span>
 <span class="sd">    to language token IDs starting at ``state_token_offset``. Pi0.5 reuses</span>
-<span class="sd">    bottom-of-vocab tokens for state bins so that PaliGemma&#39;s embedding table</span>
+<span class="sd">    bottom-of-vocab tokens for state bins so that PaliGemma's embedding table</span>
 <span class="sd">    can embed them directly.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hf_tokenizer</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">Pi05Config</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">hf_tokenizer</span> <span class="o">=</span> <span class="n">hf_tokenizer</span>
@@ -894,7 +896,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

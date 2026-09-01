@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -822,11 +824,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">rope_theta</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">500000.0</span>
     <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">156940</span>
     <span class="n">rope_scaling</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">{</span>
-        <span class="s2">&quot;factor&quot;</span><span class="p">:</span> <span class="mf">32.0</span><span class="p">,</span>
-        <span class="s2">&quot;high_freq_factor&quot;</span><span class="p">:</span> <span class="mf">4.0</span><span class="p">,</span>
-        <span class="s2">&quot;low_freq_factor&quot;</span><span class="p">:</span> <span class="mf">1.0</span><span class="p">,</span>
-        <span class="s2">&quot;original_max_position_embeddings&quot;</span><span class="p">:</span> <span class="mi">8192</span><span class="p">,</span>
-        <span class="s2">&quot;rope_type&quot;</span><span class="p">:</span> <span class="s2">&quot;llama3&quot;</span>
+        <span class="s2">"factor"</span><span class="p">:</span> <span class="mf">32.0</span><span class="p">,</span>
+        <span class="s2">"high_freq_factor"</span><span class="p">:</span> <span class="mf">4.0</span><span class="p">,</span>
+        <span class="s2">"low_freq_factor"</span><span class="p">:</span> <span class="mf">1.0</span><span class="p">,</span>
+        <span class="s2">"original_max_position_embeddings"</span><span class="p">:</span> <span class="mi">8192</span><span class="p">,</span>
+        <span class="s2">"rope_type"</span><span class="p">:</span> <span class="s2">"llama3"</span>
     <span class="p">})</span>
 
     <span class="c1"># Special token IDs</span>
@@ -837,7 +839,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">custom_token_base_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128256</span>  <span class="c1"># vocab_id of &lt;custom_token_0&gt;</span>
 
     <span class="c1"># SNAC params</span>
-    <span class="n">snac_model_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;hubertsiuzdak/snac_24khz&quot;</span>
+    <span class="n">snac_model_id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"hubertsiuzdak/snac_24khz"</span>
     <span class="n">tokens_per_frame</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">7</span>
     <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">24000</span>
 
@@ -856,7 +858,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># Available voices</span>
     <span class="n">available_voices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;tara&quot;</span><span class="p">,</span> <span class="s2">&quot;zoe&quot;</span><span class="p">,</span> <span class="s2">&quot;zac&quot;</span><span class="p">,</span> <span class="s2">&quot;jess&quot;</span><span class="p">,</span> <span class="s2">&quot;leo&quot;</span><span class="p">,</span> <span class="s2">&quot;mia&quot;</span><span class="p">,</span> <span class="s2">&quot;julia&quot;</span><span class="p">,</span> <span class="s2">&quot;leah&quot;</span><span class="p">]</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s2">"tara"</span><span class="p">,</span> <span class="s2">"zoe"</span><span class="p">,</span> <span class="s2">"zac"</span><span class="p">,</span> <span class="s2">"jess"</span><span class="p">,</span> <span class="s2">"leo"</span><span class="p">,</span> <span class="s2">"mia"</span><span class="p">,</span> <span class="s2">"julia"</span><span class="p">,</span> <span class="s2">"leah"</span><span class="p">]</span>
     <span class="p">)</span></div>
 
 </pre></div>
@@ -906,7 +908,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

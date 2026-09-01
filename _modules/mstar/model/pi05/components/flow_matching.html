@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.pi05.components.flow_matching</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Flow-matching utilities for Pi0.5: timestep embedding, Euler step, state discretization.&quot;&quot;&quot;</span>
+<span></span><span class="sd">"""Flow-matching utilities for Pi0.5: timestep embedding, Euler step, state discretization."""</span>
 
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
@@ -819,7 +821,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">min_period</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">4e-3</span><span class="p">,</span>
     <span class="n">max_period</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">4.0</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Sinusoidal timestep embedding (matches the openpi reference).</span>
+<span class="w">    </span><span class="sd">"""Sinusoidal timestep embedding (matches the openpi reference).</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        t: scalar or 1D tensor of timesteps in [0, 1].</span>
@@ -828,9 +830,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Returns:</span>
 <span class="sd">        Tensor of shape ``(*t.shape, dim)`` with the sin/cos embedding.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">if</span> <span class="n">dim</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;sincos embedding requires even dim, got </span><span class="si">{</span><span class="n">dim</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"sincos embedding requires even dim, got </span><span class="si">{</span><span class="n">dim</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">t</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="n">t</span> <span class="o">=</span> <span class="n">t</span><span class="p">[</span><span class="kc">None</span><span class="p">]</span>
 
@@ -856,7 +858,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">velocity</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
     <span class="n">dt</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;One Euler integration step: x_{t+dt} = x_t + dt * v(x_t, t).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""One Euler integration step: x_{t+dt} = x_t + dt * v(x_t, t)."""</span>
     <span class="k">return</span> <span class="n">x</span> <span class="o">+</span> <span class="n">dt</span> <span class="o">*</span> <span class="n">velocity</span></div>
 
 
@@ -869,7 +871,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">value_min</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="o">-</span><span class="mf">1.0</span><span class="p">,</span>
     <span class="n">value_max</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Map continuous robot state values in [value_min, value_max] to bin indices.</span>
+<span class="w">    </span><span class="sd">"""Map continuous robot state values in [value_min, value_max] to bin indices.</span>
 
 <span class="sd">    Used by Pi0.5 to tokenize proprioceptive state into language tokens that</span>
 <span class="sd">    PaliGemma can embed alongside image and language tokens.</span>
@@ -881,7 +883,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Returns:</span>
 <span class="sd">        1D ``torch.long`` tensor of bin indices in ``[0, num_bins)``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">clamped</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="n">value_min</span><span class="p">,</span> <span class="n">value_max</span><span class="p">)</span>
     <span class="n">normalized</span> <span class="o">=</span> <span class="p">(</span><span class="n">clamped</span> <span class="o">-</span> <span class="n">value_min</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">value_max</span> <span class="o">-</span> <span class="n">value_min</span><span class="p">)</span>
     <span class="n">indices</span> <span class="o">=</span> <span class="p">(</span><span class="n">normalized</span> <span class="o">*</span> <span class="p">(</span><span class="n">num_bins</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">round</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">)</span>
@@ -934,7 +936,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

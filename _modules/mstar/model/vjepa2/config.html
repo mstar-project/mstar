@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,12 +805,12 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.vjepa2.config</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;V-JEPA 2 configuration dataclasses.</span>
+<span></span><span class="sd">"""V-JEPA 2 configuration dataclasses.</span>
 
 <span class="sd">Flat config matching HuggingFace `VJEPA2Config` plus an optional action-conditioned</span>
 <span class="sd">predictor block. A single `VJepa2Config.from_hf_config(dict)` handles every</span>
 <span class="sd">open V-JEPA 2 checkpoint (vitl/h/g at 256, vitg at 384, and the AC variant).</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -820,10 +822,10 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">VJepa2ACPredictorConfig</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for the action-conditioned predictor (upstream V-JEPA 2-AC).</span>
+<span class="w">    </span><span class="sd">"""Configuration for the action-conditioned predictor (upstream V-JEPA 2-AC).</span>
 
 <span class="sd">    Mirrors ``vjepa2/src/models/ac_predictor.py`` defaults.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">img_size</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">256</span><span class="p">,</span> <span class="mi">256</span><span class="p">)</span>
     <span class="n">patch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
@@ -850,10 +852,10 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">VJepa2Config</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Top-level V-JEPA 2 config (shared across the HF and upstream ports).</span>
+<span class="w">    </span><span class="sd">"""Top-level V-JEPA 2 config (shared across the HF and upstream ports).</span>
 
 <span class="sd">    Field names match HF ``VJEPA2Config`` so a plain JSON round-trip works.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="c1"># Encoder</span>
     <span class="n">patch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
@@ -869,7 +871,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">layer_norm_eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span>
     <span class="n">qkv_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">attention_probs_dropout_prob</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>
-    <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;gelu&quot;</span>
+    <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"gelu"</span>
 
     <span class="c1"># Masked predictor</span>
     <span class="n">pred_hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">384</span>
@@ -879,12 +881,12 @@ window.runMermaid = runMermaid;</script>
     <span class="n">pred_zero_init_mask_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">pred_mlp_ratio</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">4.0</span>
 
-    <span class="c1"># Which predictor to instantiate.  &quot;masked&quot; = HF VJEPA2Predictor;</span>
-    <span class="c1"># &quot;ac&quot; = upstream VisionTransformerPredictorAC.</span>
-    <span class="n">predictor_kind</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;masked&quot;</span>
+    <span class="c1"># Which predictor to instantiate.  "masked" = HF VJEPA2Predictor;</span>
+    <span class="c1"># "ac" = upstream VisionTransformerPredictorAC.</span>
+    <span class="n">predictor_kind</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"masked"</span>
     <span class="n">ac_predictor</span><span class="p">:</span> <span class="n">VJepa2ACPredictorConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
-    <span class="c1"># Rollout.  ``max_rollout_horizon`` caps the Loop&#39;s</span>
+    <span class="c1"># Rollout.  ``max_rollout_horizon`` caps the Loop's</span>
     <span class="c1"># ``max_iters`` at graph-build time; per-request ``rollout_horizon`` is</span>
     <span class="c1"># enforced by early-exit (``check_stop``) from inside the</span>
     <span class="c1"># rollout submodule.</span>
@@ -897,16 +899,16 @@ window.runMermaid = runMermaid;</script>
     <span class="n">rollout_anticipation_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
 
     <span class="c1"># MPC.  Cost function used by VJepa2MPCScorerSubmodule to</span>
-    <span class="c1"># score K candidate predicted latents against the goal latent.  &quot;l1&quot;</span>
+    <span class="c1"># score K candidate predicted latents against the goal latent.  "l1"</span>
     <span class="c1"># matches upstream vjepa2/notebooks/utils/mpc_utils.py::l1 (the CEM</span>
     <span class="c1"># objective).  Fixed at deploy time rather than per-request so that</span>
     <span class="c1"># reproducibility / parity tests are deterministic across clients.</span>
-    <span class="n">mpc_cost_fn</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;l1&quot;</span>
+    <span class="n">mpc_cost_fn</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"l1"</span>
 
 <div class="viewcode-block" id="VJepa2Config.from_hf_config">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.from_hf_config">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_hf_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_dict</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">&quot;VJepa2Config&quot;</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_hf_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">config_dict</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"VJepa2Config"</span><span class="p">:</span>
         <span class="n">known_keys</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">__dataclass_fields__</span><span class="o">.</span><span class="n">values</span><span class="p">()}</span>
         <span class="n">filtered</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">config_dict</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">known_keys</span><span class="p">}</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">filtered</span><span class="p">)</span></div>
@@ -971,7 +973,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

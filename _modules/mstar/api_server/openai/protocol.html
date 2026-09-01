@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,13 +805,13 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.protocol</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Pydantic request models for the OpenAI-compatible endpoints.</span>
+<span></span><span class="sd">"""Pydantic request models for the OpenAI-compatible endpoints.</span>
 
-<span class="sd">Requests are validated here; unknown fields are allowed (``extra=&quot;allow&quot;``) so</span>
-<span class="sd">the OpenAI client&#39;s ``extra_body`` flows through as model_kwargs. Responses are</span>
+<span class="sd">Requests are validated here; unknown fields are allowed (``extra="allow"``) so</span>
+<span class="sd">the OpenAI client's ``extra_body`` flows through as model_kwargs. Responses are</span>
 <span class="sd">built as plain dicts in the serving handlers to keep the multimodal shapes</span>
 <span class="sd">(audio in ``message.audio``, images as data URLs) flexible.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -817,9 +819,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseModel</span><span class="p">,</span> <span class="n">ConfigDict</span><span class="p">,</span> <span class="n">Field</span>
 
-<span class="c1"># Allow a field literally named ``model`` without pydantic&#39;s protected-namespace</span>
+<span class="c1"># Allow a field literally named ``model`` without pydantic's protected-namespace</span>
 <span class="c1"># warning, and accept unknown fields as passthrough model_kwargs.</span>
-<span class="n">_CFG</span> <span class="o">=</span> <span class="n">ConfigDict</span><span class="p">(</span><span class="n">extra</span><span class="o">=</span><span class="s2">&quot;allow&quot;</span><span class="p">,</span> <span class="n">protected_namespaces</span><span class="o">=</span><span class="p">())</span>
+<span class="n">_CFG</span> <span class="o">=</span> <span class="n">ConfigDict</span><span class="p">(</span><span class="n">extra</span><span class="o">=</span><span class="s2">"allow"</span><span class="p">,</span> <span class="n">protected_namespaces</span><span class="o">=</span><span class="p">())</span>
 
 
 <div class="viewcode-block" id="ChatMessage">
@@ -849,21 +851,21 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># Multimodal output (vllm-omni / sglang-omni style)</span>
     <span class="n">modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">audio</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># {&quot;voice&quot;: ..., &quot;format&quot;: &quot;wav&quot;}</span></div>
+    <span class="n">audio</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># {"voice": ..., "format": "wav"}</span></div>
 
 
 
 <div class="viewcode-block" id="SpeechRequest">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SpeechRequest</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;OpenAI ``/v1/audio/speech`` (text-to-speech).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""OpenAI ``/v1/audio/speech`` (text-to-speech)."""</span>
 
     <span class="n">model_config</span> <span class="o">=</span> <span class="n">_CFG</span>
 
     <span class="nb">input</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">model</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">voice</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">response_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;wav&quot;</span>
+    <span class="n">response_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"wav"</span>
     <span class="n">speed</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mf">1.0</span>
     <span class="n">stream</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -875,7 +877,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ImageGenerationRequest">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ImageGenerationRequest</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;OpenAI ``/v1/images/generations``.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""OpenAI ``/v1/images/generations``."""</span>
 
     <span class="n">model_config</span> <span class="o">=</span> <span class="n">_CFG</span>
 
@@ -883,7 +885,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">model</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">n</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">size</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">response_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;b64_json&quot;</span>
+    <span class="n">response_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"b64_json"</span>
     <span class="n">seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
@@ -891,14 +893,14 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="VideoGenerationRequest">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VideoGenerationRequest">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">VideoGenerationRequest</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;``/v1/videos/generations`` (text/image/video-to-video).</span>
+<span class="w">    </span><span class="sd">"""``/v1/videos/generations`` (text/image/video-to-video).</span>
 
 <span class="sd">    Not an OpenAI-standard surface; modeled on the image endpoint. ``image`` (a</span>
 <span class="sd">    URL or data URI) conditions image-to-video; ``video`` conditions</span>
 <span class="sd">    video-to-video. Extra knobs (``guidance_scale``, ``num_inference_steps``,</span>
 <span class="sd">    ``negative_prompt``, ``condition_frame_indexes_vision``,</span>
 <span class="sd">    ``condition_video_keep`` …) flow through via ``extra_body``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="n">model_config</span> <span class="o">=</span> <span class="n">_CFG</span>
 
@@ -906,7 +908,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">model</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">n</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mi">1</span>
     <span class="n">size</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">response_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;b64_json&quot;</span>
+    <span class="n">response_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"b64_json"</span>
     <span class="n">seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">num_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -919,16 +921,16 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ModelCard</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
     <span class="nb">id</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="nb">object</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;model&quot;</span>
+    <span class="nb">object</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"model"</span>
     <span class="n">created</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="n">owned_by</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;mstar&quot;</span></div>
+    <span class="n">owned_by</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"mstar"</span></div>
 
 
 
 <div class="viewcode-block" id="ModelList">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelList">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ModelList</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
-    <span class="nb">object</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;list&quot;</span>
+    <span class="nb">object</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"list"</span>
     <span class="n">data</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ModelCard</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
 
 </pre></div>
@@ -978,7 +980,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

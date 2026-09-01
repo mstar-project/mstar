@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -803,12 +805,12 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.media_io</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Media decode/encode helpers shared by the native and OpenAI-compatible APIs.</span>
+<span></span><span class="sd">"""Media decode/encode helpers shared by the native and OpenAI-compatible APIs.</span>
 
 <span class="sd">Two directions:</span>
 
 <span class="sd">* **Inbound** — turn media referenced by an OpenAI-style request (``data:`` URLs,</span>
-<span class="sd">  ``http(s)`` URLs, or base64 blobs) into files under the API server&#39;s</span>
+<span class="sd">  ``http(s)`` URLs, or base64 blobs) into files under the API server's</span>
 <span class="sd">  ``upload_dir``, so ``model.load_image`` / ``load_audio`` / ``load_video`` can</span>
 <span class="sd">  read them by path. This is the same contract ``/generate`` already uses for</span>
 <span class="sd">  multipart uploads.</span>
@@ -819,7 +821,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Only stdlib + numpy are required. ``mp3`` / ``flac`` / ``ogg`` encoding is opt-in</span>
 <span class="sd">and degrades to WAV when the optional ``soundfile`` backend is unavailable, so</span>
 <span class="sd">the base install stays slim.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -838,58 +840,58 @@ window.runMermaid = runMermaid;</script>
 
 <span class="c1"># MIME (top-level type or full type) -&gt; file extension used when persisting.</span>
 <span class="n">_MIME_TO_EXT</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">&quot;image/png&quot;</span><span class="p">:</span> <span class="s2">&quot;.png&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;image/jpeg&quot;</span><span class="p">:</span> <span class="s2">&quot;.jpg&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;image/jpg&quot;</span><span class="p">:</span> <span class="s2">&quot;.jpg&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;image/webp&quot;</span><span class="p">:</span> <span class="s2">&quot;.webp&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;image/gif&quot;</span><span class="p">:</span> <span class="s2">&quot;.gif&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;image/bmp&quot;</span><span class="p">:</span> <span class="s2">&quot;.bmp&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;image/tiff&quot;</span><span class="p">:</span> <span class="s2">&quot;.tiff&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/wav&quot;</span><span class="p">:</span> <span class="s2">&quot;.wav&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/x-wav&quot;</span><span class="p">:</span> <span class="s2">&quot;.wav&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/wave&quot;</span><span class="p">:</span> <span class="s2">&quot;.wav&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/mpeg&quot;</span><span class="p">:</span> <span class="s2">&quot;.mp3&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/mp3&quot;</span><span class="p">:</span> <span class="s2">&quot;.mp3&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/flac&quot;</span><span class="p">:</span> <span class="s2">&quot;.flac&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/ogg&quot;</span><span class="p">:</span> <span class="s2">&quot;.ogg&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/opus&quot;</span><span class="p">:</span> <span class="s2">&quot;.opus&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/aac&quot;</span><span class="p">:</span> <span class="s2">&quot;.aac&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;audio/m4a&quot;</span><span class="p">:</span> <span class="s2">&quot;.m4a&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;video/mp4&quot;</span><span class="p">:</span> <span class="s2">&quot;.mp4&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;video/webm&quot;</span><span class="p">:</span> <span class="s2">&quot;.webm&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;video/quicktime&quot;</span><span class="p">:</span> <span class="s2">&quot;.mov&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;video/x-matroska&quot;</span><span class="p">:</span> <span class="s2">&quot;.mkv&quot;</span><span class="p">,</span>
+    <span class="s2">"image/png"</span><span class="p">:</span> <span class="s2">".png"</span><span class="p">,</span>
+    <span class="s2">"image/jpeg"</span><span class="p">:</span> <span class="s2">".jpg"</span><span class="p">,</span>
+    <span class="s2">"image/jpg"</span><span class="p">:</span> <span class="s2">".jpg"</span><span class="p">,</span>
+    <span class="s2">"image/webp"</span><span class="p">:</span> <span class="s2">".webp"</span><span class="p">,</span>
+    <span class="s2">"image/gif"</span><span class="p">:</span> <span class="s2">".gif"</span><span class="p">,</span>
+    <span class="s2">"image/bmp"</span><span class="p">:</span> <span class="s2">".bmp"</span><span class="p">,</span>
+    <span class="s2">"image/tiff"</span><span class="p">:</span> <span class="s2">".tiff"</span><span class="p">,</span>
+    <span class="s2">"audio/wav"</span><span class="p">:</span> <span class="s2">".wav"</span><span class="p">,</span>
+    <span class="s2">"audio/x-wav"</span><span class="p">:</span> <span class="s2">".wav"</span><span class="p">,</span>
+    <span class="s2">"audio/wave"</span><span class="p">:</span> <span class="s2">".wav"</span><span class="p">,</span>
+    <span class="s2">"audio/mpeg"</span><span class="p">:</span> <span class="s2">".mp3"</span><span class="p">,</span>
+    <span class="s2">"audio/mp3"</span><span class="p">:</span> <span class="s2">".mp3"</span><span class="p">,</span>
+    <span class="s2">"audio/flac"</span><span class="p">:</span> <span class="s2">".flac"</span><span class="p">,</span>
+    <span class="s2">"audio/ogg"</span><span class="p">:</span> <span class="s2">".ogg"</span><span class="p">,</span>
+    <span class="s2">"audio/opus"</span><span class="p">:</span> <span class="s2">".opus"</span><span class="p">,</span>
+    <span class="s2">"audio/aac"</span><span class="p">:</span> <span class="s2">".aac"</span><span class="p">,</span>
+    <span class="s2">"audio/m4a"</span><span class="p">:</span> <span class="s2">".m4a"</span><span class="p">,</span>
+    <span class="s2">"video/mp4"</span><span class="p">:</span> <span class="s2">".mp4"</span><span class="p">,</span>
+    <span class="s2">"video/webm"</span><span class="p">:</span> <span class="s2">".webm"</span><span class="p">,</span>
+    <span class="s2">"video/quicktime"</span><span class="p">:</span> <span class="s2">".mov"</span><span class="p">,</span>
+    <span class="s2">"video/x-matroska"</span><span class="p">:</span> <span class="s2">".mkv"</span><span class="p">,</span>
 <span class="p">}</span>
 
 <span class="c1"># Output audio container -&gt; (extension, mime type) for OpenAI audio responses.</span>
 <span class="n">AUDIO_FORMAT_MIME</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">&quot;wav&quot;</span><span class="p">:</span> <span class="s2">&quot;audio/wav&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;pcm&quot;</span><span class="p">:</span> <span class="s2">&quot;audio/pcm&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;mp3&quot;</span><span class="p">:</span> <span class="s2">&quot;audio/mpeg&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;flac&quot;</span><span class="p">:</span> <span class="s2">&quot;audio/flac&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;opus&quot;</span><span class="p">:</span> <span class="s2">&quot;audio/ogg&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;aac&quot;</span><span class="p">:</span> <span class="s2">&quot;audio/aac&quot;</span><span class="p">,</span>
+    <span class="s2">"wav"</span><span class="p">:</span> <span class="s2">"audio/wav"</span><span class="p">,</span>
+    <span class="s2">"pcm"</span><span class="p">:</span> <span class="s2">"audio/pcm"</span><span class="p">,</span>
+    <span class="s2">"mp3"</span><span class="p">:</span> <span class="s2">"audio/mpeg"</span><span class="p">,</span>
+    <span class="s2">"flac"</span><span class="p">:</span> <span class="s2">"audio/flac"</span><span class="p">,</span>
+    <span class="s2">"opus"</span><span class="p">:</span> <span class="s2">"audio/ogg"</span><span class="p">,</span>
+    <span class="s2">"aac"</span><span class="p">:</span> <span class="s2">"audio/aac"</span><span class="p">,</span>
 <span class="p">}</span>
 
 
 <div class="viewcode-block" id="modality_from_mime">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.modality_from_mime">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">modality_from_mime</span><span class="p">(</span><span class="n">mime</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Map a MIME type to one of our modality strings (image/audio/video).&quot;&quot;&quot;</span>
-    <span class="n">top</span> <span class="o">=</span> <span class="p">(</span><span class="n">mime</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;/&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">top</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;image&quot;</span><span class="p">,</span> <span class="s2">&quot;audio&quot;</span><span class="p">,</span> <span class="s2">&quot;video&quot;</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Map a MIME type to one of our modality strings (image/audio/video)."""</span>
+    <span class="n">top</span> <span class="o">=</span> <span class="p">(</span><span class="n">mime</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">)</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"/"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">top</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="s2">"video"</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">top</span>
-    <span class="k">return</span> <span class="s2">&quot;unknown&quot;</span></div>
+    <span class="k">return</span> <span class="s2">"unknown"</span></div>
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_ext_for</span><span class="p">(</span><span class="n">mime</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fallback</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;.bin&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-    <span class="n">mime</span> <span class="o">=</span> <span class="p">(</span><span class="n">mime</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_ext_for</span><span class="p">(</span><span class="n">mime</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fallback</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">".bin"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="n">mime</span> <span class="o">=</span> <span class="p">(</span><span class="n">mime</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">mime</span> <span class="ow">in</span> <span class="n">_MIME_TO_EXT</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">_MIME_TO_EXT</span><span class="p">[</span><span class="n">mime</span><span class="p">]</span>
-    <span class="c1"># Fall back to the top-level type&#39;s most common extension.</span>
-    <span class="n">top</span> <span class="o">=</span> <span class="n">mime</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;/&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
-    <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="s2">&quot;.png&quot;</span><span class="p">,</span> <span class="s2">&quot;audio&quot;</span><span class="p">:</span> <span class="s2">&quot;.wav&quot;</span><span class="p">,</span> <span class="s2">&quot;video&quot;</span><span class="p">:</span> <span class="s2">&quot;.mp4&quot;</span><span class="p">}</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">top</span><span class="p">,</span> <span class="n">fallback</span><span class="p">)</span>
+    <span class="c1"># Fall back to the top-level type's most common extension.</span>
+    <span class="n">top</span> <span class="o">=</span> <span class="n">mime</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"/"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="s2">".png"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">:</span> <span class="s2">".wav"</span><span class="p">,</span> <span class="s2">"video"</span><span class="p">:</span> <span class="s2">".mp4"</span><span class="p">}</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">top</span><span class="p">,</span> <span class="n">fallback</span><span class="p">)</span>
 
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
@@ -899,7 +901,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">_save_bytes</span><span class="p">(</span><span class="n">raw</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">mime</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
     <span class="n">upload_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">upload_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-    <span class="n">path</span> <span class="o">=</span> <span class="n">upload_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">uuid4</span><span class="p">()</span><span class="si">}{</span><span class="n">_ext_for</span><span class="p">(</span><span class="n">mime</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">path</span> <span class="o">=</span> <span class="n">upload_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">uuid4</span><span class="p">()</span><span class="si">}{</span><span class="n">_ext_for</span><span class="p">(</span><span class="n">mime</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
     <span class="n">path</span><span class="o">.</span><span class="n">write_bytes</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">modality_from_mime</span><span class="p">(</span><span class="n">mime</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
 
@@ -907,11 +909,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="save_data_url">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_data_url">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">save_data_url</span><span class="p">(</span><span class="n">data_url</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Persist a ``data:&lt;mime&gt;;base64,&lt;payload&gt;`` URL. Returns (modality, path).&quot;&quot;&quot;</span>
-    <span class="n">header</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">payload</span> <span class="o">=</span> <span class="n">data_url</span><span class="o">.</span><span class="n">partition</span><span class="p">(</span><span class="s2">&quot;,&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="sd">"""Persist a ``data:&lt;mime&gt;;base64,&lt;payload&gt;`` URL. Returns (modality, path)."""</span>
+    <span class="n">header</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">payload</span> <span class="o">=</span> <span class="n">data_url</span><span class="o">.</span><span class="n">partition</span><span class="p">(</span><span class="s2">","</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">payload</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Malformed data URL: missing payload&quot;</span><span class="p">)</span>
-    <span class="n">mime</span> <span class="o">=</span> <span class="n">header</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="s2">&quot;data:&quot;</span><span class="p">):]</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;;&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span> <span class="ow">or</span> <span class="s2">&quot;application/octet-stream&quot;</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Malformed data URL: missing payload"</span><span class="p">)</span>
+    <span class="n">mime</span> <span class="o">=</span> <span class="n">header</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="s2">"data:"</span><span class="p">):]</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">";"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span> <span class="ow">or</span> <span class="s2">"application/octet-stream"</span>
     <span class="n">raw</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">_save_bytes</span><span class="p">(</span><span class="n">raw</span><span class="p">,</span> <span class="n">mime</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span></div>
 
@@ -920,15 +922,15 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="save_base64">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_base64">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">save_base64</span><span class="p">(</span><span class="n">b64</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">fmt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">modality_hint</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Persist a bare base64 blob with a known ``fmt`` (e.g. ``&quot;wav&quot;``).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Persist a bare base64 blob with a known ``fmt`` (e.g. ``"wav"``)."""</span>
     <span class="n">upload_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">upload_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="n">raw</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">b64</span><span class="p">)</span>
     <span class="c1"># Sanitize the client-controlled fmt: alphanumerics only, so it cannot</span>
     <span class="c1"># inject path separators into the upload path.</span>
-    <span class="n">clean</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">fmt</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">isalnum</span><span class="p">())</span>
-    <span class="n">ext</span> <span class="o">=</span> <span class="s2">&quot;.&quot;</span> <span class="o">+</span> <span class="n">clean</span> <span class="k">if</span> <span class="n">clean</span> <span class="k">else</span> <span class="s2">&quot;.bin&quot;</span>
-    <span class="n">path</span> <span class="o">=</span> <span class="n">upload_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">uuid4</span><span class="p">()</span><span class="si">}{</span><span class="n">ext</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">clean</span> <span class="o">=</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">fmt</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s2">"."</span><span class="p">)</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">isalnum</span><span class="p">())</span>
+    <span class="n">ext</span> <span class="o">=</span> <span class="s2">"."</span> <span class="o">+</span> <span class="n">clean</span> <span class="k">if</span> <span class="n">clean</span> <span class="k">else</span> <span class="s2">".bin"</span>
+    <span class="n">path</span> <span class="o">=</span> <span class="n">upload_dir</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">uuid4</span><span class="p">()</span><span class="si">}{</span><span class="n">ext</span><span class="si">}</span><span class="s2">"</span>
     <span class="n">path</span><span class="o">.</span><span class="n">write_bytes</span><span class="p">(</span><span class="n">raw</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">modality_hint</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span></div>
 
@@ -937,21 +939,21 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="save_remote_url">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_remote_url">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">save_remote_url</span><span class="p">(</span><span class="n">url</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">30.0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Download an ``http(s)`` URL into ``upload_dir``. Returns (modality, path).</span>
+<span class="w">    </span><span class="sd">"""Download an ``http(s)`` URL into ``upload_dir``. Returns (modality, path).</span>
 
 <span class="sd">    Note: fetching arbitrary URLs has SSRF surface. Callers exposing this</span>
 <span class="sd">    publicly should allowlist hosts or disable remote fetch (data-URL only).</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">urllib.request</span>
 
     <span class="k">with</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span> <span class="k">as</span> <span class="n">resp</span><span class="p">:</span>  <span class="c1"># noqa: S310 (caller-gated)</span>
         <span class="n">raw</span> <span class="o">=</span> <span class="n">resp</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
-        <span class="n">mime</span> <span class="o">=</span> <span class="n">resp</span><span class="o">.</span><span class="n">headers</span><span class="o">.</span><span class="n">get_content_type</span><span class="p">()</span> <span class="k">if</span> <span class="n">resp</span><span class="o">.</span><span class="n">headers</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span>
+        <span class="n">mime</span> <span class="o">=</span> <span class="n">resp</span><span class="o">.</span><span class="n">headers</span><span class="o">.</span><span class="n">get_content_type</span><span class="p">()</span> <span class="k">if</span> <span class="n">resp</span><span class="o">.</span><span class="n">headers</span> <span class="k">else</span> <span class="s2">""</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">mime</span><span class="p">:</span>
         <span class="c1"># Infer from the URL path extension.</span>
         <span class="n">suffix</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">urlparse</span><span class="p">(</span><span class="n">url</span><span class="p">)</span><span class="o">.</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">suffix</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
         <span class="n">rev</span> <span class="o">=</span> <span class="p">{</span><span class="n">v</span><span class="p">:</span> <span class="n">k</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">_MIME_TO_EXT</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
-        <span class="n">mime</span> <span class="o">=</span> <span class="n">rev</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">suffix</span><span class="p">,</span> <span class="s2">&quot;application/octet-stream&quot;</span><span class="p">)</span>
+        <span class="n">mime</span> <span class="o">=</span> <span class="n">rev</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">suffix</span><span class="p">,</span> <span class="s2">"application/octet-stream"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">_save_bytes</span><span class="p">(</span><span class="n">raw</span><span class="p">,</span> <span class="n">mime</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span></div>
 
 
@@ -959,23 +961,23 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="resolve_media_ref">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.resolve_media_ref">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">resolve_media_ref</span><span class="p">(</span><span class="n">ref</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">allow_remote</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Resolve a media reference (data URL, http(s) URL, or local path).</span>
+<span class="w">    </span><span class="sd">"""Resolve a media reference (data URL, http(s) URL, or local path).</span>
 
 <span class="sd">    Returns ``(modality, path)``. Local paths are passed through unchanged</span>
 <span class="sd">    (modality inferred from extension).</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="k">if</span> <span class="n">ref</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;data:&quot;</span><span class="p">):</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="n">ref</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"data:"</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">save_data_url</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">scheme</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">scheme</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">scheme</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;http&quot;</span><span class="p">,</span> <span class="s2">&quot;https&quot;</span><span class="p">):</span>
-        <span class="n">allow_remote</span> <span class="o">=</span> <span class="n">allow_remote</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;MSTAR_ALLOW_REMOTE&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span>
+    <span class="k">if</span> <span class="n">scheme</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"http"</span><span class="p">,</span> <span class="s2">"https"</span><span class="p">):</span>
+        <span class="n">allow_remote</span> <span class="o">=</span> <span class="n">allow_remote</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_ALLOW_REMOTE"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">allow_remote</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Remote media fetch is disabled on this server&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Remote media fetch is disabled on this server"</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">save_remote_url</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
     <span class="c1"># Treat as a local filesystem path.</span>
     <span class="n">suffix</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">ref</span><span class="p">)</span><span class="o">.</span><span class="n">suffix</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
     <span class="n">rev</span> <span class="o">=</span> <span class="p">{</span><span class="n">v</span><span class="p">:</span> <span class="n">k</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">_MIME_TO_EXT</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
-    <span class="k">return</span> <span class="n">modality_from_mime</span><span class="p">(</span><span class="n">rev</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">suffix</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)),</span> <span class="n">ref</span></div>
+    <span class="k">return</span> <span class="n">modality_from_mime</span><span class="p">(</span><span class="n">rev</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">suffix</span><span class="p">,</span> <span class="s2">""</span><span class="p">)),</span> <span class="n">ref</span></div>
 
 
 
@@ -986,9 +988,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="pcm16_to_wav_bytes">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.pcm16_to_wav_bytes">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">pcm16_to_wav_bytes</span><span class="p">(</span><span class="n">pcm</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_channels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wrap raw little-endian 16-bit PCM (the model&#39;s audio output) into a WAV blob.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Wrap raw little-endian 16-bit PCM (the model's audio output) into a WAV blob."""</span>
     <span class="n">buf</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
-    <span class="k">with</span> <span class="n">wave</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s2">&quot;wb&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">wf</span><span class="p">:</span>
+    <span class="k">with</span> <span class="n">wave</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s2">"wb"</span><span class="p">)</span> <span class="k">as</span> <span class="n">wf</span><span class="p">:</span>
         <span class="n">wf</span><span class="o">.</span><span class="n">setnchannels</span><span class="p">(</span><span class="n">num_channels</span><span class="p">)</span>
         <span class="n">wf</span><span class="o">.</span><span class="n">setsampwidth</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
         <span class="n">wf</span><span class="o">.</span><span class="n">setframerate</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">))</span>
@@ -999,29 +1001,29 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="pcm16_to_container">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.pcm16_to_container">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">pcm16_to_container</span><span class="p">(</span><span class="n">pcm</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">fmt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;wav&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bytes</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Encode raw 16-bit PCM into ``fmt``. Returns ``(bytes, mime_type)``.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">pcm16_to_container</span><span class="p">(</span><span class="n">pcm</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">fmt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"wav"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bytes</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Encode raw 16-bit PCM into ``fmt``. Returns ``(bytes, mime_type)``.</span>
 
 <span class="sd">    ``wav`` and ``pcm`` use the stdlib (the bytes are already PCM_16). Compressed</span>
 <span class="sd">    formats need the optional ``soundfile`` backend; if it is missing we fall back</span>
 <span class="sd">    to WAV and log once.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">fmt</span> <span class="o">=</span> <span class="p">(</span><span class="n">fmt</span> <span class="ow">or</span> <span class="s2">&quot;wav&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
-    <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">&quot;wav&quot;</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">pcm16_to_wav_bytes</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">),</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="p">[</span><span class="s2">&quot;wav&quot;</span><span class="p">]</span>
-    <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">&quot;pcm&quot;</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">pcm</span><span class="p">,</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="p">[</span><span class="s2">&quot;pcm&quot;</span><span class="p">]</span>
+<span class="sd">    """</span>
+    <span class="n">fmt</span> <span class="o">=</span> <span class="p">(</span><span class="n">fmt</span> <span class="ow">or</span> <span class="s2">"wav"</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"wav"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">pcm16_to_wav_bytes</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">),</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="p">[</span><span class="s2">"wav"</span><span class="p">]</span>
+    <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"pcm"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">pcm</span><span class="p">,</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="p">[</span><span class="s2">"pcm"</span><span class="p">]</span>
 
     <span class="k">try</span><span class="p">:</span>
         <span class="kn">import</span><span class="w"> </span><span class="nn">soundfile</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">sf</span>  <span class="c1"># type: ignore</span>
 
-        <span class="n">audio</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">&quot;&lt;i2&quot;</span><span class="p">)</span>
+        <span class="n">audio</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"&lt;i2"</span><span class="p">)</span>
         <span class="n">buf</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
         <span class="n">sf</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="n">audio</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">),</span> <span class="nb">format</span><span class="o">=</span><span class="n">fmt</span><span class="o">.</span><span class="n">upper</span><span class="p">())</span>
-        <span class="k">return</span> <span class="n">buf</span><span class="o">.</span><span class="n">getvalue</span><span class="p">(),</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">fmt</span><span class="p">,</span> <span class="s2">&quot;application/octet-stream&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">buf</span><span class="o">.</span><span class="n">getvalue</span><span class="p">(),</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">fmt</span><span class="p">,</span> <span class="s2">"application/octet-stream"</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — any backend failure degrades to WAV</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">&quot;Audio format </span><span class="si">%r</span><span class="s2"> unavailable (need soundfile); returning WAV&quot;</span><span class="p">,</span> <span class="n">fmt</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">pcm16_to_wav_bytes</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">),</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="p">[</span><span class="s2">&quot;wav&quot;</span><span class="p">]</span></div>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Audio format </span><span class="si">%r</span><span class="s2"> unavailable (need soundfile); returning WAV"</span><span class="p">,</span> <span class="n">fmt</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">pcm16_to_wav_bytes</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">),</span> <span class="n">AUDIO_FORMAT_MIME</span><span class="p">[</span><span class="s2">"wav"</span><span class="p">]</span></div>
 
 
 
@@ -1031,48 +1033,48 @@ window.runMermaid = runMermaid;</script>
     <span class="n">video_mp4</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">pcm</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_channels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2</span><span class="p">,</span>
     <span class="n">video_fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Mux an H.264 mp4 and raw interleaved 16-bit PCM into one mp4 with an AAC</span>
+<span class="w">    </span><span class="sd">"""Mux an H.264 mp4 and raw interleaved 16-bit PCM into one mp4 with an AAC</span>
 <span class="sd">    audio track (stream-copies the video). ``video_fps`` is the true frame rate</span>
-<span class="sd">    of the content: when it differs from the container&#39;s rate the video</span>
+<span class="sd">    of the content: when it differs from the container's rate the video</span>
 <span class="sd">    timestamps are rescaled (no re-encode) so playback runs at the real rate</span>
 <span class="sd">    and stays in sync with the audio track. Requires the ``ffmpeg`` binary;</span>
-<span class="sd">    raises on failure — callers fall back to the video-only mp4.&quot;&quot;&quot;</span>
+<span class="sd">    raises on failure — callers fall back to the video-only mp4."""</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
 
     <span class="k">with</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">()</span> <span class="k">as</span> <span class="n">tmp</span><span class="p">:</span>
-        <span class="n">vpath</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;v.mp4&quot;</span>
-        <span class="n">apath</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;a.pcm&quot;</span>
-        <span class="n">opath</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;out.mp4&quot;</span>
+        <span class="n">vpath</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"v.mp4"</span>
+        <span class="n">apath</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"a.pcm"</span>
+        <span class="n">opath</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"out.mp4"</span>
         <span class="n">vpath</span><span class="o">.</span><span class="n">write_bytes</span><span class="p">(</span><span class="n">video_mp4</span><span class="p">)</span>
         <span class="n">apath</span><span class="o">.</span><span class="n">write_bytes</span><span class="p">(</span><span class="n">pcm</span><span class="p">)</span>
         <span class="n">itsscale</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="n">video_fps</span><span class="p">:</span>
             <span class="n">probe</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
-                <span class="p">[</span><span class="s2">&quot;ffprobe&quot;</span><span class="p">,</span> <span class="s2">&quot;-v&quot;</span><span class="p">,</span> <span class="s2">&quot;error&quot;</span><span class="p">,</span> <span class="s2">&quot;-select_streams&quot;</span><span class="p">,</span> <span class="s2">&quot;v:0&quot;</span><span class="p">,</span>
-                 <span class="s2">&quot;-show_entries&quot;</span><span class="p">,</span> <span class="s2">&quot;stream=avg_frame_rate&quot;</span><span class="p">,</span> <span class="s2">&quot;-of&quot;</span><span class="p">,</span> <span class="s2">&quot;csv=p=0&quot;</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">vpath</span><span class="p">)],</span>
+                <span class="p">[</span><span class="s2">"ffprobe"</span><span class="p">,</span> <span class="s2">"-v"</span><span class="p">,</span> <span class="s2">"error"</span><span class="p">,</span> <span class="s2">"-select_streams"</span><span class="p">,</span> <span class="s2">"v:0"</span><span class="p">,</span>
+                 <span class="s2">"-show_entries"</span><span class="p">,</span> <span class="s2">"stream=avg_frame_rate"</span><span class="p">,</span> <span class="s2">"-of"</span><span class="p">,</span> <span class="s2">"csv=p=0"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">vpath</span><span class="p">)],</span>
                 <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">30</span><span class="p">,</span> <span class="n">check</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="k">try</span><span class="p">:</span>
-                <span class="n">num</span><span class="p">,</span> <span class="n">den</span> <span class="o">=</span> <span class="n">probe</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;/&quot;</span><span class="p">)</span>
+                <span class="n">num</span><span class="p">,</span> <span class="n">den</span> <span class="o">=</span> <span class="n">probe</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"/"</span><span class="p">)</span>
                 <span class="n">container_fps</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">num</span><span class="p">)</span> <span class="o">/</span> <span class="nb">float</span><span class="p">(</span><span class="n">den</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">container_fps</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="nb">abs</span><span class="p">(</span><span class="n">container_fps</span> <span class="o">-</span> <span class="n">video_fps</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mf">1e-3</span><span class="p">:</span>
                     <span class="n">itsscale</span> <span class="o">=</span> <span class="n">container_fps</span> <span class="o">/</span> <span class="nb">float</span><span class="p">(</span><span class="n">video_fps</span><span class="p">)</span>
             <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">ZeroDivisionError</span><span class="p">):</span>
                 <span class="k">pass</span>
-        <span class="n">cmd</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;ffmpeg&quot;</span><span class="p">,</span> <span class="s2">&quot;-y&quot;</span><span class="p">,</span> <span class="s2">&quot;-v&quot;</span><span class="p">,</span> <span class="s2">&quot;error&quot;</span><span class="p">]</span>
+        <span class="n">cmd</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"ffmpeg"</span><span class="p">,</span> <span class="s2">"-y"</span><span class="p">,</span> <span class="s2">"-v"</span><span class="p">,</span> <span class="s2">"error"</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">itsscale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">cmd</span> <span class="o">+=</span> <span class="p">[</span><span class="s2">&quot;-itsscale&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">itsscale</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">]</span>
+            <span class="n">cmd</span> <span class="o">+=</span> <span class="p">[</span><span class="s2">"-itsscale"</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">itsscale</span><span class="si">:</span><span class="s2">.6f</span><span class="si">}</span><span class="s2">"</span><span class="p">]</span>
         <span class="n">cmd</span> <span class="o">+=</span> <span class="p">[</span>
-            <span class="s2">&quot;-i&quot;</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">vpath</span><span class="p">),</span>
-            <span class="s2">&quot;-f&quot;</span><span class="p">,</span> <span class="s2">&quot;s16le&quot;</span><span class="p">,</span> <span class="s2">&quot;-ar&quot;</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">)),</span> <span class="s2">&quot;-ac&quot;</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">num_channels</span><span class="p">)),</span> <span class="s2">&quot;-i&quot;</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">apath</span><span class="p">),</span>
-            <span class="s2">&quot;-c:v&quot;</span><span class="p">,</span> <span class="s2">&quot;copy&quot;</span><span class="p">,</span> <span class="s2">&quot;-c:a&quot;</span><span class="p">,</span> <span class="s2">&quot;aac&quot;</span><span class="p">,</span> <span class="s2">&quot;-b:a&quot;</span><span class="p">,</span> <span class="s2">&quot;192k&quot;</span><span class="p">,</span>
-            <span class="s2">&quot;-movflags&quot;</span><span class="p">,</span> <span class="s2">&quot;+faststart&quot;</span><span class="p">,</span>
+            <span class="s2">"-i"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">vpath</span><span class="p">),</span>
+            <span class="s2">"-f"</span><span class="p">,</span> <span class="s2">"s16le"</span><span class="p">,</span> <span class="s2">"-ar"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">)),</span> <span class="s2">"-ac"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">num_channels</span><span class="p">)),</span> <span class="s2">"-i"</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">apath</span><span class="p">),</span>
+            <span class="s2">"-c:v"</span><span class="p">,</span> <span class="s2">"copy"</span><span class="p">,</span> <span class="s2">"-c:a"</span><span class="p">,</span> <span class="s2">"aac"</span><span class="p">,</span> <span class="s2">"-b:a"</span><span class="p">,</span> <span class="s2">"192k"</span><span class="p">,</span>
+            <span class="s2">"-movflags"</span><span class="p">,</span> <span class="s2">"+faststart"</span><span class="p">,</span>
             <span class="nb">str</span><span class="p">(</span><span class="n">opath</span><span class="p">),</span>
         <span class="p">]</span>
         <span class="n">proc</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">cmd</span><span class="p">,</span> <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">120</span><span class="p">,</span> <span class="n">check</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">proc</span><span class="o">.</span><span class="n">returncode</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ffmpeg mux failed: </span><span class="si">{</span><span class="n">proc</span><span class="o">.</span><span class="n">stderr</span><span class="o">.</span><span class="n">strip</span><span class="p">()[:</span><span class="mi">500</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"ffmpeg mux failed: </span><span class="si">{</span><span class="n">proc</span><span class="o">.</span><span class="n">stderr</span><span class="o">.</span><span class="n">strip</span><span class="p">()[:</span><span class="mi">500</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">opath</span><span class="o">.</span><span class="n">read_bytes</span><span class="p">()</span></div>
 
 
@@ -1080,21 +1082,21 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="wav_stream_header">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.wav_stream_header">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">wav_stream_header</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_channels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">bits</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;A 44-byte WAV header with streaming (unknown-length) size fields.</span>
+<span class="w">    </span><span class="sd">"""A 44-byte WAV header with streaming (unknown-length) size fields.</span>
 
 <span class="sd">    Used to stream TTS audio over a single HTTP response: emit this header, then</span>
 <span class="sd">    16-bit PCM frames as they arrive. The 0xFFFFFFFF placeholders signal an</span>
-<span class="sd">    open-ended stream, which players and the OpenAI client&#39;s</span>
+<span class="sd">    open-ended stream, which players and the OpenAI client's</span>
 <span class="sd">    ``stream_to_file`` handle.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
 
     <span class="n">byte_rate</span> <span class="o">=</span> <span class="n">sample_rate</span> <span class="o">*</span> <span class="n">num_channels</span> <span class="o">*</span> <span class="n">bits</span> <span class="o">//</span> <span class="mi">8</span>
     <span class="n">block_align</span> <span class="o">=</span> <span class="n">num_channels</span> <span class="o">*</span> <span class="n">bits</span> <span class="o">//</span> <span class="mi">8</span>
     <span class="k">return</span> <span class="p">(</span>
-        <span class="sa">b</span><span class="s2">&quot;RIFF&quot;</span> <span class="o">+</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&lt;I&quot;</span><span class="p">,</span> <span class="mh">0xFFFFFFFF</span><span class="p">)</span> <span class="o">+</span> <span class="sa">b</span><span class="s2">&quot;WAVE&quot;</span>
-        <span class="o">+</span> <span class="sa">b</span><span class="s2">&quot;fmt &quot;</span> <span class="o">+</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&lt;IHHIIHH&quot;</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">num_channels</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">byte_rate</span><span class="p">,</span> <span class="n">block_align</span><span class="p">,</span> <span class="n">bits</span><span class="p">)</span>
-        <span class="o">+</span> <span class="sa">b</span><span class="s2">&quot;data&quot;</span> <span class="o">+</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&lt;I&quot;</span><span class="p">,</span> <span class="mh">0xFFFFFFFF</span><span class="p">)</span>
+        <span class="sa">b</span><span class="s2">"RIFF"</span> <span class="o">+</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">"&lt;I"</span><span class="p">,</span> <span class="mh">0xFFFFFFFF</span><span class="p">)</span> <span class="o">+</span> <span class="sa">b</span><span class="s2">"WAVE"</span>
+        <span class="o">+</span> <span class="sa">b</span><span class="s2">"fmt "</span> <span class="o">+</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">"&lt;IHHIIHH"</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">num_channels</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">byte_rate</span><span class="p">,</span> <span class="n">block_align</span><span class="p">,</span> <span class="n">bits</span><span class="p">)</span>
+        <span class="o">+</span> <span class="sa">b</span><span class="s2">"data"</span> <span class="o">+</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">"&lt;I"</span><span class="p">,</span> <span class="mh">0xFFFFFFFF</span><span class="p">)</span>
     <span class="p">)</span></div>
 
 
@@ -1102,8 +1104,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="png_to_data_url">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.png_to_data_url">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">png_to_data_url</span><span class="p">(</span><span class="n">png_bytes</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Encode PNG image bytes (the model&#39;s image output) as a data URL.&quot;&quot;&quot;</span>
-    <span class="k">return</span> <span class="s2">&quot;data:image/png;base64,&quot;</span> <span class="o">+</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">png_bytes</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;ascii&quot;</span><span class="p">)</span></div>
+<span class="w">    </span><span class="sd">"""Encode PNG image bytes (the model's image output) as a data URL."""</span>
+    <span class="k">return</span> <span class="s2">"data:image/png;base64,"</span> <span class="o">+</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">png_bytes</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">)</span></div>
 
 </pre></div>
 
@@ -1152,7 +1154,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

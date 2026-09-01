@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.utils.profiler</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Utilities for NVTX range annotations for profiling with nsys.&quot;&quot;&quot;</span>
+<span></span><span class="sd">"""Utilities for NVTX range annotations for profiling with nsys."""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -821,15 +823,15 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="range_push">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.range_push">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">range_push</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">synchronize</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Push an NVTX range, optionally syncing before the marker.</span>
+<span class="w">    </span><span class="sd">"""Push an NVTX range, optionally syncing before the marker.</span>
 
-<span class="sd">    Default is ``synchronize=False`` so adding NVTX markers doesn&#39;t</span>
+<span class="sd">    Default is ``synchronize=False`` so adding NVTX markers doesn't</span>
 <span class="sd">    serialize the execution. Set ``synchronize=True`` only when the</span>
 <span class="sd">    caller specifically wants the range to extend over the GPU work it</span>
 <span class="sd">    wraps (e.g. an ad-hoc benchmark of one kernel) — and remember that</span>
 <span class="sd">    each ``synchronize=True`` call drains the *entire* default stream</span>
 <span class="sd">    via ``torch.cuda.synchronize()``, not just the wrapped kernel.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">if</span> <span class="n">synchronize</span><span class="p">:</span>
         <span class="n">_sync_if_available</span><span class="p">()</span>
 
@@ -840,10 +842,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="range_pop">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.range_pop">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">range_pop</span><span class="p">(</span><span class="o">*</span><span class="p">,</span> <span class="n">synchronize</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Pop the current NVTX range, optionally syncing before the marker.</span>
+<span class="w">    </span><span class="sd">"""Pop the current NVTX range, optionally syncing before the marker.</span>
 
 <span class="sd">    Same semantics as ``range_push`` — default is ``synchronize=False``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="k">if</span> <span class="n">synchronize</span><span class="p">:</span>
         <span class="n">_sync_if_available</span><span class="p">()</span>
 
@@ -854,7 +856,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="mark">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.mark">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">mark</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Emit an instant NVTX marker without CUDA synchronization.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Emit an instant NVTX marker without CUDA synchronization."""</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">nvtx</span><span class="o">.</span><span class="n">mark</span><span class="p">(</span><span class="n">name</span><span class="p">)</span></div>
 
 
@@ -863,7 +865,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.nvtx_range">[docs]</a>
 <span class="nd">@contextmanager</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">nvtx_range</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">synchronize</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="kc">None</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Convenience context manager for `range_push`/`range_pop`.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Convenience context manager for `range_push`/`range_pop`."""</span>
     <span class="n">range_push</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">synchronize</span><span class="o">=</span><span class="n">synchronize</span><span class="p">)</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="k">yield</span>
@@ -917,7 +919,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -810,26 +812,26 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">NestedLoopIndices</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;A snapshot of where execution is across nested loops at a given moment.</span>
+<span class="w">    </span><span class="sd">"""A snapshot of where execution is across nested loops at a given moment.</span>
 
-<span class="sd">    Used by the conductor&#39;s stop-loop ordering to decide whether a freshly-</span>
-<span class="sd">    received stop request is &quot;newer&quot; than a previously-applied one — so we</span>
-<span class="sd">    don&#39;t double-stop the same loop when re-ordering messages.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    Used by the conductor's stop-loop ordering to decide whether a freshly-</span>
+<span class="sd">    received stop request is "newer" than a previously-applied one — so we</span>
+<span class="sd">    don't double-stop the same loop when re-ordering messages.</span>
+<span class="sd">    """</span>
     <span class="n">loop_name_order</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>   <span class="c1"># outer → inner</span>
     <span class="n">loop_indices</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>
     <span class="n">wg_fwd_pass_idx</span><span class="p">:</span> <span class="nb">int</span>
 
 <div class="viewcode-block" id="NestedLoopIndices.label_context_gt">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.label_context_gt">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">label_context_gt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;NestedLoopIndices | None&quot;</span><span class="p">,</span> <span class="n">target_loop_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Whether ``self``&#39;s iter indices are strictly greater than ``other``&#39;s,</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">label_context_gt</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">"NestedLoopIndices | None"</span><span class="p">,</span> <span class="n">target_loop_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether ``self``'s iter indices are strictly greater than ``other``'s,</span>
 <span class="sd">        in the path leading up to (but not including) ``target_loop_name``.</span>
 
-<span class="sd">        Example: if we&#39;re stopping the loop ``target_loop_name`` but don&#39;t want</span>
+<span class="sd">        Example: if we're stopping the loop ``target_loop_name`` but don't want</span>
 <span class="sd">        to double-stop it, we can keep the last time it was stopped and only</span>
 <span class="sd">        re-stop it again when ``new_time.label_context_gt(prev, target) == True``.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="k">if</span> <span class="n">other</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">wg_fwd_pass_idx</span> <span class="o">&gt;</span> <span class="n">other</span><span class="o">.</span><span class="n">wg_fwd_pass_idx</span><span class="p">:</span>
@@ -851,7 +853,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="NestedLoopIndices.max">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.max">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">max</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">&quot;NestedLoopIndices | None&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;NestedLoopIndices&quot;</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">"NestedLoopIndices | None"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"NestedLoopIndices"</span><span class="p">:</span>
         <span class="k">if</span> <span class="n">other</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span>
         <span class="k">if</span> <span class="n">other</span><span class="o">.</span><span class="n">label_context_gt</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -906,7 +908,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

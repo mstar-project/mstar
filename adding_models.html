@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -591,7 +591,7 @@ get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
      │
      ▼   (conductor walks the graph, running nodes via engines)
 get_partition_forward_pass_args() # asked after each graph walk completes:
-                                  #   what&#39;s next? done?
+                                  #   what's next? done?
      │
      ▼
 postprocess()                 # model output tensor -&gt; bytes for the client
@@ -624,12 +624,12 @@ under <code class="docutils literal notranslate"><span class="pre">model:</span>
 
 <span class="n">MODEL_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">type</span><span class="p">[</span><span class="n">Model</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="c1"># ...</span>
-    <span class="s2">&quot;your_model&quot;</span><span class="p">:</span> <span class="n">YourModel</span><span class="p">,</span>
+    <span class="s2">"your_model"</span><span class="p">:</span> <span class="n">YourModel</span><span class="p">,</span>
 <span class="p">}</span>
 
 <span class="n">HF_MODELS</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="c1"># ...</span>
-    <span class="s2">&quot;your_model&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;model_path_hf&quot;</span><span class="p">:</span> <span class="s2">&quot;org/your-model-id&quot;</span><span class="p">},</span>
+    <span class="s2">"your_model"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"model_path_hf"</span><span class="p">:</span> <span class="s2">"org/your-model-id"</span><span class="p">},</span>
 <span class="p">}</span>
 </pre></div>
 </div>
@@ -701,13 +701,23 @@ Cache the result. Return <code class="docutils literal notranslate"><span class=
 per node), <code class="docutils literal notranslate"><span class="pre">get_aux_sampling_configs</span></code> (see below), <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>,
 <code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code> / <code class="docutils literal notranslate"><span class="pre">load_audio</span></code> / <code class="docutils literal notranslate"><span class="pre">load_video</span></code>, and the
 partition API below.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> reaches your model from clients through the OpenAI routes’
+<code class="docutils literal notranslate"><span class="pre">extra_body</span></code> passthrough. The Dynamo bridge
+(<code class="docutils literal notranslate"><span class="pre">mstar/integrations/dynamo/bridges.py</span></code>) strips OpenAI-standard fields no
+model consumes (<code class="docutils literal notranslate"><span class="pre">_STRIP_KEYS</span></code>) before that passthrough runs. If your model
+starts reading such a field from <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> — the way <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code> is
+read — also delete the key from <code class="docutils literal notranslate"><span class="pre">_STRIP_KEYS</span></code>, or requests arriving through
+the Dynamo frontend will silently lose it.</p>
+</div>
 <p>A node whose forward samples <strong>more than once per step</strong> with different parameters
 declares the extra configs from <code class="docutils literal notranslate"><span class="pre">get_aux_sampling_configs(node_name,</span> <span class="pre">model_kwargs)</span></code>,
 which returns <code class="docutils literal notranslate"><span class="pre">label</span> <span class="pre">-&gt;</span> <span class="pre">SamplingConfig</span></code>. Qwen3-Omni’s Talker does this: the Talker LLM
 samples codec group 0 from the main config, and the CodePredictor samples groups
 1..N-1 from the <code class="docutils literal notranslate"><span class="pre">&quot;code_predictor&quot;</span></code> aux config. The submodule then samples with:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">layer0</span> <span class="o">=</span> <span class="n">sampler</span><span class="o">.</span><span class="n">sample</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>                      <span class="c1"># main config</span>
-<span class="n">code</span> <span class="o">=</span> <span class="n">sampler</span><span class="o">.</span><span class="n">sample_aux</span><span class="p">(</span><span class="s2">&quot;code_predictor&quot;</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>  <span class="c1"># aux config</span>
+<span class="n">code</span> <span class="o">=</span> <span class="n">sampler</span><span class="o">.</span><span class="n">sample_aux</span><span class="p">(</span><span class="s2">"code_predictor"</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">,</span> <span class="n">logits</span><span class="p">)</span>  <span class="c1"># aux config</span>
 </pre></div>
 </div>
 <p>Each label gets its own sampler buffers (independent per-request params, philox stream
@@ -744,18 +754,18 @@ stop signal against that loop (e.g. on EOS). This is the usual <code class="docu
 <code class="docutils literal notranslate"><span class="pre">Loop</span></code> whose body feeds its own output back as the next input:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_graph_walk_graphs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]:</span>
     <span class="n">prefill</span> <span class="o">=</span> <span class="n">GraphNode</span><span class="p">(</span>
-        <span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span>
-        <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text_inputs&quot;</span><span class="p">],</span>
+        <span class="n">name</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span>
+        <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">],</span>
         <span class="c1"># the generated token persists so the decode loop can pick it up</span>
-        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMPTY_DESTINATION</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;new_token&quot;</span><span class="p">,</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMPTY_DESTINATION</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"new_token"</span><span class="p">,</span>
                            <span class="n">persist</span><span class="o">=</span><span class="kc">True</span><span class="p">)],</span>
     <span class="p">)</span>
     <span class="n">decode</span> <span class="o">=</span> <span class="n">Loop</span><span class="p">(</span>
-        <span class="n">name</span><span class="o">=</span><span class="s2">&quot;decode_loop&quot;</span><span class="p">,</span>
+        <span class="n">name</span><span class="o">=</span><span class="s2">"decode_loop"</span><span class="p">,</span>
         <span class="n">section</span><span class="o">=</span><span class="n">GraphNode</span><span class="p">(</span>
-            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span>
-            <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;text_inputs&quot;</span><span class="p">],</span>
-            <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;text_inputs&quot;</span><span class="p">)],</span>  <span class="c1"># loop-back</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span>
+            <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">],</span>
+            <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"text_inputs"</span><span class="p">)],</span>  <span class="c1"># loop-back</span>
         <span class="p">),</span>
         <span class="n">max_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">get_max_output_tokens</span><span class="p">(),</span>
         <span class="n">outputs</span><span class="o">=</span><span class="p">[],</span>
@@ -831,7 +841,7 @@ rewrites or drops checkpoint keys that don’t line up with your parameter paths
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># in the Model: build on meta, materialize, hand off to the driver</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">_create_llm_submodule</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">tp_group</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_weights</span>
-    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;meta&quot;</span><span class="p">):</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"meta"</span><span class="p">):</span>
         <span class="n">language_model</span> <span class="o">=</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">tp_group</span><span class="p">)</span>
     <span class="n">language_model</span><span class="o">.</span><span class="n">to_empty</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
     <span class="n">load_weights</span><span class="p">(</span><span class="n">language_model</span><span class="p">,</span> <span class="n">local_dir</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>  <span class="c1"># → module.load_weights(...)</span>
@@ -916,15 +926,15 @@ a packed <code class="docutils literal notranslate"><span class="pre">prefill</s
     <span class="p">}</span>
     <span class="k">return</span> <span class="p">[</span>
         <span class="n">BasicBatchedCudaGraphConfig</span><span class="p">(</span>
-            <span class="n">capture_graph_walk</span><span class="o">=</span><span class="s2">&quot;decode&quot;</span><span class="p">,</span>
+            <span class="n">capture_graph_walk</span><span class="o">=</span><span class="s2">"decode"</span><span class="p">,</span>
             <span class="n">single_request_inputs</span><span class="o">=</span><span class="n">ARNodeInputs</span><span class="p">(</span>
                 <span class="n">input_ids</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
                 <span class="n">input_seq_len</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
             <span class="p">),</span>
         <span class="p">),</span>
         <span class="n">FlashInferPackedCudaGraphConfig</span><span class="p">(</span>
-            <span class="n">capture_graph_walk</span><span class="o">=</span><span class="s2">&quot;prefill&quot;</span><span class="p">,</span>
-            <span class="n">replay_graph_walks</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;prefill&quot;</span><span class="p">],</span>
+            <span class="n">capture_graph_walk</span><span class="o">=</span><span class="s2">"prefill"</span><span class="p">,</span>
+            <span class="n">replay_graph_walks</span><span class="o">=</span><span class="p">[</span><span class="s2">"prefill"</span><span class="p">],</span>
             <span class="n">packed_seq_len_to_inputs</span><span class="o">=</span><span class="n">prefill_packed</span><span class="p">,</span>
             <span class="n">causal_attention</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">capture_batch_sizes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">PREFILL_CAPTURE_BATCH_SIZES</span><span class="p">,</span>
@@ -1033,30 +1043,30 @@ and an eager postamble:</p>
 
     <span class="c1"># --- the captured inner region ---</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_block_loop</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">static_inputs</span><span class="p">,</span> <span class="n">static_cm</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">n_layers</span><span class="p">):</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">static_inputs</span><span class="p">[</span><span class="s2">&quot;x&quot;</span><span class="p">]</span>          <span class="c1"># READ, never reassign the dict entries</span>
-        <span class="n">pos</span> <span class="o">=</span> <span class="n">static_inputs</span><span class="p">[</span><span class="s2">&quot;pos&quot;</span><span class="p">]</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">static_inputs</span><span class="p">[</span><span class="s2">"x"</span><span class="p">]</span>          <span class="c1"># READ, never reassign the dict entries</span>
+        <span class="n">pos</span> <span class="o">=</span> <span class="n">static_inputs</span><span class="p">[</span><span class="s2">"pos"</span><span class="p">]</span>
         <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">n_layers</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">static_cm</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">static_cm</span><span class="o">.</span><span class="n">set_layer_idx</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
             <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">i</span><span class="p">](</span><span class="n">x</span><span class="p">,</span> <span class="n">pos</span><span class="o">=</span><span class="n">pos</span><span class="p">,</span> <span class="n">cache_handle</span><span class="o">=</span><span class="n">static_cm</span><span class="p">)</span>
-        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;x&quot;</span><span class="p">:</span> <span class="n">x</span><span class="p">}</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">"x"</span><span class="p">:</span> <span class="n">x</span><span class="p">}</span>
 
     <span class="c1"># --- declare the graph ---</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_piecewise_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
         <span class="k">def</span><span class="w"> </span><span class="nf">make_static_inputs</span><span class="p">(</span><span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">):</span>
             <span class="k">return</span> <span class="p">{</span>
-                <span class="s2">&quot;x&quot;</span><span class="p">:</span>   <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed_dim</span><span class="p">,</span>
+                <span class="s2">"x"</span><span class="p">:</span>   <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed_dim</span><span class="p">,</span>
                                    <span class="n">dtype</span><span class="o">=</span><span class="n">autocast_dtype</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
-                <span class="s2">&quot;pos&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+                <span class="s2">"pos"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
             <span class="p">}</span>
         <span class="k">return</span> <span class="p">{</span>
-            <span class="s2">&quot;block_loop&quot;</span><span class="p">:</span> <span class="n">PiecewiseBatchedConfig</span><span class="p">(</span>
+            <span class="s2">"block_loop"</span><span class="p">:</span> <span class="n">PiecewiseBatchedConfig</span><span class="p">(</span>
                 <span class="n">capture_fn</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_block_loop</span><span class="p">,</span>
                 <span class="n">make_static_inputs</span><span class="o">=</span><span class="n">make_static_inputs</span><span class="p">,</span>
                 <span class="n">seq_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">seq_len</span><span class="p">,</span>
-                <span class="n">forward_kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;n_layers&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">)},</span>
+                <span class="n">forward_kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">"n_layers"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">)},</span>
                 <span class="n">uses_kv_cache</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="n">cache_labels</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;main&quot;</span><span class="p">],</span>
+                <span class="n">cache_labels</span><span class="o">=</span><span class="p">[</span><span class="s2">"main"</span><span class="p">],</span>
                 <span class="n">capture_batch_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">],</span>
             <span class="p">)</span>
         <span class="p">}</span>
@@ -1065,19 +1075,19 @@ and an eager postamble:</p>
     <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">hidden</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
         <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embed</span><span class="p">(</span><span class="n">hidden</span><span class="p">)</span>                              <span class="c1"># eager preamble → [B, seq_len, D]</span>
         <span class="n">pos</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_positions</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>                    <span class="c1"># hoisted out of the graph</span>
-        <span class="n">runner</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">piecewise_runners</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;block_loop&quot;</span><span class="p">)</span>
+        <span class="n">runner</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">piecewise_runners</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"block_loop"</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">runner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">runner</span><span class="o">.</span><span class="n">can_run</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)):</span>
             <span class="n">out</span> <span class="o">=</span> <span class="n">runner</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>                              <span class="c1"># plans + replays + advances</span>
-                <span class="n">static_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;x&quot;</span><span class="p">:</span> <span class="n">x</span><span class="p">,</span> <span class="s2">&quot;pos&quot;</span><span class="p">:</span> <span class="n">pos</span><span class="p">},</span>
+                <span class="n">static_inputs</span><span class="o">=</span><span class="p">{</span><span class="s2">"x"</span><span class="p">:</span> <span class="n">x</span><span class="p">,</span> <span class="s2">"pos"</span><span class="p">:</span> <span class="n">pos</span><span class="p">},</span>
                 <span class="n">request_ids</span><span class="o">=</span><span class="n">engine_inputs</span><span class="o">.</span><span class="n">request_ids</span><span class="p">,</span>
             <span class="p">)</span>
-            <span class="n">x</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">&quot;x&quot;</span><span class="p">]</span>                                   <span class="c1"># owned clone, [B, seq_len, D]</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">"x"</span><span class="p">]</span>                                   <span class="c1"># owned clone, [B, seq_len, D]</span>
         <span class="k">else</span><span class="p">:</span>                                              <span class="c1"># eager fallback (no capture)</span>
             <span class="n">cm</span> <span class="o">=</span> <span class="n">engine_inputs</span><span class="o">.</span><span class="n">cache_manager</span>
-            <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_block_loop</span><span class="p">({</span><span class="s2">&quot;x&quot;</span><span class="p">:</span> <span class="n">x</span><span class="p">,</span> <span class="s2">&quot;pos&quot;</span><span class="p">:</span> <span class="n">pos</span><span class="p">},</span> <span class="n">cm</span><span class="p">,</span>
-                                 <span class="n">n_layers</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">))[</span><span class="s2">&quot;x&quot;</span><span class="p">]</span>
+            <span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_block_loop</span><span class="p">({</span><span class="s2">"x"</span><span class="p">:</span> <span class="n">x</span><span class="p">,</span> <span class="s2">"pos"</span><span class="p">:</span> <span class="n">pos</span><span class="p">},</span> <span class="n">cm</span><span class="p">,</span>
+                                 <span class="n">n_layers</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">))[</span><span class="s2">"x"</span><span class="p">]</span>
             <span class="n">cm</span><span class="o">.</span><span class="n">advance_seq_lens</span><span class="p">()</span>
-        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;pred&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">x</span><span class="p">)}</span>                      <span class="c1"># eager postamble</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">"pred"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">proj</span><span class="p">(</span><span class="n">x</span><span class="p">)}</span>                      <span class="c1"># eager postamble</span>
 </pre></div>
 </div>
 <p>Notes carried by the example: positions are computed eagerly and passed through
@@ -1128,10 +1138,10 @@ gives <code class="docutils literal notranslate"><span class="pre">KV_CACHE</spa
 <p>A config maps nodes to GPU ranks. The key under <code class="docutils literal notranslate"><span class="pre">model:</span></code> is your registry key; each
 <code class="docutils literal notranslate"><span class="pre">node_groups</span></code> entry assigns one or more <code class="docutils literal notranslate"><span class="pre">node_names</span></code> to <code class="docutils literal notranslate"><span class="pre">ranks</span></code>, optionally scoped
 to specific <code class="docutils literal notranslate"><span class="pre">graph_walks</span></code> (this is how prefill/decode disaggregation is expressed).</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;your_model&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"your_model"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
 <span class="nt">node_groups</span><span class="p">:</span>
-<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;LLM&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"LLM"</span><span class="p p-Indicator">]</span>
 <span class="w">    </span><span class="nt">ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]</span>
 </pre></div>
 </div>
@@ -1154,7 +1164,7 @@ Qwen3-Omni Talker leaves its code predictor replicated). Once a component is bui
 way, going from single-GPU to tensor-parallel needs only the YAML and a small sharding
 declaration — no further model-code changes. For example, running the Orpheus LLM tensor-parallel across two
 GPUs (<code class="docutils literal notranslate"><span class="pre">configs/orpheus_tp2.yaml</span></code>):</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;orpheus&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"orpheus"</span>
 <span class="nt">node_groups</span><span class="p">:</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">]</span>
 <span class="w">    </span><span class="nt">ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">]</span>
@@ -1170,7 +1180,7 @@ Override <code class="docutils literal notranslate"><span class="pre">get_defaul
 shardable nodes (and any non-default shard dimensions):</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_default_sharding_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ShardingConfig</span>
-    <span class="k">return</span> <span class="n">ShardingConfig</span><span class="p">(</span><span class="n">groups</span><span class="o">=</span><span class="p">[],</span> <span class="n">tp_enabled_nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;LLM&quot;</span><span class="p">},</span> <span class="n">shard_dim</span><span class="o">=</span><span class="p">{})</span>
+    <span class="k">return</span> <span class="n">ShardingConfig</span><span class="p">(</span><span class="n">groups</span><span class="o">=</span><span class="p">[],</span> <span class="n">tp_enabled_nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span> <span class="n">shard_dim</span><span class="o">=</span><span class="p">{})</span>
 </pre></div>
 </div>
 <p>Two pieces split work across the TP group, and it helps to keep them separate:</p>
@@ -1196,18 +1206,18 @@ a Llama 3.2 3B LLM emits audio tokens, and a SNAC decoder turns them into 24 kHz
 <p>Two nodes, two engines — the LLM needs a KV cache, the SNAC decoder doesn’t:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_node_engine_types</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">EngineType</span><span class="p">]:</span>
     <span class="k">return</span> <span class="p">{</span>
-        <span class="s2">&quot;LLM&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>
-        <span class="s2">&quot;snac_decoder&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>
+        <span class="s2">"LLM"</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>
+        <span class="s2">"snac_decoder"</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>
     <span class="p">}</span>
 </pre></div>
 </div>
 <p>Three graph walks — <code class="docutils literal notranslate"><span class="pre">prefill</span></code> and a <code class="docutils literal notranslate"><span class="pre">decode</span></code> <code class="docutils literal notranslate"><span class="pre">Loop</span></code> on the LLM, plus a
 <code class="docutils literal notranslate"><span class="pre">snac_chunk</span></code> node that emits audio to the client:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">snac_chunk</span> <span class="o">=</span> <span class="n">GraphNode</span><span class="p">(</span>
-    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;snac_decoder&quot;</span><span class="p">,</span>
-    <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;new_token&quot;</span><span class="p">],</span>
-    <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;audio_chunk&quot;</span><span class="p">,</span>
-                       <span class="n">output_modality</span><span class="o">=</span><span class="s2">&quot;audio&quot;</span><span class="p">)],</span>
+    <span class="n">name</span><span class="o">=</span><span class="s2">"snac_decoder"</span><span class="p">,</span>
+    <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"new_token"</span><span class="p">],</span>
+    <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"audio_chunk"</span><span class="p">,</span>
+                       <span class="n">output_modality</span><span class="o">=</span><span class="s2">"audio"</span><span class="p">)],</span>
 <span class="p">)</span>
 </pre></div>
 </div>
@@ -1237,14 +1247,14 @@ described below (<code class="docutils literal notranslate"><span class="pre">in
 All are declared up front:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_node_engine_types</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">EngineType</span><span class="p">]:</span>
     <span class="k">return</span> <span class="p">{</span>
-        <span class="s2">&quot;vit_encoder&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># SigLIP2 ViT (understanding)</span>
-        <span class="s2">&quot;vae_encoder&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># FLUX VAE encode (editing/gen)</span>
-        <span class="s2">&quot;init_latents&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># seed the image-gen latents</span>
-        <span class="s2">&quot;LLM&quot;</span><span class="p">:</span>          <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># Qwen2: embed + transformer + lm_head + CFG</span>
-        <span class="s2">&quot;LLM_cfg_text&quot;</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># CFG-parallel branch (text-only cond)</span>
-        <span class="s2">&quot;LLM_cfg_img&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># CFG-parallel branch (image cond)</span>
-        <span class="s2">&quot;combine_cfg&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># CFG combine + Euler step</span>
-        <span class="s2">&quot;vae_decoder&quot;</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># FLUX VAE decode → pixels</span>
+        <span class="s2">"vit_encoder"</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># SigLIP2 ViT (understanding)</span>
+        <span class="s2">"vae_encoder"</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># FLUX VAE encode (editing/gen)</span>
+        <span class="s2">"init_latents"</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># seed the image-gen latents</span>
+        <span class="s2">"LLM"</span><span class="p">:</span>          <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># Qwen2: embed + transformer + lm_head + CFG</span>
+        <span class="s2">"LLM_cfg_text"</span><span class="p">:</span> <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># CFG-parallel branch (text-only cond)</span>
+        <span class="s2">"LLM_cfg_img"</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span>    <span class="c1"># CFG-parallel branch (image cond)</span>
+        <span class="s2">"combine_cfg"</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># CFG combine + Euler step</span>
+        <span class="s2">"vae_decoder"</span><span class="p">:</span>  <span class="n">EngineType</span><span class="o">.</span><span class="n">STATELESS</span><span class="p">,</span>   <span class="c1"># FLUX VAE decode → pixels</span>
     <span class="p">}</span>
 </pre></div>
 </div>
@@ -1291,29 +1301,29 @@ then <code class="docutils literal notranslate"><span class="pre">vae_decoder</s
 followed by the decoder — note how the loop body loops <code class="docutils literal notranslate"><span class="pre">latents</span></code> and <code class="docutils literal notranslate"><span class="pre">time_index</span></code>
 back to itself, and the loop’s <code class="docutils literal notranslate"><span class="pre">outputs</span></code> hand the final latents to <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code>:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">prefill_vit</span> <span class="o">=</span> <span class="n">Sequential</span><span class="p">([</span>
-    <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">&quot;vit_encoder&quot;</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;image_inputs&quot;</span><span class="p">],</span>
-              <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;img_emb&quot;</span><span class="p">)]),</span>
-    <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;img_emb&quot;</span><span class="p">],</span>
-              <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;new_token&quot;</span><span class="p">,</span>
-                                 <span class="n">output_modality</span><span class="o">=</span><span class="s2">&quot;text&quot;</span><span class="p">,</span> <span class="n">persist</span><span class="o">=</span><span class="kc">True</span><span class="p">)]),</span>
+    <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">"vit_encoder"</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"image_inputs"</span><span class="p">],</span>
+              <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"img_emb"</span><span class="p">)]),</span>
+    <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"img_emb"</span><span class="p">],</span>
+              <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"new_token"</span><span class="p">,</span>
+                                 <span class="n">output_modality</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span> <span class="n">persist</span><span class="o">=</span><span class="kc">True</span><span class="p">)]),</span>
 <span class="p">])</span>
 
 <span class="n">image_gen</span> <span class="o">=</span> <span class="n">Sequential</span><span class="p">([</span>
     <span class="n">Loop</span><span class="p">(</span>
         <span class="n">section</span><span class="o">=</span><span class="n">GraphNode</span><span class="p">(</span>
-            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span>
-            <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;latents&quot;</span><span class="p">,</span> <span class="s2">&quot;time_index&quot;</span><span class="p">],</span>
-            <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;latents&quot;</span><span class="p">),</span>
-                     <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;LLM&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;time_index&quot;</span><span class="p">)],</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span>
+            <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"latents"</span><span class="p">,</span> <span class="s2">"time_index"</span><span class="p">],</span>
+            <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"latents"</span><span class="p">),</span>
+                     <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"LLM"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"time_index"</span><span class="p">)],</span>
         <span class="p">),</span>
         <span class="n">max_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_timesteps</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span>   <span class="c1"># one Euler step per interval</span>
-        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">&quot;vae_decoder&quot;</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;latents&quot;</span><span class="p">)],</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="s2">"vae_decoder"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"latents"</span><span class="p">)],</span>
     <span class="p">),</span>
     <span class="n">GraphNode</span><span class="p">(</span>
-        <span class="n">name</span><span class="o">=</span><span class="s2">&quot;vae_decoder&quot;</span><span class="p">,</span>
-        <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;latents&quot;</span><span class="p">],</span>
-        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">&quot;image_output&quot;</span><span class="p">,</span>
-                           <span class="n">output_modality</span><span class="o">=</span><span class="s2">&quot;image&quot;</span><span class="p">)],</span>
+        <span class="n">name</span><span class="o">=</span><span class="s2">"vae_decoder"</span><span class="p">,</span>
+        <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"latents"</span><span class="p">],</span>
+        <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"image_output"</span><span class="p">,</span>
+                           <span class="n">output_modality</span><span class="o">=</span><span class="s2">"image"</span><span class="p">)],</span>
     <span class="p">),</span>
 <span class="p">])</span>
 </pre></div>
@@ -1342,7 +1352,7 @@ a system prompt when <code class="docutils literal notranslate"><span class="pre
 <code class="docutils literal notranslate"><span class="pre">utf-8</span></code> text, <code class="docutils literal notranslate"><span class="pre">image</span></code> → PNG bytes.</p>
 <p><strong>Step 7 — Config and disaggregation.</strong> This is where BAGEL pays off. The <em>same</em> model
 code runs on one GPU:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;bagel&quot;</span>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"bagel"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32768</span>
 <span class="nt">node_groups</span><span class="p">:</span>
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">vit_encoder</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
@@ -1515,7 +1525,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

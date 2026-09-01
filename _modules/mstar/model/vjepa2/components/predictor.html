@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.vjepa2.components.predictor</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;V-JEPA 2 masked latent predictor.</span>
+<span></span><span class="sd">"""V-JEPA 2 masked latent predictor.</span>
 
 <span class="sd">Ports ``VJEPA2PredictorEmbeddings`` and ``VJEPA2Predictor`` from HuggingFace</span>
 <span class="sd">``transformers/models/vjepa2/modeling_vjepa2.py``.</span>
@@ -819,7 +821,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    predictor.layer.{N}.*</span>
 <span class="sd">    predictor.layernorm.{weight,bias}</span>
 <span class="sd">    predictor.proj.{weight,bias}</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -834,8 +836,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="VJEPA2PredictorEmbeddings">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.predictor.html#mstar.model.vjepa2.components.predictor.VJEPA2PredictorEmbeddings">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">VJEPA2PredictorEmbeddings</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Project encoder hidden states into predictor space and concatenate</span>
-<span class="sd">    learned mask tokens at the target positions.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Project encoder hidden states into predictor space and concatenate</span>
+<span class="sd">    learned mask tokens at the target positions."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">VJepa2Config</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -863,7 +865,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># Max patch id in the target mask determines how many mask tokens to</span>
         <span class="c1"># materialize before gather.  (Enables running predictor with more</span>
-        <span class="c1"># tokens than the config&#39;s frames_per_clip suggests.)</span>
+        <span class="c1"># tokens than the config's frames_per_clip suggests.)</span>
         <span class="n">max_patch_num</span> <span class="o">=</span> <span class="n">target_mask</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">max</span><span class="p">()</span> <span class="o">+</span> <span class="mi">1</span>
         <span class="n">target</span> <span class="o">=</span> <span class="n">target</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">max_patch_num</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
         <span class="n">target</span> <span class="o">=</span> <span class="n">apply_masks</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">target_mask</span><span class="p">)</span>
@@ -996,7 +998,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

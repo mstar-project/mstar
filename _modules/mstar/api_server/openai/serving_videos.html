@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.serving_videos</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;/v1/videos/generations (text-to-video and image-to-video) handler.&quot;&quot;&quot;</span>
+<span></span><span class="sd">"""/v1/videos/generations (text-to-video and image-to-video) handler."""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -820,13 +822,13 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html#mstar.api_server.openai.serving_videos.create_videos">[docs]</a>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
     <span class="n">args</span> <span class="o">=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">video_to_request</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
-    <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">&quot;vid&quot;</span><span class="p">)</span>
+    <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"vid"</span><span class="p">)</span>
 
     <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
         <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
         <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
         <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
-        <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;video&quot;</span><span class="p">],</span>
+        <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">],</span>
         <span class="n">model_kwargs</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">,</span>
         <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
@@ -834,15 +836,15 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
     <span class="c1"># Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the</span>
-    <span class="c1"># image endpoint&#39;s b64_json shape. A sound request additionally emits a raw</span>
+    <span class="c1"># image endpoint's b64_json shape. A sound request additionally emits a raw</span>
     <span class="c1"># 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one</span>
     <span class="c1"># playable file with sound); if the mux fails the plain video is returned.</span>
     <span class="c1"># The mux also rescales the video timestamps to the request frame rate: the</span>
-    <span class="c1"># video-only container always plays at the model&#39;s default fps, which would</span>
+    <span class="c1"># video-only container always plays at the model's default fps, which would</span>
     <span class="c1"># drift out of sync with the true-time audio track for other request rates.</span>
-    <span class="n">request_fps</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;fps&quot;</span><span class="p">)</span>
-    <span class="n">videos</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span><span class="o">.</span><span class="n">data</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">&quot;video&quot;</span><span class="p">]</span>
-    <span class="n">audios</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">&quot;audio&quot;</span><span class="p">]</span>
+    <span class="n">request_fps</span> <span class="o">=</span> <span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"fps"</span><span class="p">)</span>
+    <span class="n">videos</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span><span class="o">.</span><span class="n">data</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"video"</span><span class="p">]</span>
+    <span class="n">audios</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span><span class="p">]</span>
     <span class="n">data</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">video</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">videos</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">audios</span><span class="p">):</span>
@@ -851,14 +853,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">video</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">mux_mp4_with_pcm16</span><span class="p">(</span>
                     <span class="n">video</span><span class="p">,</span>
                     <span class="n">audio</span><span class="o">.</span><span class="n">data</span><span class="p">,</span>
-                    <span class="n">sample_rate</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">audio</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sample_rate&quot;</span><span class="p">,</span> <span class="mi">48000</span><span class="p">)),</span>
-                    <span class="n">num_channels</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">audio</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;num_channels&quot;</span><span class="p">,</span> <span class="mi">2</span><span class="p">)),</span>
+                    <span class="n">sample_rate</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">audio</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sample_rate"</span><span class="p">,</span> <span class="mi">48000</span><span class="p">)),</span>
+                    <span class="n">num_channels</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">audio</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"num_channels"</span><span class="p">,</span> <span class="mi">2</span><span class="p">)),</span>
                     <span class="n">video_fps</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">request_fps</span><span class="p">)</span> <span class="k">if</span> <span class="n">request_fps</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
                 <span class="p">)</span>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — degrade to video-only, keep serving</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">&quot;Muxing generated audio into the mp4 failed; returning video only&quot;</span><span class="p">)</span>
-        <span class="n">data</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;b64_json&quot;</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">video</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;ascii&quot;</span><span class="p">),</span> <span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">})</span>
-    <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;created&quot;</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">&quot;data&quot;</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
+                <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"Muxing generated audio into the mp4 failed; returning video only"</span><span class="p">)</span>
+        <span class="n">data</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">video</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">})</span>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">"created"</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
 
 </pre></div>
 
@@ -907,7 +909,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

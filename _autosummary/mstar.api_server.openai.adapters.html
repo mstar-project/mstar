@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -536,6 +536,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_chat</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_images</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_realtime"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_realtime</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_speech</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_videos</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.video_to_request()</span></code></a></li>
@@ -550,6 +551,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.speech_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.supports_chat</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_realtime"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.supports_realtime</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.supports_speech</span></code></a></li>
 </ul>
 </li>
@@ -844,6 +846,11 @@ docstring) and are reached only via <code class="docutils literal notranslate"><
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.supports_realtime">
+<span class="sig-name descname"><span class="pre">supports_realtime</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_realtime" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech">
 <span class="sig-name descname"><span class="pre">supports_speech</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -946,6 +953,11 @@ via <code class="docutils literal notranslate"><span class="pre">extra_body</spa
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_chat">
 <span class="sig-name descname"><span class="pre">supports_chat</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_chat" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_realtime">
+<span class="sig-name descname"><span class="pre">supports_realtime</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_realtime" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1136,6 +1148,7 @@ the models here apply their own prompt formatting in <code class="docutils liter
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_chat</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_images</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_realtime"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_realtime</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_speech</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_videos</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.video_to_request()</span></code></a></li>
@@ -1150,6 +1163,7 @@ the models here apply their own prompt formatting in <code class="docutils liter
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.speech_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.supports_chat</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_realtime"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.supports_realtime</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">Qwen3OmniAdapter.supports_speech</span></code></a></li>
 </ul>
 </li>
@@ -1201,7 +1215,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -814,14 +816,14 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.StreamingGraphEdge">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">StreamingGraphEdge</span><span class="p">(</span><span class="n">GraphEdge</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;A graph edge that carries streaming data between partitions.</span>
+<span class="w">    </span><span class="sd">"""A graph edge that carries streaming data between partitions.</span>
 
-<span class="sd">    Routed like a normal GraphEdge (producer is unaware it&#39;s streaming).</span>
+<span class="sd">    Routed like a normal GraphEdge (producer is unaware it's streaming).</span>
 <span class="sd">    On the consumer worker, the arriving tensors are buffered in a</span>
 <span class="sd">    StreamBuffer and gated by a ChunkPolicy before satisfying the</span>
-<span class="sd">    consuming node&#39;s input.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">target_partition</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+<span class="sd">    consuming node's input.</span>
+<span class="sd">    """</span>
+    <span class="n">target_partition</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">is_streaming</span> <span class="o">=</span> <span class="kc">True</span></div>
@@ -832,7 +834,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.Connection">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Connection</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Defines a streaming connection between two partitions.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Defines a streaming connection between two partitions."""</span>
     <span class="n">from_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">to_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span>
@@ -844,11 +846,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">PartitionTopology</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Declares how a model&#39;s computation is split into async partitions.</span>
+<span class="w">    </span><span class="sd">"""Declares how a model's computation is split into async partitions.</span>
 
 <span class="sd">    Each partition has its own set of graph walks. Connections define</span>
 <span class="sd">    streaming data flow between partitions via StreamBuffers.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">partitions</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">connections</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Connection</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span></div>
 
@@ -899,7 +901,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

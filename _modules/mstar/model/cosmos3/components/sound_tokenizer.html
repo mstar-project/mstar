@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.cosmos3.components.sound_tokenizer</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Cosmos3 AVAE sound tokenizer (decoder-only), ported from the diffusers-format</span>
+<span></span><span class="sd">"""Cosmos3 AVAE sound tokenizer (decoder-only), ported from the diffusers-format</span>
 <span class="sd">``sound_tokenizer/`` checkpoint component that ships with the Cosmos3 models.</span>
 
 <span class="sd">The checkpoint is an Oobleck-style 1D decoder (Snake activations, weight-normed</span>
@@ -812,7 +814,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">use the classic ``weight_g``/``weight_v`` weight-norm naming, which this module</span>
 <span class="sd">reproduces one-to-one so loading is a plain name-matching stream with a</span>
 <span class="sd">completeness check (same design as the transformer loader).</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -829,7 +831,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Snake1d">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Snake1d">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Snake1d</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;1D Snake activation (``x + 1/b * sin^2(a x)``) with log-scale parameters.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""1D Snake activation (``x + 1/b * sin^2(a x)``) with log-scale parameters."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">logscale</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -853,7 +855,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="OobleckResidualUnit">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.OobleckResidualUnit">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">OobleckResidualUnit</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Dilated residual unit (snake -&gt; conv k7 -&gt; snake -&gt; conv k1).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Dilated residual unit (snake -&gt; conv k7 -&gt; snake -&gt; conv k1)."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">dimension</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span><span class="p">,</span> <span class="n">dilation</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -878,7 +880,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="OobleckDecoderBlock">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.OobleckDecoderBlock">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">OobleckDecoderBlock</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Upsampling block: snake -&gt; transposed conv (stride upsample) -&gt; 3 residual units.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Upsampling block: snake -&gt; transposed conv (stride upsample) -&gt; 3 residual units."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">output_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">stride</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="n">output_padding</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -911,7 +913,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="OobleckDecoder">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.OobleckDecoder">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">OobleckDecoder</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Latent [B, C_latent, T] -&gt; waveform [B, audio_channels, T * prod(strides)].&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Latent [B, C_latent, T] -&gt; waveform [B, audio_channels, T * prod(strides)]."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -960,66 +962,66 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Cosmos3SoundTokenizer">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Cosmos3SoundTokenizer">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3SoundTokenizer</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Decoder-only AVAE for Cosmos3 sound latents.</span>
+<span class="w">    </span><span class="sd">"""Decoder-only AVAE for Cosmos3 sound latents.</span>
 
-<span class="sd">    Built from the checkpoint&#39;s ``sound_tokenizer/config.json`` (Oobleck decoder</span>
+<span class="sd">    Built from the checkpoint's ``sound_tokenizer/config.json`` (Oobleck decoder</span>
 <span class="sd">    geometry, sample rate, channel count, hop size) and loaded strictly from</span>
 <span class="sd">    ``sound_tokenizer/diffusion_pytorch_model.safetensors`` — every decoder</span>
 <span class="sd">    parameter must be filled, so a layout drift surfaces as a load error rather</span>
 <span class="sd">    than silently wrong audio.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
-    <span class="n">CONFIG_NAME</span> <span class="o">=</span> <span class="s2">&quot;config.json&quot;</span>
-    <span class="n">WEIGHTS_NAME</span> <span class="o">=</span> <span class="s2">&quot;diffusion_pytorch_model.safetensors&quot;</span>
+    <span class="n">CONFIG_NAME</span> <span class="o">=</span> <span class="s2">"config.json"</span>
+    <span class="n">WEIGHTS_NAME</span> <span class="o">=</span> <span class="s2">"diffusion_pytorch_model.safetensors"</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">sample_rate</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;sampling_rate&quot;</span><span class="p">,</span> <span class="s2">&quot;sample_rate&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">48000</span><span class="p">))</span>
-        <span class="n">stereo_default</span> <span class="o">=</span> <span class="mi">2</span> <span class="k">if</span> <span class="nb">bool</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;stereo&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">))</span> <span class="k">else</span> <span class="mi">1</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">audio_channels</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;dec_out_channels&quot;</span><span class="p">,</span> <span class="s2">&quot;audio_channels&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="n">stereo_default</span><span class="p">))</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">latent_ch</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;vocoder_input_dim&quot;</span><span class="p">,</span> <span class="s2">&quot;io_channels&quot;</span><span class="p">,</span> <span class="s2">&quot;latent_ch&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">64</span><span class="p">))</span>
-        <span class="n">dec_strides</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">s</span><span class="p">)</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;dec_strides&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">8</span><span class="p">])]</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">hop_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;hop_size&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="n">math</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">dec_strides</span><span class="p">)))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sample_rate</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"sampling_rate"</span><span class="p">,</span> <span class="s2">"sample_rate"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">48000</span><span class="p">))</span>
+        <span class="n">stereo_default</span> <span class="o">=</span> <span class="mi">2</span> <span class="k">if</span> <span class="nb">bool</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"stereo"</span><span class="p">,</span> <span class="kc">True</span><span class="p">))</span> <span class="k">else</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">audio_channels</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"dec_out_channels"</span><span class="p">,</span> <span class="s2">"audio_channels"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="n">stereo_default</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">latent_ch</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"vocoder_input_dim"</span><span class="p">,</span> <span class="s2">"io_channels"</span><span class="p">,</span> <span class="s2">"latent_ch"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">64</span><span class="p">))</span>
+        <span class="n">dec_strides</span> <span class="o">=</span> <span class="p">[</span><span class="nb">int</span><span class="p">(</span><span class="n">s</span><span class="p">)</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"dec_strides"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">8</span><span class="p">])]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hop_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"hop_size"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="n">math</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">dec_strides</span><span class="p">)))</span>
         <span class="k">if</span> <span class="n">math</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">dec_strides</span><span class="p">)</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">hop_size</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="s2">&quot;Cosmos3 sound tokenizer dec_strides product must equal hop_size: &quot;</span>
-                <span class="sa">f</span><span class="s2">&quot;prod(</span><span class="si">{</span><span class="n">dec_strides</span><span class="si">}</span><span class="s2">)=</span><span class="si">{</span><span class="n">math</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">dec_strides</span><span class="p">)</span><span class="si">}</span><span class="s2">, hop_size=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">hop_size</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="s2">"Cosmos3 sound tokenizer dec_strides product must equal hop_size: "</span>
+                <span class="sa">f</span><span class="s2">"prod(</span><span class="si">{</span><span class="n">dec_strides</span><span class="si">}</span><span class="s2">)=</span><span class="si">{</span><span class="n">math</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">dec_strides</span><span class="p">)</span><span class="si">}</span><span class="s2">, hop_size=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">hop_size</span><span class="si">}</span><span class="s2">"</span>
             <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">latent_fps</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sample_rate</span><span class="p">)</span> <span class="o">/</span> <span class="nb">float</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hop_size</span><span class="p">)</span>
 
         <span class="c1"># Optional latent (de)normalization; the published checkpoints use none</span>
         <span class="c1"># (``latent_mean``/``latent_std`` null), but the tanh variant is kept for</span>
         <span class="c1"># tokenizer revisions that set it.</span>
-        <span class="n">normalization_type</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;normalization_type&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">&quot;none&quot;</span><span class="p">))</span>
-        <span class="k">if</span> <span class="n">normalization_type</span> <span class="o">==</span> <span class="s2">&quot;none&quot;</span> <span class="ow">and</span> <span class="nb">bool</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;normalize_latents&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)):</span>
-            <span class="n">normalization_type</span> <span class="o">=</span> <span class="s2">&quot;tanh&quot;</span>
+        <span class="n">normalization_type</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"normalization_type"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s2">"none"</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">normalization_type</span> <span class="o">==</span> <span class="s2">"none"</span> <span class="ow">and</span> <span class="nb">bool</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"normalize_latents"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">)):</span>
+            <span class="n">normalization_type</span> <span class="o">=</span> <span class="s2">"tanh"</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">normalization_type</span> <span class="o">=</span> <span class="n">normalization_type</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tanh_input_scale</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;tanh_input_scale&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mf">1.5</span><span class="p">))</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tanh_output_scale</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;tanh_output_scale&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mf">3.5</span><span class="p">))</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tanh_clamp</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;tanh_clamp&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mf">0.995</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tanh_input_scale</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"tanh_input_scale"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mf">1.5</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tanh_output_scale</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"tanh_output_scale"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mf">3.5</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tanh_clamp</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"tanh_clamp"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mf">0.995</span><span class="p">))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">decoder</span> <span class="o">=</span> <span class="n">OobleckDecoder</span><span class="p">(</span>
-            <span class="n">channels</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;dec_dim&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">320</span><span class="p">)),</span>
+            <span class="n">channels</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"dec_dim"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">320</span><span class="p">)),</span>
             <span class="n">input_channels</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">latent_ch</span><span class="p">,</span>
             <span class="n">audio_channels</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">audio_channels</span><span class="p">,</span>
             <span class="n">upsampling_ratios</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="nb">reversed</span><span class="p">(</span><span class="n">dec_strides</span><span class="p">)),</span>
-            <span class="n">channel_multiples</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;dec_c_mults&quot;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">])),</span>
+            <span class="n">channel_multiples</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">_config_get</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">"dec_c_mults"</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">])),</span>
         <span class="p">)</span>
 
 <div class="viewcode-block" id="Cosmos3SoundTokenizer.from_pretrained">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Cosmos3SoundTokenizer.from_pretrained">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_pretrained</span><span class="p">(</span>
-        <span class="bp">cls</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;cpu&quot;</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;Cosmos3SoundTokenizer&quot;</span><span class="p">:</span>
-        <span class="n">tdir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">&quot;sound_tokenizer&quot;</span>
+        <span class="bp">cls</span><span class="p">,</span> <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"cpu"</span><span class="p">,</span> <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3SoundTokenizer"</span><span class="p">:</span>
+        <span class="n">tdir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"sound_tokenizer"</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">tdir</span> <span class="o">/</span> <span class="bp">cls</span><span class="o">.</span><span class="n">CONFIG_NAME</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">config</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
         <span class="n">model</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
 
         <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors.torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_file</span>
 
-        <span class="c1"># Load on CPU and move with the module: safetensors&#39; direct-to-cuda path</span>
+        <span class="c1"># Load on CPU and move with the module: safetensors' direct-to-cuda path</span>
         <span class="c1"># is unreliable inside freshly spawned worker processes.</span>
         <span class="n">state_dict</span> <span class="o">=</span> <span class="n">load_file</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">tdir</span> <span class="o">/</span> <span class="bp">cls</span><span class="o">.</span><span class="n">WEIGHTS_NAME</span><span class="p">))</span>
         <span class="n">expected</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
@@ -1031,7 +1033,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">missing</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">expected</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">state_dict</span><span class="p">))</span>
         <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Cosmos3 sound tokenizer missing keys under </span><span class="si">{</span><span class="n">tdir</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">missing</span><span class="p">[:</span><span class="mi">10</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="sa">f</span><span class="s2">"Cosmos3 sound tokenizer missing keys under </span><span class="si">{</span><span class="n">tdir</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">missing</span><span class="p">[:</span><span class="mi">10</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span>
             <span class="p">)</span>
         <span class="n">model</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">state_dict</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="n">model</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">False</span><span class="p">)</span>
@@ -1051,20 +1053,20 @@ window.runMermaid = runMermaid;</script>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_denormalize</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latent</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">normalization_type</span> <span class="o">==</span> <span class="s2">&quot;none&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">normalization_type</span> <span class="o">==</span> <span class="s2">"none"</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">latent</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">normalization_type</span> <span class="o">==</span> <span class="s2">&quot;tanh&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">normalization_type</span> <span class="o">==</span> <span class="s2">"tanh"</span><span class="p">:</span>
             <span class="n">in_dtype</span> <span class="o">=</span> <span class="n">latent</span><span class="o">.</span><span class="n">dtype</span>
             <span class="n">z</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="n">latent</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">tanh_output_scale</span><span class="p">,</span> <span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">tanh_clamp</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tanh_clamp</span><span class="p">)</span>
             <span class="k">return</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">atanh</span><span class="p">(</span><span class="n">z</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">tanh_input_scale</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">in_dtype</span><span class="p">)</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported sound tokenizer normalization_type=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">normalization_type</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unsupported sound tokenizer normalization_type=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">normalization_type</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
 
 <div class="viewcode-block" id="Cosmos3SoundTokenizer.decode">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Cosmos3SoundTokenizer.decode">[docs]</a>
     <span class="nd">@torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">()</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">decode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">latents</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Sound latents ``[B, C, T]`` or ``[C, T]`` -&gt; waveform in [-1, 1]</span>
-<span class="sd">        (``[B, audio_channels, T * hop_size]``, squeezed for unbatched input).&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""Sound latents ``[B, C, T]`` or ``[C, T]`` -&gt; waveform in [-1, 1]</span>
+<span class="sd">        (``[B, audio_channels, T * hop_size]``, squeezed for unbatched input)."""</span>
         <span class="n">squeeze</span> <span class="o">=</span> <span class="n">latents</span><span class="o">.</span><span class="n">ndim</span> <span class="o">==</span> <span class="mi">2</span>
         <span class="k">if</span> <span class="n">squeeze</span><span class="p">:</span>
             <span class="n">latents</span> <span class="o">=</span> <span class="n">latents</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
@@ -1120,7 +1122,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

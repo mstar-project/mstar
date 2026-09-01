@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.vjepa2.components.layers</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Shared transformer building blocks for V-JEPA 2 encoder and predictor.</span>
+<span></span><span class="sd">"""Shared transformer building blocks for V-JEPA 2 encoder and predictor.</span>
 
 <span class="sd">Ports ``VJEPA2MLP``, ``VJEPA2RopeAttention``, ``VJEPA2Layer`` from HuggingFace</span>
 <span class="sd">``transformers/models/vjepa2/modeling_vjepa2.py``.  Uses eager (matmul+softmax)</span>
@@ -817,7 +819,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    norm2.{weight,bias}</span>
 <span class="sd">    mlp.fc1.{weight,bias}</span>
 <span class="sd">    mlp.fc2.{weight,bias}</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -829,10 +831,10 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.vjepa2.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">VJepa2Config</span>
 
 <span class="n">_ACT2FN</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">&quot;gelu&quot;</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">GELU</span><span class="p">(),</span>
-    <span class="s2">&quot;gelu_new&quot;</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">GELU</span><span class="p">(</span><span class="n">approximate</span><span class="o">=</span><span class="s2">&quot;tanh&quot;</span><span class="p">),</span>
-    <span class="s2">&quot;relu&quot;</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">ReLU</span><span class="p">(),</span>
-    <span class="s2">&quot;silu&quot;</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">SiLU</span><span class="p">(),</span>
+    <span class="s2">"gelu"</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">GELU</span><span class="p">(),</span>
+    <span class="s2">"gelu_new"</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">GELU</span><span class="p">(</span><span class="n">approximate</span><span class="o">=</span><span class="s2">"tanh"</span><span class="p">),</span>
+    <span class="s2">"relu"</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">ReLU</span><span class="p">(),</span>
+    <span class="s2">"silu"</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">SiLU</span><span class="p">(),</span>
 <span class="p">}</span>
 
 <span class="c1"># TODO: replace with SDPA (flashInfer does not support float32 precision)</span>
@@ -844,11 +846,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">value</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
     <span class="n">scaling</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Bit-reproducible eager attention.</span>
+<span class="w">    </span><span class="sd">"""Bit-reproducible eager attention.</span>
 
-<span class="sd">    Matches HF&#39;s ``eager_attention_forward`` — softmax done in fp32 then</span>
+<span class="sd">    Matches HF's ``eager_attention_forward`` — softmax done in fp32 then</span>
 <span class="sd">    cast back to the input dtype.  No dropout (inference-only).</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">attn_weights</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">matmul</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">))</span> <span class="o">*</span> <span class="n">scaling</span>
     <span class="n">attn_weights</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">attn_weights</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">query</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
     <span class="n">attn_output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">matmul</span><span class="p">(</span><span class="n">attn_weights</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
@@ -907,13 +909,13 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="VJEPA2RopeAttention">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2RopeAttention">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">VJEPA2RopeAttention</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Self-attention with 3D rotary positional encoding.</span>
+<span class="w">    </span><span class="sd">"""Self-attention with 3D rotary positional encoding.</span>
 
 <span class="sd">    Q/K/V are separate ``nn.Linear`` projections (matches HF checkpoint key</span>
 <span class="sd">    layout: ``attention.{query,key,value,proj}.*``).  RoPE is applied to</span>
 <span class="sd">    queries and keys, split into depth/height/width axes derived from each</span>
-<span class="sd">    token&#39;s position id.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    token's position id.</span>
+<span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -923,7 +925,7 @@ window.runMermaid = runMermaid;</script>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">hidden_size</span> <span class="o">%</span> <span class="n">num_attention_heads</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;hidden_size=</span><span class="si">{</span><span class="n">hidden_size</span><span class="si">}</span><span class="s2"> is not divisible by num_attention_heads=</span><span class="si">{</span><span class="n">num_attention_heads</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"hidden_size=</span><span class="si">{</span><span class="n">hidden_size</span><span class="si">}</span><span class="s2"> is not divisible by num_attention_heads=</span><span class="si">{</span><span class="n">num_attention_heads</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_attention_heads</span> <span class="o">=</span> <span class="n">num_attention_heads</span>
@@ -1027,7 +1029,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="VJEPA2Layer">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.vjepa2.components.layers.html#mstar.model.vjepa2.components.layers.VJEPA2Layer">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">VJEPA2Layer</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;One transformer block: pre-norm self-attention + pre-norm MLP with residuals.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""One transformer block: pre-norm self-attention + pre-norm MLP with residuals."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1108,7 +1110,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

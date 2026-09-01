@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.pi05.config</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Configuration for the Pi0.5 vision-language-action model.&quot;&quot;&quot;</span>
+<span></span><span class="sd">"""Configuration for the Pi0.5 vision-language-action model."""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
@@ -812,7 +814,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Pi05Config</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Pi0.5 model configuration.</span>
+<span class="w">    </span><span class="sd">"""Pi0.5 model configuration.</span>
 
 <span class="sd">    Pi0.5 combines a SigLIP vision encoder with two Gemma transformer experts:</span>
 <span class="sd">    PaliGemma (Gemma-2B backbone) processes the prefix (image + text + state</span>
@@ -822,7 +824,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Both experts share KV-cache dimensions (num_kv_heads, head_dim) so that the</span>
 <span class="sd">    action expert can attend to the cache written by PaliGemma.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="c1"># ----- SigLIP vision encoder (So400m/14) -----</span>
     <span class="n">vit_hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1152</span>
@@ -836,7 +838,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># ----- Shared attention dimensions (PaliGemma + action expert) -----</span>
     <span class="c1"># Both experts share num_kv_heads and head_dim so the action expert can</span>
-    <span class="c1"># read PaliGemma&#39;s KV cache; only the per-expert hidden_size and MLP</span>
+    <span class="c1"># read PaliGemma's KV cache; only the per-expert hidden_size and MLP</span>
     <span class="c1"># dimensions differ.</span>
     <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">18</span>
     <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
@@ -846,7 +848,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">rope_theta</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">10000.0</span>
 
     <span class="c1"># ----- PaliGemma expert (Gemma-2B by default) -----</span>
-    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>  <span class="c1"># paligemma hidden / &quot;width&quot;</span>
+    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>  <span class="c1"># paligemma hidden / "width"</span>
     <span class="n">pali_intermediate_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16384</span>
     <span class="n">vocab_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">257152</span>
     <span class="n">pad_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
@@ -876,7 +878,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># ----- Default per-request sampling parameters -----</span>
     <span class="c1"># Pi0.5 has no stochastic sampling; included for API parity.</span>
-    <span class="n">default_action_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;float32&quot;</span>
+    <span class="n">default_action_dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"float32"</span>
     <span class="n">extra</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
 
 
@@ -886,10 +888,10 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># field name exactly. This keeps the mapping maintainable: only the few</span>
 <span class="c1"># exceptions need to be enumerated, rather than every field.</span>
 <span class="n">_HF_KEY_RENAMES</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">&quot;num_hidden_layers&quot;</span><span class="p">:</span> <span class="s2">&quot;num_layers&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;num_attention_heads&quot;</span><span class="p">:</span> <span class="s2">&quot;num_qo_heads&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;num_key_value_heads&quot;</span><span class="p">:</span> <span class="s2">&quot;num_kv_heads&quot;</span><span class="p">,</span>
-    <span class="s2">&quot;intermediate_size&quot;</span><span class="p">:</span> <span class="s2">&quot;pali_intermediate_size&quot;</span><span class="p">,</span>
+    <span class="s2">"num_hidden_layers"</span><span class="p">:</span> <span class="s2">"num_layers"</span><span class="p">,</span>
+    <span class="s2">"num_attention_heads"</span><span class="p">:</span> <span class="s2">"num_qo_heads"</span><span class="p">,</span>
+    <span class="s2">"num_key_value_heads"</span><span class="p">:</span> <span class="s2">"num_kv_heads"</span><span class="p">,</span>
+    <span class="s2">"intermediate_size"</span><span class="p">:</span> <span class="s2">"pali_intermediate_size"</span><span class="p">,</span>
 <span class="p">}</span>
 
 <span class="c1"># Pi05Config field names — computed once from the dataclass.</span>
@@ -899,12 +901,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="load_pi05_config">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.load_pi05_config">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">load_pi05_config</span><span class="p">(</span><span class="n">hf_config</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Pi05Config</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Build a Pi05Config, optionally overlaying values from an HF config dict.</span>
+<span class="w">    </span><span class="sd">"""Build a Pi05Config, optionally overlaying values from an HF config dict.</span>
 
 <span class="sd">    Auto-maps any HF key that matches a Pi05Config field name. For the few</span>
 <span class="sd">    HF keys whose names differ (e.g. ``num_hidden_layers`` -&gt; ``num_layers``),</span>
 <span class="sd">    an explicit rename dict is used. Unrecognised keys are silently ignored.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">cfg</span> <span class="o">=</span> <span class="n">Pi05Config</span><span class="p">()</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">hf_config</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">cfg</span>
@@ -964,7 +966,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

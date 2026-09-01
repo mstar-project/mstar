@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -803,7 +805,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.utils.adarms_norm</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Fused AdaRMS normalisation + scale/shift/gate Triton kernel.</span>
+<span></span><span class="sd">"""Fused AdaRMS normalisation + scale/shift/gate Triton kernel.</span>
 
 <span class="sd">Replaces the three-step sequence in Pi05AdaRMSNorm.forward():</span>
 
@@ -818,7 +820,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    * Store normed output and gate</span>
 
 <span class="sd">Falls back to the original eager path on CPU or when Triton is not available.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -846,14 +848,14 @@ window.runMermaid = runMermaid;</script>
         <span class="n">eps</span><span class="p">,</span>
         <span class="n">BLOCK_H</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">,</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;One Triton program per row of x (one (bs_idx, ah_idx) pair).</span>
+<span class="w">        </span><span class="sd">"""One Triton program per row of x (one (bs_idx, ah_idx) pair).</span>
 
 <span class="sd">        pid  — linear index into [BS * AH] rows.</span>
 <span class="sd">        bs_idx = pid // AH — selects which row of (scale, shift, gate_mod) to load.</span>
 
 <span class="sd">        All conditioning tensors are [BS, H]; x and outputs are [BS*AH, H].</span>
 <span class="sd">        Arithmetic is done in float32; stores are cast back to the pointer dtype.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="n">pid</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
         <span class="n">bs_idx</span> <span class="o">=</span> <span class="n">pid</span> <span class="o">//</span> <span class="n">AH</span>
 
@@ -891,7 +893,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">gate_mod</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
     <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Fused AdaRMS norm: RMS-normalise x then apply scale/shift conditioning.</span>
+<span class="w">    </span><span class="sd">"""Fused AdaRMS norm: RMS-normalise x then apply scale/shift conditioning.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        x:        float tensor, shape [BS * AH, H], any dtype.</span>
@@ -904,7 +906,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        (normed, gate) both shape [BS * AH, H], same dtype as x.</span>
 
 <span class="sd">    Falls back to an eager implementation on CPU or without Triton.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">BS_AH</span><span class="p">,</span> <span class="n">H</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span>
     <span class="n">BS</span> <span class="o">=</span> <span class="n">scale</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
     <span class="n">AH</span> <span class="o">=</span> <span class="n">BS_AH</span> <span class="o">//</span> <span class="n">BS</span>
@@ -986,7 +988,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -809,7 +811,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ChunkPolicy">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ChunkPolicy</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Determines when a StreamBuffer has enough items for the consumer node.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Determines when a StreamBuffer has enough items for the consumer node."""</span>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">first_chunk_read</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">items_consumed</span> <span class="o">=</span> <span class="mi">0</span>
@@ -825,7 +827,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.is_ready">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_ready</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">buffer_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return True if the buffer has enough items for a chunk.&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""Return True if the buffer has enough items for a chunk."""</span>
         <span class="o">...</span></div>
 
 
@@ -833,11 +835,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.next_chunk_size">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">next_chunk_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">buffer_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the number of items to consume for the next chunk.</span>
+<span class="w">        </span><span class="sd">"""Return the number of items to consume for the next chunk.</span>
 
 <span class="sd">        Only called when is_ready() returns True.</span>
 <span class="sd">        For sliding-window policies this is the stride, not the window.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="o">...</span></div>
 
 
@@ -845,19 +847,19 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.window_size">[docs]</a>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">window_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Return the full window of items to include in the chunk.</span>
+<span class="w">        </span><span class="sd">"""Return the full window of items to include in the chunk.</span>
 
 <span class="sd">        For non-overlapping policies, equals next_chunk_size.</span>
 <span class="sd">        For sliding-window policies, this is larger than the stride —</span>
 <span class="sd">        the buffer retains older items so the chunk contains the full window.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="o">...</span></div>
 
 
 <div class="viewcode-block" id="ChunkPolicy.continue_after_producer_done">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">continue_after_producer_done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Whether the buffer should keep producing (empty) chunks after the</span>
+<span class="w">        </span><span class="sd">"""Whether the buffer should keep producing (empty) chunks after the</span>
 <span class="sd">        producer signals done and all buffered items have been consumed.</span>
 
 <span class="sd">        Default ``False``: partition-done is propagated to the conductor after</span>
@@ -867,9 +869,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        after the producer finishes (e.g., Thinker→Talker: the Talker</span>
 <span class="sd">        continues generating codec tokens after the Thinker hits text EOS).</span>
 <span class="sd">        In this case the buffer produces empty chunks (``_collate([])`` →</span>
-<span class="sd">        ``{&quot;data&quot;: None}``), and the consumer&#39;s partition-done is determined</span>
+<span class="sd">        ``{"data": None}``), and the consumer's partition-done is determined</span>
 <span class="sd">        by its own model logic, not by the StreamBuffer.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
+<span class="sd">        """</span>
         <span class="k">return</span> <span class="kc">False</span></div>
 </div>
 
@@ -878,13 +880,13 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="SlidingWindowChunkPolicy">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">SlidingWindowChunkPolicy</span><span class="p">(</span><span class="n">ChunkPolicy</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Fixed-size sliding window that advances by a stride.</span>
+<span class="w">    </span><span class="sd">"""Fixed-size sliding window that advances by a stride.</span>
 
 <span class="sd">    Each pop_chunk returns `window` items and advances the consumed</span>
 <span class="sd">    pointer by `stride`. Old items before the window are discarded.</span>
 
 <span class="sd">    Example (Orpheus SNAC): window=28 tokens (4 frames), stride=7 (1 frame).</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">window</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">stride</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -914,9 +916,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="LeftContextChunkPolicy">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.LeftContextChunkPolicy">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">LeftContextChunkPolicy</span><span class="p">(</span><span class="n">ChunkPolicy</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Chunk policy for streaming vocoders with left-context overlap.</span>
+<span class="w">    </span><span class="sd">"""Chunk policy for streaming vocoders with left-context overlap.</span>
 
-<span class="sd">    Matches HuggingFace&#39;s ``Qwen3OmniMoeCode2Wav.chunked_decode`` pattern:</span>
+<span class="sd">    Matches HuggingFace's ``Qwen3OmniMoeCode2Wav.chunked_decode`` pattern:</span>
 
 <span class="sd">        Iter 0: codes[0 : chunk]                → emit all (no context)</span>
 <span class="sd">        Iter 1: codes[chunk-ctx : 2*chunk]       → trim first ctx, emit rest</span>
@@ -925,7 +927,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    The first pop returns ``chunk`` items (no context).  Subsequent pops</span>
 <span class="sd">    return ``chunk + left_context`` items, where the leading ``left_context``</span>
 <span class="sd">    items OVERLAP with the tail of the previous chunk.  This overlap allows</span>
-<span class="sd">    the causal ConvNet vocoder to &quot;warm up&quot; its internal state on frames</span>
+<span class="sd">    the causal ConvNet vocoder to "warm up" its internal state on frames</span>
 <span class="sd">    it has already processed, ensuring a smooth transition at chunk</span>
 <span class="sd">    boundaries.</span>
 
@@ -933,7 +935,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    (not ``chunk``), so the last ``left_context`` items of the first chunk</span>
 <span class="sd">    remain in the buffer as overlap for the second pop.  All subsequent</span>
 <span class="sd">    pops advance by ``chunk``.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">chunk</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">left_context</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -972,7 +974,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="FixedChunkPolicy">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.FixedChunkPolicy">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">FixedChunkPolicy</span><span class="p">(</span><span class="n">ChunkPolicy</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Release non-overlapping chunks of fixed size.</span>
+<span class="w">    </span><span class="sd">"""Release non-overlapping chunks of fixed size.</span>
 
 <span class="sd">    Each pop_chunk returns exactly `chunk_size` items and advances by</span>
 <span class="sd">    `chunk_size`. No overlap, no sliding window.</span>
@@ -981,7 +983,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        chunk_size: number of items per chunk.</span>
 <span class="sd">        continue_after_done: if True, keep producing empty chunks after</span>
 <span class="sd">            the producer finishes and all buffered items are consumed.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">continue_after_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
@@ -1059,7 +1061,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

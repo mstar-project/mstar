@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -803,13 +805,13 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.higgs_audio.config</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Config for Higgs-Audio STT (bosonai/higgs-audio-v3-stt).</span>
+<span></span><span class="sd">"""Config for Higgs-Audio STT (bosonai/higgs-audio-v3-stt).</span>
 
-<span class="sd">Higgs-Audio STT = Whisper-style audio encoder (&quot;audio_tower&quot;) + MLP</span>
-<span class="sd">projector (&quot;audio_encoder_proj&quot;) + dense Qwen3 text LLM. Values are read</span>
-<span class="sd">from the checkpoint&#39;s ``config.json`` (top-level audio fields +</span>
+<span class="sd">Higgs-Audio STT = Whisper-style audio encoder ("audio_tower") + MLP</span>
+<span class="sd">projector ("audio_encoder_proj") + dense Qwen3 text LLM. Values are read</span>
+<span class="sd">from the checkpoint's ``config.json`` (top-level audio fields +</span>
 <span class="sd">``text_config``).</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
@@ -855,8 +857,8 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># transcription prompt used by the reference transcribe.py</span>
     <span class="n">default_prompt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="p">(</span>
-        <span class="s2">&quot;Transcribe the speech. Output only the spoken words in lowercase &quot;</span>
-        <span class="s2">&quot;with no punctuation.&quot;</span>
+        <span class="s2">"Transcribe the speech. Output only the spoken words in lowercase "</span>
+        <span class="s2">"with no punctuation."</span>
     <span class="p">)</span>
 
     <span class="n">stop_token_ids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">)</span>
@@ -872,8 +874,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="HiggsAudioModelConfig.encoder_output_length">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.higgs_audio.config.html#mstar.model.higgs_audio.config.HiggsAudioModelConfig.encoder_output_length">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">encoder_output_length</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mel_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Valid audio-embedding count for ``mel_len`` mel frames:</span>
-<span class="sd">        conv2 (stride 2) -&gt; avg_pool (stride 2) -&gt; projector conv (stride 2).&quot;&quot;&quot;</span>
+<span class="w">        </span><span class="sd">"""Valid audio-embedding count for ``mel_len`` mel frames:</span>
+<span class="sd">        conv2 (stride 2) -&gt; avg_pool (stride 2) -&gt; projector conv (stride 2)."""</span>
         <span class="n">after_conv</span> <span class="o">=</span> <span class="p">(</span><span class="n">mel_len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">1</span>
         <span class="n">after_pool</span> <span class="o">=</span> <span class="p">(</span><span class="n">after_conv</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span> <span class="o">+</span> <span class="mi">1</span>
         <span class="k">return</span> <span class="p">(</span><span class="n">after_pool</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">projector_temporal_downsample</span> <span class="o">+</span> <span class="mi">1</span></div>
@@ -881,42 +883,42 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># audio_&lt;X&gt; fields sourced from audio_encoder_config[&lt;X&gt;].</span>
     <span class="n">_ENCODER_FIELDS</span> <span class="o">=</span> <span class="p">{</span>
-        <span class="s2">&quot;audio_d_model&quot;</span><span class="p">:</span> <span class="s2">&quot;d_model&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;audio_encoder_layers&quot;</span><span class="p">:</span> <span class="s2">&quot;encoder_layers&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;audio_encoder_attention_heads&quot;</span><span class="p">:</span> <span class="s2">&quot;encoder_attention_heads&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;audio_encoder_ffn_dim&quot;</span><span class="p">:</span> <span class="s2">&quot;encoder_ffn_dim&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;audio_num_mel_bins&quot;</span><span class="p">:</span> <span class="s2">&quot;num_mel_bins&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;audio_max_source_positions&quot;</span><span class="p">:</span> <span class="s2">&quot;max_source_positions&quot;</span><span class="p">,</span>
+        <span class="s2">"audio_d_model"</span><span class="p">:</span> <span class="s2">"d_model"</span><span class="p">,</span>
+        <span class="s2">"audio_encoder_layers"</span><span class="p">:</span> <span class="s2">"encoder_layers"</span><span class="p">,</span>
+        <span class="s2">"audio_encoder_attention_heads"</span><span class="p">:</span> <span class="s2">"encoder_attention_heads"</span><span class="p">,</span>
+        <span class="s2">"audio_encoder_ffn_dim"</span><span class="p">:</span> <span class="s2">"encoder_ffn_dim"</span><span class="p">,</span>
+        <span class="s2">"audio_num_mel_bins"</span><span class="p">:</span> <span class="s2">"num_mel_bins"</span><span class="p">,</span>
+        <span class="s2">"audio_max_source_positions"</span><span class="p">:</span> <span class="s2">"max_source_positions"</span><span class="p">,</span>
     <span class="p">}</span>
     <span class="c1"># Fields sourced from the top level of config.json by the same name.</span>
     <span class="n">_TOPLEVEL_FIELDS</span> <span class="o">=</span> <span class="p">(</span>
-        <span class="s2">&quot;projector_temporal_downsample&quot;</span><span class="p">,</span> <span class="s2">&quot;audio_in_token_idx&quot;</span><span class="p">,</span>
-        <span class="s2">&quot;audio_bos_token_id&quot;</span><span class="p">,</span> <span class="s2">&quot;audio_eos_token_id&quot;</span><span class="p">,</span> <span class="s2">&quot;chunk_size_seconds&quot;</span><span class="p">,</span>
+        <span class="s2">"projector_temporal_downsample"</span><span class="p">,</span> <span class="s2">"audio_in_token_idx"</span><span class="p">,</span>
+        <span class="s2">"audio_bos_token_id"</span><span class="p">,</span> <span class="s2">"audio_eos_token_id"</span><span class="p">,</span> <span class="s2">"chunk_size_seconds"</span><span class="p">,</span>
     <span class="p">)</span>
 
 <div class="viewcode-block" id="HiggsAudioModelConfig.from_pretrained">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.higgs_audio.config.html#mstar.model.higgs_audio.config.HiggsAudioModelConfig.from_pretrained">[docs]</a>
     <span class="nd">@classmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">from_pretrained</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;HiggsAudioModelConfig&quot;</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_pretrained</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"HiggsAudioModelConfig"</span><span class="p">:</span>
         <span class="n">local_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">local_dir</span><span class="p">)</span>
-        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">local_dir</span> <span class="o">/</span> <span class="s2">&quot;config.json&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">local_dir</span> <span class="o">/</span> <span class="s2">"config.json"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
             <span class="n">hf</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
-        <span class="n">tc</span> <span class="o">=</span> <span class="n">hf</span><span class="p">[</span><span class="s2">&quot;text_config&quot;</span><span class="p">]</span>
-        <span class="n">enc</span> <span class="o">=</span> <span class="n">hf</span><span class="p">[</span><span class="s2">&quot;audio_encoder_config&quot;</span><span class="p">]</span>
+        <span class="n">tc</span> <span class="o">=</span> <span class="n">hf</span><span class="p">[</span><span class="s2">"text_config"</span><span class="p">]</span>
+        <span class="n">enc</span> <span class="o">=</span> <span class="n">hf</span><span class="p">[</span><span class="s2">"audio_encoder_config"</span><span class="p">]</span>
         <span class="n">field_names</span> <span class="o">=</span> <span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">cls</span><span class="p">)}</span>
 
         <span class="n">values</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># 1. text LLM: fields whose name matches a text_config key.</span>
         <span class="n">values</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">k</span><span class="p">:</span> <span class="n">tc</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">field_names</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">tc</span><span class="p">})</span>
-        <span class="n">values</span><span class="p">[</span><span class="s2">&quot;head_dim&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">tc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-            <span class="s2">&quot;head_dim&quot;</span><span class="p">,</span> <span class="n">tc</span><span class="p">[</span><span class="s2">&quot;hidden_size&quot;</span><span class="p">]</span> <span class="o">//</span> <span class="n">tc</span><span class="p">[</span><span class="s2">&quot;num_attention_heads&quot;</span><span class="p">]</span>
+        <span class="n">values</span><span class="p">[</span><span class="s2">"head_dim"</span><span class="p">]</span> <span class="o">=</span> <span class="n">tc</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+            <span class="s2">"head_dim"</span><span class="p">,</span> <span class="n">tc</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">]</span> <span class="o">//</span> <span class="n">tc</span><span class="p">[</span><span class="s2">"num_attention_heads"</span><span class="p">]</span>
         <span class="p">)</span>
         <span class="c1"># 2. audio encoder: audio_&lt;X&gt; &lt;- audio_encoder_config[&lt;X&gt;].</span>
         <span class="n">values</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">f</span><span class="p">:</span> <span class="n">enc</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">f</span><span class="p">,</span> <span class="n">k</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_ENCODER_FIELDS</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">enc</span><span class="p">})</span>
         <span class="c1"># 3. top-level config.json (+ the pad_token_id -&gt; eos_token_id rename).</span>
         <span class="n">values</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">k</span><span class="p">:</span> <span class="n">hf</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="bp">cls</span><span class="o">.</span><span class="n">_TOPLEVEL_FIELDS</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">hf</span><span class="p">})</span>
-        <span class="k">if</span> <span class="s2">&quot;pad_token_id&quot;</span> <span class="ow">in</span> <span class="n">hf</span><span class="p">:</span>
-            <span class="n">values</span><span class="p">[</span><span class="s2">&quot;eos_token_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">hf</span><span class="p">[</span><span class="s2">&quot;pad_token_id&quot;</span><span class="p">]</span>
+        <span class="k">if</span> <span class="s2">"pad_token_id"</span> <span class="ow">in</span> <span class="n">hf</span><span class="p">:</span>
+            <span class="n">values</span><span class="p">[</span><span class="s2">"eos_token_id"</span><span class="p">]</span> <span class="o">=</span> <span class="n">hf</span><span class="p">[</span><span class="s2">"pad_token_id"</span><span class="p">]</span>
 
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">values</span><span class="p">)</span></div>
 </div>
@@ -968,7 +970,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>

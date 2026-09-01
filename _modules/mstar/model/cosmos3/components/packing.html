@@ -49,6 +49,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -408,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Aug 16, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -803,15 +805,15 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.cosmos3.components.packing</h1><div class="highlight"><pre>
-<span></span><span class="sd">&quot;&quot;&quot;Joint-sequence packing for Cosmos3 generation (ported from the diffusers</span>
+<span></span><span class="sd">"""Joint-sequence packing for Cosmos3 generation (ported from the diffusers</span>
 <span class="sd">``Cosmos3OmniPipeline``).</span>
 
 <span class="sd">Pure, stateless primitives that turn a prompt + latent shape into the</span>
-<span class="sd">transformer&#39;s per-step inputs: the 3D interleaved mRoPE position ids, the</span>
+<span class="sd">transformer's per-step inputs: the 3D interleaved mRoPE position ids, the</span>
 <span class="sd">text/vision segment layouts, and the chat-template tokenization. Shared by the</span>
-<span class="sd">t2i pipeline and the engine submodule&#39;s input preprocessing. Reproduces the</span>
-<span class="sd">diffusers pipeline&#39;s packed t2i inputs byte-for-byte.</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">t2i pipeline and the engine submodule's input preprocessing. Reproduces the</span>
+<span class="sd">diffusers pipeline's packed t2i inputs byte-for-byte.</span>
+<span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -833,7 +835,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">get_3d_mrope_ids_text_tokens</span><span class="p">(</span>
     <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">temporal_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">,</span> <span class="n">use_float_positions</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Text tokens: all three axes share the same increasing ids from ``temporal_offset``.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Text tokens: all three axes share the same increasing ids from ``temporal_offset``."""</span>
     <span class="k">if</span> <span class="n">use_float_positions</span><span class="p">:</span>
         <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">+</span> <span class="n">temporal_offset</span>
     <span class="k">else</span><span class="p">:</span>
@@ -857,8 +859,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">base_temporal_compression_factor</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">start_frame_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Vision/sound (VAE) tokens: (t, h, w) grid ids, with optional fps modulation</span>
-<span class="sd">    of the temporal axis (only when ``fps`` is set and ``grid_t &gt; 1``).&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Vision/sound (VAE) tokens: (t, h, w) grid ids, with optional fps modulation</span>
+<span class="sd">    of the temporal axis (only when ``fps`` is set and ``grid_t &gt; 1``)."""</span>
     <span class="n">fps_modulation_enabled</span> <span class="o">=</span> <span class="n">fps</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">grid_t</span> <span class="o">&gt;</span> <span class="mi">1</span>
     <span class="n">effective_base_tcf</span> <span class="o">=</span> <span class="p">(</span>
         <span class="n">base_temporal_compression_factor</span>
@@ -907,11 +909,11 @@ window.runMermaid = runMermaid;</script>
     <span class="n">base_temporal_compression_factor</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span>
     <span class="n">start_frame_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">float</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Action tokens: a frame-rate ``(T, 1, 1)`` temporal grid sharing the media</span>
+<span class="w">    </span><span class="sd">"""Action tokens: a frame-rate ``(T, 1, 1)`` temporal grid sharing the media</span>
 <span class="sd">    offset with the vision band. The action stream is uncompressed in time</span>
 <span class="sd">    (``temporal_compression_factor=1``) but its rate is expressed in the same</span>
 <span class="sd">    base-fps units as the vision latents (``base_temporal_compression_factor``),</span>
-<span class="sd">    so an action chunk lines up temporally with the conditioning video.&quot;&quot;&quot;</span>
+<span class="sd">    so an action chunk lines up temporally with the conditioning video."""</span>
     <span class="k">return</span> <span class="n">get_3d_mrope_ids_vae_tokens</span><span class="p">(</span>
         <span class="n">grid_t</span><span class="o">=</span><span class="n">grid_t</span><span class="p">,</span>
         <span class="n">grid_h</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
@@ -939,60 +941,60 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#                          action token is predicted.</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
 
-<span class="n">ACTION_MODE_FORWARD_DYNAMICS</span> <span class="o">=</span> <span class="s2">&quot;forward_dynamics&quot;</span>
-<span class="n">ACTION_MODE_INVERSE_DYNAMICS</span> <span class="o">=</span> <span class="s2">&quot;inverse_dynamics&quot;</span>
-<span class="n">ACTION_MODE_POLICY</span> <span class="o">=</span> <span class="s2">&quot;policy&quot;</span>
+<span class="n">ACTION_MODE_FORWARD_DYNAMICS</span> <span class="o">=</span> <span class="s2">"forward_dynamics"</span>
+<span class="n">ACTION_MODE_INVERSE_DYNAMICS</span> <span class="o">=</span> <span class="s2">"inverse_dynamics"</span>
+<span class="n">ACTION_MODE_POLICY</span> <span class="o">=</span> <span class="s2">"policy"</span>
 <span class="n">ACTION_MODES</span> <span class="o">=</span> <span class="p">(</span><span class="n">ACTION_MODE_FORWARD_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="action_condition_frame_indexes">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.action_condition_frame_indexes">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">action_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Clean (conditioning) action tokens for ``mode``.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Clean (conditioning) action tokens for ``mode``."""</span>
     <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">ACTION_MODE_FORWARD_DYNAMICS</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">action_length</span><span class="p">))</span>
     <span class="k">if</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">[]</span>
-    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown Cosmos3 action mode: </span><span class="si">{</span><span class="n">mode</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span></div>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown Cosmos3 action mode: </span><span class="si">{</span><span class="n">mode</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 
 
 
 <div class="viewcode-block" id="vision_condition_frame_indexes">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.vision_condition_frame_indexes">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">vision_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">latent_frames</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Clean (conditioning) latent video frames for ``mode``.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Clean (conditioning) latent video frames for ``mode``."""</span>
     <span class="k">if</span> <span class="n">mode</span> <span class="ow">in</span> <span class="p">(</span><span class="n">ACTION_MODE_FORWARD_DYNAMICS</span><span class="p">,</span> <span class="n">ACTION_MODE_POLICY</span><span class="p">):</span>
         <span class="k">return</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span>
     <span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="n">ACTION_MODE_INVERSE_DYNAMICS</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">latent_frames</span><span class="p">))</span>
-    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown Cosmos3 action mode: </span><span class="si">{</span><span class="n">mode</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span></div>
+    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown Cosmos3 action mode: </span><span class="si">{</span><span class="n">mode</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 
 
 
 <div class="viewcode-block" id="normalize_condition_frame_indexes">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">normalize_condition_frame_indexes</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">default</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Normalize a request&#39;s video-conditioning latent-frame indexes.</span>
+<span class="w">    </span><span class="sd">"""Normalize a request's video-conditioning latent-frame indexes.</span>
 
 <span class="sd">    Accepts an int, a comma-separated string, or an iterable of ints; returns a</span>
-<span class="sd">    sorted, de-duplicated tuple. ``None`` falls back to ``default``.&quot;&quot;&quot;</span>
+<span class="sd">    sorted, de-duplicated tuple. ``None`` falls back to ``default``."""</span>
     <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">default</span><span class="p">)</span>
     <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-        <span class="n">value</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">value</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;,&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">item</span><span class="o">.</span><span class="n">strip</span><span class="p">()]</span>
+        <span class="n">value</span> <span class="o">=</span> <span class="p">[</span><span class="n">item</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">value</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">","</span><span class="p">)</span> <span class="k">if</span> <span class="n">item</span><span class="o">.</span><span class="n">strip</span><span class="p">()]</span>
     <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
         <span class="n">value</span> <span class="o">=</span> <span class="p">[</span><span class="n">value</span><span class="p">]</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="n">indexes</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">sorted</span><span class="p">({</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">value</span><span class="p">}))</span>
     <span class="k">except</span> <span class="p">(</span><span class="ne">TypeError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="s2">&quot;condition_frame_indexes_vision must be an int, comma-separated &quot;</span>
-            <span class="sa">f</span><span class="s2">&quot;string, or list of ints; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">&quot;</span>
+            <span class="s2">"condition_frame_indexes_vision must be an int, comma-separated "</span>
+            <span class="sa">f</span><span class="s2">"string, or list of ints; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span>
         <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">indexes</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;condition_frame_indexes_vision must contain at least one index&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"condition_frame_indexes_vision must contain at least one index"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">indexes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;condition_frame_indexes_vision must be non-negative, got </span><span class="si">{</span><span class="n">indexes</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"condition_frame_indexes_vision must be non-negative, got </span><span class="si">{</span><span class="n">indexes</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">indexes</span></div>
 
 
@@ -1000,16 +1002,16 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="action_start_frame_offset">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.action_start_frame_offset">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">action_start_frame_offset</span><span class="p">(</span><span class="n">action_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">video_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;mRoPE start-frame offset for the action band: action chunks of length</span>
+<span class="w">    </span><span class="sd">"""mRoPE start-frame offset for the action band: action chunks of length</span>
 <span class="sd">    ``num_frames - 1`` start one frame in (aligned to predicted frames 1..N);</span>
-<span class="sd">    a full ``num_frames`` chunk starts at 0.&quot;&quot;&quot;</span>
+<span class="sd">    a full ``num_frames`` chunk starts at 0."""</span>
     <span class="k">if</span> <span class="n">action_length</span> <span class="o">==</span> <span class="n">video_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">:</span>
         <span class="k">return</span> <span class="mi">1</span>
     <span class="k">if</span> <span class="n">action_length</span> <span class="o">==</span> <span class="n">video_length</span><span class="p">:</span>
         <span class="k">return</span> <span class="mi">0</span>
     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-        <span class="s2">&quot;Cosmos3 action_chunk_size must equal num_frames - 1 or num_frames; &quot;</span>
-        <span class="sa">f</span><span class="s2">&quot;got action_chunk_size=</span><span class="si">{</span><span class="n">action_length</span><span class="si">}</span><span class="s2">, num_frames=</span><span class="si">{</span><span class="n">video_length</span><span class="si">}</span><span class="s2">.&quot;</span>
+        <span class="s2">"Cosmos3 action_chunk_size must equal num_frames - 1 or num_frames; "</span>
+        <span class="sa">f</span><span class="s2">"got action_chunk_size=</span><span class="si">{</span><span class="n">action_length</span><span class="si">}</span><span class="s2">, num_frames=</span><span class="si">{</span><span class="n">video_length</span><span class="si">}</span><span class="s2">."</span>
     <span class="p">)</span></div>
 
 
@@ -1019,47 +1021,47 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># robomind-franka share a domain (both are a Franka arm with a Robotiq</span>
 <span class="c1"># gripper); the agibot names are aliases of one domain likewise.</span>
 <span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-    <span class="s2">&quot;no_action&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
-    <span class="s2">&quot;av&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
-    <span class="s2">&quot;camera_pose&quot;</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span>
-    <span class="s2">&quot;hand_pose&quot;</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span>
-    <span class="s2">&quot;pusht&quot;</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span>
-    <span class="s2">&quot;libero&quot;</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span>
-    <span class="s2">&quot;umi&quot;</span><span class="p">:</span> <span class="mi">6</span><span class="p">,</span>
-    <span class="s2">&quot;bridge_orig_lerobot&quot;</span><span class="p">:</span> <span class="mi">7</span><span class="p">,</span>
-    <span class="s2">&quot;droid_lerobot&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
-    <span class="s2">&quot;robomind-franka&quot;</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
-    <span class="s2">&quot;galbot&quot;</span><span class="p">:</span> <span class="mi">9</span><span class="p">,</span>
-    <span class="s2">&quot;robomind-franka-dual&quot;</span><span class="p">:</span> <span class="mi">12</span><span class="p">,</span>
-    <span class="s2">&quot;robomind-ur&quot;</span><span class="p">:</span> <span class="mi">13</span><span class="p">,</span>
-    <span class="s2">&quot;agibotworld&quot;</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
-    <span class="s2">&quot;agibot_gear_gripper&quot;</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
-    <span class="s2">&quot;agibot_gear_gripper_ext&quot;</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
-    <span class="s2">&quot;fractal&quot;</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
+    <span class="s2">"no_action"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span>
+    <span class="s2">"av"</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="s2">"camera_pose"</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span>
+    <span class="s2">"hand_pose"</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span>
+    <span class="s2">"pusht"</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span>
+    <span class="s2">"libero"</span><span class="p">:</span> <span class="mi">5</span><span class="p">,</span>
+    <span class="s2">"umi"</span><span class="p">:</span> <span class="mi">6</span><span class="p">,</span>
+    <span class="s2">"bridge_orig_lerobot"</span><span class="p">:</span> <span class="mi">7</span><span class="p">,</span>
+    <span class="s2">"droid_lerobot"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+    <span class="s2">"robomind-franka"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span>
+    <span class="s2">"galbot"</span><span class="p">:</span> <span class="mi">9</span><span class="p">,</span>
+    <span class="s2">"robomind-franka-dual"</span><span class="p">:</span> <span class="mi">12</span><span class="p">,</span>
+    <span class="s2">"robomind-ur"</span><span class="p">:</span> <span class="mi">13</span><span class="p">,</span>
+    <span class="s2">"agibotworld"</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
+    <span class="s2">"agibot_gear_gripper"</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
+    <span class="s2">"agibot_gear_gripper_ext"</span><span class="p">:</span> <span class="mi">15</span><span class="p">,</span>
+    <span class="s2">"fractal"</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
 <span class="p">}</span>
 
 
 <div class="viewcode-block" id="resolve_action_domain_id">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.resolve_action_domain_id">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">resolve_action_domain_id</span><span class="p">(</span><span class="n">domain_id</span><span class="p">,</span> <span class="n">domain_name</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Resolve an action request&#39;s embodiment domain. A numeric ``domain_id``</span>
+<span class="w">    </span><span class="sd">"""Resolve an action request's embodiment domain. A numeric ``domain_id``</span>
 <span class="sd">    wins; otherwise ``domain_name`` looks up the published table. One of the</span>
 <span class="sd">    two is required — the domain conditions the action pathway, and a silent</span>
-<span class="sd">    default would predict actions for the wrong embodiment.&quot;&quot;&quot;</span>
+<span class="sd">    default would predict actions for the wrong embodiment."""</span>
     <span class="k">if</span> <span class="n">domain_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">resolved</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">domain_id</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">resolved</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cosmos3 domain_id must be non-negative, got </span><span class="si">{</span><span class="n">resolved</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3 domain_id must be non-negative, got </span><span class="si">{</span><span class="n">resolved</span><span class="si">}</span><span class="s2">."</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">resolved</span>
     <span class="k">if</span> <span class="n">domain_name</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">str</span><span class="p">(</span><span class="n">domain_name</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">():</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="s2">&quot;Cosmos3 action requests require &#39;domain_id&#39; or a non-empty &#39;domain_name&#39;.&quot;</span>
+            <span class="s2">"Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."</span>
         <span class="p">)</span>
     <span class="n">key</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">domain_name</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
     <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;Unknown Cosmos3 action domain_name=</span><span class="si">{</span><span class="n">domain_name</span><span class="si">!r}</span><span class="s2">; expected one of &quot;</span>
-            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">)</span><span class="si">}</span><span class="s2"> or a numeric domain_id.&quot;</span>
+            <span class="sa">f</span><span class="s2">"Unknown Cosmos3 action domain_name=</span><span class="si">{</span><span class="n">domain_name</span><span class="si">!r}</span><span class="s2">; expected one of "</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">)</span><span class="si">}</span><span class="s2"> or a numeric domain_id."</span>
         <span class="p">)</span>
     <span class="k">return</span> <span class="n">EMBODIMENT_TO_DOMAIN_ID</span><span class="p">[</span><span class="n">key</span><span class="p">]</span></div>
 
@@ -1072,19 +1074,19 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># video). Both append the eos + start-of-generation special tokens.</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
 
-<span class="n">SYSTEM_PROMPT_IMAGE</span> <span class="o">=</span> <span class="s2">&quot;You are a helpful assistant who will generate images from a give prompt.&quot;</span>
-<span class="n">SYSTEM_PROMPT_VIDEO</span> <span class="o">=</span> <span class="s2">&quot;You are a helpful assistant who will generate videos from a give prompt.&quot;</span>
-<span class="n">IMAGE_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This image is of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
-<span class="n">INVERSE_IMAGE_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This image is not of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
-<span class="n">VIDEO_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This video is of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
-<span class="n">INVERSE_VIDEO_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;This video is not of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution.&quot;</span>
-<span class="n">DURATION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;The video is </span><span class="si">{duration:.1f}</span><span class="s2"> seconds long and is of </span><span class="si">{fps:.0f}</span><span class="s2"> FPS.&quot;</span>
-<span class="n">INVERSE_DURATION_TEMPLATE</span> <span class="o">=</span> <span class="s2">&quot;The video is not </span><span class="si">{duration:.1f}</span><span class="s2"> seconds long and is not of </span><span class="si">{fps:.0f}</span><span class="s2"> FPS.&quot;</span>
+<span class="n">SYSTEM_PROMPT_IMAGE</span> <span class="o">=</span> <span class="s2">"You are a helpful assistant who will generate images from a give prompt."</span>
+<span class="n">SYSTEM_PROMPT_VIDEO</span> <span class="o">=</span> <span class="s2">"You are a helpful assistant who will generate videos from a give prompt."</span>
+<span class="n">IMAGE_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">"This image is of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution."</span>
+<span class="n">INVERSE_IMAGE_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">"This image is not of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution."</span>
+<span class="n">VIDEO_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">"This video is of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution."</span>
+<span class="n">INVERSE_VIDEO_RESOLUTION_TEMPLATE</span> <span class="o">=</span> <span class="s2">"This video is not of </span><span class="si">{height}</span><span class="s2">x</span><span class="si">{width}</span><span class="s2"> resolution."</span>
+<span class="n">DURATION_TEMPLATE</span> <span class="o">=</span> <span class="s2">"The video is </span><span class="si">{duration:.1f}</span><span class="s2"> seconds long and is of </span><span class="si">{fps:.0f}</span><span class="s2"> FPS."</span>
+<span class="n">INVERSE_DURATION_TEMPLATE</span> <span class="o">=</span> <span class="s2">"The video is not </span><span class="si">{duration:.1f}</span><span class="s2"> seconds long and is not of </span><span class="si">{fps:.0f}</span><span class="s2"> FPS."</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_append</span><span class="p">(</span><span class="n">base</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">addition</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-    <span class="n">base</span> <span class="o">=</span> <span class="n">base</span><span class="o">.</span><span class="n">rstrip</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span>
-    <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base</span><span class="si">}</span><span class="s2">. </span><span class="si">{</span><span class="n">addition</span><span class="si">}</span><span class="s2">&quot;</span> <span class="k">if</span> <span class="n">base</span> <span class="k">else</span> <span class="n">addition</span>
+    <span class="n">base</span> <span class="o">=</span> <span class="n">base</span><span class="o">.</span><span class="n">rstrip</span><span class="p">(</span><span class="s2">"."</span><span class="p">)</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">base</span><span class="si">}</span><span class="s2">. </span><span class="si">{</span><span class="n">addition</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">base</span> <span class="k">else</span> <span class="n">addition</span>
 
 
 <div class="viewcode-block" id="tokenize_prompt">
@@ -1102,21 +1104,21 @@ window.runMermaid = runMermaid;</script>
     <span class="n">add_duration_template</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
     <span class="n">max_sequence_length</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return ``(cond_input_ids, uncond_input_ids)`` for image/video generation.</span>
+<span class="w">    </span><span class="sd">"""Return ``(cond_input_ids, uncond_input_ids)`` for image/video generation.</span>
 
 <span class="sd">    Mirrors the diffusers pipeline: apply the Qwen2 chat template with the</span>
 <span class="sd">    mode-specific system prompt and metadata sentences (duration for video, then</span>
 <span class="sd">    resolution), using inverse templates for the negative prompt, then append the</span>
 <span class="sd">    eos + start-of-generation (``&lt;|vision_start|&gt;``) special tokens. Image mode is</span>
 <span class="sd">    ``num_frames == 1``. ``max_sequence_length`` caps the chat-template token</span>
-<span class="sd">    count BEFORE the two trailing markers (the reference serving pipeline&#39;s</span>
+<span class="sd">    count BEFORE the two trailing markers (the reference serving pipeline's</span>
 <span class="sd">    truncation contract); ``None`` leaves the prompt unbounded.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
+<span class="sd">    """</span>
     <span class="n">is_image</span> <span class="o">=</span> <span class="n">num_frames</span> <span class="o">==</span> <span class="mi">1</span>
     <span class="k">if</span> <span class="n">negative_prompt</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">negative_prompt</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+        <span class="n">negative_prompt</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">eos_id</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span>
-    <span class="n">sog_id</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">convert_tokens_to_ids</span><span class="p">(</span><span class="s2">&quot;&lt;|vision_start|&gt;&quot;</span><span class="p">)</span>
+    <span class="n">sog_id</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">convert_tokens_to_ids</span><span class="p">(</span><span class="s2">"&lt;|vision_start|&gt;"</span><span class="p">)</span>
 
     <span class="n">resolution_template</span> <span class="o">=</span> <span class="n">IMAGE_RESOLUTION_TEMPLATE</span> <span class="k">if</span> <span class="n">is_image</span> <span class="k">else</span> <span class="n">VIDEO_RESOLUTION_TEMPLATE</span>
     <span class="n">inverse_resolution_template</span> <span class="o">=</span> <span class="p">(</span>
@@ -1136,17 +1138,17 @@ window.runMermaid = runMermaid;</script>
         <span class="n">conversations</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">if</span> <span class="n">use_system_prompt</span><span class="p">:</span>
             <span class="n">conversations</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="n">SYSTEM_PROMPT_IMAGE</span> <span class="k">if</span> <span class="n">is_image</span> <span class="k">else</span> <span class="n">SYSTEM_PROMPT_VIDEO</span><span class="p">}</span>
+                <span class="p">{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"system"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">SYSTEM_PROMPT_IMAGE</span> <span class="k">if</span> <span class="n">is_image</span> <span class="k">else</span> <span class="n">SYSTEM_PROMPT_VIDEO</span><span class="p">}</span>
             <span class="p">)</span>
-        <span class="n">conversations</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;user&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="n">text</span><span class="p">})</span>
+        <span class="n">conversations</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="n">text</span><span class="p">})</span>
         <span class="n">enc</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">apply_chat_template</span><span class="p">(</span>
             <span class="n">conversations</span><span class="p">,</span> <span class="n">tokenize</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">add_generation_prompt</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">add_vision_id</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span>
         <span class="p">)</span>
-        <span class="n">ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">enc</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">])</span>
+        <span class="n">ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">enc</span><span class="p">[</span><span class="s2">"input_ids"</span><span class="p">])</span>
         <span class="k">if</span> <span class="n">max_sequence_length</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_sequence_length</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                <span class="s2">&quot;Cosmos3 prompt token count truncated to max_sequence_length: &quot;</span>
-                <span class="s2">&quot;original_token_count=</span><span class="si">%d</span><span class="s2">, max_sequence_length=</span><span class="si">%d</span><span class="s2">, removed_token_count=</span><span class="si">%d</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="s2">"Cosmos3 prompt token count truncated to max_sequence_length: "</span>
+                <span class="s2">"original_token_count=</span><span class="si">%d</span><span class="s2">, max_sequence_length=</span><span class="si">%d</span><span class="s2">, removed_token_count=</span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span>
                 <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">),</span> <span class="n">max_sequence_length</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">ids</span><span class="p">)</span> <span class="o">-</span> <span class="n">max_sequence_length</span><span class="p">,</span>
             <span class="p">)</span>
             <span class="n">ids</span> <span class="o">=</span> <span class="n">ids</span><span class="p">[:</span><span class="n">max_sequence_length</span><span class="p">]</span>
@@ -1171,11 +1173,11 @@ window.runMermaid = runMermaid;</script>
         <span class="n">num_tokens</span><span class="o">=</span><span class="n">und_len</span><span class="p">,</span> <span class="n">temporal_offset</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">use_float_positions</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span>
     <span class="p">)</span>
     <span class="k">return</span> <span class="p">{</span>
-        <span class="s2">&quot;input_ids&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;text_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">und_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;und_len&quot;</span><span class="p">:</span> <span class="n">und_len</span><span class="p">,</span>
-        <span class="s2">&quot;text_mrope_ids&quot;</span><span class="p">:</span> <span class="n">text_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">:</span> <span class="n">next_off</span> <span class="o">+</span> <span class="n">config</span><span class="o">.</span><span class="n">unified_3d_mrope_temporal_modality_margin</span><span class="p">,</span>
+        <span class="s2">"input_ids"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"text_indexes"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">und_len</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"und_len"</span><span class="p">:</span> <span class="n">und_len</span><span class="p">,</span>
+        <span class="s2">"text_mrope_ids"</span><span class="p">:</span> <span class="n">text_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"vision_start_temporal_offset"</span><span class="p">:</span> <span class="n">next_off</span> <span class="o">+</span> <span class="n">config</span><span class="o">.</span><span class="n">unified_3d_mrope_temporal_modality_margin</span><span class="p">,</span>
     <span class="p">}</span></div>
 
 
@@ -1193,13 +1195,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">device</span><span class="p">,</span>
     <span class="n">noisy_frames</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;``latent_shape`` is the vision latent tensor shape ``[B, C, T, H, W]``.</span>
+<span class="w">    </span><span class="sd">"""``latent_shape`` is the vision latent tensor shape ``[B, C, T, H, W]``.</span>
 
 <span class="sd">    ``noisy_frames`` lists the latent frames that are noisy (predicted); the rest</span>
 <span class="sd">    are clean conditioning context. When ``None`` it defaults to frame 0 clean</span>
 <span class="sd">    if ``has_image_condition`` else all frames noisy — i.e. the t2i/t2v/i2v</span>
 <span class="sd">    layouts. Action modes pass an explicit list (e.g. ``[]`` for</span>
-<span class="sd">    inverse-dynamics, where the whole video is conditioning).&quot;&quot;&quot;</span>
+<span class="sd">    inverse-dynamics, where the whole video is conditioning)."""</span>
     <span class="n">p</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">latent_patch_size</span>
     <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">,</span> <span class="n">latent_h</span><span class="p">,</span> <span class="n">latent_w</span> <span class="o">=</span> <span class="n">latent_shape</span>
     <span class="n">patch_h</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">latent_h</span> <span class="o">/</span> <span class="n">p</span><span class="p">)</span>
@@ -1232,13 +1234,13 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
 
     <span class="k">return</span> <span class="p">{</span>
-        <span class="s2">&quot;vision_token_shapes&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">latent_t</span><span class="p">,</span> <span class="n">patch_h</span><span class="p">,</span> <span class="n">patch_w</span><span class="p">)],</span>
-        <span class="s2">&quot;vision_sequence_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">num_vision_tokens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;vision_mse_loss_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">mse_loss_indexes</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;vision_noisy_frame_indexes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">noisy_frame_indexes</span><span class="p">],</span>
-        <span class="s2">&quot;vision_mrope_ids&quot;</span><span class="p">:</span> <span class="n">vision_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;num_vision_tokens&quot;</span><span class="p">:</span> <span class="n">num_vision_tokens</span><span class="p">,</span>
-        <span class="s2">&quot;num_noisy_vision_tokens&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">noisy_list</span><span class="p">)</span> <span class="o">*</span> <span class="n">frame_token_stride</span><span class="p">,</span>
+        <span class="s2">"vision_token_shapes"</span><span class="p">:</span> <span class="p">[(</span><span class="n">latent_t</span><span class="p">,</span> <span class="n">patch_h</span><span class="p">,</span> <span class="n">patch_w</span><span class="p">)],</span>
+        <span class="s2">"vision_sequence_indexes"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">num_vision_tokens</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"vision_mse_loss_indexes"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">mse_loss_indexes</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"vision_noisy_frame_indexes"</span><span class="p">:</span> <span class="p">[</span><span class="n">noisy_frame_indexes</span><span class="p">],</span>
+        <span class="s2">"vision_mrope_ids"</span><span class="p">:</span> <span class="n">vision_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"num_vision_tokens"</span><span class="p">:</span> <span class="n">num_vision_tokens</span><span class="p">,</span>
+        <span class="s2">"num_noisy_vision_tokens"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">noisy_list</span><span class="p">)</span> <span class="o">*</span> <span class="n">frame_token_stride</span><span class="p">,</span>
     <span class="p">}</span></div>
 
 
@@ -1252,10 +1254,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">config</span><span class="p">,</span>
     <span class="n">device</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Sound (AVAE-latent) band of the generation sequence: a ``(T, 1, 1)`` grid</span>
-<span class="sd">    at the sound tokenizer&#39;s latent frame rate, sharing the post-text media</span>
+<span class="w">    </span><span class="sd">"""Sound (AVAE-latent) band of the generation sequence: a ``(T, 1, 1)`` grid</span>
+<span class="sd">    at the sound tokenizer's latent frame rate, sharing the post-text media</span>
 <span class="sd">    temporal offset with the vision band. Every sound frame is noisy/predicted</span>
-<span class="sd">    (sound generation has no clean conditioning tokens).&quot;&quot;&quot;</span>
+<span class="sd">    (sound generation has no clean conditioning tokens)."""</span>
     <span class="n">effective_fps</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">sound_latent_fps</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span> <span class="k">else</span> <span class="kc">None</span>
     <span class="n">sound_mrope_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">get_3d_mrope_ids_vae_tokens</span><span class="p">(</span>
         <span class="n">grid_t</span><span class="o">=</span><span class="n">sound_latent_frames</span><span class="p">,</span>
@@ -1270,12 +1272,12 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
     <span class="n">sequence_indexes</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">sound_latent_frames</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
     <span class="k">return</span> <span class="p">{</span>
-        <span class="s2">&quot;sound_token_shapes&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">sound_latent_frames</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)],</span>
-        <span class="s2">&quot;sound_sequence_indexes&quot;</span><span class="p">:</span> <span class="n">sequence_indexes</span><span class="p">,</span>
-        <span class="s2">&quot;sound_mse_loss_indexes&quot;</span><span class="p">:</span> <span class="n">sequence_indexes</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span>
-        <span class="s2">&quot;sound_noisy_frame_indexes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">sound_latent_frames</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)],</span>
-        <span class="s2">&quot;sound_mrope_ids&quot;</span><span class="p">:</span> <span class="n">sound_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;num_sound_tokens&quot;</span><span class="p">:</span> <span class="n">sound_latent_frames</span><span class="p">,</span>
+        <span class="s2">"sound_token_shapes"</span><span class="p">:</span> <span class="p">[(</span><span class="n">sound_latent_frames</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)],</span>
+        <span class="s2">"sound_sequence_indexes"</span><span class="p">:</span> <span class="n">sequence_indexes</span><span class="p">,</span>
+        <span class="s2">"sound_mse_loss_indexes"</span><span class="p">:</span> <span class="n">sequence_indexes</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span>
+        <span class="s2">"sound_noisy_frame_indexes"</span><span class="p">:</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">sound_latent_frames</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)],</span>
+        <span class="s2">"sound_mrope_ids"</span><span class="p">:</span> <span class="n">sound_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"num_sound_tokens"</span><span class="p">:</span> <span class="n">sound_latent_frames</span><span class="p">,</span>
     <span class="p">}</span></div>
 
 
@@ -1293,7 +1295,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">sound_latent_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">noisy_frames</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Assemble the per-prompt static transformer inputs for image/video</span>
+<span class="w">    </span><span class="sd">"""Assemble the per-prompt static transformer inputs for image/video</span>
 <span class="sd">    generation. ``latent_shape`` is ``[B, C, T, H, W]`` (``T == 1`` for images;</span>
 <span class="sd">    ``T == 1 + (num_frames - 1) // temporal_factor`` for video). When</span>
 <span class="sd">    ``has_image_condition`` is set, latent frame 0 is a clean conditioning anchor</span>
@@ -1303,37 +1305,37 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``sound_latent_frames`` appends a jointly denoised sound</span>
 <span class="sd">    band after the vision tokens (the generation block becomes</span>
 <span class="sd">    ``[vision | sound]``). Step-varying fields (``vision_tokens``,</span>
-<span class="sd">    ``vision_timesteps``) are spliced in per denoising step by the caller.&quot;&quot;&quot;</span>
+<span class="sd">    ``vision_timesteps``) are spliced in per denoising step by the caller."""</span>
     <span class="n">text</span> <span class="o">=</span> <span class="n">build_text_segment</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
     <span class="n">vision</span> <span class="o">=</span> <span class="n">build_vision_segment</span><span class="p">(</span>
         <span class="n">latent_shape</span><span class="o">=</span><span class="n">latent_shape</span><span class="p">,</span>
         <span class="n">has_image_condition</span><span class="o">=</span><span class="n">has_image_condition</span><span class="p">,</span>
-        <span class="n">mrope_offset</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">],</span>
+        <span class="n">mrope_offset</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">"vision_start_temporal_offset"</span><span class="p">],</span>
         <span class="n">vision_fps</span><span class="o">=</span><span class="n">fps</span><span class="p">,</span>
-        <span class="n">curr</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">],</span>
+        <span class="n">curr</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">"und_len"</span><span class="p">],</span>
         <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
         <span class="n">vae_scale_factor_temporal</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
         <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
         <span class="n">noisy_frames</span><span class="o">=</span><span class="n">noisy_frames</span><span class="p">,</span>
     <span class="p">)</span>
-    <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;text_mrope_ids&quot;</span><span class="p">],</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;vision_mrope_ids&quot;</span><span class="p">]]</span>
+    <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[</span><span class="s2">"text_mrope_ids"</span><span class="p">],</span> <span class="n">vision</span><span class="p">[</span><span class="s2">"vision_mrope_ids"</span><span class="p">]]</span>
     <span class="n">static</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="n">text</span><span class="p">,</span> <span class="o">**</span><span class="n">vision</span><span class="p">}</span>
-    <span class="n">sequence_length</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">]</span> <span class="o">+</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;num_vision_tokens&quot;</span><span class="p">]</span>
+    <span class="n">sequence_length</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">"und_len"</span><span class="p">]</span> <span class="o">+</span> <span class="n">vision</span><span class="p">[</span><span class="s2">"num_vision_tokens"</span><span class="p">]</span>
     <span class="k">if</span> <span class="n">sound_latent_frames</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">sound</span> <span class="o">=</span> <span class="n">build_sound_segment</span><span class="p">(</span>
             <span class="n">sound_latent_frames</span><span class="o">=</span><span class="n">sound_latent_frames</span><span class="p">,</span>
-            <span class="n">mrope_offset</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">],</span>
+            <span class="n">mrope_offset</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">"vision_start_temporal_offset"</span><span class="p">],</span>
             <span class="n">curr</span><span class="o">=</span><span class="n">sequence_length</span><span class="p">,</span>
             <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
             <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="n">static</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">sound</span><span class="p">)</span>
-        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">sound</span><span class="p">[</span><span class="s2">&quot;sound_mrope_ids&quot;</span><span class="p">])</span>
-        <span class="n">sequence_length</span> <span class="o">+=</span> <span class="n">sound</span><span class="p">[</span><span class="s2">&quot;num_sound_tokens&quot;</span><span class="p">]</span>
+        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">sound</span><span class="p">[</span><span class="s2">"sound_mrope_ids"</span><span class="p">])</span>
+        <span class="n">sequence_length</span> <span class="o">+=</span> <span class="n">sound</span><span class="p">[</span><span class="s2">"num_sound_tokens"</span><span class="p">]</span>
     <span class="n">pos_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">is_floating_point</span><span class="p">()</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">long</span>
     <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">p</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pos_dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
-    <span class="n">static</span><span class="p">[</span><span class="s2">&quot;position_ids&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span>
-    <span class="n">static</span><span class="p">[</span><span class="s2">&quot;sequence_length&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">sequence_length</span>
+    <span class="n">static</span><span class="p">[</span><span class="s2">"position_ids"</span><span class="p">]</span> <span class="o">=</span> <span class="n">position_ids</span>
+    <span class="n">static</span><span class="p">[</span><span class="s2">"sequence_length"</span><span class="p">]</span> <span class="o">=</span> <span class="n">sequence_length</span>
     <span class="k">return</span> <span class="n">static</span></div>
 
 
@@ -1348,7 +1350,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
     <span class="n">device</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Image-mode convenience wrapper around :func:`build_static_inputs`.&quot;&quot;&quot;</span>
+<span class="w">    </span><span class="sd">"""Image-mode convenience wrapper around :func:`build_static_inputs`."""</span>
     <span class="k">return</span> <span class="n">build_static_inputs</span><span class="p">(</span>
         <span class="n">input_ids</span><span class="p">,</span> <span class="n">latent_shape</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">vae_scale_factor_temporal</span><span class="p">,</span> <span class="n">fps</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span>
         <span class="n">has_image_condition</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -1370,16 +1372,16 @@ window.runMermaid = runMermaid;</script>
     <span class="n">action_start_offset</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">device</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Assemble the static transformer inputs for joint video+action generation.</span>
+<span class="w">    </span><span class="sd">"""Assemble the static transformer inputs for joint video+action generation.</span>
 
 <span class="sd">    The generation sequence is ``[video tokens | action tokens]`` after the text</span>
 <span class="sd">    prefix. Both media bands share the post-text temporal offset (the 15000</span>
 <span class="sd">    margin), with the action band on its own frame-rate grid. Conditioning per</span>
 <span class="sd">    ``mode`` decides which video frames and action tokens are clean context vs</span>
 <span class="sd">    noisy/predicted (see :func:`vision_condition_frame_indexes` /</span>
-<span class="sd">    :func:`action_condition_frame_indexes`).&quot;&quot;&quot;</span>
+<span class="sd">    :func:`action_condition_frame_indexes`)."""</span>
     <span class="n">text</span> <span class="o">=</span> <span class="n">build_text_segment</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
-    <span class="n">media_offset</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">&quot;vision_start_temporal_offset&quot;</span><span class="p">]</span>
+    <span class="n">media_offset</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">"vision_start_temporal_offset"</span><span class="p">]</span>
     <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">video_latent_shape</span>
 
     <span class="n">vision_clean</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">vision_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">))</span>
@@ -1389,14 +1391,14 @@ window.runMermaid = runMermaid;</script>
         <span class="n">has_image_condition</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">mrope_offset</span><span class="o">=</span><span class="n">media_offset</span><span class="p">,</span>
         <span class="n">vision_fps</span><span class="o">=</span><span class="n">fps</span><span class="p">,</span>
-        <span class="n">curr</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">],</span>
+        <span class="n">curr</span><span class="o">=</span><span class="n">text</span><span class="p">[</span><span class="s2">"und_len"</span><span class="p">],</span>
         <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
         <span class="n">vae_scale_factor_temporal</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
         <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
         <span class="n">noisy_frames</span><span class="o">=</span><span class="n">vision_noisy</span><span class="p">,</span>
     <span class="p">)</span>
 
-    <span class="n">curr</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">&quot;und_len&quot;</span><span class="p">]</span> <span class="o">+</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;num_vision_tokens&quot;</span><span class="p">]</span>
+    <span class="n">curr</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="s2">"und_len"</span><span class="p">]</span> <span class="o">+</span> <span class="n">vision</span><span class="p">[</span><span class="s2">"num_vision_tokens"</span><span class="p">]</span>
     <span class="n">action_clean</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">action_condition_frame_indexes</span><span class="p">(</span><span class="n">mode</span><span class="p">,</span> <span class="n">action_chunk_size</span><span class="p">))</span>
     <span class="n">action_noisy</span> <span class="o">=</span> <span class="p">[</span><span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">action_chunk_size</span><span class="p">)</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">action_clean</span><span class="p">]</span>
     <span class="n">effective_action_fps</span> <span class="o">=</span> <span class="n">action_fps</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_fps_modulation</span> <span class="k">else</span> <span class="kc">None</span>
@@ -1409,25 +1411,25 @@ window.runMermaid = runMermaid;</script>
         <span class="n">start_frame_offset</span><span class="o">=</span><span class="n">action_start_offset</span><span class="p">,</span>
     <span class="p">)</span>
 
-    <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[</span><span class="s2">&quot;text_mrope_ids&quot;</span><span class="p">],</span> <span class="n">vision</span><span class="p">[</span><span class="s2">&quot;vision_mrope_ids&quot;</span><span class="p">],</span> <span class="n">action_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)]</span>
+    <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[</span><span class="s2">"text_mrope_ids"</span><span class="p">],</span> <span class="n">vision</span><span class="p">[</span><span class="s2">"vision_mrope_ids"</span><span class="p">],</span> <span class="n">action_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)]</span>
     <span class="n">pos_dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">is_floating_point</span><span class="p">()</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">)</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">long</span>
     <span class="n">position_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">p</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">pos_dtype</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
 
     <span class="k">return</span> <span class="p">{</span>
         <span class="o">**</span><span class="n">text</span><span class="p">,</span>
         <span class="o">**</span><span class="n">vision</span><span class="p">,</span>
-        <span class="s2">&quot;action_token_shapes&quot;</span><span class="p">:</span> <span class="p">[(</span><span class="n">action_chunk_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)],</span>
-        <span class="s2">&quot;action_sequence_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">action_chunk_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;action_noisy_frame_indexes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">action_noisy</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)],</span>
-        <span class="s2">&quot;action_mse_loss_indexes&quot;</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+        <span class="s2">"action_token_shapes"</span><span class="p">:</span> <span class="p">[(</span><span class="n">action_chunk_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)],</span>
+        <span class="s2">"action_sequence_indexes"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">curr</span><span class="p">,</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">action_chunk_size</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"action_noisy_frame_indexes"</span><span class="p">:</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">action_noisy</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)],</span>
+        <span class="s2">"action_mse_loss_indexes"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
             <span class="p">[</span><span class="n">curr</span> <span class="o">+</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">action_noisy</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span>
         <span class="p">),</span>
-        <span class="s2">&quot;action_mrope_ids&quot;</span><span class="p">:</span> <span class="n">action_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
-        <span class="s2">&quot;num_action_tokens&quot;</span><span class="p">:</span> <span class="n">action_chunk_size</span><span class="p">,</span>
-        <span class="s2">&quot;num_noisy_action_tokens&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">action_noisy</span><span class="p">),</span>
-        <span class="s2">&quot;action_mode&quot;</span><span class="p">:</span> <span class="n">mode</span><span class="p">,</span>
-        <span class="s2">&quot;position_ids&quot;</span><span class="p">:</span> <span class="n">position_ids</span><span class="p">,</span>
-        <span class="s2">&quot;sequence_length&quot;</span><span class="p">:</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">action_chunk_size</span><span class="p">,</span>
+        <span class="s2">"action_mrope_ids"</span><span class="p">:</span> <span class="n">action_mrope_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+        <span class="s2">"num_action_tokens"</span><span class="p">:</span> <span class="n">action_chunk_size</span><span class="p">,</span>
+        <span class="s2">"num_noisy_action_tokens"</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">action_noisy</span><span class="p">),</span>
+        <span class="s2">"action_mode"</span><span class="p">:</span> <span class="n">mode</span><span class="p">,</span>
+        <span class="s2">"position_ids"</span><span class="p">:</span> <span class="n">position_ids</span><span class="p">,</span>
+        <span class="s2">"sequence_length"</span><span class="p">:</span> <span class="n">curr</span> <span class="o">+</span> <span class="n">action_chunk_size</span><span class="p">,</span>
     <span class="p">}</span></div>
 
 </pre></div>
@@ -1477,7 +1479,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 16, 2026.
+  Last updated on Sep 01, 2026.
   <br/>
 </p>
   </div>
