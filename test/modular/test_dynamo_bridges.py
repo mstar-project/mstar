@@ -361,6 +361,53 @@ def test_realtime_stop_mid_turn(tmp_path):
     assert server.aborted
 
 
+def test_realtime_turn_aborts_on_dropped_socket(tmp_path):
+    # A dropped socket flips is_killed, not is_stopped. The turn must abort
+    # instead of generating to completion into a queue nobody reads.
+    server = _BlockingServer([], tmp_path)
+    ctx = _AsyncCtx()
+    bridge = RealtimeBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+
+    async def collect():
+        out = []
+        async for event in bridge.generate(_client_events([
+            {"type": "input_audio_buffer.append",
+             "audio": base64.b64encode(PCM).decode("ascii")},
+            {"type": "input_audio_buffer.commit"},
+        ]), ctx):
+            out.append(event)
+        return out
+
+    async def run():
+        return await asyncio.wait_for(collect(), timeout=5)
+
+    out = asyncio.run(run())
+    types = [e["type"] for e in out]
+    assert "response.created" in types
+    assert "response.done" not in types
+    assert server.aborted
+
+
+def test_realtime_session_validates_pcm_rate(tmp_path):
+    # audio/pcm at a rate other than 24 kHz would silently play back wrong;
+    # reject it up front. 24000 (and an absent rate) stay accepted.
+    server = _FakeRealtimeServer([], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {
+            "type": "realtime", "model": "q3o",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000}}},
+        }},
+        {"type": "session.update", "session": {
+            "type": "realtime", "model": "q3o",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+        }},
+    ])
+    errors = [e for e in out if e["type"] == "error"]
+    assert len(errors) == 1
+    assert "24000" in errors[0]["error"]["message"]
+    assert [e["type"] for e in out].count("session.updated") == 2
+
+
 # ----------------------------------------------------------------------
 # request bridge (seam double; no engine)
 # ----------------------------------------------------------------------
@@ -400,6 +447,50 @@ def test_images_cancel_before_first_chunk(tmp_path):
     with pytest.raises(RuntimeError, match="cancelled"):
         asyncio.run(run())
     assert server.aborted
+
+
+def test_images_n_follows_native_seed_contract(tmp_path):
+    # n engine requests, image i seeded seed + i — the create_images
+    # contract, so image 0 matches the same request with n=1.
+    server = _FakeRealtimeServer([_chunk("image", b"png-bytes")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")
+
+    async def run():
+        return await bridge._images(
+            {"prompt": "a cat", "model": "bagel", "n": 3, "nvext": {"seed": 7}},
+            _Ctx())
+
+    result = asyncio.run(run())
+    seeds = [s["model_kwargs"].get("seed") for s in server.submitted]
+    assert seeds == [7, 8, 9]
+    assert len(result["data"]) == 3
+
+    server.submitted.clear()
+    unseeded = asyncio.run(bridge._images(
+        {"prompt": "a cat", "model": "bagel", "n": 2}, _Ctx()))
+    assert [s["model_kwargs"].get("seed") for s in server.submitted] == [None, None]
+    assert len(unseeded["data"]) == 2
+
+
+def test_images_edit_carries_declared_seed(tmp_path):
+    # seed is a declared request field, so model_extra never carries it; the
+    # edit path must hand it to the adapter explicitly.
+    server = _FakeRealtimeServer([_chunk("image", b"png-bytes")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["bagel"], "bagel")
+    ref = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
+
+    async def run():
+        return await bridge._images(
+            {"prompt": "make it night", "model": "bagel",
+             "input_reference": ref, "nvext": {"seed": 5}},
+            _Ctx())
+
+    result = asyncio.run(run())
+    assert len(server.submitted) == 1
+    submit = server.submitted[0]
+    assert submit["model_kwargs"].get("seed") == 5
+    assert submit["file_paths"]["image"]
+    assert len(result["data"]) == 1
 
 
 # ----------------------------------------------------------------------

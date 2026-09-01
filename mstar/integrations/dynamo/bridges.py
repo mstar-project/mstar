@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import dataclasses
 import logging
 import time
 import uuid
@@ -237,25 +238,45 @@ class RequestBridge:
             _, path = media_io.resolve_media_ref(reference, self.server.upload_dir)
             extra = dict(req.model_extra or {})
             extra.pop("input_reference", None)
-            args = self.adapter.image_edit_to_request(req.prompt, path, extra)
+            # seed is a declared field, so model_extra never carries it; the
+            # edit adapter expects it in extra_kwargs (the native multipart
+            # route feeds it from a form field). Edits are single-submit on
+            # the native path too, so n does not apply here.
+            if req.seed is not None:
+                extra.setdefault("seed", req.seed)
+            submits = [self.adapter.image_edit_to_request(req.prompt, path, extra)]
         else:
+            # OpenAI ``n``: n engine requests submitted up front, image i
+            # seeded seed + i — the native create_images contract, so image 0
+            # is bit-identical to the same request with n=1.
             args = self.adapter.image_to_request(req, self.server.upload_dir)
+            submits = [args]
+            seed = args.model_kwargs.get("seed")
+            for i in range(1, max(1, int(req.n or 1))):
+                kwargs = dict(args.model_kwargs)
+                if seed is not None:
+                    kwargs["seed"] = int(seed) + i
+                submits.append(dataclasses.replace(args, model_kwargs=kwargs))
 
-        rid = self._submit(args, prefix="img")
+        rids = [self._submit(args, prefix="img") for args in submits]
         images: list[bytes] = []
         try:
-            async for chunk in _stream_chunks(self.server, rid, context):
-                if chunk.modality == "image":
-                    images.append(chunk.data)
-                elif chunk.modality == "error":
-                    raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+            for rid in rids:
+                async for chunk in _stream_chunks(self.server, rid, context):
+                    if chunk.modality == "image":
+                        images.append(chunk.data)
+                    elif chunk.modality == "error":
+                        raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                if _client_gone(context):
+                    break
         finally:
-            self.server.abort_request(rid)
+            for rid in rids:
+                self.server.abort_request(rid)
 
         if _client_gone(context):
             raise RuntimeError("request cancelled")
-        if not images:
-            raise RuntimeError("no image produced")
+        if len(images) < len(rids):
+            raise RuntimeError(f"produced {len(images)} of {len(rids)} images")
         return {
             "created": int(time.time()),
             "data": [{"b64_json": base64.b64encode(img).decode("ascii")} for img in images],
@@ -653,10 +674,10 @@ class RealtimeBridge:
             stopped = False
             text_parts: list[str] = []
             try:
-                async for chunk in self.server.iter_result_chunks(rid):
-                    if context is not None and context.is_stopped():
-                        stopped = True
-                        break
+                # _stream_chunks races the context's killed-or-stopped future,
+                # so a dropped socket aborts the turn instead of generating
+                # into a queue nobody reads until the model finishes.
+                async for chunk in _stream_chunks(self.server, rid, context):
                     if chunk.modality == "text":
                         delta = chunk.data.decode("utf-8", "replace")
                         for token in _TEMPLATE_END_TOKENS:
@@ -674,6 +695,7 @@ class RealtimeBridge:
                             delta=base64.b64encode(chunk.data).decode("ascii")))
                     elif chunk.modality == "error":
                         raise RuntimeError(chunk.data.decode("utf-8", "replace"))
+                stopped = _client_gone(context)
             finally:
                 self.server.abort_request(rid)
             if stopped:
@@ -720,10 +742,19 @@ class RealtimeBridge:
             nonlocal session, pcm
             try:
                 async for event in request_stream:
-                    if context is not None and context.is_stopped():
+                    if _client_gone(context):
                         break
                     etype = event.get("type") if isinstance(event, dict) else None
                     if etype == "session.update":
+                        # The frontend parses client frames into typed structs
+                        # before forwarding. Legacy flat fields
+                        # (input_audio_format: "pcm16") are unknown keys there
+                        # and never reach us, and a partial audio object — only
+                        # input, only output, or a format outside the typed
+                        # shapes (audio/pcm with its rate, audio/pcmu,
+                        # audio/pcma) — closes the socket upstream as a
+                        # malformed frame. What arrives here is a complete GA
+                        # audio object or nothing.
                         session = event.get("session")
                         fmt = {}
                         if isinstance(session, dict):
@@ -732,6 +763,12 @@ class RealtimeBridge:
                             out_stream.put_nowait(self._error(
                                 f"unsupported input audio format {fmt.get('type')!r}; "
                                 "only audio/pcm is supported",
+                                etype="invalid_request_error",
+                                code="unsupported_audio_format"))
+                        elif isinstance(fmt, dict) and fmt.get("rate") not in (None, 24000):
+                            out_stream.put_nowait(self._error(
+                                f"unsupported input audio rate {fmt.get('rate')!r}; "
+                                "only 24000 is supported",
                                 etype="invalid_request_error",
                                 code="unsupported_audio_format"))
                         out_stream.put_nowait(self._session_updated(session))
