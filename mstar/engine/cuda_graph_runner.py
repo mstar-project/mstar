@@ -22,7 +22,7 @@ from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSu
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
 def autocast_scope(dtype: torch.dtype | None):
