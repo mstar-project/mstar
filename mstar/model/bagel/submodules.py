@@ -16,6 +16,10 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     PackedCudaGraphConfig,
+    PiecewiseCallInputs,
+    PiecewiseCaptureShape,
+    PiecewiseCudaGraphConfig,
+    PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
@@ -29,6 +33,7 @@ from mstar.model.bagel.components.modeling_utils import (
     vllm_vae_resize,
     vllm_vit_resize,
 )
+from mstar.model.bagel.components.vit_encoder import VIT_ATTN
 from mstar.model.bagel.config import BagelModelConfig
 from mstar.model.higgs_audio.config import SAMPLER
 from mstar.model.submodule_base import (
@@ -59,6 +64,9 @@ NODE_TO_CFG_LABEL = {
     "LLM_cfg_text": "cfg_text",
     "LLM_cfg_img": "cfg_img",
 }
+
+# The ViT encoder's block loop, as a piecewise capture region
+VIT_BLOCK_LOOP = "vit_block_loop"
 
 
 def requires_cfg_for_inputs(inputs: list) -> bool:
@@ -115,6 +123,27 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.transform = ImageTransform(980, 224, 14)
         self.vae_transform = ImageTransform(1024, 512, 16)
+
+        self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") == "1"
+        # CUDA-graph capture of the ViT block loop, over the engine's ragged
+        # attention resource. Off by default: capture costs one graph per
+        # (bs, token bucket) and the eager flash-attn path is already fast;
+        # the win is removing per-layer launch overhead on small images.
+        self._cuda_graph_enabled = os.environ.get("MSTAR_VIT_CUDA_GRAPH", "0") == "1"
+        self._cg_token_buckets = [
+            int(t) for t in os.environ.get(
+                "MSTAR_VIT_CG_TOKEN_BUCKETS", "512,1024,2048,4096,4900"
+            ).split(",") if t.strip()
+        ]  # 4900 == 70*70, the exact length the "vllm" preprocess option emits
+        self._cg_batch_sizes = [
+            int(b) for b in
+            os.environ.get("MSTAR_VIT_CG_BATCH_SIZES", "1,2,4").split(",")
+            if b.strip()
+        ] if self._vit_batching else [1]
+        # `prepare_inputs` emits exactly one varlen segment (one image) per
+        # request, so the segment ceiling is the batch size. Raise only if that
+        # changes — and raise the resource's `max_segments_per_request` with it.
+        self._max_images_per_request = 1
 
     def prepare_inputs(
         self,
@@ -179,27 +208,161 @@ class ViTEncoderSubmodule(NodeSubmodule):
         max_seqlen: int,
         **kwargs,
     ) -> NameToTensorList:
-        features = self.vit_model(
+        features = self._encode(
+            engine_inputs=engine_inputs,
             packed_pixel_values=packed_pixel_values,
-            packed_flattened_position_ids=packed_position_ids,
+            packed_position_ids=packed_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            seq_lens=[int(packed_pixel_values.shape[0])],
         )
         features = self.connector(features)
         features = features + self.vit_pos_embed(packed_position_ids)
         return {"img_emb": [features]}
 
+    def get_piecewise_cuda_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype,
+        tp_world_size: int = 1, **kwargs,
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        """Capture the ViT block loop, leaving patch-embed and the RoPE gathers
+        eager — they are data-dependent indexing with no business in a graph."""
+        if not self._cuda_graph_enabled:
+            return {}
+        vit_config = self.vit_model.vision_model.config
+        hidden = vit_config.hidden_size
+        rope_dim = (hidden // vit_config.num_attention_heads) // 2
+
+        def make_static_inputs(shape: PiecewiseCaptureShape):
+            statics = {
+                "hidden_states": torch.zeros(
+                    shape.total_tokens, hidden, dtype=autocast_dtype, device=device
+                )
+            }
+            if vit_config.rope:
+                for name in ("cos_h", "sin_h", "cos_w", "sin_w"):
+                    statics[name] = torch.zeros(
+                        shape.total_tokens, rope_dim,
+                        dtype=autocast_dtype, device=device,
+                    )
+            return statics
+
+        def declare_step(
+            request_ids: list[str], seq_lens: list[int],
+        ) -> SubmoduleStep:
+            # One segment per row: `_images_per_request` is 1, so a request's
+            # tokens are one independently-attending image. Padding rows come
+            # through with span 0 and attend nothing.
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=seq_len)
+                    for rid, seq_len in zip(request_ids, seq_lens, strict=True)
+                ],
+                steps={VIT_ATTN: AttentionStep(causal=False)},
+            )
+
+        return {
+            VIT_BLOCK_LOOP: PiecewisePackedConfig(
+                capture_fn=self._capture_block_loop,
+                make_static_inputs=make_static_inputs,
+                declare_step=declare_step,
+                total_tokens=sorted(self._cg_token_buckets),
+                capture_batch_sizes=sorted(self._cg_batch_sizes),
+            )
+        }
+
+    def _capture_block_loop(
+        self, inp: PiecewiseCallInputs,
+    ) -> dict[str, torch.Tensor]:
+        """The captured region. Reads the runner-owned buffers, never rebinds.
+
+        ``cu_seqlens`` / ``max_seqlen`` go unused on this path: the layout
+        lives in the ragged attention resource, which the runner plans outside
+        the graph before every replay.
+        """
+        rope_inputs = {
+            name: inp.static_inputs[name]
+            for name in ("cos_h", "sin_h", "cos_w", "sin_w")
+            if name in inp.static_inputs
+        }
+        out = self.vit_model.vision_model.encode(
+            inp.static_inputs["hidden_states"],
+            cu_seqlens=None,
+            max_seqlen=0,
+            use_ragged=True,
+            **rope_inputs,
+        )
+        return {"hidden_states": out}
+
+    def _encode(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        packed_pixel_values: torch.Tensor,
+        packed_position_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        seq_lens: list[int],
+    ) -> torch.Tensor:
+        """ViT features for a packed batch, through the captured block loop
+        when one fits and eager flash-attn otherwise.
+
+        Only the replay is kept out of dynamo's reach; ``embed`` and ``encode``
+        stay traceable, which is worth ~7% on this tower.
+        """
+        vision_model = self.vit_model.vision_model
+        hidden_states, rope_inputs = vision_model.embed(
+            packed_pixel_values, packed_position_ids
+        )
+        captured = self._replay_block_loop(
+            engine_inputs, hidden_states, rope_inputs, cu_seqlens, seq_lens,
+        )
+        if captured is not None:
+            return captured
+        return vision_model.encode(
+            hidden_states, cu_seqlens, max_seqlen, use_ragged=False, **rope_inputs
+        )
+
+    @torch.compiler.disable
+    def _replay_block_loop(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        hidden_states: torch.Tensor,
+        rope_inputs: dict[str, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        seq_lens: list[int],
+    ) -> torch.Tensor | None:
+        """The captured block loop's output, or None when it can't serve this
+        batch and the caller should run eager."""
+        runner = engine_inputs.piecewise_runners.get(VIT_BLOCK_LOOP)
+        if runner is None or not runner.can_run(
+            len(seq_lens), int(hidden_states.shape[0])
+        ):
+            return None
+        # A captured bucket fixes the segment count at bs * images_per_request;
+        # a request carrying more images than that takes the eager path rather
+        # than tripping the wrapper's guard.
+        n_segments = int(cu_seqlens.numel()) - 1
+        if n_segments > len(seq_lens) * self._max_images_per_request:
+            return None
+        out = runner.run(
+            static_inputs={"hidden_states": hidden_states, **rope_inputs},
+            request_ids=list(engine_inputs.request_ids),
+            seq_lens=seq_lens,
+        )
+        # a view: the connector consumes it within this step
+        return out.get_view("hidden_states")
+
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        # Opt-in via MSTAR_VIT_BATCHING=1. Off by default because flashattn
-        # varlen reductions across packed images produce small bf16 drift,
-        # which at greedy temperature=0 can flip downstream LLM argmax.
-        if os.environ.get("MSTAR_VIT_BATCHING", "0") != "1":
+        # Opt-in via MSTAR_VIT_BATCHING=1.
+        if not self._vit_batching:
             return False
         return batch.graph_walk == "prefill_vit" and len(model_inputs) > 1
 
     def max_batch_size(self, graph_walk: str):
+        if not self._vit_batching:
+            return 1
         if graph_walk == "prefill_vit":
-            return 32
+            # low batch size, as higher batch sizes can cause performance degredation
+            return 4
         return None
 
     def preprocess(
@@ -245,11 +408,13 @@ class ViTEncoderSubmodule(NodeSubmodule):
         seq_lens: list[int],
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        features = self.vit_model(
+        features = self._encode(
+            engine_inputs=engine_inputs,
             packed_pixel_values=packed_pixel_values,
-            packed_flattened_position_ids=packed_position_ids,
+            packed_position_ids=packed_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            seq_lens=seq_lens,
         )
         features = self.connector(features)
         features = features + self.vit_pos_embed(packed_position_ids)

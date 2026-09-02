@@ -50,6 +50,8 @@ from mstar.engine.resources import (
     NodeResourceSpec,
     PositionConfig,
     PositionSpec,
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
@@ -69,7 +71,7 @@ from mstar.model.bagel.components.autoencoder import BagelAutoEncoder
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mstar.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
-from mstar.model.bagel.components.vit_encoder import BagelVisionModel
+from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
 from mstar.model.bagel.config import load_bagel_config
 from mstar.model.bagel.submodules import (
     CombineCFGSubmodule,
@@ -619,7 +621,8 @@ class BagelModel(Model):
         )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The KV cache, the attention over it, positions, and the sampler.
+        """The KV cache, the attention over it, positions, and the sampler,
+        plus the ViT's own cacheless attention.
 
         The labels here are the names the layers bind against
         (``Attention(attn_key=..., kv_key=..., pos_key=...)``) and the names
@@ -628,7 +631,22 @@ class BagelModel(Model):
         """
         kv_config = self._kv_config()
         nodes = set(self._LLM_NODES)
+        vit = self.config.vit_config
         return [
+            # The ViT tower attends within one packed forward and caches
+            # nothing, so this stands alone: no KV resource behind it, and only
+            # the captured block loop plans it (eager runs flash-attn — see
+            # `BagelViTAttention.attend`).
+            RaggedAttentionSpec(
+                resource_key=VIT_ATTN, nodes={"vit_encoder"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=vit.num_attention_heads,
+                    num_kv_heads=vit.num_attention_heads,
+                    head_dim=vit.hidden_size // vit.num_attention_heads,
+                    # one image, hence one attending segment, per request
+                    max_segments_per_request=1,
+                ),
+            ),
             KVSpec(resource_key="kv", nodes=nodes, config=kv_config),
             AttentionSpec(
                 resource_key="attn", nodes=nodes,
