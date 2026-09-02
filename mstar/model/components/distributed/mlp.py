@@ -52,7 +52,12 @@ class ParallelGatedMLP(nn.Module):
         comm_group: CommGroup | None = None,
         activation: str | Callable = "silu",
         bias: bool = False,
+        reduce_results: bool = True,
     ):
+        """``reduce_results=False`` returns this rank's PARTIAL down_proj
+        output (no all-reduce) so a caller can fold it into another
+        partial sum and reduce once — the shared-expert + routed-expert
+        layout of a DeepSeek-style MoE block."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -73,7 +78,7 @@ class ParallelGatedMLP(nn.Module):
             output_size=hidden_size,
             bias=bias,
             input_is_parallel=True,
-            reduce_results=True,
+            reduce_results=reduce_results,
         )
 
         self.intermediate_size_per_partition = (

@@ -35,6 +35,15 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
+   * - ``MSTAR_DIST_TIMEOUT_S``
+     - config's ``dist_timeout_s``
+     - Timeout in seconds for the NCCL world group and its parallel
+       subgroups (:func:`mstar.distributed.communication.resolve_dist_timeout`).
+       Overrides the deployment config's ``dist_timeout_s``; with neither set,
+       PyTorch's default applies. Raise it only where weight load, JIT or
+       CUDA-graph capture can exceed that default (a 1T MoE at TP8 does) —
+       a hung collective takes correspondingly longer to abort. Must be set
+       before the conductor spawns workers, which inherit it.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
@@ -98,6 +107,150 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+   * - ``MSTAR_TP_ALLREDUCE``
+     - ``nccl``
+     - All-reduce backend for small TP messages
+       (:mod:`mstar.distributed.communication`). ``nccl``: torch.distributed's
+       ring/tree. ``symm_oneshot`` / ``symm_multimem``: route messages up to
+       ``MSTAR_TP_SYMM_AR_MAX_KB`` through torch symmetric memory (one-shot:
+       each rank reads all peers over NVLink and reduces locally; multimem:
+       NVLS multicast, needs NVSwitch + driver support). A B=1 TP8 decode step
+       is ~160–230 all-reduces of ~10 KB, where NCCL's per-call latency
+       dominates (measured in-graph: NCCL 26.4 µs vs multimem 7.4 µs per
+       call). Larger messages stay on NCCL. CUDA-graph capturable. Reduction
+       order differs from NCCL's, so bf16 results can differ in the last bit
+       — measure before flipping. Falls back to ``nccl`` with a warning if
+       symmetric memory is unavailable.
+   * - ``MSTAR_TP_SYMM_AR_MAX_KB``
+     - ``512``
+     - Message-size cap (KB) for the symmetric-memory all-reduce path above;
+       larger tensors use NCCL.
+   * - ``MSTAR_TP_STEP_BARRIER``
+     - ``1``
+     - Per-step ``dist.barrier()`` at the engine's execute entry
+       (``KVCacheEngine.execute_forward``, ``StatelessEngine.execute_batch``).
+       On NCCL a barrier is a dummy all-reduce plus a current-stream
+       synchronize, so the host blocks until the previous step has drained
+       — it forbids enqueueing step N+1 behind step N. The forward's own
+       collectives keep ranks in lockstep without it; capture-time barriers
+       are separate and unaffected. ``0`` removes it. Turning it off widens
+       the host run-ahead window, which is why pinned staging buffers are
+       event-fenced (``mstar/utils/sampling.py``).
+
+GLM-5.2 (MTP, capture, collectives)
+-----------------------------------
+
+Read by :mod:`mstar.model.glm52`. Every knob below is a measured
+default with an escape hatch; the ones that change numerics (reduction
+order or norm convention) are called out. "Bit-exact" refers to the
+3264-token greedy stream of the TP8 bench against plain (MTP-off,
+captured) decode.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 8 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_GRAPH_COMPILE_MODE``
+     - ``default``
+     - ``torch.compile`` mode for the forward captured by the piecewise /
+       full-graph runners (``mstar/engine/cuda_graph_runner.py``). ``default``
+       keeps Inductor's fusion but takes cuBLAS for every GEMM and skips
+       autotuning: at decode shapes (M=4) max-autotune's warm-L2 benchmark
+       picks Triton GEMM templates that run 2× slower than cuBLAS's split-K
+       kernels once the weights stream from HBM — measured −8 % on the GLM-5.2
+       trunk at per-rank dims, capture 130 s → 27 s; TP8 arm R 2026-08-29
+       90.03 → 96.97 tok/s with it (+ hoist + rope-skip), stream bit-exact.
+       ``max-autotune-no-cudagraphs`` restores the previous behaviour. Any mode
+       string ``torch.compile`` accepts.
+   * - ``MSTAR_INDUCTOR_GEMM_BACKENDS``
+     - unset
+     - When set (e.g. ``ATEN`` or ``ATEN,TRITON``), restricts Inductor's
+       ``max_autotune_gemm_backends`` for the captured forward; only matters
+       under an autotuning compile mode.
+   * - ``MSTAR_GLM52_GRAPH_COMPILE``
+     - ``1``
+     - Capture the ``torch.compile``'d forward into the CUDA graphs. ``0``
+       captures the eager forward instead — escape hatch for an
+       Inductor-subprocess Triton crash (``per_token_group_quant_fp8_kernel``
+       failing in ``make_llir`` under the compile pool) that once failed
+       every capture and silently degraded the fast config to eager. Stream
+       capture alone still removes launch overhead; Inductor fusion is what
+       ``0`` gives up.
+   * - ``MSTAR_GLM52_MTP_PAIR_POSTNORM``
+     - ``1``
+     - MTP draft input pairing uses the trunk's post-norm hidden state (the
+       reference convention). Recovers per-position acceptance p1/p2 to
+       0.89/0.74 from pre-norm's 0.77/0.33. ``0`` restores pre-norm pairing.
+       Changes which tokens are drafted, never which are emitted (greedy
+       verify emits the trunk's own argmax).
+   * - ``MSTAR_GLM52_MTP_CAPTURE_SYNC``
+     - ``1``
+     - Capture the decode sync pass as a padded ``(bs, k+1)`` piecewise
+       graph. Bit-identical to the eager pass (pinned by
+       ``test_sync_capture_matches_eager_bit_identically``). ``0`` runs it
+       eager; with post-norm pairing also on, the eager path has a known FP
+       near-tie fork of ~0.25 % of the stream, so strict bit-identity to
+       plain decode then also needs ``MSTAR_GLM52_MTP_PAIR_POSTNORM=0``.
+   * - ``MSTAR_GLM52_MTP_CAPTURE_PREFILL``
+     - ``1``
+     - Capture the MTP *prefill* trunk (embed + all layers over the packed
+       prompt) as a piecewise graph over the same token buckets the k=0
+       config captures. Without it the whole prefill runs eager under MTP:
+       TTFT 305 ms vs 57 ms at k=0. Sample, plane sync and draft chain stay
+       outside the graph. ``0`` runs prefill eager; per-bucket capture
+       failures fall back to eager on their own.
+   * - ``MSTAR_GLM52_MTP_PREFILL_DRAFTS``
+     - ``1``
+     - Bundle the first drafts with the prefill output so the first decode
+       step is a speculated ``(k+1)``-row step like every other. ``0`` drops
+       the bundle — one wasted unspeculated step per request. Read through a
+       single helper so the edge that writes the bundle and the transition
+       that reads it cannot disagree.
+   * - ``MSTAR_GLM52_MTP_DRAFT_PHASE_GRAPH``
+     - ``1``
+     - The whole decode draft phase as ONE captured graph: padded sync pass,
+       draft-1 head and the ``k-1`` chain iterations, with ``k`` FlashInfer
+       plan slots planned before a single replay. The three-replay version
+       was host-bound at ~5 ms/step (1.2–2 ms of host per piecewise
+       ``run()``); one replay is ~1.2 ms. Requires sync capture. ``0``
+       restores the three-graph path (still the fallback for missing
+       buckets).
+   * - ``MSTAR_GLM52_MTP_PHASE_PREPARE``
+     - ``0``
+     - Hoist the accepted-count-independent half of the draft phase (sync
+       inputs, contiguous positions, slot-0 FlashInfer plan) above the
+       verify readback, so the host does ~0.6–0.9 ms of it while blocked in
+       the verify ``.tolist()`` instead of stalling the GPU afterwards.
+       Bit-exact by construction; default off until a TP8 arm measures it.
+   * - ``MSTAR_GLM52_PLAN_ROPE``
+     - ``1``
+     - Keep the per-plan ``plan_rope`` staging. GLM-5.2 applies RoPE
+       explicitly in its attention and never calls ``cache_handle.apply_rope``,
+       so every ``plan_rope`` is dead work: a pinned host build plus an
+       async H2D per plan, 3–4 per MTP step, two of them on the post-verify
+       critical path. ``0`` skips them; default on until a TP8 arm confirms
+       bit-identity (the reduced-dims GPU test already does).
+   * - ``MSTAR_GLM52_MOE_FUSED_ALLREDUCE``
+     - ``0``
+     - Add the shared-expert output to the routed partial *before* the TP
+       all-reduce and reduce once (the ``DeepseekV2MoE`` layout) instead of
+       reducing each separately: one collective fewer per MoE layer (76 at
+       TP8; the step went 233 → 158 all-reduces measured). ``1`` enables. Off by default because bf16 rounding
+       order moves (sum-then-reduce vs reduce-then-sum); the 08-19 TP8 arm
+       that enabled it together with ``MSTAR_TP_ALLREDUCE=symm_multimem``
+       stayed bit-exact on the bench, but that is a measurement, not a
+       guarantee.
+   * - ``MSTAR_GLM52_MTP_STEP_TIMING``
+     - ``0``
+     - ``N`` > 0 logs the per-phase GPU|host split (trunk, verify readback,
+       draft phase, tail) of every ``N``-th decode step from CUDA events —
+       an nsys-lite for the MTP step. The GPU column is stream-elapsed time
+       between events and so *includes* idle the GPU spends waiting on the
+       host to enqueue; read it next to the host column, not alone.
+
 Serving (Rust frontend)
 -----------------------
 

@@ -214,6 +214,10 @@ exclude = ["tests*", "benchmark*", "examples*"]
 # Ship the vendored CUDA source so it can be JIT-compiled on first use.
 [tool.setuptools.package-data]
 "mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.utils.marlin" = [
+    "csrc/**/*.cu", "csrc/**/*.cuh", "csrc/**/*.h", "csrc/**/*.hpp",
+    "csrc/**/*.cpp", "csrc/**/*.py",
+]
 
 [tool.ruff]
 exclude = [".git", ".ruff_cache", ".venv", "ref"]
@@ -250,6 +254,8 @@ ignore = [
 "mstar/graph/graph_io.py" = ["F403", "F405"]
 # Imports are deliberately placed after a module-level pytest.skip().
 "test/modular/test_phase1.py" = ["E402"]
+# Same pattern: the no-GPU skip must precede the triton-pulling mstar imports.
+"test/integration/test_glm52_dsa_longctx_serve.py" = ["E402"]
 # Imports are deliberately placed after module-level pytest.importorskip().
 "test/rust/*.py" = ["E402"]
 

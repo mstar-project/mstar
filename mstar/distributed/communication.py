@@ -1,8 +1,85 @@
+import os
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 import torch
 import torch.distributed as dist
+
+DIST_TIMEOUT_ENV = "MSTAR_DIST_TIMEOUT_S"
+
+# Small-message all-reduce backend for TP groups. "nccl" (default) is
+# torch.distributed's NCCL ring/tree; "symm_oneshot" / "symm_multimem" route
+# messages up to MSTAR_TP_SYMM_AR_MAX_KB (default 512) through torch symmetric
+# memory (one-shot: every rank reads all peers' buffers over NVLink and reduces
+# locally; multimem: NVLS multicast, needs NVSwitch + driver support). At B=1
+# decode a TP8 step is ~160-230 all-reduces of ~10 KB, where NCCL's per-call
+# latency (~15-30 us) dominates and a one-shot kernel is ~5-10 us; larger
+# messages (prefill) stay on NCCL. Both are CUDA-graph capturable. Reduction
+# order differs from NCCL's, so bf16 results can differ at the last bit —
+# flag-gated, measure before flipping.
+TP_ALLREDUCE_ENV = "MSTAR_TP_ALLREDUCE"
+TP_SYMM_AR_MAX_KB_ENV = "MSTAR_TP_SYMM_AR_MAX_KB"
+
+# Per-step TP barrier at the engine's execute entry (KVCacheEngine.execute_forward,
+# StatelessEngine.execute_batch). "1" (default) keeps it. With the NCCL backend
+# dist.barrier() is a dummy all-reduce followed by a current-stream synchronize,
+# so the host blocks until everything already enqueued (the previous step)
+# drains: it forbids enqueueing step N+1 behind N — which is exactly what
+# MSTAR_TP_ASYNC_SCHED tries to do. The forward's own NCCL collectives keep
+# ranks in lockstep without it; capture-time barriers (cuda_graph_runner) are
+# separate and unaffected. Flag-gated, default unchanged: measure, then decide.
+TP_STEP_BARRIER_ENV = "MSTAR_TP_STEP_BARRIER"
+
+
+def step_barrier_enabled() -> bool:
+    return os.environ.get(TP_STEP_BARRIER_ENV, "1").strip() not in ("0", "false", "no", "off")
+
+
+class _SymmAllReduce:
+    """One persistent symmetric-memory buffer per group; all-reduce small
+    messages through it (copy in, reduce, copy out — in-place semantics)."""
+
+    def __init__(self, device_group, device: torch.device, max_bytes: int, mode: str):
+        import torch.distributed._symmetric_memory as symm
+
+        self.mode = mode
+        self.max_bytes = max_bytes
+        self.group_name = device_group.group_name
+        symm.enable_symm_mem_for_group(self.group_name)
+        # Raw byte buffer; viewed per dtype at call time.
+        self._buf = symm.empty(max_bytes, dtype=torch.uint8, device=device)
+        symm.rendezvous(self._buf, self.group_name)
+
+    def all_reduce_(self, input_: torch.Tensor) -> torch.Tensor:
+        n = input_.numel()
+        flat = input_.view(-1)
+        view = self._buf[: n * input_.element_size()].view(input_.dtype)
+        view.copy_(flat)
+        if self.mode == "symm_multimem":
+            torch.ops.symm_mem.multimem_all_reduce_(view, "sum", self.group_name)
+            flat.copy_(view)
+        else:
+            out = torch.ops.symm_mem.one_shot_all_reduce(view, "sum", self.group_name)
+            flat.copy_(out)
+        return input_
+
+
+def resolve_dist_timeout(dist_timeout_s: float | None = None) -> dict[str, timedelta]:
+    """Build the ``timeout`` kwarg for ``init_process_group`` / ``new_group``."""
+    raw = os.environ.get(DIST_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            dist_timeout_s = float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{DIST_TIMEOUT_ENV} must be a number of seconds, got {raw!r}"
+            ) from exc
+    if dist_timeout_s is None:
+        return {}
+    if dist_timeout_s <= 0:
+        raise ValueError(f"Distributed timeout must be positive, got {dist_timeout_s}")
+    return {"timeout": timedelta(seconds=float(dist_timeout_s))}
 
 
 class CommGroup:
@@ -27,6 +104,29 @@ class CommGroup:
         self.world_size = len(group_members)
         self.device_group = None
         self.initialized = False
+        self._symm_ar: "_SymmAllReduce | None" = None
+
+    def _maybe_init_symm_allreduce(self) -> None:
+        """Build the symmetric-memory all-reduce path if MSTAR_TP_ALLREDUCE
+        asks for it. Collective across the group (rendezvous) — every member
+        calls this from ``init_dist`` at the same point."""
+        mode = os.environ.get(TP_ALLREDUCE_ENV, "nccl").strip().lower()
+        if mode not in ("symm_oneshot", "symm_multimem"):
+            return
+        if self.world_size == 1 or self.device_group is None or not torch.cuda.is_available():
+            return
+        max_kb = int(os.environ.get(TP_SYMM_AR_MAX_KB_ENV, "512") or "512")
+        try:
+            self._symm_ar = _SymmAllReduce(
+                self.device_group, torch.device("cuda", torch.cuda.current_device()),
+                max_kb * 1024, mode,
+            )
+        except Exception as exc:  # noqa: BLE001 — fall back to NCCL, loudly
+            import logging
+            logging.getLogger(__name__).warning(
+                "MSTAR_TP_ALLREDUCE=%s requested but symmetric memory could not "
+                "be set up (%r); using NCCL", mode, exc)
+            self._symm_ar = None
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -64,9 +164,26 @@ class CommGroup:
             return
         dist.barrier(group=self.device_group)
 
+    def step_barrier(self):
+        """The per-step barrier at the engine's execute entry. Same as
+        ``barrier()`` unless ``MSTAR_TP_STEP_BARRIER=0`` (see the env note at the
+        top of this module). Read per call: the flag is a launch-time setting and
+        the lookup is ~100 ns against a ~100 us barrier."""
+        if self.world_size == 1 or not step_barrier_enabled():
+            return
+        dist.barrier(group=self.device_group)
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
+        symm = self._symm_ar
+        if (
+            symm is not None
+            and input_.is_cuda
+            and input_.is_contiguous()
+            and input_.numel() * input_.element_size() <= symm.max_bytes
+        ):
+            return symm.all_reduce_(input_)
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
@@ -192,6 +309,8 @@ class WorkerParallelGroups:
     # projections).
     node_to_tp_group: dict[str, CommGroup] = field(default_factory=dict)
     node_to_sp_group: dict[str, CommGroup] = field(default_factory=dict)
+    # Process-group timeout in seconds, from the deployment config's
+    dist_timeout_s: float | None = None
 
     def add(self, node: str, comm_group: CommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -233,11 +352,13 @@ class WorkerParallelGroups:
         if not self.any_parallelism:
             return
 
+        timeout_kwargs = resolve_dist_timeout(self.dist_timeout_s)
         dist.init_process_group(
             backend="nccl",
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
+            **timeout_kwargs,
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
@@ -247,7 +368,9 @@ class WorkerParallelGroups:
         # an SP group (degenerate meshes) maps to one subgroup.
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
-            rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
+            rank_tuple_to_pg[rank_tuple] = dist.new_group(
+                ranks=list(rank_tuple), **timeout_kwargs
+            )
 
         seen: set[int] = set()
         for comm_group in (
@@ -261,6 +384,7 @@ class WorkerParallelGroups:
                 continue
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
             comm_group.initialized = True
+            comm_group._maybe_init_symm_allreduce()
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:
         if node not in self.node_to_tp_group:
@@ -309,7 +433,8 @@ class GlobalParallelConfig:
     def __init__(
         # leaving type annotation as Any due to circular import
         self, worker_graphs: dict[str, Any],
-        worker_ids: list[str]
+        worker_ids: list[str],
+        dist_timeout_s: float | None = None,
     ):
         self.num_workers = len(worker_ids)
         any_parallelism = any(
@@ -337,6 +462,7 @@ class GlobalParallelConfig:
                 global_rank=i, num_workers=self.num_workers,
                 any_parallelism=any_parallelism,
                 world_parallel_groups=world_parallel_groups,
+                dist_timeout_s=dist_timeout_s,
             ) for i, wid in enumerate(worker_ids)
         }
 
@@ -372,4 +498,3 @@ class GlobalParallelConfig:
                         self.per_worker_config[worker_ids[rank]].add_sp(
                             node, self.sp_comm_groups[key]
                         )
-

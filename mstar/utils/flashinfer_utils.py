@@ -19,7 +19,17 @@ import logging
 
 import torch
 
+from mstar.utils.pinned_staging import pinned
+
 logger = logging.getLogger(__name__)
+
+# Page index the padded tail of every captured KV scatter aims at. The
+# captured set_kv_cache/set_latent scatters write the FULL capture-bucket
+# row count on every replay; when the real batch is smaller, the plan
+# points the tail rows at (NULL_PAGE_IDX, 0). The paged allocators withhold
+# this page from circulation (PageAllocator(reserve_null_page=True)) so
+# the garbage never lands in a live request's KV.
+NULL_PAGE_IDX = 0
 
 
 @torch.compiler.disable
@@ -185,10 +195,22 @@ class FlashInferPrefillWrapper:
         per-token bookkeeping below.
         """
         self.dtype = dtype
+        host_inputs = qo_indptr.device.type == "cpu"
+        # FlashInfer copies ``paged_kv_indices`` into its static buffer with
+        # non_blocking only when the source is already on the device (it
+        # cannot know a host tensor is pinned, so it forces a BLOCKING copy —
+        # a stream drain, prefill.py:2331 / decode.py:1460). Ship the indices
+        # ourselves, async from pinned memory, and hand FlashInfer the device
+        # tensor; the indptr/last_page_len stay on the host because its plan
+        # wants ``.to("cpu")`` views of those (no-op for host tensors).
+        indices_dev = (
+            paged_kv_indices.to(self.device, non_blocking=True)
+            if host_inputs else paged_kv_indices
+        )
         self.attn_wrapper.plan(
             qo_indptr=qo_indptr,
             paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
+            paged_kv_indices=indices_dev,
             paged_kv_last_page_len=paged_kv_last_page_len,
             num_qo_heads=self.num_qo_heads,
             num_kv_heads=self.num_kv_heads,
@@ -198,13 +220,19 @@ class FlashInferPrefillWrapper:
             q_data_type=dtype,
         )
 
-        # Async H2D for the GPU-side per-token bookkeeping that follows.
-        if qo_indptr.device.type != "cuda":
-            qo_indptr = qo_indptr.to(self.device, non_blocking=True)
-            paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
-            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
-            paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
+        if host_inputs:
+            # Host-side per-token bookkeeping: the scatter map is a pure
+            # function of host-known ints (mstar/utils/pinned_staging.py for
+            # why the device version cost ~5 stream drains per plan).
+            self._plan_scatter_host(
+                qo_indptr, paged_kv_indptr, paged_kv_indices,
+                paged_kv_last_page_len,
+            )
+            if not self.use_cuda_graph:
+                self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
+            return
 
+        # Legacy device-tensor path (syncs on repeat_interleave / .item()).
         # Allow the qo_indptr to be accessible by BatchedCacheManager.get_qo_indptr_buf,
         # even if we're not in a cuda graph
         if not self.use_cuda_graph:
@@ -251,11 +279,47 @@ class FlashInferPrefillWrapper:
             self.token_to_page[:total_tokens].copy_(token_to_page)
             self.token_to_cache[:total_tokens].copy_(token_to_cache)
             if total_tokens < self.max_total_tokens:
-                self.token_to_page[total_tokens:] = 0
+                # The captured set_kv_cache scatter writes max_total_tokens
+                # rows every replay; the tail must aim at the reserved null
+                # page or it stomps slot 0 of a live request's page.
+                self.token_to_page[total_tokens:] = NULL_PAGE_IDX
                 self.token_to_cache[total_tokens:] = 0
         else:
             self.token_to_page = token_to_page
             self.token_to_cache = token_to_cache
+
+    def _plan_scatter_host(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+    ) -> None:
+        """Per-token (page, offset) map from host lists, shipped async."""
+        qo = qo_indptr.tolist()
+        kvp = paged_kv_indptr.tolist()
+        lpl = paged_kv_last_page_len.tolist()
+        # kv length AFTER append, per request: full pages + the last page.
+        kv_len = [
+            (kvp[i + 1] - kvp[i] - 1) * self.page_size + lpl[i]
+            if kvp[i + 1] > kvp[i] else 0
+            for i in range(len(kvp) - 1)
+        ]
+        t2p, t2c = paged_scatter_map_host(
+            qo, kvp, paged_kv_indices.tolist(), kv_len, self.page_size)
+        total_tokens = len(t2p)
+        self._total_tokens = total_tokens
+        h2p = pinned(t2p, torch.long)
+        h2c = pinned(t2c, torch.long)
+        if self.use_cuda_graph:
+            self.token_to_page[:total_tokens].copy_(h2p, non_blocking=True)
+            self.token_to_cache[:total_tokens].copy_(h2c, non_blocking=True)
+            if total_tokens < self.max_total_tokens:
+                self.token_to_page[total_tokens:] = NULL_PAGE_IDX
+                self.token_to_cache[total_tokens:] = 0
+        else:
+            self.token_to_page = h2p.to(self.device, non_blocking=True)
+            self.token_to_cache = h2c.to(self.device, non_blocking=True)
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
@@ -388,6 +452,12 @@ class FlashInferDecodeWrapper:
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
         n_req = paged_kv_indptr.shape[0] - 1
+        # Indices go to the device ourselves (async from pinned): FlashInfer
+        # forces a BLOCKING copy for a host ``indices`` tensor (decode.py:1460)
+        # — see the prefill wrapper. indptr/last_page_len stay on the host
+        # for its ``.to("cpu")`` views.
+        if paged_kv_indices.device.type != "cuda":
+            paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
 
         if self.enable_nvtx:
             from mstar.utils.profiler import range_pop, range_push
@@ -414,7 +484,7 @@ class FlashInferDecodeWrapper:
                 range_push("flashinfer.decode.metadata_h2d", synchronize=False)
             try:
                 paged_kv_indptr = paged_kv_indptr.to(self.device, non_blocking=True)
-                paged_kv_indices = paged_kv_indices.to(self.device, non_blocking=True)
+                # (paged_kv_indices already moved to the device above)
                 paged_kv_last_page_len = paged_kv_last_page_len.to(self.device, non_blocking=True)
             finally:
                 if self.enable_nvtx:
@@ -487,3 +557,298 @@ class FlashInferDecodeWrapper:
         positions = self.kv_cache_locations[:n, 1]
         kv_cache_layer[pages, 0, positions] = k[:n].to(self.dtype)
         kv_cache_layer[pages, 1, positions] = v[:n].to(self.dtype)
+
+
+def paged_scatter_map_host(
+    qo_indptr: list[int],
+    kv_indptr: list[int],
+    kv_indices: list[int],
+    kv_len_arr: list[int],
+    page_size: int,
+) -> tuple[list[int], list[int]]:
+    """Paged-cache scatter map for the new tokens of a planned batch, on host.
+
+    Token ``j`` (0-based) of request ``i`` — whose ``kv_len_arr[i]`` counts
+    the new tokens too — lands at global slot ``g = kv_len[i] - len[i] + j``,
+    i.e. page ``kv_indices[kv_indptr[i] + g // page_size]`` at offset
+    ``g % page_size``. Same arithmetic ``FlashInferMLAWrapper`` used to run
+    as ~10 device kernels plus an ``.item()`` sync; every input is
+    host-known, so it is a Python loop over a few thousand ints at most.
+    Returns ``(token_to_page, token_to_cache)`` of length ``qo_indptr[-1]``.
+    """
+    t2p: list[int] = []
+    t2c: list[int] = []
+    for i in range(len(qo_indptr) - 1):
+        length = qo_indptr[i + 1] - qo_indptr[i]
+        if length <= 0:
+            continue
+        base = kv_len_arr[i] - length
+        ptr = kv_indptr[i]
+        for j in range(length):
+            g = base + j
+            t2p.append(kv_indices[ptr + g // page_size])
+            t2c.append(g % page_size)
+    return t2p, t2c
+
+
+mla_scatter_map_host = paged_scatter_map_host  # historical name
+
+
+class FlashInferMLAWrapper:
+    """FlashInfer MLA wrapper for the 4D latent cache.
+
+    The kernel only supports real Kimi dims (ckv=512, kpe=64); callers must gate
+    before construction because off-dim calls can corrupt the CUDA context. CUDA
+    graph mode updates static index/scatter buffers with ``copy_()``.
+    """
+
+    def __init__(
+        self,
+        workspace_buffer: torch.Tensor,
+        *,
+        num_heads: int,
+        head_dim_ckv: int,
+        head_dim_kpe: int,
+        page_size: int,
+        sm_scale: float,
+        batch_size: int | None = None,
+        max_num_pages: int | None = None,
+        max_total_tokens: int | None = None,
+        device: torch.device = torch.device("cuda"),
+        use_cuda_graph: bool = False,
+        backend: str = "auto",
+        enable_nvtx: bool = False,
+    ):
+        self.device = device
+        self.use_cuda_graph = use_cuda_graph
+        self.enable_nvtx = enable_nvtx
+        self.num_heads = num_heads
+        self.head_dim_ckv = head_dim_ckv
+        self.head_dim_kpe = head_dim_kpe
+        self.page_size = page_size
+        self.sm_scale = sm_scale
+        self.batch_size = batch_size
+        self.max_total_tokens = max_total_tokens
+        self.dtype = None
+        self._total_tokens = 0
+
+        import flashinfer
+
+        if self.use_cuda_graph:
+            assert batch_size is not None, "batch_size required for CUDA graph mode"
+            assert max_num_pages is not None, "max_num_pages required for CUDA graph mode"
+            assert max_total_tokens is not None, "max_total_tokens required for CUDA graph mode"
+
+            # Stable addresses for graph replay.
+            self._qo_indptr_buf = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=device
+            )
+            self._kv_indptr_buf = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=device
+            )
+            self._kv_indices_buf = torch.zeros(
+                max_num_pages, dtype=torch.int32, device=device
+            )
+            self._kv_len_arr_buf = torch.zeros(
+                batch_size, dtype=torch.int32, device=device
+            )
+
+            self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=self._qo_indptr_buf,
+                kv_indptr=self._kv_indptr_buf,
+                kv_indices=self._kv_indices_buf,
+                kv_len_arr=self._kv_len_arr_buf,
+                backend=backend,
+            )
+
+            # Static buffers for the vectorized latent scatter (page, offset).
+            self.token_to_page = torch.zeros(
+                max_total_tokens, dtype=torch.long, device=device
+            )
+            self.token_to_cache = torch.zeros(
+                max_total_tokens, dtype=torch.long, device=device
+            )
+        else:
+            self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+                workspace_buffer, backend=backend,
+            )
+            self.token_to_page = None
+            self.token_to_cache = None
+
+        # Host-side staging for the scatter map (see plan()). Pinned so the
+        # H2D copy into the static buffers is a real async DMA; grown on
+        # demand in eager mode where max_total_tokens is unknown.
+        self._pinned_ok = torch.cuda.is_available() and device.type == "cuda"
+        n0 = max_total_tokens or 0
+        self._t2p_host = torch.empty(n0, dtype=torch.long, pin_memory=self._pinned_ok)
+        self._t2c_host = torch.empty(n0, dtype=torch.long, pin_memory=self._pinned_ok)
+        # Fence between consecutive plans on this wrapper. FlashInfer's plan()
+        # copies our index tensors and its own pinned int-workspace to the
+        # device with non_blocking copies and no guard of its own; the next
+        # plan must not overwrite either source before those DMAs executed.
+        # Recorded after every plan; waited on before the next. Normally
+        # already complete: it only bites when the CPU is more than one
+        # replay ahead of the GPU — which is exactly one replay's worth of
+        # pipelining, and all we need.
+        self._plan_event: torch.cuda.Event | None = None
+        self._plan_fenced = False  # True once _plan_event has been recorded
+
+    @torch.compiler.disable
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+        *,
+        causal: bool = True,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        """Plan the MLA kernel and compute latent scatter indices.
+
+        Pass **host** (ideally pinned) int32 tensors. FlashInfer's ``plan()``
+        does ``.to("cpu")`` on ``qo_indptr``/``kv_indptr``/``kv_len_arr`` and
+        ``copy_(non_blocking=True)`` into its graph-mode buffers: from host
+        memory that is a no-op plus an async DMA; from *device* tensors it is
+        three stream-draining D2H copies per plan. The scatter map
+        (``token_to_page``/``token_to_cache``) is likewise derived on the
+        host — every input to it is host-known — and shipped with one async
+        H2D each, instead of ~10 tiny device kernels and an ``.item()`` sync.
+        Device tensors are still accepted (legacy callers) and take the old
+        device-side path.
+        """
+        self.dtype = dtype
+        if self._plan_fenced and not self._plan_event.query():
+            self._plan_event.synchronize()
+
+        self.attn_wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_len_arr,
+            self.num_heads,
+            self.head_dim_ckv,
+            self.head_dim_kpe,
+            self.page_size,
+            causal,
+            self.sm_scale,
+            dtype,
+            dtype,
+        )
+
+        if qo_indptr.device.type == "cpu":
+            self._plan_scatter_host(qo_indptr, kv_indptr, kv_indices, kv_len_arr)
+        else:
+            self._plan_scatter_device(qo_indptr, kv_indptr, kv_indices, kv_len_arr)
+
+        if self._pinned_ok:
+            if self._plan_event is None:
+                self._plan_event = torch.cuda.Event()
+            self._plan_event.record(torch.cuda.current_stream())
+            self._plan_fenced = True
+
+    def _plan_scatter_host(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+    ) -> None:
+        """Scatter map from host lists: token t of request i (intra offset j)
+        lands at global slot g = kv_len[i] - len[i] + j -> page
+        kv_indices[kv_indptr[i] + g // page_size], offset g % page_size."""
+        t2p, t2c = paged_scatter_map_host(
+            qo_indptr.tolist(), kv_indptr.tolist(), kv_indices.tolist(),
+            kv_len_arr.tolist(), self.page_size,
+        )
+        total_tokens = len(t2p)
+        self._total_tokens = total_tokens
+
+        if self._t2p_host.numel() < total_tokens:
+            cap = max(total_tokens, 2 * self._t2p_host.numel(), 64)
+            self._t2p_host = torch.empty(cap, dtype=torch.long, pin_memory=self._pinned_ok)
+            self._t2c_host = torch.empty(cap, dtype=torch.long, pin_memory=self._pinned_ok)
+        if total_tokens:
+            self._t2p_host[:total_tokens].copy_(torch.as_tensor(t2p, dtype=torch.long))
+            self._t2c_host[:total_tokens].copy_(torch.as_tensor(t2c, dtype=torch.long))
+        h2p = self._t2p_host[:total_tokens]
+        h2c = self._t2c_host[:total_tokens]
+
+        if self.use_cuda_graph:
+            self.token_to_page[:total_tokens].copy_(h2p, non_blocking=True)
+            self.token_to_cache[:total_tokens].copy_(h2c, non_blocking=True)
+            if total_tokens < self.max_total_tokens:
+                # The captured set_latent scatter writes max_total_tokens
+                # rows every replay; the tail must aim at the reserved null
+                # page or every padded replay stomps slot 0 of a live
+                # request's page across all layer planes.
+                self.token_to_page[total_tokens:] = NULL_PAGE_IDX
+                self.token_to_cache[total_tokens:] = 0
+        else:
+            self.token_to_page = h2p.to(self.device, non_blocking=True)
+            self.token_to_cache = h2c.to(self.device, non_blocking=True)
+
+    def _plan_scatter_device(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+    ) -> None:
+        """Legacy device-side scatter map (syncs on ``.item()``)."""
+        n_req = qo_indptr.shape[0] - 1
+        starts = qo_indptr[:-1].to(torch.int32)
+        lens = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)
+        total_tokens = int(lens.sum().item())
+        self._total_tokens = total_tokens
+
+        seg = torch.repeat_interleave(
+            torch.arange(n_req, dtype=torch.int32, device=self.device), lens
+        )
+        intra = torch.arange(
+            total_tokens, dtype=torch.int32, device=self.device
+        ) - torch.repeat_interleave(starts, lens)
+
+        start_new = kv_len_arr[seg] - lens[seg]
+        g = start_new + intra
+
+        page_off = torch.div(g, self.page_size, rounding_mode="floor").to(torch.int32)
+        off_in_page = (g - page_off * self.page_size).to(torch.int32)
+        abs_page_ptr = kv_indptr[:-1][seg] + page_off
+
+        token_to_page = kv_indices[abs_page_ptr].to(torch.long)
+        token_to_cache = off_in_page.to(torch.long)
+
+        if self.use_cuda_graph:
+            self.token_to_page[:total_tokens].copy_(token_to_page)
+            self.token_to_cache[:total_tokens].copy_(token_to_cache)
+            if total_tokens < self.max_total_tokens:
+                self.token_to_page[total_tokens:] = NULL_PAGE_IDX
+                self.token_to_cache[total_tokens:] = 0
+        else:
+            self.token_to_page = token_to_page
+            self.token_to_cache = token_to_cache
+
+    @torch.compiler.disable
+    def set_latent(self, latent_cache_layer: torch.Tensor, latent: torch.Tensor):
+        """Scatter one compressed latent per new token into the paged cache."""
+        n = self._total_tokens
+        page_idx = self.token_to_page[:n]
+        cache_idx = self.token_to_cache[:n]
+        latent_cache_layer[page_idx, cache_idx] = latent[:n].to(latent_cache_layer.dtype)
+
+    @torch.compiler.disable
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the planned MLA kernel."""
+        return self.attn_wrapper.run(
+            q_nope.to(self.dtype), q_pe.to(self.dtype),
+            ckv_cache, kpe_cache, return_lse=False,
+        )

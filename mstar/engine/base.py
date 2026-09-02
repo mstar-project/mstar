@@ -128,6 +128,13 @@ class NodeOutput:
     # _execute_on_gpu_thread; engines don't populate it themselves.
     completion_event: "torch.cuda.Event | None" = None
     failed_requests: dict[str, str] = field(default_factory=dict) # rid -> error message
+    # GPU-thread self-timings under MSTAR_PHASE_TIMING (else None): wall of
+    # plan_attention* calls inside this execute, and total
+    # _execute_on_gpu_thread wall (entry to return, finalize included). Set
+    # by the worker like completion_event; the main loop records them as
+    # gpu_plan / gpu_exec_other / gpu_thread_total after future.result().
+    gpu_plan_wall: "float | None" = None
+    gpu_thread_wall: "float | None" = None
 
 
 @dataclass

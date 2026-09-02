@@ -32,13 +32,32 @@ class PageAllocator:
     ``reset_label`` — the unlocked qsize/get pair could false-negative
     (return None when pages are about to be freed) or partially fill the
     output list under multi-consumer contention.
+
+    ``reserve_null_page`` withholds ``flashinfer_utils.NULL_PAGE_IDX`` from
+    circulation — required for any pool whose pages CUDA-graph-captured
+    scatters can target (all paged self/cross-attention KV pools): the
+    captured scatter writes the full capture-bucket row count every replay,
+    and the wrappers aim the padding tail at (NULL_PAGE_IDX, 0). The CPU
+    offload pool keeps the default: its indices never appear in scatter
+    buffers.
     """
 
-    def __init__(self, max_num_pages: int):
+    def __init__(self, max_num_pages: int, reserve_null_page: bool = False):
+        from mstar.utils.flashinfer_utils import NULL_PAGE_IDX
+
         self.max_num_pages = max_num_pages
         self.free_pages: queue.Queue[int] = queue.Queue()
         self._lock = threading.Lock()
-        for i in range(max_num_pages):
+        first_page = 0
+        if reserve_null_page:
+            if max_num_pages < 2:
+                raise ValueError(
+                    "reserve_null_page needs max_num_pages >= 2, got "
+                    f"{max_num_pages}: page {NULL_PAGE_IDX} is withheld as "
+                    "the padded-replay scatter target"
+                )
+            first_page = NULL_PAGE_IDX + 1
+        for i in range(first_page, max_num_pages):
             self.free_pages.put(i)
 
     def allocate(self, n: int) -> list[int]:
@@ -122,6 +141,10 @@ class KVCacheConfig:
     # FA3 on Hopper; models can pin ``fa2`` when their deployment toolchain
     # cannot compile the Hopper JIT kernels.
     flashinfer_backend: str = "auto"
+    # For "mla_absorb", whose scale is based on qk_head_dim rather than latent width.
+    softmax_scale: float | None = None
+    # For "mla_absorb": split combined latent head_dim into ckv + kpe.
+    mla_ckv_dim: int | None = None
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -470,7 +493,10 @@ class PagedAllocationManager:
         transfer_engine_info: TransferEngineInfo
     ):
         self.config = config
-        self.page_allocator = PageAllocator(config.max_num_pages)
+        # Null page reserved: captured-scatter padding rows land in
+        # (NULL_PAGE_IDX, 0) of this pool at every padded graph replay.
+        self.page_allocator = PageAllocator(
+            config.max_num_pages, reserve_null_page=True)
         self.request_states: dict[str, LabelToState] = {}
         self.kv_cache = kv_cache
         self.write_policy = StoreWritePolicy.ALWAYS
@@ -728,4 +754,3 @@ class PagedAllocationManager:
                 state.seq_len = seq_len
                 state.position_id_start = pos_id
         cpu_pool.sync()
-

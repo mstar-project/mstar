@@ -1,0 +1,8 @@
+model: "kimi_k2_7"
+# Single-rank Kimi-K2.7 text config; use TP8 configs for the real 1T checkpoint.
+max_seq_len: 262144
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    tp_size: 1
+    graph_walks: [prefill, decode]
