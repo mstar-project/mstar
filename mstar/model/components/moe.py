@@ -338,7 +338,7 @@ def _gate_up_weight_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: int | str | None = None,
 ):
-    """Load one expert's gate_proj or up_proj into the fused gate_up_proj param.
+    """Load fused experts or one expert projection into ``gate_up_proj``.
 
     ``loaded_shard_id`` is ``"gate:N"`` or ``"up:N"`` where N is the
     expert index.  ``loaded_weight`` shape is ``(inter, hidden)`` — a
@@ -346,7 +346,21 @@ def _gate_up_weight_loader(
     into the correct position in ``param`` which has shape
     ``(E, 2*shard_inter, hidden)``.
     """
-    assert loaded_shard_id is not None
+    if loaded_shard_id is None:
+        # Qwen3 stores fused experts in execution order [E, input, 2 * inter].
+        # M* kernels use torch.linear order [E, 2 * inter, input].
+        expected = (param.shape[0], param.shape[2], 2 * full_inter)
+        assert tuple(loaded_weight.shape) == expected, (
+            f"fused gate_up_proj shape mismatch: got {tuple(loaded_weight.shape)}, expected {expected}"
+        )
+        loaded_weight = loaded_weight.transpose(1, 2)
+        shard_inter = divide(full_inter, tp_size)
+        start = tp_rank * shard_inter
+        param.data[:, :shard_inter, :] = loaded_weight[:, start:start + shard_inter, :]
+        param.data[:, shard_inter:, :] = loaded_weight[
+            :, full_inter + start:full_inter + start + shard_inter, :
+        ]
+        return
     kind, expert_str = loaded_shard_id.split(":")
     expert_idx = int(expert_str)
     shard_inter = divide(full_inter, tp_size)
@@ -363,12 +377,23 @@ def _down_proj_weight_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: int | str | None = None,
 ):
-    """Load one expert's down_proj into the fused down_proj param.
+    """Load fused experts or one expert projection into ``down_proj``.
 
     ``loaded_shard_id`` is ``"down:N"``.  ``loaded_weight`` shape is
     ``(hidden, inter)``.  The TP rank's column slice is taken.
     """
-    assert loaded_shard_id is not None
+    if loaded_shard_id is None:
+        # Qwen3 stores [E, intermediate, hidden]; M* stores
+        # [E, hidden, intermediate].
+        expected = (param.shape[0], full_inter, param.shape[1])
+        assert tuple(loaded_weight.shape) == expected, (
+            f"fused down_proj shape mismatch: got {tuple(loaded_weight.shape)}, expected {expected}"
+        )
+        loaded_weight = loaded_weight.transpose(1, 2)
+        shard_inter = divide(full_inter, tp_size)
+        start = tp_rank * shard_inter
+        param.data.copy_(loaded_weight[:, :, start:start + shard_inter])
+        return
     expert_idx = int(loaded_shard_id.split(":")[1])
     shard_inter = divide(full_inter, tp_size)
     start = tp_rank * shard_inter

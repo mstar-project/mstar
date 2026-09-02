@@ -46,3 +46,10 @@ vision-language-action policies, and world models — through a **Python SDK**, 
    :caption: Contributing
 
    adding_models
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Model Integration Designs
+
+   qwenvl/README
+   qwenvl/PR_0_SINGLE_GPU_CORRECTNESS

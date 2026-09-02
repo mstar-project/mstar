@@ -1,0 +1,9 @@
+model: "qwenvl"
+max_seq_len: 262144
+# Qwen3-VL-30B-A3B: tensor-parallel MoE LLM, unsharded vision encoder.
+node_groups:
+  - node_names: [vision_encoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2

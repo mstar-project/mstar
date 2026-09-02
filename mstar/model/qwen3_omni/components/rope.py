@@ -17,137 +17,9 @@ from typing import Tuple
 
 import torch
 
-# -----------------------------------------------------------------------
-# Inverse frequencies
-# -----------------------------------------------------------------------
+from mstar.model.components.mrope import compute_3d_cos_sin, compute_rope_freqs
 
-def compute_rope_freqs(
-    head_dim: int,
-    rope_theta: float = 1_000_000.0,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Compute inverse frequencies for standard RoPE.
-
-    Returns
-    -------
-    inv_freq : torch.Tensor  shape ``(head_dim // 2,)``
-        Inverse frequency vector  ``1 / (theta^(2i/d))``.
-    """
-    inv_freq = 1.0 / (
-        rope_theta
-        ** (
-            torch.arange(0, head_dim, 2, dtype=torch.int64, device=device).float()
-            / head_dim
-        )
-    )
-    return inv_freq
-
-
-# -----------------------------------------------------------------------
-# 3-D cos / sin from position IDs
-# -----------------------------------------------------------------------
-
-def compute_3d_cos_sin(
-    position_ids_3d: torch.Tensor,
-    inv_freq: torch.Tensor,
-    mrope_section: list[int] | tuple[int, ...] = (24, 20, 20),
-    attention_scaling: float = 1.0,
-    target_dtype: torch.dtype | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute cos/sin embeddings from 3D position IDs.
-
-    This mirrors the ``Qwen3OmniMoeThinkerTextRotaryEmbedding.forward`` path:
-    it computes raw per-component frequencies for all ``head_dim // 2`` dims,
-    applies interleaved MRoPE mixing, then doubles up for the standard
-    rotate-half convention.
-
-    Parameters
-    ----------
-    position_ids_3d : torch.Tensor
-        Shape ``(3, seq_len)`` -- temporal, height, width positions.
-    inv_freq : torch.Tensor
-        Shape ``(head_dim // 2,)`` -- inverse frequencies from
-        :func:`compute_rope_freqs`.
-    mrope_section : list[int]
-        Three integers ``[s1, s2, s3]`` with ``s1+s2+s3 == head_dim // 2``.
-        Default ``[24, 20, 20]`` for head_dim=128.
-    attention_scaling : float
-        Multiplicative scaling applied to cos/sin (defaults to 1.0).
-
-    Returns
-    -------
-    cos : torch.Tensor  shape ``(seq_len, head_dim)``
-    sin : torch.Tensor  shape ``(seq_len, head_dim)``
-        Ready to be used with :func:`apply_interleaved_mrope`.
-    """
-    # position_ids_3d: (3, seq_len)  ->  (3, 1, seq_len)
-    #   for matmul with inv_freq: (1, head_dim//2, 1)
-    # result freqs: (3, 1, head_dim//2, seq_len) -> transpose -> (3, 1, seq_len, head_dim//2)
-    pos = position_ids_3d[:, None, None, :].float()       # (3, 1, 1, seq_len)
-    ifreq = inv_freq[None, None, :, None].float()          # (1, 1, head_dim//2, 1)
-
-    # Broadcast: (3, 1, head_dim//2, seq_len)
-    freqs = (ifreq * pos).transpose(2, 3)                  # (3, 1, seq_len, head_dim//2)
-
-    # Apply interleaved mrope mixing -> (1, seq_len, head_dim//2)
-    freqs = _apply_interleaved_mrope_freqs(freqs, mrope_section)
-
-    # Double up for rotate-half: (1, seq_len, head_dim)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos = (emb.cos() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
-    sin = (emb.sin() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
-
-    # Cast back to the model dtype (e.g. bfloat16) so that the subsequent
-    # ``q * cos`` / ``k * cos`` multiplications inside apply_interleaved_mrope
-    # don't promote q/k to fp32 -- which would mismatch the paged KV cache
-    # dtype that FlashInfer's attention call expects.  HF does the same
-    # (modeling_qwen3_omni_moe.py:1329).
-    if target_dtype is not None:
-        cos = cos.to(target_dtype)
-        sin = sin.to(target_dtype)
-
-    return cos, sin
-
-
-# -----------------------------------------------------------------------
-# Interleaved MRoPE helpers
-# -----------------------------------------------------------------------
-
-def _apply_interleaved_mrope_freqs(
-    freqs: torch.Tensor,
-    mrope_section: list[int] | tuple[int, ...],
-) -> torch.Tensor:
-    """Mix the three frequency components into an interleaved layout.
-
-    This is the core of the TM-RoPE interleaving.  Given ``freqs`` of shape
-    ``(3, bs, seq_len, head_dim//2)`` where component 0 is temporal, 1 is
-    height, and 2 is width, produce a single ``(bs, seq_len, head_dim//2)``
-    tensor with the interleaved pattern.
-
-    The HF implementation (``apply_interleaved_mrope``) does::
-
-        freqs_t = freqs[0]   # start from temporal (covers all dims)
-        for dim, offset in enumerate((1, 2), start=1):   # H=1, W=2
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-
-    So the result starts as all-temporal, then selected interleaved slots
-    are overwritten with H and W values.  For ``mrope_section = [24, 20, 20]``
-    and ``head_dim // 2 = 64``:
-      - Temporal occupies: dims 0,3,6,...,57 and 60,61,62,63  (24 dims)
-      - Height occupies:   dims 1,4,7,...,58                   (20 dims)
-      - Width occupies:    dims 2,5,8,...,59                   (20 dims)
-    """
-    # Start from temporal component for all dims
-    freqs_t = freqs[0].clone()
-
-    for dim, offset in enumerate((1, 2), start=1):  # H, W
-        length = mrope_section[dim] * 3
-        idx = slice(offset, length, 3)
-        freqs_t[..., idx] = freqs[dim, ..., idx]
-
-    return freqs_t
+__all__ = ["apply_interleaved_mrope", "compute_3d_cos_sin", "compute_rope_freqs"]
 
 
 def apply_interleaved_mrope(
@@ -239,9 +111,7 @@ def get_rope_index_text(
     pos_ids_3d : torch.Tensor
         Shape ``(3, seq_len)``.  ``dtype=torch.float``.
     """
-    positions = torch.arange(seq_len, dtype=torch.float, device=device) + float(
-        start_pos
-    )
+    positions = torch.arange(seq_len, dtype=torch.float, device=device) + float(start_pos)
     return positions.unsqueeze(0).expand(3, -1).contiguous()
 
 
@@ -283,9 +153,7 @@ def get_rope_index_audio(
         Shape ``(3, num_audio_tokens)``.  ``dtype=torch.float``.
     """
     del position_id_per_seconds  # kept for API compatibility
-    positions = torch.arange(
-        num_audio_tokens, dtype=torch.float, device=device
-    ) + float(start_pos)
+    positions = torch.arange(num_audio_tokens, dtype=torch.float, device=device) + float(start_pos)
     return positions.unsqueeze(0).expand(3, -1).contiguous()
 
 
@@ -340,28 +208,22 @@ def get_rope_index_vision(
         # ``position_id_per_seconds``; for still images (grid_t == 1)
         # that collapses to a single value per image.
         if seconds_per_grid is None:
-            temporal = torch.full(
-                (num_tokens,), float(start_pos), dtype=torch.float, device=device
-            )
+            temporal = torch.full((num_tokens,), float(start_pos), dtype=torch.float, device=device)
         else:
             temporal = (
-                torch.arange(grid_t, dtype=torch.float, device=device) * seconds_per_grid * position_id_per_seconds
-            ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten().float()
+                (torch.arange(grid_t, dtype=torch.float, device=device) * seconds_per_grid * position_id_per_seconds)
+                .view(-1, 1)
+                .expand(-1, llm_grid_h * llm_grid_w)
+                .flatten()
+                .float()
+            )
 
-        h_index = (
-            torch.arange(llm_grid_h, dtype=torch.float, device=device)
-            .view(1, -1, 1)
-            .expand(grid_t, -1, llm_grid_w)
-            .flatten()
-            + float(start_pos)
-        )
-        w_index = (
-            torch.arange(llm_grid_w, dtype=torch.float, device=device)
-            .view(1, 1, -1)
-            .expand(grid_t, llm_grid_h, -1)
-            .flatten()
-            + float(start_pos)
-        )
+        h_index = torch.arange(llm_grid_h, dtype=torch.float, device=device).view(1, -1, 1).expand(
+            grid_t, -1, llm_grid_w
+        ).flatten() + float(start_pos)
+        w_index = torch.arange(llm_grid_w, dtype=torch.float, device=device).view(1, 1, -1).expand(
+            grid_t, llm_grid_h, -1
+        ).flatten() + float(start_pos)
 
         pos_ids_list.append(torch.stack([temporal, h_index, w_index], dim=0))
 
