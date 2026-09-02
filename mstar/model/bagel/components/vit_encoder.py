@@ -62,29 +62,10 @@ def _sdpa_varlen(
     )
     return out.squeeze(0).transpose(0, 1).contiguous()
 
-@torch.compiler.disable
-def run_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int,
-    causal: bool = False,
-    scale: float | None = None,
-) -> torch.Tensor:
-    # cu_seqlens isolates per-image attention when multiple images are packed.
-    # flashinfer's varlen kernels silently miscompute at SigLIP2's head_dim=72.
-    if _FLASH_ATTN_AVAILABLE:
-        return flash_attn_varlen_func(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            causal=causal,
-            softmax_scale=scale,
-        )
-    return _sdpa_varlen(q, k, v, cu_seqlens, causal=causal, scale=scale)
+# Resource key BAGEL declares its ViT's cacheless attention under. The layers
+# bind against it (``BagelViTAttention.bind_resources``) and the piecewise
+# region's ``declare_step`` names it.
+VIT_ATTN = "vit_attn"
 
 
 class RotaryEmbedding2D(torch.nn.Module):
@@ -206,6 +187,55 @@ class BagelViTAttention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
+        # The engine's cacheless attention resource, bound at load; used only
+        # for a step the encoder pointed at it. See `attend` / `BagelViTEncoder.bind_step`.
+        self.ragged_attn = None
+        self.use_ragged = False
+
+    def bind_resources(self, resources: dict) -> None:
+        """See ``NodeSubmodule.bind_node_resources``. ``.get``: a deployment
+        that declares no ViT attention resource keeps the eager path."""
+        self.ragged_attn = resources.get(VIT_ATTN)
+
+    @torch.compiler.disable
+    def attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        causal: bool = False,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        """Varlen attention; ``cu_seqlens`` isolates per-image attention when
+        several images are packed into one forward.
+
+        Two backends, picked by the step's ``use_ragged`` cursor:
+
+        - set (captured path) — the engine's ragged attention resource,
+          planned OUTSIDE the graph by the piecewise runner. The only
+          capture-legal option: flash-attn's varlen entry point is not
+          reliably capturable, and the SDPA fallback builds its mask from data.
+          The layout lives in the plan, so ``cu_seqlens`` goes unread here.
+        - clear (eager path) — flash-attn varlen, preferred when not
+          capturing: FlashInfer has no kernel for SigLIP2's head_dim=72 and
+          has to zero-pad q/k/v to 128, which flash-attn does not.
+        """
+        if self.use_ragged:
+            return self.ragged_attn.run(q, k, v)
+        if _FLASH_ATTN_AVAILABLE:
+            return flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=causal,
+                softmax_scale=scale,
+            )
+        return _sdpa_varlen(q, k, v, cu_seqlens, causal=causal, scale=scale)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -239,7 +269,7 @@ class BagelViTAttention(nn.Module):
             q = torch.cat([qh, qw], dim=-1)
             k = torch.cat([kh, kw], dim=-1)
 
-        attn_output = run_attention(
+        attn_output = self.attend(
             q,
             k,
             v,
@@ -318,6 +348,27 @@ class BagelViTEncoder(nn.Module):
             [BagelViTEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
 
+    @property
+    def ragged_available(self) -> bool:
+        """Whether a ragged attention resource was bound — i.e. whether the
+        captured path is possible at all on this deployment."""
+        return self.layers[0].self_attn.ragged_attn is not None
+
+    def bind_step(self, use_ragged: bool) -> None:
+        """Point the whole stack at this step's attention backend.
+
+        Only a captured region binds the resource: outside one nothing planned
+        a layout, and attending an unplanned resource is an error rather than
+        something to fall back from.
+        """
+        if use_ragged and not self.ragged_available:
+            raise RuntimeError(
+                "BagelViTEncoder: no ragged attention resource bound; declare "
+                f"a RaggedAttentionSpec under {VIT_ATTN!r} for this node"
+            )
+        for layer in self.layers:
+            layer.self_attn.use_ragged = use_ragged
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
@@ -352,33 +403,68 @@ class BagelVisionTransformer(nn.Module):
         self.encoder = BagelViTEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
+    def embed(
+        self,
+        packed_pixel_values: torch.Tensor,
+        packed_flattened_position_ids: torch.LongTensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Preamble: patch embedding plus the gathered 2D-RoPE tables.
+
+        Split out from ``forward`` so a caller can run it eagerly and hand the
+        results to a captured block loop — the gathers are data-dependent
+        indexing that has no business inside a graph.
+        """
+        hidden_states = self.embeddings(
+            packed_pixel_values=packed_pixel_values,
+            packed_flattened_position_ids=packed_flattened_position_ids
+        )
+
+        rope_inputs = {}
+        if self.config.rope:
+            rope_inputs.update(
+                cos_h = self.rope.cos_h[packed_flattened_position_ids],
+                sin_h = self.rope.sin_h[packed_flattened_position_ids],
+                cos_w = self.rope.cos_w[packed_flattened_position_ids],
+                sin_w = self.rope.sin_w[packed_flattened_position_ids]
+            )
+        return hidden_states, rope_inputs
+
+    def encode(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.IntTensor,
+        max_seqlen: int,
+        use_ragged: bool = False,
+        **rope_inputs,
+    ) -> torch.Tensor:
+        """The capturable tail: encoder block loop plus post-layernorm.
+
+        Constant for a fixed token layout, so this is the region a piecewise
+        CUDA graph records. ``use_ragged`` selects the attention backend for
+        the whole stack — see ``BagelViTAttention.attend``.
+        """
+        self.encoder.bind_step(use_ragged)
+        last_hidden_state = self.encoder(
+            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen, **rope_inputs
+        )
+        return self.post_layernorm(last_hidden_state)
+
     def forward(
         self,
         packed_pixel_values: torch.Tensor,
         packed_flattened_position_ids: torch.LongTensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
+        use_ragged: bool = False,
     ) -> torch.Tensor:
-        hidden_states = self.embeddings(
-            packed_pixel_values=packed_pixel_values,
-            packed_flattened_position_ids=packed_flattened_position_ids
+        hidden_states, rope_inputs = self.embed(
+            packed_pixel_values, packed_flattened_position_ids
         )
-
-        extra_inputs = {}
-        if self.config.rope:
-            extra_inputs.update(
-                cos_h = self.rope.cos_h[packed_flattened_position_ids],
-                sin_h = self.rope.sin_h[packed_flattened_position_ids],
-                cos_w = self.rope.cos_w[packed_flattened_position_ids],
-                sin_w = self.rope.sin_w[packed_flattened_position_ids]
-            )
-
-        last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-            **extra_inputs
+        return self.encode(
+            hidden_states, cu_seqlens, max_seqlen,
+            use_ragged=use_ragged, **rope_inputs,
         )
-        last_hidden_state = self.post_layernorm(last_hidden_state)
-        return last_hidden_state
 
 
 class BagelVisionModel(nn.Module):
@@ -395,6 +481,7 @@ class BagelVisionModel(nn.Module):
         packed_flattened_position_ids: torch.LongTensor,
         cu_seqlens: torch.IntTensor,
         max_seqlen: int,
+        use_ragged: bool = False,
     ) -> torch.Tensor:
 
         return self.vision_model(
@@ -402,4 +489,5 @@ class BagelVisionModel(nn.Module):
             packed_flattened_position_ids=packed_flattened_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            use_ragged=use_ragged,
         )

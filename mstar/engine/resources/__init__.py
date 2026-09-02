@@ -19,6 +19,10 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
+from mstar.engine.resources.attn.ragged.config import (
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
+)
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.kv.config import (
     KVConfig,
@@ -88,6 +92,8 @@ __all__ = [
     "PositionSpec",
     "PositionStep",
     "PublishedInfo",
+    "RaggedAttentionConfig",
+    "RaggedAttentionSpec",
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
