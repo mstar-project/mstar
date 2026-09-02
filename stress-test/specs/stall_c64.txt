@@ -1,0 +1,3 @@
+warmup_c1|--model bagel --request-type text_to_text --profiling-type closed_loop --ignore-eos --output-len-min 128 --output-len-max 128 --num-warmup 0 --local-cache ${STRESS_CACHE} --max-concurrency 1 --num-requests 20 --output-len-seed 1
+warmup_c32|--model bagel --request-type text_to_text --profiling-type closed_loop --ignore-eos --output-len-min 128 --output-len-max 128 --num-warmup 0 --local-cache ${STRESS_CACHE} --max-concurrency 32 --num-requests 20 --output-len-seed 1
+c64|--model bagel --request-type text_to_text --profiling-type closed_loop --ignore-eos --output-len-min 128 --output-len-max 128 --num-warmup 0 --local-cache ${STRESS_CACHE} --max-concurrency 64 --num-requests 200 --output-len-seed 1

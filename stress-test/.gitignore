@@ -1,0 +1,3 @@
+# The repository root ignores *.json. The reference runner outputs in
+# expected/ are the whole point of that directory, so un-ignore them here.
+!expected/*.json

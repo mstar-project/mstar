@@ -1,0 +1,1 @@
+# boot-only cell: no runs. Used for the warm-boot time-to-health measurement.
