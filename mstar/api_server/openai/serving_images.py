@@ -47,7 +47,17 @@ async def create_images(api, model_name, adapter, req, raw_request=None):  # noq
     return {"created": now(), "data": data}
 
 
-async def create_image_edit(api, model_name, adapter, *, prompt, image_bytes, image_filename, model_kwargs):  # noqa: ARG001
+async def create_image_edit(
+    api,
+    model_name,
+    adapter,
+    *,
+    prompt,
+    image_bytes,
+    image_filename,
+    model_kwargs,
+    raw_request=None,
+):  # noqa: ARG001
     # Persist the uploaded image so the model's loader can read it by path
     # (same contract as multipart uploads), then run the image-to-image edit.
     upload_dir = Path(api.upload_dir)
@@ -69,7 +79,7 @@ async def create_image_edit(api, model_name, adapter, *, prompt, image_bytes, im
         request_id=request_id,
     )
 
-    chunks = await api.collect_results(request_id)
+    chunks = await api.collect_results(request_id, raw_request)
     data = [
         {"b64_json": base64.b64encode(c.data).decode("ascii"), "url": None}
         for c in chunks
