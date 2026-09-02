@@ -82,11 +82,17 @@ class CacheStream:
     offloaded: bool = False
     generation: int = 0
 
+    # set from a successful admit until commit: an admitted step already holds
+    # addressing into these pages, so an offload in that window must not claim
+    # them. read by `_claim_for_offload`
+    step_in_flight: bool = False
+
     def reset(self, freed: bool=False):
         self.stored_len = 0
         self.position = 0
         self.released = 0
         self.generation += 1
+        self.step_in_flight = False
 
         if freed:
             self.page_indices.clear()
@@ -225,6 +231,16 @@ class KVManager(AttentionResource):
         self._preplan_states: dict[str, KVPlanState] = {}
         self._preplanned = False
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
+
+        # (rid, to_label, stored_len, generation) for pre-forks appliedb by
+        # a staged step; facilitates clear_preplan function
+        self._preplan_fork_undo: list[tuple[str, str, int, int]] = []
+        # (rid, to_label) for intialized reservations by staged step; cleared_preplan removes
+        # recorded in admit not plan, so separate from above.
+        self._preplan_new_labels: list[tuple[str, str]] = []
+        # (rid, label) marked step_in_flight by a staged step, so an abandoned
+        # one does not leave its streams unevictable
+        self._preplan_marked: list[tuple[str, str]] = []
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -365,8 +381,20 @@ class KVManager(AttentionResource):
         # one critical section so the read-of-stored_len then alloc is atomic
         # against a concurrent reset/remove/commit on another thread
         with self._lock:
+            if ctx.is_preplan:
+                # a preplan that was promoted or abandoned already cleared
+                # these; reset anyway so a refused admit can't leave stale
+                # entries for the next clear_preplan to act on
+                self._preplan_new_labels = []
+                self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in ctx.padded_request_ids:
+                    # checked before the reservation, which is what creates it
+                    if (
+                        ctx.is_preplan
+                        and to_label not in self._streams.get(rid, {})
+                    ):
+                        self._preplan_new_labels.append((rid, to_label))
                     alloc_res = self._reserve_fork(
                         rid, from_label, to_label,
                         extra=0 if not extra else extra.get((rid, from_label), 0),
@@ -385,18 +413,43 @@ class KVManager(AttentionResource):
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
+
+            # marked here rather than in plan so the mark also covers
+            # admit -> plan, where an offload would otherwise release pages
+            # this step has already been given. last, and only once every
+            # reservation above succeeded, so a refusal has nothing to unwind.
+            # `.get` because a zero-span segment on a label nothing created
+            # reserves no stream (see the loop above)
+            for segment in step.segments:
+                stream = self._streams.get(
+                    segment.request_id, {}
+                ).get(segment.label)
+                if stream is None:
+                    continue
+                stream.step_in_flight = True
+                if ctx.is_preplan:
+                    self._preplan_marked.append(
+                        (segment.request_id, segment.label)
+                    )
         # TODO: apply retention policy
 
         return ADMIT_OK
 
     def _sequence_views(self, segments: list[Segment]) -> list[SequenceView]:
         views = []
+        page_size = self.kv_cache.page_size
         for s in segments:
             stream = self._streams[s.request_id][s.label]
+            # `page_indices` is a high-water mark, so a stream can hold more
+            # pages than its tokens need (a refused admit, a reset that kept
+            # its pages). slice to the length or the view addresses token 0
+            # into the wrong page and reports the padding as resident context
+            length = s.span + stream.stored_len
+            num_pages = -(-length // page_size)
             views.append(SequenceView(
                 request_id=s.request_id,
-                label=s.label, page_idxs=stream.page_indices,
-                length=s.span + stream.stored_len,
+                label=s.label, page_idxs=stream.page_indices[:num_pages],
+                length=length,
                 to_compute=s.span,
                 generation=stream.generation,
             ))
@@ -518,13 +571,19 @@ class KVManager(AttentionResource):
         if self._preplanned:
             self._current_plan_states = self._preplan_states
             res = self._cached_plan_output
+            # promotion, not abandonment: the staged forks and marks are kept,
+            # so drop the undo records before clear_preplan replays them
+            self._preplan_fork_undo = []
+            self._preplan_new_labels = []
+            self._preplan_marked = []
             # must reset here: otherwise the *next* step's admit still sees
             # `_preplanned` and skips its allocation
             self.clear_preplan()
             return res
+        undo = self._preplan_fork_undo if ctx.is_preplan else None
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.padded_request_ids:
-                self._apply_fork(rid, from_label, to_label)
+                self._apply_fork(rid, from_label, to_label, undo=undo)
         res = KVPlanOutputs(
             {
                 plan_label: self._plan_output(self._sequence_views(segments))
@@ -546,6 +605,31 @@ class KVManager(AttentionResource):
         return True
 
     def clear_preplan(self):
+        # the staged step is not going to run, so undo what it did to live
+        # state: dropping the cached plan is not enough, the pre-forks already
+        # copied pages and moved lengths
+        with self._lock:
+            for rid, label, stored_len, generation in reversed(
+                self._preplan_fork_undo
+            ):
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is not None:
+                    stream.stored_len = stored_len
+                    stream.generation = generation
+            self._preplan_fork_undo = []
+            # labels the staged step invented are removed, not rewound to 0:
+            # a stream at 0 that nothing asked for is still a stream, and it
+            # holds the pages the reservation took
+            for rid, label in reversed(self._preplan_new_labels):
+                stream = self._streams.get(rid, {}).pop(label, None)
+                if stream is not None:
+                    self._arena.release(stream.page_indices)
+            self._preplan_new_labels = []
+            for rid, label in self._preplan_marked:
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is not None:
+                    stream.step_in_flight = False
+            self._preplan_marked = []
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}
@@ -555,9 +639,27 @@ class KVManager(AttentionResource):
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
             for segment in step.segments:
+                stream = self._streams[segment.request_id][segment.label]
+                # cleared before the `step.commit` test: a step that keeps no
+                # tokens (image_gen, action_gen) still read these pages, and
+                # leaving the mark set would make the request unevictable
+                stream.step_in_flight = False
                 if step.commit and segment.span > 0:
-                    stream = self._streams[segment.request_id][segment.label]
+                    # an offload beat the mark (claimed before this step's
+                    # admit). the host copy predates the span, so writing the
+                    # length here would be lost on reload
+                    if stream.offloaded:
+                        logger.warning(
+                            "KV %s: dropping %d committed tokens for %s label "
+                            "%s; the stream was offloaded mid-step",
+                            self.name, segment.span,
+                            segment.request_id, segment.label,
+                        )
+                        continue
                     stream.stored_len += segment.span
+                    # so a claim taken in a window the mark misses still fails
+                    # `_commit_offload`'s generation guard
+                    stream.generation += 1
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
@@ -583,9 +685,13 @@ class KVManager(AttentionResource):
             return False
         if self._cpu_pool.is_offloaded(rid):
             return True
-        return any(
-            stream.offloaded for stream in self._streams.get(rid, {}).values()
-        )
+        # every writer of `_streams` holds the lock, and the worker calls this
+        # from its victim filter while steps are running. reentrant, so callers
+        # already under the lock are unaffected
+        with self._lock:
+            return any(
+                stream.offloaded for stream in self._streams.get(rid, {}).values()
+            )
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns pages freed.
@@ -641,7 +747,13 @@ class KVManager(AttentionResource):
         claimed: list[ClaimedStream] = []
         read_futures: list[Future] = []
         with self._lock:
-            for label, stream in self._streams.get(rid, {}).items():
+            streams = self._streams.get(rid, {})
+            # refuse the whole request, not the marked streams: a step is
+            # already admitted against these pages and the caller has other
+            # victims. the eviction retries once the step commits
+            if any(stream.step_in_flight for stream in streams.values()):
+                return [], []
+            for label, stream in streams.items():
                 if stream.offloaded or not stream.page_indices:
                     continue
                 stream.offloaded = True
@@ -896,7 +1008,15 @@ class KVManager(AttentionResource):
         """
         # TODO: handle realloc
         if from_label not in self._streams[rid]:
-            return AllocResult()
+            if extra <= 0:
+                # nothing to fork from and nothing this step adds; also the
+                # shape a padded request produces during capture
+                return AllocResult()
+            # the source does not exist *yet*: this step's own segments create
+            # it, and `extra` is what they will put in it. reserving nothing
+            # here left `_apply_fork` copying onto an unbacked target
+            self._ensure_label(rid, to_label)
+            return self._alloc(rid, to_label, extra)
         from_stream = self._streams[rid][from_label]
         if from_stream.offloaded:
             # the target is a fresh stream an offload never claimed, so refuse
@@ -907,22 +1027,37 @@ class KVManager(AttentionResource):
             rid, to_label, from_stream.stored_len + extra
         )
 
-    def _apply_fork(self, rid: str, from_label: str, to_label: str) -> None:
+    def _apply_fork(
+        self, rid: str, from_label: str, to_label: str, undo: list | None = None,
+    ) -> None:
         """Copy a stream onto its fork target, over pages `_reserve_fork` took.
 
         Locked (reentrant): called from plan (pre-forks, else unguarded) and
-        from the already-locked commit (post-forks)."""
+        from the already-locked commit (post-forks).
+
+        ``undo`` collects each target's prior ``(stored_len, generation)`` so a
+        preplan that is abandoned can be reversed; see `clear_preplan`.
+        """
         with self._lock:
             if from_label not in self._streams[rid]:
                 return
             from_stream = self._streams[rid][from_label]
             to_stream = self._ensure_label(rid, to_label)
-            # TODO: only copy necessary pages
-            # the source can hold more pages than the fork needs (pages
-            # reserved for an uncommitted span), so copy only the prefix
+            if undo is not None:
+                undo.append(
+                    (rid, to_label, to_stream.stored_len, to_stream.generation)
+                )
+            # sized off the source's length, not either side's page count:
+            # both can hold more pages than the fork needs, and a target left
+            # over-reserved by a refused admit used to make the copy lopsided
+            n = -(-from_stream.stored_len // self.config.page_size)
+            assert len(to_stream.page_indices) >= n, (
+                f"fork target {rid}/{to_label} holds "
+                f"{len(to_stream.page_indices)} pages but its source "
+                f"{from_label} needs {n}; _reserve_fork under-reserved"
+            )
             self._arena.copy_pages(
-                from_stream.page_indices[:len(to_stream.page_indices)],
-                to_stream.page_indices
+                from_stream.page_indices[:n], to_stream.page_indices[:n],
             )
             to_stream.stored_len = from_stream.stored_len
             to_stream.generation += 1

@@ -62,6 +62,10 @@ class RopeManager(PositionManager):
 
         self._preplan_pos_ids: dict[str, torch.Tensor] = {}
         self._preplanned = False
+        # (rid, to_label, counter) for each pre-fork applied, so
+        # `clear_preplan` can put the targets back. Mirror to
+        # `KVManager._preplan_fork_undo`
+        self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -123,6 +127,19 @@ class RopeManager(PositionManager):
         return True
 
     def clear_preplan(self):
+        # `None` means the label had no counter before the staging, which is
+        # not the same as having had 0: restoring 0 leaves behind a label the
+        # abandoned step invented. KV draws the same line with
+        # `_preplan_new_labels`
+        for rid, label, counter in reversed(self._preplan_fork_undo):
+            counters = self._counters.get(rid)
+            if counters is None:
+                continue
+            if counter is None:
+                counters.pop(label, None)
+            else:
+                counters[label] = counter
+        self._preplan_fork_undo = []
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_pos_ids = {}
@@ -140,6 +157,9 @@ class RopeManager(PositionManager):
             self._current_pos_ids = self._preplan_pos_ids
             self._preplan_pos_ids = {}
             self._preplanned = False
+            # Promotion, not abandonment: the staged forks are kept, so the
+            # undo record is dropped rather than replayed.
+            self._preplan_fork_undo = []
             return self._current_pos_ids
 
         lease = ctx.slot_lease
@@ -158,7 +178,10 @@ class RopeManager(PositionManager):
         # disjoint from the ones the in-flight forward reads
         # a stream forked off another starts at the source's position, so
         # mirror the forks KV just applied before any counter is read below
-        self._apply_forks(plan_outputs.pre_forks, ctx.padded_request_ids)
+        self._apply_forks(
+            plan_outputs.pre_forks, ctx.padded_request_ids,
+            undo=self._preplan_fork_undo if ctx.is_preplan else None,
+        )
 
         pos_ids_out = self._preplan_pos_ids if ctx.is_preplan else self._current_pos_ids
         pos_ids_out.clear()
@@ -186,10 +209,13 @@ class RopeManager(PositionManager):
 
     def _apply_forks(
         self, forks: tuple[tuple[str, str], ...], request_ids: tuple[str, ...],
+        undo: list | None = None,
     ) -> None:
         for from_label, to_label in forks:
             for rid in request_ids:
                 counters = self._counters.setdefault(rid, {})
+                if undo is not None:
+                    undo.append((rid, to_label, counters.get(to_label)))
                 counters[to_label] = counters.get(from_label, 0)
 
     def _advances(self, step: PositionStep) -> tuple[int, ...]:
