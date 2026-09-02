@@ -146,15 +146,17 @@ def test_the_cap_counts_rows_the_caller_already_has():
     assert len(sched.backlog[(NODE, WALK)].node_objects) == 3
 
 
-def test_a_full_caller_batch_schedules_nothing_and_backlogs_it_all():
+def test_a_full_caller_batch_schedules_nothing_and_leaves_the_queue_alone():
+    """With no capacity left there is nothing to assemble. These rids stay
+    queued rather than being parked in a backlog the caller cannot drain."""
     sched = _scheduler(_Engine(max_bs=4))
+    manager = _Manager([f"r{i}" for i in range(2)])
 
-    batch = sched.get_next_batch(
-        _Manager([f"r{i}" for i in range(2)]), pre_existing_batch_size=4,
-    )
+    batch = sched.get_next_batch(manager, pre_existing_batch_size=4)
 
     assert batch is None
-    assert len(sched.backlog[(NODE, WALK)].node_objects) == 2
+    assert sched.backlog == {}
+    assert set(manager.queues["wg0"]._ready) == {"r0", "r1"}
 
 
 def test_a_fully_drained_ready_set_leaves_no_backlog_entry():
@@ -285,6 +287,136 @@ def test_a_targeted_call_takes_only_its_own_backlog_entry():
 
     assert batch.node_name == "B"
     assert ("A", WALK) in sched.backlog
+
+
+def test_a_full_caller_batch_does_not_clobber_the_backlog():
+    """The regression: above the node's cap the caller already holds a full
+    batch, so nothing can be scheduled — but the scan still popped fresh nodes
+    off the ready queues and parked them under the backlog's own key, dropping
+    the chunk that was already there. Those rids are off the queues, so they
+    never run again."""
+    sched = _scheduler(_Engine(max_bs=16))
+    backlogged = [f"b{i}" for i in range(8)]
+    sched.backlog[(NODE, WALK)] = _batch(backlogged)
+
+    # the speculative batch already holds the full cap
+    batch = sched.get_next_batch(
+        _Manager(["f0", "f1"]), target=(NODE, WALK), pre_existing_batch_size=16,
+    )
+
+    assert batch is None, "no capacity left, so nothing should be scheduled"
+    still_queued = set(sched.backlog[(NODE, WALK)].node_objects)
+    assert set(backlogged) <= still_queued, (
+        f"lost {sorted(set(backlogged) - still_queued)} from the backlog"
+    )
+
+
+def test_fresh_work_does_not_evict_a_blocked_backlog_chunk():
+    """Capacity remains, but a wholly-blocked chunk is already parked under
+    this key. The scan's leftovers must fold in beside it — replacing drops
+    rids whose graph nodes are already off the ready queues."""
+    sched = _scheduler(_Engine(max_bs=2, not_ready={"b0", "b1"}))
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    batch = sched.get_next_batch(_Manager(["f0", "f1", "f2"]))
+
+    assert set(batch.node_objects) == {"f0", "f1"}
+    held = set(sched.backlog[(NODE, WALK)].node_objects)
+    assert held == {"b0", "b1", "f2"}, f"lost the blocked chunk: {held}"
+
+
+def test_fresh_work_merges_into_an_existing_backlog_entry():
+    sched = _scheduler(_Engine(max_bs=2))
+    sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
+
+    sched.get_next_batch(_Manager(["f0", "f1", "f2"]), pre_existing_batch_size=2)
+
+    held = set(sched.backlog[(NODE, WALK)].node_objects)
+    assert {"b0", "b1"} <= held, "the older chunk must survive"
+
+
+def test_no_capacity_leaves_the_ready_queue_alone():
+    """Popping nodes we cannot schedule is what makes the loss possible."""
+    sched = _scheduler(_Engine(max_bs=16))
+    manager = _Manager(["f0", "f1"])
+
+    sched.get_next_batch(manager, pre_existing_batch_size=16)
+
+    assert set(manager.queues["wg0"]._ready) == {"f0", "f1"}, (
+        "fresh nodes were popped off the queue with nowhere to put them"
+    )
+
+
+# ── backlog vs speculation ──────────────────────────────────────────────
+
+
+def test_room_for_continuing_reserves_the_backlog_first():
+    """32 decodes at a cap of 16: the 16 waiting take the whole next batch, so
+    the spec chain keeps none of its own. Without this the chain re-speculates
+    the same 16 forever and the other half never runs."""
+    sched = _scheduler(_Engine(max_bs=16))
+    sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(16)])
+
+    assert sched.room_for_continuing((NODE, WALK)) == 0
+
+
+def test_room_for_continuing_splits_a_partial_backlog():
+    sched = _scheduler(_Engine(max_bs=16))
+    sched.backlog[(NODE, WALK)] = _batch([f"b{i}" for i in range(6)])
+
+    assert sched.room_for_continuing((NODE, WALK)) == 10
+
+
+def test_room_for_continuing_is_unbounded_without_a_cap():
+    sched = _scheduler(_Engine(max_bs=None))
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+
+    assert sched.room_for_continuing((NODE, WALK)) is None
+
+
+def test_the_reserved_room_is_exactly_what_the_backlog_then_fills():
+    """The two halves have to agree: whatever `room_for_continuing` holds
+    back, the follow-up call must actually hand over."""
+    sched = _scheduler(_Engine(max_bs=16))
+    backlogged = [f"b{i}" for i in range(16)]
+    sched.backlog[(NODE, WALK)] = _batch(backlogged)
+
+    keep = sched.room_for_continuing((NODE, WALK))
+    batch = sched.get_next_batch(
+        _Manager([]), target=(NODE, WALK), pre_existing_batch_size=keep,
+    )
+
+    assert set(batch.node_objects) == set(backlogged)
+    assert sched.backlog == {}
+
+
+# ── fairness peek ───────────────────────────────────────────────────────
+
+
+def test_the_peek_sees_a_backlogged_walk_the_queues_cannot_show():
+    """A backlogged chunk's nodes are off the ready queues, so the scan alone
+    reports no contention and the spec chain never yields to it."""
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.backlog[("other", "prefill")] = _batch(["b0"], node="other", walk="prefill")
+
+    assert sched.has_ready_excluding(_Manager([]), (NODE, WALK)) is True
+
+
+def test_the_peek_ignores_the_speculated_walks_own_backlog():
+    """That chunk is absorbed by the merge (`room_for_continuing`), so it is
+    not a reason to break the chain."""
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.backlog[(NODE, WALK)] = _batch(["b0"])
+
+    assert sched.has_ready_excluding(_Manager([]), (NODE, WALK)) is False
+
+
+def test_the_peek_ignores_a_backlog_of_failed_rids():
+    sched = _scheduler(_Engine(max_bs=8))
+    sched.backlog[("other", "prefill")] = _batch(["b0"], node="other", walk="prefill")
+    sched.failed_rids.add("b0")
+
+    assert sched.has_ready_excluding(_Manager([]), (NODE, WALK)) is False
 
 
 # ── round robin ─────────────────────────────────────────────────────────

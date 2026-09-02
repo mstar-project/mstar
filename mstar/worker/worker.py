@@ -1394,6 +1394,11 @@ class Worker:
         new_request_to_worker_graph: dict[str, str] = {}
         per_request_inputs: dict[str, NameToTensorList] = {}
         consumed_streaming_edges: dict[str, GraphEdge] = {}
+        # Backlogged rids for this target get first claim on the batch: they
+        # have already waited a step, and the chain only ever continues its own
+        # rids, so at the cap they would never be reached. None => uncapped.
+        spec_target = (spec_node_info.node_name, batch_N.graph_walk)
+        max_continuing = self.scheduler.room_for_continuing(spec_target)
         for rid, batch_N_node in batch_N.node_objects.items():
             wgio = self._get_wgio_for_rid(batch_N, rid)
             loop = wgio.loops.get(spec_node_info.loop_name)
@@ -1408,6 +1413,12 @@ class Worker:
             )
             if already_removed or already_stopped or is_stopping:
                 # Loop/request has already finished, don't speculate further work
+                continue
+
+            if max_continuing is not None and len(continuing) >= max_continuing:
+                # Room is spoken for by the backlog. Skipped before any
+                # streaming ingest, so there is nothing to roll back; this rid
+                # goes ready again the moment the in-flight batch lands.
                 continue
 
             # If the speculation is contingent on streaming edges, ingest the
@@ -1493,7 +1504,7 @@ class Worker:
         # the normal scheduler path.
         fresh_batch = self.scheduler.get_next_batch(
             self.worker_graphs_manager,
-            target=(spec_node_info.node_name, batch_N.graph_walk),
+            target=spec_target,
             pre_existing_batch_size=len(continuing)
         )
 

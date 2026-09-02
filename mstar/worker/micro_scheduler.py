@@ -37,6 +37,14 @@ class ScheduledBatch:
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[str, str] = None
 
+    def merge(self, other: "ScheduledBatch") -> None:
+        """Fold ``other``'s requests in, ours first — they have waited longer."""
+        assert (self.node_name, self.graph_walk) == (
+            other.node_name, other.graph_walk
+        ), "only batches for the same (node, walk) share a backlog entry"
+        self.node_objects.update(other.node_objects)
+        self.request_to_worker_graph.update(other.request_to_worker_graph)
+
     def split_off_first(
         self, bs: int | None, exclude_rids: set[str] | None = None
     ) -> "tuple[ScheduledBatch | None, ScheduledBatch | None]":
@@ -344,21 +352,24 @@ class MicroScheduler:
         entries = [e for e in node_name_to_requests[best_node_name] \
                    if e.graph_walk == graph_walk]
 
+        if max_batch_size is None:
+            max_batch_size = self._max_batch_size(best_node_name, graph_walk)
+        remaining = self._remaining_capacity(max_batch_size, pre_existing_batch_size)
+        if remaining is not None and remaining <= 0:
+            # The caller already holds a full batch. Assembling would pop these
+            # nodes off their ready queues with nowhere to run them, so leave
+            # them queued for the next pass.
+            return None
+
         full_batch = self._assemble_batch(
             worker_graphs_manager, best_node_name, graph_walk, entries
         )
         if not full_batch:
             return None
 
-        if max_batch_size is None:
-            max_batch_size = self._max_batch_size(best_node_name, graph_walk)
-
         # Everything past the first step is already popped off the queues, so
         # it has to be remembered here or it would never run.
-        return self._cap_batch_and_schedule(
-            batch=full_batch,
-            max_bs=self._remaining_capacity(max_batch_size, pre_existing_batch_size),
-        )
+        return self._cap_batch_and_schedule(batch=full_batch, max_bs=remaining)
 
     @staticmethod
     def _remaining_capacity(
@@ -402,19 +413,30 @@ class MicroScheduler:
         """
         node_walk = (batch.node_name, batch.graph_walk)
         if max_bs is not None and max_bs <= 0:
-            self.backlog[node_walk] = batch
+            self._backlog(node_walk, batch)
             return None
         capped_batch, remainder = batch.split_off_first(
             max_bs, exclude_rids=exclude_rids
         )
-        # never store None: `_drop_backlogged_rid` walks these
-        if remainder is None:
-            self.backlog.pop(node_walk, None)
-        else:
-            self.backlog[node_walk] = remainder
+        # only ever store a real remainder: `_drop_backlogged_rid` walks these
+        if remainder is not None:
+            self._backlog(node_walk, remainder)
         if capped_batch is not None:
             self._mark_scheduled(*node_walk, len(capped_batch.node_objects))
         return capped_batch
+
+    def _backlog(self, node_walk: tuple[str, str], batch: ScheduledBatch) -> None:
+        """Park ``batch``, folding it into whatever already waits under this key.
+
+        Replacing would drop the rids already there — their graph nodes came
+        off the ready queues when they were first assembled, so nothing would
+        ever schedule them again and the requests hang.
+        """
+        existing = self.backlog.get(node_walk)
+        if existing is None:
+            self.backlog[node_walk] = batch
+        else:
+            existing.merge(batch)
 
     def _mark_scheduled(
         self, node_name: str, graph_walk: str, num_requests: int,
@@ -512,6 +534,40 @@ class MicroScheduler:
         )
 
 
+    def _backlog_has_schedulable(
+        self, exclude_target: tuple[str, str] | None,
+    ) -> bool:
+        """Whether a backlogged chunk outside ``exclude_target`` holds a rid
+        still worth running."""
+        now = time.monotonic()
+        for node_walk, batch in self.backlog.items():
+            if node_walk == exclude_target:
+                continue
+            for rid in batch.node_objects:
+                if rid in self.failed_rids or rid in self.pending_removes:
+                    continue
+                if self.held_until.get(rid, 0.0) > now:
+                    continue
+                return True
+        return False
+
+    def room_for_continuing(self, target: tuple[str, str]) -> int | None:
+        """How many of a speculative batch's own rids fit once this target's
+        backlog is served first.
+
+        The chain only ever continues its own rids, so at the cap a backlogged
+        chunk under the same (node, walk) would never be reached. Giving the
+        backlog first claim costs the displaced rids one step — their nodes go
+        ready again when the in-flight batch lands.
+
+        None for an uncapped node: everything fits, so nothing is displaced.
+        """
+        cap = self._max_batch_size(*target)
+        if cap is None:
+            return None
+        waiting = self.backlog.get(target)
+        return max(0, cap - (0 if waiting is None else len(waiting.node_objects)))
+
     def has_ready_excluding(
         self,
         worker_graphs_manager: WorkerGraphsManager,
@@ -525,7 +581,14 @@ class MicroScheduler:
 
         Does NOT pop or modify queue state. Mirrors the ready-scan in
         get_next_batch but stops at the first match.
+
+        Backlogged chunks count too: their graph nodes came off the queues
+        when they were assembled, so the scan below cannot see them. A chunk
+        under `exclude_target` is left out like any other — the speculative
+        merge takes that one before its own rids, so it needs no yield.
         """
+        if self._backlog_has_schedulable(exclude_target):
+            return True
 
         # A failed rid is normally invisible here — get_next_batch refuses to
         # schedule it, so reporting it as ready would break the spec chain for
