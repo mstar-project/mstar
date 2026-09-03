@@ -231,9 +231,11 @@ class AttentionResource(Resource):
     def default_label(self) -> str:
         return self._default_label
 
+    @torch.compiler.disable
     def set_default_label(self, label: str) -> None:
         self._default_label = label
 
+    @torch.compiler.disable
     def set_default_layer_idx(self, layer_idx: int) -> None:
         self._default_layer_idx = layer_idx
 

@@ -25,6 +25,7 @@ class AttentionCallable:
         # Can be changed at runtime, e.g., for a model that switches
         self.attn = attn
 
+    @torch.compiler.disable
     def bind_step(self, label: str, attn: AttentionManager | None = None) -> None:
         if attn is not None:
             self.attn = attn
@@ -43,10 +44,12 @@ class AttentionCallable:
         """
         return self.kv.default_label
 
+    @torch.compiler.disable
     def set_layer_idx(self, layer_idx: int) -> None:
         self.attn.set_default_layer_idx(layer_idx)
         self.kv.set_default_layer_idx(layer_idx)
 
+    @torch.compiler.disable
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     ) -> torch.Tensor:
