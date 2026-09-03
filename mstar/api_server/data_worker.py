@@ -30,7 +30,10 @@ from mstar.utils.ipc_format import (
     AbortRequest,
     ConductorMessage,
     ConductorMessageType,
+    DrainRequest,
     NewRequestConductor,
+    ReadsDone,
+    RemoveRequest,
     TensorReceived,
     UnpersistTensors,
     WorkerMessageType,
@@ -61,6 +64,7 @@ class PreprocessWorker:
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
         self.abort_request_queue = queue.Queue()
+        self.reads_done_queue = queue.Queue()
         self.discard_tensor_queue = queue.Queue()
         self.output_queue = queue.Queue()
         self.profile_queue = queue.Queue()
@@ -98,6 +102,7 @@ class PreprocessWorker:
                 profile_queue=self.profile_queue,
                 cleanup_request_queue=self.cleanup_request_queue,
                 abort_request_queue=self.abort_request_queue,
+                reads_done_queue=self.reads_done_queue,
                 discard_tensor_queue=self.discard_tensor_queue,
                 stop_event=self.stop_event,
                 communicator=self.communicator,
@@ -114,8 +119,22 @@ class PreprocessWorker:
         self.request_input_queue.put(input)
 
     def abort_request(self, request_id: str):
+        # Forward the abort to the conductor and begin draining our own reads
+        # (the worker thread ACKs READS_DONE once they finish). The hard cleanup
+        # of the persisted input signals waits for the conductor's
+        # REMOVE_REQUEST, so a worker still reading them can't be unlinked
+        # out from under it. Drop only the main-thread bookkeeping here.
         self.abort_request_queue.put(request_id)
-        self.cleanup_request(request_id)
+        self.output_loop_idxs.pop(request_id, None)
+        self.per_request_reading_tensors.pop(request_id, None)
+
+    def finished_reading(self, request_id: str):
+        """Happy path: the API server finished delivering this request's outputs
+        (drained), so we have no more reads. Tell the conductor via READS_DONE;
+        it will send REMOVE_REQUEST to trigger the hard cleanup."""
+        self.reads_done_queue.put(request_id)
+        self.output_loop_idxs.pop(request_id, None)
+        self.per_request_reading_tensors.pop(request_id, None)
 
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
@@ -231,6 +250,7 @@ class PreprocessWorkerThread:
         profile_queue: queue.Queue,
         cleanup_request_queue: queue.Queue,
         abort_request_queue: queue.Queue,
+        reads_done_queue: queue.Queue,
         discard_tensor_queue: queue.Queue,
         stop_event: threading.Event,
         communicator: BaseCommunicator,
@@ -243,9 +263,15 @@ class PreprocessWorkerThread:
         self.result_tensor_queue = result_tensor_queue
         self.cleanup_request_queue = cleanup_request_queue
         self.abort_request_queue = abort_request_queue
+        self.reads_done_queue = reads_done_queue
         self.discard_tensor_queue = discard_tensor_queue
         self.out_queue = out_queue
         self.profile_queue = profile_queue
+
+        # Teardown drain: rids we've stopped reading for (until REMOVE_REQUEST),
+        # and those we've already ACKed READS_DONE for (avoid double-ACK).
+        self._draining_rids: set[str] = set()
+        self._reads_done_sent: set[str] = set()
 
         self.stop_event = stop_event
         self.device = device
@@ -510,7 +536,52 @@ class PreprocessWorkerThread:
                     self.tensor_manager.set_persist(
                         body.request_id, uuid, persist=False
                     )
+            elif message.message_type == WorkerMessageType.DRAIN_REQUEST:
+                body: DrainRequest = message.body
+                self._begin_drain(body.request_id)
+            elif message.message_type == WorkerMessageType.REMOVE_REQUEST:
+                body: RemoveRequest = message.body
+                self._hard_cleanup(body.request_id)
         return did_work
+
+    def _begin_drain(self, request_id: str) -> None:
+        """Stop reading this rid; ACK READS_DONE once in-flight reads finish.
+        Idempotent — abort self-initiates while the conductor may also drive it."""
+        self._draining_rids.add(request_id)
+        self._complete_drain_if_ready(request_id)
+
+    def _complete_drain_if_ready(self, request_id: str) -> None:
+        if request_id not in self._draining_rids:
+            return
+        if request_id in self._reads_done_sent:
+            return
+        if self.tensor_manager.has_inflight_reads(request_id):
+            return  # let _process_read_tensors resolve the futures; retry
+        self._send_reads_done(request_id)
+
+    def _send_reads_done(self, request_id: str) -> None:
+        if request_id in self._reads_done_sent:
+            return
+        self._reads_done_sent.add(request_id)
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.READS_DONE,
+                body=ReadsDone(
+                    request_id=request_id,
+                    entity_id="api_server_preprocess_worker",
+                ),
+            ),
+        )
+
+    def _hard_cleanup(self, request_id: str) -> None:
+        """Phase-2 teardown: unconditionally drop all tensor state for the rid
+        (unlink the input-signal SHM). Safe now that every reader has drained."""
+        self._draining_rids.discard(request_id)
+        self._reads_done_sent.discard(request_id)
+        self.tensor_manager.force_cleanup_request(request_id)
+        self.tensor_uuid_to_metadata_per_request.pop(request_id, None)
+        self.request_model_kwargs.pop(request_id, None)
 
     def run(self):
         while not self.stop_event.is_set():
@@ -525,6 +596,11 @@ class PreprocessWorkerThread:
                 while not self.result_tensor_queue.empty():
                     did_work = True
                     result = self.result_tensor_queue.get()
+                    # Draining for teardown: don't start new reads — ack the
+                    # tensors back so the producing worker can free its buffers.
+                    if result.request_id in self._draining_rids:
+                        self._discard_result_tensor(result)
+                        continue
                     try:
                         self._read_result_tensor(result)
                     except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -538,13 +614,22 @@ class PreprocessWorkerThread:
                         )
                 while not self.abort_request_queue.empty():
                     did_work = True
+                    rid = self.abort_request_queue.get()
                     self.communicator.send(
                         "conductor",
                         ConductorMessage(
                             message_type=ConductorMessageType.ABORT_REQUEST,
-                            body=AbortRequest(request_id=self.abort_request_queue.get()),
+                            body=AbortRequest(request_id=rid),
                         ),
                     )
+                    # Begin draining our own reads immediately, overlapping with
+                    # the conductor round-trip (it also sends a DrainRequest).
+                    self._begin_drain(rid)
+                while not self.reads_done_queue.empty():
+                    did_work = True
+                    # Happy path: the API server drained this request's outputs,
+                    # so we have no more reads — ACK so the conductor can Remove.
+                    self._send_reads_done(self.reads_done_queue.get())
                 while not self.discard_tensor_queue.empty():
                     did_work = True
                     self._discard_result_tensor(self.discard_tensor_queue.get())
@@ -556,6 +641,9 @@ class PreprocessWorkerThread:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
                     self.request_model_kwargs.pop(req_id, None)
                 did_work = self._process_read_tensors() or did_work
+                # Reads may have just resolved; ACK any drains now free of them.
+                for rid in list(self._draining_rids):
+                    self._complete_drain_if_ready(rid)
                 if not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
@@ -570,7 +658,10 @@ class PreprocessWorkerThread:
                         self._fail_request(
                             pre_input.request_id, exc, "preprocessing",
                         )
-                        self.tensor_manager.cleanup_request(pre_input.request_id)
+                        # Never reached the conductor, so there are no remote
+                        # readers to race: hard-drop the (possibly persisted)
+                        # input signals directly.
+                        self.tensor_manager.force_cleanup_request(pre_input.request_id)
                         self.request_model_kwargs.pop(pre_input.request_id, None)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")

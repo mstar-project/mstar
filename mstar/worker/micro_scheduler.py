@@ -1,6 +1,6 @@
 import logging
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -79,6 +79,12 @@ class MicroScheduler:
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: set[str] = set()
 
+        # rid -> number of committed (ZMQ received) tp follow batches still
+        # queued. On the fail/abort path we drain these before ACKing READS_DONE
+        # so the worker graph queues aren't torn down while a follow still needs
+        # to pop from them.
+        self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
+
     def _select_node_priority(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
@@ -101,7 +107,7 @@ class MicroScheduler:
         # Enforce same graph_walk for the entire batch.
         # Pick the most common graph_walk to maximize batch size;
         # remaining requests stay in the queue for the next cycle.
-        walk_counts: dict[str, int] = {}
+        walk_counts: dict[str, int] = defaultdict(lambda: 0)
         for e in entries:
             walk_counts[e.graph_walk] = walk_counts.get(e.graph_walk, 0) + 1
         graph_walk = max(walk_counts, key=walk_counts.get)
@@ -136,6 +142,8 @@ class MicroScheduler:
         self, message: ScheduleTPNode
     ):
         self.tp_batches_pending_schedule.append(message)
+        for rid in message.request_ids:
+            self.pending_tp_follow_count[rid] += 1
 
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
@@ -193,6 +201,11 @@ class MicroScheduler:
                 assert len(popped) == 1
                 node_objects[rid] = popped[0]
                 request_to_worker_graph[rid] = wgid
+
+        for rid in first_tp_node.request_ids:
+            self.pending_tp_follow_count[rid] -= 1
+            if self.pending_tp_follow_count[rid] <= 0:
+                self.pending_tp_follow_count.pop(rid, None)
 
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(
@@ -400,4 +413,5 @@ class MicroScheduler:
         """Forget all per-request scheduler state; called on REMOVE_REQUEST."""
         self.failed_rids.discard(rid)
         self.held_until.pop(rid, None)
+        self.pending_tp_follow_count.pop(rid, None)
 

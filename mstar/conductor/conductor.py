@@ -33,10 +33,12 @@ from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.ipc_format import (
     ConductorMessageType,
+    DrainRequest,
     FailRequests,
     InputSignals,
     NewRequest,
     NewRequestConductor,
+    ReadsDone,
     RemoveRequest,
     UnpersistTensors,
     WorkerGraphsDone,
@@ -205,6 +207,19 @@ class RequestData:
         ]
 
 
+@dataclass
+class DrainingRequest:
+    """Teardown barrier state: a request whose participants are draining their
+    reads. Once every entity in ``expected_acks`` has sent READS_DONE it is safe
+    to send the hard RemoveRequest to all ``participants``."""
+    expected_acks: set[str]
+    participants: set[str]
+    # Set for the fail path: the client notification is deferred until the
+    # barrier completes (so the API server doesn't tear down mid-read).
+    failure_error: str | None = None
+    failure_status: int = 500
+
+
 class Conductor:
     def __init__(
         self,
@@ -219,6 +234,12 @@ class Conductor:
         tcp_transfer_device=""
     ):
         self.requests: dict[str, RequestData] = {}
+        # Requests in teardown: kept in self.requests (so they still count toward
+        # concurrency until their GPU state is freed) with barrier state here.
+        self.draining: dict[str, DrainingRequest] = {}
+        # READS_DONE that arrived before the barrier was registered (the
+        # preprocess worker self-drains on abort before we process ABORT_REQUEST).
+        self._early_reads_done: dict[str, set[str]] = {}
         self.model = model
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
@@ -813,14 +834,79 @@ class Conductor:
             if graph_walk in self.worker_graphs[wg_id].graph_walks
         }
 
+    PREPROCESS_WORKER = "api_server_preprocess_worker"
+
+    def _request_workers(self, request_data: RequestData) -> set[str]:
+        return {
+            worker_id
+            for worker_ids in request_data.worker_graph_to_workers.values()
+            for worker_id in worker_ids
+        }
+
+    def _register_draining(
+        self, request_id: str, expected_acks: set[str], participants: set[str],
+        failure_error: str | None = None, failure_status: int = 500,
+    ):
+        """Start the teardown barrier for a request. Applies any READS_DONE that
+        raced ahead of registration, and finalizes immediately if already
+        satisfied (e.g. a happy path with no outstanding reader)."""
+        expected_acks = set(expected_acks) - self._early_reads_done.pop(request_id, set())
+        self.draining[request_id] = DrainingRequest(
+            expected_acks=expected_acks,
+            participants=participants,
+            failure_error=failure_error,
+            failure_status=failure_status,
+        )
+        if not expected_acks:
+            self._finalize_draining(request_id)
+
+    def _finalize_draining(self, request_id: str):
+        """Every reader has drained: send the hard RemoveRequest to all
+        participants, notify the client on the fail path, then free state."""
+        dr = self.draining.pop(request_id, None)
+        if dr is None:
+            return
+        for entity in dr.participants:
+            self.communicator.send(
+                entity,
+                WorkerMessage(
+                    message_type=WorkerMessageType.REMOVE_REQUEST,
+                    body=RemoveRequest(request_id),
+                ),
+            )
+        if dr.failure_error is not None:
+            self.communicator.send(
+                "api_server",
+                APIServerMessage(
+                    message_type="request_failed",
+                    body=RequestFailed(
+                        request_id=request_id,
+                        error_message=dr.failure_error,
+                        status=dr.failure_status,
+                    ),
+                ),
+            )
+        self.requests.pop(request_id, None)
+        logger.info("Tore down request %s; freed worker resources", request_id)
+        self._try_admit_waiting()
+
+    def _handle_reads_done(self, body: ReadsDone):
+        dr = self.draining.get(body.request_id)
+        if dr is None:
+            # Raced ahead of registration (preprocess-worker self-drain on abort).
+            self._early_reads_done.setdefault(body.request_id, set()).add(body.entity_id)
+            return
+        dr.expected_acks.discard(body.entity_id)
+        if not dr.expected_acks:
+            self._finalize_draining(body.request_id)
+
     def _fail_requests(self, body: FailRequests):
-        """Tear down requests a worker reported as unservable and tell the
-        client. Mirrors ``_process_request_done``, but the api-server side
-        turns the message into an HTTP error / stream error event.
-        """
+        """Tear down requests a worker reported as unservable. Routes through the
+        drain barrier; the client is notified (request_failed) only once every
+        reader has drained, so no output is unlinked under an in-flight read."""
         for rid, error_message in body.errors.items():
             request_data = self.requests.get(rid)
-            if request_data is None:
+            if request_data is None or rid in self.draining:
                 # Expected under TP: every rank raises symmetrically and each
                 # reports the failure, so only the first report finds the
                 # request. Also covers a client abort racing the failure.
@@ -830,17 +916,7 @@ class Conductor:
                 )
                 continue
             logger.error("Request %s failed on a worker: %s", rid, error_message)
-            self._remove_request(rid, request_data)
-            self.communicator.send(
-                "api_server",
-                APIServerMessage(
-                    message_type="request_failed",
-                    body=RequestFailed(
-                        request_id=rid,
-                        error_message=error_message,
-                    ),
-                ),
-            )
+            self._remove_request(rid, request_data, failure_error=error_message)
 
     def _abort_request(self, request_id: str):
         """Tear down a request the client abandoned, freeing its worker GPU state."""
@@ -851,33 +927,36 @@ class Conductor:
                 return
 
         request_data = self.requests.get(request_id)
-        if request_data is None:
-            logger.info("Abort for request %s ignored; already finished or unknown", request_id)
+        if request_data is None or request_id in self.draining:
+            logger.info("Abort for request %s ignored; already finished, unknown, or draining", request_id)
             return
         self._remove_request(request_id, request_data)
 
-    def _remove_request(self, request_id: str, request_data: RequestData):
-        """Drop conductor state for a request and free its worker GPU state.
-
-        Shared by the abort (client went away) and fail (worker can't serve
-        it) paths; neither notifies the api server from here.
+    def _remove_request(
+        self, request_id: str, request_data: RequestData,
+        failure_error: str | None = None,
+    ):
+        """Begin teardown for an abort/fail: drain every participant's reads,
+        then (on the barrier's completion) hard-remove. Shared by the abort
+        (client went away) and fail (worker can't serve it) paths.
         """
-        workers = {
-            worker_id
-            for worker_ids in request_data.worker_graph_to_workers.values()
-            for worker_id in worker_ids
-        }
-        for worker_id in workers:
+        workers = self._request_workers(request_data)
+        participants = workers | {self.PREPROCESS_WORKER}
+        for entity in participants:
             self.communicator.send(
-                worker_id,
+                entity,
                 WorkerMessage(
-                    message_type=WorkerMessageType.REMOVE_REQUEST,
-                    body=RemoveRequest(request_id),
+                    message_type=WorkerMessageType.DRAIN_REQUEST,
+                    body=DrainRequest(request_id),
                 ),
             )
-        del self.requests[request_id]
-        logger.info("Tore down request %s; freed worker resources", request_id)
-        self._try_admit_waiting()
+        logger.info("Draining request %s (%d participants) before teardown", request_id, len(participants))
+        self._register_draining(
+            request_id,
+            expected_acks=participants,
+            participants=participants,
+            failure_error=failure_error,
+        )
 
     def _process_request_done(
         self, request_id: str
@@ -886,14 +965,8 @@ class Conductor:
         logger.info("Request %s done", request_id)
         request_data = self.requests[request_id]
         request_data.conductor_finish_time = time.perf_counter()
-        for worker_ids in request_data.worker_graph_to_workers.values():
-            for worker_id in worker_ids:
-                msg = WorkerMessage(
-                    message_type=WorkerMessageType.REMOVE_REQUEST,
-                    body=RemoveRequest(request_id)
-                )
-                self.communicator.send(worker_id, msg)
 
+        # Tell the client first, so nothing below adds to completion latency.
         self.communicator.send(
             "api_server",
             APIServerMessage(
@@ -909,8 +982,32 @@ class Conductor:
                 )
             )
         )
-        del self.requests[request_id]
-        self._try_admit_waiting()
+
+        # Unpersist anything still held, with correct ref counts, so producers
+        # reclaim it as the final reads ACK — before the hard teardown.
+        still_persisted = [
+            info
+            for infos in request_data.persist_signals.values()
+            for info in infos
+        ]
+        if still_persisted:
+            self._un_persist_tensors(request_id, still_persisted)
+
+        # Workers are done reading (the graph finished); the only remaining
+        # reader is the preprocess worker still delivering outputs. Defer the
+        # hard RemoveRequest until it signals READS_DONE, so a worker output
+        # isn't unlinked under an in-flight read.
+        # NOTE: "workers done reading" assumes a well-behaved graph. A model bug
+        # that emits extra/erroneous tensors could leave a worker read scheduled
+        # past completion, which this path won't wait for. Gating the happy path
+        # on per-worker READS_DONE too (like abort/fail) would handle that
+        # robustly — TODO once the barrier has proven out.
+        workers = self._request_workers(request_data)
+        self._register_draining(
+            request_id,
+            expected_acks={self.PREPROCESS_WORKER},
+            participants=workers | {self.PREPROCESS_WORKER},
+        )
 
     def _process_worker_graphs_done(
         self, body: WorkerGraphsDone
@@ -1189,9 +1286,13 @@ class Conductor:
                         self._abort_request(message.body.request_id)
                     elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
                         self._fail_requests(message.body)
+                    elif message.message_type == ConductorMessageType.READS_DONE:
+                        self._handle_reads_done(message.body)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
                         rid = message.body.request_id
-                        if rid not in self.requests:
+                        # Draining requests linger in self.requests (concurrency
+                        # accounting) but are being torn down — ignore late dones.
+                        if rid not in self.requests or rid in self.draining:
                             logger.debug(
                                 "WORKER_GRAPHS_DONE for unknown request %s (already completed?)", rid
                             )
@@ -1212,7 +1313,7 @@ class Conductor:
                 completed_requests = []
 
                 for request_id, partition_name, p_done in done_partition_forwards:
-                    if request_id not in self.requests:
+                    if request_id not in self.requests or request_id in self.draining:
                         continue  # already completed by another partition in this cycle
                     all_done = self._process_done_forward(
                         request_id, partition_name,
@@ -1222,7 +1323,7 @@ class Conductor:
                         completed_requests.append(request_id)
 
                 for request_id in dict.fromkeys(completed_requests):
-                    if request_id in self.requests:
+                    if request_id in self.requests and request_id not in self.draining:
                         self._process_request_done(request_id)
             except Exception:
                 logger.exception("Conductor error in main loop")
