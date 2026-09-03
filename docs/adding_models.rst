@@ -173,6 +173,16 @@ per node), ``get_aux_sampling_configs`` (see below), ``get_max_output_tokens``,
 ``get_autocast_dtype``, ``load_image`` / ``load_audio`` / ``load_video``, and the
 partition API below.
 
+.. note::
+
+   ``model_kwargs`` reaches your model from clients through the OpenAI routes'
+   ``extra_body`` passthrough. The Dynamo bridge
+   (``mstar/integrations/dynamo/bridges.py``) strips OpenAI-standard fields no
+   model consumes (``_STRIP_KEYS``) before that passthrough runs. If your model
+   starts reading such a field from ``model_kwargs`` — the way ``ignore_eos`` is
+   read — also delete the key from ``_STRIP_KEYS``, or requests arriving through
+   the Dynamo frontend will silently lose it.
+
 A node whose forward samples **more than once per step** with different parameters
 declares the extra configs from ``get_aux_sampling_configs(node_name, model_kwargs)``,
 which returns ``label -> SamplingConfig``. Qwen3-Omni's Talker does this: the Talker LLM

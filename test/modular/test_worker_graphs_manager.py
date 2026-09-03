@@ -13,6 +13,7 @@ import pytest
 from mstar.conductor.request_info import (
     CurrentForwardPassInfo,
 )
+from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.model.base import WorkerGraph
 from mstar.worker.node_manager_utils import (
@@ -48,6 +49,11 @@ def _fwd_info(graph_walk: str, partition: str = "default", fwd_index: int = 0):
         sampling_config={},
         partition_name=partition,
     )
+
+
+def _sharding_config():
+    """Un-sharded base config; ``add_request`` clones it and calls ``setup``."""
+    return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
 
 # --- fixtures ----------------------------------------------------------------
@@ -106,6 +112,8 @@ def _make_manager(wg_id="wg0", graph_walk="decode", worker_id="worker0"):
     mgr = WorkerGraphsManager(
         queues=queues,
         per_request_info={},
+        base_sharding_config=_sharding_config(),
+        worker_id=worker_id,
         all_worker_graph_ids_to_graph_walks={wg_id: {graph_walk}},
         all_worker_graph_ids_to_nodes={wg_id: {"prefill", "ar_decode"}},
         all_worker_graph_ids_to_dyn_loops={wg_id: {"ar_loop"}},
@@ -114,7 +122,7 @@ def _make_manager(wg_id="wg0", graph_walk="decode", worker_id="worker0"):
     mgr.add_request(
         request_id="rid",
         partition_worker_graph_ids=[wg_id],
-        worker_graph_to_worker={wg_id: worker_id},
+        worker_graph_to_workers={wg_id: [worker_id]},
         current_fwd_info=_fwd_info(graph_walk),
     )
     return mgr, wg_id, graph_walk
@@ -214,10 +222,10 @@ def test_stop_loops_snapshots_loop_stop_times_when_req_info_provided():
     assert snapshot.loop_name_order == ["ar_loop"]
 
 
-def test_complete_loops_shim_drops_loop_back_on_loop_done():
-    """End-to-end: drive prefill + 2 ar_decode iters with EOS on the 2nd;
-    complete_loops on the final ar_decode should drop the loop-back signals
-    from kept and append the loop's terminal outputs."""
+def test_loop_done_drops_loop_back_and_keeps_terminal_outputs():
+    """Drive prefill and two ar_decode iterations, requesting loop termination
+    before the second completes. The final completion should report loop-back
+    signals in ``filtered_signals`` and return only the terminal outputs."""
     mgr, wg_id, _ = _make_manager()
     mgr.process_new_inputs("rid", [GraphEdge(name="prompt", next_node="prefill")])
     mgr.mark_node_complete("rid", wg_id, "prefill")
@@ -234,19 +242,14 @@ def test_complete_loops_shim_drops_loop_back_on_loop_done():
         GraphEdge(name="kv_cache", next_node="ar_decode"),
     ])
     mgr.stop_loops("rid", "default", {"ar_loop"})
-    ar_decode_outputs = list(
-        mgr.queues[wg_id].per_request_queues["rid"].nodes["ar_decode"].outputs
-    )
-    result = mgr.complete_loops("rid", wg_id, ar_decode_outputs, "ar_decode")
+    completion = mgr.mark_node_complete("rid", wg_id, "ar_decode")
 
-    # Loop-back edges should be filtered out.
-    filtered_names = sorted((e.name, e.next_node) for e in result.filtered_out)
-    assert filtered_names == [("kv_cache", "ar_decode"), ("token", "ar_decode")]
-    # Kept should include the loop's terminal output (token → post_processor)
-    # since the loop's done branch returns ar_loop.outputs and the shim appends
-    # any output edges whose (name, dest) is not in the caller's set.
-    kept_dests = {e.next_node for e in result.kept}
-    assert "post_processor" in kept_dests
+    assert sorted(completion.filtered_signals) == [
+        ("kv_cache", "ar_decode"), ("token", "ar_decode"),
+    ]
+    assert [(e.name, e.next_node) for e in completion.output_edges] == [
+        ("token", "post_processor"),
+    ]
 
 
 def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
@@ -278,6 +281,8 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
             tensor_manager=StubTensorManager(),
         )},
         per_request_info={},
+        base_sharding_config=_sharding_config(),
+        worker_id="worker0",
         all_worker_graph_ids_to_graph_walks={wg_id: {"prefill_text"}},
         all_worker_graph_ids_to_nodes={wg_id: {"prefill_text"}},
         all_worker_graph_ids_to_dyn_loops={wg_id: set()},
@@ -286,7 +291,7 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
     mgr.add_request(
         request_id="rid",
         partition_worker_graph_ids=[wg_id],
-        worker_graph_to_worker={wg_id: "worker0"},
+        worker_graph_to_workers={wg_id: ["worker0"]},
         current_fwd_info=_fwd_info("prefill_text"),
     )
     mgr.process_new_inputs("rid", [GraphEdge(name="text_inputs", next_node="prefill_text")])
@@ -332,6 +337,8 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
             tensor_manager=StubTensorManager(),
         )},
         per_request_info={},
+        base_sharding_config=_sharding_config(),
+        worker_id="worker0",
         all_worker_graph_ids_to_graph_walks={wg_id: {"prefill"}},
         all_worker_graph_ids_to_nodes={wg_id: {"prefill"}},
         all_worker_graph_ids_to_dyn_loops={wg_id: set()},
@@ -340,7 +347,7 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
     mgr.add_request(
         request_id="rid",
         partition_worker_graph_ids=[wg_id],
-        worker_graph_to_worker={wg_id: "worker0"},
+        worker_graph_to_workers={wg_id: ["worker0"]},
         current_fwd_info=_fwd_info("prefill"),
     )
     mgr.process_new_inputs("rid", [GraphEdge(name="prompt", next_node="prefill")])
@@ -348,6 +355,7 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
 
     routing = mgr.process_node_outputs(
         "rid",
+        node_name="prefill",
         outputs=list(mgr.queues[wg_id].per_request_queues["rid"].nodes["prefill"].outputs),
         graph_walk="prefill",
     )
