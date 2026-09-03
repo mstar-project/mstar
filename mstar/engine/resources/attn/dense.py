@@ -14,15 +14,20 @@ from mstar.engine.resources.step import StepContext
 
 logger = logging.getLogger(__name__)
 
+# imported here, not per `run`: the wheel may be absent, so keep the failure
+try:
+    from fa3_fwd_interface import flash_attn_varlen_func
+except Exception as _fa3_exc:  # noqa: BLE001
+    flash_attn_varlen_func = None
+    _FA3_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
+else:
+    _FA3_IMPORT_ERROR = None
+
 
 @functools.cache
 def _fa3_unavailable_reason() -> str | None:
     """verify flash attention 3 fwd kernel imports"""
-    try:
-        import fa3_fwd_interface  # noqa: F401
-    except Exception as exc:  # noqa: BLE001
-        return f"{type(exc).__name__}: {exc}"
-    return None
+    return _FA3_IMPORT_ERROR
 
 
 @functools.cache
@@ -144,11 +149,12 @@ class DenseAttentionManager(AttentionManager):
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         self.reset_default_cursors()
-        assert ctx.slot_lease is None and not ctx.is_preplan, (
-            "dense attention is eager-only: the prefix gather and the "
-            "concatenation allocate and are shaped by the step, so there is "
-            "nothing for a captured graph to replay"
-        )
+        if ctx.slot_lease is not None or ctx.is_preplan:
+            raise RuntimeError(
+                "dense attention is eager-only: the prefix gather and the "
+                "concatenation allocate and are shaped by the step, so there is "
+                "nothing for a captured graph to replay"
+            )
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, (
             f"Dense Attention Manager expected plan result from {self._kv_cache_name}"
@@ -252,25 +258,7 @@ class DenseAttentionManager(AttentionManager):
             "layer_idx (the layer writes nothing through the KV resource "
             "under this backend — see `requires_kv_write`)"
         )
-        # `plan` refuses a leased slot, which covers every path that plans. A
-        # a piecewise region that never plans would reach here and bake this
-        # capture would reach here and bake this step's gather, its shapes and
-        # the address of a cached prefix into the graph; the first invalidation
-        # re-gathers into a new tensor the replay does not read. Silent, so
-        # raise rather than assert.
-        if self._on_cuda and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "dense attention cannot be captured: the prefix gather and "
-                "the concatenation are shaped by the step and allocate. A "
-                "piecewise region that does not plan is the path that "
-                "gets here — capture that region against the paged backend."
-            )
-        from fa3_fwd_interface import flash_attn_varlen_func
-
         plan = self._current_plans[label]
-        q = q.to(self._dtype)
-        k = k.to(self._dtype)
-        v = v.to(self._dtype)
 
         k_parts: list[torch.Tensor] = []
         v_parts: list[torch.Tensor] = []
@@ -284,8 +272,13 @@ class DenseAttentionManager(AttentionManager):
             v_parts.append(v[offset:offset + segment.q_len])
             offset += segment.q_len
 
+        key = torch.cat(k_parts, dim=0)
+        val = torch.cat(v_parts, dim=0)
+        if q.dtype != key.dtype:
+            q = q.to(key.dtype)
+
         out = flash_attn_varlen_func(
-            q, torch.cat(k_parts, dim=0), torch.cat(v_parts, dim=0),
+            q, key, val,
             plan.cu_q, plan.cu_k, plan.max_q, plan.max_k,
             # a causal plan aligns the query block to the end of the key
             # sequence, so the fresh tokens see the whole prefix; only
