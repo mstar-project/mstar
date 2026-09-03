@@ -1,7 +1,7 @@
 """FlashInfer utility wrappers for batched paged attention.
 
 Provides:
-- run_rms_norm / run_attention: simple single-request helpers
+- run_attention: simple single-request attention helper
 - FlashInferPrefillWrapper: batched prefill with paged KV cache, optional CUDA graph mode
 - FlashInferDecodeWrapper: batched decode with paged KV cache, optional CUDA graph mode
 
@@ -20,34 +20,6 @@ import logging
 import torch
 
 logger = logging.getLogger(__name__)
-
-
-@torch.compiler.disable
-def run_rms_norm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-06,
-    rms_norm_dtype=None
-):
-    orig_dtype = input.dtype
-    if rms_norm_dtype is not None:
-        input = input.to(rms_norm_dtype)
-    elif torch.is_autocast_enabled():
-        dtype = torch.get_autocast_dtype("cuda")
-        input = input.to(dtype)
-    elif input.dtype == torch.float32:
-        # Unsupported dtype; must recast
-        input = input.to(torch.bfloat16)
-
-    # flashinfer.norm.rmsnorm requires matching input/weight dtypes; cast weight
-    # to match whatever input ended up as.
-    if weight.dtype != input.dtype:
-        weight = weight.to(input.dtype)
-
-    import flashinfer
-    return flashinfer.norm.rmsnorm(
-        input, weight, eps=eps
-    ).to(orig_dtype)
 
 
 def run_attention(
