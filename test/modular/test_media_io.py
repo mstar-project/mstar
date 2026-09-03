@@ -46,6 +46,17 @@ def test_save_base64_audio(tmp_path):
     assert modality == "audio" and path.endswith(".wav")
 
 
+@pytest.mark.parametrize("raw", [b"R", b"RI"])
+def test_save_base64_audio_accepts_unpadded(raw, tmp_path):
+    # Some OpenAI clients strip the trailing "=" from input_audio.data; a
+    # 1- or 2-byte payload is the case that needs 2 or 1 pad chars back.
+    encoded = base64.b64encode(raw).decode().rstrip("=")
+    modality, path = media_io.save_base64(encoded, "wav", "audio", tmp_path)
+    assert modality == "audio" and path.endswith(".wav")
+    with open(path, "rb") as f:
+        assert f.read() == raw
+
+
 def test_png_data_url():
     assert media_io.png_to_data_url(b"x").startswith("data:image/png;base64,")
 
