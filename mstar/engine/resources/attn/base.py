@@ -100,46 +100,6 @@ class PlanCacheKey(NamedTuple):
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
 
 
-# Attention resources reachable from a custom op. A traced forward can't pass
-# the resource itself into an op (a schema takes tensors and scalars), so it
-# passes this handle. One entry per resource, fixed for the process, so dynamo
-# specializing on it costs nothing — a handle that varied per step or per slot
-# would reintroduce the recompiles this exists to avoid.
-_ATTENDERS: dict[int, "AttentionManager"] = {}
-
-
-def _register_attender(manager: "AttentionManager") -> int:
-    """Give an attention resource a handle its layers can pass into the op."""
-    handle = len(_ATTENDERS)
-    _ATTENDERS[handle] = manager
-    return handle
-
-
-@torch.library.custom_op("mstar::flashinfer_attend", mutates_args=())
-def flashinfer_attend(
-    handle: int, label: str, q: torch.Tensor, kv_cache_layer: torch.Tensor,
-) -> torch.Tensor:
-    """One layer's attention, planned by the resource behind ``handle``.
-
-    Behind an op because FlashInfer's kernel is a TVM-FFI call dynamo can't
-    trace and can't run on fake tensors: called directly it breaks the graph
-    once per layer, and each break makes the layer body a frame dynamo
-    recompiles per ``layer_idx``.
-    """
-    out = _ATTENDERS[handle].attend(q, label, kv_cache_layer)
-    # the planned wrapper runs in its own dtype; the fake below promises q's,
-    # and a mismatch there is silent corruption
-    return out.to(q.dtype)
-
-
-@flashinfer_attend.register_fake
-def _flashinfer_attend_fake(
-    handle: int, label: str, q: torch.Tensor, kv_cache_layer: torch.Tensor,
-) -> torch.Tensor:
-    # attention is shape-preserving on the query
-    return torch.empty_like(q)
-
-
 class WorkspacePool:
     """FlashInfer workspace buffers, one per (plan label, cg slot).
 

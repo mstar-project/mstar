@@ -53,33 +53,15 @@ class PageAllocator:
         return self.free_pages.qsize()
 
 
-@torch.library.custom_op("mstar::kv_scatter_nhd", mutates_args={"cache"})
-def kv_scatter_nhd(
+@torch.compiler.disable
+def _kv_scatter_nhd_eager(
     cache: torch.Tensor, layer_idx: int,
     k: torch.Tensor, v: torch.Tensor,
     page_idx: torch.Tensor, cache_idx: torch.Tensor,
 ) -> None:
-    """Scatter per-token K/V into one layer's (page, offset) slots.
-
-    A custom op rather than plain indexing because the forward reaches the
-    cache through an attribute chain: dynamo lifts it as a graph attribute, so
-    tracing the mutation makes AOTAutograd functionalize it into a copy of the
-    WHOLE cache (tens of GiB). Declaring the mutation here keeps the write in
-    place and in-graph — no copy, and no graph break to recompile the layer
-    body once per layer.
-    """
     layer = cache[layer_idx]
     layer[page_idx, 0, cache_idx] = k.to(cache.dtype)
     layer[page_idx, 1, cache_idx] = v.to(cache.dtype)
-
-
-@kv_scatter_nhd.register_fake
-def _kv_scatter_nhd_fake(
-    cache: torch.Tensor, layer_idx: int,
-    k: torch.Tensor, v: torch.Tensor,
-    page_idx: torch.Tensor, cache_idx: torch.Tensor,
-) -> None:
-    return None
 
 
 class KVCache:
@@ -197,16 +179,12 @@ class KVCache:
         return_tensor: bool=False
     ) -> None:
         """Scatter per-token K/V ([num_tokens, num_kv_heads, head_dim]) into
-        the (page, offset-in-page) slots given by ``page_idx``/``cache_idx``.
-
-        Goes through ``mstar::kv_scatter_nhd`` so the mutation survives being
-        traced — see that op for why.
-        """
+        the (page, offset-in-page) slots given by ``page_idx``/``cache_idx``."""
         if self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"write_tokens is not implemented for layout {self.layout}."
             )
-        torch.ops.mstar.kv_scatter_nhd(
+        _kv_scatter_nhd_eager(
             self.tensor, layer_idx, k, v, page_idx, cache_idx,
         )
         if return_tensor:

@@ -6,7 +6,6 @@ from mstar.engine.resources.attn.base import (
     AttentionManager,
     AttentionWrapper,
     WorkspacePool,
-    _register_attender,
 )
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.wrappers import (
@@ -31,7 +30,6 @@ class FlashInferManager(AttentionManager):
         self._kv_cache_name = kv_cache
         self._device = device
         self._dtype = dtype
-        self._attend_handle = _register_attender(self)
 
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
@@ -203,12 +201,14 @@ class FlashInferManager(AttentionManager):
         del k, v, layer_idx
         if label is None:
             label = self._default_label
-        return torch.ops.mstar.flashinfer_attend(
-            self._attend_handle, label, q, kv_cache_layer,
-        )
+        return self._attend(q, label, kv_cache_layer)
 
-    def attend(
+    @torch.compiler.disable
+    def _attend(
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor,
     ) -> torch.Tensor:
-        """The eager body of ``run``, called from inside the op."""
-        return self._current_plan_states[label].run(q, kv_cache_layer)
+        o = self._current_plan_states[label].run(q, kv_cache_layer)
+        if o.dtype != q.dtype:
+            o = o.to(q.dtype)
+        return o
+
