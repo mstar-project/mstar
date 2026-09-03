@@ -1,8 +1,8 @@
 """Generic token sampling utilities.
 
-Uses FlashInfer's fused top-k/top-p sampling kernel for GPU efficiency
-and CUDA graph compatibility. Model-agnostic — any AR model returns logits,
-this module selects the next token.
+Uses device-specific fused top-k/top-p sampling kernels: FlashInfer on CUDA and
+``vllm-xpu-kernels`` on XPU. Model-agnostic — any AR model returns logits, this
+module selects the next token.
 
 Supports per-request sampling parameters (different temperature/top_k/top_p
 for each request in a batch) via tensor parameters.
@@ -559,7 +559,47 @@ def sample_tokens(
     # Default to the conservative "unknown → do the work" path.
     run_greedy = True if any_greedy is None else any_greedy
 
-    if logits.device.type == "xpu":
+    if logits.device.type == "cuda":
+        import flashinfer
+
+        # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
+        # (reads probs) to the same device/stream so the write-before-read is
+        # ordered without an explicit sync. Otherwise FlashInfer runs on the
+        # worker's current-device stream while probs lives off-device (e.g. BAGEL
+        # LLM on rank 1) — a cross-stream race that yields garbage.
+        with torch.cuda.device(logits.device):
+            # Fast path: top_k is disabled for every request in the batch. One Triton
+            # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
+            # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
+            # deterministically picks argmax on one-hot rows, matching greedy semantics.
+            if all_top_k_zero is True:
+                probs = fused_temperature_softmax(
+                    logits, temperature,
+                    penalty=repetition_penalty if seen_token_mask is not None else None,
+                    seen_mask=seen_token_mask,
+                    include_greedy=run_greedy,
+                )
+                result = flashinfer.sampling.top_p_sampling_from_probs(
+                    probs, top_p,
+                    deterministic=True,
+                    seed=seed, offset=rand_offset,
+                )
+                return result[0] if isinstance(result, tuple) else result
+
+            probs = fused_temperature_softmax(
+                logits, temperature,
+                penalty=repetition_penalty if seen_token_mask is not None else None,
+                seen_mask=seen_token_mask,
+                include_greedy=run_greedy,
+            )
+            result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, top_k, top_p,
+                deterministic=True,
+                seed=seed, offset=rand_offset
+            )
+            return result[0] if isinstance(result, tuple) else result
+
+    elif logits.device.type == "xpu":
         import vllm_xpu_kernels._xpu_C  # noqa: F401
 
         scores = logits.float()
@@ -620,44 +660,11 @@ def sample_tokens(
             sampled = torch.where(greedy, greedy_tokens, sampled)
         return sampled
 
-    import flashinfer
-
-    # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
-    # (reads probs) to the same device/stream so the write-before-read is
-    # ordered without an explicit sync. Otherwise FlashInfer runs on the
-    # worker's current-device stream while probs lives off-device (e.g. BAGEL
-    # LLM on rank 1) — a cross-stream race that yields garbage.
-    with torch.cuda.device(logits.device):
-        # Fast path: top_k is disabled for every request in the batch. One Triton
-        # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
-        # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
-        # deterministically picks argmax on one-hot rows, matching greedy semantics.
-        if all_top_k_zero is True:
-            probs = fused_temperature_softmax(
-                logits, temperature,
-                penalty=repetition_penalty if seen_token_mask is not None else None,
-                seen_mask=seen_token_mask,
-                include_greedy=run_greedy,
-            )
-            result = flashinfer.sampling.top_p_sampling_from_probs(
-                probs, top_p,
-                deterministic=True,
-                seed=seed, offset=rand_offset,
-            )
-            return result[0] if isinstance(result, tuple) else result
-
-        probs = fused_temperature_softmax(
-            logits, temperature,
-            penalty=repetition_penalty if seen_token_mask is not None else None,
-            seen_mask=seen_token_mask,
-            include_greedy=run_greedy,
+    else:
+        raise ValueError(
+            f"Sampling is unsupported on device type {logits.device.type!r}; "
+            "expected 'cuda' or 'xpu'."
         )
-        result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p,
-            deterministic=True,
-            seed=seed, offset=rand_offset
-        )
-        return result[0] if isinstance(result, tuple) else result
 
 
 def _to_tensor(
