@@ -571,7 +571,15 @@ class BatchedCacheManager(ABC):
         if q.device.type == "cuda":
             import flashinfer
 
-            if llama31_params:
+            if not llama31_params:
+                flashinfer.rope.apply_rope_pos_ids_inplace(
+                    q, k, ps.pos_ids,
+                    rotary_dim=rotary_dim,
+                    interleave=interleave,
+                    rope_scale=rope_scale,
+                    rope_theta=rope_theta,
+                )
+            else:
                 flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
                     q, k, ps.pos_ids,
                     rotary_dim=rotary_dim,
@@ -579,14 +587,6 @@ class BatchedCacheManager(ABC):
                     rope_scale=rope_scale,
                     rope_theta=rope_theta,
                     **llama31_params,
-                )
-            else:
-                flashinfer.rope.apply_rope_pos_ids_inplace(
-                    q, k, ps.pos_ids,
-                    rotary_dim=rotary_dim,
-                    interleave=interleave,
-                    rope_scale=rope_scale,
-                    rope_theta=rope_theta,
                 )
         elif q.device.type == "xpu":
             if llama31_params:
