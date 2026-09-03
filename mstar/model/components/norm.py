@@ -2,9 +2,9 @@
 
 ``RMSNorm`` supports both the standard Llama-style normalization
 (``normed * weight``) and Gemma's variant (``normed * (1 + weight)``)
-through the ``gemma_mode`` flag. In standard mode the FlashInfer fused
-kernel is used; Gemma mode falls back to a fp32 manual computation that
-matches HF Gemma exactly.
+through the ``gemma_mode`` flag. Standard mode dispatches to a fused
+accelerator kernel when available; Gemma mode uses an fp32 computation
+that matches Hugging Face Gemma exactly.
 
 ``AdaRMSNorm`` adds adaRMS conditioning (scale / shift / gate from a
 condition vector). Used by pi05's action expert flow-matching path; the
@@ -16,7 +16,41 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.utils.flashinfer_utils import run_rms_norm
+
+@torch.compiler.disable
+def run_rms_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    rms_norm_dtype=None,
+) -> torch.Tensor:
+    """Apply RMSNorm using the best implementation for the input device."""
+    orig_dtype = input.dtype
+    device_type = input.device.type
+    if rms_norm_dtype is not None:
+        input = input.to(rms_norm_dtype)
+    elif torch.is_autocast_enabled(device_type):
+        input = input.to(torch.get_autocast_dtype(device_type))
+    elif input.dtype == torch.float32 and device_type == "cuda":
+        input = input.to(torch.bfloat16)
+
+    if weight.dtype != input.dtype:
+        weight = weight.to(input.dtype)
+
+    if device_type == "cuda":
+        import flashinfer
+
+        output = flashinfer.norm.rmsnorm(input, weight, eps=eps)
+    elif device_type == "xpu":
+        import vllm_xpu_kernels._C  # noqa: F401
+
+        output = torch.empty_like(input)
+        torch.ops._C.rms_norm(output, input, weight, eps)
+    else:
+        variance = input.float().pow(2).mean(dim=-1, keepdim=True)
+        output = input * torch.rsqrt(variance + eps).to(input.dtype)
+        output = output * weight
+    return output.to(orig_dtype)
 
 
 class RMSNorm(nn.Module):
@@ -28,8 +62,8 @@ class RMSNorm(nn.Module):
         gemma_mode: if True, use ``(1 + weight)`` and a fp32 manual
             implementation (matches HF Gemma exactly; the loaded
             checkpoint weight is centered around zero, not one). If
-            False, use ``weight`` and dispatch to FlashInfer's fused
-            kernel.
+            False, use ``weight`` and dispatch to the device-appropriate
+            implementation.
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6, gemma_mode: bool = False):
@@ -50,9 +84,8 @@ class RMSNorm(nn.Module):
             normed = x * torch.rsqrt(var + self.variance_epsilon)
             normed = normed * (1.0 + self.weight.to(torch.float32))
             return normed.to(orig_dtype)
-        # FlashInfer's rmsnorm wants 2D input — reshape/restore around the
-        # call so callers can pass arbitrary leading dims (e.g. the talker
-        # code_predictor's [bs, seq_len, hidden_size] batched path).
+        # Fused kernels expect 2D input. Reshape/restore so callers can pass
+        # arbitrary leading dims, such as [batch, sequence, hidden_size].
         orig_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, orig_shape[-1])
         out = run_rms_norm(flat, self.weight, eps=self.variance_epsilon)
