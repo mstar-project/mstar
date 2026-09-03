@@ -523,7 +523,7 @@ class Engine:
             if self._enable_nvtx:
                 range_push("engine.collect_outputs")
             try:
-                return self._collect_outputs(
+                out = self._collect_outputs(
                     submodule_mgmt, lease, raw, inputs, req_info,
                     request_ids=batch.request_ids,
                     step_request_ids=batch.step_context.padded_request_ids,
@@ -531,6 +531,19 @@ class Engine:
             finally:
                 if self._enable_nvtx:
                     range_pop()
+            # Sampling runs inside the captured graph, so nothing else waits:
+            # without this the thread returns before the token exists and N+1 is
+            # submitted ahead of it. Must stay after `commit_done`, which the
+            # plan thread gates on.
+            if lease is not None and not torch.cuda.is_current_stream_capturing():
+                if self._enable_nvtx:
+                    range_push("engine.await_outputs")
+                try:
+                    torch.cuda.current_stream().synchronize()
+                finally:
+                    if self._enable_nvtx:
+                        range_pop()
+            return out
         finally:
             if lease is not None:
                 cg_runner.release(lease, real_bs)
