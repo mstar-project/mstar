@@ -471,11 +471,6 @@ class BatchedCacheManager(ABC):
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
-        if self.device.type == "xpu" and computed_pos_ids.dtype != torch.long:
-            computed_pos_ids = computed_pos_ids.to(
-                device=self.device, dtype=torch.long,
-            )
-
         if self._cuda_graph_mode:
             if ps.pos_ids is not None:
                 n = computed_pos_ids.shape[0]
@@ -539,8 +534,6 @@ class BatchedCacheManager(ABC):
                     pos_ids_list, dtype=torch.long, device=self.device,
                 ))
         combined_pos_ids = parts[0] if len(parts) == 1 else torch.cat(parts)
-        if self.device.type == "xpu" and combined_pos_ids.dtype != torch.long:
-            combined_pos_ids = combined_pos_ids.to(torch.long)
         self._plan_states[combined_label].pos_ids = combined_pos_ids
 
     @torch.compiler.disable
@@ -611,8 +604,11 @@ class BatchedCacheManager(ABC):
 
             import vllm_xpu_kernels._C  # noqa: F401
 
+            # vllm-xpu-kernels requires int64 position IDs. Normalize at the
+            # backend boundary so RoPE planning remains device-agnostic.
+            pos_ids = ps.pos_ids.to(device=q.device, dtype=torch.long)
             torch.ops._C.rotary_embedding(
-                ps.pos_ids,
+                pos_ids,
                 q,
                 k,
                 q.shape[-1],
