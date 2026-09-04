@@ -1,6 +1,7 @@
 
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -45,6 +46,12 @@ from mstar.profile.worker import ExecTimings
 from mstar.utils.profiler import mark, range_pop, range_push
 
 logger = logging.getLogger(__name__)
+
+# Block the GPU thread on its step's outputs before returning (1-step launch
+# bound vs the worker's default 2-step). Off by default: it kills the
+# GPU(N+1)/postprocess(N) overlap. Enable only where 2 steps overflow the CUDA
+# launch queue and block a launch (machine/driver dependent).
+_ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 
 
 @dataclass
@@ -531,11 +538,13 @@ class Engine:
             finally:
                 if self._enable_nvtx:
                     range_pop()
-            # Sampling runs inside the captured graph, so nothing else waits:
-            # without this the thread returns before the token exists and N+1 is
-            # submitted ahead of it. Must stay after `commit_done`, which the
-            # plan thread gates on.
-            if lease is not None and not torch.cuda.is_current_stream_capturing():
+            # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
+            # Not for correctness — downstream reads already gate on the
+            # completion event, so the token exists before it is read. This just
+            # holds the GPU thread until the step drains, tightening the 2-step
+            # launch bound to 1. Must stay after `commit_done`, which the plan
+            # thread gates on. Skipped during capture: you can't sync mid-capture.
+            if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
                 if self._enable_nvtx:
                     range_push("engine.await_outputs")
                 try:
@@ -602,6 +611,16 @@ class Engine:
                 if nvtx:
                     range_pop()
         batch.commit_done.set()
+        # Same optional 1-step launch throttle as _exec_single. This path is
+        # always eager (never capturing), but the guard is kept for parity.
+        if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
+            if nvtx:
+                range_push("engine.await_outputs")
+            try:
+                torch.cuda.current_stream().synchronize()
+            finally:
+                if nvtx:
+                    range_pop()
         return merged
 
     def _declare_and_admit(
