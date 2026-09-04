@@ -10,10 +10,10 @@ Worker integration:
   * The per-rank ``num_heads`` / ``num_kv_heads`` come from
     ``self.qkv_proj`` (already computed by ``QKVParallelLinear`` based on
     the comm group's world size and GQA replica count).
-  * The cache handle's ``KVCacheConfig`` must be set up with the
-    per-rank head counts so paged attention reads / writes the right
-    slice. This is the caller's responsibility — typically the worker
-    derives it from the request's ``ShardingConfig``.
+  * The KV resource's ``KVConfig`` must carry the per-rank head counts so
+    paged attention reads / writes the right slice. ``KVConfig.shard()``
+    narrows them to one rank's slice at build time, from the instance
+    world size (tp * sp).
 
 For non-standard RoPE (qwen3's 3D MRoPE), subclass and override
 ``_apply_rope`` — same shape as the non-parallel ``Attention``.

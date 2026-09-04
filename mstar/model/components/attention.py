@@ -193,11 +193,11 @@ class CrossAttention(nn.Module):
     """Multi-head cross-attention over an engine-managed encoder-context KV.
 
     For encoder-decoder models (Whisper, etc.): the decoder attends to a
-    fixed encoder context whose K/V are computed once at prefill and stored
-    in the engine's cross-attention context pool (see issue #160 /
-    ``BatchedCacheManager.add_cross_attn_kv`` / ``run_cross_attn``). Q is
-    projected per step; K/V projections are exposed via ``compute_kv`` so
-    the submodule can write them into the pool at encode time.
+    fixed encoder context whose K/V are computed once at prefill and written
+    into a KV resource of their own, under the ``context_label`` the model's
+    ``CrossAttentionConfig`` names (see issue #160). Q is projected per step;
+    K/V projections are exposed via ``compute_kv`` so the submodule can write
+    them into that cache at encode time.
 
     Q/K/V/O are separate ``nn.Linear`` matching the HF layout. Subclasses
     override projection details (bias flags, a ``compute_kv`` that reshapes

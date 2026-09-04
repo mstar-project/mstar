@@ -508,11 +508,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
             if runner is not None and runner.can_run(bs):
                 out = runner.run(static_inputs={...}, request_ids=..., seq_lens=...)
 
-        A config that sets ``uses_sampler=True`` has the engine's per-node
-        sampler buffers wired into its runner, which passes a ``sampler`` into
-        the config's ``capture_fn`` so sampling can live INSIDE the capture
-        (params are read straight from buffers whose addresses are stable across
-        replays) instead of being hoisted out as static inputs.
+        A config's ``capture_fn`` takes one ``PiecewiseCallInputs``, whose
+        ``engine_inputs.resources`` carries the node's resources — so a
+        resource call (sampling included) can live INSIDE the capture, reading
+        params straight from buffers whose addresses are stable across replays
+        instead of being hoisted out as static inputs. A region that touches a
+        resource declares its work in the config's own ``declare_step``; the
+        runner admits, plans and commits it per replay.
 
         Default: no piecewise graphs. Override to return
         ``{label: PiecewiseCudaGraphConfig}``; multiple labels capture multiple

@@ -910,8 +910,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         Reads the hidden state and RoPE position tensors out of the
         runner-owned ``static_inputs`` (never reassigns them) so the captured
         graph replays against the buffers the runner updates via ``.copy_()``
-        before each replay. ``static_cm`` is the runner's persistent cache
-        manager (planned outside the graph).
+        before each replay. The region's KV and attention work is declared by
+        the config's own ``declare_step``; the runner admits, plans and commits
+        it around each replay, outside the graph.
         """
         cond_tokens = inp.kwargs.get("cond_tokens")
         fn = self.predictor.make_block_loop_fn("main", inp.static_inputs, cond_tokens)
@@ -924,8 +925,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         """One BATCHED piecewise graph (``"block_loop"``) for the AC predictor.
 
         ``capture_seq_len = cond_tokens + N*N`` is the per-frame token count
-        (one rollout step processes one frame). The block loop reads the
-        FlashInfer KV cache, so ``uses_kv_cache=True``.
+        (one rollout step processes one frame). The block loop reads the KV
+        cache, so the region declares its own ``KVStep`` / ``AttentionStep``
+        and takes its slot with ``lease_before_step=True``.
         """
         ac = self.config.ac_predictor
         if ac is None:
