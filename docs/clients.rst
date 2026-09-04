@@ -27,7 +27,10 @@ NDJSON stream.
      - One or more media uploads; each file's modality is inferred from its extension.
    * - ``input_modalities``
      - auto
-     - Comma-separated input modalities; auto-detected from the data when omitted.
+     - Comma-separated input modalities, one entry per prompt element in order.
+       Auto-detected from the uploads and text when omitted, which is what keeps
+       the ordering and the count of same-modality attachments; an explicit list
+       replaces it.
    * - ``output_modalities``
      - ``text``
      - Comma-separated desired outputs (e.g. ``text``, ``image``, ``audio``, ``video``,
