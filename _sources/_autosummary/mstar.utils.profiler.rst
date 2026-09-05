@@ -15,6 +15,8 @@ mstar.utils.profiler
    
       mark
       nvtx_range
+      phase_buffer
+      phase_record
       range_pop
       range_push
    

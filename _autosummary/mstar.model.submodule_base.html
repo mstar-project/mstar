@@ -1,0 +1,1646 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>mstar.model.submodule_base &#8212; M* v0.2.0 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.model.submodule_base';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="mstar.model.vjepa2" href="mstar.model.vjepa2.html" />
+    <link rel="prev" title="mstar.model.pi05.kernels.image_normalize" href="mstar.model.pi05.kernels.image_normalize.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Sep 05, 2026"/>
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.2.0 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../clients.html">Using a Server</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models.html">Supported Models</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.engine.html">mstar.engine.engine</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.model.html">mstar.model</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.components.html">mstar.model.components</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.attention.html">mstar.model.components.attention</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.moe.html">mstar.model.components.moe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.norm.html">mstar.model.components.norm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.model.submodule_base</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.submodules.html">mstar.model.vjepa2.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.components.html">mstar.model.wan22.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="mstar.worker.html">mstar.worker</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../environment_variables.html">Environment variables</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.model.submodule_base.rst?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.model.submodule_base.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/_autosummary/mstar.model.submodule_base.rst" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.rst</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>mstar.model.submodule_base</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.collate"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.collate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.custom_pos_ids"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.custom_pos_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.input_embeds"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.input_embeds</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.input_ids"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.input_ids</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.LazyRequestStates"><code class="docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.captured"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.captured</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.first_request_info"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.first_request_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.per_request_info"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.per_request_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.per_request_states"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.per_request_states</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.piecewise_runners"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.piecewise_runners</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.request_ids"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.request_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.resources"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.resources</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.single_request_info"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.single_request_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.step"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.step</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.clone"><code class="docutils literal notranslate"><span class="pre">NodeInputs.clone()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeInputs.input_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.kwargs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.kwargs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.resource_step_info"><code class="docutils literal notranslate"><span class="pre">NodeInputs.resource_step_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.tensor_inputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.tensor_inputs</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_batch"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_use_cuda_graphs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cg_key_info"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cg_key_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward_batched()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_autocast_dtype()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_device"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_device()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.node_resources</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.postprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.prepare_inputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState"><code class="docutils literal notranslate"><span class="pre">PerRequestState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.add"><code class="docutils literal notranslate"><span class="pre">PerRequestState.add()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.add_all"><code class="docutils literal notranslate"><span class="pre">PerRequestState.add_all()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.disag_shared_keys"><code class="docutils literal notranslate"><span class="pre">PerRequestState.disag_shared_keys</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.get"><code class="docutils literal notranslate"><span class="pre">PerRequestState.get()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.kwargs"><code class="docutils literal notranslate"><span class="pre">PerRequestState.kwargs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.remove"><code class="docutils literal notranslate"><span class="pre">PerRequestState.remove()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.tensors"><code class="docutils literal notranslate"><span class="pre">PerRequestState.tensors</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod"><code class="docutils literal notranslate"><span class="pre">StackingMethod</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.CAT"><code class="docutils literal notranslate"><span class="pre">StackingMethod.CAT</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.NONE"><code class="docutils literal notranslate"><span class="pre">StackingMethod.NONE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.STACK"><code class="docutils literal notranslate"><span class="pre">StackingMethod.STACK</span></code></a></li>
+</ul>
+</li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="module-mstar.model.submodule_base">
+<span id="mstar-model-submodule-base"></span><h1>mstar.model.submodule_base<a class="headerlink" href="#module-mstar.model.submodule_base" title="Link to this heading">#</a></h1>
+<p class="rubric">Classes</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ARNodeInputs</span></code></a>([tensor_inputs, kwargs, ...])</p></td>
+<td><p>Unlike in regular ModelInputs, for LLMInputs we expect either input_ids or input_embeds to be set (but typically not both), and we require input_seq_len to be set (for cache planning).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeSubmodule" title="mstar.model.submodule_base.ARNodeSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a>()</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.LazyRequestStates" title="mstar.model.submodule_base.LazyRequestStates"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a>(submodule, rids)</p></td>
+<td><p>The batch's <a href="#id1"><span class="problematic" id="id2">``</span></a>PerRequestState``s, resolved on first read.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code></a>(request_ids, ...)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NodeInputs</span></code></a>(tensor_inputs, kwargs, ...)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a>()</p></td>
+<td><p>Base class for a model's compute units: defines the prepare_inputs → preprocess → forward(_batched) contract the engines drive.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.PerRequestState" title="mstar.model.submodule_base.PerRequestState"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PerRequestState</span></code></a>([tensors, kwargs, ...])</p></td>
+<td><p>Engine-owned per-request state a submodule persists across forwards.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.StackingMethod" title="mstar.model.submodule_base.StackingMethod"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StackingMethod</span></code></a>(*values)</p></td>
+<td><p></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeInputs">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ARNodeInputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor_inputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_step_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_embeds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">custom_pos_ids</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeInputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeInputs" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeInputs</span></code></a></p>
+<p>Unlike in regular ModelInputs, for LLMInputs we expect either input_ids
+or input_embeds to be set (but typically not both), and we require
+input_seq_len to be set (for cache planning).</p>
+<p>The tensor_inputs and kwargs dicts are still available for additional
+inputs as needed; but the main LLM inputs should be provided in the given
+dedicated fields.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tensor_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>kwargs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p></li>
+<li><p><strong>resource_step_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>input_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>input_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>input_embeds</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>custom_pos_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeInputs.collate">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">collate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">inputs_list</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stacking_method</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">StackingMethod.NONE</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeInputs.collate"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeInputs.collate" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>inputs_list</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><em>ARNodeInputs</em></a><em>]</em>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeInputs.custom_pos_ids">
+<span class="sig-name descname"><span class="pre">custom_pos_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ARNodeInputs.custom_pos_ids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeInputs.input_embeds">
+<span class="sig-name descname"><span class="pre">input_embeds</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ARNodeInputs.input_embeds" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeInputs.input_ids">
+<span class="sig-name descname"><span class="pre">input_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ARNodeInputs.input_ids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ARNodeSubmodule</span></span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">prepare_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fwd_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.prepare_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>fwd_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><em>ARNodeInputs</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.preprocess">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">preprocess</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.preprocess"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>engine_inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><em>ARNodeInputs</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a> | <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.LazyRequestStates">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">LazyRequestStates</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">submodule</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#LazyRequestStates"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.LazyRequestStates" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Mapping</span></code></a></p>
+<p>The batch’s <a href="#id3"><span class="problematic" id="id4">``</span></a>PerRequestState``s, resolved on first read.</p>
+<p>Only a couple of submodules read these, but the engine builds the view for
+every step of every node; materialising the dict there is bs dict inserts
+(and, for a padded step, bs <code class="docutils literal notranslate"><span class="pre">PerRequestState</span></code> allocations) per step that
+nothing usually looks at.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>submodule</strong> (<a class="reference internal" href="#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><em>NodeSubmodule</em></a>)</p></li>
+<li><p><strong>rids</strong> (<em>Sequence</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ModelInputsFromEngine</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'list[str]'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">'dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">CurrentForwardPassInfo]'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resources</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">'dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">Resource]'</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">piecewise_runners</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">&quot;dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">'PiecewiseCudaGraphRunner']&quot;</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_states</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">&quot;'Mapping[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">PerRequestState]</span> <span class="pre">|</span> <span class="pre">None'&quot;</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'SubmoduleStep</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">captured</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'bool'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ModelInputsFromEngine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>per_request_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a><em>]</em>)</p></li>
+<li><p><strong>resources</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><em>Resource</em></a><em>]</em>)</p></li>
+<li><p><strong>piecewise_runners</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>'PiecewiseCudaGraphRunner'</em><em>]</em>)</p></li>
+<li><p><strong>per_request_states</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.model.submodule_base.PerRequestState" title="mstar.model.submodule_base.PerRequestState"><em>PerRequestState</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.SubmoduleStep" title="mstar.engine.resources.SubmoduleStep"><em>SubmoduleStep</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>captured</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.captured">
+<span class="sig-name descname"><span class="pre">captured</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.captured" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.first_request_info">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">first_request_info</span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.first_request_info" title="Link to this definition">#</a></dt>
+<dd><p>unlike single_request_info, does not assert that there is only one request</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.per_request_info">
+<span class="sig-name descname"><span class="pre">per_request_info</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><span class="pre">CurrentForwardPassInfo</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.per_request_info" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.per_request_states">
+<span class="sig-name descname"><span class="pre">per_request_states</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Mapping</span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.submodule_base.PerRequestState" title="mstar.model.submodule_base.PerRequestState"><span class="pre">PerRequestState</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.per_request_states" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.piecewise_runners">
+<span class="sig-name descname"><span class="pre">piecewise_runners</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'PiecewiseCudaGraphRunner'</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.piecewise_runners" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.request_ids">
+<span class="sig-name descname"><span class="pre">request_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.request_ids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.resources">
+<span class="sig-name descname"><span class="pre">resources</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.resources" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.single_request_info">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">single_request_info</span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.single_request_info" title="Link to this definition">#</a></dt>
+<dd><p>asserts that there is only one request</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>IMPORTANT</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ModelInputsFromEngine.step">
+<span class="sig-name descname"><span class="pre">step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.SubmoduleStep" title="mstar.engine.resources.SubmoduleStep"><span class="pre">SubmoduleStep</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.ModelInputsFromEngine.step" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">NodeInputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensor_inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">'dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">torch.Tensor]'</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'dict'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_step_info</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'Any</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_seq_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeInputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tensor_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>kwargs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p></li>
+<li><p><strong>resource_step_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>input_seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.clone">
+<span class="sig-name descname"><span class="pre">clone</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeInputs.clone"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.clone" title="Link to this definition">#</a></dt>
+<dd><p>Copy with tensors cloned, so a capture template can be reused.</p>
+<p>Goes through the fields rather than naming them, so a subclass gets
+its own type back without restating this.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.input_seq_len">
+<span class="sig-name descname"><span class="pre">input_seq_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.input_seq_len" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.kwargs">
+<span class="sig-name descname"><span class="pre">kwargs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.kwargs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.resource_step_info">
+<span class="sig-name descname"><span class="pre">resource_step_info</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.resource_step_info" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeInputs.tensor_inputs">
+<span class="sig-name descname"><span class="pre">tensor_inputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeInputs.tensor_inputs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">NodeSubmodule</span></span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a>, <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
+<p>Base class for a model’s compute units: defines the prepare_inputs →
+preprocess → forward(_batched) contract the engines drive.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.bind_node_resources">
+<span class="sig-name descname"><span class="pre">bind_node_resources</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resources</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.bind_node_resources"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources" title="Link to this definition">#</a></dt>
+<dd><p>Receive the engine-built resources for this submodule’s node, and
+pass them down to every layer that calls one.</p>
+<p>A layer body (attention, cross-attention) calls the resources
+directly — <code class="docutils literal notranslate"><span class="pre">attn.run</span></code>, <code class="docutils literal notranslate"><span class="pre">kv.write_kv</span></code>, <code class="docutils literal notranslate"><span class="pre">pos.apply_qk</span></code> — so it
+needs its own references. It resolves them here, once at load, by the
+labels the model declared in <code class="docutils literal notranslate"><span class="pre">get_node_resources</span></code>; a layer that
+names a label this node doesn’t have fails at bind rather than in the
+middle of a forward.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>resources</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.can_batch">
+<span class="sig-name descname"><span class="pre">can_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_inputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.can_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.can_batch" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>batch</strong> (<a class="reference internal" href="mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch" title="mstar.engine.engine.ExecutingBatch"><em>ExecutingBatch</em></a>)</p></li>
+<li><p><strong>model_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs">
+<span class="sig-name descname"><span class="pre">can_use_cuda_graphs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_inputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.can_use_cuda_graphs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs" title="Link to this definition">#</a></dt>
+<dd><p>Return True if this submodule supports CUDA graphs for <code class="docutils literal notranslate"><span class="pre">batch</span></code>.</p>
+<p>Default: derives from <code class="docutils literal notranslate"><span class="pre">get_cuda_graph_configs</span></code> — if any declared
+config can replay for this batch’s graph_walk, CUDA graphs are
+supported. We check <code class="docutils literal notranslate"><span class="pre">cfg.replay_graph_walks</span></code> (not just
+<code class="docutils literal notranslate"><span class="pre">cfg.capture_graph_walk</span></code>) so aliased walks — e.g. Qwen3-Omni’s
+<code class="docutils literal notranslate"><span class="pre">prefill_audio</span></code> reusing the <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code> capture, or
+<code class="docutils literal notranslate"><span class="pre">prefill_vision</span></code> reusing its own — are correctly admitted at the
+eligibility gate. The runner’s <code class="docutils literal notranslate"><span class="pre">_config_for</span></code> already looks up by
+<code class="docutils literal notranslate"><span class="pre">replay_graph_walks</span></code>; this keeps the gate consistent so aliased
+walks don’t silently fall through to the eager path.</p>
+<p><code class="docutils literal notranslate"><span class="pre">replay_graph_walks</span></code> is always a superset of <code class="docutils literal notranslate"><span class="pre">{capture_graph_walk}</span></code>
+(see <code class="docutils literal notranslate"><span class="pre">CudaGraphConfig.__init__</span></code>), so this never narrows what the
+previous code accepted — only widens it for configs that explicitly
+declared aliases.</p>
+<p>Subclasses can override to reject on batch shape / metadata (e.g.
+codec submodules that need homogeneous frame counts).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>batch</strong> (<a class="reference internal" href="mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch" title="mstar.engine.engine.ExecutingBatch"><em>ExecutingBatch</em></a>)</p></li>
+<li><p><strong>model_inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.cg_key_info">
+<span class="sig-name descname"><span class="pre">cg_key_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.cg_key_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.cg_key_info" title="Link to this definition">#</a></dt>
+<dd><p>Which of this walk’s capture buckets a batch belongs to.</p>
+<p>A walk can be captured more than once when the batch’s <em>shape</em> is not
+the whole story — bagel captures decode twice, guidance on and off,
+because the two declare different segments over the same token count.
+The engine leases a slot before the step is declared, so it cannot read
+the answer off the step; it asks here instead.</p>
+<p>Must equal the <code class="docutils literal notranslate"><span class="pre">additional_key_info</span></code> on the config that captured the
+bucket, and the <code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> this batch’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> puts on
+its step. Disagreeing is not an error anywhere — it just misses the
+capture and runs eager — so derive both from one place.</p>
+<p>None (the default) means the walk has a single capture.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>per_request_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.check_stop">
+<span class="sig-name descname"><span class="pre">check_stop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.check_stop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.check_stop" title="Link to this definition">#</a></dt>
+<dd><p>Return the set of dynamic-loop names that should stop after this step.</p>
+<p>Runs on the worker’s slow-postprocess path <em>after</em> <code class="docutils literal notranslate"><span class="pre">execute_batch</span></code>
+returns — never inside <code class="docutils literal notranslate"><span class="pre">execute_batch</span></code>. <strong>Allowed</strong> to read tensor
+values (<code class="docutils literal notranslate"><span class="pre">.item()</span></code> / <code class="docutils literal notranslate"><span class="pre">.cpu()</span></code>) because by this point the GPU
+thread is no longer blocked by it.</p>
+<p>Stops returned here are deferred by one step: they apply to the
+worker’s <em>next</em> iter’s fast postprocess. The current in-flight step
+(already submitted under the assumption that the rid continues)
+will run for that rid and its output discarded — the standard
+1-wasted-step cost for any stop signal.</p>
+<p>Default: no stops.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>request_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.cleanup_request">
+<span class="sig-name descname"><span class="pre">cleanup_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.cleanup_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request" title="Link to this definition">#</a></dt>
+<dd><p>Remove per-request state when a request completes. The engines call
+this on request removal; overrides with extra internal state should
+call super().</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.declare_step">
+<span class="sig-name descname"><span class="pre">declare_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot_lease</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">piecewise_leases</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.declare_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.declare_step" title="Link to this definition">#</a></dt>
+<dd><p>Declare this batch’s step for the runner to drive: which cache
+streams it touches, what spans they grow by, which plans back it,
+which streams fork, and what commits when it lands. The runner
+drives the declaration before <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> and commits it after
+the forward, so a declaring submodule keeps no plan or advance
+calls of its own. None means the submodule still plans and
+advances through the facade itself.</p>
+<p><code class="docutils literal notranslate"><span class="pre">request_ids</span></code> pairs positionally with <code class="docutils literal notranslate"><span class="pre">inputs</span></code>. Under a captured
+graph the batch is padded to the bucket’s shape, so it carries the
+padding rows’ ids too — declare their segments like any other row.</p>
+<p><code class="docutils literal notranslate"><span class="pre">slot_lease</span></code> is the slot this step will replay on, or None for an
+eager step. A submodule whose declaration differs between the two
+(cosmos3 packs both guidance branches into one plan for the captured
+shape) must key off this, not off its own capture key: the key says
+the batch <em>could</em> be captured, the lease says it was.</p>
+<p><code class="docutils literal notranslate"><span class="pre">piecewise_leases</span></code> names the regions of this node that hold a slot
+for this step. Such a region declares, plans and commits its own work,
+so a resource it owns must be left out of this declaration.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
+<li><p><strong>slot_lease</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SlotLease" title="mstar.engine.resources.step.SlotLease"><em>SlotLease</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>piecewise_leases</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SlotLease" title="mstar.engine.resources.step.SlotLease"><em>SlotLease</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.SubmoduleStep" title="mstar.engine.resources.step.SubmoduleStep"><em>SubmoduleStep</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.disable_autocast">
+<span class="sig-name descname"><span class="pre">disable_autocast</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.disable_torch_compile">
+<span class="sig-name descname"><span class="pre">disable_torch_compile</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.filter_batched_output">
+<span class="sig-name descname"><span class="pre">filter_batched_output</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.filter_batched_output"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output" title="Link to this definition">#</a></dt>
+<dd><p>Drop keys a real request shouldn’t receive. A captured forward emits
+a fixed key set for graph compat, so the filtering happens here.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.forward">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.forward" title="Link to this definition">#</a></dt>
+<dd><p>Pure tensor → NameToTensorList computation.
+Compilable + CUDA-graphable.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>engine_inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.forward_batched">
+<span class="sig-name descname"><span class="pre">forward_batched</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.forward_batched"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.forward_batched" title="Link to this definition">#</a></dt>
+<dd><p>Batched form of <code class="docutils literal notranslate"><span class="pre">forward</span></code>: maps a multi-request batch to
+per-request outputs. Override when <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> returns True.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>engine_inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>]]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype">
+<span class="sig-name descname"><span class="pre">get_autocast_dtype</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.get_autocast_dtype"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype" title="Link to this definition">#</a></dt>
+<dd><p>Per-submodule autocast dtype override for the engine’s forward
+wrap. The engine consults this on each <code class="docutils literal notranslate"><span class="pre">execute_batch</span></code> and uses
+the returned dtype instead of its own when non-<code class="docutils literal notranslate"><span class="pre">None</span></code>.</p>
+<p>Default: <code class="docutils literal notranslate"><span class="pre">None</span></code> (inherit the engine’s autocast dtype). To turn
+autocast off for one specific submodule whose engine otherwise has
+it enabled, wrap the submodule’s forward with
+<code class="docutils literal notranslate"><span class="pre">torch.amp.autocast(enabled=False)</span></code> — that path is engine-agnostic
+and doesn’t need this surface.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.get_cuda_graph_configs">
+<span class="sig-name descname"><span class="pre">get_cuda_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.get_cuda_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.get_cuda_graph_configs" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>torch.device</em></a>)</p></li>
+<li><p><strong>tp_world_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig" title="mstar.engine.cuda_graph_config.CudaGraphConfig">CudaGraphConfig</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.get_device">
+<span class="sig-name descname"><span class="pre">get_device</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.get_device"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.get_device" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.get_piecewise_cuda_graph_configs">
+<span class="sig-name descname"><span class="pre">get_piecewise_cuda_graph_configs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_world_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.get_piecewise_cuda_graph_configs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_cuda_graph_configs" title="Link to this definition">#</a></dt>
+<dd><p>Return the piecewise CUDA graph configs this submodule opts into.</p>
+<p><code class="docutils literal notranslate"><span class="pre">autocast_dtype</span></code> is the engine’s autocast dtype — passed so a config’s
+<code class="docutils literal notranslate"><span class="pre">make_static_inputs</span></code> can allocate the hidden-state buffer in the dtype
+the captured region runs under (avoids a copy-time upcast at replay).</p>
+<p>A piecewise CUDA graph captures ONE inner callable of this submodule’s
+forward (e.g. a transformer block loop) as a CUDA graph while the
+surrounding compute stays eager. The engine builds one
+<code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner</span></code> per returned label and threads the runners
+into <code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.piecewise_runners</span></code> so the submodule’s
+forward can look them up by label:</p>
+<blockquote>
+<div><p>runner = engine_inputs.piecewise_runners.get(“block_loop”)
+if runner is not None and runner.can_run(bs):</p>
+<blockquote>
+<div><p>out = runner.run(static_inputs={…}, request_ids=…, seq_lens=…)</p>
+</div></blockquote>
+</div></blockquote>
+<p>A config’s <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> takes one <code class="docutils literal notranslate"><span class="pre">PiecewiseCallInputs</span></code>, whose
+<code class="docutils literal notranslate"><span class="pre">engine_inputs.resources</span></code> carries the node’s resources — so a
+resource call (sampling included) can live INSIDE the capture, reading
+params straight from buffers whose addresses are stable across replays
+instead of being hoisted out as static inputs. A region that touches a
+resource declares its work in the config’s own <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>; the
+runner admits, plans and commits it per replay.</p>
+<p>Default: no piecewise graphs. Override to return
+<code class="docutils literal notranslate"><span class="pre">{label:</span> <span class="pre">PiecewiseCudaGraphConfig}</span></code>; multiple labels capture multiple
+independent graphs (i.e., one per outer function to be graphed).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>torch.device</em></a>)</p></li>
+<li><p><strong>autocast_dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>torch.dtype</em></a>)</p></li>
+<li><p><strong>tp_world_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig" title="mstar.engine.cuda_graph_config.PiecewiseCudaGraphConfig">PiecewiseCudaGraphConfig</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.max_batch_size">
+<span class="sig-name descname"><span class="pre">max_batch_size</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.max_batch_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.node_resources">
+<span class="sig-name descname"><span class="pre">node_resources</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.node_resources" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.postprocess">
+<span class="sig-name descname"><span class="pre">postprocess</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.postprocess"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.postprocess" title="Link to this definition">#</a></dt>
+<dd><p>Per-request postprocessing on the submodule outputs.</p>
+<p>Runs on the GPU thread inside <code class="docutils literal notranslate"><span class="pre">execute_batch</span></code>, after the forward
+(eager, batched, or CUDA-graph replay). <code class="docutils literal notranslate"><span class="pre">inputs</span></code> is the request’s
+<code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> result for this step, so a submodule can finish a
+step the captured graph could not hold (e.g. combine guidance branches
+and run a Python multistep scheduler against the step’s input latents).</p>
+<p>Keep it metadata-only where possible. <strong>Avoid reading tensor values</strong>
+— <code class="docutils literal notranslate"><span class="pre">.item()</span></code> / <code class="docutils literal notranslate"><span class="pre">.cpu()</span></code> sync here block the GPU thread and forfeit
+the worker’s async-scheduling overlap; stop-condition decisions that
+need token values (e.g. EOS) belong in <code class="docutils literal notranslate"><span class="pre">check_stop</span></code>. A captured-path
+tail that must read scheduler state is the sanctioned exception — it
+costs the same sync wherever it runs.</p>
+<dl class="simple">
+<dt>Typical uses:</dt><dd><ul class="simple">
+<li><p>rebind output names for graph routing (<code class="docutils literal notranslate"><span class="pre">outputs[&quot;text_inputs&quot;]</span> <span class="pre">=</span>
+<span class="pre">outputs[&quot;new_token&quot;]</span></code>);</p></li>
+<li><p>drop keys on a per-request basis for static-capture submodules
+(e.g. Qwen3-Omni Thinker dropping <code class="docutils literal notranslate"><span class="pre">thinker_states</span></code> for requests
+that don’t need audio);</p></li>
+<li><p>finish a captured step from <code class="docutils literal notranslate"><span class="pre">inputs</span></code> (Cosmos3 denoise tail).</p></li>
+</ul>
+</dd>
+</dl>
+<p>Modifies <code class="docutils literal notranslate"><span class="pre">outputs</span></code> in-place; returns nothing.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>request_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.prepare_inputs">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">prepare_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fwd_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.prepare_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.prepare_inputs" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>fwd_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.preprocess">
+<span class="sig-name descname"><span class="pre">preprocess</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">engine_inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.preprocess"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.preprocess" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>engine_inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.ModelInputsFromEngine" title="mstar.model.submodule_base.ModelInputsFromEngine"><em>ModelInputsFromEngine</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a> | <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.request_state">
+<span class="sig-name descname"><span class="pre">request_state</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.request_state"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.request_state" title="Link to this definition">#</a></dt>
+<dd><p>The request’s state, created on first access.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.PerRequestState" title="mstar.model.submodule_base.PerRequestState"><em>PerRequestState</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.request_states">
+<span class="sig-name descname"><span class="pre">request_states</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.submodule_base.PerRequestState" title="mstar.model.submodule_base.PerRequestState"><span class="pre">PerRequestState</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.request_states" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs">
+<span class="sig-name descname"><span class="pre">unpack_packed_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">static_output</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real_seq_lens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.unpack_packed_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs" title="Link to this definition">#</a></dt>
+<dd><p>Per-rid slicing for packed sentinels emitted by the captured graph.</p>
+<p>Decode-style submodules emit per-rid entries inside the captured
+forward (one slice per request, fixed shape), so they don’t need
+this. Prefill-style submodules pack a (total_tokens, …) tensor
+whose per-request slice ends depend on real seq_lens — slicing has
+to happen post-replay, outside the captured region. Default
+no-ops; override and key off <code class="docutils literal notranslate"><span class="pre">static_output</span></code> sentinel names.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>static_output</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p></li>
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>real_seq_lens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
+<li><p><strong>per_request_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>]]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">PerRequestState</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tensors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">disag_shared_keys</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#PerRequestState"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Engine-owned per-request state a submodule persists across forwards.</p>
+<p>Submodules stash whatever a request’s later steps need (schedulers,
+conditioning latents, packing metadata) instead of keeping private
+<code class="docutils literal notranslate"><span class="pre">dict[request_id,</span> <span class="pre">...]</span></code> attributes. The engine owns the lifecycle: it
+injects the batch’s states via <code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.per_request_states</span></code>
+and drops a request’s state when the request is removed — no submodule
+cleanup code required.</p>
+<p><code class="docutils literal notranslate"><span class="pre">tensors</span></code> vs <code class="docutils literal notranslate"><span class="pre">kwargs</span></code> split by value kind: device tensors go in
+<code class="docutils literal notranslate"><span class="pre">tensors</span></code>, everything else (numbers, dicts, scheduler objects) in
+<code class="docutils literal notranslate"><span class="pre">kwargs</span></code>. <code class="docutils literal notranslate"><span class="pre">disag_shared_keys</span></code> is reserved for PD disaggregation —
+marked keys would travel with the request (tensors via the tensor
+manager, kwargs with the forward-pass info); no engine implements the
+transfer yet.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tensors</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em>)</p></li>
+<li><p><strong>kwargs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>disag_shared_keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState.add">
+<span class="sig-name descname"><span class="pre">add</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#PerRequestState.add"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState.add" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState.add_all">
+<span class="sig-name descname"><span class="pre">add_all</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#PerRequestState.add_all"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState.add_all" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState.disag_shared_keys">
+<span class="sig-name descname"><span class="pre">disag_shared_keys</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState.disag_shared_keys" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState.get">
+<span class="sig-name descname"><span class="pre">get</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#PerRequestState.get"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState.get" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState.kwargs">
+<span class="sig-name descname"><span class="pre">kwargs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState.kwargs" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState.remove">
+<span class="sig-name descname"><span class="pre">remove</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">keys</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#PerRequestState.remove"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState.remove" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.PerRequestState.tensors">
+<span class="sig-name descname"><span class="pre">tensors</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.PerRequestState.tensors" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.StackingMethod">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">StackingMethod</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#StackingMethod"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.StackingMethod" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.Enum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.StackingMethod.CAT">
+<span class="sig-name descname"><span class="pre">CAT</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'cat'</span></span><a class="headerlink" href="#mstar.model.submodule_base.StackingMethod.CAT" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.StackingMethod.NONE">
+<span class="sig-name descname"><span class="pre">NONE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'none'</span></span><a class="headerlink" href="#mstar.model.submodule_base.StackingMethod.NONE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.StackingMethod.STACK">
+<span class="sig-name descname"><span class="pre">STACK</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'stack'</span></span><a class="headerlink" href="#mstar.model.submodule_base.StackingMethod.STACK" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="mstar.model.pi05.kernels.image_normalize.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">mstar.model.pi05.kernels.image_normalize</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="mstar.model.vjepa2.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">mstar.model.vjepa2</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.collate"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.collate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.custom_pos_ids"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.custom_pos_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.input_embeds"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.input_embeds</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeInputs.input_ids"><code class="docutils literal notranslate"><span class="pre">ARNodeInputs.input_ids</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.LazyRequestStates"><code class="docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.captured"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.captured</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.first_request_info"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.first_request_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.per_request_info"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.per_request_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.per_request_states"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.per_request_states</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.piecewise_runners"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.piecewise_runners</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.request_ids"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.request_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.resources"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.resources</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.single_request_info"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.single_request_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ModelInputsFromEngine.step"><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine.step</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.clone"><code class="docutils literal notranslate"><span class="pre">NodeInputs.clone()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.input_seq_len"><code class="docutils literal notranslate"><span class="pre">NodeInputs.input_seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.kwargs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.kwargs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.resource_step_info"><code class="docutils literal notranslate"><span class="pre">NodeInputs.resource_step_info</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeInputs.tensor_inputs"><code class="docutils literal notranslate"><span class="pre">NodeInputs.tensor_inputs</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.bind_node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_batch"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_batch()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.can_use_cuda_graphs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cg_key_info"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cg_key_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward_batched()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_autocast_dtype()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_device"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_device()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.get_piecewise_cuda_graph_configs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.get_piecewise_cuda_graph_configs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.max_batch_size"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.max_batch_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.node_resources"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.node_resources</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.postprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.postprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.prepare_inputs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState"><code class="docutils literal notranslate"><span class="pre">PerRequestState</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.add"><code class="docutils literal notranslate"><span class="pre">PerRequestState.add()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.add_all"><code class="docutils literal notranslate"><span class="pre">PerRequestState.add_all()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.disag_shared_keys"><code class="docutils literal notranslate"><span class="pre">PerRequestState.disag_shared_keys</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.get"><code class="docutils literal notranslate"><span class="pre">PerRequestState.get()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.kwargs"><code class="docutils literal notranslate"><span class="pre">PerRequestState.kwargs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.remove"><code class="docutils literal notranslate"><span class="pre">PerRequestState.remove()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.PerRequestState.tensors"><code class="docutils literal notranslate"><span class="pre">PerRequestState.tensors</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod"><code class="docutils literal notranslate"><span class="pre">StackingMethod</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.CAT"><code class="docutils literal notranslate"><span class="pre">StackingMethod.CAT</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.NONE"><code class="docutils literal notranslate"><span class="pre">StackingMethod.NONE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.StackingMethod.STACK"><code class="docutils literal notranslate"><span class="pre">StackingMethod.STACK</span></code></a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Sep 05, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,1671 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mstar.model.submodule_base &#8212; M* v0.2.0 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../../../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../../../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = ".mermaid-container {\n    position: relative;\n    display: flex;\n    flex-direction: row;\n    width: 100%;\n}\n\n.mermaid-container > pre {\n    display: block;\n    width: 100%;\n}\n\n.mermaid-container > pre > svg {\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}\n\n.mermaid-fullscreen-btn {\n    position: absolute;\n    width: 28px;\n    height: 28px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.3);\n    border-radius: 4px;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.2s;\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);\n    font-size: 14px;\n    line-height: 1;\n    padding: 0;\n    color: #333;\n}\n\n.mermaid-fullscreen-btn:hover {\n    opacity: 100% !important;\n    background: rgba(255, 255, 255, 1);\n    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-btn.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.3);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-btn.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal {\n    display: none;\n    position: fixed !important;\n    top: 0 !important;\n    left: 0 !important;\n    width: 95vw;\n    height: 100vh;\n    background: rgba(255, 255, 255, 0.98);\n    z-index: 9999;\n    padding: 20px;\n    overflow: auto;\n}\n\n.mermaid-fullscreen-modal.dark-theme {\n    background: rgba(0, 0, 0, 0.98);\n}\n\n.mermaid-fullscreen-modal.active {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen {\n    position: relative;\n    width: 95vw;\n    height: 90vh;\n    max-width: 95vw;\n    max-height: 90vh;\n    background: white;\n    border-radius: 8px;\n    padding: 20px;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);\n    overflow: auto;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen.dark-theme {\n    background: #1a1a1a;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);\n}\n\n.mermaid-container-fullscreen pre.mermaid {\n    width: 100%;\n    height: 100%;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen .mermaid svg {\n    height: 100% !important;\n    width: 100% !important;\n    cursor: grab;\n}\n\n.mermaid-fullscreen-close {\n    position: fixed !important;\n    top: 20px !important;\n    right: 20px !important;\n    width: 40px;\n    height: 40px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.2);\n    border-radius: 50%;\n    cursor: pointer;\n    z-index: 10000;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);\n    transition: all 0.2s;\n    font-size: 24px;\n    line-height: 1;\n    color: #333;\n}\n\n.mermaid-fullscreen-close:hover {\n    background: white;\n    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-close.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.2);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-close.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal .mermaid-fullscreen-btn {\n    display: none !important;\n}";
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+let closeModal = () => {};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal?.classList.contains('active')) {
+        closeModal();
+    }
+});
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
+        all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if (false) {
+                                        addZoomToSvgs(d3.selectAll("").select(function() {
+                                            return this.querySelector("svg");
+                                        }));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
+
+    if (false) {
+        const mermaids_to_add_zoom = 0 === -1 ? mermaids_active.length : 0;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("").select(function() {
+                return this.querySelector("svg");
+            });
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            }
+            addZoomToSvgs(svgs);
+        }
+    } else if(mermaids_active.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if (!true) return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = "\u26f6";
+        fullscreenBtn.style.opacity = "50%";
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scrollX, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.display = 'block';
+
+                if (false) {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+
+
+const load = async () => {
+    initStyles();
+
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...{"startOnLoad": false},
+                ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...{"startOnLoad": false},
+    ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/model/submodule_base';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Sep 05, 2026"/>
+  
+    
+    <script src="../../../_static/searchtools.js"></script>
+    <script src="../../../_static/language_data.js"></script>
+    <script src="../../../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.2.0 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../clients.html">Using a Server</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../models.html">Supported Models</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.engine.html">mstar.engine.engine</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.components.html">mstar.model.components</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.attention.html">mstar.model.components.attention</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.moe.html">mstar.model.components.moe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.norm.html">mstar.model.components.norm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.submodules.html">mstar.model.vjepa2.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.components.html">mstar.model.wan22.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../environment_variables.html">Environment variables</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/model/submodule_base.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1></h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for mstar.model.submodule_base</h1><div class="highlight"><pre>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span><span class="p">,</span> <span class="n">replace</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphConfig</span><span class="p">,</span> <span class="n">PiecewiseCudaGraphConfig</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">PiecewiseCudaGraphRunner</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExecutingBatch</span>
+
+
+<div class="viewcode-block" id="NodeInputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">NodeInputs</span><span class="p">:</span>
+    <span class="n">tensor_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># non-tensor kwargs</span>
+    <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+
+    <span class="c1"># Any additional information required for declare_step, e.g., like</span>
+    <span class="c1"># if CFG is required for diffusion/flow submodules</span>
+    <span class="n">resource_step_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Tokens this row contributes to the batch. The engine sums it to pick a</span>
+    <span class="c1"># capture bucket and to size padding, and a step declares its spans from</span>
+    <span class="c1"># it. 0 for a submodule whose inputs aren't sequence-shaped.</span>
+    <span class="n">input_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+
+<div class="viewcode-block" id="NodeInputs.clone">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs.clone">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clone</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Copy with tensors cloned, so a capture template can be reused.</span>
+
+<span class="sd">        Goes through the fields rather than naming them, so a subclass gets</span>
+<span class="sd">        its own type back without restating this.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="n">replace</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span>
+            <span class="o">**</span><span class="p">{</span><span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">_clone_value</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">))</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">self</span><span class="p">)},</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_clone_value</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">value</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="n">_clone_value</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">value</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="p">(</span><span class="nb">list</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)):</span>
+        <span class="k">return</span> <span class="nb">type</span><span class="p">(</span><span class="n">value</span><span class="p">)(</span><span class="n">_clone_value</span><span class="p">(</span><span class="n">item</span><span class="p">)</span> <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">value</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">value</span>
+
+
+<div class="viewcode-block" id="StackingMethod">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.StackingMethod">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">StackingMethod</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="n">NONE</span> <span class="o">=</span> <span class="s2">"none"</span>
+    <span class="n">STACK</span> <span class="o">=</span> <span class="s2">"stack"</span>
+    <span class="n">CAT</span> <span class="o">=</span> <span class="s2">"cat"</span></div>
+
+
+
+<div class="viewcode-block" id="ARNodeInputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeInputs">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ARNodeInputs</span><span class="p">(</span><span class="n">NodeInputs</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""</span>
+<span class="sd">    Unlike in regular ModelInputs, for LLMInputs we expect either input_ids</span>
+<span class="sd">    or input_embeds to be set (but typically not both), and we require</span>
+<span class="sd">    input_seq_len to be set (for cache planning).</span>
+
+<span class="sd">    The tensor_inputs and kwargs dicts are still available for additional</span>
+<span class="sd">    inputs as needed; but the main LLM inputs should be provided in the given</span>
+<span class="sd">    dedicated fields.</span>
+<span class="sd">    """</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">input_embeds</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Tensor for single cache label, dict for multi-label</span>
+    <span class="n">custom_pos_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="ARNodeInputs.collate">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeInputs.collate">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">collate</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">inputs_list</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="s2">"ARNodeInputs"</span><span class="p">],</span> <span class="n">stacking_method</span><span class="o">=</span><span class="n">StackingMethod</span><span class="o">.</span><span class="n">NONE</span><span class="p">):</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span><span class="nb">list</span><span class="p">)</span>
+
+        <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs_list</span><span class="p">:</span>
+            <span class="c1"># --- required field ---</span>
+            <span class="n">out</span><span class="p">[</span><span class="s2">"input_seq_len"</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">input_seq_len</span><span class="p">)</span>
+
+            <span class="c1"># --- usually mutually exclusive main inputs ---</span>
+            <span class="k">if</span> <span class="n">inp</span><span class="o">.</span><span class="n">input_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">out</span><span class="p">[</span><span class="s2">"input_ids"</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">input_ids</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">inp</span><span class="o">.</span><span class="n">input_embeds</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">out</span><span class="p">[</span><span class="s2">"input_embeds"</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">input_embeds</span><span class="p">)</span>
+
+            <span class="c1"># --- custom_pos_ids ---</span>
+            <span class="k">if</span> <span class="n">inp</span><span class="o">.</span><span class="n">custom_pos_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">custom_pos_ids</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                    <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">inp</span><span class="o">.</span><span class="n">custom_pos_ids</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                        <span class="n">out</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"custom_pos_ids"</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">out</span><span class="p">[</span><span class="s2">"custom_pos_ids"</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">custom_pos_ids</span><span class="p">)</span>
+
+            <span class="c1"># --- tensor_inputs ---</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">inp</span><span class="o">.</span><span class="n">tensor_inputs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="n">out</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"tensor_inputs"</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+
+            <span class="c1"># --- kwargs ---</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="n">out</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"kwargs"</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+
+        <span class="c1"># --- optional stacking ---</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">maybe_stack</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">stacking_method</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">stacking_method</span> <span class="o">==</span> <span class="n">StackingMethod</span><span class="o">.</span><span class="n">NONE</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">x</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">stacking_method</span> <span class="o">==</span> <span class="n">StackingMethod</span><span class="o">.</span><span class="n">STACK</span><span class="p">:</span>
+                        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+                <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="n">x</span>  <span class="c1"># fallback if shapes mismatch</span>
+            <span class="k">return</span> <span class="n">x</span>
+
+        <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"input_ids"</span><span class="p">,</span> <span class="s2">"input_embeds"</span><span class="p">,</span> <span class="s2">"custom_pos_ids"</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">out</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="n">k</span><span class="p">],</span> <span class="nb">list</span><span class="p">):</span>
+                <span class="n">out</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="n">maybe_stack</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="n">k</span><span class="p">],</span> <span class="n">stacking_method</span><span class="p">)</span>
+
+        <span class="c1"># nested dicts</span>
+        <span class="k">for</span> <span class="n">parent</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">"tensor_inputs"</span><span class="p">,</span> <span class="s2">"custom_pos_ids"</span><span class="p">,</span> <span class="s2">"kwargs"</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="n">parent</span> <span class="ow">in</span> <span class="n">out</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="n">parent</span><span class="p">],</span> <span class="nb">dict</span><span class="p">):</span>
+                <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">out</span><span class="p">[</span><span class="n">parent</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                    <span class="n">out</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="n">maybe_stack</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">stacking_method</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">out</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="PerRequestState">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.PerRequestState">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PerRequestState</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Engine-owned per-request state a submodule persists across forwards.</span>
+
+<span class="sd">    Submodules stash whatever a request's later steps need (schedulers,</span>
+<span class="sd">    conditioning latents, packing metadata) instead of keeping private</span>
+<span class="sd">    ``dict[request_id, ...]`` attributes. The engine owns the lifecycle: it</span>
+<span class="sd">    injects the batch's states via ``ModelInputsFromEngine.per_request_states``</span>
+<span class="sd">    and drops a request's state when the request is removed — no submodule</span>
+<span class="sd">    cleanup code required.</span>
+
+<span class="sd">    ``tensors`` vs ``kwargs`` split by value kind: device tensors go in</span>
+<span class="sd">    ``tensors``, everything else (numbers, dicts, scheduler objects) in</span>
+<span class="sd">    ``kwargs``. ``disag_shared_keys`` is reserved for PD disaggregation —</span>
+<span class="sd">    marked keys would travel with the request (tensors via the tensor</span>
+<span class="sd">    manager, kwargs with the forward-pass info); no engine implements the</span>
+<span class="sd">    transfer yet.</span>
+<span class="sd">    """</span>
+
+    <span class="n">tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="n">disag_shared_keys</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PerRequestState.add">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.PerRequestState.add">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">add</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kwargs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span></div>
+
+
+<div class="viewcode-block" id="PerRequestState.add_all">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.PerRequestState.add_all">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">add_all</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="PerRequestState.remove">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.PerRequestState.remove">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">remove</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">keys</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">([</span><span class="n">keys</span><span class="p">]</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">keys</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="n">keys</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="PerRequestState.get">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.PerRequestState.get">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">default</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">kwargs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__contains__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensors</span> <span class="ow">or</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">kwargs</span></div>
+
+
+
+<div class="viewcode-block" id="LazyRequestStates">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.LazyRequestStates">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">LazyRequestStates</span><span class="p">(</span><span class="n">Mapping</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The batch's ``PerRequestState``s, resolved on first read.</span>
+
+<span class="sd">    Only a couple of submodules read these, but the engine builds the view for</span>
+<span class="sd">    every step of every node; materialising the dict there is bs dict inserts</span>
+<span class="sd">    (and, for a padded step, bs ``PerRequestState`` allocations) per step that</span>
+<span class="sd">    nothing usually looks at.</span>
+<span class="sd">    """</span>
+
+    <span class="vm">__slots__</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"_submodule"</span><span class="p">,</span> <span class="s2">"_rids"</span><span class="p">,</span> <span class="s2">"_members"</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">submodule</span><span class="p">:</span> <span class="s2">"NodeSubmodule"</span><span class="p">,</span> <span class="n">rids</span><span class="p">:</span> <span class="s2">"Sequence[str]"</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_submodule</span> <span class="o">=</span> <span class="n">submodule</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rids</span> <span class="o">=</span> <span class="n">rids</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_members</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__getitem__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PerRequestState"</span><span class="p">:</span>
+        <span class="c1"># membership set built on first read, so a step nobody reads pays nothing</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_members</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_members</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_rids</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">rid</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_members</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodule</span><span class="o">.</span><span class="n">request_state</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__iter__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">iter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_rids</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__len__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_rids</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="ModelInputsFromEngine">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ModelInputsFromEngine</span><span class="p">:</span>
+    <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]</span>
+    <span class="n">resources</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Resource</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+
+    <span class="c1"># label -&gt; warmed-up PiecewiseCudaGraphRunner for inner-loop capture. Owned</span>
+    <span class="c1"># by the engine, spread in at execute time (like ``cache_manager`` /</span>
+    <span class="c1"># ``sampler``). Empty when the submodule opts into no piecewise graphs or</span>
+    <span class="c1"># capture failed. See ``NodeSubmodule.get_piecewise_cuda_graph_configs``.</span>
+    <span class="n">piecewise_runners</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"PiecewiseCudaGraphRunner"</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+
+    <span class="c1"># The batch's per-request states, injected by the engine (None on paths</span>
+    <span class="c1"># that don't carry them, e.g. CUDA-graph capture with synthetic requests).</span>
+    <span class="c1"># Usually a ``LazyRequestStates`` view rather than a materialised dict.</span>
+    <span class="n">per_request_states</span><span class="p">:</span> <span class="s2">"Mapping[str, PerRequestState] | None"</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># This step's declaration, as ``declare_step`` returned it. A forward</span>
+    <span class="c1"># that has to agree with its own declaration reads it here rather than</span>
+    <span class="c1"># re-deriving it (cosmos3 declares its denoise attention against the dense</span>
+    <span class="c1"># backend or the paged one depending on whether the step got a capture</span>
+    <span class="c1"># slot, and the forward has to call the one that was planned). None for a</span>
+    <span class="c1"># submodule that declares no step.</span>
+    <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Whether this forward runs under a captured CUDA graph — either the</span>
+    <span class="c1"># capture itself or a replay. What ``cache_manager.is_captured`` used to</span>
+    <span class="c1"># carry: a submodule whose ``preprocess`` packs differently for the</span>
+    <span class="c1"># fixed-shape graph (cosmos3 stacks its denoise inputs on a leading batch</span>
+    <span class="c1"># dim) reads it here. The forward method itself is chosen by the config's</span>
+    <span class="c1"># ``capture_forward_method``, so most submodules never need this.</span>
+    <span class="n">captured</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="nd">@property</span>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">single_request_info</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""</span>
+<span class="sd">        IMPORTANT: asserts that there is only one request</span>
+<span class="sd">        """</span>
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">per_request_info</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_request_info</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">request_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
+
+    <span class="nd">@property</span>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">first_request_info</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""</span>
+<span class="sd">        unlike single_request_info, does not assert that there is only one request</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">per_request_info</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">request_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span></div>
+
+
+
+<div class="viewcode-block" id="NodeSubmodule">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">NodeSubmodule</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">ABC</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Base class for a model's compute units: defines the prepare_inputs →</span>
+<span class="sd">    preprocess → forward(_batched) contract the engines drive."""</span>
+
+    <span class="c1"># Set True on a submodule whose forward does not benefit from (or is broken</span>
+    <span class="c1"># by) torch.compile — e.g. a data-dependent denoise loop, or a one-shot</span>
+    <span class="c1"># forward where the trace cost dwarfs the win. The KV-cache / stateless</span>
+    <span class="c1"># engines skip compiling such submodules (CUDA-graph capture is unaffected).</span>
+    <span class="n">disable_torch_compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="c1"># Set True on a submodule that must run in its own parameter dtype — e.g. a</span>
+    <span class="c1"># numerically sensitive fp32 vocoder. The engine then neither casts its</span>
+    <span class="c1"># params to the autocast dtype nor wraps its forward (or capture) in</span>
+    <span class="c1"># autocast, and explicitly disables any ambient one.</span>
+    <span class="n">disable_autocast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="c1"># Per-request state store. prepare_inputs-time code (no engine inputs</span>
+        <span class="c1"># in scope) reaches it via ``request_state``; preprocess/forward read</span>
+        <span class="c1"># the engine-injected ``ModelInputsFromEngine.per_request_states`` view</span>
+        <span class="c1"># of the same objects. The engine removes a request's entry via</span>
+        <span class="c1"># ``cleanup_request`` when the request is removed.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PerRequestState</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># Engine-built resources for this submodule's node (KV cache pool,</span>
+        <span class="c1"># embedder, scratch caches), bound once at load. Empty until then</span>
+        <span class="c1"># and on engines that build none.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">node_resources</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+<div class="viewcode-block" id="NodeSubmodule.bind_node_resources">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.bind_node_resources">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bind_node_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Receive the engine-built resources for this submodule's node, and</span>
+<span class="sd">        pass them down to every layer that calls one.</span>
+
+<span class="sd">        A layer body (attention, cross-attention) calls the resources</span>
+<span class="sd">        directly — ``attn.run``, ``kv.write_kv``, ``pos.apply_qk`` — so it</span>
+<span class="sd">        needs its own references. It resolves them here, once at load, by the</span>
+<span class="sd">        labels the model declared in ``get_node_resources``; a layer that</span>
+<span class="sd">        names a label this node doesn't have fails at bind rather than in the</span>
+<span class="sd">        middle of a forward.</span>
+<span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">node_resources</span> <span class="o">=</span> <span class="n">resources</span>
+        <span class="k">for</span> <span class="n">module</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">modules</span><span class="p">():</span>
+            <span class="n">bind</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="s2">"bind_resources"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">bind</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">module</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">self</span><span class="p">:</span>
+                <span class="n">bind</span><span class="p">(</span><span class="n">resources</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.cg_key_info">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.cg_key_info">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cg_key_info</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Which of this walk's capture buckets a batch belongs to.</span>
+
+<span class="sd">        A walk can be captured more than once when the batch's *shape* is not</span>
+<span class="sd">        the whole story — bagel captures decode twice, guidance on and off,</span>
+<span class="sd">        because the two declare different segments over the same token count.</span>
+<span class="sd">        The engine leases a slot before the step is declared, so it cannot read</span>
+<span class="sd">        the answer off the step; it asks here instead.</span>
+
+<span class="sd">        Must equal the ``additional_key_info`` on the config that captured the</span>
+<span class="sd">        bucket, and the ``cg_key_info`` this batch's ``declare_step`` puts on</span>
+<span class="sd">        its step. Disagreeing is not an error anywhere — it just misses the</span>
+<span class="sd">        capture and runs eager — so derive both from one place.</span>
+
+<span class="sd">        None (the default) means the walk has a single capture.</span>
+<span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">per_request_info</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.request_state">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.request_state">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">request_state</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PerRequestState</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The request's state, created on first access."""</span>
+        <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">state</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">state</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="p">[</span><span class="n">request_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">PerRequestState</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">state</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.get_device">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_device">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_device</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">next</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">parameters</span><span class="p">())</span><span class="o">.</span><span class="n">device</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.prepare_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.prepare_inputs">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span><span class="p">:</span>
+        <span class="k">pass</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.preprocess">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.preprocess">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">engine_inputs</span><span class="p">:</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="n">Any</span><span class="p">]:</span> <span class="c1"># input name to tensor</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Batching not implemented for submodule </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="o">**</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tensor_inputs</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">kwargs</span>
+        <span class="p">}</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.declare_step">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.declare_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">declare_step</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
+        <span class="n">slot_lease</span><span class="p">:</span> <span class="n">SlotLease</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">piecewise_leases</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmoduleStep</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Declare this batch's step for the runner to drive: which cache</span>
+<span class="sd">        streams it touches, what spans they grow by, which plans back it,</span>
+<span class="sd">        which streams fork, and what commits when it lands. The runner</span>
+<span class="sd">        drives the declaration before ``preprocess`` and commits it after</span>
+<span class="sd">        the forward, so a declaring submodule keeps no plan or advance</span>
+<span class="sd">        calls of its own. None means the submodule still plans and</span>
+<span class="sd">        advances through the facade itself.</span>
+
+<span class="sd">        ``request_ids`` pairs positionally with ``inputs``. Under a captured</span>
+<span class="sd">        graph the batch is padded to the bucket's shape, so it carries the</span>
+<span class="sd">        padding rows' ids too — declare their segments like any other row.</span>
+
+<span class="sd">        ``slot_lease`` is the slot this step will replay on, or None for an</span>
+<span class="sd">        eager step. A submodule whose declaration differs between the two</span>
+<span class="sd">        (cosmos3 packs both guidance branches into one plan for the captured</span>
+<span class="sd">        shape) must key off this, not off its own capture key: the key says</span>
+<span class="sd">        the batch *could* be captured, the lease says it was.</span>
+
+<span class="sd">        ``piecewise_leases`` names the regions of this node that hold a slot</span>
+<span class="sd">        for this step. Such a region declares, plans and commits its own work,</span>
+<span class="sd">        so a resource it owns must be left out of this declaration."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.forward">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.forward">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">engine_inputs</span><span class="p">:</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span> <span class="c1"># coming from preprocess output</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NameToTensorList</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""</span>
+<span class="sd">        Pure tensor → NameToTensorList computation.</span>
+<span class="sd">        Compilable + CUDA-graphable.</span>
+<span class="sd">        """</span>
+        <span class="k">pass</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.forward_batched">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.forward_batched">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward_batched</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">engine_inputs</span><span class="p">:</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span> <span class="c1"># coming from preprocess output</span>
+    <span class="p">)</span>  <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NameToTensorList</span><span class="p">]:</span> <span class="c1"># request_id to tensors</span>
+<span class="w">        </span><span class="sd">"""Batched form of ``forward``: maps a multi-request batch to</span>
+<span class="sd">        per-request outputs. Override when ``can_batch`` returns True."""</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"Batching not implemented for submodule </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">"</span>
+            <span class="s2">" - override forward_batched to implement, or ensure can_batch returns False"</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.can_batch">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.can_batch">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">can_batch</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">,</span>
+        <span class="n">model_inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
+    <span class="p">):</span>
+        <span class="k">return</span> <span class="kc">False</span> <span class="c1"># batching disabled by default</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.filter_batched_output">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.filter_batched_output">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">filter_batched_output</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">"""Drop keys a real request shouldn't receive. A captured forward emits</span>
+<span class="sd">        a fixed key set for graph compat, so the filtering happens here."""</span>
+        <span class="k">return</span> <span class="n">outputs</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.unpack_packed_outputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">unpack_packed_outputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">static_output</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
+        <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">real_seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">],</span>
+        <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]]:</span>
+<span class="w">        </span><span class="sd">"""Per-rid slicing for packed sentinels emitted by the captured graph.</span>
+
+<span class="sd">        Decode-style submodules emit per-rid entries inside the captured</span>
+<span class="sd">        forward (one slice per request, fixed shape), so they don't need</span>
+<span class="sd">        this. Prefill-style submodules pack a (total_tokens, ...) tensor</span>
+<span class="sd">        whose per-request slice ends depend on real seq_lens — slicing has</span>
+<span class="sd">        to happen post-replay, outside the captured region. Default</span>
+<span class="sd">        no-ops; override and key off ``static_output`` sentinel names.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="p">{}</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.max_batch_size">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.max_batch_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_batch_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.get_autocast_dtype">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_autocast_dtype">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_autocast_dtype</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Per-submodule autocast dtype override for the engine's forward</span>
+<span class="sd">        wrap. The engine consults this on each ``execute_batch`` and uses</span>
+<span class="sd">        the returned dtype instead of its own when non-``None``.</span>
+
+<span class="sd">        Default: ``None`` (inherit the engine's autocast dtype). To turn</span>
+<span class="sd">        autocast off for one specific submodule whose engine otherwise has</span>
+<span class="sd">        it enabled, wrap the submodule's forward with</span>
+<span class="sd">        ``torch.amp.autocast(enabled=False)`` — that path is engine-agnostic</span>
+<span class="sd">        and doesn't need this surface.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+    <span class="c1"># Note: do not import CudaGraphConfig; it causes a circular import situation</span>
+<div class="viewcode-block" id="NodeSubmodule.get_cuda_graph_configs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_cuda_graph_configs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_cuda_graph_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">CudaGraphConfig</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">[]</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.get_piecewise_cuda_graph_configs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.get_piecewise_cuda_graph_configs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_piecewise_cuda_graph_configs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="n">tp_world_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PiecewiseCudaGraphConfig</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Return the piecewise CUDA graph configs this submodule opts into.</span>
+
+<span class="sd">        ``autocast_dtype`` is the engine's autocast dtype — passed so a config's</span>
+<span class="sd">        ``make_static_inputs`` can allocate the hidden-state buffer in the dtype</span>
+<span class="sd">        the captured region runs under (avoids a copy-time upcast at replay).</span>
+
+<span class="sd">        A piecewise CUDA graph captures ONE inner callable of this submodule's</span>
+<span class="sd">        forward (e.g. a transformer block loop) as a CUDA graph while the</span>
+<span class="sd">        surrounding compute stays eager. The engine builds one</span>
+<span class="sd">        ``PiecewiseCudaGraphRunner`` per returned label and threads the runners</span>
+<span class="sd">        into ``ModelInputsFromEngine.piecewise_runners`` so the submodule's</span>
+<span class="sd">        forward can look them up by label:</span>
+
+<span class="sd">            runner = engine_inputs.piecewise_runners.get("block_loop")</span>
+<span class="sd">            if runner is not None and runner.can_run(bs):</span>
+<span class="sd">                out = runner.run(static_inputs={...}, request_ids=..., seq_lens=...)</span>
+
+<span class="sd">        A config's ``capture_fn`` takes one ``PiecewiseCallInputs``, whose</span>
+<span class="sd">        ``engine_inputs.resources`` carries the node's resources — so a</span>
+<span class="sd">        resource call (sampling included) can live INSIDE the capture, reading</span>
+<span class="sd">        params straight from buffers whose addresses are stable across replays</span>
+<span class="sd">        instead of being hoisted out as static inputs. A region that touches a</span>
+<span class="sd">        resource declares its work in the config's own ``declare_step``; the</span>
+<span class="sd">        runner admits, plans and commits it per replay.</span>
+
+<span class="sd">        Default: no piecewise graphs. Override to return</span>
+<span class="sd">        ``{label: PiecewiseCudaGraphConfig}``; multiple labels capture multiple</span>
+<span class="sd">        independent graphs (i.e., one per outer function to be graphed).</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="p">{}</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.can_use_cuda_graphs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.can_use_cuda_graphs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">can_use_cuda_graphs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">,</span>
+        <span class="n">model_inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeInputs</span><span class="p">]</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Return True if this submodule supports CUDA graphs for ``batch``.</span>
+
+<span class="sd">        Default: derives from ``get_cuda_graph_configs`` — if any declared</span>
+<span class="sd">        config can replay for this batch's graph_walk, CUDA graphs are</span>
+<span class="sd">        supported. We check ``cfg.replay_graph_walks`` (not just</span>
+<span class="sd">        ``cfg.capture_graph_walk``) so aliased walks — e.g. Qwen3-Omni's</span>
+<span class="sd">        ``prefill_audio`` reusing the ``prefill_text`` capture, or</span>
+<span class="sd">        ``prefill_vision`` reusing its own — are correctly admitted at the</span>
+<span class="sd">        eligibility gate. The runner's ``_config_for`` already looks up by</span>
+<span class="sd">        ``replay_graph_walks``; this keeps the gate consistent so aliased</span>
+<span class="sd">        walks don't silently fall through to the eager path.</span>
+
+<span class="sd">        ``replay_graph_walks`` is always a superset of ``{capture_graph_walk}``</span>
+<span class="sd">        (see ``CudaGraphConfig.__init__``), so this never narrows what the</span>
+<span class="sd">        previous code accepted — only widens it for configs that explicitly</span>
+<span class="sd">        declared aliases.</span>
+
+<span class="sd">        Subclasses can override to reject on batch shape / metadata (e.g.</span>
+<span class="sd">        codec submodules that need homogeneous frame counts).</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_cached_cuda_graph_walks"</span><span class="p">):</span>
+            <span class="n">walks</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">cfg</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_cuda_graph_configs</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"cpu"</span><span class="p">),</span> <span class="n">tp_world_size</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+                <span class="n">walks</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">cfg</span><span class="o">.</span><span class="n">replay_graph_walks</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_cached_cuda_graph_walks</span> <span class="o">=</span> <span class="n">walks</span>
+        <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_cuda_graph_walks</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.postprocess">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.postprocess">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">postprocess</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]],</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">NodeInputs</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">"""</span>
+<span class="sd">        Per-request postprocessing on the submodule outputs.</span>
+
+<span class="sd">        Runs on the GPU thread inside ``execute_batch``, after the forward</span>
+<span class="sd">        (eager, batched, or CUDA-graph replay). ``inputs`` is the request's</span>
+<span class="sd">        ``prepare_inputs`` result for this step, so a submodule can finish a</span>
+<span class="sd">        step the captured graph could not hold (e.g. combine guidance branches</span>
+<span class="sd">        and run a Python multistep scheduler against the step's input latents).</span>
+
+<span class="sd">        Keep it metadata-only where possible. **Avoid reading tensor values**</span>
+<span class="sd">        — ``.item()`` / ``.cpu()`` sync here block the GPU thread and forfeit</span>
+<span class="sd">        the worker's async-scheduling overlap; stop-condition decisions that</span>
+<span class="sd">        need token values (e.g. EOS) belong in ``check_stop``. A captured-path</span>
+<span class="sd">        tail that must read scheduler state is the sanctioned exception — it</span>
+<span class="sd">        costs the same sync wherever it runs.</span>
+
+<span class="sd">        Typical uses:</span>
+<span class="sd">          - rebind output names for graph routing (``outputs["text_inputs"] =</span>
+<span class="sd">            outputs["new_token"]``);</span>
+<span class="sd">          - drop keys on a per-request basis for static-capture submodules</span>
+<span class="sd">            (e.g. Qwen3-Omni Thinker dropping ``thinker_states`` for requests</span>
+<span class="sd">            that don't need audio);</span>
+<span class="sd">          - finish a captured step from ``inputs`` (Cosmos3 denoise tail).</span>
+
+<span class="sd">        Modifies ``outputs`` in-place; returns nothing.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.check_stop">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.check_stop">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_stop</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""</span>
+<span class="sd">        Return the set of dynamic-loop names that should stop after this step.</span>
+
+<span class="sd">        Runs on the worker's slow-postprocess path *after* ``execute_batch``</span>
+<span class="sd">        returns — never inside ``execute_batch``. **Allowed** to read tensor</span>
+<span class="sd">        values (``.item()`` / ``.cpu()``) because by this point the GPU</span>
+<span class="sd">        thread is no longer blocked by it.</span>
+
+<span class="sd">        Stops returned here are deferred by one step: they apply to the</span>
+<span class="sd">        worker's *next* iter's fast postprocess. The current in-flight step</span>
+<span class="sd">        (already submitted under the assumption that the rid continues)</span>
+<span class="sd">        will run for that rid and its output discarded — the standard</span>
+<span class="sd">        1-wasted-step cost for any stop signal.</span>
+
+<span class="sd">        Default: no stops.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="nb">set</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="NodeSubmodule.cleanup_request">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.cleanup_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cleanup_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Remove per-request state when a request completes. The engines call</span>
+<span class="sd">        this on request removal; overrides with extra internal state should</span>
+<span class="sd">        call super()."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="ARNodeSubmodule">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ARNodeSubmodule</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">):</span>
+<div class="viewcode-block" id="ARNodeSubmodule.prepare_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ARNodeInputs</span><span class="p">:</span>
+        <span class="k">pass</span></div>
+
+
+    <span class="c1"># We are setting preprocess to be abstract here when it was not abstract</span>
+    <span class="c1"># in the base NodeSubmodule class because the default behavior for preprocess</span>
+    <span class="c1"># there is not valid in the AR case (batching should typically be enabled, and</span>
+    <span class="c1"># preprocess should be implemented). This "making a method abstract in the</span>
+    <span class="c1"># subclass but not base class" behavior is supported by Python's abc module.</span>
+<div class="viewcode-block" id="ARNodeSubmodule.preprocess">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.preprocess">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">engine_inputs</span><span class="p">:</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ARNodeInputs</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="n">Any</span><span class="p">]:</span> <span class="c1"># input name to tensor</span>
+        <span class="k">pass</span></div>
+</div>
+
+
+
+</pre></div>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Sep 05, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

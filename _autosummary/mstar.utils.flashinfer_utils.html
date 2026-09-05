@@ -50,12 +50,12 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.utils.logging_config" href="mstar.utils.logging_config.html" />
+    <link rel="next" title="mstar.utils.ipc_format" href="mstar.utils.ipc_format.html" />
     <link rel="prev" title="mstar.utils.adarms_norm" href="mstar.utils.adarms_norm.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 03, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 05, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -223,12 +223,34 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.arena.html">mstar.communication.arena</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.tensors.html">mstar.communication.tensors</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="mstar.engine.html">mstar.engine</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.engine.html">mstar.engine.engine</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.graph.base.html">mstar.graph.base</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
@@ -237,11 +259,22 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.components.html">mstar.model.components</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.attention.html">mstar.model.components.attention</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.moe.html">mstar.model.components.moe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.norm.html">mstar.model.components.norm</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
 </details></li>
@@ -261,13 +294,17 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.vjepa2.submodules.html">mstar.model.vjepa2.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.components.html">mstar.model.wan22.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -286,6 +323,7 @@
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
@@ -514,19 +552,6 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper.plan()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.run"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.set_kv_cache"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper.set_kv_cache()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.plan()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.run"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.set_kv_cache"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.set_kv_cache()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.run_attention"><code class="docutils literal notranslate"><span class="pre">run_attention()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
 </ul>
             </nav>
@@ -541,237 +566,27 @@
                   
   <section id="module-mstar.utils.flashinfer_utils">
 <span id="mstar-utils-flashinfer-utils"></span><h1>mstar.utils.flashinfer_utils<a class="headerlink" href="#module-mstar.utils.flashinfer_utils" title="Link to this heading">#</a></h1>
-<p>FlashInfer utility wrappers for batched paged attention.</p>
-<p>Provides:
-- run_rms_norm / run_attention: simple single-request helpers
-- FlashInferPrefillWrapper: batched prefill with paged KV cache, optional CUDA graph mode
-- FlashInferDecodeWrapper: batched decode with paged KV cache, optional CUDA graph mode</p>
-<p>CUDA graph mode requires:
-- Static buffer pointers passed at construction (qo_indptr_buf, paged_kv_indptr_buf, etc.)
-- plan() updates values via .copy_() without reallocating
-- The same wrapper object must be used during both capture and replay</p>
-<dl class="simple">
-<dt>Adapted from VoxServe’s flashinfer_utils.py for our KV cache layout:</dt><dd><p>[num_layers, max_pages, 2, page_size, num_kv_heads, head_dim]</p>
-</dd>
-</dl>
-<p>(VoxServe uses [n_pages, 2, page_size, n_heads, head_dim] without layer dim.)</p>
+<p>FlashInfer helpers used from model code.</p>
+<p>The batched paged-attention wrappers live in
+<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.attn.wrappers</span></code>.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.flashinfer_utils.run_attention" title="mstar.utils.flashinfer_utils.run_attention"><code class="xref py py-obj docutils literal notranslate"><span class="pre">run_attention</span></code></a>(q, k, v[, scale, causal])</p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.flashinfer_utils.run_rms_norm" title="mstar.utils.flashinfer_utils.run_rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">run_rms_norm</span></code></a>(input, weight[, eps, ...])</p></td>
-<td><p></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.flashinfer_utils.run_rms_norm" title="mstar.utils.flashinfer_utils.run_rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">run_rms_norm</span></code></a>(input, weight[, eps, ...])</p></td>
+<td><p>RMS norm through <code class="docutils literal notranslate"><span class="pre">mstar::flashinfer_rmsnorm</span></code>.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p class="rubric">Classes</p>
-<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
-<tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper" title="mstar.utils.flashinfer_utils.FlashInferDecodeWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper</span></code></a>(workspace_buffer, ...)</p></td>
-<td><p>Batched decode attention with paged KV cache.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper" title="mstar.utils.flashinfer_utils.FlashInferPrefillWrapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper</span></code></a>(workspace_buffer, ...)</p></td>
-<td><p>Batched prefill attention with paged KV cache.</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferDecodeWrapper">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.flashinfer_utils.</span></span><span class="sig-name descname"><span class="pre">FlashInferDecodeWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">workspace_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.device('cuda')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_cuda_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_nvtx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferDecodeWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>Batched decode attention with paged KV cache.</p>
-<p>Optimized for the common decode case where each request appends
-exactly 1 new token. Uses BatchDecodeWithPagedKVCacheWrapper.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – FlashInfer workspace</p></li>
-<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of query/output heads</p></li>
-<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of key/value heads</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – dimension per head</p></li>
-<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – KV cache page size</p></li>
-<li><p><strong>batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max requests in batch)</p></li>
-<li><p><strong>max_num_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max pages across all requests)</p></li>
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>) – torch device</p></li>
-<li><p><strong>use_cuda_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – if True, pre-allocate static buffers for graph capture</p></li>
-<li><p><strong>enable_nvtx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-<li><p><strong>backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-</ul>
-</dd>
-</dl>
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.plan">
-<span class="sig-name descname"><span class="pre">plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">paged_kv_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_last_page_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_locations</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferDecodeWrapper.plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.plan" title="Link to this definition">#</a></dt>
-<dd><p>Plan decode attention and compute KV write locations.</p>
-<p>For decode, each request appends exactly 1 token. The write
-location is the last page at position = last_page_len (before
-the append; after append it becomes last_page_len).</p>
-<p>Inputs may be on CPU; see prefill wrapper’s plan docstring.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>paged_kv_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>paged_kv_indices</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>paged_kv_last_page_len</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>kv_cache_locations</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a>)</p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.run">
-<span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_layer</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferDecodeWrapper.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.run" title="Link to this definition">#</a></dt>
-<dd><p>Run planned batched decode attention.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>q</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [n_req, num_qo_heads, head_dim]</p></li>
-<li><p><strong>kv_cache_layer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [max_pages, 2, page_size, num_kv_heads, head_dim]</p></li>
-</ul>
-</dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>[n_req, num_qo_heads, head_dim]</p>
-</dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>output</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.set_kv_cache">
-<span class="sig-name descname"><span class="pre">set_kv_cache</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache_layer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">v</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferDecodeWrapper.set_kv_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.set_kv_cache" title="Link to this definition">#</a></dt>
-<dd><p>Write K, V for decode (1 token per request).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>kv_cache_layer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [max_pages, 2, page_size, num_kv_heads, head_dim]</p></li>
-<li><p><strong>k</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [n_req, num_kv_heads, head_dim]</p></li>
-<li><p><strong>v</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [n_req, num_kv_heads, head_dim]</p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferPrefillWrapper">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.flashinfer_utils.</span></span><span class="sig-name descname"><span class="pre">FlashInferPrefillWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">workspace_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.device('cuda')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_cuda_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_nvtx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferPrefillWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>Batched prefill attention with paged KV cache.</p>
-<p>Wraps flashinfer.BatchPrefillWithPagedKVCacheWrapper with:
-- Pre-computed token_to_page / token_to_cache for vectorized KV writes
-- Optional CUDA graph mode with static buffers</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – FlashInfer workspace (256MB+ recommended)</p></li>
-<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of query/output heads</p></li>
-<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of key/value heads</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – dimension per head</p></li>
-<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – KV cache page size</p></li>
-<li><p><strong>batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max requests in batch)</p></li>
-<li><p><strong>max_total_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max total new tokens across batch)</p></li>
-<li><p><strong>max_num_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max pages across all requests)</p></li>
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>) – torch device</p></li>
-<li><p><strong>use_cuda_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – if True, pre-allocate static buffers for graph capture</p></li>
-<li><p><strong>enable_nvtx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-<li><p><strong>backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-</ul>
-</dd>
-</dl>
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.plan">
-<span class="sig-name descname"><span class="pre">plan</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">qo_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_indptr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">paged_kv_last_page_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">causal</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.bfloat16</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferPrefillWrapper.plan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.plan" title="Link to this definition">#</a></dt>
-<dd><p>Plan attention and compute KV write indices.</p>
-<p>In CUDA graph mode, updates static buffers via .copy_() so that
-the same GPU addresses are used during graph replay.</p>
-<p>Inputs may be on CPU — that’s preferred because FlashInfer’s
-<code class="docutils literal notranslate"><span class="pre">BatchPrefillWithPagedKVCacheWrapper.plan</span></code> does <code class="docutils literal notranslate"><span class="pre">indptr.to(&quot;cpu&quot;)</span></code>
-/ <code class="docutils literal notranslate"><span class="pre">last_page_len.to(&quot;cpu&quot;)</span></code> internally; passing GPU tensors there
-triggers a synchronous default-stream sync that drains the
-speculatively-queued next decode step. We let the inner plan
-consume them as CPU and async-H2D copy to the device for our own
-per-token bookkeeping below.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>qo_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>paged_kv_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>paged_kv_indices</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>paged_kv_last_page_len</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>causal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a>)</p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.run">
-<span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_layer</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferPrefillWrapper.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.run" title="Link to this definition">#</a></dt>
-<dd><p>Run planned batched prefill attention.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>q</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [total_tokens, num_qo_heads, head_dim]</p></li>
-<li><p><strong>kv_cache_layer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [max_pages, 2, page_size, num_kv_heads, head_dim]
-(single layer slice of the full KV cache)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>[total_tokens, num_qo_heads, head_dim]</p>
-</dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>output</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.set_kv_cache">
-<span class="sig-name descname"><span class="pre">set_kv_cache</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache_layer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">v</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#FlashInferPrefillWrapper.set_kv_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.set_kv_cache" title="Link to this definition">#</a></dt>
-<dd><p>Write K, V to the paged KV cache at pre-computed positions.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>kv_cache_layer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [max_pages, 2, page_size, num_kv_heads, head_dim]</p></li>
-<li><p><strong>k</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [total_tokens, num_kv_heads, head_dim]</p></li>
-<li><p><strong>v</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – [total_tokens, num_kv_heads, head_dim]</p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.run_attention">
-<span class="sig-prename descclassname"><span class="pre">mstar.utils.flashinfer_utils.</span></span><span class="sig-name descname"><span class="pre">run_attention</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">v</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">causal</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#run_attention"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.run_attention" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>q</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>k</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>v</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>causal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-</ul>
-</dd>
-</dl>
-</dd></dl>
-
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.run_rms_norm">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.flashinfer_utils.</span></span><span class="sig-name descname"><span class="pre">run_rms_norm</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#run_rms_norm"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.run_rms_norm" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<dd><p>RMS norm through <code class="docutils literal notranslate"><span class="pre">mstar::flashinfer_rmsnorm</span></code>.</p>
+<p>Behind an op rather than called directly: FlashInfer’s kernel is a TVM-FFI
+call dynamo can’t trace, and a break here lands inside every decoder
+layer’s <code class="docutils literal notranslate"><span class="pre">input_layernorm</span></code> — which makes the layer body a frame dynamo
+recompiles once per layer.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>input</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
@@ -805,11 +620,11 @@ per-token bookkeeping below.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.utils.logging_config.html"
+       href="mstar.utils.ipc_format.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.utils.logging_config</p>
+        <p class="prev-next-title">mstar.utils.ipc_format</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -831,19 +646,6 @@ per-token bookkeeping below.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper.plan()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.run"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferDecodeWrapper.set_kv_cache"><code class="docutils literal notranslate"><span class="pre">FlashInferDecodeWrapper.set_kv_cache()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.plan()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.run"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.run()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.FlashInferPrefillWrapper.set_kv_cache"><code class="docutils literal notranslate"><span class="pre">FlashInferPrefillWrapper.set_kv_cache()</span></code></a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.run_attention"><code class="docutils literal notranslate"><span class="pre">run_attention()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
 </ul>
   </nav></div>
@@ -878,7 +680,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 03, 2026.
+  Last updated on Sep 05, 2026.
   <br/>
 </p>
   </div>

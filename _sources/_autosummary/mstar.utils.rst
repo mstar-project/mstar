@@ -34,5 +34,4 @@
    ipc_format
    logging_config
    profiler
-   sampling
 

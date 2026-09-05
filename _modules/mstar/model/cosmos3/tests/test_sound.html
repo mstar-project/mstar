@@ -1,0 +1,1356 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mstar.model.cosmos3.tests.test_sound &#8212; M* v0.2.0 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../../../../../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../../../../../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../../../../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../../../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../../../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../../../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../../../../../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = ".mermaid-container {\n    position: relative;\n    display: flex;\n    flex-direction: row;\n    width: 100%;\n}\n\n.mermaid-container > pre {\n    display: block;\n    width: 100%;\n}\n\n.mermaid-container > pre > svg {\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}\n\n.mermaid-fullscreen-btn {\n    position: absolute;\n    width: 28px;\n    height: 28px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.3);\n    border-radius: 4px;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.2s;\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);\n    font-size: 14px;\n    line-height: 1;\n    padding: 0;\n    color: #333;\n}\n\n.mermaid-fullscreen-btn:hover {\n    opacity: 100% !important;\n    background: rgba(255, 255, 255, 1);\n    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-btn.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.3);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-btn.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal {\n    display: none;\n    position: fixed !important;\n    top: 0 !important;\n    left: 0 !important;\n    width: 95vw;\n    height: 100vh;\n    background: rgba(255, 255, 255, 0.98);\n    z-index: 9999;\n    padding: 20px;\n    overflow: auto;\n}\n\n.mermaid-fullscreen-modal.dark-theme {\n    background: rgba(0, 0, 0, 0.98);\n}\n\n.mermaid-fullscreen-modal.active {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen {\n    position: relative;\n    width: 95vw;\n    height: 90vh;\n    max-width: 95vw;\n    max-height: 90vh;\n    background: white;\n    border-radius: 8px;\n    padding: 20px;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);\n    overflow: auto;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen.dark-theme {\n    background: #1a1a1a;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);\n}\n\n.mermaid-container-fullscreen pre.mermaid {\n    width: 100%;\n    height: 100%;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen .mermaid svg {\n    height: 100% !important;\n    width: 100% !important;\n    cursor: grab;\n}\n\n.mermaid-fullscreen-close {\n    position: fixed !important;\n    top: 20px !important;\n    right: 20px !important;\n    width: 40px;\n    height: 40px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.2);\n    border-radius: 50%;\n    cursor: pointer;\n    z-index: 10000;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);\n    transition: all 0.2s;\n    font-size: 24px;\n    line-height: 1;\n    color: #333;\n}\n\n.mermaid-fullscreen-close:hover {\n    background: white;\n    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-close.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.2);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-close.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal .mermaid-fullscreen-btn {\n    display: none !important;\n}";
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+let closeModal = () => {};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal?.classList.contains('active')) {
+        closeModal();
+    }
+});
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
+        all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if (false) {
+                                        addZoomToSvgs(d3.selectAll("").select(function() {
+                                            return this.querySelector("svg");
+                                        }));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
+
+    if (false) {
+        const mermaids_to_add_zoom = 0 === -1 ? mermaids_active.length : 0;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("").select(function() {
+                return this.querySelector("svg");
+            });
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            }
+            addZoomToSvgs(svgs);
+        }
+    } else if(mermaids_active.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if (!true) return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = "\u26f6";
+        fullscreenBtn.style.opacity = "50%";
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scrollX, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.display = 'block';
+
+                if (false) {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+
+
+const load = async () => {
+    initStyles();
+
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...{"startOnLoad": false},
+                ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...{"startOnLoad": false},
+    ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/model/cosmos3/tests/test_sound';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="index" title="Index" href="../../../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../../../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Sep 05, 2026"/>
+  
+    
+    <script src="../../../../../_static/searchtools.js"></script>
+    <script src="../../../../../_static/language_data.js"></script>
+    <script src="../../../../../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../../../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.2.0 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../clients.html">Using a Server</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../models.html">Supported Models</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../../../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.engine.html">mstar.engine.engine</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.html">mstar.model.components</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.attention.html">mstar.model.components.attention</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.moe.html">mstar.model.components.moe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.components.norm.html">mstar.model.components.norm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.vjepa2.submodules.html">mstar.model.vjepa2.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.wan22.components.html">mstar.model.wan22.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../environment_variables.html">Environment variables</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/model/cosmos3/tests/test_sound.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1></h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for mstar.model.cosmos3.tests.test_sound</h1><div class="highlight"><pre>
+<span></span><span class="sd">"""Tests for the Cosmos3 opt-in sound generation path.</span>
+
+<span class="sd">CPU-safe unit tests cover the sound segment packing (mrope band, indexes,</span>
+<span class="sd">position ids), the duration -&gt; latent-frame math, the request-level validation</span>
+<span class="sd">and walk selection, a tiny AVAE decoder shape check, and the decoder-subset</span>
+<span class="sd">checkpoint load. GPU tests (gated on ``COSMOS3_NANO_DIR`` + CUDA) check the</span>
+<span class="sd">engine cache-once [video | sound] loop against the fused reference pipeline —</span>
+<span class="sd">bit-tight with the sdpa handle, PSNR-level with FlashInfer — and smoke the</span>
+<span class="sd">real checkpoint sound tokenizer.</span>
+
+<span class="sd">Run CPU only:  python3 test_sound.py</span>
+<span class="sd">Run with GPU:  COSMOS3_NANO_DIR=&lt;snap&gt; python3 test_sound.py</span>
+<span class="sd">"""</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>  <span class="c1"># noqa: F401 — keeps parity harness imports uniform</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.components.packing</span><span class="w"> </span><span class="kn">import</span> <span class="n">build_static_inputs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cosmos3Config</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.constants</span><span class="w"> </span><span class="kn">import</span> <span class="n">VIDEO_SOUND_GEN_WALK</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.submodules</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cosmos3DiTSubmodule</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.tests.test_engine_cache</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">_engine_resources</span><span class="p">,</span>
+    <span class="n">_forward_step</span><span class="p">,</span>
+    <span class="n">_load</span><span class="p">,</span>
+    <span class="n">_SdpaResources</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># CPU-safe unit tests</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+
+<div class="viewcode-block" id="test_sound_segment_layout">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_segment_layout">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_segment_layout</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">cfg</span> <span class="o">=</span> <span class="n">Cosmos3Config</span><span class="p">()</span>  <span class="c1"># Nano defaults (fps modulation on, sound fps 25)</span>
+    <span class="n">input_ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">7</span><span class="p">))</span>
+    <span class="n">latent_shape</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">latent_channel</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">16</span><span class="p">)</span>  <span class="c1"># patch grid 8x8</span>
+    <span class="n">per_frame</span> <span class="o">=</span> <span class="mi">8</span> <span class="o">*</span> <span class="mi">8</span>
+    <span class="n">t_s</span> <span class="o">=</span> <span class="mi">18</span>
+
+    <span class="n">st</span> <span class="o">=</span> <span class="n">build_static_inputs</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">latent_shape</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mf">24.0</span><span class="p">,</span> <span class="s2">"cpu"</span><span class="p">,</span> <span class="n">sound_latent_frames</span><span class="o">=</span><span class="n">t_s</span><span class="p">)</span>
+    <span class="n">n_vis</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">per_frame</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"num_sound_tokens"</span><span class="p">]</span> <span class="o">==</span> <span class="n">t_s</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"sequence_length"</span><span class="p">]</span> <span class="o">==</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span> <span class="o">+</span> <span class="n">t_s</span>
+    <span class="c1"># Sound tokens sit after the vision band; all of them are noisy/predicted.</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"sound_sequence_indexes"</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span> <span class="o">==</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span><span class="p">,</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span> <span class="o">+</span> <span class="n">t_s</span><span class="p">))</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"sound_mse_loss_indexes"</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span> <span class="o">==</span> <span class="n">st</span><span class="p">[</span><span class="s2">"sound_sequence_indexes"</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"sound_noisy_frame_indexes"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span> <span class="o">==</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">t_s</span><span class="p">))</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"sound_token_shapes"</span><span class="p">]</span> <span class="o">==</span> <span class="p">[(</span><span class="n">t_s</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]</span>
+    <span class="c1"># Position ids cover text + vision + sound; the sound band shares the media</span>
+    <span class="c1"># temporal offset and advances at base_fps / sound_latent_fps (24/25) per</span>
+    <span class="c1"># latent frame, with zero spatial ids ((T, 1, 1) grid).</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"position_ids"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span> <span class="o">+</span> <span class="n">t_s</span><span class="p">)</span>
+    <span class="n">media_off</span> <span class="o">=</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">cfg</span><span class="o">.</span><span class="n">unified_3d_mrope_temporal_modality_margin</span>
+    <span class="n">s_t</span> <span class="o">=</span> <span class="n">st</span><span class="p">[</span><span class="s2">"position_ids"</span><span class="p">][</span><span class="mi">0</span><span class="p">,</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span><span class="p">:]</span>
+    <span class="k">assert</span> <span class="nb">abs</span><span class="p">(</span><span class="n">s_t</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">-</span> <span class="n">media_off</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mf">1e-6</span>
+    <span class="c1"># float32 positions at the ~15k media offset quantize the 0.96 spacing to</span>
+    <span class="c1"># ~4e-4; assert against the same-precision computation's tolerance.</span>
+    <span class="k">assert</span> <span class="nb">abs</span><span class="p">((</span><span class="n">s_t</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="n">s_t</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">-</span> <span class="mf">24.0</span> <span class="o">/</span> <span class="mf">25.0</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mf">5e-3</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"position_ids"</span><span class="p">][</span><span class="mi">1</span><span class="p">,</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span><span class="p">:]</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span>
+    <span class="k">assert</span> <span class="n">st</span><span class="p">[</span><span class="s2">"position_ids"</span><span class="p">][</span><span class="mi">2</span><span class="p">,</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span><span class="p">:]</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span>
+    <span class="c1"># Without sound the layout is unchanged.</span>
+    <span class="n">st0</span> <span class="o">=</span> <span class="n">build_static_inputs</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">latent_shape</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mf">24.0</span><span class="p">,</span> <span class="s2">"cpu"</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">st0</span><span class="p">[</span><span class="s2">"sequence_length"</span><span class="p">]</span> <span class="o">==</span> <span class="mi">7</span> <span class="o">+</span> <span class="n">n_vis</span> <span class="ow">and</span> <span class="s2">"sound_sequence_indexes"</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">st0</span></div>
+
+
+
+<div class="viewcode-block" id="test_sound_frame_math">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_frame_math">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_frame_math</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">dit</span> <span class="o">=</span> <span class="n">Cosmos3DiTSubmodule</span><span class="p">(</span><span class="n">transformer</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="n">Cosmos3Config</span><span class="p">())</span>
+    <span class="c1"># Video-duration default: 93 frames @ 16 fps = 5.8125 s -&gt; 279000 samples</span>
+    <span class="c1"># -&gt; ceil(279000 / 1920) = 146 latent frames.</span>
+    <span class="n">target</span><span class="p">,</span> <span class="n">frames</span> <span class="o">=</span> <span class="n">dit</span><span class="o">.</span><span class="n">_resolve_sound_frames</span><span class="p">({</span><span class="s2">"num_frames"</span><span class="p">:</span> <span class="mi">93</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">:</span> <span class="mf">16.0</span><span class="p">})</span>
+    <span class="k">assert</span> <span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">frames</span><span class="p">)</span> <span class="o">==</span> <span class="p">(</span><span class="mi">279000</span><span class="p">,</span> <span class="mi">146</span><span class="p">)</span>
+    <span class="c1"># 17 frames @ 24 fps = 0.7083 s -&gt; 34000 samples -&gt; 18 latent frames.</span>
+    <span class="n">target</span><span class="p">,</span> <span class="n">frames</span> <span class="o">=</span> <span class="n">dit</span><span class="o">.</span><span class="n">_resolve_sound_frames</span><span class="p">({</span><span class="s2">"num_frames"</span><span class="p">:</span> <span class="mi">17</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">:</span> <span class="mf">24.0</span><span class="p">})</span>
+    <span class="k">assert</span> <span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">frames</span><span class="p">)</span> <span class="o">==</span> <span class="p">(</span><span class="mi">34000</span><span class="p">,</span> <span class="mi">18</span><span class="p">)</span>
+    <span class="c1"># Explicit sound_duration wins; sub-frame durations clamp to one video frame.</span>
+    <span class="n">target</span><span class="p">,</span> <span class="n">frames</span> <span class="o">=</span> <span class="n">dit</span><span class="o">.</span><span class="n">_resolve_sound_frames</span><span class="p">({</span><span class="s2">"num_frames"</span><span class="p">:</span> <span class="mi">17</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">:</span> <span class="mf">24.0</span><span class="p">,</span> <span class="s2">"sound_duration"</span><span class="p">:</span> <span class="mf">2.0</span><span class="p">})</span>
+    <span class="k">assert</span> <span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">frames</span><span class="p">)</span> <span class="o">==</span> <span class="p">(</span><span class="mi">96000</span><span class="p">,</span> <span class="mi">50</span><span class="p">)</span>
+    <span class="n">target</span><span class="p">,</span> <span class="n">frames</span> <span class="o">=</span> <span class="n">dit</span><span class="o">.</span><span class="n">_resolve_sound_frames</span><span class="p">({</span><span class="s2">"num_frames"</span><span class="p">:</span> <span class="mi">17</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">:</span> <span class="mf">24.0</span><span class="p">,</span> <span class="s2">"sound_duration"</span><span class="p">:</span> <span class="mf">0.0</span><span class="p">})</span>
+    <span class="k">assert</span> <span class="n">target</span> <span class="o">==</span> <span class="nb">round</span><span class="p">(</span><span class="mi">48000</span> <span class="o">/</span> <span class="mf">24.0</span><span class="p">)</span> <span class="ow">and</span> <span class="n">frames</span> <span class="o">==</span> <span class="mi">2</span></div>
+
+
+
+<div class="viewcode-block" id="test_sound_request_validation">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_request_validation">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_request_validation</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.cosmos3_model</span><span class="w"> </span><span class="kn">import</span> <span class="n">AUDIO_DECODER_NODE</span><span class="p">,</span> <span class="n">Cosmos3Model</span>
+
+    <span class="n">model</span> <span class="o">=</span> <span class="n">Cosmos3Model</span><span class="p">(</span><span class="n">model_path_hf</span><span class="o">=</span><span class="s2">"unused"</span><span class="p">,</span> <span class="n">skip_weight_loading</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="c1"># Sound rides the video walk; t2i and action requests reject it.</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">_resolve_gen_params</span><span class="p">({</span><span class="s2">"generate_sound"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"num_frames"</span><span class="p">:</span> <span class="mi">17</span><span class="p">},</span> <span class="p">[],</span> <span class="p">[</span><span class="s2">"video"</span><span class="p">])</span>
+    <span class="k">assert</span> <span class="n">p</span><span class="p">[</span><span class="s2">"generate_sound"</span><span class="p">]</span> <span class="ow">is</span> <span class="kc">True</span>
+    <span class="k">for</span> <span class="n">bad</span> <span class="ow">in</span> <span class="p">(</span>
+        <span class="p">{</span><span class="s2">"generate_sound"</span><span class="p">:</span> <span class="kc">True</span><span class="p">},</span>  <span class="c1"># single-frame (image) default</span>
+        <span class="p">{</span><span class="s2">"generate_sound"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"num_frames"</span><span class="p">:</span> <span class="mi">17</span><span class="p">,</span> <span class="s2">"action_mode"</span><span class="p">:</span> <span class="s2">"policy"</span><span class="p">},</span>
+    <span class="p">):</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">model</span><span class="o">.</span><span class="n">_resolve_gen_params</span><span class="p">(</span><span class="n">bad</span><span class="p">,</span> <span class="p">[],</span> <span class="p">[</span><span class="s2">"video"</span><span class="p">]</span> <span class="k">if</span> <span class="s2">"num_frames"</span> <span class="ow">in</span> <span class="n">bad</span> <span class="k">else</span> <span class="p">[])</span>
+            <span class="k">raise</span> <span class="ne">AssertionError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"expected ValueError for </span><span class="si">{</span><span class="n">bad</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+            <span class="k">pass</span>
+    <span class="c1"># The sound walk + audio decoder node are registered when sound is enabled...</span>
+    <span class="c1"># Under the v1 engine the graph walks are what declare a node as served, so</span>
+    <span class="c1"># the node set is read off them rather than off an engine-type mapping.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">served_nodes</span><span class="p">(</span><span class="n">m</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">n</span> <span class="k">for</span> <span class="n">g</span> <span class="ow">in</span> <span class="n">m</span><span class="o">.</span><span class="n">get_graph_walk_graphs</span><span class="p">()</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">g</span><span class="o">.</span><span class="n">get_nodes</span><span class="p">()}</span>
+
+    <span class="k">assert</span> <span class="n">VIDEO_SOUND_GEN_WALK</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">get_graph_walk_graphs</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="n">AUDIO_DECODER_NODE</span> <span class="ow">in</span> <span class="n">served_nodes</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="c1"># ...and disappear when the serving knob is off.</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">enable_sound</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">assert</span> <span class="n">VIDEO_SOUND_GEN_WALK</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">get_graph_walk_graphs</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="n">AUDIO_DECODER_NODE</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">served_nodes</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">model</span><span class="o">.</span><span class="n">_resolve_gen_params</span><span class="p">({</span><span class="s2">"generate_sound"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">"num_frames"</span><span class="p">:</span> <span class="mi">17</span><span class="p">},</span> <span class="p">[],</span> <span class="p">[</span><span class="s2">"video"</span><span class="p">])</span>
+        <span class="k">raise</span> <span class="ne">AssertionError</span><span class="p">(</span><span class="s2">"expected ValueError with sound serving disabled"</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+        <span class="k">pass</span></div>
+
+
+
+<div class="viewcode-block" id="test_sound_forward_smoke_cpu">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_forward_smoke_cpu">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_forward_smoke_cpu</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.components.transformer</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cosmos3OmniTransformer</span>
+
+    <span class="n">cfg</span> <span class="o">=</span> <span class="n">Cosmos3Config</span><span class="p">(</span>
+        <span class="n">hidden_size</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">num_hidden_layers</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">num_attention_heads</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">num_key_value_heads</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+        <span class="n">head_dim</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span> <span class="n">intermediate_size</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span> <span class="n">vocab_size</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span> <span class="n">rope_axes_dim</span><span class="o">=</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span>
+        <span class="n">latent_channel</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="n">latent_patch_size</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">patch_latent_dim</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+        <span class="n">sound_gen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">sound_dim</span><span class="o">=</span><span class="mi">6</span><span class="p">,</span> <span class="n">action_gen</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">Cosmos3OmniTransformer</span><span class="p">(</span><span class="n">cfg</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+    <span class="c1"># The parallel linears allocate uninitialized storage (production overwrites</span>
+    <span class="c1"># it with checkpoint weights); give every parameter small deterministic</span>
+    <span class="c1"># values so this smoke is not at the mercy of allocator garbage.</span>
+    <span class="n">gen</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">()</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+        <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">():</span>
+            <span class="n">p</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">)</span> <span class="o">*</span> <span class="mf">0.02</span><span class="p">)</span>
+    <span class="n">latent_shape</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">latent_channel</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
+    <span class="n">t_s</span> <span class="o">=</span> <span class="mi">5</span>
+    <span class="n">static</span> <span class="o">=</span> <span class="n">build_static_inputs</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span> <span class="n">latent_shape</span><span class="p">,</span> <span class="n">cfg</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mf">24.0</span><span class="p">,</span> <span class="s2">"cpu"</span><span class="p">,</span> <span class="n">sound_latent_frames</span><span class="o">=</span><span class="n">t_s</span><span class="p">)</span>
+    <span class="n">fields</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s2">"input_ids"</span><span class="p">,</span> <span class="s2">"text_indexes"</span><span class="p">,</span> <span class="s2">"position_ids"</span><span class="p">,</span> <span class="s2">"und_len"</span><span class="p">,</span> <span class="s2">"sequence_length"</span><span class="p">,</span>
+        <span class="s2">"vision_token_shapes"</span><span class="p">,</span> <span class="s2">"vision_sequence_indexes"</span><span class="p">,</span> <span class="s2">"vision_mse_loss_indexes"</span><span class="p">,</span>
+        <span class="s2">"vision_noisy_frame_indexes"</span><span class="p">,</span> <span class="s2">"sound_token_shapes"</span><span class="p">,</span> <span class="s2">"sound_sequence_indexes"</span><span class="p">,</span>
+        <span class="s2">"sound_mse_loss_indexes"</span><span class="p">,</span> <span class="s2">"sound_noisy_frame_indexes"</span><span class="p">,</span>
+    <span class="p">]</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+        <span class="n">preds</span><span class="p">,</span> <span class="n">sound</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span>
+            <span class="n">vision_tokens</span><span class="o">=</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">latent_shape</span><span class="p">)],</span>
+            <span class="n">vision_timesteps</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">static</span><span class="p">[</span><span class="s2">"num_noisy_vision_tokens"</span><span class="p">],),</span> <span class="mf">500.0</span><span class="p">),</span>
+            <span class="n">sound_tokens</span><span class="o">=</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">cfg</span><span class="o">.</span><span class="n">sound_dim</span><span class="p">,</span> <span class="n">t_s</span><span class="p">)],</span>
+            <span class="n">sound_timesteps</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">t_s</span><span class="p">,),</span> <span class="mf">500.0</span><span class="p">),</span>
+            <span class="o">**</span><span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">static</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">},</span>
+        <span class="p">)</span>
+    <span class="k">assert</span> <span class="n">preds</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">latent_shape</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">preds</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span><span class="o">.</span><span class="n">all</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="n">sound</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="n">cfg</span><span class="o">.</span><span class="n">sound_dim</span><span class="p">,</span> <span class="n">t_s</span><span class="p">)</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">sound</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span><span class="o">.</span><span class="n">all</span><span class="p">()</span>
+    <span class="c1"># The cached denoise step decodes the same band via _embed_sound/_decode_sound;</span>
+    <span class="c1"># its scatter/gather helpers must round-trip all-noisy sound frames.</span>
+    <span class="n">emb</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">_embed_sound</span><span class="p">(</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">sound_dim</span><span class="p">,</span> <span class="n">t_s</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">full</span><span class="p">((</span><span class="n">t_s</span><span class="p">,),</span> <span class="mf">500.0</span><span class="p">),</span>
+        <span class="n">static</span><span class="p">[</span><span class="s2">"sound_token_shapes"</span><span class="p">],</span> <span class="n">static</span><span class="p">[</span><span class="s2">"sound_noisy_frame_indexes"</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">assert</span> <span class="n">emb</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="n">t_s</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">)</span>
+    <span class="n">dec</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">_decode_sound</span><span class="p">(</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">t_s</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">),</span> <span class="n">static</span><span class="p">[</span><span class="s2">"sound_token_shapes"</span><span class="p">],</span> <span class="n">static</span><span class="p">[</span><span class="s2">"sound_noisy_frame_indexes"</span><span class="p">]</span>
+    <span class="p">)</span>
+    <span class="k">assert</span> <span class="n">dec</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">cfg</span><span class="o">.</span><span class="n">sound_dim</span><span class="p">,</span> <span class="n">t_s</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="test_sound_tokenizer_tiny_decode">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_tokenizer_tiny_decode">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_tokenizer_tiny_decode</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.components.sound_tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cosmos3SoundTokenizer</span>
+
+    <span class="n">tok</span> <span class="o">=</span> <span class="n">Cosmos3SoundTokenizer</span><span class="p">({</span>
+        <span class="s2">"sampling_rate"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span> <span class="s2">"hop_size"</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="s2">"dec_dim"</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="s2">"dec_c_mults"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+        <span class="s2">"dec_strides"</span><span class="p">:</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span> <span class="s2">"dec_out_channels"</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">"vocoder_input_dim"</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span>
+    <span class="p">})</span>
+    <span class="n">tok</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">tok</span><span class="o">.</span><span class="n">latent_fps</span> <span class="o">==</span> <span class="mf">2.0</span> <span class="ow">and</span> <span class="n">tok</span><span class="o">.</span><span class="n">get_audio_num_samples</span><span class="p">(</span><span class="mi">5</span><span class="p">)</span> <span class="o">==</span> <span class="mi">20</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+        <span class="n">audio</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">5</span><span class="p">))</span>
+    <span class="k">assert</span> <span class="n">audio</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">20</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">audio</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">&lt;=</span> <span class="mf">1.0</span></div>
+
+
+
+<div class="viewcode-block" id="test_sound_tokenizer_load_ignores_encoder_keys">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_tokenizer_load_ignores_encoder_keys">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_tokenizer_load_ignores_encoder_keys</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors.torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">save_file</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.components.sound_tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cosmos3SoundTokenizer</span>
+
+    <span class="n">config</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">"sampling_rate"</span><span class="p">:</span> <span class="mi">8</span><span class="p">,</span> <span class="s2">"hop_size"</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="s2">"dec_dim"</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="s2">"dec_c_mults"</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span>
+        <span class="s2">"dec_strides"</span><span class="p">:</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">],</span> <span class="s2">"dec_out_channels"</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">"vocoder_input_dim"</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span>
+    <span class="p">}</span>
+    <span class="n">decoder_sd</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">Cosmos3SoundTokenizer</span><span class="p">(</span><span class="n">config</span><span class="p">)</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+    <span class="c1"># Full-AVAE checkpoints carry encoder tensors on top of the decoder ones.</span>
+    <span class="n">encoder_sd</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">"encoder.layers.0.weight_g"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+        <span class="s2">"encoder.layers.0.weight_v"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">7</span><span class="p">),</span>
+        <span class="s2">"encoder.layers.1.act.alpha"</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+    <span class="p">}</span>
+    <span class="k">with</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">()</span> <span class="k">as</span> <span class="n">tmp</span><span class="p">:</span>
+        <span class="n">tdir</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="s2">"sound_tokenizer"</span><span class="p">)</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">tdir</span><span class="p">)</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">tdir</span><span class="p">,</span> <span class="n">Cosmos3SoundTokenizer</span><span class="o">.</span><span class="n">CONFIG_NAME</span><span class="p">),</span> <span class="s2">"w"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">f</span><span class="p">)</span>
+        <span class="n">weights_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">tdir</span><span class="p">,</span> <span class="n">Cosmos3SoundTokenizer</span><span class="o">.</span><span class="n">WEIGHTS_NAME</span><span class="p">)</span>
+        <span class="n">save_file</span><span class="p">({</span><span class="o">**</span><span class="n">decoder_sd</span><span class="p">,</span> <span class="o">**</span><span class="n">encoder_sd</span><span class="p">},</span> <span class="n">weights_path</span><span class="p">)</span>
+        <span class="n">tok</span> <span class="o">=</span> <span class="n">Cosmos3SoundTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+        <span class="c1"># The encoder tensors are dropped; every decoder weight loads verbatim.</span>
+        <span class="n">loaded</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">state_dict</span><span class="p">()</span>
+        <span class="k">assert</span> <span class="nb">set</span><span class="p">(</span><span class="n">loaded</span><span class="p">)</span> <span class="o">==</span> <span class="nb">set</span><span class="p">(</span><span class="n">decoder_sd</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="nb">all</span><span class="p">((</span><span class="n">loaded</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">==</span> <span class="n">decoder_sd</span><span class="p">[</span><span class="n">k</span><span class="p">])</span><span class="o">.</span><span class="n">all</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">decoder_sd</span><span class="p">)</span>
+        <span class="c1"># A genuinely missing decoder key must still fail the load.</span>
+        <span class="n">short_sd</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">decoder_sd</span><span class="p">)</span>
+        <span class="n">dropped</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">short_sd</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">short_sd</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">dropped</span><span class="p">)</span>
+        <span class="n">save_file</span><span class="p">({</span><span class="o">**</span><span class="n">short_sd</span><span class="p">,</span> <span class="o">**</span><span class="n">encoder_sd</span><span class="p">},</span> <span class="n">weights_path</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">Cosmos3SoundTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">AssertionError</span><span class="p">(</span><span class="s2">"expected KeyError for a missing decoder key"</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">KeyError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="n">dropped</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span></div>
+
+
+
+<span class="c1"># ---------------------------------------------------------------------------</span>
+<span class="c1"># GPU parity (gated on COSMOS3_NANO_DIR + CUDA). Reuses the engine-cache test</span>
+<span class="c1"># harness: same prompt/seed discipline, sdpa handle for bit-tight bounds,</span>
+<span class="c1"># FlashInfer for the served path.</span>
+<span class="c1"># ---------------------------------------------------------------------------</span>
+
+<span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"CUBLAS_WORKSPACE_CONFIG"</span><span class="p">,</span> <span class="s2">":4096:8"</span><span class="p">)</span>
+<span class="n">PROMPT</span> <span class="o">=</span> <span class="s2">"A drummer plays a fast roll on a snare drum in a small room."</span>
+<span class="n">H</span> <span class="o">=</span> <span class="n">W</span> <span class="o">=</span> <span class="mi">256</span>
+<span class="n">FRAMES</span><span class="p">,</span> <span class="n">STEPS</span><span class="p">,</span> <span class="n">GS</span><span class="p">,</span> <span class="n">SEED</span> <span class="o">=</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span> <span class="mf">6.0</span><span class="p">,</span> <span class="mi">7</span>
+<span class="n">_SOUND_CACHE</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
+
+
+<span class="nd">@torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">()</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_run_cache_once_sound</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">dit</span><span class="p">,</span> <span class="n">resources</span><span class="p">,</span> <span class="n">init</span><span class="p">,</span> <span class="n">sound_init</span><span class="p">,</span> <span class="n">cond_ids</span><span class="p">,</span> <span class="n">uncond_ids</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardPassInfo</span>
+
+    <span class="n">rid</span> <span class="o">=</span> <span class="s2">"rs0"</span>
+    <span class="n">md</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"height"</span><span class="p">:</span> <span class="n">H</span><span class="p">,</span> <span class="s2">"width"</span><span class="p">:</span> <span class="n">W</span><span class="p">,</span> <span class="s2">"num_frames"</span><span class="p">:</span> <span class="n">FRAMES</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">:</span> <span class="mf">24.0</span><span class="p">,</span>
+          <span class="s2">"guidance_scale"</span><span class="p">:</span> <span class="n">GS</span><span class="p">,</span> <span class="s2">"num_inference_steps"</span><span class="p">:</span> <span class="n">STEPS</span><span class="p">,</span> <span class="s2">"generate_sound"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}</span>
+    <span class="n">fwd</span> <span class="o">=</span> <span class="n">CurrentForwardPassInfo</span><span class="p">(</span>
+        <span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">graph_walk</span><span class="o">=</span><span class="s2">"prefill"</span><span class="p">,</span>
+        <span class="n">fwd_index</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">random_seed</span><span class="o">=</span><span class="n">SEED</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">sampling_config</span><span class="o">=</span><span class="p">{},</span> <span class="n">step_metadata</span><span class="o">=</span><span class="n">md</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">text_inputs</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cond_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">uncond_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+    <span class="p">]</span>
+    <span class="n">ni</span> <span class="o">=</span> <span class="n">dit</span><span class="o">.</span><span class="n">prepare_inputs</span><span class="p">(</span><span class="s2">"prefill"</span><span class="p">,</span> <span class="n">fwd</span><span class="p">,</span> <span class="p">{</span><span class="s2">"text_inputs"</span><span class="p">:</span> <span class="n">text_inputs</span><span class="p">})</span>
+    <span class="n">_forward_step</span><span class="p">(</span><span class="n">dit</span><span class="p">,</span> <span class="s2">"prefill"</span><span class="p">,</span> <span class="n">resources</span><span class="p">,</span> <span class="p">[</span><span class="n">rid</span><span class="p">],</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">fwd</span><span class="p">},</span> <span class="p">[</span><span class="n">ni</span><span class="p">])</span>
+
+    <span class="n">latents</span><span class="p">,</span> <span class="n">sound_latents</span> <span class="o">=</span> <span class="n">init</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="n">sound_init</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+    <span class="n">time_index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">fwd</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">=</span> <span class="n">VIDEO_SOUND_GEN_WALK</span>
+    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">STEPS</span><span class="p">):</span>
+        <span class="n">ni</span> <span class="o">=</span> <span class="n">dit</span><span class="o">.</span><span class="n">prepare_inputs</span><span class="p">(</span><span class="n">VIDEO_SOUND_GEN_WALK</span><span class="p">,</span> <span class="n">fwd</span><span class="p">,</span> <span class="p">{</span>
+            <span class="s2">"latents"</span><span class="p">:</span> <span class="p">[</span><span class="n">latents</span><span class="p">],</span> <span class="s2">"sound_latents"</span><span class="p">:</span> <span class="p">[</span><span class="n">sound_latents</span><span class="p">],</span> <span class="s2">"time_index"</span><span class="p">:</span> <span class="p">[</span><span class="n">time_index</span><span class="p">],</span>
+        <span class="p">})</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="n">_forward_step</span><span class="p">(</span>
+            <span class="n">dit</span><span class="p">,</span> <span class="n">VIDEO_SOUND_GEN_WALK</span><span class="p">,</span> <span class="n">resources</span><span class="p">,</span> <span class="p">[</span><span class="n">rid</span><span class="p">],</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">fwd</span><span class="p">},</span> <span class="p">[</span><span class="n">ni</span><span class="p">],</span>
+        <span class="p">)</span>
+        <span class="n">latents</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">"latents"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">sound_latents</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">"sound_latents"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">time_index</span> <span class="o">=</span> <span class="n">out</span><span class="p">[</span><span class="s2">"time_index"</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">dit</span><span class="o">.</span><span class="n">cleanup_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">latents</span><span class="p">,</span> <span class="n">sound_latents</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_sound_scenario</span><span class="p">():</span>
+    <span class="k">if</span> <span class="s2">"ctx"</span> <span class="ow">in</span> <span class="n">_SOUND_CACHE</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">_SOUND_CACHE</span><span class="p">[</span><span class="s2">"ctx"</span><span class="p">]</span>
+    <span class="n">base</span> <span class="o">=</span> <span class="n">_load</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">base</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">_SOUND_CACHE</span><span class="p">[</span><span class="s2">"ctx"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.components.packing</span><span class="w"> </span><span class="kn">import</span> <span class="n">tokenize_prompt</span>
+
+    <span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span> <span class="n">mpipe</span><span class="p">,</span> <span class="n">model</span> <span class="o">=</span> <span class="n">base</span><span class="p">[</span><span class="s2">"device"</span><span class="p">],</span> <span class="n">base</span><span class="p">[</span><span class="s2">"dtype"</span><span class="p">],</span> <span class="n">base</span><span class="p">[</span><span class="s2">"mpipe"</span><span class="p">],</span> <span class="n">base</span><span class="p">[</span><span class="s2">"model"</span><span class="p">]</span>
+    <span class="n">cond_ids</span><span class="p">,</span> <span class="n">uncond_ids</span> <span class="o">=</span> <span class="n">tokenize_prompt</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="n">PROMPT</span><span class="p">,</span> <span class="s2">""</span><span class="p">,</span> <span class="n">num_frames</span><span class="o">=</span><span class="n">FRAMES</span><span class="p">,</span> <span class="n">height</span><span class="o">=</span><span class="n">H</span><span class="p">,</span> <span class="n">width</span><span class="o">=</span><span class="n">W</span><span class="p">)</span>
+    <span class="n">lat_t</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="p">(</span><span class="n">FRAMES</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">mpipe</span><span class="o">.</span><span class="n">vae_scale_temporal</span>
+    <span class="n">_</span><span class="p">,</span> <span class="n">t_s</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_submodule</span><span class="p">(</span><span class="s2">"dit"</span><span class="p">)</span><span class="o">.</span><span class="n">_resolve_sound_frames</span><span class="p">({</span><span class="s2">"num_frames"</span><span class="p">:</span> <span class="n">FRAMES</span><span class="p">,</span> <span class="s2">"fps"</span><span class="p">:</span> <span class="mf">24.0</span><span class="p">})</span>
+    <span class="n">gen</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">SEED</span><span class="p">)</span>
+    <span class="n">init</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="mi">48</span><span class="p">,</span> <span class="n">lat_t</span><span class="p">,</span> <span class="n">H</span> <span class="o">//</span> <span class="mi">16</span><span class="p">,</span> <span class="n">W</span> <span class="o">//</span> <span class="mi">16</span><span class="p">),</span> <span class="n">generator</span><span class="o">=</span><span class="n">gen</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="c1"># The fused pipeline draws its sound noise from `generator` after the video</span>
+    <span class="c1"># latents; with explicit `latents` that is the generator's first draw, so a</span>
+    <span class="c1"># same-state generator here reproduces it for the engine loop.</span>
+    <span class="n">sgen</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">SEED</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">diffusers.utils.torch_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">randn_tensor</span>
+
+    <span class="n">sound_init</span> <span class="o">=</span> <span class="n">randn_tensor</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">sound_dim</span><span class="p">,</span> <span class="n">t_s</span><span class="p">),</span> <span class="n">generator</span><span class="o">=</span><span class="n">sgen</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="n">sgen2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Generator</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">manual_seed</span><span class="p">(</span><span class="n">SEED</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="n">lat_fused</span><span class="p">,</span> <span class="n">sound_fused</span> <span class="o">=</span> <span class="n">mpipe</span><span class="p">(</span>
+        <span class="n">prompt</span><span class="o">=</span><span class="n">PROMPT</span><span class="p">,</span> <span class="n">negative_prompt</span><span class="o">=</span><span class="s2">""</span><span class="p">,</span> <span class="n">num_frames</span><span class="o">=</span><span class="n">FRAMES</span><span class="p">,</span> <span class="n">height</span><span class="o">=</span><span class="n">H</span><span class="p">,</span> <span class="n">width</span><span class="o">=</span><span class="n">W</span><span class="p">,</span>
+        <span class="n">num_inference_steps</span><span class="o">=</span><span class="n">STEPS</span><span class="p">,</span> <span class="n">guidance_scale</span><span class="o">=</span><span class="n">GS</span><span class="p">,</span> <span class="n">latents</span><span class="o">=</span><span class="n">init</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="n">decode</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">generate_sound</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">generator</span><span class="o">=</span><span class="n">sgen2</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">ctx</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+        <span class="n">cond</span><span class="o">=</span><span class="n">cond_ids</span><span class="p">,</span> <span class="n">uncond</span><span class="o">=</span><span class="n">uncond_ids</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="n">init</span><span class="p">,</span> <span class="n">sound_init</span><span class="o">=</span><span class="n">sound_init</span><span class="p">,</span>
+        <span class="n">lat_fused</span><span class="o">=</span><span class="n">lat_fused</span><span class="p">,</span> <span class="n">sound_fused</span><span class="o">=</span><span class="n">sound_fused</span><span class="p">,</span> <span class="n">t_s</span><span class="o">=</span><span class="n">t_s</span><span class="p">,</span> <span class="o">**</span><span class="n">base</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">_SOUND_CACHE</span><span class="p">[</span><span class="s2">"ctx"</span><span class="p">]</span> <span class="o">=</span> <span class="n">ctx</span>
+    <span class="k">return</span> <span class="n">ctx</span>
+
+
+<div class="viewcode-block" id="test_sound_cache_once_matches_fused_exact">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_cache_once_matches_fused_exact">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_cache_once_matches_fused_exact</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">ctx</span> <span class="o">=</span> <span class="n">_sound_scenario</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">ctx</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">"  (skipped sound cache-once parity: needs COSMOS3_NANO_DIR + CUDA)"</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="n">dit</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"dit"</span><span class="p">]</span>
+    <span class="n">prev</span> <span class="o">=</span> <span class="n">dit</span><span class="o">.</span><span class="n">batched_cfg</span>
+    <span class="n">dit</span><span class="o">.</span><span class="n">batched_cfg</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">lat</span><span class="p">,</span> <span class="n">snd</span> <span class="o">=</span> <span class="n">_run_cache_once_sound</span><span class="p">(</span>
+            <span class="n">ctx</span><span class="p">[</span><span class="s2">"model"</span><span class="p">],</span> <span class="n">dit</span><span class="p">,</span> <span class="n">_SdpaResources</span><span class="p">()</span><span class="o">.</span><span class="n">as_dict</span><span class="p">(),</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"init"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"sound_init"</span><span class="p">],</span>
+            <span class="n">ctx</span><span class="p">[</span><span class="s2">"cond"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"uncond"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"device"</span><span class="p">],</span>
+        <span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="n">dit</span><span class="o">.</span><span class="n">batched_cfg</span> <span class="o">=</span> <span class="n">prev</span>
+    <span class="n">vdiff</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"lat_fused"</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">lat</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"lat_fused"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="n">sdiff</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"sound_fused"</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">snd</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"sound_fused"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="n">vdiff</span> <span class="o">&lt;=</span> <span class="mf">1e-3</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"sound-walk video latents differ from fused by </span><span class="si">{</span><span class="n">vdiff</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2"> (&gt; 1e-3)"</span>
+    <span class="k">assert</span> <span class="n">sdiff</span> <span class="o">&lt;=</span> <span class="mf">1e-3</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"sound latents differ from fused by </span><span class="si">{</span><span class="n">sdiff</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2"> (&gt; 1e-3)"</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  sound cache-once (sdpa) abs-max diff: video=</span><span class="si">{</span><span class="n">vdiff</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2"> sound=</span><span class="si">{</span><span class="n">sdiff</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="test_sound_engine_path_flashinfer">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_engine_path_flashinfer">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_engine_path_flashinfer</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">ctx</span> <span class="o">=</span> <span class="n">_sound_scenario</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">ctx</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">"  (skipped sound engine parity: needs COSMOS3_NANO_DIR + CUDA)"</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">cm</span> <span class="o">=</span> <span class="n">_engine_resources</span><span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"model"</span><span class="p">],</span> <span class="p">[</span><span class="s2">"rs0"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"device"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"dtype"</span><span class="p">])</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  (skipped sound engine parity: FlashInfer unavailable: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="n">lat</span><span class="p">,</span> <span class="n">snd</span> <span class="o">=</span> <span class="n">_run_cache_once_sound</span><span class="p">(</span>
+        <span class="n">ctx</span><span class="p">[</span><span class="s2">"model"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"dit"</span><span class="p">],</span> <span class="n">cm</span><span class="p">,</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"init"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"sound_init"</span><span class="p">],</span>
+        <span class="n">ctx</span><span class="p">[</span><span class="s2">"cond"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"uncond"</span><span class="p">],</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"device"</span><span class="p">],</span>
+    <span class="p">)</span>
+    <span class="n">img_fused</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"mpipe"</span><span class="p">]</span><span class="o">.</span><span class="n">_decode</span><span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"lat_fused"</span><span class="p">])</span><span class="o">.</span><span class="n">squeeze</span><span class="p">()</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+    <span class="n">img_engine</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"mpipe"</span><span class="p">]</span><span class="o">.</span><span class="n">_decode</span><span class="p">(</span><span class="n">lat</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"lat_fused"</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">))</span><span class="o">.</span><span class="n">squeeze</span><span class="p">()</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+    <span class="n">mse</span> <span class="o">=</span> <span class="p">(</span><span class="n">img_fused</span> <span class="o">-</span> <span class="n">img_engine</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="n">psnr</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"inf"</span><span class="p">)</span> <span class="k">if</span> <span class="n">mse</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="o">-</span><span class="mi">10</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">log10</span><span class="p">(</span><span class="n">mse</span><span class="p">)</span>
+    <span class="n">s_ref</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"sound_fused"</span><span class="p">]</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+    <span class="n">s_mse</span> <span class="o">=</span> <span class="p">(</span><span class="n">s_ref</span> <span class="o">-</span> <span class="n">snd</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">s_ref</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="n">s_snr</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="s2">"inf"</span><span class="p">)</span> <span class="k">if</span> <span class="n">s_mse</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="mi">10</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">log10</span><span class="p">(</span><span class="n">s_ref</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">/</span> <span class="n">s_mse</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">psnr</span> <span class="o">&gt;=</span> <span class="mi">30</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"sound-walk video PSNR </span><span class="si">{</span><span class="n">psnr</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> &lt; 30 (MSE </span><span class="si">{</span><span class="n">mse</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">)"</span>
+    <span class="k">assert</span> <span class="n">s_snr</span> <span class="o">&gt;=</span> <span class="mi">30</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"sound latent SNR </span><span class="si">{</span><span class="n">s_snr</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> &lt; 30 dB (MSE </span><span class="si">{</span><span class="n">s_mse</span><span class="si">:</span><span class="s2">.3e</span><span class="si">}</span><span class="s2">)"</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  sound engine path (flashinfer): video PSNR=</span><span class="si">{</span><span class="n">psnr</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> dB, sound latent SNR=</span><span class="si">{</span><span class="n">s_snr</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> dB"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="test_sound_tokenizer_decode_real">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.cosmos3.tests.test_sound.html#mstar.model.cosmos3.tests.test_sound.test_sound_tokenizer_decode_real">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_sound_tokenizer_decode_real</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">ctx</span> <span class="o">=</span> <span class="n">_sound_scenario</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">ctx</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">"  (skipped sound tokenizer decode: needs COSMOS3_NANO_DIR + CUDA)"</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.cosmos3.components.sound_tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cosmos3SoundTokenizer</span>
+
+    <span class="n">snap</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"COSMOS3_NANO_DIR"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isdir</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">snap</span><span class="p">,</span> <span class="s2">"sound_tokenizer"</span><span class="p">))):</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">"  (skipped sound tokenizer decode: checkpoint has no sound_tokenizer/)"</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="n">tok</span> <span class="o">=</span> <span class="n">Cosmos3SoundTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">snap</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"device"</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">tok</span><span class="o">.</span><span class="n">sample_rate</span> <span class="o">==</span> <span class="mi">48000</span> <span class="ow">and</span> <span class="n">tok</span><span class="o">.</span><span class="n">hop_size</span> <span class="o">==</span> <span class="mi">1920</span> <span class="ow">and</span> <span class="n">tok</span><span class="o">.</span><span class="n">latent_ch</span> <span class="o">==</span> <span class="mi">64</span>
+    <span class="n">audio</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">ctx</span><span class="p">[</span><span class="s2">"sound_fused"</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">))</span>
+    <span class="k">assert</span> <span class="n">audio</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">tok</span><span class="o">.</span><span class="n">audio_channels</span><span class="p">,</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">"t_s"</span><span class="p">]</span> <span class="o">*</span> <span class="n">tok</span><span class="o">.</span><span class="n">hop_size</span><span class="p">)</span>
+    <span class="n">audio</span> <span class="o">=</span> <span class="n">audio</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">audio</span><span class="p">)</span><span class="o">.</span><span class="n">all</span><span class="p">()</span> <span class="ow">and</span> <span class="n">audio</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">&lt;=</span> <span class="mf">1.0</span>
+    <span class="c1"># Denoised latents must decode to a live waveform, not (near-)silence or rail</span>
+    <span class="c1"># clipping (a wrong-band or unloaded-weight failure shows up here).</span>
+    <span class="n">rms</span> <span class="o">=</span> <span class="n">audio</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span><span class="o">.</span><span class="n">sqrt</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="mf">1e-4</span> <span class="o">&lt;</span> <span class="n">rms</span> <span class="o">&lt;</span> <span class="mf">0.9</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"decoded sound RMS </span><span class="si">{</span><span class="n">rms</span><span class="si">:</span><span class="s2">.5f</span><span class="si">}</span><span class="s2"> out of range"</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"  sound tokenizer decode: shape=</span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">audio</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2">, rms=</span><span class="si">{</span><span class="n">rms</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_main</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">failures</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">tests</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="p">(</span><span class="s2">"sound_segment_layout"</span><span class="p">,</span> <span class="n">test_sound_segment_layout</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_frame_math"</span><span class="p">,</span> <span class="n">test_sound_frame_math</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_request_validation"</span><span class="p">,</span> <span class="n">test_sound_request_validation</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_forward_smoke_cpu"</span><span class="p">,</span> <span class="n">test_sound_forward_smoke_cpu</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_tokenizer_tiny_decode"</span><span class="p">,</span> <span class="n">test_sound_tokenizer_tiny_decode</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_tokenizer_load_ignores_encoder_keys"</span><span class="p">,</span> <span class="n">test_sound_tokenizer_load_ignores_encoder_keys</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_cache_once_matches_fused_exact"</span><span class="p">,</span> <span class="n">test_sound_cache_once_matches_fused_exact</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_engine_path_flashinfer"</span><span class="p">,</span> <span class="n">test_sound_engine_path_flashinfer</span><span class="p">),</span>
+        <span class="p">(</span><span class="s2">"sound_tokenizer_decode_real"</span><span class="p">,</span> <span class="n">test_sound_tokenizer_decode_real</span><span class="p">),</span>
+    <span class="p">]</span>
+    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">fn</span> <span class="ow">in</span> <span class="n">tests</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">fn</span><span class="p">()</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"PASS  </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+            <span class="n">failures</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">name</span><span class="p">,</span> <span class="n">exc</span><span class="p">))</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"FAIL  </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">failures</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">SystemExit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">"</span><span class="se">\n</span><span class="s2">All Cosmos3 sound checks passed."</span><span class="p">)</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">"__main__"</span><span class="p">:</span>
+    <span class="n">_main</span><span class="p">()</span>
+</pre></div>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Sep 05, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

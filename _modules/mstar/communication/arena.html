@@ -1,0 +1,1741 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mstar.communication.arena &#8212; M* v0.2.0 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../../../_static/documentation_options.js?v=7f7c277e"></script>
+    <script src="../../../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../../../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../../../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = ".mermaid-container {\n    position: relative;\n    display: flex;\n    flex-direction: row;\n    width: 100%;\n}\n\n.mermaid-container > pre {\n    display: block;\n    width: 100%;\n}\n\n.mermaid-container > pre > svg {\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}\n\n.mermaid-fullscreen-btn {\n    position: absolute;\n    width: 28px;\n    height: 28px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.3);\n    border-radius: 4px;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.2s;\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);\n    font-size: 14px;\n    line-height: 1;\n    padding: 0;\n    color: #333;\n}\n\n.mermaid-fullscreen-btn:hover {\n    opacity: 100% !important;\n    background: rgba(255, 255, 255, 1);\n    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-btn.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.3);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-btn.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal {\n    display: none;\n    position: fixed !important;\n    top: 0 !important;\n    left: 0 !important;\n    width: 95vw;\n    height: 100vh;\n    background: rgba(255, 255, 255, 0.98);\n    z-index: 9999;\n    padding: 20px;\n    overflow: auto;\n}\n\n.mermaid-fullscreen-modal.dark-theme {\n    background: rgba(0, 0, 0, 0.98);\n}\n\n.mermaid-fullscreen-modal.active {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen {\n    position: relative;\n    width: 95vw;\n    height: 90vh;\n    max-width: 95vw;\n    max-height: 90vh;\n    background: white;\n    border-radius: 8px;\n    padding: 20px;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);\n    overflow: auto;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen.dark-theme {\n    background: #1a1a1a;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);\n}\n\n.mermaid-container-fullscreen pre.mermaid {\n    width: 100%;\n    height: 100%;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen .mermaid svg {\n    height: 100% !important;\n    width: 100% !important;\n    cursor: grab;\n}\n\n.mermaid-fullscreen-close {\n    position: fixed !important;\n    top: 20px !important;\n    right: 20px !important;\n    width: 40px;\n    height: 40px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.2);\n    border-radius: 50%;\n    cursor: pointer;\n    z-index: 10000;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);\n    transition: all 0.2s;\n    font-size: 24px;\n    line-height: 1;\n    color: #333;\n}\n\n.mermaid-fullscreen-close:hover {\n    background: white;\n    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-close.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.2);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-close.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal .mermaid-fullscreen-btn {\n    display: none !important;\n}";
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+let closeModal = () => {};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal?.classList.contains('active')) {
+        closeModal();
+    }
+});
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
+        all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if (false) {
+                                        addZoomToSvgs(d3.selectAll("").select(function() {
+                                            return this.querySelector("svg");
+                                        }));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
+
+    if (false) {
+        const mermaids_to_add_zoom = 0 === -1 ? mermaids_active.length : 0;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("").select(function() {
+                return this.querySelector("svg");
+            });
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            }
+            addZoomToSvgs(svgs);
+        }
+    } else if(mermaids_active.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if (!true) return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = "\u26f6";
+        fullscreenBtn.style.opacity = "50%";
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scrollX, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.display = 'block';
+
+                if (false) {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+
+
+const load = async () => {
+    initStyles();
+
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...{"startOnLoad": false},
+                ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...{"startOnLoad": false},
+    ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/communication/arena';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="index" title="Index" href="../../../genindex.html" />
+    <link rel="search" title="Search" href="../../../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Sep 05, 2026"/>
+  
+    
+    <script src="../../../_static/searchtools.js"></script>
+    <script src="../../../_static/language_data.js"></script>
+    <script src="../../../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.2.0 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../clients.html">Using a Server</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../models.html">Supported Models</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.adapters.html">mstar.api_server.openai.adapters</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.engine.engine.html">mstar.engine.engine</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.components.html">mstar.model.components</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.attention.html">mstar.model.components.attention</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.moe.html">mstar.model.components.moe</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.norm.html">mstar.model.components.norm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.vjepa2.submodules.html">mstar.model.vjepa2.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.components.html">mstar.model.wan22.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../environment_variables.html">Environment variables</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/communication/arena.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1></h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <h1>Source code for mstar.communication.arena</h1><div class="highlight"><pre>
+<span></span><span class="sd">"""Tensor transport over a shared-memory arena.</span>
+
+<span class="sd">``ArenaShmCommunicationManager`` replaces the file transport's per-tensor</span>
+<span class="sd">open/write/read/unlink with a Rust segmented ``/dev/shm`` arena (persistent</span>
+<span class="sd">mmaps + first-fit coalescing allocator, vendored in ``rust/``). Producer:</span>
+<span class="sd">``register_for_send`` reserves a slot and D2H-copies into the segment on the</span>
+<span class="sd">copy stream; the ``(segment, offset)`` rides the existing descriptors.</span>
+<span class="sd">Consumer: ``start_read_tensors`` maps the named segment once, reads</span>
+<span class="sd">zero-copy, H2D-copies on the copy stream; the producer reclaims on ACK,</span>
+<span class="sd">gated by a CUDA-event future so an edge is never ACKed before its copies</span>
+<span class="sd">land. Segments are mapped once and never move, so the one-time</span>
+<span class="sd">``cudaHostRegister`` per segment (within ``MSTAR_SHM_ARENA_PIN_MAX_MB``)</span>
+<span class="sd">holds for its lifetime and keeps the side-stream copies truly async.</span>
+
+<span class="sd">Capacity degrades in layers: grow by segments up to</span>
+<span class="sd">``MSTAR_SHM_ARENA_MAX_SEGMENTS``; at the cap, briefly backpressure for</span>
+<span class="sd">consumer ACKs; then spill the tensor to the per-uuid file protocol</span>
+<span class="sd">(``MSTAR_SHM_ARENA_SPILL``, default on) — slower, never fails, like the old</span>
+<span class="sd">transport at saturation. ``stats_summary()`` exposes occupancy and the</span>
+<span class="sd">fragmentation gauge (largest contiguous free block); ``--log-stats`` logs it</span>
+<span class="sd">periodically.</span>
+
+<span class="sd">Ceilings are PER-ENTITY and multiply across a node: with E entities</span>
+<span class="sd">(workers + the api-server data worker), /dev/shm demand can reach</span>
+<span class="sd">``MAX_SEGMENTS x SEGMENT_MB x E`` and pinned host RAM approx</span>
+<span class="sd">``PIN_MAX_MB x E`` (consumers pin peer segments too, so one process can pin</span>
+<span class="sd">more than its own arena holds). Construction fails fast when one entity's</span>
+<span class="sd">ceiling already exceeds /dev/shm, and warns when it exceeds current free</span>
+<span class="sd">space or when the pin budget is an outsized share of physical RAM.</span>
+
+<span class="sd">Selection: ``create_tensor_communication_manager`` picks this manager for</span>
+<span class="sd">the SHM protocol when ``MSTAR_SHM_ARENA`` is ``1`` (require) or ``AUTO``</span>
+<span class="sd">(use if the ``mstar_rust`` extension imports); default ``0`` keeps the file</span>
+<span class="sd">transport. See :doc:`environment_variables` for all knobs.</span>
+<span class="sd">"""</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">queue</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.communicator</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseCommunicator</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">FutureAndPointers</span><span class="p">,</span>
+    <span class="n">SharedMemoryCommunicationManager</span><span class="p">,</span>
+    <span class="n">_deserialize_tensor</span><span class="p">,</span>
+    <span class="n">_nullcontext</span><span class="p">,</span>
+    <span class="n">_serialize_tensor</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
+
+<span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+
+<span class="n">_CUDA_HOST_ALREADY_REGISTERED</span> <span class="o">=</span> <span class="mi">712</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_CudaEventFuture</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Future-shaped CUDA event. An edge whose H2D copies ride behind this</span>
+<span class="sd">    event reports ready only once the copies have completed on the device —</span>
+<span class="sd">    so the ACK that lets the producer reclaim the arena slot is deferred by</span>
+<span class="sd">    ``get_ready_tensors``'s existing future polling instead of a blocking</span>
+<span class="sd">    host synchronize."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">):</span>
+        <span class="c1"># blocking=True: `synchronize` SLEEPS until the event fires. The</span>
+        <span class="c1"># default (False) busy-waits — the watcher thread that turns these</span>
+        <span class="c1"># into wake futures would burn a full core per wait.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_event</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">(</span><span class="n">blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_event</span><span class="o">.</span><span class="n">record</span><span class="p">(</span><span class="n">stream</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_event</span><span class="o">.</span><span class="n">query</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">result</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_event</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+
+
+<span class="n">_CUDART</span> <span class="o">=</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_cudart</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">"""libcudart via ctypes: unlike the torch binding, a ctypes call</span>
+<span class="sd">    RELEASES the GIL, so registering a 256 MiB segment (tens of ms) on the</span>
+<span class="sd">    send path cannot stall the process's other Python threads (serve loop,</span>
+<span class="sd">    stream relays, the wake watcher)."""</span>
+    <span class="k">global</span> <span class="n">_CUDART</span>
+    <span class="k">if</span> <span class="n">_CUDART</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes.util</span>
+
+        <span class="n">name</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">util</span><span class="o">.</span><span class="n">find_library</span><span class="p">(</span><span class="s2">"cudart"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">"libcudart.so"</span>
+        <span class="n">lib</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">CDLL</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_size_t</span><span class="p">,</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_uint</span><span class="p">]</span>
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span>
+        <span class="n">_CUDART</span> <span class="o">=</span> <span class="n">lib</span>
+    <span class="k">return</span> <span class="n">_CUDART</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_unlink_paths</span><span class="p">(</span><span class="n">paths</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Exit-time segment unlink (weakref.finalize target — must not</span>
+<span class="sd">    reference the manager). Workers exit with the manager still alive, so</span>
+<span class="sd">    the interpreter never garbage-collects it and the Rust Drop (which</span>
+<span class="sd">    unlinks) never runs; without this, every worker run leaks its full</span>
+<span class="sd">    segments in /dev/shm until swept by a later start."""</span>
+    <span class="k">for</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">paths</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+            <span class="k">pass</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_unpin</span><span class="p">(</span><span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""cudaHostUnregister a previously pinned mapping (GIL released via</span>
+<span class="sd">    ctypes). Returns success."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">return</span> <span class="kc">False</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">lib</span> <span class="o">=</span> <span class="n">_cudart</span><span class="p">()</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">ctypes</span>
+
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="o">.</span><span class="n">argtypes</span> <span class="o">=</span> <span class="p">[</span><span class="n">ctypes</span><span class="o">.</span><span class="n">c_void_p</span><span class="p">]</span>
+        <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="o">.</span><span class="n">restype</span> <span class="o">=</span> <span class="n">ctypes</span><span class="o">.</span><span class="n">c_int</span>
+        <span class="n">rc</span> <span class="o">=</span> <span class="n">lib</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+        <span class="n">rc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">cudart</span><span class="p">()</span><span class="o">.</span><span class="n">cudaHostUnregister</span><span class="p">(</span><span class="n">ptr</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">rc</span> <span class="o">==</span> <span class="mi">0</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_pin</span><span class="p">(</span><span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""cudaHostRegister a mapped segment (idempotent). Returns success.</span>
+<span class="sd">    GIL released for the duration (see ``_cudart``)."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">return</span> <span class="kc">False</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">rc</span> <span class="o">=</span> <span class="n">_cudart</span><span class="p">()</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>  <span class="c1"># no loadable libcudart: fall back to the torch binding</span>
+        <span class="n">rc</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">cudart</span><span class="p">()</span><span class="o">.</span><span class="n">cudaHostRegister</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">ok</span> <span class="o">=</span> <span class="n">rc</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">_CUDA_HOST_ALREADY_REGISTERED</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"cudaHostRegister(</span><span class="si">%#x</span><span class="s2">, </span><span class="si">%d</span><span class="s2">) failed rc=</span><span class="si">%d</span><span class="s2"> — copies fall "</span>
+                       <span class="s2">"back to pageable bandwidth"</span><span class="p">,</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">rc</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">ok</span>
+
+
+<div class="viewcode-block" id="ArenaShmCommunicationManager">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ArenaShmCommunicationManager</span><span class="p">(</span><span class="n">SharedMemoryCommunicationManager</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">my_entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">hostname</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">device</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">communicator</span><span class="p">:</span> <span class="n">BaseCommunicator</span><span class="p">,</span>
+        <span class="n">shm_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">enable_prof</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
+            <span class="n">my_entity_id</span><span class="o">=</span><span class="n">my_entity_id</span><span class="p">,</span> <span class="n">hostname</span><span class="o">=</span><span class="n">hostname</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
+            <span class="n">communicator</span><span class="o">=</span><span class="n">communicator</span><span class="p">,</span> <span class="n">shm_dir</span><span class="o">=</span><span class="n">shm_dir</span><span class="p">,</span>
+            <span class="n">enable_prof</span><span class="o">=</span><span class="n">enable_prof</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">mstar_rust</span><span class="w"> </span><span class="kn">import</span> <span class="n">SegmentedShmArena</span><span class="p">,</span> <span class="n">ShmArena</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_ShmArena</span> <span class="o">=</span> <span class="n">ShmArena</span>
+        <span class="n">segment_mb</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SEGMENT_MB"</span><span class="p">,</span> <span class="s2">"256"</span><span class="p">))</span>
+        <span class="n">max_segments</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_MAX_SEGMENTS"</span><span class="p">,</span> <span class="s2">"32"</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_full_timeout_s</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_FULL_TIMEOUT_S"</span><span class="p">,</span> <span class="s2">"30"</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_PIN"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
+            <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="ow">and</span> <span class="nb">str</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"cpu"</span>
+        <span class="p">)</span>
+        <span class="c1"># Pinned host memory is a system-wide resource (pages come out of the</span>
+        <span class="c1"># OS's pageable pool), so it gets its own budget, distinct from the</span>
+        <span class="c1"># segment cap. Segments past the budget stay unpinned — copies still</span>
+        <span class="c1"># work, they just lose async overlap. Oversized dedicated segments</span>
+        <span class="c1"># (single allocations larger than a segment) are never pinned: a</span>
+        <span class="c1"># one-shot transfer doesn't amortize the registration cost.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_PIN_MAX_MB"</span><span class="p">,</span> <span class="s2">"4096"</span><span class="p">))</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget_warned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_segment_bytes</span> <span class="o">=</span> <span class="n">segment_mb</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span>
+        <span class="c1"># Arena saturation spills to the per-uuid file transport (the old</span>
+        <span class="c1"># protocol) instead of failing: bursty or oversized workloads degrade</span>
+        <span class="c1"># to file-copy speed, matching the prior manager's "slower, never</span>
+        <span class="c1"># fails" behavior. MSTAR_SHM_ARENA_SPILL=0 restores strict</span>
+        <span class="c1"># backpressure + timeout.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_spill</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SPILL"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
+        <span class="c1"># Default 0: on a worker, TENSOR_RECEIVED ACKs (which free slots)</span>
+        <span class="c1"># are processed by the SAME thread that would sit in this grace</span>
+        <span class="c1"># wait, so waiting is pure dead time there — spill immediately.</span>
+        <span class="c1"># Deployments where another thread drains the communicator (the</span>
+        <span class="c1"># threaded api_server) can set a small grace to ride out bursts.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_spill_after_s</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SPILL_AFTER_S"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_frag_warned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="c1"># h2d completion watcher: turns a CUDA event into a real Future so</span>
+        <span class="c1"># the worker's eventfd wakes the moment reads finish (no 10 ms tick).</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span><span class="p">:</span> <span class="n">queue</span><span class="o">.</span><span class="n">Queue</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_wake_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
+        <span class="c1"># Serializes pin accounting and peer-map insertion: _pin releases</span>
+        <span class="c1"># the GIL (ctypes), so unlocked read-modify-write of _pinned_bytes</span>
+        <span class="c1"># tears, and check-then-insert on _peer_segments can map+pin the</span>
+        <span class="c1"># same segment twice (the loser leaking forever).</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pin_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
+        <span class="c1"># Concurrent start_read_tensors calls (threaded api-server): used to</span>
+        <span class="c1"># keep eviction from unmapping a segment another thread is copying</span>
+        <span class="c1"># from before its future lands in `pending`.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_reads_active</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># Periodic occupancy/fragmentation logging, tied to --log-stats</span>
+        <span class="c1"># (enable_prof) and time-gated.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_stats_interval_s</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_STATS_INTERVAL_S"</span><span class="p">,</span> <span class="s2">"60"</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_stats_last</span> <span class="o">=</span> <span class="mf">0.0</span>
+        <span class="c1"># CEILINGS ARE PER-ENTITY and multiply across a node: every entity</span>
+        <span class="c1"># (workers + the api-server data worker) creates its own arena, so</span>
+        <span class="c1"># node /dev/shm demand can reach</span>
+        <span class="c1">#     MAX_SEGMENTS x SEGMENT_MB x num_entities</span>
+        <span class="c1"># and node pinned RAM approx PIN_MAX_MB x num_entities (a consumer</span>
+        <span class="c1"># pins peer segments too, so one process's pinned bytes can exceed</span>
+        <span class="c1"># its own arena). Check the static tmpfs ceiling NOW instead of</span>
+        <span class="c1"># surfacing as ENOSPC on a growth mid-run.</span>
+        <span class="n">per_entity_max</span> <span class="o">=</span> <span class="p">(</span><span class="n">segment_mb</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">)</span> <span class="o">*</span> <span class="n">max_segments</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">st</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">statvfs</span><span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">)</span>
+            <span class="n">shm_total</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">f_frsize</span> <span class="o">*</span> <span class="n">st</span><span class="o">.</span><span class="n">f_blocks</span>
+            <span class="n">shm_avail</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">f_frsize</span> <span class="o">*</span> <span class="n">st</span><span class="o">.</span><span class="n">f_bavail</span>
+        <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+            <span class="n">shm_total</span> <span class="o">=</span> <span class="n">shm_avail</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_shm_total</span> <span class="o">=</span> <span class="n">shm_total</span>
+        <span class="k">if</span> <span class="n">shm_total</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">per_entity_max</span> <span class="o">&gt;</span> <span class="n">shm_total</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"SHM arena ceiling for ONE entity "</span>
+                    <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="n">per_entity_max</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">20</span><span class="si">}</span><span class="s2"> MiB = "</span>
+                    <span class="sa">f</span><span class="s2">"MSTAR_SHM_ARENA_MAX_SEGMENTS x _SEGMENT_MB) exceeds "</span>
+                    <span class="sa">f</span><span class="s2">"/dev/shm (</span><span class="si">{</span><span class="n">shm_total</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">20</span><span class="si">}</span><span class="s2"> MiB) — and every entity "</span>
+                    <span class="sa">f</span><span class="s2">"multiplies this. Lower the knobs or grow tmpfs."</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">per_entity_max</span> <span class="o">&gt;</span> <span class="n">shm_avail</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"ARENA: this entity's ceiling (</span><span class="si">%d</span><span class="s2"> MiB) exceeds current "</span>
+                    <span class="s2">"/dev/shm free space (</span><span class="si">%d</span><span class="s2"> MiB); ceilings are per-entity "</span>
+                    <span class="s2">"and multiply across workers — growth may hit ENOSPC "</span>
+                    <span class="s2">"under load"</span><span class="p">,</span> <span class="n">per_entity_max</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">shm_avail</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">phys</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">sysconf</span><span class="p">(</span><span class="s2">"SC_PHYS_PAGES"</span><span class="p">)</span> <span class="o">*</span> <span class="n">os</span><span class="o">.</span><span class="n">sysconf</span><span class="p">(</span><span class="s2">"SC_PAGE_SIZE"</span><span class="p">)</span>
+        <span class="k">except</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">):</span>
+            <span class="n">phys</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span> <span class="ow">and</span> <span class="n">phys</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget</span> <span class="o">&gt;</span> <span class="n">phys</span> <span class="o">//</span> <span class="mi">4</span><span class="p">):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"ARENA: MSTAR_SHM_ARENA_PIN_MAX_MB (</span><span class="si">%d</span><span class="s2"> MiB) exceeds a "</span>
+                <span class="s2">"quarter of physical RAM (</span><span class="si">%d</span><span class="s2"> MiB) FOR ONE ENTITY; pinned "</span>
+                <span class="s2">"budgets multiply across entities and come out of the OS's "</span>
+                <span class="s2">"pageable pool"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">phys</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
+        <span class="c1"># INSTANCE-UNIQUE base name: a fixed per-entity name in the global</span>
+        <span class="c1"># /dev/shm namespace collides across servers (a second server's</span>
+        <span class="c1"># create() truncates the first's live segments — silent corruption)</span>
+        <span class="c1"># and across users (permission-denied at startup). pid + random</span>
+        <span class="c1"># token makes each instance's names unique; wire-compatibility is</span>
+        <span class="c1"># free because consumers open whatever segment name the descriptor</span>
+        <span class="c1"># carries. The pid embedded in the name also enables the orphan</span>
+        <span class="c1"># sweep below.</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">secrets</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_sweep_orphans</span><span class="p">()</span>
+        <span class="n">base</span> <span class="o">=</span> <span class="p">(</span><span class="sa">f</span><span class="s2">"mstar_arena_</span><span class="si">{</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">()</span><span class="si">}</span><span class="s2">_"</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">secrets</span><span class="o">.</span><span class="n">token_hex</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span> <span class="o">=</span> <span class="n">SegmentedShmArena</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+            <span class="n">base</span><span class="p">,</span> <span class="n">segment_mb</span> <span class="o">&lt;&lt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">max_segments</span><span class="p">)</span>
+        <span class="c1"># Guaranteed exit-time unlink: weakref.finalize runs at interpreter</span>
+        <span class="c1"># shutdown even when the manager is still referenced (the worker</span>
+        <span class="c1"># case — no explicit cleanup path runs there, so the Rust Drop</span>
+        <span class="c1"># never fires). The callback captures only the mutable name list,</span>
+        <span class="c1"># which _sync_segments extends as the arena grows.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_own_segment_paths</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_finalizer</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">finalize</span><span class="p">(</span>
+            <span class="bp">self</span><span class="p">,</span> <span class="n">_unlink_paths</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_own_segment_paths</span><span class="p">)</span>
+        <span class="c1"># Producer-side segment views (memoryviews are stable: segments</span>
+        <span class="c1"># never move or resize) + how many segments are already pinned.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">memoryview</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_segments</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_sync_segments</span><span class="p">()</span>
+        <span class="c1"># uuid -&gt; (segment_idx, offset) for sender-side reclaim.</span>
+        <span class="c1"># (register_for_send receives the TensorPointerInfos directly and</span>
+        <span class="c1"># stamps them in place — no side-table needed.)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># uuid -&gt; stage time, for the TTL backstop: a request aborted after</span>
+        <span class="c1"># staging but before every consumer ACKs defers reclaim forever</span>
+        <span class="c1"># (cleanup_request waits for ACKs that will never come). A slot</span>
+        <span class="c1"># older than the REQUEST timeout cannot have a legitimate reader —</span>
+        <span class="c1"># the request is dead by contract — so freeing past a bound safely</span>
+        <span class="c1"># above it cannot race a real consumer. Default OFF pending review</span>
+        <span class="c1"># discussion; enable with MSTAR_SHM_ARENA_SLOT_TTL_S (recommend</span>
+        <span class="c1"># &gt;= 2x the request timeout).</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_slot_ttl_s</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SLOT_TTL_S"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_ttl_reclaimed_total</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># Consumer-side: peer segment name -&gt; (arena, memoryview,</span>
+        <span class="c1"># pinned_nbytes) — pinned_nbytes 0 when the segment wasn't pinned.</span>
+        <span class="c1"># Entries are EVICTED (unpin + unmap) once the backing file is gone</span>
+        <span class="c1"># (producer finished or restarted): with instance-unique names a</span>
+        <span class="c1"># restarting producer mints new names every generation, so a</span>
+        <span class="c1"># never-evicting cache would grow mappings and pinned bytes without</span>
+        <span class="c1"># bound on any long-lived consumer.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">object</span><span class="p">,</span> <span class="nb">memoryview</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_peer_evict_last</span> <span class="o">=</span> <span class="mf">0.0</span>
+
+    <span class="c1"># -- segments --------------------------------------------------------</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_sweep_orphans</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A SIGKILLed server never runs Drop, orphaning up to its full</span>
+<span class="sd">        arena in /dev/shm until reboot. Names embed the owning pid, so a</span>
+<span class="sd">        startup sweep can reclaim any segment whose owner is gone. Files we</span>
+<span class="sd">        cannot judge (foreign naming) or cannot remove (another user's)</span>
+<span class="sd">        are left with a debug note."""</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">names</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">listdir</span><span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">names</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">"mstar_arena_"</span><span class="p">):</span>
+                <span class="k">continue</span>
+            <span class="n">parts</span> <span class="o">=</span> <span class="n">name</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"."</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">rsplit</span><span class="p">(</span><span class="s2">"_"</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">3</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">isdigit</span><span class="p">():</span>
+                <span class="k">continue</span>   <span class="c1"># pre-uniquification or foreign naming: skip</span>
+            <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/proc/</span><span class="si">{</span><span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="si">}</span><span class="s2">"</span><span class="p">):</span>
+                <span class="k">continue</span>   <span class="c1"># owner alive</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/dev/shm/</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"ARENA: swept orphaned segment </span><span class="si">%s</span><span class="s2"> "</span>
+                            <span class="s2">"(owner pid </span><span class="si">%s</span><span class="s2"> is gone)"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+            <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: cannot sweep </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">e</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_maybe_pin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Pin within budget; returns the bytes actually pinned (0 if</span>
+<span class="sd">        skipped/failed). Runs under _pin_lock: _pin releases the GIL, so</span>
+<span class="sd">        budget check + register + accounting must be one atomic unit."""</span>
+        <span class="c1"># Oversized dedicated segments ARE pinned (within budget): freed</span>
+        <span class="c1"># segments are reused for later large tensors, so the registration</span>
+        <span class="c1"># amortizes over the segment's lifetime, not one transfer.</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span><span class="p">:</span>
+            <span class="k">return</span> <span class="mi">0</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_lock</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_locked</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_pin_locked</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ptr</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span> <span class="o">+</span> <span class="n">nbytes</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget_warned</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"ARENA: pinned-memory budget reached (</span><span class="si">%d</span><span class="s2"> MiB, "</span>
+                    <span class="s2">"MSTAR_SHM_ARENA_PIN_MAX_MB); further segments stay "</span>
+                    <span class="s2">"unpinned — copies work but lose async overlap"</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_pin_budget_warned</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">return</span> <span class="mi">0</span>
+        <span class="k">if</span> <span class="n">_pin</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span> <span class="o">+=</span> <span class="n">nbytes</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_segments</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">return</span> <span class="n">nbytes</span>
+        <span class="k">return</span> <span class="mi">0</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_sync_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">grew</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="p">:</span>
+            <span class="n">i</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">)</span>
+            <span class="n">seg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">segment</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_own_segment_paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"/dev/shm/</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">segment_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">memoryview</span><span class="p">(</span><span class="n">seg</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_pin</span><span class="p">(</span><span class="o">*</span><span class="n">seg</span><span class="o">.</span><span class="n">ptr_len</span><span class="p">())</span>
+            <span class="n">grew</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">if</span> <span class="n">grew</span><span class="p">:</span>
+            <span class="n">total</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
+            <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_shm_total</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="n">total</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_total</span> <span class="o">*</span> <span class="mf">0.8</span><span class="p">):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"ARENA: this entity's segments now total </span><span class="si">%d</span><span class="s2"> MiB — over "</span>
+                    <span class="s2">"80</span><span class="si">%%</span><span class="s2"> of /dev/shm (</span><span class="si">%d</span><span class="s2"> MiB). Oversized dedicated "</span>
+                    <span class="s2">"segments grow past the static ceiling; other entities "</span>
+                    <span class="s2">"multiply this further."</span><span class="p">,</span>
+                    <span class="n">total</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_total</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">"ARENA: grew to </span><span class="si">%d</span><span class="s2"> segments (</span><span class="si">%d</span><span class="s2"> MiB total, </span><span class="si">%d</span><span class="s2"> MiB free, "</span>
+                <span class="s2">"largest free block </span><span class="si">%d</span><span class="s2"> MiB, </span><span class="si">%d</span><span class="s2"> MiB pinned)"</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="p">,</span> <span class="n">total</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="n">free</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span>
+                <span class="n">largest</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
+
+<div class="viewcode-block" id="ArenaShmCommunicationManager.stats_summary">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stats_summary</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Occupancy/fragmentation snapshot (named apart from the raw</span>
+<span class="sd">        ``SegmentedShmArena.stats`` tuple). The fragmentation signature is</span>
+<span class="sd">        `largest_free_block` collapsing while `free_bytes` stays high."""</span>
+        <span class="n">total</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">"segments"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="p">,</span>
+            <span class="s2">"total_bytes"</span><span class="p">:</span> <span class="n">total</span><span class="p">,</span>
+            <span class="s2">"free_bytes"</span><span class="p">:</span> <span class="n">free</span><span class="p">,</span>
+            <span class="s2">"largest_free_block"</span><span class="p">:</span> <span class="n">largest</span><span class="p">,</span>
+            <span class="s2">"pinned_bytes"</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span><span class="p">,</span>
+        <span class="p">}</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_reclaim_expired</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""TTL backstop for abort-orphaned slots (see _arena_ts). Returns</span>
+<span class="sd">        the number of slots/files reclaimed."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_slot_ttl_s</span><span class="p">:</span>
+            <span class="k">return</span> <span class="mi">0</span>
+        <span class="n">now</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">ts</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+            <span class="k">if</span> <span class="n">now</span> <span class="o">-</span> <span class="n">ts</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_slot_ttl_s</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">loc</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="o">*</span><span class="n">loc</span><span class="p">)</span>
+                <span class="n">n</span> <span class="o">+=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">path</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+                    <span class="n">n</span> <span class="o">+=</span> <span class="mi">1</span>
+                <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+                    <span class="k">pass</span>
+        <span class="k">if</span> <span class="n">n</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_ttl_reclaimed_total</span> <span class="o">+=</span> <span class="n">n</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"ARENA: TTL-reclaimed </span><span class="si">%d</span><span class="s2"> slot(s)/file(s) older than </span><span class="si">%.0f</span><span class="s2">s "</span>
+                <span class="s2">"(</span><span class="si">%d</span><span class="s2"> total) — requests aborted without consumer ACKs; "</span>
+                <span class="s2">"the ACK path is leaking"</span><span class="p">,</span>
+                <span class="n">n</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_slot_ttl_s</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ttl_reclaimed_total</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">n</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_maybe_log_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Under ``--log-stats`` (enable_prof), log the snapshot at most</span>
+<span class="sd">        once per MSTAR_SHM_ARENA_STATS_INTERVAL_S so a long soak leaves an</span>
+<span class="sd">        occupancy/fragmentation time series in the logs."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">now</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">now</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stats_last</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stats_interval_s</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_stats_last</span> <span class="o">=</span> <span class="n">now</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_reclaim_expired</span><span class="p">()</span>
+        <span class="n">st</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">stats_summary</span><span class="p">()</span>
+        <span class="c1"># live_slots/spill_files climbing while requests finish = reclaim</span>
+        <span class="c1"># being deferred (e.g. aborts without ACKs) — the soak's leak canary.</span>
+        <span class="n">st</span><span class="p">[</span><span class="s2">"live_slots"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">)</span>
+        <span class="n">st</span><span class="p">[</span><span class="s2">"spill_files"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"ARENA stats: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">st</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_peer_view</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">segment_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">memoryview</span><span class="p">:</span>
+        <span class="n">entry</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">segment_name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">entry</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_lock</span><span class="p">:</span>
+                <span class="n">entry</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">segment_name</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">entry</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>   <span class="c1"># lost the race: another thread mapped it</span>
+                    <span class="n">arena</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ShmArena</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">segment_name</span><span class="p">)</span>
+                    <span class="n">pinned</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_pin_locked</span><span class="p">(</span><span class="o">*</span><span class="n">arena</span><span class="o">.</span><span class="n">ptr_len</span><span class="p">())</span>
+                              <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_segments</span> <span class="k">else</span> <span class="mi">0</span><span class="p">)</span>
+                    <span class="n">entry</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="p">[</span><span class="n">segment_name</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+                        <span class="n">arena</span><span class="p">,</span> <span class="nb">memoryview</span><span class="p">(</span><span class="n">arena</span><span class="p">),</span> <span class="n">pinned</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">entry</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_evict_dead_peers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Drop cached peer segments whose backing file is gone. Gated on</span>
+<span class="sd">        `self.pending` being empty: an mmap must outlive any in-flight h2d</span>
+<span class="sd">        copy that reads from it, and pending futures are exactly those</span>
+<span class="sd">        copies. Time-gated to keep the existence checks off the hot path."""</span>
+        <span class="n">now</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="c1"># _reads_active &gt; 1: another thread may have queued an async H2D</span>
+        <span class="c1"># copy whose future hasn't reached `pending` yet — unmapping under</span>
+        <span class="c1"># it would be a use-after-free. Only the sole active reader evicts.</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reads_active</span> <span class="o">&gt;</span> <span class="mi">1</span>
+                <span class="ow">or</span> <span class="n">now</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_evict_last</span> <span class="o">&lt;</span> <span class="mf">10.0</span><span class="p">):</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_peer_evict_last</span> <span class="o">=</span> <span class="n">now</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/dev/shm/</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">):</span>
+                <span class="k">continue</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pin_lock</span><span class="p">:</span>
+                <span class="n">arena</span><span class="p">,</span> <span class="n">view</span><span class="p">,</span> <span class="n">pinned</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+                <span class="k">if</span> <span class="n">pinned</span><span class="p">:</span>
+                    <span class="c1"># Unregister BEFORE unmapping: tearing down a mapping</span>
+                    <span class="c1"># CUDA still holds registered leaves a dangling pinned</span>
+                    <span class="c1"># range. On failure keep the entry (retry next sweep)</span>
+                    <span class="c1"># so accounting stays truthful.</span>
+                    <span class="n">ptr</span><span class="p">,</span> <span class="n">_len</span> <span class="o">=</span> <span class="n">arena</span><span class="o">.</span><span class="n">ptr_len</span><span class="p">()</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="n">_unpin</span><span class="p">(</span><span class="n">ptr</span><span class="p">):</span>
+                        <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                            <span class="s2">"ARENA: cudaHostUnregister failed for dead peer "</span>
+                            <span class="s2">"</span><span class="si">%s</span><span class="s2">; keeping mapping until it succeeds"</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+                        <span class="k">continue</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_bytes</span> <span class="o">-=</span> <span class="n">pinned</span>
+                <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_segments</span><span class="p">[</span><span class="n">name</span><span class="p">]</span>
+            <span class="n">view</span><span class="o">.</span><span class="n">release</span><span class="p">()</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: evicted dead peer segment </span><span class="si">%s</span><span class="s2"> "</span>
+                         <span class="s2">"(</span><span class="si">%d</span><span class="s2"> MiB pinned released)"</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">pinned</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
+
+    <span class="c1"># -- producer ---------------------------------------------------------</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_reserve</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Reserve with layered degradation. At the segment cap: wait</span>
+<span class="sd">        briefly for consumer ACKs to free space; then (default) return None</span>
+<span class="sd">        so the caller SPILLS this tensor to the per-uuid file transport —</span>
+<span class="sd">        slower, never fails, exactly the old manager's saturation behavior.</span>
+<span class="sd">        MSTAR_SHM_ARENA_SPILL=0 keeps strict backpressure for the full</span>
+<span class="sd">        timeout, then raises."""</span>
+        <span class="n">grace</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill_after_s</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_full_timeout_s</span>
+        <span class="n">deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">grace</span>
+        <span class="n">warned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">seg</span><span class="p">,</span> <span class="n">off</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">reserve</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">nbytes</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+            <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reclaim_expired</span><span class="p">():</span>
+                    <span class="k">continue</span>   <span class="c1"># expired slots freed: retry the reserve</span>
+                <span class="n">total</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">free</span> <span class="o">&gt;=</span> <span class="n">nbytes</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_frag_warned</span><span class="p">:</span>
+                    <span class="c1"># The fragmentation signature: enough TOTAL free space,</span>
+                    <span class="c1"># but no contiguous block large enough.</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                        <span class="s2">"ARENA: fragmentation — need </span><span class="si">%d</span><span class="s2"> bytes with </span><span class="si">%d</span><span class="s2"> free "</span>
+                        <span class="s2">"but largest free block is </span><span class="si">%d</span><span class="s2"> (of </span><span class="si">%d</span><span class="s2"> total). "</span>
+                        <span class="s2">"Consider larger MSTAR_SHM_ARENA_SEGMENT_MB."</span><span class="p">,</span>
+                        <span class="n">nbytes</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span><span class="p">,</span> <span class="n">total</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_frag_warned</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="k">if</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">deadline</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill</span><span class="p">:</span>
+                        <span class="k">return</span> <span class="kc">None</span>
+                    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">"SHM arena full for &gt;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_full_timeout_s</span><span class="si">}</span><span class="s2">s "</span>
+                        <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="si">}</span><span class="s2"> segments); raise "</span>
+                        <span class="s2">"MSTAR_SHM_ARENA_MAX_SEGMENTS / _SEGMENT_MB or check "</span>
+                        <span class="s2">"for consumers not ACKing"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">warned</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                        <span class="s2">"SHM arena at capacity; backpressuring sends until "</span>
+                        <span class="s2">"consumers ACK</span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                        <span class="s2">" (then spilling to file)"</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_spill</span> <span class="k">else</span> <span class="s2">""</span><span class="p">)</span>
+                    <span class="n">warned</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.002</span><span class="p">)</span>
+                <span class="k">continue</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_sync_segments</span><span class="p">()</span>
+            <span class="k">return</span> <span class="n">seg</span><span class="p">,</span> <span class="n">off</span>
+
+<div class="viewcode-block" id="ArenaShmCommunicationManager.register_for_send">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_for_send</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tensor_infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">],</span>
+        <span class="n">skip_cuda_sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="k">else</span> <span class="n">_nullcontext</span><span class="p">()</span>
+        <span class="p">)</span>
+        <span class="n">queued</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_log_stats</span><span class="p">()</span>
+        <span class="k">with</span> <span class="n">ctx</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">info_arg</span> <span class="ow">in</span> <span class="n">tensor_infos</span><span class="p">:</span>
+                <span class="n">uuid</span> <span class="o">=</span> <span class="n">info_arg</span><span class="o">.</span><span class="n">uuid</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
+                    <span class="k">continue</span>
+                <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
+                <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+                <span class="n">t</span> <span class="o">=</span> <span class="n">tensor</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+                <span class="n">nbytes</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">t</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+                <span class="n">loc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserve</span><span class="p">(</span><span class="n">nbytes</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">loc</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span>
+                        <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
+                    <span class="c1"># Lost a concurrent-duplicate race: another thread</span>
+                    <span class="c1"># registered this uuid while our reserve released the</span>
+                    <span class="c1"># GIL. Return our slot instead of orphaning it.</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="o">*</span><span class="n">loc</span><span class="p">)</span>
+                    <span class="k">continue</span>
+                <span class="k">if</span> <span class="n">loc</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># Arena saturated: spill THIS tensor to the per-uuid file</span>
+                    <span class="c1"># protocol (infos keep shm_segment=None — the consumer</span>
+                    <span class="c1"># falls back to the file read for exactly those).</span>
+                    <span class="n">data</span> <span class="o">=</span> <span class="n">_serialize_tensor</span><span class="p">(</span><span class="n">t</span><span class="p">)</span>
+                    <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
+                    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"wb"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">path</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span>
+                        <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_record_tx</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">),</span>
+                                        <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: spilled </span><span class="si">%s</span><span class="s2"> to </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> bytes)"</span><span class="p">,</span>
+                                 <span class="n">uuid</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">))</span>
+                    <span class="k">continue</span>
+                <span class="n">seg</span><span class="p">,</span> <span class="n">off</span> <span class="o">=</span> <span class="n">loc</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">nbytes</span><span class="p">:</span>
+                        <span class="n">host</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
+                            <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">[</span><span class="n">seg</span><span class="p">][</span><span class="n">off</span><span class="p">:</span><span class="n">off</span> <span class="o">+</span> <span class="n">nbytes</span><span class="p">],</span>
+                            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span>
+                        <span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+                        <span class="c1"># Async D2H into the pinned segment when a copy</span>
+                        <span class="c1"># stream exists (one sync below covers the batch);</span>
+                        <span class="c1"># blocking otherwise, so the descriptor can never</span>
+                        <span class="c1"># ship ahead of the bytes.</span>
+                        <span class="n">host</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
+                            <span class="n">t</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+                        <span class="n">queued</span> <span class="o">=</span> <span class="kc">True</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+                <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
+                    <span class="c1"># Anything that unwinds between reserve and the</span>
+                    <span class="c1"># _arena_locs record would orphan the slot forever</span>
+                    <span class="c1"># (cleanup can only free what is recorded).</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
+                    <span class="k">raise</span>
+                <span class="n">seg_name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">segment_name</span><span class="p">(</span><span class="n">seg</span><span class="p">)</span>
+                <span class="n">info_arg</span><span class="o">.</span><span class="n">shm_segment</span> <span class="o">=</span> <span class="n">seg_name</span>
+                <span class="n">info_arg</span><span class="o">.</span><span class="n">shm_offset</span> <span class="o">=</span> <span class="n">off</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span>
+                    <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_record_tx</span><span class="p">(</span>
+                        <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: staged </span><span class="si">%s</span><span class="s2"> at </span><span class="si">%s</span><span class="s2">+</span><span class="si">%d</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> bytes)"</span><span class="p">,</span>
+                             <span class="n">uuid</span><span class="p">,</span> <span class="n">seg_name</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">queued</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># The control message referencing these bytes is sent after we</span>
+            <span class="c1"># return; the consumer must never observe a partial copy.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span></div>
+
+
+    <span class="c1"># -- consumer ---------------------------------------------------------</span>
+
+<div class="viewcode-block" id="ArenaShmCommunicationManager.start_read_tensors">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">start_read_tensors</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="c1"># Increment races are benign here: a torn count can only make</span>
+        <span class="c1"># eviction OVER-cautious (skip a sweep), never unsafe.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_reads_active</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_start_read_tensors</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">,</span>
+                                            <span class="n">graph_walk</span><span class="p">)</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_reads_active</span> <span class="o">-=</span> <span class="mi">1</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_start_read_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_evict_dead_peers</span><span class="p">()</span>
+        <span class="n">h2d_did_work</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">read_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="k">else</span> <span class="n">_nullcontext</span><span class="p">()</span>
+        <span class="p">)</span>
+        <span class="k">with</span> <span class="n">ctx</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">graph_edge</span> <span class="ow">in</span> <span class="n">graph_edges</span><span class="p">:</span>
+                <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="k">continue</span>
+                <span class="n">rx_t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+                <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">source_entity</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_slice_existing_tensor</span><span class="p">(</span>
+                            <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+                            <span class="n">next_node</span><span class="o">=</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">,</span>
+                            <span class="n">graph_walk</span><span class="o">=</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">info</span><span class="o">=</span><span class="n">info</span><span class="p">,</span>
+                        <span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span>
+                            <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                        <span class="k">continue</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span>
+                            <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">):</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span>
+                            <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                        <span class="k">continue</span>
+                    <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">shm_segment</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="c1"># Spilled at the producer (arena saturated): read the</span>
+                        <span class="c1"># per-uuid file, the old protocol's path.</span>
+                        <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_path</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">source_entity</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
+                        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"rb"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                            <span class="n">f</span><span class="o">.</span><span class="n">seek</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">offset</span><span class="p">)</span>
+                            <span class="n">data</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
+                        <span class="n">tensor</span> <span class="o">=</span> <span class="n">_deserialize_tensor</span><span class="p">(</span>
+                            <span class="n">data</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">tensor_info</span><span class="o">=</span><span class="n">info</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_read_from_arena</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+                    <span class="n">h2d_did_work</span> <span class="o">=</span> <span class="n">h2d_did_work</span> <span class="ow">or</span> <span class="n">tensor</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">put_tensor</span><span class="p">(</span>
+                        <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">tensor</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span>
+                        <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                    <span class="c1"># +1 transit (released by get_ready_tensors), +1 usage</span>
+                    <span class="c1"># (released by _cleanup_consumed_inputs).</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+                <span class="n">read_edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                    <span class="p">(</span><span class="n">graph_edge</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">rx_t0</span><span class="p">))</span>
+        <span class="n">future</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">h2d_did_work</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># Downstream kernels see the data (device-side ordering only).</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span><span class="p">)</span>
+            <span class="c1"># The producer reclaims the slot when an edge is ACKed, and the</span>
+            <span class="c1"># source is its live mapping — so the edge must not report ready</span>
+            <span class="c1"># until its copies have completed (the file path's f.read() made</span>
+            <span class="c1"># this implicit). One event covers the batch: all copies were</span>
+            <span class="c1"># queued on the h2d stream in program order. get_ready_tensors</span>
+            <span class="c1"># polls it — no host block here.</span>
+            <span class="n">future</span> <span class="o">=</span> <span class="n">_CudaEventFuture</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_h2d_stream</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">graph_edge</span><span class="p">,</span> <span class="n">rx_time</span> <span class="ow">in</span> <span class="n">read_edges</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="n">FutureAndPointers</span><span class="p">(</span>
+                    <span class="n">future</span><span class="o">=</span><span class="n">future</span><span class="p">,</span> <span class="n">graph_edges</span><span class="o">=</span><span class="p">[</span><span class="n">graph_edge</span><span class="p">],</span>
+                    <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span> <span class="n">rx_time</span><span class="o">=</span><span class="n">rx_time</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="n">future</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[]</span>
+        <span class="c1"># A real Future for the worker's eventfd (EventWakeup.register_</span>
+        <span class="c1"># futures needs add_done_callback): completed by the watcher thread</span>
+        <span class="c1"># the moment the h2d copies finish, so an otherwise-idle worker</span>
+        <span class="c1"># re-checks get_ready_tensors immediately instead of on its next</span>
+        <span class="c1"># poll tick.</span>
+        <span class="k">return</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_wake_when_done</span><span class="p">(</span><span class="n">future</span><span class="p">)]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_wake_when_done</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cuda_future</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Future</span><span class="p">:</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wake_lock</span><span class="p">:</span>   <span class="c1"># two callers must not race the create</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="o">=</span> <span class="n">queue</span><span class="o">.</span><span class="n">Queue</span><span class="p">()</span>
+                <span class="c1"># staticmethod target closing over ONLY the queue: a bound</span>
+                <span class="c1"># method would pin the whole manager (and its arena — so</span>
+                <span class="c1"># segments never unlink) for the daemon thread's lifetime.</span>
+                <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span>
+                    <span class="n">target</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_watch_wakes</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span><span class="p">,),</span>
+                    <span class="n">daemon</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                    <span class="n">name</span><span class="o">=</span><span class="sa">f</span><span class="s2">"arena-h2d-wake-</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+        <span class="n">fut</span><span class="p">:</span> <span class="n">Future</span> <span class="o">=</span> <span class="n">Future</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span><span class="o">.</span><span class="n">put</span><span class="p">((</span><span class="n">cuda_future</span><span class="p">,</span> <span class="n">fut</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">fut</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_watch_wakes</span><span class="p">(</span><span class="n">q</span><span class="p">:</span> <span class="n">queue</span><span class="o">.</span><span class="n">Queue</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Events are queued in stream order, so sequential waits are exact.</span>
+        <span class="c1"># None is the close() sentinel.</span>
+        <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+            <span class="n">item</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">item</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="n">cuda_future</span><span class="p">,</span> <span class="n">fut</span> <span class="o">=</span> <span class="n">item</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">cuda_future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>   <span class="c1"># event.synchronize (GIL released)</span>
+                <span class="n">fut</span><span class="o">.</span><span class="n">set_result</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>          <span class="c1"># noqa: BLE001 — wake best-effort;</span>
+                <span class="c1"># a cancelled/already-resolved future must not kill the</span>
+                <span class="c1"># watcher (its death silently downgrades every later wake</span>
+                <span class="c1"># to the poll tick and grows the queue unboundedly).</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">fut</span><span class="o">.</span><span class="n">done</span><span class="p">():</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="n">fut</span><span class="o">.</span><span class="n">set_result</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+                    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+                        <span class="k">pass</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_read_from_arena</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">TensorPointerInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="n">t</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">dims</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">t</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">!=</span> <span class="s2">"cpu"</span> <span class="k">else</span> <span class="n">t</span>
+        <span class="n">view</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_peer_view</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">shm_segment</span><span class="p">)</span>
+        <span class="n">start</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">shm_offset</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">offset</span>  <span class="c1"># offset = TP-shard read offset</span>
+        <span class="n">flat</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
+            <span class="n">view</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">start</span> <span class="o">+</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="n">flat</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">!=</span> <span class="s2">"cpu"</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">t</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">t</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>  <span class="c1"># CPU consumer: own the bytes past reclaim</span>
+
+    <span class="c1"># -- reclaim ----------------------------------------------------------</span>
+
+<div class="viewcode-block" id="ArenaShmCommunicationManager.close">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.close">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">close</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Stop the wake watcher (segments/pins release with the arena's</span>
+<span class="sd">        Drop once the manager is garbage collected)."""</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wake_lock</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_cleanup_by_uuid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="c1"># Grandparent cleanup (refcounts): skip the file manager's unlink.</span>
+        <span class="nb">super</span><span class="p">(</span><span class="n">SharedMemoryCommunicationManager</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span>
+            <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">loc</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="o">*</span><span class="n">loc</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: freed </span><span class="si">%s</span><span class="s2"> at </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">loc</span><span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">path</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>   <span class="c1"># spilled tensor: reclaim the file</span>
+            <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+                <span class="k">pass</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span></div>
+
+</pre></div>
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Sep 05, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>

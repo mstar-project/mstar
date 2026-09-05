@@ -13,19 +13,11 @@ mstar.utils.flashinfer\_utils
 
    .. autosummary::
    
-      run_attention
       run_rms_norm
    
    
 
    
-   
-   .. rubric:: Classes
-
-   .. autosummary::
-   
-      FlashInferDecodeWrapper
-      FlashInferPrefillWrapper
    
    
 
