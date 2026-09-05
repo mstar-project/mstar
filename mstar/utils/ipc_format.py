@@ -36,6 +36,7 @@ class WorkerMessageType(Enum):
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
+    TP_NO_SPEC = "tp_no_spec"
 
 
 @dataclass
@@ -89,9 +90,34 @@ class StopLoops(MessageBody):
 
 @dataclass
 class ScheduleTPNode(MessageBody):
+    """Leader → followers: schedule this node for these rids.
+
+    Ids only; followers rebuild the batch from replicated state. Under TP
+    async scheduling the same message carries a speculative head:
+    ``spec_seq`` names this batch, ``spec_from_seq`` the leader's in-flight
+    step it was speculated from. A head is never cancelled on the wire; each
+    rank derives "void" from replicated state (``tp_async_sim.py``, B2_LOCAL).
+    Fields are defaulted so serial construction sites are unchanged.
+    """
+
     node_name: str
     graph_walk: str
     request_ids: list[str]
+    speculative: bool = False
+    spec_seq: int = -1
+    spec_from_seq: int = -1
+
+
+@dataclass
+class TPNoSpeculation(MessageBody):
+    """Leader → followers (TP async scheduling): no speculative head will
+    follow the leader's step ``spec_from_seq`` of this node / walk. A follower
+    awaiting that step settles on this marker instead of on a head."""
+
+    node_name: str
+    graph_walk: str
+    spec_from_seq: int
+
 
 @dataclass
 class WorkerMessage:

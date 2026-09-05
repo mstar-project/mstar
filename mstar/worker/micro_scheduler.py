@@ -29,6 +29,9 @@ class ScheduledBatch:
     node_objects: dict[str,GraphNode]
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[str, str] = None
+    # TP async scheduling: the ``ScheduleTPNode.spec_seq`` this batch came off
+    # the TP-follow FIFO with; -1 otherwise. A head's ``spec_from_seq`` matches it.
+    tp_seq: int = -1
 
 
 # Priority: lower value = higher priority
@@ -137,6 +140,64 @@ class MicroScheduler:
     ):
         self.tp_batches_pending_schedule.append(message)
 
+    # TP-follow FIFO accessors for the follower's async-scheduling path: peek
+    # the head to decide whether it can be built early, pop it once committed
+    # to building (or dropping) it. FIFO order is never disturbed.
+
+    def peek_tp_follow(self) -> ScheduleTPNode | None:
+        if not self.tp_batches_pending_schedule:
+            return None
+        return self.tp_batches_pending_schedule[0]
+
+    def pop_tp_follow_head(self) -> ScheduleTPNode:
+        return self.tp_batches_pending_schedule.popleft()
+
+    def pop_ready_rids(
+        self, worker_graphs_manager: WorkerGraphsManager,
+        node_name: str, graph_walk: str, request_ids: list[str],
+    ) -> tuple[dict[str, GraphNode], dict[str, str]] | None:
+        """Pop ``node_name`` for exactly ``request_ids`` — all of them, or none.
+
+        Readiness is the same two-level check the serial TP-follow path uses
+        (node in the rid's ready set, engine says the node is ready), evaluated
+        for every rid BEFORE anything is popped, so a partially-ready set leaves
+        the queues untouched and the caller can simply try again later. Bumps
+        the batch counter like any other schedule.
+
+        Empty ``request_ids`` is a valid all-of-nothing: returns empty dicts.
+        """
+        if not request_ids:
+            return {}, {}
+        node_partition = worker_graphs_manager.get_partition_for_node(node_name)
+        wgid = worker_graphs_manager.get_worker_graph_id_for_node(
+            request_ids[0], node_name, graph_walk=graph_walk,
+        )
+        queue = worker_graphs_manager.queues[wgid]
+        engine = self.engine_manager.get_engine(node_name)
+        for rid in request_ids:
+            # An unknown rid (removed on this rank, or not registered here
+            # yet) is "not ready", not an error: raising here would fail the
+            # caller's whole in-flight batch on this rank alone.
+            wg = queue.per_request_queues.get(rid)
+            if wg is None or node_name not in wg.ready_node_names:
+                return None
+            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
+            if not engine.check_ready(node_name, rid, fwd_info):
+                return None
+
+        node_objects: dict[str, GraphNode] = {}
+        request_to_worker_graph: dict[str, str] = {}
+        for rid in request_ids:
+            popped = queue.pop_ready_nodes(rid, [node_name])
+            if popped:
+                assert len(popped) == 1
+                node_objects[rid] = popped[0]
+                request_to_worker_graph[rid] = wgid
+
+        self.batch_number += 1
+        self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
+        return node_objects, request_to_worker_graph
+
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
         target_node_name: str | None = None,
@@ -145,15 +206,19 @@ class MicroScheduler:
     ) -> ScheduledBatch | None:
         if len(self.tp_batches_pending_schedule) == 0:
             return
+        # A TP-follow batch is a mandate from the group leader: once its
+        # ScheduleTPNode is popped from the FIFO, nothing on this worker will
+        # ever reschedule it (followers cannot initiate scheduling for
+        # parallel nodes), so whoever pops it must submit it unconditionally.
+        # Targeted calls come from merge paths (the speculation fresh-rid
+        # merge in ``worker._try_speculate_next``) that may reject or
+        # partially consume the batch they are handed — handing them a
+        # mandate would strand the popped message, and the group would hang
+        # at the next collective. Refuse instead: the message stays queued
+        # for the unconditional scheduling path.
+        if target_node_name is not None or target_graph_walk is not None:
+            return
         first_tp_node: ScheduleTPNode = self.tp_batches_pending_schedule[0]
-        # Respect the caller's filters: a targeted call (e.g. the speculation
-        # path asking for one specific node/walk) must not be handed a TP
-        # follower batch for some other node, or the caller will merge those
-        # node objects into a batch labeled with the target's name.
-        if target_node_name is not None and first_tp_node.node_name != target_node_name:
-            return
-        if target_graph_walk is not None and first_tp_node.graph_walk != target_graph_walk:
-            return
         if exclude_target is not None and \
                 (first_tp_node.node_name, first_tp_node.graph_walk) == exclude_target:
             return
@@ -163,41 +228,16 @@ class MicroScheduler:
                     (first_tp_node.node_name, first_tp_node.graph_walk)
                 ):
             return
-        # check if batch is ready
-        node_partition = worker_graphs_manager.get_partition_for_node(first_tp_node.node_name)
-        # Use the leader's graph walk, not this worker's current one: the
-        # follower may lag or lead the leader's partition state.
-        wgid = worker_graphs_manager.get_worker_graph_id_for_node(
-            first_tp_node.request_ids[0], first_tp_node.node_name,
-            graph_walk=first_tp_node.graph_walk,
+        # Check readiness for every rid and pop all-or-nothing. Use the
+        # leader's graph walk, not this worker's current one: the follower may
+        # lag or lead the leader's partition state.
+        popped = self.pop_ready_rids(
+            worker_graphs_manager, first_tp_node.node_name,
+            first_tp_node.graph_walk, first_tp_node.request_ids,
         )
-        queue = worker_graphs_manager.queues[wgid]
-        for rid in first_tp_node.request_ids:
-            wg = queue.per_request_queues[rid]
-            if first_tp_node.node_name not in wg.ready_node_names:
-                return
-            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
-            # check if the node is ready on the engine level
-            # (e.g., for AR, whether the kv cache is read in)
-            engine = self.engine_manager.get_engine(first_tp_node.node_name)
-            if not engine.check_ready(first_tp_node.node_name, rid, fwd_info):
-                return
-
-        node_objects = {}
-        request_to_worker_graph = {}
-
-        # TODO: this code is also repeated below, should pull into a helper fn
-        for rid in first_tp_node.request_ids:
-            popped = queue.pop_ready_nodes(rid, [first_tp_node.node_name])
-            if popped:
-                assert len(popped) == 1
-                node_objects[rid] = popped[0]
-                request_to_worker_graph[rid] = wgid
-
-        self.batch_number += 1
-        self.node_and_walk_to_last_batch_num[(
-            first_tp_node.node_name, first_tp_node.graph_walk
-        )] = self.batch_number
+        if popped is None:
+            return
+        node_objects, request_to_worker_graph = popped
 
         self.tp_batches_pending_schedule.popleft()
 
@@ -206,6 +246,7 @@ class MicroScheduler:
             graph_walk=first_tp_node.graph_walk,
             node_objects=node_objects,
             request_to_worker_graph=request_to_worker_graph,
+            tp_seq=first_tp_node.spec_seq,
         )
 
 
