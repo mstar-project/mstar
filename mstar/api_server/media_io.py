@@ -110,7 +110,9 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
     """Persist a bare base64 blob with a known ``fmt`` (e.g. ``"wav"``)."""
     upload_dir = Path(upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    raw = base64.b64decode(b64)
+    # Some OpenAI clients omit trailing padding, but b64decode requires it.
+    padded = b64 + "=" * (-len(b64) % 4)
+    raw = base64.b64decode(padded)
     # Sanitize the client-controlled fmt: alphanumerics only, so it cannot
     # inject path separators into the upload path.
     clean = "".join(c for c in fmt.lstrip(".") if c.isalnum())
