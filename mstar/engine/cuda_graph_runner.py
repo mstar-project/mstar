@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
-def autocast_scope(dtype: torch.dtype | None):
+def autocast_scope(dtype: torch.dtype | None, device_type: str = "cuda"):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
     submodule in its own dtype and shuts out any ambient autocast."""
     return torch.amp.autocast(
-        "cuda", enabled=dtype is not None, dtype=dtype or torch.bfloat16
+        device_type, enabled=dtype is not None, dtype=dtype or torch.bfloat16
     )
 
 

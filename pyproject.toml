@@ -41,6 +41,14 @@ audio = [
     "soundfile",
 ]
 
+# Optional: serve a deployment as a NVIDIA Dynamo backend
+# (python -m mstar.integrations.dynamo). Nothing outside
+# mstar/integrations/dynamo/ imports these.
+dynamo = [
+    "ai-dynamo>=1.4.0,<1.5",
+    "uvloop",
+]
+
 bagel = [
     "einops",
     "flashinfer-python>=0.6.4",

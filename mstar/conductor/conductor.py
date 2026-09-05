@@ -231,6 +231,9 @@ class Conductor:
 
         with open(model_config_file, "r") as f:
             self.model_config = yaml.safe_load(f)
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        self.device_type = accelerator.type if accelerator is not None else "cpu"
+        logger.info("Detected worker device type: %s", self.device_type)
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
@@ -410,7 +413,10 @@ class Conductor:
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": f"cuda:{rank}",
+                    "device": (
+                        f"{self.device_type}:{rank}"
+                        if self.device_type != "cpu" else "cpu"
+                    ),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device

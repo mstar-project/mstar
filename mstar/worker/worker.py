@@ -154,8 +154,8 @@ class Worker:
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
 
-        if self.device.type == "cuda" and self.device.index is not None:
-            torch.cuda.set_device(self.device)
+        if self.device.type != "cpu" and self.device.index is not None:
+            torch.accelerator.set_device_index(self.device)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -166,7 +166,10 @@ class Worker:
             dist_init_method = f"tcp://{hostname}:29500"
 
         self.parallel_groups = parallel_groups
-        self.parallel_groups.init_dist(init_method=dist_init_method)
+        self.parallel_groups.init_dist(
+            init_method=dist_init_method,
+            device=self.device,
+        )
 
         # Build node_to_partition mapping from model's partitions and graph walks
         node_to_partition: dict[str, str] = {}
@@ -1112,7 +1115,7 @@ class Worker:
         engine.reset_pre_plan_for_batch(spec_node_batch)
 
     def _init_cuda_executor_thread(self) -> None:
-        """Pin this executor thread to the worker's CUDA device.
+        """Pin this executor thread to the worker's accelerator device.
 
         The CUDA current device is per-thread and defaults to 0. PyTorch
         ops carry per-tensor device guards, but raw Triton launches and
@@ -1121,8 +1124,8 @@ class Worker:
         lives on a non-zero device, work issued from an unpinned thread
         lands on device 0's stream, unordered with the real compute.
         """
-        if self.device.type == "cuda" and self.device.index is not None:
-            torch.cuda.set_device(self.device)
+        if self.device.type != "cpu" and self.device.index is not None:
+            torch.accelerator.set_device_index(self.device)
 
     @contextmanager
     def _span(self, name: str):
@@ -1190,9 +1193,14 @@ class Worker:
                 engine.reset_pre_plan_for_batch(node_batch)
             with self._span("worker.gpu_thread.exec"):
                 outputs = engine.exec_and_postprocess(node_batch)
-            if torch.cuda.is_available():
-                event = torch.cuda.Event()
-                event.record(torch.cuda.default_stream(self.device))
+            execution_stream = (
+                torch.accelerator.current_stream(self.device)
+                if self.device.type != "cpu"
+                else None
+            )
+            if execution_stream is not None:
+                event = torch.Event()
+                event.record(execution_stream)
                 node_batch.completion_event = event
             return outputs
         finally:
@@ -1703,7 +1711,7 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        if torch.cuda.is_available() and batch_N.batch.node_objects:
+        if self.device.type != "cpu" and batch_N.batch.node_objects:
             if batch_N.node_batch.completion_event is not None:
                 if self.enable_nvtx:
                     range_push("worker.postprocess.completion_event_sync", synchronize=False)
@@ -1711,7 +1719,7 @@ class Worker:
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
             else:
-                torch.cuda.default_stream().synchronize()
+                torch.accelerator.synchronize(self.device)
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -2575,4 +2583,3 @@ class Worker:
                 _set_pending(None)
                 consecutive_spec_steps = 0
                 sleep(0.01)
-

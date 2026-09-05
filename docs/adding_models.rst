@@ -156,6 +156,16 @@ You must implement these abstract methods:
 
    See `Step 4 — Implement the submodules`_.
 
+.. note::
+
+   ``model_kwargs`` reaches your model from clients through the OpenAI routes'
+   ``extra_body`` passthrough. The Dynamo bridge
+   (``mstar/integrations/dynamo/bridges.py``) strips OpenAI-standard fields no
+   model consumes (``_STRIP_KEYS``) before that passthrough runs. If your model
+   starts reading such a field from ``model_kwargs`` — the way ``ignore_eos`` is
+   read — also delete the key from ``_STRIP_KEYS``, or requests arriving through
+   the Dynamo frontend will silently lose it.
+
 The following methods have defaults and are optional to override:
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,

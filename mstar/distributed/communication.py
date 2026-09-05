@@ -229,6 +229,7 @@ class WorkerParallelGroups:
     # projections).
     node_to_tp_group: dict[str, CommGroup] = field(default_factory=dict)
     node_to_sp_group: dict[str, CommGroup] = field(default_factory=dict)
+    _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
 
@@ -252,6 +253,7 @@ class WorkerParallelGroups:
 
     def init_dist(
         self, init_method="tcp://127.0.0.1:29500",
+        device: torch.device | None = None,
     ):
         """Initialize the NCCL world group and per-node parallel subgroups.
 
@@ -268,15 +270,20 @@ class WorkerParallelGroups:
         every rank — members keep the returned handle, non-members
         discard it.
         """
-        torch.cuda.set_device(self.global_rank)
+        device = device or torch.device("cuda", self.global_rank)
+        self._device = device
+        if device.type != "cpu":
+            torch.accelerator.set_device_index(device)
+        backend = dist.get_default_backend_for_device(device.type)
         if not self.any_parallelism:
             return
 
         dist.init_process_group(
-            backend="nccl",
+            backend=backend,
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
+            device_id=device,
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
@@ -428,4 +435,3 @@ class GlobalParallelConfig:
                         self.per_worker_config[worker_ids[rank]].add_sp(
                             node, self.sp_comm_groups[key]
                         )
-

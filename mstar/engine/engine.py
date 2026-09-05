@@ -465,7 +465,8 @@ class Engine:
         try:
             # inference-only, under the same scope the capture path used
             with torch.no_grad(), autocast_scope(
-                self._autocast_dtype_for(self._submodules[batch.node_name].submodule)
+                self._autocast_dtype_for(self._submodules[batch.node_name].submodule),
+                device_type=self._device.type,
             ):
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
