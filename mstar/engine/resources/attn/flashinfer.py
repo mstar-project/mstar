@@ -170,6 +170,7 @@ class FlashInferManager(AttentionManager):
         self._preplan_states = {}
 
     ### Submodule-level functionality
+    @torch.compiler.disable
     def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:
         if label not in self._current_plan_states:
             return
