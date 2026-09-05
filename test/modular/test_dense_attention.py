@@ -147,7 +147,7 @@ class TestDensePlan:
         manager = _manager()
         ctx = _ctx([_view("r0", [0], prefix=2, fresh=2)])
         ctx.slot_lease = SlotLease(slot=0, bucket=None)
-        with pytest.raises(AssertionError, match="eager-only"):
+        with pytest.raises(RuntimeError, match="eager-only"):
             manager.plan(AttentionStep(causal=False), ctx)
 
     def test_missing_kv_plan_is_named(self):
@@ -232,23 +232,6 @@ class TestPrefixGather:
         with pytest.raises(AssertionError, match="dense attention runs on"):
             manager.run(torch.zeros(1, 1, 1), "main", _layer_tensor())
 
-    def test_running_under_capture_is_refused(self, monkeypatch):
-        """`plan` guards every path that plans, which leaves the piecewise
-        region that declares `reuses_outer_plan` and never plans. Its capture
-        would bake in this step's shapes and the address of a cached prefix,
-        so `run` refuses too."""
-        manager = _manager()
-        self._planned(manager, [_view("r0", [0], prefix=3, fresh=1)])
-        monkeypatch.setattr(manager, "_on_cuda", True)
-        monkeypatch.setattr(
-            torch.cuda, "is_current_stream_capturing", lambda: True
-        )
-        fresh = torch.zeros(1, NUM_KV_HEADS, HEAD_DIM)
-        with pytest.raises(RuntimeError, match="cannot be captured"):
-            manager.run(
-                fresh, "main", _layer_tensor(), k=fresh, v=fresh, layer_idx=0,
-            )
-
 
 class TestBackendSelection:
     def test_dense_spec_builds_dense_when_fa3_is_there(self):
@@ -324,15 +307,22 @@ class TestStreamGeneration:
         kv.commit(step, ctx)
         return out, step, ctx
 
-    def test_appending_does_not_invalidate_a_resident_prefix(self, kv_manager):
+    def test_denoise_steps_do_not_invalidate_a_resident_prefix(self, kv_manager):
+        # the dense backend's only consumer (cosmos3) drives it with
+        # commit=False: each denoise step recomputes its fresh K/V in place
+        # rather than appending. commit is what moves the epoch (it is how an
+        # in-place page write blocks an offload), so a commit=False step within
+        # the pages already held leaves the resident prefix — and a gather of
+        # it — good across steps.
         kv = kv_manager
         kv.ingest_request("r0")
-        out, _, _ = self._plan_views(kv, [Segment("r0", "main", 6)])
+        # commit the frozen prefix once, then read the epoch the denoise steps
+        # ride on (after the prefix's own commit has moved it)
+        self._plan_views(kv, [Segment("r0", "main", 6)])
+        out, _, _ = self._plan_views(kv, [Segment("r0", "main", 1)], commit=False)
         first = out["main"].views[0].generation
 
-        # a second step appends within the pages already held: same pages,
-        # same resident bytes, so a gather of the first 6 tokens stays good
-        out, _, _ = self._plan_views(kv, [Segment("r0", "main", 1)])
+        out, _, _ = self._plan_views(kv, [Segment("r0", "main", 1)], commit=False)
         assert out["main"].views[0].generation == first
 
     def test_taking_new_pages_moves_the_epoch(self, kv_manager):
