@@ -27,11 +27,10 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import ParallelSparseMoeBlock, RMSNorm
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
-from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, Qwen3OmniModelConfig
 
 
 class Qwen3OmniThinkerLayer(nn.Module):
@@ -68,6 +67,9 @@ class Qwen3OmniThinkerLayer(nn.Module):
             rms_norm_eps=tc.rms_norm_eps,
             use_mrope=True,
             comm_group=comm_group,
+            attn_key=THINKER_ATTN,
+            kv_key=THINKER_KV,
+            pos_key=THINKER_POS
         )
 
         # Post-attention layernorm
@@ -101,14 +103,12 @@ class Qwen3OmniThinkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
     ) -> torch.Tensor:
         """
         Args:
             hidden_states: [tokens, hidden_size]
-            cache_handle: BatchedCacheManager with pre-planned attention.
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE.
 
@@ -120,7 +120,6 @@ class Qwen3OmniThinkerLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states,
-            cache_handle=cache_handle,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
         )
@@ -188,26 +187,22 @@ class Qwen3OmniThinkerModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
-        mrope_pos_advance: Optional[list[int]] = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
+        label: str = "main",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             input_embeds: [tokens, hidden_size] -- pre-embedded input
                 (token embeddings possibly merged with multimodal features).
-            cache_handle: BatchedCacheManager with pre-planned attention
-                and RoPE.
             cos_sin_3d: (cos, sin) for 3D MRoPE, each [tokens, head_dim].
             mrope_section: section sizes for interleaved 3D MRoPE,
                 e.g. [24, 20, 20].
-            mrope_pos_advance: optional per-request MRoPE position advance
-                for ``advance_seq_lens``.  Vision prefill passes an explicit
-                value because the 3D-grid position span is larger than the
-                number of tokens; text / audio / decode leave it None and
-                ``position_id_start`` advances by ``seq_len``.
+            label: the plan key every layer runs against. The stream's
+                stored length and position counter advance when the runner
+                commits the declared step (vision prefill declares its
+                MRoPE 3D-grid span there).
 
         Returns:
             hidden_states: [tokens, hidden_size] -- final normed hidden states
@@ -221,11 +216,14 @@ class Qwen3OmniThinkerModel(nn.Module):
         layer_0_embed = hidden_states.clone()
         layer_n_hidden = None
 
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.model.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.model.layers):
-            cache_handle.set_layer_idx(layer_idx)
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
             hidden_states = decoder_layer(
                 hidden_states,
-                cache_handle=cache_handle,
                 cos_sin_3d=cos_sin_3d,
                 mrope_section=mrope_section,
             )
@@ -240,18 +238,6 @@ class Qwen3OmniThinkerModel(nn.Module):
             # Capture hidden states at the accept_hidden_layer for Talker
             if layer_idx == self.accept_hidden_layer:
                 layer_n_hidden = hidden_states.clone()
-
-        # Advance sequence lengths after all layers.  ``pos_id_ns`` decouples
-        # the position-id advance from the seq-len advance (needed for vision
-        # prefill where the 3D-grid span != number of tokens).
-        #
-        # NOTE: correct for eager + decode-only capture.  CudaGraphRunner
-        # does its own post-replay ``advance_seq_lens()`` at
-        # cuda_graph_runner.py:552 with no args, so this ``pos_id_ns`` is
-        # NOT honored on the replay path.  If we ever capture vision
-        # prefill, that runner call would need to accept a submodule-
-        # supplied ``pos_id_ns``.
-        cache_handle.advance_seq_lens(pos_id_ns=mrope_pos_advance)
 
         # Final layer norm
         hidden_states = self.model.norm(hidden_states)

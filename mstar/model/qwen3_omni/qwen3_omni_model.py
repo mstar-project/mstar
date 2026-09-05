@@ -40,17 +40,37 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+from mstar.model.qwen3_omni.config import (
+    CODE_PRED_SAMPLER,
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    TALKER_SAMPLER,
+    THINKER_ATTN,
+    THINKER_KV,
+    THINKER_POS,
+    THINKER_SAMPLER,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import Operation, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -147,44 +167,112 @@ class Qwen3OmniModel(Model):
         # Lazy submodule cache -- each worker only loads what it needs
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-    # -----------------------------------------------------------------------
-    # Model ABC: KV cache config
-    # -----------------------------------------------------------------------
-
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        """Return separate KV cache configs for Thinker and Talker."""
-        thinker_cfg = KVCacheConfig(
+    # -------------------------------------------------------------------
+    # Model ABC: resources
+    # -------------------------------------------------------------------
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        thinker_kv = KVConfig(
             num_layers=self.config.thinker_text.num_hidden_layers,
             num_kv_heads=self.config.thinker_text.num_key_value_heads,
             head_dim=self.config.thinker_head_dim,
             max_seq_len=self.config.thinker_text.max_position_embeddings,
             num_qo_heads=self.config.thinker_text.num_attention_heads,
-            nodes=["Thinker"]
         )
-        talker_cfg = KVCacheConfig(
+        talker_kv = KVConfig(
             num_layers=self.config.talker_text.num_hidden_layers,
             num_kv_heads=self.config.talker_text.num_key_value_heads,
             head_dim=self.config.talker_head_dim,
             max_seq_len=self.config.thinker_text.max_position_embeddings,
             num_qo_heads=self.config.talker_text.num_attention_heads,
-            nodes=["Talker"]
         )
-        return [thinker_cfg, talker_cfg]
 
-    # -----------------------------------------------------------------------
-    # Model ABC: node engine types
-    # -----------------------------------------------------------------------
+        return [
+            KVSpec(
+                resource_key=THINKER_KV,
+                nodes={"Thinker"},
+                config=thinker_kv
+            ),
+            KVSpec(
+                resource_key=TALKER_KV,
+                nodes={"Talker"},
+                config=talker_kv
+            ),
+            AttentionSpec(
+                resource_key=THINKER_ATTN,
+                nodes={"Thinker"},
+                config=AttentionConfig(
+                    kv_cache=THINKER_KV
+                ),
+            ),
+            AttentionSpec(
+                resource_key=TALKER_ATTN,
+                nodes={"Talker"},
+                config=AttentionConfig(
+                    kv_cache=TALKER_KV
+                ),
+            ),
+            PositionSpec(
+                resource_key=THINKER_POS,
+                nodes={"Thinker"},
+                config=PositionConfig(
+                    kv_cache=THINKER_KV
+                )
+            ),
+            PositionSpec(
+                resource_key=TALKER_POS,
+                nodes={"Talker"},
+                config=PositionConfig(
+                    kv_cache=TALKER_KV
+                )
+            ),
+            SamplerSpec(
+                resource_key=THINKER_SAMPLER,
+                nodes={"Thinker"},
+                vocab_size=self.config.thinker_text.vocab_size,
+                enable_repetion_penalty=True,
+            ),
+            SamplerSpec(
+                resource_key=TALKER_SAMPLER,
+                nodes={"Talker"},
+                vocab_size=self.config.talker_text.vocab_size,
+                enable_repetion_penalty=True,
+            ),
+            SamplerSpec(
+                resource_key=CODE_PRED_SAMPLER,
+                nodes={"Talker"},
+                vocab_size=self.config.code_predictor.vocab_size,
+                enable_repetion_penalty=False,
+            )
+        ]
 
-    def get_node_engine_types(self) -> dict[str, EngineType]:
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
+        model_kwargs = model_kwargs or {}
+
         return {
-            "audio_encoder": EngineType.STATELESS,
-            "vision_encoder": EngineType.STATELESS,
-            "Thinker": EngineType.KV_CACHE,
-            "Talker": EngineType.KV_CACHE,
-            "Code2Wav": EngineType.STATELESS,
+            THINKER_SAMPLER: SamplingReqConfig(
+                temperature=model_kwargs.get("thinker_temperature", 0.7),
+                top_p=model_kwargs.get("thinker_top_p", 0.9),
+                ignore_eos=model_kwargs.get("ignore_eos", False),
+                repetition_penalty=model_kwargs.get("thinker_repetition_penalty", 1.0)
+            ),
+            TALKER_SAMPLER: SamplingReqConfig(
+                temperature=model_kwargs.get("talker_temperature", 0.9),
+                top_k=model_kwargs.get("talker_top_k", 50),
+                top_p=model_kwargs.get("talker_top_p", 1.0),
+                repetition_penalty=model_kwargs.get("talker_repetition_penalty", 1.05)
+            ),
+            CODE_PRED_SAMPLER: SamplingReqConfig(
+                temperature=model_kwargs.get("code_predictor_temperature", 1.0),
+                top_k=model_kwargs.get("code_predictor_top_k", 50),
+                top_p=model_kwargs.get("code_predictor_top_p", 0.8),
+            )
         }
 
-    def get_max_talker_output_tokens(self, **model_kwargs):
+    def _get_max_talker_output_tokens(self, **model_kwargs):
         return model_kwargs.get("talker_max_output_tokens", MAX_OUTPUT_TOKENS)
 
     # -----------------------------------------------------------------------
@@ -476,58 +564,6 @@ class Qwen3OmniModel(Model):
             ],
         )
 
-    # -----------------------------------------------------------------------
-    # Model ABC: sampling config
-    # -----------------------------------------------------------------------
-    def get_sampling_config(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    )  -> SamplingConfig | None:
-        if model_kwargs is None:
-            model_kwargs = {}
-
-        if node_name == "Thinker":
-            temperature = model_kwargs.get("thinker_temperature", 0.7)
-            top_p = model_kwargs.get("thinker_top_p", 0.9)
-            # only apply ignore_eos to the thinker
-            ignore_eos = model_kwargs.get("ignore_eos", False)
-            return SamplingConfig(
-                vocab_size=self.config.thinker_text.vocab_size,
-                temperature=temperature, top_p=top_p,
-                ignore_eos=ignore_eos
-            )
-        if node_name == "Talker":
-            temperature = model_kwargs.get("talker_temperature", 0.9)
-            top_k = model_kwargs.get("talker_top_k", 50)
-            top_p = model_kwargs.get("talker_top_p", 1.0)
-            repetition_penalty = model_kwargs.get("talker_repetition_penalty", 1.05)
-            return SamplingConfig(
-                vocab_size=self.config.talker_text.vocab_size,
-                temperature=temperature, top_p=top_p, top_k=top_k,
-                repetition_penalty=repetition_penalty
-            )
-        # fallback to default config
-        return SamplingConfig()
-
-    def get_aux_sampling_configs(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> dict[str, SamplingConfig]:
-        """The Talker's CodePredictor samples residual codec groups 1..N-1 with
-        its own params (the Talker LLM samples group 0 via the main config)."""
-        if node_name != "Talker":
-            return {}
-        model_kwargs = model_kwargs or {}
-        # No vocab_size: the depth loop applies no repetition penalty, so the
-        # seen-token mask buffers aren't allocated for this label.
-        return {
-            "code_predictor": SamplingConfig(
-                temperature=model_kwargs.get("code_predictor_temperature", 1.0),
-                top_k=model_kwargs.get("code_predictor_top_k", 50),
-                top_p=model_kwargs.get("code_predictor_top_p", 0.8),
-            )
-        }
-
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         # Qwen3-Omni's Code2Wav vocoder emits speech at 24 kHz.
         return 24000
@@ -573,7 +609,7 @@ class Qwen3OmniModel(Model):
                     ),
                     "prefill_chunks_processed": 0,
                     "voice": model_kwargs.get("voice", "Ethan"),
-                    "talker_max_tokens": self.get_max_talker_output_tokens(**model_kwargs),
+                    "talker_max_tokens": self._get_max_talker_output_tokens(**model_kwargs),
                 },
             )
             return ForwardPassArgs(
@@ -1507,6 +1543,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeAudioEncoder,
         )
 
+        from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Load config only (no weights)
@@ -1524,6 +1561,7 @@ class Qwen3OmniModel(Model):
         # (which resolves to "sdpa"), Qwen3OmniMoeAudioAttention runs
         # SDPA on the full packed sequence (no per-segment fusion),
         # which is significantly slower than FA2's varlen path.
+        patch_hf_fa2_int_maxlen()
         audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
             audio_config, attn_implementation="flash_attention_2"
         )
@@ -1546,6 +1584,7 @@ class Qwen3OmniModel(Model):
             Qwen3OmniMoeVisionEncoder,
         )
 
+        from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
         # Load full config (no weights)
@@ -1567,6 +1606,7 @@ class Qwen3OmniModel(Model):
         # N-frame video. This causes the 10× V2T/V2S TTFT regression vs
         # vllm-omni. With "flash_attention_2", a single varlen FA2 call
         # per layer handles all frames at once via cu_seqlens.
+        patch_hf_fa2_int_maxlen()
         vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
             vision_config, attn_implementation="flash_attention_2"
         )

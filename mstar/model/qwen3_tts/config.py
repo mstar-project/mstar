@@ -16,6 +16,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# Resource label constants (Talker node)
+# ---------------------------------------------------------------------------
+TALKER_KV = "talker_kv"
+TALKER_ATTN = "talker_attn"
+TALKER_POS = "talker_pos"
+TALKER_SAMPLER = "talker_sampler"
+CODE_PRED_SAMPLER = "code_predictor"
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     """Read optional checkpoint metadata, leaving dataclass defaults intact."""

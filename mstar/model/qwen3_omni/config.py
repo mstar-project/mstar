@@ -16,6 +16,22 @@ from pathlib import Path
 from typing import Any, Tuple
 
 # ---------------------------------------------------------------------------
+# Resource label constants
+# ---------------------------------------------------------------------------
+THINKER_KV = "thinker_kv"
+TALKER_KV = "talker_kv"
+
+THINKER_ATTN = "thinker_attn"
+TALKER_ATTN = "talker_attn"
+
+THINKER_POS = "thinker_pos"
+TALKER_POS = "talker_pos"
+
+THINKER_SAMPLER = "thinker_sampler"
+TALKER_SAMPLER = "talker_sampler"
+CODE_PRED_SAMPLER = "code_sampler"
+
+# ---------------------------------------------------------------------------
 # Thinker text backbone
 # ---------------------------------------------------------------------------
 

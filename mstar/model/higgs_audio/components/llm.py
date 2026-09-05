@@ -17,7 +17,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -25,7 +24,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+from mstar.model.higgs_audio.config import ATTN, KV_CACHE, ROPE, HiggsAudioModelConfig
 
 
 def _build_decoder_layer(
@@ -42,6 +41,9 @@ def _build_decoder_layer(
             rms_norm_eps=config.rms_norm_eps,
             rope_theta=config.rope_theta,
             input_hidden_size=config.hidden_size,
+            attn_key=ATTN,
+            kv_key=KV_CACHE,
+            pos_key=ROPE,
         ),
         mlp=ParallelGatedMLP(
             comm_group=comm_group,
@@ -83,14 +85,17 @@ class HiggsAudioLLM(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = input_embeds
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
-            hidden_states = decoder_layer(
-                hidden_states=hidden_states, cache_handle=cache_handle,
-            )
-        cache_handle.advance_seq_lens()
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states = decoder_layer(hidden_states=hidden_states)
+        # the advance is the runner's now, off the step declaration
         return self.norm(hidden_states)

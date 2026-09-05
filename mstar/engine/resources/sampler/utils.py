@@ -11,12 +11,11 @@ CUDA graph compatible: no Python control flow branches — uses masking
 to handle greedy vs sampled requests in the same batch.
 
 Usage:
-    from mstar.utils.sampling import sample_tokens
+    from mstar.engine.resources.sampler.utils import sample_tokens
     tokens = sample_tokens(logits, temperature=0.7, top_p=0.9)
 """
 
 import logging
-import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
@@ -228,44 +227,6 @@ class SamplingConfig:
 
 
 @dataclass
-class MultiSamplingConfig:
-    """A node's sampling configs: the main one plus any labelled aux samplers.
-
-    Aux samplers exist for submodules that sample more than once per step with
-    different params — e.g. the Qwen3-Omni Talker samples codec group 0 from the
-    Talker LLM and groups 1..N-1 from the CodePredictor.
-    """
-    # Never None after construction — see ``__post_init__``. Callers of a node's
-    # config can read ``.main`` unguarded.
-    main: SamplingConfig = field(default_factory=SamplingConfig)
-    aux: dict[str, SamplingConfig] = field(default_factory=dict)
-
-    def __post_init__(self):
-        if self.main is None:
-            # Allow the upstream (e.g., a model implementation) to return None
-            # for its base config, but set it to the default sampling config here.
-            self.main = SamplingConfig()
-
-    def set_seed(self, seed: int):
-        self.main.set_seed(seed)
-        for label, cfg in self.aux.items():
-            # Derive aux seeds from the request seed so aux draws don't replay
-            # the main sampler's philox stream. crc32 (unlike hash()) is stable
-            # across processes, so TP ranks derive the same seed.
-            cfg.set_seed(seed ^ (zlib.crc32(label.encode()) & 0x7FFFFFFF))
-
-    @property
-    def seed(self):
-        return self.main.seed
-
-    @property
-    def ignore_eos(self) -> bool:
-        # Stop conditions are a main-config concern; submodules' ``check_stop``
-        # reads this straight off the node's config.
-        return self.main.ignore_eos
-
-
-@dataclass
 class BaseSampler(ABC):
     def _broadcast_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         """In-place broadcast of ``tokens`` from rank 0 to all TP ranks.
@@ -285,35 +246,6 @@ class BaseSampler(ABC):
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
         pass
-
-
-@dataclass
-class BaseMultiSampler(BaseSampler):
-    main: BaseSampler
-    aux: dict[str, BaseSampler] = field(default_factory=dict)
-
-    @property
-    def tp_group(self):
-        # Every label shares the submodule's communicator; expose main's so
-        # ``_broadcast_tokens`` called on the multi-sampler still broadcasts
-        # (without this it reads no tp_group and silently no-ops).
-        return getattr(self.main, "tp_group", None)
-
-    def sample(
-        self, request_ids: list[str], logits: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
-        return self.main.sample(request_ids, logits, **kwargs)
-
-    def sample_aux(
-        self, label: str,
-        request_ids: list[str],
-        logits: torch.Tensor, **kwargs
-    ) -> torch.Tensor:
-        assert label in self.aux, (
-            f"No aux sampler {label!r} (have {sorted(self.aux)}). The node's "
-            "``get_aux_sampling_configs`` must declare it."
-        )
-        return self.aux[label].sample(request_ids, logits, **kwargs)
 
 
 @dataclass
@@ -393,6 +325,8 @@ class Sampler(BaseSampler):
                 device=self.device
             )
 
+    # sampling runs inside the forward; nothing here is worth tracing
+    @torch.compiler.disable
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
     ) -> torch.Tensor:
@@ -470,52 +404,6 @@ class Sampler(BaseSampler):
         return tokens
 
 
-@dataclass
-class MultiSampler(BaseMultiSampler):
-    """Eager ``Sampler`` per label. Each owns its own per-request state."""
-    main: Sampler
-    aux: dict[str, Sampler] = field(default_factory=dict)
-
-    @classmethod
-    def new(
-        cls, aux_labels: list[str],
-        device: torch.device,
-        **sampler_kwargs
-    ) -> "MultiSampler":
-        return cls(
-            main=Sampler(device, **sampler_kwargs),
-            aux={
-                label: Sampler(device, **sampler_kwargs) \
-                    for label in aux_labels
-            }
-        )
-
-    def add_request(self, request_id: str):
-        self.main.add_request(request_id)
-        for aux in self.aux.values():
-            aux.add_request(request_id)
-
-    def get_token_mask(self, request_id: str):
-        return self.main.get_token_mask(request_id)
-
-    def get_aux_token_masks(self, request_id: str):
-        return {
-            label: sampler.get_token_mask(request_id) \
-                for label, sampler in self.aux.items()
-        }
-
-    def remove_request(self, request_id: str):
-        self.main.remove_request(request_id)
-        for aux in self.aux.values():
-            aux.remove_request(request_id)
-
-    def set_config(self, request_id: str, config: MultiSamplingConfig):
-        self.main.set_config(request_id, **asdict(config.main))
-        for label in config.aux.keys() & self.aux.keys():
-            self.aux[label].set_config(request_id, **asdict(config.aux[label]))
-
-
-@torch.compiler.disable
 def sample_tokens(
     logits: torch.Tensor,
     temperature: float | torch.Tensor = 0.6,
@@ -741,49 +629,19 @@ class CudaGraphableSampler(BaseSampler):
         """
         if self.seen_tokens_buf is None:
             return
+        # One multi-tensor-apply instead of bs separate copy_ launches. The
+        # masks are separately-owned tensors, so a single index_copy_ would
+        # need them to be views into one buffer; _foreach_copy_ fuses the
+        # launches without changing that ownership.
+        dsts = []
+        srcs = []
         for i, m in enumerate(seen_masks):
             mask = m._seen_token_mask
             if mask is not None:
-                mask.copy_(self.seen_tokens_buf[i])
-
-
-@dataclass
-class MultiCudaGraphableSampler(BaseMultiSampler):
-    """Graph-safe counterpart of ``MultiSampler``, built by ``MultiSamplerBuffers``.
-
-    Submodules sample the main stream with ``sample`` and each aux stream with
-    ``sample_aux(label, ...)``; every param comes from the label's own static
-    device buffers, so replay honours per-request configs without recapture.
-    """
-    main: CudaGraphableSampler
-    aux: dict[str, CudaGraphableSampler] = field(default_factory=dict)
-
-    def _samplers(self) -> "Iterable[CudaGraphableSampler]":
-        return [self.main, *self.aux.values()]
-
-    @property
-    def applied_penalty_in_graph(self) -> bool:
-        return any(s.applied_penalty_in_graph for s in self._samplers())
-
-    @applied_penalty_in_graph.setter
-    def applied_penalty_in_graph(self, value: bool) -> None:
-        for s in self._samplers():
-            s.applied_penalty_in_graph = value
-
-    @torch.compiler.disable
-    def sync_seen_token_masks(
-        self, request_ids: list[str], sampler: MultiSampler,
-    ) -> None:
-        """Sync each label's in-graph rows back to its eager ``SeenTokenMask``s."""
-        self.main.sync_seen_token_masks(
-            [sampler.main.get_token_mask(rid) for rid in request_ids]
-        )
-        for label, aux in self.aux.items():
-            eager = sampler.aux.get(label)
-            if eager is not None:
-                aux.sync_seen_token_masks(
-                    [eager.get_token_mask(rid) for rid in request_ids]
-                )
+                dsts.append(mask)
+                srcs.append(self.seen_tokens_buf[i])
+        if dsts:
+            torch._foreach_copy_(dsts, srcs)
 
 
 @dataclass
@@ -795,6 +653,8 @@ class Buffer:
     - ``master``  ``[capacity]`` slot-indexed cache, one row per active request.
     - ``row_cpu`` ``[1]`` pinned staging for a single async H2D master-row write.
     """
+    # ``[cg_slots, max_bs]``: one per-step row per double-buffer slot, so a
+    # pre-plan gathering into one slot doesn't clobber the replay reading another
     buf: torch.Tensor
     master: torch.Tensor
     row_cpu: torch.Tensor
@@ -804,10 +664,10 @@ class Buffer:
     @classmethod
     def allocate(
         cls, max_bs: int, capacity: int, device: torch.device,
-        dtype: torch.dtype, default: float, pinned: bool,
+        dtype: torch.dtype, default: float, pinned: bool, cg_slots: int = 1,
     ) -> "Buffer":
         return cls(
-            buf=torch.full((max_bs,), default, dtype=dtype, device=device),
+            buf=torch.full((cg_slots, max_bs), default, dtype=dtype, device=device),
             master=torch.full((capacity,), default, dtype=dtype, device=device),
             row_cpu=torch.zeros(1, dtype=dtype, pin_memory=pinned),
             default=default,
@@ -825,17 +685,22 @@ class Buffer:
         new[: self.master.shape[0]].copy_(self.master)
         self.master = new
 
-    def gather(self, idx_view: torch.Tensor, padded_bs: int) -> None:
-        torch.index_select(self.master, 0, idx_view, out=self.buf[:padded_bs])
+    def slot_view(self, cg_slot: int, bs: int) -> torch.Tensor:
+        """This slot's per-step row (clamped: a single-buffered buffer — the
+        RNG offset, gathered inline and used serialized — ignores ``cg_slot``)."""
+        return self.buf[cg_slot if self.buf.shape[0] > 1 else 0, :bs]
 
-    def scatter(self, idx_view: torch.Tensor, real_bs: int) -> None:
+    def gather(self, idx_view: torch.Tensor, padded_bs: int, cg_slot: int) -> None:
+        torch.index_select(self.master, 0, idx_view, out=self.slot_view(cg_slot, padded_bs))
+
+    def scatter(self, idx_view: torch.Tensor, real_bs: int, cg_slot: int) -> None:
         """Persist the per-step rows back to their slots (GPU-only, no CPU).
 
         Inverse of ``gather`` — for buffers whose per-step value is advanced in
         graph (the RNG offset). REAL rows only: padding rows all gather from
         slot 0 and get advanced too, so scattering them would clobber slot 0.
         """
-        self.master.index_copy_(0, idx_view[:real_bs], self.buf[:real_bs])
+        self.master.index_copy_(0, idx_view[:real_bs], self.slot_view(cg_slot, real_bs))
 
 
 @dataclass
@@ -845,16 +710,17 @@ class MaskBuffer:
     Mirrors ``Buffer`` but 2-D and sourced from on-device ``SeenTokenMask``
     tensors, so the master-row write is a GPU->GPU copy (no pinned staging).
     """
-    buf: torch.Tensor       # [max_bs, V] bool
+    buf: torch.Tensor       # [cg_slots, max_bs, V] bool
     master: torch.Tensor    # [capacity, V] bool
     vocab_size: int
 
     @classmethod
     def allocate(
         cls, max_bs: int, capacity: int, vocab_size: int, device: torch.device,
+        cg_slots: int = 1,
     ) -> "MaskBuffer":
         return cls(
-            buf=torch.zeros(max_bs, vocab_size, dtype=torch.bool, device=device),
+            buf=torch.zeros(cg_slots, max_bs, vocab_size, dtype=torch.bool, device=device),
             master=torch.zeros(capacity, vocab_size, dtype=torch.bool, device=device),
             vocab_size=vocab_size,
         )
@@ -873,8 +739,13 @@ class MaskBuffer:
         new[: self.master.shape[0]].copy_(self.master)
         self.master = new
 
-    def gather(self, idx_view: torch.Tensor, padded_bs: int) -> None:
-        torch.index_select(self.master, 0, idx_view, out=self.buf[:padded_bs])
+    def slot_view(self, cg_slot: int, bs: int) -> torch.Tensor:
+        """This slot's per-step rows (clamped: single-buffered — the seen-token
+        mask, gathered inline and used serialized — ignores ``cg_slot``)."""
+        return self.buf[cg_slot if self.buf.shape[0] > 1 else 0, :bs]
+
+    def gather(self, idx_view: torch.Tensor, padded_bs: int, cg_slot: int) -> None:
+        torch.index_select(self.master, 0, idx_view, out=self.slot_view(cg_slot, padded_bs))
 
 
 @dataclass
@@ -891,7 +762,7 @@ class SamplerBuffers:
     seed. The optional ``seen_tokens`` ``MaskBuffer`` (allocated only when
     ``vocab_size`` is given) carries the per-request repetition-penalty mask.
 
-    ``gather_for_request_ids`` builds a pinned slot-index tensor, async-copies it
+    ``gather_static`` / ``gather_dynamic`` build a pinned slot-index tensor, async-copy it
     to GPU, and ``index_select``s each master into the per-step buffers — one
     cheap gather per buffer instead of the old per-element item-assignments.
     """
@@ -922,14 +793,25 @@ class SamplerBuffers:
     # Master cache capacity (grown by doubling when more requests are
     # concurrently registered than the per-step buffer holds).
     _master_capacity: int = field(default=0, repr=False)
-    # Per-step slot-index staging. ``_slot_idx_cpu`` is pinned so the H2D
-    # copy can be issued non-blocking; ``_slot_idx_gpu`` is the device-side
-    # index tensor that ``index_select`` reads from.
+    # Number of double-buffer slots (per-step buffers carry this leading dim).
+    cg_slots: int = 1
+    # Per-step slot-index staging, per cg slot. ``_slot_idx_cpu`` is pinned so
+    # the H2D copy can be issued non-blocking; ``_slot_idx_gpu`` is the
+    # device-side index tensor that ``index_select`` reads from.
     _slot_idx_cpu: torch.Tensor = field(default=None, repr=False)
     _slot_idx_gpu: torch.Tensor = field(default=None, repr=False)
-    # Real (unpadded) batch size of the last gather — the scatter-back writes
-    # only these rows (padding rows all map to slot 0).
-    _last_real_bs: int = field(default=0, repr=False)
+    # Zero-copy numpy view of ``_slot_idx_cpu``, so staging is one slice write
+    # rather than a tensor __setitem__ per row. Built lazily; the tensor is
+    # allocated once and never rebound, so the view stays valid.
+    _slot_idx_np: Any = field(default=None, repr=False)
+    # Real (unpadded) batch size of the last gather per cg slot — the
+    # scatter-back writes only these rows (padding rows all map to slot 0).
+    _last_real_bs: list[int] = field(default_factory=list, repr=False)
+    # cg slot -> the (rids, padded_bs) its pinned index row currently holds, so
+    # gather_dynamic can re-issue the H2D without redoing the O(bs) CPU fill
+    _staged_rids: dict[int, tuple[tuple[str, ...], int]] = field(
+        default_factory=dict, repr=False
+    )
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
@@ -954,22 +836,28 @@ class SamplerBuffers:
         device: torch.device,
         tp_group: "CommGroup | None" = None,  # noqa: F821
         vocab_size: int | None = None,
+        cg_slots: int = 1,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
         repetition penalty. The master rows default to a ``SamplingConfig()`` row
         (temp=1, top_k=0, top_p=1, rep_penalty=1) — what an unregistered slot
-        would surface if accidentally indexed.
+        would surface if accidentally indexed. ``cg_slots`` double-buffers the
+        per-step tensors so the sampler can pre-plan.
         """
         pinned = torch.cuda.is_available() and device.type == "cuda"
         cap = max_batch_size
 
-        def mk(dtype: torch.dtype, default: float) -> Buffer:
-            return Buffer.allocate(max_batch_size, cap, device, dtype, default, pinned)
+        def mk(dtype: torch.dtype, default: float, slots=cg_slots) -> Buffer:
+            return Buffer.allocate(
+                max_batch_size, cap, device, dtype, default, pinned, slots
+            )
 
+        # seen token mask is not double-buffered, as it depends on the GPU
+        # value of the previous step. Same goes for offset
         seen_tokens = (
-            MaskBuffer.allocate(max_batch_size, cap, vocab_size, device)
+            MaskBuffer.allocate(max_batch_size, cap, vocab_size, device, cg_slots=1)
             if vocab_size is not None else None
         )
         return cls(
@@ -979,27 +867,30 @@ class SamplerBuffers:
             top_p=mk(torch.float32, 1.0),
             seed=mk(torch.long, 0),
             rep_penalty=mk(torch.float32, 1.0),
-            offset=mk(torch.long, 0),
+            offset=mk(torch.long, 0, slots=1),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             _master_capacity=cap,
-            _slot_idx_cpu=torch.zeros(max_batch_size, dtype=torch.long, pin_memory=pinned),
-            _slot_idx_gpu=torch.zeros(max_batch_size, dtype=torch.long, device=device),
+            cg_slots=cg_slots,
+            _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
+            _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
+            _last_real_bs=[0] * cg_slots,
             _free_slots=list(range(cap)),
         )
 
-    def slice_for_bs(self, bs: int) -> dict[str, Any]:
-        """Return bs-sized views into each buffer (zero-copy slices) plus
+    def slice_for_bs(self, bs: int, cg_slot: int = 0) -> dict[str, Any]:
+        """Return bs-sized views into one slot's buffers (zero-copy slices) plus
         the owning submodule's ``tp_group`` so the constructed sampler
         broadcasts across TP ranks."""
+        # slot_view clamps single-buffered buffers (offset, seen mask) to slot 0
         return {
-            "temperature_buf": self.temperature.buf[:bs],
-            "top_k_buf": self.top_k.buf[:bs],
-            "top_p_buf": self.top_p.buf[:bs],
-            "seed_buf": self.seed.buf[:bs],
-            "offset_buf": self.offset.buf[:bs],
-            "rep_penalty_buf": self.rep_penalty.buf[:bs],
-            "seen_tokens_buf": self.seen_tokens.buf[:bs] if self.seen_tokens is not None else None,
+            "temperature_buf": self.temperature.slot_view(cg_slot, bs),
+            "top_k_buf": self.top_k.slot_view(cg_slot, bs),
+            "top_p_buf": self.top_p.slot_view(cg_slot, bs),
+            "seed_buf": self.seed.slot_view(cg_slot, bs),
+            "offset_buf": self.offset.slot_view(cg_slot, bs),
+            "rep_penalty_buf": self.rep_penalty.slot_view(cg_slot, bs),
+            "seen_tokens_buf": self.seen_tokens.slot_view(cg_slot, bs) if self.seen_tokens is not None else None,
             "tp_group": self.tp_group,
         }
 
@@ -1100,12 +991,17 @@ class SamplerBuffers:
     ) -> None:
         """Copy each request's current seen-token mask into its master row.
 
-        Called every step (before ``gather_for_request_ids``) for submodules that
+        Called every step (before ``gather_dynamic``) for submodules that
         sample with a penalty in-graph, so the gathered per-step buffer reflects
         the live prompt + generated tokens. No-op when seen-token tracking is off.
         """
         if self.seen_tokens is None:
             return
+        # Batched for the same reason as sync_seen_token_masks: bs launches
+        # become one. _init_slot still has to run per slot (it is CPU-side
+        # bookkeeping plus a master-row write) before anything is staged.
+        dsts = []
+        srcs = []
         for rid, m in zip(request_ids, seen_masks, strict=False):
             slot = self._rid_to_slot.get(rid)
             if slot is None:
@@ -1115,7 +1011,10 @@ class SamplerBuffers:
                 self._init_slot(slot, rid)
             mask = m._seen_token_mask
             if mask is not None:
-                self.seen_tokens.write_master_row(slot, mask)
+                dsts.append(self.seen_tokens.master[slot])
+                srcs.append(mask)
+        if dsts:
+            torch._foreach_copy_(dsts, srcs)
 
     def _init_slot(self, slot: int, rid: str) -> None:
         """GPU-side init for a newly registered slot. Must run on the thread
@@ -1123,160 +1022,98 @@ class SamplerBuffers:
         that read them (``register_request`` runs on the main thread)."""
         self.offset.master[slot:slot + 1].zero_()
         self._write_master_row(slot, self._cached_config[rid])
-        if self.seen_tokens is not None:
-            self.seen_tokens.clear_master_row(slot)
+        # mask row not cleared: always staged fresh before gather, and clearing
+        # here would race the default-stream stage from the plan stream
         self._pending_init.discard(slot)
 
     # ------------------------------------------------------------------
     # Per-step gather: pinned-H2D slot-index → index_select into per-step bufs
     # ------------------------------------------------------------------
 
-    def gather_for_request_ids(
-        self, request_ids: list[str], padded_bs: int,
-        gather_seen_tokens: bool = True,
-    ) -> "CudaGraphableSampler":
-        """Materialise the per-step sampling tensors for ``request_ids``.
+    def _stage_slot_idx(
+        self, request_ids: list[str], padded_bs: int, cg_slot: int,
+    ) -> None:
+        """Write this batch's master-slot indices into ``cg_slot``'s pinned row.
 
         Padding slots (``i >= len(request_ids)``) reuse slot 0's row — the
         captured graph forwards them through the same kernels as real slots,
-        but their outputs are discarded by the runner's dummy-rid remap, so
-        the row contents don't matter as long as they're well-formed.
+        but their outputs are discarded by the runner's dummy-rid remap.
+        Unregistered rids fall back to slot 0 (the config defaults).
         """
         assert padded_bs <= self.max_batch_size, (
             f"padded_bs={padded_bs} exceeds SamplerBuffers.max_batch_size="
             f"{self.max_batch_size}"
         )
-
-        # CPU-only fill of the pinned slot-index buffer. Unregistered rids
-        # fall back to slot 0 (matches the defaults — temp=1, top_k=0, top_p=1,
-        # rep_penalty=1 — for any rid the AR engine forgot to register).
-        for i, rid in enumerate(request_ids):
-            slot = self._rid_to_slot.get(rid)
+        # Batched for the same reason as stage_seen_token_masks: _init_slot has
+        # to run per slot, but the staging writes become one. Elementwise, this
+        # was ~46us at bs=16 — all Python, and the plan thread pays it inline.
+        if self._slot_idx_np is None:
+            self._slot_idx_np = self._slot_idx_cpu.numpy()
+        get = self._rid_to_slot.get
+        pending = self._pending_init
+        rows = []
+        for rid in request_ids:
+            slot = get(rid)
             if slot is None:
                 slot = 0
-            elif slot in self._pending_init:
-                # Ordered ahead of the gathers below because it's issued here.
+            elif slot in pending:
                 self._init_slot(slot, rid)
-            self._slot_idx_cpu[i] = slot
-        for i in range(len(request_ids), padded_bs):
-            self._slot_idx_cpu[i] = 0
+            rows.append(slot)
+        if len(rows) < padded_bs:
+            rows.extend([0] * (padded_bs - len(rows)))
+        self._slot_idx_np[cg_slot, :padded_bs] = rows
+        self._staged_rids[cg_slot] = (tuple(request_ids), padded_bs)
 
-        # Single async H2D (pinned) of the slot indices.
-        idx_view = self._slot_idx_gpu[:padded_bs]
-        idx_view.copy_(self._slot_idx_cpu[:padded_bs], non_blocking=True)
+    def _upload_slot_idx(self, padded_bs: int, cg_slot: int) -> torch.Tensor:
+        """H2D the staged row on the CURRENT stream, and hand back its view."""
+        idx_view = self._slot_idx_gpu[cg_slot, :padded_bs]
+        idx_view.copy_(self._slot_idx_cpu[cg_slot, :padded_bs], non_blocking=True)
+        return idx_view
 
-        # One index_select per buffer, writing directly into the
-        # cuda-graph-friendly per-step buffers. The RNG offset gathers the same
-        # way (by slot); the graph advances it in place and ``scatter_offset``
-        # persists it back to the master after replay — no CPU round-trip, and
-        # the offset follows the request's slot regardless of batch position.
+    def gather_static(
+        self, request_ids: list[str], padded_bs: int, cg_slot: int,
+    ) -> None:
+        """Gather the per-request scalar config (temp/top_k/top_p/seed/penalty)
+        into ``cg_slot``. Safe to pre-plan: these change only on a config
+        update, never step to step."""
+        self._stage_slot_idx(request_ids, padded_bs, cg_slot)
+        idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         for buf in self._scalar_buffers():
-            buf.gather(idx_view, padded_bs)
-        self.offset.gather(idx_view, padded_bs)
-        self._last_real_bs = len(request_ids)
-        # The seen-token mask is large ([bs, V] bool); only gather it when the
-        # caller's graph actually applies the penalty in-graph (the Talker), so
-        # non-penalty graphs that happen to allocate the buffer don't pay for it.
-        if self.seen_tokens is not None and gather_seen_tokens:
-            self.seen_tokens.gather(idx_view, padded_bs)
+            buf.gather(idx_view, padded_bs, cg_slot)
+        self._last_real_bs[cg_slot] = len(request_ids)
 
-        slices = self.slice_for_bs(padded_bs)
-        return CudaGraphableSampler(**slices)
-
-    def scatter_offset(self) -> None:
-        """Persist the (in-graph advanced) per-step offsets back to their slot
-        masters. Call once AFTER the graph replay for the last gather; GPU-only,
-        real rows only (padding rows all map to slot 0)."""
-        self.offset.scatter(self._slot_idx_gpu, self._last_real_bs)
-
-
-@dataclass
-class MultiSamplerBuffers:
-    """One ``SamplerBuffers`` per label — the graph-side owner of a node's configs.
-
-    Each label gets independent scalar/seed/offset buffers (and its own optional
-    seen-token mask, sized by that label's ``vocab_size``), so the aux samplers
-    neither share the main sampler's RNG stream nor its penalty state.
-    """
-    main: SamplerBuffers
-    aux: dict[str, SamplerBuffers] = field(default_factory=dict)
-
-    @classmethod
-    def allocate(
-        cls,
-        max_batch_size: int,
-        device: torch.device,
-        config: MultiSamplingConfig | None = None,
-        tp_group: "CommGroup | None" = None,  # noqa: F821
-    ) -> "MultiSamplerBuffers":
-        config = config or MultiSamplingConfig()
-        main_cfg = config.main
-
-        def mk(cfg: SamplingConfig) -> SamplerBuffers:
-            return SamplerBuffers.allocate(
-                max_batch_size=max_batch_size, device=device,
-                tp_group=tp_group, vocab_size=cfg.vocab_size,
-            )
-
-        return cls(
-            main=mk(main_cfg),
-            aux={label: mk(cfg) for label, cfg in config.aux.items()},
-        )
-
-    def register_request(
-        self, rid: str, config: MultiSamplingConfig | None = None,
-    ) -> None:
-        self.main.register_request(rid, config.main if config else None)
-        for label, bufs in self.aux.items():
-            bufs.register_request(rid, config.aux.get(label) if config else None)
-
-    def unregister_request(self, rid: str) -> None:
-        self.main.unregister_request(rid)
-        for bufs in self.aux.values():
-            bufs.unregister_request(rid)
-
-    def update_request_config(
-        self, rid: str, config: MultiSamplingConfig,
-    ) -> None:
-        self.main.update_request_config(rid, config.main)
-        for label, cfg in config.aux.items():
-            bufs = self.aux.get(label)
-            if bufs is not None:
-                bufs.update_request_config(rid, cfg)
-
-    def stage_seen_token_masks(
-        self, request_ids: list[str], sampler: MultiSampler,
-    ) -> None:
-        """Stage every label's live eager masks into its master rows."""
-        self.main.stage_seen_token_masks(
-            request_ids, [sampler.main.get_token_mask(rid) for rid in request_ids]
-        )
-        for label, bufs in self.aux.items():
-            eager = sampler.aux.get(label)
-            if eager is not None:
-                bufs.stage_seen_token_masks(
-                    request_ids,
-                    [eager.get_token_mask(rid) for rid in request_ids],
-                )
-
-    def gather_for_request_ids(
-        self, request_ids: list[str], padded_bs: int,
+    def gather_dynamic(
+        self, request_ids: list[str], padded_bs: int, cg_slot: int,
         gather_seen_tokens: bool = True,
-    ) -> MultiCudaGraphableSampler:
-        return MultiCudaGraphableSampler(
-            main=self.main.gather_for_request_ids(
-                request_ids, padded_bs, gather_seen_tokens,
-            ),
-            aux={
-                label: bufs.gather_for_request_ids(
-                    request_ids, padded_bs, gather_seen_tokens,
-                ) for label, bufs in self.aux.items()
-            },
-        )
+    ) -> None:
+        """Gather the per-step state — RNG offset and seen-token mask — into
+        ``cg_slot``. Must run inline (default stream) AFTER the previous step's
+        commit scattered the offset / synced the mask; pre-planning it reads
+        stale state across the plan/default stream boundary.
 
-    def scatter_offsets(self) -> None:
-        """Persist every label's advanced RNG offset back to its master. Call
-        once after the graph replay for the gather (see ``SamplerBuffers``)."""
-        self.main.scatter_offset()
-        for bufs in self.aux.values():
-            bufs.scatter_offset()
+        Only the H2D is re-issued (the pinned row ``gather_static`` staged for
+        this slot is stream-agnostic, and this step's batch is the one it was
+        staged for) — restaging is the fallback for a caller that reached here
+        without a matching ``gather_static``.
+
+        The seen-token mask is large ([bs, V] bool); only gathered when the
+        caller's graph actually applies the penalty in-graph (the Talker)."""
+        if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
+            self._stage_slot_idx(request_ids, padded_bs, cg_slot)
+        idx_view = self._upload_slot_idx(padded_bs, cg_slot)
+        self.offset.gather(idx_view, padded_bs, cg_slot)
+        if self.seen_tokens is not None and gather_seen_tokens:
+            self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
+
+    def sampler_for(self, padded_bs: int, cg_slot: int) -> "CudaGraphableSampler":
+        """A sampler bound to ``cg_slot``'s per-step buffer views (zero-copy).
+        Valid regardless of when the buffers are (re)gathered into."""
+        return CudaGraphableSampler(**self.slice_for_bs(padded_bs, cg_slot))
+
+    def scatter_offset(self, cg_slot: int = 0) -> None:
+        """Persist the (in-graph advanced) per-step offsets back to their slot
+        masters. Call once AFTER the graph replay for the gather on ``cg_slot``;
+        GPU-only, real rows only (padding rows all map to slot 0)."""
+        self.offset.scatter(
+            self._slot_idx_gpu[cg_slot], self._last_real_bs[cg_slot], cg_slot
+        )

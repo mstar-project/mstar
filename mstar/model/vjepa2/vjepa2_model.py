@@ -37,8 +37,13 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -53,7 +58,7 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.components.vit_encoder import VJEPA2Encoder
-from mstar.model.vjepa2.config import VJepa2ACPredictorConfig, VJepa2Config
+from mstar.model.vjepa2.config import ATTN, KV_CACHE, VJepa2ACPredictorConfig, VJepa2Config
 from mstar.model.vjepa2.submodules import (
     VJepa2ACPredictorSubmodule,
     VJepa2ACRolloutPredictorSubmodule,
@@ -283,41 +288,32 @@ class VJepa2Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        # KV cache exists for the AC rollout predictor
-        if self.config.predictor_kind == "ac":
-            return [KVCacheConfig(
-                num_layers=self.config.ac_predictor.depth,
-                num_kv_heads=self.config.ac_predictor.num_heads,
-                head_dim=self.config.ac_predictor.predictor_embed_dim // self.config.ac_predictor.num_heads,
-                max_seq_len=16384, # TODO: actually compute this
-                num_qo_heads=self.config.ac_predictor.num_heads,
-                nodes=["rollout_predictor"]
-            )]
-        return [] # otherwise no kv cache
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        types: dict[str, EngineType] = {
-            "video_encoder": EngineType.STATELESS,
-            "predictor": EngineType.STATELESS,
-        }
-        # Rollout uses a distinct node so the single-pass and rollout walks
-        # can coexist without branching inside a submodule.  Both node names
-        # resolve to wrappers around the same underlying predictor nn.Module
-        # (``VJEPA2Predictor`` for masked, ``VisionTransformerPredictorAC``
-        # for AC) — no weight duplication.  The AC variant uses a
-        # sliding-window autoregressive rollout, so ``rollout_predictor``
-        # is registered for both predictor kinds.
-        types["rollout_predictor"] = EngineType.STATELESS
-        # MPC nodes advertised only for AC (the masked predictor
-        # has no action input, so K-way candidate evaluation makes no sense
-        # for it).  ``ac_predictor_mpc`` shares the underlying
-        # VisionTransformerPredictorAC nn.Module with ``predictor``.
-        if self.config.predictor_kind == "ac":
-            types["ac_predictor_mpc"] = EngineType.STATELESS
-            types["mpc_scorer"] = EngineType.STATELESS
-            types["rollout_predictor"] = EngineType.KV_CACHE
-        return types
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        # only the AC predictor caches K/V across steps; the masked one is
+        # a one-shot forward with nothing for the engine to build
+        if self.config.predictor_kind != "ac":
+            return []
+        kv = KVConfig(
+            num_layers=self.config.ac_predictor.depth,
+            num_kv_heads=self.config.ac_predictor.num_heads,
+            head_dim=self.config.ac_predictor.predictor_embed_dim // self.config.ac_predictor.num_heads,
+            max_seq_len=16384, # TODO: actually compute this
+            num_qo_heads=self.config.ac_predictor.num_heads,
+        )
+        return [
+            KVSpec(
+                resource_key=KV_CACHE,
+                nodes={"rollout_predictor"},
+                config=kv
+            ),
+            AttentionSpec(
+                resource_key=ATTN,
+                nodes={"rollout_predictor"},
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE
+                ),
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         predictor_inputs: list[str] = ["encoder_hidden"]

@@ -37,12 +37,11 @@ except (ImportError, AttributeError) as e:  # pragma: no cover - env-specific
 
 def _make_info() -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
+        request_id="r0",
         graph_walk="prefill_video_mpc",
-        requires_cfg=False,
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
-        sampling_config={},
     )
 
 

@@ -3,8 +3,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from mstar.communication.tensors import TensorCommunicationManager
-from mstar.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -272,7 +273,7 @@ class WorkerGraphsManager:
         self, request_id: str,
         partition_name,
         current_fwd_info: CurrentForwardPassInfo | None=None,
-        per_label_seq_info: PerLabelSeqInfo | None=None,
+        resource_publish_info: dict[str, PublishedInfo] | None=None,
     ):
         req_info = self.per_request_info[request_id]
         part_info = req_info.per_partition_info[partition_name]
@@ -286,15 +287,15 @@ class WorkerGraphsManager:
                 ]
             part_info.current_fwd_info = current_fwd_info
 
-        if per_label_seq_info is not None:
+        if resource_publish_info is not None:
             fwd_info = self.get_fwd_info(request_id, partition_name)
-            fwd_info.per_label_seq_info.update(per_label_seq_info)
+            fwd_info.update_publish_info(resource_publish_info)
 
     def get_graph_walk(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).graph_walk
 
-    def get_seq_info(self, request_id: str, partition_name: str):
-        return self.get_fwd_info(request_id, partition_name).per_label_seq_info
+    def get_publish_info(self, request_id: str, partition_name: str):
+        return self.get_fwd_info(request_id, partition_name).resource_publish_info
 
     def get_fwd_number(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).fwd_index

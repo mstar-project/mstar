@@ -22,7 +22,7 @@ Requires a GPU + flashinfer.
 
 import torch
 
-from mstar.utils.sampling import sample_cuda_graphable_gpu
+from mstar.engine.resources.sampler.utils import sample_cuda_graphable_gpu
 
 DEV = "cuda"
 V = 2048

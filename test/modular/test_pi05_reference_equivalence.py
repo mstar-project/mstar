@@ -641,6 +641,27 @@ def _vanilla_sdpa(
     return out.transpose(0, 1).to(q.dtype)
 
 
+def _write_paged_kv(
+    kv_cache_layer: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    start_pos: int,
+    page_size: int,
+) -> None:
+    """Append K,V at logical positions ``start_pos..start_pos+len(k)``.
+
+    Stands in for what ``KVManager.write_kv`` does in production; the wrapper
+    itself no longer touches the cache. Pages are laid out identically to the
+    ``paged_kv_indices`` the test plans with, i.e. page i holds positions
+    ``[i * page_size, (i + 1) * page_size)``.
+    """
+    pos = torch.arange(k.shape[0], device=k.device) + start_pos
+    page_idx = torch.div(pos, page_size, rounding_mode="floor")
+    cache_idx = pos - page_idx * page_size
+    kv_cache_layer[page_idx, 0, cache_idx] = k.to(kv_cache_layer.dtype)
+    kv_cache_layer[page_idx, 1, cache_idx] = v.to(kv_cache_layer.dtype)
+
+
 @requires_cuda
 def test_flashinfer_paged_prefill_attention_matches_sdpa():
     """``FlashInferPrefillWrapper`` (real paged KV cache, no Mooncake) vs SDPA.
@@ -655,7 +676,7 @@ def test_flashinfer_paged_prefill_attention_matches_sdpa():
 
     Both scenarios are compared against torch SDPA on the same Q,K,V values.
     """
-    from mstar.utils.flashinfer_utils import FlashInferPrefillWrapper
+    from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
 
     torch.manual_seed(0)
     num_qo_heads = 8
@@ -686,7 +707,7 @@ def test_flashinfer_paged_prefill_attention_matches_sdpa():
     ind = torch.tensor(list(range(n_prefix_pages)), dtype=torch.int32, device=DEVICE)
     last = torch.tensor([last_page_len], dtype=torch.int32, device=DEVICE)
     wrapper.plan(qo, ki, ind, last, causal=False, dtype=MSTAR_DTYPE)
-    wrapper.set_kv_cache(kv_cache_layer, kp, vp)
+    _write_paged_kv(kv_cache_layer, kp, vp, 0, page_size)
     prefill_out = wrapper.run(qp, kv_cache_layer)
 
     scale = head_dim ** -0.5
@@ -708,7 +729,7 @@ def test_flashinfer_paged_prefill_attention_matches_sdpa():
     ind2 = torch.tensor(list(range(n_pages_after)), dtype=torch.int32, device=DEVICE)
     last2 = torch.tensor([last_page_len_after], dtype=torch.int32, device=DEVICE)
     wrapper.plan(qo2, ki2, ind2, last2, causal=False, dtype=MSTAR_DTYPE)
-    wrapper.set_kv_cache(kv_cache_layer, ks, vs)
+    _write_paged_kv(kv_cache_layer, ks, vs, prefix_len, page_size)
     suffix_out = wrapper.run(qs, kv_cache_layer)
 
     k_full = torch.cat([kp, ks], dim=0)

@@ -176,12 +176,33 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
        scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
+   * - ``resources``
+     - *(optional)* Per-resource overrides, keyed by the model's resource names (see
+       below).
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
 
-Node names are model-specific — they are the keys of the model's
-``get_node_engine_types`` (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``,
-Orpheus's ``LLM`` / ``snac_decoder``).
+Node names are model-specific — they are the node names appearing in the model's graph
+walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
+``snac_decoder``).
+
+**Resource overrides.** A model declares the KV caches, attention backends, positions and
+samplers that its nodes need. Each declaration has a ``resource_key``. A deployment tunes
+them by that name:
+
+.. code-block:: yaml
+
+   resources:
+     kv_cache:
+       max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages
+     talker_attn:
+       flashinfer_backend: fa2  # also: backend (flashinfer / dense)
+
+Use one block per resource. A model with two caches, such as Whisper's decoder cache and
+its encoder context, can therefore size each one separately. If a block names a resource
+that the model does not declare, or sets a key that the resource does not accept, loading
+fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
+no longer read. It raises an error with a message describing the migration.
 
 **Single GPU.** Everything on rank 0:
 

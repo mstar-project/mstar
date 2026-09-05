@@ -40,9 +40,21 @@ from PIL import Image
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVReqConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
+from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -70,7 +82,6 @@ from mstar.model.base import DECODE, ForwardPassArgs, Model
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -594,14 +605,82 @@ class BagelModel(Model):
             return img_byte_arr.getvalue()
         raise ValueError(f"Unsupported modality: {modality!r}")
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [KVCacheConfig(
+    # The three LLM nodes run the same weights over their own cache streams
+    # (CFG branches), so they share one set of resources.
+    _LLM_NODES = frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})
+
+    def _kv_config(self) -> KVConfig:
+        return KVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_attention_heads,
-        )]
+        )
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The KV cache, the attention over it, positions, and the sampler.
+
+        The labels here are the names the layers bind against
+        (``Attention(attn_key=..., kv_key=..., pos_key=...)``) and the names
+        ``declare_step`` keys its resource steps by, so they are one
+        declaration read from three places.
+        """
+        kv_config = self._kv_config()
+        nodes = set(self._LLM_NODES)
+        return [
+            KVSpec(resource_key="kv", nodes=nodes, config=kv_config),
+            AttentionSpec(
+                resource_key="attn", nodes=nodes,
+                config=AttentionConfig(kv_cache="kv"),
+            ),
+            PositionSpec(
+                resource_key="rope", nodes=nodes,
+                config=PositionConfig(
+                    kv_cache="kv", rope_theta=self.config.rope_theta,
+                ),
+            ),
+            SamplerSpec(
+                resource_key="sampler", nodes=nodes,
+                vocab_size=self.config.vocab_size,
+            ),
+        ]
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Per-resource knobs a new request is opened with.
+
+        Two things are per-request rather than per-deployment: which cache
+        labels the request will use (guidance doubles them, and it is a
+        property of the request's arguments), and its sampling parameters.
+        The conductor resolves this once and the engine hands each config to
+        its resource at ingest.
+        """
+        from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
+
+        model_kwargs = model_kwargs or {}
+        cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
+        sampling = self.get_sampling_config("LLM", model_kwargs)
+        return {
+            # The KV resource reads this in admit_retrieve, to know which of a
+            # published request's streams to pull in. Guidance-off requests
+            # name only "main", so a transfer never drags branches that this
+            # request will not attend.
+            "kv": KVReqConfig(needed_labels_per_node_walk={
+                (node, walk): active_labels(walk, cfg, node)
+                for node in self._LLM_NODES
+                for walk in LLM_GRAPH_WALKS
+            }),
+            "sampler": SamplingReqConfig(
+                temperature=sampling.temperature,
+                top_k=sampling.top_k,
+                top_p=sampling.top_p,
+                ignore_eos=sampling.ignore_eos,
+                repetition_penalty=sampling.repetition_penalty,
+            ),
+        }
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -613,18 +692,6 @@ class BagelModel(Model):
         logger.info(f"Successfully loaded in BAGEL submodule for {node_name}")
         self._submodule_cache[node_name] = submodule
         return submodule
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {
-            "vit_encoder": EngineType.STATELESS,
-            "vae_encoder": EngineType.STATELESS,
-            "init_latents": EngineType.STATELESS,
-            "LLM": EngineType.KV_CACHE,
-            "LLM_cfg_text": EngineType.KV_CACHE,
-            "LLM_cfg_img": EngineType.KV_CACHE,
-            "combine_cfg": EngineType.STATELESS,
-            "vae_decoder": EngineType.STATELESS,
-        }
 
     def get_worker_graphs(self, config_path: str):
         import yaml
@@ -877,6 +944,7 @@ class BagelModel(Model):
     ) -> dict:
         return {
             "is_prefill": full_metadata.is_prefill,
+            "requires_cfg": full_metadata.kwargs["requires_cfg"],
             "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
             "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
             "cfg_interval": full_metadata.kwargs["cfg_interval"],
@@ -1026,12 +1094,12 @@ class BagelModel(Model):
             "think_mode": think_mode,
             **params,  # CFG params  + gen width / height
         }
+        kwargs["requires_cfg"] = self._requires_cfg(**kwargs)
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk=first_graph_walk,
             is_prefill=bool(schedule),
-            requires_cfg=self._requires_cfg(**kwargs),
             kwargs=kwargs,
         )
         step_metadata =  self._get_step_metadata(full_metadata)

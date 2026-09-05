@@ -1,101 +1,26 @@
 """Parity test: VisionTransformerPredictorAC cached vs non-cached forward.
 
-The KV-cached path (forward with cache_handle, one frame at a time) must produce
-the same output per frame as the non-cached path (all T frames at once with a
-causal block attention mask).
+The KV-cached path (forward under a plan label, one frame at a time) must
+produce the same output per frame as the non-cached path (all T frames at once
+with a causal block attention mask).
 
 Why they must match:
   Non-cached: frame t_0 attends to frames 0..t_0 (blocked by the causal mask).
   Cached:     at step t_0 the cache holds K/V for frames 0..t_0 exactly, so
               full (non-causal) attention over the cache equals the masked result.
 
-Uses a FakeCacheManager backed by F.scaled_dot_product_attention — no FlashInfer
-or GPU required.
+Uses a fake KV + attention resource pair backed by
+F.scaled_dot_product_attention — no FlashInfer or GPU required.
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
 
-# ---------------------------------------------------------------------------
-# Fake cache manager
-# ---------------------------------------------------------------------------
-
-class FakeCacheManager:
-    """Emulates BatchedCacheManager.run_attention with plain Python lists.
-
-    Per layer and per request, we accumulate K/V tokens across time steps.
-    This matches the real FlashInfer path where each request has its own KV
-    pages and full attention is computed over that request's accumulated history.
-
-    plan_attention must be called before each forward pass (as preprocess does
-    in production) so run_attention knows how to split the flattened
-    [sum(seq_lens), H, D] tensor back into per-request slices.
-    """
-
-    def __init__(self):
-        self.layer_idx: int = 0
-        self._seq_lens: list[int] = []
-        # layer -> list of per-request (list[k], list[v])
-        self._kv: dict[int, list[tuple[list[torch.Tensor], list[torch.Tensor]]]] = {}
-
-    def set_layer_idx(self, idx: int) -> None:
-        self.layer_idx = idx
-
-    def plan_attention(self, seq_lens: list[int], is_causal: bool = False) -> None:
-        """Record per-request token counts for the upcoming forward pass."""
-        self._seq_lens = list(seq_lens)
-        n_req = len(seq_lens)
-        # Initialise KV history for any new layer that hasn't been seen yet.
-        for layer, req_kvs in self._kv.items():
-            if len(req_kvs) != n_req:
-                self._kv[layer] = [([], []) for _ in range(n_req)]
-
-    def advance_seq_len(self, n: int | None = None) -> None:
-        pass  # seq tracking not needed; accumulated K/V lists are the history
-
-    def run_attention(
-        self,
-        q: torch.Tensor,  # [sum(seq_lens), num_heads, head_dim]
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer_idx: int | None = None,
-    ) -> torch.Tensor:
-        layer = layer_idx if layer_idx is not None else self.layer_idx
-
-        # Fall back to single-request if plan_attention wasn't called.
-        seq_lens = self._seq_lens if self._seq_lens else [q.shape[0]]
-        n_req = len(seq_lens)
-
-        if layer not in self._kv:
-            self._kv[layer] = [([], []) for _ in range(n_req)]
-
-        req_kvs = self._kv[layer]
-        q_splits = torch.split(q, seq_lens)
-        k_splits = torch.split(k, seq_lens)
-        v_splits = torch.split(v, seq_lens)
-
-        outputs: list[torch.Tensor] = []
-        for i, (q_i, k_i, v_i) in enumerate(zip(q_splits, k_splits, v_splits, strict=False)):
-            req_kvs[i][0].append(k_i)
-            req_kvs[i][1].append(v_i)
-
-            all_k = torch.cat(req_kvs[i][0], dim=0)  # [ctx_tokens, H, D]
-            all_v = torch.cat(req_kvs[i][1], dim=0)
-
-            # SDPA: [1, H, L, D] x [1, H, S, D]
-            q_t = q_i.permute(1, 0, 2).unsqueeze(0)
-            k_t = all_k.permute(1, 0, 2).unsqueeze(0)
-            v_t = all_v.permute(1, 0, 2).unsqueeze(0)
-            out_i = F.scaled_dot_product_attention(q_t, k_t, v_t)
-            outputs.append(out_i.squeeze(0).permute(1, 0, 2))  # [L, H, D]
-
-        return torch.cat(outputs, dim=0)  # [sum(seq_lens), H, D]
-
+from .fake_resources import bind_fake_resources
 
 # ---------------------------------------------------------------------------
 # Shared config
@@ -148,15 +73,15 @@ class TestKVCacheParity:
         with torch.no_grad():
             out_full = model(x_full, actions, states)   # [B, T*N, embed_dim]
 
-        # Cached: one frame at a time, accumulating K/V in FakeCacheManager.
-        cache = FakeCacheManager()
+        # Cached: one frame at a time, accumulating K/V in the fake resources.
+        cache = bind_fake_resources(model)
         with torch.no_grad():
             for t_0 in range(T):
                 x_t   = x_full[:, t_0 * N : (t_0 + 1) * N, :]
                 act_t = actions[:, t_0 : t_0 + 1, :]
                 st_t  = states[:, t_0 : t_0 + 1, :]
 
-                out_t = model(x_t, act_t, st_t, t_0=t_0, cache_handle=cache)
+                out_t = model(x_t, act_t, st_t, t_0=t_0, label="main")
                 # [B, N, embed_dim]
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -183,7 +108,7 @@ class TestKVCacheParity:
         with torch.no_grad():
             out_full = model(x_full, actions, states, extrinsics=extrinsics)
 
-        cache = FakeCacheManager()
+        cache = bind_fake_resources(model)
         with torch.no_grad():
             for t_0 in range(T):
                 x_t   = x_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -193,7 +118,7 @@ class TestKVCacheParity:
 
                 out_t = model(
                     x_t, act_t, st_t, extrinsics=ext_t,
-                    t_0=t_0, cache_handle=cache,
+                    t_0=t_0, label="main",
                 )
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -205,9 +130,9 @@ class TestKVCacheParity:
     def test_parity_batch_size_2(self):
         """Parity holds for B=2 (two independent sequences in the same forward).
 
-        plan_attention must be called before each frame to tell FakeCacheManager
-        (and, in production, BatchedCacheManager) the per-request token count so
-        run_attention can split the flattened [B*n, H, D] tensor correctly.
+        `plan` must be called before each frame to tell the fake resources
+        (and, in production, the KV resource's own plan) the per-request token
+        count, so attention can split the flattened [B*n, H, D] tensor.
         """
         torch.manual_seed(99)
         cfg = _tiny_ac_config()
@@ -226,7 +151,7 @@ class TestKVCacheParity:
         with torch.no_grad():
             out_full = model(x_full, actions, states)
 
-        cache = FakeCacheManager()
+        cache = bind_fake_resources(model)
         with torch.no_grad():
             for t_0 in range(T):
                 x_t   = x_full[:, t_0 * N : (t_0 + 1) * N, :]
@@ -234,8 +159,8 @@ class TestKVCacheParity:
                 st_t  = states[:, t_0 : t_0 + 1, :]
 
                 # Mirror what preprocess does in production.
-                cache.plan_attention(seq_lens=[tokens_per_req] * B, is_causal=False)
-                out_t = model(x_t, act_t, st_t, t_0=t_0, cache_handle=cache)
+                cache.plan(seq_lens=[tokens_per_req] * B)
+                out_t = model(x_t, act_t, st_t, t_0=t_0, label="main")
 
                 expected = out_full[:, t_0 * N : (t_0 + 1) * N, :]
                 torch.testing.assert_close(
@@ -254,9 +179,9 @@ class TestKVCacheParity:
         act = torch.randn(B, 1, cfg.action_embed_dim)
         st  = torch.randn(B, 1, cfg.action_embed_dim)
 
-        cache = FakeCacheManager()
+        cache = bind_fake_resources(model)
         with torch.no_grad():
-            out = model(x, act, st, t_0=0, cache_handle=cache)
+            out = model(x, act, st, t_0=0, label="main")
 
         assert out.shape == (B, N, cfg.embed_dim)
 
@@ -289,14 +214,14 @@ class TestKVCacheParity:
         st_pert[:, -1, :]   += 100.0
 
         def _run_cached(x_seq, actions, states):
-            cache = FakeCacheManager()
+            cache = bind_fake_resources(model)
             outs = []
             with torch.no_grad():
                 for t_0 in range(T):
                     x_t   = x_seq[:, t_0 * N : (t_0 + 1) * N, :]
                     act_t = actions[:, t_0 : t_0 + 1, :]
                     st_t  = states[:, t_0 : t_0 + 1, :]
-                    outs.append(model(x_t, act_t, st_t, t_0=t_0, cache_handle=cache))
+                    outs.append(model(x_t, act_t, st_t, t_0=t_0, label="main"))
             return outs
 
         base_outs = _run_cached(x_base, act_base, st_base)

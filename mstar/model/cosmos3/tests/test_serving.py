@@ -17,12 +17,7 @@ import pytest
 
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 
-NANO_DIR = Path(
-    os.environ.get(
-        "COSMOS3_NANO_DIR",
-        "/Users/atindrajha/Downloads/disaggregation_research/Cosmos3-Nano-hf",
-    )
-)
+NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
 
 
 def test_adapter_registered_for_images() -> None:
