@@ -29,10 +29,32 @@ def test_customer_can_submit_image_plus_text_chat_request():
     assert processor.call_kwargs["images"][0].dtype == "uint8"
     assert result["position_ids"][0][:, -1].tolist() == [3, 3, 3]
     assert model.postprocess(torch.tensor([4, 5]), "text") == b"decoded:[4, 5]"
+    assert processor.decode_kwargs == {"skip_special_tokens": True, "clean_up_tokenization_spaces": False}
     with pytest.raises(ValueError, match="Unsupported"):
         model.postprocess(torch.tensor([4]), "image")
     with pytest.raises(NotImplementedError, match=r"image\+text"):
         model.process_prompt("video", ["video"], ["text"], {"video_inputs": [torch.ones(1)]})
+
+
+def test_streaming_decode_holds_partial_utf8_and_skips_special_tokens():
+    class ByteProcessor:
+        def decode(self, token_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
+            assert skip_special_tokens
+            assert not clean_up_tokenization_spaces
+            visible = [token for token in token_ids if token != 99]
+            return {(1,): "\ufffd", (1, 2): "€"}.get(tuple(visible), "€")
+
+    model = object.__new__(QwenVLModel)
+    model.processor = ByteProcessor()
+    model._decode_token_ids, model._decode_text = {}, {}
+    kwargs = {"_mstar_request_id": "request"}
+
+    assert model.postprocess(torch.tensor([1]), "text", request_kwargs=kwargs) == b""
+    assert model.postprocess(torch.tensor([2]), "text", request_kwargs=kwargs) == "€".encode()
+    assert model.postprocess(torch.tensor([99]), "text", request_kwargs=kwargs) == b""
+    model.cleanup_postprocess("request")
+    assert model._decode_token_ids == {}
+    assert model._decode_text == {}
 
 
 def test_cli_exposes_qwen3_vl_single_gpu_correctness_baseline():

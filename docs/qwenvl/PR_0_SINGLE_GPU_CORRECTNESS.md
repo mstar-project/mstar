@@ -145,11 +145,13 @@ code-level readiness.
 
 Proven locally:
 
-- tiny official Transformers text and image hidden-state parity;
-- official two-image position-ID parity;
+- tiny official Transformers text hidden-state and last-token logit parity;
+- direct merged-vision and three-feature DeepStack parity;
+- official merge-2 two-image and non-square position-ID parity;
 - strict synthetic checkpoint completeness and fused-layout handling;
 - graph declaration, prompt conversion, cache position side-channel, packed
-  last-token indexing, and decode-only EOS/max-token stop behavior;
+  last-token indexing, resumed-prefill position deltas, incremental UTF-8
+  detokenization, and decode-only EOS/max-token stop behavior;
 - single-GPU config resolution.
 
 Not proven:
@@ -159,6 +161,25 @@ Not proven:
 - real image-to-text decoded output;
 - single-GPU peak memory/headroom;
 - 72B-class behavior.
+
+Collect the real-checkpoint load and memory evidence on the qualifying GPU
+using an immutable Hub revision:
+
+```bash
+uv run --extra qwenvl python benchmark/qwenvl_acceptance.py checkpoint \
+  --revision <hub-commit-sha> --output qwenvl-checkpoint-evidence.json
+uv run --extra qwenvl python benchmark/qwenvl_acceptance.py positions \
+  --revision <hub-commit-sha> --output qwenvl-position-evidence.json
+```
+
+After starting the PR-0 server, collect the deterministic image-chat streaming
+smoke. The emitted text still requires human coherence review:
+
+```bash
+uv run --extra qwenvl mstar serve qwenvl --gpus 0 --port 8000
+uv run --extra qwenvl python benchmark/qwenvl_acceptance.py server \
+  --url http://localhost:8000 --output qwenvl-server-evidence.json
+```
 
 ## 8. Rollback rule
 

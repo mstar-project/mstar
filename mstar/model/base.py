@@ -503,6 +503,10 @@ class Model(ABC):
         """
         return output.cpu().numpy().tobytes()
 
+    def cleanup_postprocess(self, request_id: str) -> None:
+        """Release optional per-request output encoding state."""
+        return None
+
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,

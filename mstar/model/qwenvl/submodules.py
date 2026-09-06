@@ -136,6 +136,7 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> ARNodeInputs:
         input_ids = inputs["text_inputs"][0]
+        position_start = pos_info.get("main", PositionInfo()).position_id_start
         if graph_walk == "prefill_vision":
             position_ids = inputs["position_ids"][0]
             return ARNodeInputs(
@@ -146,7 +147,7 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
                     "vision_embeds": inputs["vision_embeds"][0],
                     "deepstack_visual_embeds": inputs["deepstack_visual_embeds"],
                 },
-                kwargs={"position_advance": int(position_ids.max()) + 1},
+                kwargs={"position_advance": int(position_ids.max()) + 1 - position_start},
             )
         if graph_walk == "prefill":
             position_ids = inputs["position_ids"][0]
@@ -154,12 +155,11 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
                 input_ids=input_ids,
                 input_seq_len=input_ids.numel(),
                 custom_pos_ids=position_ids,
-                kwargs={"position_advance": int(position_ids.max()) + 1},
+                kwargs={"position_advance": int(position_ids.max()) + 1 - position_start},
             )
         if graph_walk != "decode":
             raise ValueError(f"Unknown QwenVL graph walk {graph_walk!r}.")
-        start = pos_info.get("main", PositionInfo()).position_id_start
-        positions = torch.arange(input_ids.numel(), device=input_ids.device, dtype=torch.long) + start
+        positions = torch.arange(input_ids.numel(), device=input_ids.device, dtype=torch.long) + position_start
         return ARNodeInputs(
             input_ids=input_ids,
             input_seq_len=input_ids.numel(),
@@ -180,10 +180,9 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         cache.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
         position_ids = torch.cat([request.custom_pos_ids for request in inputs], dim=1)
         position_advance = [int(request.kwargs["position_advance"]) for request in inputs]
-        # CUDA-graph replay calls ``advance_seq_lens()`` with no args, so the
-        # MRoPE span has to live on the plan-state side channel.  Eager
-        # forward still passes ``pos_id_ns`` explicitly; both paths consume
-        # the same per-request advance.
+        # Keep the MRoPE span on the plan-state side channel used by the
+        # cache manager. This is also the contract a future CUDA-graph replay
+        # path must consume via ``advance_seq_lens()`` with no arguments.
         cache.set_custom_pos_advance(position_advance, label="main")
         packed: dict[str, torch.Tensor | Any] = {
             "text_inputs": torch.cat([request.input_ids for request in inputs]),

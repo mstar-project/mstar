@@ -45,7 +45,7 @@ def _vision_values():
         "in_channels": 3,
         "patch_size": 2,
         "temporal_patch_size": 1,
-        "spatial_merge_size": 1,
+        "spatial_merge_size": 2,
         "num_position_embeddings": 16,
         "deepstack_visual_indexes": [0, 1, 2],
     }
@@ -77,6 +77,33 @@ def test_text_chat_execution_matches_reference_moe_model(monkeypatch):
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
 
+def test_text_prefill_last_token_logits_match_reference_causal_lm(monkeypatch):
+    reference = qwen_transformers_or_skip()
+    patch_cpu_rms_norm(monkeypatch)
+    text, vision = _text_values(), _vision_values()
+    config = reference.config(text_config=text, vision_config=vision, image_token_id=30)
+    oracle = reference.causal_lm(config).eval()
+    model = QwenVLForCausalLM(config).eval()
+    weights = (
+        (f"model.language_model.{name}", value)
+        for name, value in oracle.model.language_model.state_dict().items()
+    )
+    loaded = load_qwen_vl_text_weights(model, [*weights, ("lm_head.weight", oracle.lm_head.weight)])
+    assert loaded == set(dict(model.named_parameters()))
+    ids, positions = torch.tensor([1, 2, 3]), torch.arange(3).expand(3, -1)
+    reference_positions = torch.cat((torch.arange(ids.numel()).unsqueeze(0), positions), dim=0)
+
+    expected = oracle(
+        input_ids=ids.unsqueeze(0),
+        position_ids=reference_positions.unsqueeze(1),
+        use_cache=False,
+    ).logits[0, -1]
+    hidden = model(model.model.embed_tokens(ids), CausalCache(), positions, position_advance=3)
+    actual = model.lm_head(hidden[-1])
+
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+
 def test_image_chat_execution_matches_reference_deepstack_model(monkeypatch):
     reference = qwen_transformers_or_skip()
     patch_cpu_rms_norm(monkeypatch)
@@ -96,7 +123,7 @@ def test_image_chat_execution_matches_reference_deepstack_model(monkeypatch):
         mstar_vision, ((f"model.visual.{name}", value) for name, value in oracle.visual.state_dict().items())
     ) == set(dict(mstar_vision.named_parameters()))
     ids = torch.tensor([1, 30, 30, 30, 30, 2])
-    grid, pixels = torch.tensor([[1, 2, 2]]), torch.randn(4, 12)
+    grid, pixels = torch.tensor([[1, 4, 4]]), torch.randn(16, 12)
     positions = qwen_vl_position_ids(ids, grid, config)
     # HF's four-axis input keeps monotonic token positions for the causal
     # mask separate from the three interleaved MRoPE axes. M*'s cache plan
@@ -110,7 +137,12 @@ def test_image_chat_execution_matches_reference_deepstack_model(monkeypatch):
         position_ids=reference_positions.unsqueeze(1),
         use_cache=False,
     ).last_hidden_state[0]
+    expected_vision, expected_deepstack = oracle.visual(pixels, grid_thw=grid)
     vision_embeds, deepstack_visual_embeds = mstar_vision(pixels, grid_thw=grid)
+    torch.testing.assert_close(vision_embeds, expected_vision, atol=5e-6, rtol=5e-6)
+    assert len(deepstack_visual_embeds) == len(expected_deepstack) == 3
+    for actual_feature, expected_feature in zip(deepstack_visual_embeds, expected_deepstack, strict=True):
+        torch.testing.assert_close(actual_feature, expected_feature, atol=5e-6, rtol=5e-6)
     embeddings = mstar_text.model.embed_tokens(ids).clone()
     embeddings[ids == 30] = vision_embeds
     reference_hidden = oracle.language_model(
@@ -139,12 +171,28 @@ def test_image_positions_match_the_official_qwen3_multimodal_contract():
     oracle = reference.model(config).eval()
     vision_start = config.vision_start_token_id
     ids = torch.tensor([1, vision_start, 30, 30, 30, 30, 2, vision_start, 30, 30, 30, 30, 3])
-    grids = torch.tensor([[1, 2, 2], [1, 2, 2]])
+    grids = torch.tensor([[1, 4, 4], [1, 4, 4]])
 
     expected, _ = oracle.get_rope_index(
         ids.unsqueeze(0),
         image_grid_thw=grids,
     )
     actual = qwen_vl_position_ids(ids, grids, config)
+
+    torch.testing.assert_close(actual, expected[:, 0])
+
+
+def test_merge2_non_square_image_positions_match_the_official_oracle():
+    reference = qwen_transformers_or_skip()
+    text, vision = _text_values(), _vision_values()
+    config = reference.config(text_config=text, vision_config=vision, image_token_id=30)
+    oracle = reference.model(config).eval()
+    vision_start = config.vision_start_token_id
+    grid = torch.tensor([[1, 4, 6]])
+    image_tokens = [30] * 6
+    ids = torch.tensor([1, vision_start, *image_tokens, 2])
+
+    expected, _ = oracle.get_rope_index(ids.unsqueeze(0), image_grid_thw=grid)
+    actual = qwen_vl_position_ids(ids, grid, config)
 
     torch.testing.assert_close(actual, expected[:, 0])

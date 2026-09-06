@@ -69,6 +69,16 @@ def test_image_prefill_preserves_mrope_position_for_follow_up_decode():
     assert packed["seq_lens"] == [3, 6]
     assert packed["position_advance"] == [3, 4]
     assert cache.custom_pos_advance == [3, 4]
+    resumed = submodule.prepare_inputs(
+        "prefill",
+        None,
+        {
+            "text_inputs": [torch.tensor([6, 7])],
+            "position_ids": [torch.tensor([[4, 5], [4, 5], [4, 5]])],
+        },
+        pos_info={"main": PositionInfo(position_id_start=4)},
+    )
+    assert resumed.kwargs["position_advance"] == 2
     decode = submodule.prepare_inputs(
         "decode", None, {"text_inputs": [torch.tensor([7])]}, pos_info={"main": PositionInfo(position_id_start=4)}
     )

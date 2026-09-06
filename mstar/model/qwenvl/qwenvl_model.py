@@ -36,6 +36,8 @@ class QwenVLModel(Model):
         self.local_dir = self._resolve_snapshot()
         self.config = load_qwenvl_config(self.local_dir)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self._decode_token_ids: dict[str, list[int]] = {}
+        self._decode_text: dict[str, str] = {}
         from transformers import AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(self.local_dir, trust_remote_code=True)
@@ -235,10 +237,38 @@ class QwenVLModel(Model):
             ignore_eos=options.get("ignore_eos", False),
         )
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
+    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality != "text":
             raise ValueError(f"Unsupported QwenVL output modality {modality!r}.")
-        return self.processor.decode(output.reshape(-1)).encode()
+        token_ids = output.detach().reshape(-1).to(device="cpu", dtype=torch.long).tolist()
+        request_id = (request_kwargs or {}).get("_mstar_request_id")
+        if request_id is None:
+            return self.processor.decode(
+                token_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).encode()
+
+        accumulated = self._decode_token_ids.setdefault(request_id, [])
+        accumulated.extend(token_ids)
+        decoded = self.processor.decode(
+            accumulated,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        # Byte-level tokenizers may end an intermediate decode with U+FFFD
+        # until the remaining bytes of a UTF-8 character arrive. Hold that
+        # unstable suffix instead of streaming a replacement character.
+        stable = decoded.rstrip("\ufffd")
+        emitted = self._decode_text.get(request_id, "")
+        if not stable.startswith(emitted):
+            raise RuntimeError("QwenVL incremental decode changed text that was already streamed.")
+        self._decode_text[request_id] = stable
+        return stable[len(emitted) :].encode()
+
+    def cleanup_postprocess(self, request_id: str) -> None:
+        self._decode_token_ids.pop(request_id, None)
+        self._decode_text.pop(request_id, None)
 
     def get_default_sharding_config(self):
         from mstar.distributed.base import ShardingConfig

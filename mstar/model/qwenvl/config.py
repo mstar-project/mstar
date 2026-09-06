@@ -25,6 +25,11 @@ def validate_qwenvl_config(config: Any) -> None:
         )
     if text.decoder_sparse_step != 1 or text.mlp_only_layers:
         raise ValueError("QwenVL requires a sparse MoE block on every decoder layer.")
+    if not isinstance(text.eos_token_id, int):
+        raise ValueError(
+            "QwenVL requires text_config.eos_token_id to be a single integer; "
+            f"got {text.eos_token_id!r}."
+        )
 
     rope_scaling = text.rope_scaling or {}
     section = tuple(rope_scaling.get("mrope_section", ()))

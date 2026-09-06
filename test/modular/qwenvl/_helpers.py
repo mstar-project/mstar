@@ -120,8 +120,10 @@ class FakeProcessor:
             result.update({"pixel_values": torch.ones(self.grid.prod().item(), 12), "image_grid_thw": self.grid})
         return result
 
-    def decode(self, output):
-        return f"decoded:{output.tolist()}"
+    def decode(self, output, **kwargs):
+        self.decode_kwargs = kwargs
+        values = output.tolist() if hasattr(output, "tolist") else list(output)
+        return f"decoded:{values}"
 
 
 class FixedLanguageModel(torch.nn.Module):
@@ -168,6 +170,7 @@ def qwen_transformers_or_skip():
             Qwen3VLMoeVisionConfig,
         )
         from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+            Qwen3VLMoeForConditionalGeneration,
             Qwen3VLMoeModel,
             Qwen3VLMoeTextModel,
             Qwen3VLMoeVisionModel,
@@ -180,6 +183,7 @@ def qwen_transformers_or_skip():
         vision_config=Qwen3VLMoeVisionConfig,
         vision_model=Qwen3VLMoeVisionModel,
         model=Qwen3VLMoeModel,
+        causal_lm=Qwen3VLMoeForConditionalGeneration,
         text_model=Qwen3VLMoeTextModel,
     )
 

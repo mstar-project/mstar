@@ -35,6 +35,7 @@ def test_platform_uses_the_official_checkpoint_config(tmp_path):
             lambda config: config.text_config.rope_scaling.update(mrope_interleaved=False),
             "mrope_interleaved",
         ),
+        (lambda config: setattr(config.text_config, "eos_token_id", None), "single integer"),
         (lambda config: setattr(config, "tie_word_embeddings", True), "untied output head"),
     ],
 )
