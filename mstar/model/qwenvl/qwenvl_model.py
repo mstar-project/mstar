@@ -224,7 +224,7 @@ class QwenVLModel(Model):
         return ForwardPassArgs(
             full_metadata=partition_metadata,
             inputs=[edge],
-            unpersist_tensors=sum(edge.tensor_info, start=[]),
+            unpersist_tensors=list(edge.tensor_info),
             step_metadata={"is_prefill": False},
         )
 

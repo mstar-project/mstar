@@ -9,7 +9,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.base import EngineType
-from mstar.graph.base import Loop
+from mstar.graph.base import Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.qwenvl.qwenvl_model import QwenVLModel
 from mstar.model.qwenvl.submodules import QwenVLLLMSubmodule, QwenVLVisionSubmodule
@@ -114,6 +114,33 @@ def test_chat_request_runs_prefill_then_bounded_decode():
     graph = model.get_graph_walk_graphs()["decode"]
     assert isinstance(graph, Loop)
     assert {edge.next_node for edge in graph.section.outputs} == {"LLM", EMIT_TO_CLIENT}
+
+
+def test_prefill_to_decode_unpersist_accepts_real_token_pointers():
+    """The empty-list case in ``test_chat_request_runs_prefill_then_bounded_decode``
+    hides a TypeError: ``sum(edge.tensor_info, start=[])`` cannot concatenate
+    ``TensorPointerInfo`` objects. The first real decode step always carries
+    a non-empty ``new_token`` pointer list.
+    """
+    model = object.__new__(QwenVLModel)
+    model.config = tiny_config()
+    pointer = TensorPointerInfo(
+        dims=[1],
+        dtype="int64",
+        nbytes=8,
+        address=0,
+        stride=[8],
+        uuid="new-token",
+        source_session_id="host:1",
+        source_entity="w0",
+    )
+    metadata = CurrentForwardConductorMetadata(
+        input_modalities=["text"], output_modalities=["text"], graph_walk="prefill", is_prefill=True
+    )
+    decode = model.get_partition_forward_pass_args("default", metadata, {"new_token": [pointer]})
+    assert decode.full_metadata.graph_walk == "decode"
+    assert decode.unpersist_tensors == [pointer]
+    assert decode.inputs[0].tensor_info == [pointer]
 
 
 def test_tp2_topology_remains_an_explicit_later_slice():
