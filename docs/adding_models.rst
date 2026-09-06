@@ -1083,11 +1083,6 @@ The V-JEPA2 AC predictor is the reference implementation. See
 before the region, a captured block loop that reads the KV cache over a fixed per-step
 sequence, and an eager section after the region.
 
-BAGEL's ViT tower is the packed, cacheless counterpart. See
-``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``: a
-``PiecewisePackedConfig`` whose region declares only ragged attention, with patch
-embedding and the RoPE gathers left eager because they are data-dependent indexing.
-
 .. code-block:: python
 
    from mstar.engine.cuda_graph_config import (
@@ -1151,6 +1146,11 @@ Second, the same block loop is used on both the captured path and the eager path
 code exists in one place only. Third, the region's ``declare_step`` covers only the
 captured path. The eager path is covered by the submodule's own ``declare_step``, as shown
 under **Splitting the declaration** above.
+
+BAGEL's ViT tower is the packed, cacheless counterpart. See
+``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``: a
+``PiecewisePackedConfig`` whose region declares only ragged attention, with patch
+embedding and the RoPE gathers left eager because they are data-dependent indexing.
 
 .. _config-yaml:
 
