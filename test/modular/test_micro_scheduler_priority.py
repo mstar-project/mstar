@@ -3,45 +3,44 @@ dict key.
 
 ``_select_node_priority`` used to compute ``best_node_name`` and then return
 the loop variable ``node_name`` — the last key in ``node_name_to_requests``.
-When a KV node and a stateless node were both ready, ``get_next_batch``
-paired the *stateless* node name with the *KV* walk, found no members, and
-returned None. The worker idled forever despite ready work.
+When a high-priority node and a low-priority node were both ready,
+``get_next_batch`` paired the *low-priority* node name with the *winning*
+walk, found no members, and returned None. The worker idled forever despite
+ready work.
 
-These tests pin the failure mode: insertion order is LLM then vision so the
-last-iterated key is the lower-priority node. A correct implementation still
-selects LLM.
+These tests pin the failure mode on the resource-pool scheduler: insertion
+order is LLM then vision so the last-iterated key is the lower-priority
+node. A correct implementation still selects LLM.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mstar.engine.base import EngineType
+from mstar.engine.resources.step import FULL_ADMIT_OK
 from mstar.worker.micro_scheduler import (
     MicroScheduler,
     ReadyNodeEntry,
     SchedulingType,
 )
 
+LLM_DECODE = ("LLM", "decode")
+VISION_PREFILL = ("vision_encoder", "prefill_vision")
+# Lower value = higher priority. LLM decode is the latency-sensitive walk.
+NODE_WALK_PRIORITY = {
+    LLM_DECODE: 0,
+    VISION_PREFILL: 2,
+}
+
 
 class _Engine:
-    def __init__(self, engine_type: EngineType):
-        self._engine_type = engine_type
+    def get_max_batch_size(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return None
 
-    def engine_type(self):
-        return self._engine_type
-
-    def check_ready(self, node_name, request_id, request_info):
-        del node_name, request_id, request_info
-        return True
-
-
-class _EngineManager:
-    def __init__(self, node_to_engine: dict[str, _Engine]):
-        self.node_to_engine = node_to_engine
-
-    def get_engine(self, node_name: str) -> _Engine:
-        return self.node_to_engine[node_name]
+    def check_ready(self, node_name, rid, fwd_info):
+        del node_name, rid, fwd_info
+        return FULL_ADMIT_OK
 
 
 class _Queue:
@@ -78,48 +77,40 @@ class _GraphsManager:
         return object()
 
 
-def _manager() -> _EngineManager:
-    # Insertion order matters: LLM first, vision last. The bug returns the
-    # last key (vision) even though KV_CACHE has higher priority.
-    return _EngineManager(
-        {
-            "LLM": _Engine(EngineType.KV_CACHE),
-            "vision_encoder": _Engine(EngineType.STATELESS),
-        }
+def _scheduler() -> MicroScheduler:
+    return MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda name: _Engine()),
+        sched_type=SchedulingType.PRIORITY,
+        parallel_leader_nodes={"LLM", "vision_encoder"},
+        node_walk_priority=NODE_WALK_PRIORITY,
     )
 
 
-def test_select_node_priority_returns_kv_node_not_last_iterated_key():
-    scheduler = MicroScheduler(_manager(), sched_type=SchedulingType.PRIORITY)
+def test_select_node_priority_returns_ranked_node_not_last_iterated_key():
+    scheduler = _scheduler()
     ready = {
         "LLM": [ReadyNodeEntry("r0", "wg0", "decode")],
         "vision_encoder": [ReadyNodeEntry("r1", "wg0", "prefill_vision")],
     }
     node, walk = scheduler._select_node_priority(ready)
-    assert (node, walk) == ("LLM", "decode")
+    assert (node, walk) == LLM_DECODE
     assert list(ready)[-1] == "vision_encoder"
 
 
-def test_get_next_batch_under_priority_schedules_kv_instead_of_idling():
-    """Both nodes ready on different walks: PRIORITY must emit the KV batch.
+def test_get_next_batch_under_priority_schedules_ranked_node_instead_of_idling():
+    """Both nodes ready on different walks: PRIORITY must emit the LLM batch.
 
     The buggy return of the last-iterated node name pairs vision with the
     decode walk, finds no members, and hands the worker None.
     """
-    scheduler = MicroScheduler(
-        _manager(),
-        sched_type=SchedulingType.PRIORITY,
-        parallel_leader_nodes={"LLM", "vision_encoder"},
-    )
     graphs = _GraphsManager(
         ready={"r0": {"LLM"}, "r1": {"vision_encoder"}},
         walks={"LLM": "decode", "vision_encoder": "prefill_vision"},
     )
-    batch = scheduler.get_next_batch(graphs)
+    batch = _scheduler().get_next_batch(graphs)
     assert batch is not None, (
-        "PRIORITY must not idle when a KV node is ready: returning the last "
-        "iterated node name yields an empty (vision, decode) pair"
+        "PRIORITY must not idle when a higher-ranked node is ready: returning "
+        "the last iterated node name yields an empty (vision, decode) pair"
     )
-    assert batch.node_name == "LLM"
-    assert batch.graph_walk == "decode"
+    assert (batch.node_name, batch.graph_walk) == LLM_DECODE
     assert list(batch.node_objects) == ["r0"]

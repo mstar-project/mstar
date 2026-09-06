@@ -1,10 +1,10 @@
 """Higgs-Audio audio tower + feature projector.
 
-The checkpoint ships its own modeling code, but it targets the
-transformers-4 layer API (``encoder_layer(...)[0]``; transformers 5
-returns the tensor directly, so indexing strips the batch dim). These
-are small modules, so they're reimplemented here against the current
-transformers API instead of running the checkpoint's remote code.
+The checkpoint ships its own modeling code, but the layer call
+convention differs between transformers 4 and 5 (4 takes a positional
+``layer_head_mask`` and returns a tuple; 5 drops it and returns the
+tensor). These are small modules, so they're reimplemented here and the
+layer call is adapted to whichever signature is installed.
 
 Tower = Whisper encoder (conv1 -> conv2(stride 2) -> sinusoidal
 positions -> ``WhisperEncoderLayer`` stack) followed by an
@@ -15,6 +15,8 @@ checkpoint's ``audio_tower.*`` / ``audio_encoder_proj.*``.
 """
 from __future__ import annotations
 
+import inspect
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -22,6 +24,11 @@ from transformers import WhisperConfig
 from transformers.models.whisper.modeling_whisper import WhisperEncoderLayer
 
 from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+
+# transformers 4 requires a positional layer_head_mask; transformers 5 dropped it.
+_LAYER_TAKES_HEAD_MASK = (
+    "layer_head_mask" in inspect.signature(WhisperEncoderLayer.forward).parameters
+)
 
 
 class HiggsAudioTower(nn.Module):
@@ -59,7 +66,8 @@ class HiggsAudioTower(nn.Module):
         hidden = hidden.permute(0, 2, 1)  # (B, T, D)
         hidden = hidden + self.embed_positions.weight[: hidden.shape[1]]
         for layer in self.layers:
-            hidden = layer(hidden, None)
+            out = layer(hidden, None, None) if _LAYER_TAKES_HEAD_MASK else layer(hidden, None)
+            hidden = out[0] if isinstance(out, tuple) else out  # tf4 returns (hidden, attn)
         hidden = self.avg_pooler(hidden.permute(0, 2, 1)).permute(0, 2, 1)
         return self.layer_norm(hidden)
 

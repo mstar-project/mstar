@@ -1,29 +1,21 @@
-from mstar.model.bagel.bagel_model import BagelModel
-from mstar.model.base import Model
-from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
-from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
-from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
-from mstar.model.wan22.wan22_model import Wan22Model
-from mstar.model.whisper.whisper_model import WhisperModel
+from importlib import import_module
 
-MODEL_REGISTRY: dict[str, type[Model]] = {
-    "bagel": BagelModel,
-    "cosmos3": Cosmos3Model,
-    "cosmos3_droid": Cosmos3Model,
-    "cosmos3_super": Cosmos3Model,
-    "higgs_audio": HiggsAudioModel,
-    "orpheus": OrpheusModel,
-    "pi05": Pi05Model,
-    "qwen3_omni": Qwen3OmniModel,
-    "qwen3_tts": Qwen3TTSModel,
-    "vjepa2": VJepa2Model,
-    "vjepa2_ac": VJepa2ACModel,
-    "wan22": Wan22Model,
-    "whisper_large": WhisperModel,
+from mstar.model.base import Model
+
+MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
+    "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
+    "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
+    "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
+    "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
+    "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
+    "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -71,4 +63,5 @@ HF_MODELS: dict[str, dict] = {
 def get_model_class(name: str) -> type[Model]:
     if name not in MODEL_REGISTRY:
         raise KeyError(f"Unknown model name: {name!r}. Available: {list(MODEL_REGISTRY.keys())}")
-    return MODEL_REGISTRY[name]
+    module_name, class_name = MODEL_REGISTRY[name]
+    return getattr(import_module(module_name), class_name)

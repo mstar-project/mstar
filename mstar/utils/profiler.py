@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+import os
+from collections import defaultdict
 from contextlib import contextmanager
 from typing import Iterator
 
 import torch
+
+# Per-phase wall-clock samples (MSTAR_PHASE_TIMING), shared process-wide so the
+# engine's threads can record into the same buffer the worker flushes.
+PHASE_PERIOD = int(os.environ.get("MSTAR_PHASE_TIMING", "0") or "0")
+_PHASE_BUF: dict[str, list[float]] = defaultdict(list)
+
+
+def phase_record(name: str, dt: float) -> None:
+    if PHASE_PERIOD:
+        _PHASE_BUF[name].append(dt)
+
+
+def phase_buffer() -> dict[str, list[float]]:
+    """The shared sample buffer; ``Worker.run`` reads and clears it."""
+    return _PHASE_BUF
 
 
 def _sync_if_available() -> None:

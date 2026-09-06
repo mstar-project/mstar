@@ -166,6 +166,7 @@ class OpenAIAdapter:
     supports_speech: bool = False   # POST /v1/audio/speech
     supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
     supports_videos: bool = False   # POST /v1/videos/generations
+    supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
@@ -244,6 +245,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
     supports_chat = True
     supports_speech = True
+    supports_realtime = True
 
     def _voice(self, req) -> str | None:
         audio_cfg = getattr(req, "audio", None) or {}

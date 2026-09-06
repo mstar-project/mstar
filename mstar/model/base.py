@@ -8,13 +8,14 @@ import yaml
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
+    DEFAULT_PARTITION,
     CurrentForwardConductorMetadata,
     PartitionDefinition,
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig, ShardingGroup
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -24,11 +25,9 @@ from mstar.graph.base import (
     Sequential,
     TensorPointerInfo,
 )
-from mstar.utils.sampling import MultiSamplingConfig, SamplingConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
-
 
 @dataclass
 class TensorAndMetadata:
@@ -259,7 +258,7 @@ class Model(ABC):
                 continue
             node_to_group_idx.update({name: i for name in group["node_names"]})
 
-        partition = "default"
+        partition = DEFAULT_PARTITION
         for part in self.get_partitions():
             if graph_walk in part.graph_walks:
                 partition = part.name
@@ -350,68 +349,55 @@ class Model(ABC):
             groups=[], tp_enabled_nodes=[], shard_dim={}
         ) # default: no sharding
 
-    @abstractmethod
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        """Return per-node KV cache configs.
+    @property
+    def nodes(self) -> list[str]:
+        return sorted({
+            node
+            for graph in self.get_graph_walk_graphs().values()
+            for node in graph.get_nodes()
+        })
 
-        Maps AR node name -> KVCacheConfig. Nodes not in the dict
-        fall back to the first config (for models where all AR nodes
-        share the same config, e.g., Bagel's LLM / LLM_cfg_text / LLM_cfg_img).
+    @abstractmethod
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """Declare the resources the engine builds, and which nodes share each.
+
+        The whole declaration: a KV cache's shape, the attention backend over
+        it, positions, samplers. The engine builds one resource per spec and
+        hands each node the subset naming it.
         """
         pass
+
+    def get_request_resource_configs(
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Per-resource config a new request is opened with, by resource label.
+
+        Where a request's knobs live now: sampling params, whether it needs
+        CFG, retention. The conductor resolves this once per request and the
+        engine hands each config to its resource at ingest.
+        """
+        del model_kwargs, partition_fwd_args
+        return {}
 
     def get_sampling_config(
         self, node_name: str,
         model_kwargs: dict | None = None,
     )  -> SamplingConfig | None:
+        """This node's sampling params. Feed it to the sampler resource's
+        config in ``get_request_resource_configs``.
+
+        A node that samples under several configs (a talker and its code
+        predictor, say) declares one sampler resource per label rather than
+        nesting them here.
+        """
         return SamplingConfig(
             ignore_eos=(model_kwargs or {}).get("ignore_eos", False)
         )
 
-    def get_aux_sampling_configs(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> dict[str, SamplingConfig]:
-        """
-        For a node that needs to perform sampling with multiple configs, for
-        instance the talker and code predictor in Qwen3-Omni / TTS. Returns
-        label -> SamplingConfig, e.g., {"code_predictor": ...}
-
-        The submodule samples these via ``sampler.sample_aux(label, ...)``; each
-        label gets its own sampler buffers, so the params are per-request and
-        CUDA-graph safe.
-
-        Contract: the label SET must not depend on ``model_kwargs`` — only the
-        values may. The aux SamplerBuffers are allocated once at engine build
-        from the default config, and MultiSampler.set_config /
-        MultiSamplerBuffers.update_request_config intersect against that fixed
-        set, so any label introduced later (per-request) is silently dropped
-        (and only asserts if the submodule then tries to sample it).
-        """
-        return {}
-
-    def resolve_sampling_configs(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> MultiSamplingConfig:
-        """Bundle a node's main + aux configs. The engines consume this, not
-        ``get_sampling_config`` directly."""
-        return MultiSamplingConfig(
-            main=self.get_sampling_config(
-                node_name=node_name, model_kwargs=model_kwargs
-            ),
-            aux=self.get_aux_sampling_configs(
-                node_name=node_name, model_kwargs=model_kwargs
-            )
-        )
-
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        pass
-
-    @abstractmethod
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        """Returns node_name -> EngineType enum."""
         pass
 
     @abstractmethod
@@ -566,7 +552,7 @@ class Model(ABC):
         """
         from mstar.streaming.topology import PartitionTopology
 
-        return PartitionTopology(partitions=["default"], connections=[])
+        return PartitionTopology(partitions=[DEFAULT_PARTITION], connections=[])
 
     def get_partitions(self) -> list[PartitionDefinition]:
         """Return partition definitions.
@@ -577,7 +563,7 @@ class Model(ABC):
         walks = set(self.get_graph_walk_graphs().keys())
         return [
             PartitionDefinition(
-                name="default",
+                name=DEFAULT_PARTITION,
                 graph_walks=walks,
                 initial_walk=None,
                 producer_partitions=[],

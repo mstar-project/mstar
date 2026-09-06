@@ -17,7 +17,7 @@ dependencies = [
     "msgpack",
     "python-multipart",
     "requests",
-    "torch>=2.9.1",
+    "torch>=2.9.1,<2.13.0",
     "torchvision>=0.24.1",
     "torchaudio>=2.9.1",
     "uvicorn",
@@ -39,6 +39,14 @@ dev = [
 # and SDK. WAV/PCM work without this.
 audio = [
     "soundfile",
+]
+
+# Optional: serve a deployment as a NVIDIA Dynamo backend
+# (python -m mstar.integrations.dynamo). Nothing outside
+# mstar/integrations/dynamo/ imports these.
+dynamo = [
+    "ai-dynamo>=1.4.0,<1.5",
+    "uvloop",
 ]
 
 bagel = [
