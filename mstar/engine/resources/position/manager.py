@@ -304,8 +304,8 @@ class RopeManager(PositionManager):
         rope_dtype = rope_dtype if rope_dtype is not None else config.rope_dtype
         if rope_dtype is not None:
             q, k = q.to(rope_dtype), k.to(rope_dtype)
-        elif torch.is_autocast_enabled():
-            dtype = torch.get_autocast_gpu_dtype()
+        elif torch.is_autocast_enabled(q.device.type):
+            dtype = torch.get_autocast_dtype(q.device.type)
             q, k = q.to(dtype), k.to(dtype)
         elif q.dtype == torch.float32:
             q, k = q.to(torch.bfloat16), k.to(torch.bfloat16)
