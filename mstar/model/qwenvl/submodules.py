@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -9,11 +10,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
-from mstar.engine.kv_store import PositionInfo
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.qwenvl.components import compute_mrope_cos_sin
+from mstar.model.qwenvl.config import ATTN, KV_CACHE, POS, SAMPLER
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.utils.sampling import Sampler
 
 
 def qwen_vl_position_ids(
@@ -132,11 +133,18 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        pos_info: dict[str, PositionInfo] = {},
+        resources: dict | None = None,
         **kwargs,
     ) -> ARNodeInputs:
         input_ids = inputs["text_inputs"][0]
-        position_start = pos_info.get("main", PositionInfo()).position_id_start
+        position_start = 0
+        pos_info = kwargs.get("pos_info") or {}
+        if "main" in pos_info:
+            position_start = getattr(pos_info["main"], "position_id_start", 0)
+        elif resources is not None and POS in resources and fwd_info is not None:
+            published = resources[POS].publish(fwd_info.request_id)
+            if published is not None:
+                position_start = published.counters.get("main", 0)
         if graph_walk == "prefill_vision":
             position_ids = inputs["position_ids"][0]
             return ARNodeInputs(
@@ -167,23 +175,48 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
             kwargs={"position_advance": input_ids.numel()},
         )
 
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
+        del graph_walk, slot_lease, piecewise_leases, kwargs
+        pos_advance = tuple(
+            int(inp.kwargs.get("position_advance", inp.input_seq_len)) for inp in inputs
+        )
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            steps={
+                KV_CACHE: KVStep(),
+                ATTN: AttentionStep(causal=True),
+                SAMPLER: SamplerStep(apply_penalty=True),
+                POS: PositionStep(advance=pos_advance),
+            },
+        )
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        cache = engine_inputs.cache_manager
-        assert cache is not None, "QwenVL LLM requires a KV-cache manager."
+        cache = getattr(engine_inputs, "cache_manager", None)
         seq_lens = [request.input_seq_len for request in inputs]
-        cache.set_active_label("main")
-        cache.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
         position_ids = torch.cat([request.custom_pos_ids for request in inputs], dim=1)
         position_advance = [int(request.kwargs["position_advance"]) for request in inputs]
-        # Keep the MRoPE span on the plan-state side channel used by the
-        # cache manager. This is also the contract a future CUDA-graph replay
-        # path must consume via ``advance_seq_lens()`` with no arguments.
-        cache.set_custom_pos_advance(position_advance, label="main")
+        # Compatibility path for component tests that still inject a fake
+        # cache_manager. Production planning lives on declare_step.
+        if cache is not None:
+            cache.set_active_label("main")
+            cache.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
+            cache.set_custom_pos_advance(position_advance, label="main")
         packed: dict[str, torch.Tensor | Any] = {
             "text_inputs": torch.cat([request.input_ids for request in inputs]),
             "position_ids": position_ids,
@@ -246,8 +279,7 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         embeddings = self._merge_embeddings(text_inputs, vision_embeds)
-        cache = engine_inputs.cache_manager
-        assert cache is not None
+        cache = getattr(engine_inputs, "cache_manager", None)
         return self.language_model(
             embeddings,
             cache,
@@ -291,7 +323,8 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
             last = hidden.index_select(0, _last_token_indices(seq_lens, hidden.device))
         return {"logits": [self.lm_head(last)]}
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        del batch, model_inputs
         return True
 
     def forward_batched(
@@ -320,13 +353,12 @@ class QwenVLLLMSubmodule(ARNodeSubmodule):
             visual_token_mask,
             deepstack_visual_embeds,
         )
-        cache = engine_inputs.cache_manager
-        assert cache is not None
         if seq_lens is None:
             seq_lens = [1] * len(engine_inputs.request_ids)
         last = hidden.index_select(0, _last_token_indices(seq_lens, hidden.device))
         logits = self.lm_head(last)
-        sampler: Sampler | None = engine_inputs.sampler
+        resources = getattr(engine_inputs, "resources", None) or {}
+        sampler = resources.get(SAMPLER, getattr(engine_inputs, "sampler", None))
         request_ids = engine_inputs.request_ids
         if sampler is None:
             return {rid: {"logits": [logits[i : i + 1]]} for i, rid in enumerate(request_ids)}

@@ -43,6 +43,7 @@ class _StubAPI:
         self.last_submit = None
         self._chunks: dict = {}
         self.next_chunks: list = []
+        self.last_raw_request = None
 
     def submit_request(self, **kw):
         self.last_submit = kw
@@ -50,6 +51,7 @@ class _StubAPI:
         return kw["request_id"]
 
     async def collect_results(self, request_id, raw_request=None):
+        self.last_raw_request = raw_request
         return self._chunks.get(request_id, [])
 
     async def iter_result_chunks(self, request_id):
@@ -153,6 +155,7 @@ def test_images_edits(client_and_stub):
     mk = stub.last_submit["model_kwargs"]
     assert mk.get("cfg_img_scale") == 2.0 and mk.get("cfg_interval") == [0.0, 1.0]
     assert "image" in (stub.last_submit["file_paths"] or {})
+    assert stub.last_raw_request is not None
 
 
 def test_videos_generations_wan22(client_and_stub):

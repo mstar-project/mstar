@@ -2,6 +2,13 @@
 
 from dataclasses import dataclass, field
 
+# ---------------------------------------------------------------------------
+# Resource label constants (LLM node: shared by PaliGemma + action expert)
+# ---------------------------------------------------------------------------
+LLM_KV = "kv"
+LLM_ATTN = "attn"
+LLM_POS = "rope"
+
 
 @dataclass
 class Pi05Config:

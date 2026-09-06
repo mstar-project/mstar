@@ -7,8 +7,9 @@ max_seq_len: 8192
 # 256p/480p video (480p needs ~300 pages) and leaves room for activations; 720p
 # video (~692 pages + large replicated activations) does not fit at TP=2 and is
 # deferred to sequence-parallelism.
-kv_cache:
-  max_num_pages: 384
+resources:
+  kv:
+    max_num_pages: 384
 # Super (64B, ~128 GB bf16) is unviable on one 80 GB GPU, so the DiT runs
 # tensor-parallel across 2 ranks (~64 GB weights/rank). The VAE decoder is small
 # and runs un-sharded on rank 0 (the DiT's final latents are replicated, so it

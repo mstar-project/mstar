@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.engine.kv_store import PositionInfo
 from mstar.model.qwenvl.components import QwenVLForCausalLM
 from mstar.model.qwenvl.submodules import (
     QwenVLLLMSubmodule,
@@ -76,11 +75,11 @@ def test_image_prefill_preserves_mrope_position_for_follow_up_decode():
             "text_inputs": [torch.tensor([6, 7])],
             "position_ids": [torch.tensor([[4, 5], [4, 5], [4, 5]])],
         },
-        pos_info={"main": PositionInfo(position_id_start=4)},
+        pos_info={"main": SimpleNamespace(position_id_start=4)},
     )
     assert resumed.kwargs["position_advance"] == 2
     decode = submodule.prepare_inputs(
-        "decode", None, {"text_inputs": [torch.tensor([7])]}, pos_info={"main": PositionInfo(position_id_start=4)}
+        "decode", None, {"text_inputs": [torch.tensor([7])]}, pos_info={"main": SimpleNamespace(position_id_start=4)}
     )
     assert decode.custom_pos_ids.tolist() == [[4], [4], [4]]
     with pytest.raises(ValueError, match="Unknown"):

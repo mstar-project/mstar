@@ -9,15 +9,25 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
+from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.qwenvl.config import load_qwenvl_config
+from mstar.model.qwenvl.config import ATTN, KV_CACHE, POS, SAMPLER, load_qwenvl_config
 from mstar.model.qwenvl.submodules import qwen_vl_position_ids
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -50,21 +60,49 @@ class QwenVLModel(Model):
 
         return snapshot_download(repo_id=self.model_path_hf, cache_dir=self.cache_dir)
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
+    def get_node_resources(self) -> list[NodeResourceSpec]:
         text = self.config.text_config
+        kv_config = KVConfig(
+            num_layers=text.num_hidden_layers,
+            num_kv_heads=text.num_key_value_heads,
+            head_dim=text.head_dim,
+            max_seq_len=text.max_position_embeddings,
+            num_qo_heads=text.num_attention_heads,
+        )
         return [
-            KVCacheConfig(
-                num_layers=text.num_hidden_layers,
-                num_kv_heads=text.num_key_value_heads,
-                head_dim=text.head_dim,
-                max_seq_len=text.max_position_embeddings,
-                num_qo_heads=text.num_attention_heads,
-                nodes=["LLM"],
-            )
+            KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=kv_config),
+            AttentionSpec(
+                resource_key=ATTN,
+                nodes={"LLM"},
+                config=AttentionConfig(kv_cache=KV_CACHE),
+            ),
+            PositionSpec(
+                resource_key=POS,
+                nodes={"LLM"},
+                config=PositionConfig(kv_cache=KV_CACHE),
+            ),
+            SamplerSpec(
+                resource_key=SAMPLER,
+                nodes={"LLM"},
+                vocab_size=text.vocab_size,
+                enable_repetion_penalty=True,
+            ),
         ]
 
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {"vision_encoder": EngineType.STATELESS, "LLM": EngineType.KV_CACHE}
+    def get_request_resource_configs(
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
+        options = model_kwargs or {}
+        return {
+            SAMPLER: SamplingReqConfig(
+                temperature=options.get("temperature", 0.0),
+                top_p=options.get("top_p", 1.0),
+                ignore_eos=options.get("ignore_eos", False),
+            )
+        }
 
     def get_graph_walk_graphs(self):
         return {

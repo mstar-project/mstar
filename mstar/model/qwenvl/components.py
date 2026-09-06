@@ -6,10 +6,10 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import ParallelSparseMoeBlock, RMSNorm
 from mstar.model.components.distributed import ColumnParallelLinear, ParallelAttention, VocabParallelEmbedding
 from mstar.model.components.mrope import compute_3d_cos_sin, compute_rope_freqs
+from mstar.model.qwenvl.config import ATTN, KV_CACHE
 
 
 def compute_mrope_cos_sin(
@@ -53,21 +53,27 @@ class QwenVLAttention(ParallelAttention):
             qk_norm=True,
             rms_norm_eps=text.rms_norm_eps,
             rope_theta=text.rope_theta,
+            attn_key=ATTN,
+            kv_key=KV_CACHE,
+            pos_key=None,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        cache_handle=None,
+        cos: torch.Tensor | None = None,
+        sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
         q = q * cos.unsqueeze(1) + _rotate_half(q) * sin.unsqueeze(1)
         k = k * cos.unsqueeze(1) + _rotate_half(k) * sin.unsqueeze(1)
-        output = cache_handle.run_attention(q=q, k=k, v=v)
+        if cache_handle is not None:
+            output = cache_handle.run_attention(q=q, k=k, v=v)
+        else:
+            output = self.attend(q, k, v)
         return self.o_proj(output.reshape(tokens, self.num_heads * self.head_dim))
 
 
@@ -88,7 +94,7 @@ class QwenVLDecoderLayer(nn.Module):
             norm_topk_prob=text.norm_topk_prob,
         )
 
-    def forward(self, hidden_states, cache_handle, cos, sin):
+    def forward(self, hidden_states, cache_handle=None, cos=None, sin=None):
         residual = hidden_states
         hidden_states = self.self_attn(self.input_layernorm(hidden_states), cache_handle, cos, sin)
         hidden_states = residual + hidden_states
@@ -140,8 +146,8 @@ class QwenVLForCausalLM(nn.Module):
     def forward(
         self,
         input_embeds,
-        cache_handle,
-        position_ids,
+        cache_handle=None,
+        position_ids=None,
         position_advance: int | list[int] | None = None,
         cos=None,
         sin=None,
@@ -165,14 +171,27 @@ class QwenVLForCausalLM(nn.Module):
                     f"got {len(deepstack_visual_embeds)} feature sets."
                 )
         hidden_states = input_embeds
+        if cache_handle is not None:
+            for index, layer in enumerate(self.model.layers):
+                cache_handle.set_layer_idx(index)
+                hidden_states = layer(hidden_states, cache_handle, cos, sin)
+                if deepstack_visual_embeds is not None and index < len(deepstack_visual_embeds):
+                    hidden_states = self._inject_deepstack(
+                        hidden_states,
+                        visual_token_mask,
+                        deepstack_visual_embeds[index],
+                    )
+            cache_handle.advance_seq_lens(pos_id_ns=position_advance)
+            return self.model.norm(hidden_states)
+
+        self.model.layers[0].self_attn.attend.bind_step("main")
         for index, layer in enumerate(self.model.layers):
-            cache_handle.set_layer_idx(index)
-            hidden_states = layer(hidden_states, cache_handle, cos, sin)
+            layer.self_attn.attend.set_layer_idx(index)
+            hidden_states = layer(hidden_states, None, cos, sin)
             if deepstack_visual_embeds is not None and index < len(deepstack_visual_embeds):
                 hidden_states = self._inject_deepstack(
                     hidden_states,
                     visual_token_mask,
                     deepstack_visual_embeds[index],
                 )
-        cache_handle.advance_seq_lens(pos_id_ns=position_advance)
         return self.model.norm(hidden_states)

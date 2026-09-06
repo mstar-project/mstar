@@ -14,10 +14,6 @@ def _make_model() -> OrpheusModel:
     return model
 
 
-def _audio_token_for_pos(pos: int, code: int = 1) -> int:
-    return 10 + (pos * 4096) + code
-
-
 def test_orpheus_prefill_transitions_to_decode():
     model = _make_model()
     metadata = CurrentForwardConductorMetadata(
@@ -35,8 +31,8 @@ def test_orpheus_prefill_transitions_to_decode():
 
     assert result.full_metadata.graph_walk == "decode"
     assert result.step_metadata["is_prefill"] is False
-    assert result.full_metadata.kwargs["audio_token_count"] == 0
-    assert result.full_metadata.kwargs["decode_finished"] is False
+    assert result.request_done is False
+    assert "decode_finished" not in result.full_metadata.kwargs
 
 
 def test_orpheus_decode_eos_marks_done():
@@ -47,7 +43,6 @@ def test_orpheus_decode_eos_marks_done():
         graph_walk="decode",
         is_prefill=False,
         kwargs={
-            "audio_token_count": 0,
             "decode_finished": False,
         },
     )

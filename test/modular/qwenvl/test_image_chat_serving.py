@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.base import EngineType
 from mstar.graph.base import Loop, TensorPointerInfo
+from mstar.model.qwenvl.config import ATTN, KV_CACHE, POS, SAMPLER
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.qwenvl.qwenvl_model import QwenVLModel
 from mstar.model.qwenvl.submodules import QwenVLLLMSubmodule, QwenVLVisionSubmodule
@@ -90,8 +90,10 @@ def test_platform_can_resolve_local_or_hub_model_snapshot(tmp_path, monkeypatch)
     model.model_path_hf, model.cache_dir = "Qwen/Qwen3-VL-30B-A3B-Instruct", "/cache"
     assert model._resolve_snapshot() == "/resolved"
     assert captured == {"repo_id": model.model_path_hf, "cache_dir": "/cache"}
-    assert model.get_node_engine_types() == {"vision_encoder": EngineType.STATELESS, "LLM": EngineType.KV_CACHE}
-    assert model.get_kv_cache_config()[0].num_layers == 3
+    resources = {spec.resource_key: spec for spec in model.get_node_resources()}
+    assert set(resources) == {KV_CACHE, ATTN, POS, SAMPLER}
+    assert resources[KV_CACHE].nodes == {"LLM"}
+    assert resources[KV_CACHE].config.num_layers == 3
     assert model.get_sampling_config("LLM", {"temperature": 0.5}).temperature == 0.5
 
 

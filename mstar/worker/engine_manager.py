@@ -1,76 +1,32 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Callable
 
 import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
-from mstar.engine.base import BaseEngine, EngineType
-from mstar.engine.kv_cache_engine import KVCacheEngine
-from mstar.engine.kv_store import KVCacheConfig, TransferEngineInfo
-from mstar.engine.stateless_engine import (
-    StatelessEngine,
-    StatelessEngineConfig,
-    make_audio_codec_config,
-    make_enc_dec_config,
-)
+from mstar.engine.engine import Engine
+from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.base import Model
-
-
-def _make_kv_cache(
-    autocast_dtype: torch.dtype, enable_nvtx: bool, enable_prof: bool = False
-) -> BaseEngine:
-    return KVCacheEngine(
-        autocast_dtype=autocast_dtype, enable_nvtx=enable_nvtx, enable_prof=enable_prof
-    )
-
-
-def _make_stateless_factory(
-    config_factory: Callable[[torch.dtype | None], StatelessEngineConfig],
-) -> Callable[[torch.dtype | None, bool, bool], BaseEngine]:
-    def factory(
-        autocast_dtype: torch.dtype | None, enable_nvtx: bool, enable_prof: bool = False
-    ) -> BaseEngine:
-        return StatelessEngine(
-            config=config_factory(autocast_dtype),
-            enable_nvtx=enable_nvtx,
-            enable_prof=enable_prof,
-        )
-
-    return factory
-
-
-# Engine-type strings (``EngineType.value``) → factory. ``STATELESS`` is
-# resolved via ``STATELESS_FLAVOR_FACTORIES`` instead because its config
-# depends on the submodule (enc_dec vs audio_codec).
-ENGINE_TYPE_FACTORIES: dict[str, Callable[[torch.dtype | None, bool, bool], BaseEngine]] = {
-    "kv_cache": _make_kv_cache,
-}
-
-
-# Stateless-engine flavor → factory. The submodule declares its flavor via
-# ``NodeSubmodule.get_stateless_flavor()``; the EngineManager groups
-# ``STATELESS`` nodes by that flavor so each flavor gets one engine with the
-# right config (autocast, force_float32, torch.compile, piecewise runner).
-STATELESS_FLAVOR_FACTORIES: dict[str, Callable[[torch.dtype | None, bool, bool], BaseEngine]] = {
-    "enc_dec": _make_stateless_factory(make_enc_dec_config),
-    "audio_codec": _make_stateless_factory(make_audio_codec_config),
-}
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class EngineManager:
-    """Maps node names to engine instances."""
-    node_to_engine: dict[str, BaseEngine] = field(default_factory=dict)
+    """Owns the worker's engine.
+
+    One engine serves every node: it holds all the submodules and the
+    resources they share, so there is nothing to group or dedup.
+    """
+    engine: Engine
+    node_names: set[str] = field(default_factory=set)
 
     @classmethod
     def build(
         cls,
         node_names: set[str],
         device: torch.device,
-        kv_config: list[KVCacheConfig],
         model_config: dict,
         parallel_groups: WorkerParallelGroups,
         transfer_engine_info: TransferEngineInfo,
@@ -78,15 +34,14 @@ class EngineManager:
         enable_nvtx: bool = False,
         enable_prof: bool=False,
     ) -> "EngineManager":
-        """
-        Build an EngineManager from a list of engine configs.
+        """Build the engine and load this worker's nodes into it.
 
-        The Model object (if provided) supplies nn.Module submodules for
-        each node via model.get_submodule(node_name). In dummy mode
-        (model=None or get_submodule returns None), engines run without
-        real computation.
+        The model supplies each node's submodule via ``get_submodule`` and its
+        resources via ``get_node_resources``; the KV cache's shape rides on
+        the latter, so there is no separate cache config.
         """
-        node_to_engine_type = model.get_node_engine_types()
+        specs = model.get_node_resources()
+        apply_yaml_overrides(specs, model_config)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
@@ -99,139 +54,74 @@ class EngineManager:
         # Allocation dtype hint for get_submodule: a node's params should be
         # allocated directly in ``autocast_dtype`` (cast meta -> dtype before
         # ``to_empty``) instead of allocating fp32 then down-casting after
-        # return — the latter doubles the load-time VRAM peak. This is the
-        # SAME resolved dtype applied by the post-return cast at the
-        # ``engine.has_autocast()`` branch below, so allocation and runtime
-        # dtype stay consistent. ``None`` (no model/config autocast) means
-        # leave fp32. Build paths that must stay fp32 regardless (e.g. the
-        # audio-codec vocoders, whose stateless engine locks autocast off)
-        # don't use the meta+to_empty path and simply ignore this hint.
-        node_submodules: dict[str, torch.nn.Module | None] = {}
-        if model is not None:
-            for name in node_names:
-                node_tp_group = parallel_groups.get_tp_config_for_node(name)
-                # Sequence parallelism is opt-in per node; only forward the SP
-                # group when this node actually participates in one, so models
-                # that don't support SP keep their existing get_submodule call.
-                extra = {}
-                node_sp_group = parallel_groups.get_sp_config_for_node(name)
-                if node_sp_group.world_size > 1:
-                    extra["sp_group"] = node_sp_group
-                node_submodules[name] = model.get_submodule(
-                    name, device, tp_group=node_tp_group,
-                    autocast_dtype=autocast_dtype, **extra,
-                )
-
-        # Group nodes by the factory key. STATELESS nodes split further by
-        # the flavor declared on the submodule; other engine types group
-        # on the engine-type string alone.
-        group_to_nodes: dict[tuple[str, str | None], list[str]] = {}
+        # return — the latter doubles the load-time VRAM peak. The cast below
+        # applies the same resolved dtype, so allocation and runtime agree.
+        submodules: dict[str, torch.nn.Module] = {}
         for name in node_names:
-            engine_type = node_to_engine_type[name]
-            if engine_type == EngineType.STATELESS:
-                sm = node_submodules.get(name)
-                flavor = sm.get_stateless_flavor() if sm is not None else "enc_dec"
-                group_key: tuple[str, str | None] = ("stateless", flavor)
-            else:
-                group_key = (engine_type.value, None)
-            group_to_nodes.setdefault(group_key, []).append(name)
-
-        node_to_engine: dict[str, BaseEngine] = {}
-        for (engine_type_str, flavor), engine_node_names in group_to_nodes.items():
-            if engine_type_str == "stateless":
-                factory = STATELESS_FLAVOR_FACTORIES[flavor]
-            else:
-                factory = ENGINE_TYPE_FACTORIES[engine_type_str]
-            engine = factory(autocast_dtype, enable_nvtx, enable_prof)
-
-            submodules: dict[str, torch.nn.Module] = {}
-            for name in engine_node_names:
-                submodule = node_submodules.get(name)
-                if submodule is not None:
-                    if engine.has_autocast():
-                        submodules[name] = submodule.to(
-                            device=device,
-                            dtype=autocast_dtype,
-                        )
-                    else:
-                        submodules[name] = submodule.to(device=device)
-
-            engine.load_model(
-                submodules,
-                parallel_groups=parallel_groups,
-                kv_cache_config=kv_config,
-                device=device,
-                transfer_engine_info=transfer_engine_info,
-                kv_cache_type=autocast_dtype,
-                default_sampling_config={
-                    node: model.resolve_sampling_configs(node, {}) \
-                        for node in submodules
-                }
+            # Sequence parallelism is opt-in per node; only forward the SP
+            # group when this node actually participates in one, so models
+            # that don't support SP keep their existing get_submodule call.
+            extra = {}
+            node_sp_group = parallel_groups.get_sp_config_for_node(name)
+            if node_sp_group.world_size > 1:
+                extra["sp_group"] = node_sp_group
+            submodule = model.get_submodule(
+                name, device,
+                tp_group=parallel_groups.get_tp_config_for_node(name),
+                autocast_dtype=autocast_dtype, **extra,
             )
-            log_key = engine_type_str if flavor is None else f"{engine_type_str}.{flavor}"
-            logger.info("Engine %s loaded in on device %s", log_key, str(device))
+            if submodule is None:
+                continue
+            if submodule.disable_autocast:
+                # keeps the dtype it was built in; the engine won't autocast it
+                submodules[name] = submodule.to(device=device)
+                continue
+            # A submodule that must run in its own dtype (an audio codec in
+            # fp32, say) says so; otherwise it takes the engine's.
+            node_dtype = submodule.get_autocast_dtype() or autocast_dtype
+            submodules[name] = submodule.to(device=device, dtype=node_dtype)
 
-            for name in engine_node_names:
-                node_to_engine[name] = engine
-        logger.info("All engines loaded on device %s", str(device))
+        engine = Engine(
+            autocast_dtype=autocast_dtype,
+            enable_nvtx=enable_nvtx,
+            enable_profile=enable_prof,
+        )
+        engine.load_model(
+            submodules,
+            specs=specs,
+            parallel_groups=parallel_groups,
+            device=device,
+            transfer_engine_info=transfer_engine_info,
+            kv_cache_type=autocast_dtype,
+        )
+        logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(node_to_engine=node_to_engine)
+        return cls(engine=engine, node_names=set(node_names))
 
     def warmup_all(self) -> None:
-        """Call warmup() on all unique engines for CUDA graph capture."""
-        seen = set()
+        """CUDA graph capture, for the whole forward and any piecewise region."""
         with torch.no_grad():
-            for engine in self.node_to_engine.values():
-                eid = id(engine)
-                if eid not in seen:
-                    seen.add(eid)
-                    engine.warmup()
+            self.engine.warmup()
 
-    def get_engine(self, node_name: str) -> BaseEngine:
-        return self.node_to_engine[node_name]
+    def get_engine(self, node_name: str) -> Engine:
+        del node_name  # one engine serves every node
+        return self.engine
 
-    def add_request(self, request_id: str) -> None:
-        """Propagate add_request to all unique engines."""
-        seen = set()
-        for engine in self.node_to_engine.values():
-            eid = id(engine)
-            if eid not in seen:
-                seen.add(eid)
-                engine.add_request(request_id)
+    def add_request(
+        self, request_id: str,
+        resource_configs: dict[str, ResourceReqConfig] | None = None,
+    ) -> None:
+        """Open resource state for a request, on the per-resource configs the
+        conductor resolved for it (``Model.get_request_resource_configs``)."""
+        self.engine.add_request(request_id, resource_configs)
 
     def remove_request(self, request_id: str) -> None:
-        """Propagate remove_request to all unique engines."""
-        seen = set()
-        for engine in self.node_to_engine.values():
-            eid = id(engine)
-            if eid not in seen:
-                seen.add(eid)
-                engine.remove_request(request_id)
+        self.engine.remove_request(request_id)
 
-    def set_alloc_write_policies(self, policy):
-        for engine in self._unique_engines():
-            engine.set_alloc_write_policy(policy)
-
-    def lru_tracked_nodes(self) -> list[str]:
-        """Aggregate ``engine.lru_tracked_nodes()`` across unique engines.
-        The worker uses this to seed / clean up the per-request LRU
-        timestamps it needs for offload-victim selection.
-        """
-        out: list[str] = []
-        for engine in self._unique_engines():
-            out.extend(engine.lru_tracked_nodes())
-        return out
-
-    def _unique_engines(self) -> list[BaseEngine]:
-        seen = set()
-        result = []
-        for engine in self.node_to_engine.values():
-            eid = id(engine)
-            if eid not in seen:
-                seen.add(eid)
-                result.append(engine)
-        return result
+    def evictable_nodes(self) -> list[str]:
+        """Nodes whose state can be reclaimed. The worker keeps the per-request
+        LRU timestamps it needs to pick victims among them."""
+        return [name for name in sorted(self.node_names) if self.engine.evictable(name)]
 
     def shutdown(self) -> None:
-        for engine in self._unique_engines():
-            engine.shutdown()
+        self.engine.shutdown()

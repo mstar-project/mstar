@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+KV_CACHE = "kv"
+ATTN = "attn"
+POS = "rope"
+SAMPLER = "sampler"
+
 
 def validate_qwenvl_config(config: Any) -> None:
     """Reject architecture variants that the M* QwenVL graph does not implement."""
