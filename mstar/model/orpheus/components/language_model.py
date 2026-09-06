@@ -16,7 +16,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.kv_cache_engine import BatchedCacheManager
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -24,7 +23,7 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.orpheus.config import OrpheusModelConfig
+from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, OrpheusModelConfig
 
 
 def _build_decoder_layer(config: OrpheusModelConfig, comm_group: CommGroup | None = None) -> DecoderLayer:
@@ -40,6 +39,9 @@ def _build_decoder_layer(config: OrpheusModelConfig, comm_group: CommGroup | Non
             rope_low_freq_factor=config.rope_scaling["low_freq_factor"],
             rope_high_freq_factor=config.rope_scaling["high_freq_factor"],
             rope_old_context_len=config.rope_scaling["original_max_position_embeddings"],
+            attn_key=ATTN,
+            kv_key=KV_CACHE,
+            pos_key=ROPE
         ),
         mlp=ParallelGatedMLP(
             comm_group=comm_group,
@@ -72,14 +74,17 @@ class OrpheusLanguageModel(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
     ) -> torch.Tensor:
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
-            query_sequence = decoder_layer(
-                hidden_states=query_sequence, cache_handle=cache_handle,
-            )
-        cache_handle.advance_seq_lens()
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            query_sequence = decoder_layer(hidden_states=query_sequence)
+        # the advance is the runner's now, off the step declaration
         return self.norm(query_sequence)
 
 
@@ -103,10 +108,11 @@ class OrpheusForCausalLM(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
         **kwargs,
     ) -> torch.Tensor:
-        return self.model(query_sequence=query_sequence, cache_handle=cache_handle)
+        return self.model(query_sequence=query_sequence, label=label)
 
     def load_weights(self, weights):
         """Load HF Llama-style weights into the fused parameters."""

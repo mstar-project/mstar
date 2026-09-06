@@ -1,8 +1,8 @@
 """PaliGemma transformer expert for Pi0.5 (prefix processing).
 
-A Gemma-style transformer that integrates with mstar's BatchedCacheManager
-for paged KV cache. Used for the prefill graph walk where it processes
-the prefix tokens (image + language + state) and writes the KV cache
+A Gemma-style transformer that writes the paged KV cache through the node's
+KV/attention/position resources. Used for the prefill graph walk where it
+processes the prefix tokens (image + language + state) and writes the KV cache
 that the action expert later reads during action generation.
 
 Composed entirely from ``mstar.model.components`` — Gemma RMSNorm
@@ -15,10 +15,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.pi05.config import Pi05Config
+from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
 
 
 def _build_paligemma_layer(
@@ -42,6 +41,9 @@ def _build_paligemma_layer(
             head_dim=config.head_dim,
             input_hidden_size=h,
             rope_theta=config.rope_theta,
+            attn_key=LLM_ATTN,
+            kv_key=LLM_KV,
+            pos_key=LLM_POS,
         ),
         mlp=ParallelGatedMLP(
             hidden_size=h,
@@ -73,16 +75,17 @@ class Pi05PaliGemmaExpert(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        write_cache: bool = True,
+        *,
+        label: str,
     ) -> torch.Tensor:
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
-            query_sequence = layer(
-                hidden_states=query_sequence, cache_handle=cache_handle,
-            )
+            layer.self_attn.attend.set_layer_idx(layer_idx)
+            query_sequence = layer(hidden_states=query_sequence)
 
-        if write_cache:
-            cache_handle.advance_seq_lens()
-
+        # `write_cache` and the advance that followed it are the step
+        # declaration's now: the runner commits the step after the forward.
         return self.norm(query_sequence)
