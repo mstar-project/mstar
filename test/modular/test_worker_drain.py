@@ -50,7 +50,7 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, lru_tracked_nodes=lambda: [],
+        remove_request=lambda rid: None, evictable_nodes=lambda: [],
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(

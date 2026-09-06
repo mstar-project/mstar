@@ -2664,7 +2664,7 @@ class Worker:
                 # thread then admits, plans and runs it inline; the slot is
                 # leased inside exec, once the token count is known.
                 # send messages to follower ranks if relevant
-                self._maybe_send_zmq_to_tp_followers(node_batch)
+                self.maybe_send_zmq_to_tp_followers(node_batch)
 
                 future = gpu_executor.submit(
                     self._execute_on_gpu_thread, batch, node_batch, None,

@@ -679,6 +679,5 @@ class MicroScheduler:
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
-        self.tp_batches_pending_schedule.pop(rid, None)
         self.pending_tp_follow_count.pop(rid, None)
 

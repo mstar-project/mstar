@@ -30,7 +30,9 @@ def _request_data(workers=("w0",), persist_signals=None, ref_cnts=None):
         all_worker_graph_ids={"wg"},
         max_output_tokens=1,
         random_seed=0,
-        sampling_config={},
+        # Post-resource-pool refactor: requests carry per-resource configs
+        # rather than a sampling_config. The barrier never reads them.
+        resource_configs={},
     )
 
 
