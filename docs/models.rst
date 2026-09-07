@@ -55,6 +55,14 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``kimi_k3`` *(Beta)*
+     - ``moonshotai/Kimi-K3``
+     - Kimi K3 text LLM: 93-layer hybrid of Kimi Delta Attention (linear, recurrent
+       state) and gated NoPE MLA, Block Attention Residuals, 896-expert latent MoE with
+       MXFP4 experts. The expert-pruned ``mgoin/Kimi-K3-pruned75`` (224 experts, 475 GB)
+       fits one 8xH100 node at TP8 (``configs/kimi_k3_pruned75_tp8.yaml``); the full
+       1.56 TB checkpoint needs a multi-node deployment. Text only for now (no vision
+       tower), no speculative decoding yet.
 
 Notes
 -----
