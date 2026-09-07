@@ -1,8 +1,7 @@
 import logging
-import os
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 
 import torch
 
@@ -144,11 +143,6 @@ class CudaGraphBucket:
 
 
 class CudaGraphRunner:
-    # Double-buffer: capture two graphs per config key, when the node has a
-    # resource that pre-plans. Replay alternates so plan(N+1) on the inactive
-    # slot can run concurrent with replay(N) on the active slot. Override via
-    # MSTAR_NUM_SLOTS=1 to disable double-buffer
-    NUM_SLOTS = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
 
@@ -161,6 +155,7 @@ class CudaGraphRunner:
         device: torch.device,
         autocast_dtype: torch.dtype | None,
         joint_comm_group: JointGroups,
+        num_slots: int,
         enable_nvtx: bool=False,
     ):
         self._submodule_name = submodule_name
@@ -176,19 +171,12 @@ class CudaGraphRunner:
         self._autocast_dtype = autocast_dtype
         self._enable_nvtx = enable_nvtx
 
-        # A second slot only buys something when a resource can plan a step
-        # ahead: the point is for that plan to write buffers the in-flight
-        # replay isn't reading. With nothing to pre-plan, the slots would hold
-        # identical graphs and double the capture time and memory.
-        self._num_slots = self.NUM_SLOTS if any(
-            resource.supports_preplan for resource in resources.values()
-        ) else 1
+        # How many slots to double-buffer; the caller decides (pre-plan or a
+        # force_double_buffer resource), since without either the slots would
+        # hold identical graphs and double the capture time and memory.
+        self._num_slots = num_slots
 
         self._buckets: dict[BucketKey, CudaGraphBucket] = {}
-
-        # Rotated globally, not per bucket: slot-keyed buffers are shared across
-        # buckets, so per-bucket counters let consecutive steps collide on a slot.
-        self._next_slot = 0
 
         self._memory_pool = None
         # set by prepare_for_capture; capture reuses it rather than re-deriving
@@ -676,9 +664,10 @@ class CudaGraphRunner:
         ) is not None
 
     def lease_slot(
-        self, graph_walk: str, bs: int, num_tokens: int | None = None,
+        self, graph_walk: str, bs: int,
+        slot: int,
+        num_tokens: int | None = None,
         cg_key_info: Any | None = None,
-        slot: int | None = None,
     ) -> SlotLease | None:
         """Pick the bucket and double-buffer slot an upcoming step replays on.
 
@@ -697,9 +686,7 @@ class CudaGraphRunner:
         if key is None:
             return None
         bucket = self._buckets[key]
-        if slot is None:
-            slot = self._next_slot
-            self._next_slot = (self._next_slot + 1) % self._num_slots
+
         # Hand back the bucket the capture ran under, not the alias this walk
         # found it by. Resources key their per-slot state (attention wrappers,
         # position buffers) on `lease.bucket`, so a lease naming an aliased
@@ -898,6 +885,12 @@ class PiecewiseOutput:
         return value[:self._real_len]
 
 
+class PiecewiseGraphKey(NamedTuple):
+    bs: int
+    seq_len: int
+    slot: int
+
+
 class PiecewiseCudaGraphRunner:
     """Captures one inner callable of a submodule's forward as a CUDA graph.
 
@@ -913,9 +906,6 @@ class PiecewiseCudaGraphRunner:
 
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
-    # A region can't overlap itself, and there is no pre-plan path into one, so
-    # a single slot suffices.
-    SLOT = 0
 
     def __init__(
         self,
@@ -925,6 +915,7 @@ class PiecewiseCudaGraphRunner:
         step_runner: StepRunner,
         device: torch.device,
         autocast_dtype: torch.dtype | None,
+        num_slots: int,
         joint_comm_group: JointGroups | None = None,
         node_name: str | None = None,
     ):
@@ -942,11 +933,44 @@ class PiecewiseCudaGraphRunner:
         self._capture_batch_sizes = sorted(
             config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
         )
-        self._graphs: dict[tuple[int, int], PiecewiseGraphData] = {}
+
+        self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
         self._memory_pool = None
         self._dummy_rows = DummyRowPool(
             prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
         )
+
+        # A region has no pre-plan path, so a second slot buys nothing unless a
+        # resource it replays stages a step's layout into a reused buffer behind
+        # an async H2D where the host can run ahead (see force_double_buffer).
+        double_buffer = any(
+            self._resources[key].force_double_buffer
+            for key in self._needed_resources()
+        )
+        self._num_slots = num_slots if double_buffer else 1
+        self._current_slot = 0
+
+    def _needed_resources(self) -> set[str]:
+        """The resource keys this region's declared step touches, to size
+        double-buffering. Dummy rows are ingested as ``_capture_one`` will
+        anyway (kept for the runner's lifetime), so this declaration matches the
+        one capture runs."""
+        if self._config.declare_step is None:
+            return set()
+        needed: set[str] = set()
+        for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
+            dummy_rids = self._dummy_rows.ensure(
+                f"{shape.bs}_{shape.total_tokens}", shape.bs
+            )
+            step = self._config.declare_step(
+                list(dummy_rids), list(shape.seq_lens)
+            )
+            if step is not None:
+                needed.update(step.steps.keys())
+        return needed
+
+    def set_slot(self, slot: int):
+        self._current_slot = slot % self._num_slots
 
     @property
     def any_graphs(self) -> bool:
@@ -970,10 +994,11 @@ class PiecewiseCudaGraphRunner:
                 self._step_runner.build_cuda_graph_buffers(
                     [
                         CGSlotSpec(
-                            bucket=self._bucket(shape), slot=self.SLOT,
+                            bucket=self._bucket(shape), slot=slot,
                             config=self._config,
                         )
                         for shape in shapes
+                        for slot in range(self._num_slots)
                     ],
                     max_bs=max(shape.bs for shape in shapes),
                     max_seq_len=max(shape.total_tokens for shape in shapes),
@@ -1002,25 +1027,29 @@ class PiecewiseCudaGraphRunner:
         )
         captured: list[bool] = []
         for shape in ordered:
-            # keep ranks in lockstep: the region may hold collectives, and a
-            # rank still in pre-capture setup would mismatch one already in the
-            # warmup forward
-            if self._comm_group is not None:
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
-            try:
-                self._capture_one(shape)
-                captured.append(True)
+            shape_captured = True
+            for slot in range(self._num_slots):
+                # keep ranks in lockstep: the region may hold collectives, and a
+                # rank still in pre-capture setup would mismatch one already in the
+                # warmup forward
+                if self._comm_group is not None:
+                    self._comm_group.tp_group.barrier()
+                    self._comm_group.sp_group.barrier()
+                try:
+                    self._capture_one(shape, slot)
+                except Exception:
+                    shape_captured = False
+                    logger.warning(
+                        "PiecewiseCudaGraphRunner[%s]: failed to capture bs=%d "
+                        "total_tokens=%d", self._label, shape.bs, shape.total_tokens,
+                        exc_info=True,
+                    )
+                    break
+            captured.append(shape_captured)
+            if shape_captured:
                 logger.info(
-                    "PiecewiseCudaGraphRunner[%s]: captured bs=%d total_tokens=%d",
-                    self._label, shape.bs, shape.total_tokens,
-                )
-            except Exception:
-                captured.append(False)
-                logger.warning(
-                    "PiecewiseCudaGraphRunner[%s]: failed to capture bs=%d "
-                    "total_tokens=%d", self._label, shape.bs, shape.total_tokens,
-                    exc_info=True,
+                    "PiecewiseCudaGraphRunner[%s]: captured bs=%d total_tokens=%d (%d slots)",
+                    self._label, shape.bs, shape.total_tokens, self._num_slots
                 )
 
         # `ordered` comes from the config, so every rank agrees on the order
@@ -1031,20 +1060,24 @@ class PiecewiseCudaGraphRunner:
         ):
             if ok:
                 continue
-            if self._graphs.pop((shape.bs, shape.total_tokens), None) is not None:
-                logger.warning(
-                    "PiecewiseCudaGraphRunner[%s]: dropping bs=%d total_tokens=%d, "
-                    "captured here but not on every rank",
-                    self._label, shape.bs, shape.total_tokens,
-                )
+            for slot in range(self._num_slots):
+                if self._graphs.pop(PiecewiseGraphKey(
+                    bs=shape.bs, seq_len=shape.total_tokens, slot=slot
+                ), None) is not None:
+                    logger.warning(
+                        "PiecewiseCudaGraphRunner[%s]: dropping bs=%d total_tokens=%d, slot=%d "
+                        "captured here but not on every rank, or not captured for all slots",
+                        self._label, shape.bs, shape.total_tokens, slot
+                    )
 
-    def _capture_one(self, shape: PiecewiseCaptureShape) -> None:
+    def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
         dummy_rids = self._dummy_rows.ensure(
             f"{shape.bs}_{shape.total_tokens}", shape.bs
         )
         static_inputs = self._config.make_static_inputs(shape)
         step = self._declare(
             dummy_rids, shape.seq_lens, self._bucket(shape), capture=True,
+            slot=slot
         )
         call = self._call_inputs(static_inputs, dummy_rids)
 
@@ -1079,7 +1112,9 @@ class PiecewiseCudaGraphRunner:
             # the same ids, so their plan finds the storage already resident
             self._dummy_rows.reset(dummy_rids)
 
-        self._graphs[(shape.bs, shape.total_tokens)] = PiecewiseGraphData(
+        self._graphs[PiecewiseGraphKey(
+            bs=shape.bs, seq_len=shape.total_tokens, slot=slot
+        )] = PiecewiseGraphData(
             graph=graph,
             static_inputs=static_inputs,
             static_outputs=static_outputs,
@@ -1111,7 +1146,7 @@ class PiecewiseCudaGraphRunner:
 
     def _declare(
         self, request_ids: list[str], seq_lens: list[int],
-        bucket: BucketKey, capture: bool,
+        bucket: BucketKey, capture: bool, slot: int
     ):
         """The region's step over the padded batch, addressed at its slot."""
         if self._config.declare_step is None:
@@ -1122,9 +1157,9 @@ class PiecewiseCudaGraphRunner:
         step.set_ctx(StepContext(
             request_ids=tuple(request_ids),
             graph_walk=PIECEWISE_WALK,
-            slot=self.SLOT,
+            slot=slot,
             capture=capture,
-            slot_lease=SlotLease(slot=self.SLOT, bucket=bucket),
+            slot_lease=SlotLease(slot=slot, bucket=bucket),
         ))
         return step
 
@@ -1205,7 +1240,7 @@ class PiecewiseCudaGraphRunner:
         """
         data = self._resolve(batch_size, total_tokens)
         return None if data is None else SlotLease(
-            slot=self.SLOT, bucket=data.bucket
+            slot=self._current_slot, bucket=data.bucket
         )
 
     def run(
@@ -1266,6 +1301,7 @@ class PiecewiseCudaGraphRunner:
                 self._config.replay_seq_lens(data.shape, seq_lens, real_bs),
                 data.bucket,
                 capture=False,
+                slot=self._current_slot,
             )
         try:
             self._plan(step, data.shape)

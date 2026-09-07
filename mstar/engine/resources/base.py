@@ -139,6 +139,21 @@ class Resource(ABC):
     def supports_preplan(self):
         return False
 
+    @property
+    def force_double_buffer(self):
+        """Whether this resource needs double-buffering even off the pre-plan path.
+
+        A resource that stages a step's layout into a reused host buffer and
+        issues a non-blocking H2D into a graph-read device buffer has a race the
+        moment the CPU runs ahead of the GPU: plan(N+1) can overwrite the buffer
+        before step N's DMA has retired, and the replay attends with N+1's data.
+        The main runner already double-buffers whenever a resource
+        ``supports_preplan``; this flag extends that to a runner that has no
+        pre-plan path but still replays such a resource — notably the piecewise
+        runner. Off by default; a resource opts in only if it has this hazard.
+        """
+        return False
+
     def clear_preplan(self):
         return
 

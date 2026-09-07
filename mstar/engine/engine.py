@@ -62,12 +62,40 @@ class SubmoduleManagement:
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
     cuda_graph_runner: CudaGraphRunner | None = None
+    _next_slot: int = 0
+    _num_slots: int = 1
 
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
     piecewise_runners: dict[str, PiecewiseCudaGraphRunner] = field(
         default_factory=dict
     )
+
+    def __post_init__(self):
+        # Double-buffer when anything needs it: a pre-plan resource needs slot
+        # N+1's plan to write buffers replay(N) isn't reading, and a
+        # ``force_double_buffer`` resource has the same hazard off the pre-plan
+        # path (e.g. in the piecewise runner). This is the slot the batch
+        # rotation cycles through; each runner narrows it to its own slot count.
+        double_buffered = any(
+            res.supports_preplan or res.force_double_buffer
+            for res in self.resources.values()
+        )
+        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2")) \
+            if double_buffered else 1
+
+    def lease_slot(self) -> int:
+        slot = self._next_slot
+        self._next_slot = (self._next_slot + 1) % self._num_slots
+        return slot
+
+    def set_piecewise_slot(self, slot: int) -> None:
+        """Point the region runners at this batch's slot, on the GPU thread just
+        before its forward. Set here rather than at lease time: leasing runs
+        ahead of the forward (pre-plan reserves N+1's slot while N is in flight),
+        so a lease-time write would race the replay reading ``_current_slot``."""
+        for runner in self.piecewise_runners.values():
+            runner.set_slot(slot)
 
 
 @dataclass
@@ -78,6 +106,9 @@ class ExecutingBatch:
     step_context: StepContext
 
     running_batched: bool = False
+
+    # Enables double-buffering for resources with non-blocking H2D 
+    slot: int | None = None
 
     # Selects among a walk's capture buckets; matches SubmoduleStep.cg_key_info
     cg_key_info: Any | None = None
@@ -186,8 +217,15 @@ class ExecutingBatch:
         self.admit_error = reason
         self.failed_resource = failed_resource
 
+    def set_slot(self, slot: int):
+        self.slot = slot
+        if self.step_context is not None:
+            self.step_context.slot = slot
+
     def lease_slot(self, slot_lease: SlotLease):
         self.step_context.slot_lease = slot_lease
+        if self.slot is None:
+            self.set_slot(slot_lease.slot)
 
 
 class Engine:
@@ -328,6 +366,7 @@ class Engine:
                 device=self._device,
                 autocast_dtype=self._autocast_dtype_for(submodule),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
+                num_slots=submodule_mgmt._num_slots,
                 enable_nvtx=self._enable_nvtx
             )
             piecewise[node_name] = self._build_piecewise_runners(
@@ -387,6 +426,7 @@ class Engine:
                 device=self._device,
                 autocast_dtype=node_dtype,
                 joint_comm_group=submodule_mgmt.joint_comm_group,
+                num_slots=submodule_mgmt._num_slots,
                 node_name=node_name,
             )
             runners[label] = runner
@@ -491,6 +531,9 @@ class Engine:
         """The one-forward path: batched (a lease replay or ``forward_batched``)
         or a single eager request."""
         submodule_mgmt = self._submodules[batch.node_name]
+        # On the GPU thread, right before the forward: point the region runners
+        # at this batch's slot so the piecewise lease and replay agree with it.
+        submodule_mgmt.set_piecewise_slot(batch.slot or 0)
         cg_runner = submodule_mgmt.cuda_graph_runner
         lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
@@ -579,8 +622,12 @@ class Engine:
             ctxs[rid] = StepContext(
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
-                slot=0, capture=False,
+                slot=submodule_mgmt.lease_slot(), capture=False,
             )
+            # Each request runs its own cycle, so its region lease/replay tracks
+            # its own slot; declare (here) and drive (below) are separate loops,
+            # so set it in both.
+            submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
             admit_outcome, steps[rid] = self._declare_and_admit(
                 batch, rids=[rid], inputs=[inp],
                 submodule=submodule_mgmt.submodule,
@@ -592,6 +639,7 @@ class Engine:
         # Step 2: drive step, plan -> forward -> commit loop
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
             req_info = {rid: batch.per_request_info[rid]}
+            submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
             if nvtx:
                 range_push(f"engine.per_request.{rid}")
             try:
@@ -1078,6 +1126,10 @@ class Engine:
         ``CudaGraphRunner.select_batched_bucket``.
         """
         submodule_mgmt = self._submodules[batch.node_name]
+
+        if batch.slot is None:
+            batch.set_slot(submodule_mgmt.lease_slot())
+
         cg_runner = submodule_mgmt.cuda_graph_runner
         if cg_runner is None:
             return None
@@ -1092,6 +1144,7 @@ class Engine:
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,
             bs=len(batch.request_ids),
+            slot=batch.slot,
             num_tokens=(
                 None if batch.inputs is None
                 else sum(inp.input_seq_len for inp in batch.inputs)
