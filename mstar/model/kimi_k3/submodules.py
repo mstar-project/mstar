@@ -38,7 +38,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 
-    def __init__(self, language_model: nn.Module, config: KimiK3Config, cuda_graphs: bool = True):
+    def __init__(self, language_model: nn.Module, config: KimiK3Config, cuda_graphs: bool = True,
+                 max_capture_batch_size: int | None = None):
         super().__init__()
         self.language_model = language_model
         self.embed_tokens = language_model.model.embed_tokens
@@ -47,6 +48,10 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         # the torch reference KDA kernel addresses state slots from the host, so it must
         # run eagerly; the fla/fused kernels take device index tensors and can be captured
         self.cuda_graphs = cuda_graphs
+        # deployments cap the decode buckets at their KDA slot count: a bucket wider than the
+        # number of resident requests can only ever replay with padding rows
+        self.capture_batch_sizes = [b for b in self.DECODE_CAPTURE_BATCH_SIZES
+                                    if max_capture_batch_size is None or b <= max_capture_batch_size]
 
     def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
         if not self.cuda_graphs:
@@ -57,7 +62,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=1,
                 ),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES, compile=False),
+                capture_batch_sizes=self.capture_batch_sizes, compile=False),
             # no prefill capture: the KDA varlen conv/chunk kernels size work on the host
             # (fla's repeat_interleave), which CUDA streams refuse while capturing; prefill
             # runs eager on FlashKDA
