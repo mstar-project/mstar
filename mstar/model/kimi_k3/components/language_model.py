@@ -226,7 +226,6 @@ class KimiK3ForCausalLM(nn.Module):
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         pending_packed: dict[str, torch.Tensor] = {}
-        plain: list[tuple[str, torch.Tensor]] = []
 
         def route_expert(prefix: str, expert: int, w: str, tensor: torch.Tensor, kind: str = "weight") -> None:
             base = "down" if w == "w2" else "gate_up"
@@ -238,35 +237,39 @@ class KimiK3ForCausalLM(nn.Module):
             param.weight_loader(param, tensor, f"{_SHARD_OF[w]}:{expert}")
             loaded.add(target)
 
-        for name, tensor in weights:
-            if name.startswith("language_model."):
-                name = name[len("language_model."):]
-            if name.startswith(("vision_tower.", "mm_projector.")):
-                continue
-            m = _EXPERT_RE.match(name)
-            if m is None:
-                plain.append((name, tensor))
-                continue
-            prefix, expert, w, kind = m.group(1), int(m.group(2)), m.group(3), m.group(4)
-            if kind == "weight" or self.quantized_experts:
-                route_expert(prefix, expert, w, tensor, kind)
-                continue
-            key = f"{prefix}.experts.{expert}.{w}"
-            other = pending_packed.pop(key, None)
-            if other is None:
-                pending_packed[key] = tensor
-                continue
-            packed, scale = (tensor, other) if kind == "weight_packed" else (other, tensor)
-            route_expert(prefix, expert, w, dequant_mxfp4(packed, scale, dtype=params[
-                f"{prefix}.experts.down_proj"].dtype))
-        assert not pending_packed, f"unpaired MXFP4 tensors: {sorted(pending_packed)[:3]}"
+        def plain_stream():
+            """Route expert tensors as they stream (side effect) and yield the rest to the
+            generic loader *immediately*: a full-size tensor must never outlive its own
+            dispatch, or a rank accumulates the unsharded checkpoint on its GPU."""
+            for name, tensor in weights:
+                if name.startswith("language_model."):
+                    name = name[len("language_model."):]
+                if name.startswith(("vision_tower.", "mm_projector.")):
+                    continue
+                m = _EXPERT_RE.match(name)
+                if m is None:
+                    yield name, tensor
+                    continue
+                prefix, expert, w, kind = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+                if kind == "weight" or self.quantized_experts:
+                    route_expert(prefix, expert, w, tensor, kind)
+                    continue
+                key = f"{prefix}.experts.{expert}.{w}"
+                other = pending_packed.pop(key, None)
+                if other is None:
+                    pending_packed[key] = tensor
+                    continue
+                packed, scale = (tensor, other) if kind == "weight_packed" else (other, tensor)
+                route_expert(prefix, expert, w, dequant_mxfp4(packed, scale, dtype=params[
+                    f"{prefix}.experts.down_proj"].dtype))
 
         stacked = [
             *[_Rule(t, s, i) for t, s, i in KDA_STACKED_PARAMS],
             _Rule(".gate_up_proj", ".gate_proj", 0),
             _Rule(".gate_up_proj", ".up_proj", 1),
         ]
-        loaded |= load_weights_into(self, plain, stacked_params=stacked, name_remapper=_remap_name)
+        loaded |= load_weights_into(self, plain_stream(), stacked_params=stacked, name_remapper=_remap_name)
+        assert not pending_packed, f"unpaired MXFP4 tensors: {sorted(pending_packed)[:3]}"
         missing = sorted(set(params) - loaded)
         if missing:
             logger.warning("Kimi K3: %d parameters not loaded, e.g. %s", len(missing), missing[:5])
