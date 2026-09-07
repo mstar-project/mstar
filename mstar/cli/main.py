@@ -38,6 +38,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
+    # Kimi K3 (text): the expert-pruned dev checkpoint on one 8xH100 node, TP8.
+    "kimi_k3": "kimi_k3_pruned75_tp8.yaml",
 }
 
 
