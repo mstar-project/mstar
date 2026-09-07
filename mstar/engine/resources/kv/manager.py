@@ -535,12 +535,10 @@ class KVManager(AttentionResource):
         ctx: StepContext, lease,
     ):
         for label, indptrs in plan_output.items():
-            # On device for both paths so the attention wrapper's plan can take
-            # paged_kv_indices from device and skip FlashInfer's host sync.
-            indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
             else:
+                indptrs.cuda_indptrs = indptrs.cpu_indptrs.to_device(self._device)
                 plan_state = self._compute_plan_state(
                     indptrs.cuda_indptrs,
                     total_tokens=indptrs.get_total_len()

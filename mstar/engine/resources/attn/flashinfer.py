@@ -154,16 +154,11 @@ class FlashInferManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, is_decode)
 
-            indptr_kwargs = indptrs.to_kwargs_dict()
-            # Device paged_kv_indices: FlashInfer's plan host-syncs on a CPU
-            # indices tensor, and the KV manager already staged these on device.
-            indptr_kwargs["paged_kv_indices"] = kv_out.cuda_indptrs.paged_kv_indices
-
             # TODO: cache the latest plan state
             wrapper.plan(
                 causal=step.causal,
                 dtype=self._dtype,
-                **indptr_kwargs
+                **indptrs.to_kwargs_dict()
             )
             plan_states[label] = wrapper
 
