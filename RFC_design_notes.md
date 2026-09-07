@@ -1,6 +1,6 @@
 # Design notes
 
-Companion to RFC #210. The RFC states decisions; this explains the one that gets questioned most, then records the rest.
+Companion to RFC #210.
 
 ## Why not a radix tree
 
