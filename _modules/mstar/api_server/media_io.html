@@ -945,6 +945,16 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="n">modality_from_mime</span><span class="p">(</span><span class="n">mime</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_decode_base64_payload</span><span class="p">(</span><span class="n">payload</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Decode client-provided base64 after normalizing common wire variants."""</span>
+    <span class="c1"># OpenAI-compatible clients may omit padding or wrap the payload at a</span>
+    <span class="c1"># fixed column width. Normalize both forms before asking the decoder to</span>
+    <span class="c1"># validate the alphabet, so malformed requests fail as client errors.</span>
+    <span class="n">cleaned</span> <span class="o">=</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">payload</span><span class="o">.</span><span class="n">split</span><span class="p">())</span>
+    <span class="n">padded</span> <span class="o">=</span> <span class="n">cleaned</span> <span class="o">+</span> <span class="s2">"="</span> <span class="o">*</span> <span class="p">(</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="n">cleaned</span><span class="p">)</span> <span class="o">%</span> <span class="mi">4</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">padded</span><span class="p">,</span> <span class="n">validate</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+
 <div class="viewcode-block" id="save_data_url">
 <a class="viewcode-back" href="../../../_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_data_url">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">save_data_url</span><span class="p">(</span><span class="n">data_url</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
@@ -953,7 +963,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">payload</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Malformed data URL: missing payload"</span><span class="p">)</span>
     <span class="n">mime</span> <span class="o">=</span> <span class="n">header</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="s2">"data:"</span><span class="p">):]</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">";"</span><span class="p">,</span> <span class="mi">1</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span> <span class="ow">or</span> <span class="s2">"application/octet-stream"</span>
-    <span class="n">raw</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+    <span class="n">raw</span> <span class="o">=</span> <span class="n">_decode_base64_payload</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">_save_bytes</span><span class="p">(</span><span class="n">raw</span><span class="p">,</span> <span class="n">mime</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span></div>
 
 
@@ -964,7 +974,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Persist a bare base64 blob with a known ``fmt`` (e.g. ``"wav"``)."""</span>
     <span class="n">upload_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">upload_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-    <span class="n">raw</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">b64</span><span class="p">)</span>
+    <span class="n">raw</span> <span class="o">=</span> <span class="n">_decode_base64_payload</span><span class="p">(</span><span class="n">b64</span><span class="p">)</span>
     <span class="c1"># Sanitize the client-controlled fmt: alphanumerics only, so it cannot</span>
     <span class="c1"># inject path separators into the upload path.</span>
     <span class="n">clean</span> <span class="o">=</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">fmt</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s2">"."</span><span class="p">)</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">isalnum</span><span class="p">())</span>
