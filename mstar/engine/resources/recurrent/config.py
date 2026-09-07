@@ -123,7 +123,7 @@ class RecurrentPlanOutput:
     the capture batch size, so the captured kernels read stable addresses.
     """
     slot_ids: torch.Tensor  # int32 [rows] on device
-    has_state: torch.Tensor  # bool [rows] on device
+    has_state: torch.Tensor  # int32 0/1 [rows] on device (one packed copy with slot_ids and cu_seqlens)
     cu_seqlens: torch.Tensor  # int32 [rows + 1] on device: token boundaries of the rows
     slot_ids_cpu: list[int] = field(default_factory=list)
     has_state_cpu: list[bool] = field(default_factory=list)
