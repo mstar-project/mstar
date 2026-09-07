@@ -7,6 +7,7 @@ the abort/fail path (drain all workers + preprocess worker, then Remove).
 """
 
 import types
+from collections import deque
 
 import torch
 
@@ -14,6 +15,7 @@ from mstar.conductor.conductor import Conductor, RequestData
 from mstar.graph.base import TensorPointerInfo
 from mstar.utils.ipc_format import (
     FailRequests,
+    NewRequestConductor,
     ReadsDone,
     UnpersistTensors,
     WorkerMessageType,
@@ -36,7 +38,18 @@ def _request_data(workers=("w0",), persist_signals=None, ref_cnts=None):
     )
 
 
-def _conductor(requests):
+def _new_request(rid):
+    return NewRequestConductor(
+        request_id=rid,
+        initial_signals={},
+        initial_input_modalities=["text"],
+        initial_output_modalities=["text"],
+        input_metadata={},
+        model_kwargs={},
+    )
+
+
+def _conductor(requests, drain_ttl_s=120.0):
     c = Conductor.__new__(Conductor)
     c.sent = []
     c.admits = 0
@@ -45,7 +58,12 @@ def _conductor(requests):
     )
     c.requests = dict(requests)
     c.draining = {}
+    c._drain_ttl_s = drain_ttl_s
     c._early_reads_done = {}
+    c._early_abort_requests = set()
+    c._draining_deadlines = deque()
+    c._early_reads_done_deadlines = deque()
+    c._early_abort_deadlines = deque()
     c.waiting_queue = []
     c.enable_prof = False
     c._try_admit_waiting = lambda: setattr(c, "admits", c.admits + 1)
@@ -101,6 +119,17 @@ def test_abort_of_unknown_request_sends_nothing():
     c = _conductor({})
     c._abort_request("nope")
     assert c.sent == []
+
+
+def test_abort_of_queued_request_removes_preprocess_state():
+    """A request aborted out of the waiting queue never reached a worker, so the
+    preprocess worker is the only holder of its persisted input signals."""
+    c = _conductor({})
+    c.waiting_queue = [_new_request("r1")]
+    c._abort_request("r1")
+
+    assert c.waiting_queue == []
+    assert _remove_targets(c, "r1") == {PREPROCESS}
 
 
 def test_second_abort_while_draining_is_ignored():
@@ -189,3 +218,73 @@ def test_reads_done_racing_registration_is_not_lost():
     c._handle_reads_done(ReadsDone(request_id="r1", entity_id="w0"))
     assert _remove_targets(c, "r1") == {"w0", PREPROCESS}
     assert "r1" not in c.requests
+
+
+# ── ordering race: abort before ingest ──────────────────────────────────────
+
+def test_abort_racing_ingest_drops_the_request_and_removes_signals():
+    """The preprocess worker forwards ABORT_REQUEST before it finishes
+    preprocessing, so the abort can outrun the NEW_REQUEST it aborts. The
+    request must never be dispatched, and its input signals must be removed —
+    but only once ingest proves they exist."""
+    c = _conductor({})
+    c._abort_request("r1")
+    assert "r1" in c._early_abort_requests
+    # Nothing sent yet: a RemoveRequest here would beat the signals into being.
+    assert c.sent == []
+
+    c._ingest_request(_new_request("r1"))
+    assert "r1" not in c.requests and c.waiting_queue == []
+    assert _remove_targets(c, "r1") == {PREPROCESS}
+    assert "r1" not in c._early_abort_requests
+
+
+def test_abort_racing_ingest_discards_its_early_reads_done():
+    c = _conductor({})
+    c._abort_request("r1")
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    c._ingest_request(_new_request("r1"))
+    assert "r1" not in c._early_reads_done
+
+
+# ── expiry sweeps ───────────────────────────────────────────────────────────
+
+def test_drain_barrier_times_out_and_force_finalizes():
+    """A participant that never ACKs (crashed/hung) must not hold the request —
+    or, on the fail path, the client's notification — forever."""
+    c = _conductor({"r1": _request_data()}, drain_ttl_s=0.0)
+    c._fail_requests(FailRequests(errors={"r1": "boom"}))
+    assert "r1" in c.draining  # w0 and the preprocess worker never ACK
+
+    c._sweep_expiry()
+    assert "r1" not in c.draining and "r1" not in c.requests
+    assert _remove_targets(c, "r1") == {"w0", PREPROCESS}
+    failures = [
+        m for e, m in c.sent
+        if e == "api_server" and m.message_type == "request_failed"
+    ]
+    assert len(failures) == 1
+    assert c.admits == 1
+
+
+def test_sweep_leaves_a_live_barrier_alone():
+    c = _conductor({"r1": _request_data()})
+    c._abort_request("r1")
+    c._sweep_expiry()
+    assert "r1" in c.draining
+    assert _remove_targets(c, "r1") == set()
+
+
+def test_stale_early_entries_are_swept():
+    """Early ACKs and abort tombstones for requests that never come back must
+    not pile up."""
+    c = _conductor({}, drain_ttl_s=0.0)
+    c._handle_reads_done(ReadsDone(request_id="gone", entity_id="w0"))
+    c._abort_request("also-gone")
+    assert c._early_reads_done and c._early_abort_requests
+
+    c._sweep_expiry()
+    assert not c._early_reads_done
+    assert not c._early_abort_requests
+    assert not c._early_reads_done_deadlines
+    assert not c._early_abort_deadlines

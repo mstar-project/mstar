@@ -128,11 +128,14 @@ class PreprocessWorker:
         self.output_loop_idxs.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
-    def finished_reading(self, request_id: str):
-        """Happy path: the API server finished delivering this request's outputs
-        (drained), so we have no more reads. Tell the conductor via READS_DONE;
-        it will send REMOVE_REQUEST to trigger the hard cleanup."""
-        self.reads_done_queue.put(request_id)
+    def finished_reading(self, request_id: str, drained: bool = True):
+        """The API server is done with this request's outputs. Tell the
+        conductor via READS_DONE; it will send REMOVE_REQUEST to trigger the
+        hard cleanup. ``drained`` means every chunk was delivered, so no read
+        can still be in flight and the ACK can go out immediately; pass False
+        when delivery was abandoned (TTL, client gone) and the ACK must wait
+        for any in-flight read."""
+        self.reads_done_queue.put((request_id, drained))
         self.output_loop_idxs.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
@@ -544,6 +547,17 @@ class PreprocessWorkerThread:
                 self._hard_cleanup(body.request_id)
         return did_work
 
+    def _finish_reading(self, request_id: str, drained: bool) -> None:
+        """The API server is done with this rid's outputs. ``drained`` (every
+        chunk delivered) means no read can still be in flight, so ACK straight
+        away — the happy path pays nothing. Otherwise delivery was abandoned
+        (TTL, client gone) with reads possibly still running, so gate the ACK on
+        them; ACKing there would let the conductor unlink under a read."""
+        if drained:
+            self._send_reads_done(request_id)
+        else:
+            self._begin_drain(request_id)
+
     def _begin_drain(self, request_id: str) -> None:
         """Stop reading this rid; ACK READS_DONE once in-flight reads finish.
         Idempotent — abort self-initiates while the conductor may also drive it."""
@@ -627,9 +641,7 @@ class PreprocessWorkerThread:
                     self._begin_drain(rid)
                 while not self.reads_done_queue.empty():
                     did_work = True
-                    # Happy path: the API server drained this request's outputs,
-                    # so we have no more reads — ACK so the conductor can Remove.
-                    self._send_reads_done(self.reads_done_queue.get())
+                    self._finish_reading(*self.reads_done_queue.get())
                 while not self.discard_tensor_queue.empty():
                     did_work = True
                     self._discard_result_tensor(self.discard_tensor_queue.get())

@@ -182,7 +182,7 @@ def _api_server(messages):
         received_final_chunks=lambda rid, outs: False,
         # The teardown drain: the api server reports it is done reading and the
         # conductor drives the hard cleanup.
-        finished_reading=s.cleaned.append,
+        finished_reading=lambda rid, drained=True: s.cleaned.append(rid),
         new_result_tensors=lambda body: None,
         discard_result_tensors=lambda body: None,
     )

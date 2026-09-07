@@ -321,10 +321,10 @@ class APIServer:
                 )
             )
             if drained or req is None:
-                stale.append((rid, False))
+                stale.append((rid, False, drained))
             elif (now - ts) >= self._recently_completed_ttl:
-                stale.append((rid, True))
-        for rid, lost_outputs in stale:
+                stale.append((rid, True, drained))
+        for rid, lost_outputs, drained in stale:
             # only set the event when there are no more pending chunks
             req = self.pending_requests.get(rid)
             if req is not None:
@@ -354,8 +354,10 @@ class APIServer:
                     profile.rx_info.extend(self.preprocess_worker.get_rx_info(rid))
             # We're done delivering this request's outputs (all chunks in, or the
             # TTL gave up): tell the conductor via READS_DONE. It drives the hard
-            # cleanup with a RemoveRequest once every reader has drained.
-            self.preprocess_worker.finished_reading(rid)
+            # cleanup with a RemoveRequest once every reader has drained. Only
+            # the drained case is known to have no read left in flight; the
+            # others make the data worker gate the ACK on its own reads first.
+            self.preprocess_worker.finished_reading(rid, drained=drained)
             self.recently_completed.pop(rid, None)
 
     def _process_messages(self) -> None:

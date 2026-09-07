@@ -215,6 +215,28 @@ def test_preprocess_reads_done_idempotent():
     assert len(_pw_reads_done(wt)) == 1
 
 
+def test_preprocess_finished_reading_acks_immediately_when_drained():
+    """Happy path: delivery completed, so the ACK goes out without paying for a
+    drain check (and without gating on reads that cannot exist)."""
+    wt = _preprocess(inflight_reads=True)  # would block a gated ACK
+    wt._finish_reading("X", drained=True)
+    assert len(_pw_reads_done(wt)) == 1
+    assert "X" not in wt._draining_rids
+
+
+def test_preprocess_finished_reading_gates_ack_when_not_drained():
+    """Abandoned delivery (TTL / client gone): reads may still be in flight, so
+    the ACK must wait for them rather than let the conductor unlink under one."""
+    wt = _preprocess(inflight_reads=True)
+    wt._finish_reading("X", drained=False)
+    assert not _pw_reads_done(wt)
+    assert "X" in wt._draining_rids
+
+    wt.tensor_manager.has_inflight_reads = lambda rid: False
+    wt._complete_drain_if_ready("X")
+    assert len(_pw_reads_done(wt)) == 1
+
+
 def test_preprocess_hard_cleanup_force_drops_and_clears():
     wt = _preprocess()
     wt._draining_rids.add("X")

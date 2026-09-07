@@ -6,7 +6,7 @@ import os
 import signal
 import socket
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -235,9 +235,25 @@ class Conductor:
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
         self.draining: dict[str, DrainingRequest] = {}
+        # Backstop for a participant that never ACKs (crashed, hung, OOMed): the
+        # barrier is force-finalized so one faulty worker can't hold a
+        # concurrency slot — or the client's failure notification — forever.
+        self._drain_ttl_s = float(os.environ.get("MSTAR_DRAIN_TTL_S", "120"))
+
         # READS_DONE that arrived before the barrier was registered (the
         # preprocess worker self-drains on abort before we process ABORT_REQUEST).
         self._early_reads_done: dict[str, set[str]] = {}
+        # Aborts for requests we haven't ingested yet: the preprocess worker
+        # forwards ABORT_REQUEST from its abort queue before it finishes
+        # preprocessing, so it can outrun the NEW_REQUEST it aborts.
+        self._early_abort_requests: set[str] = set()
+        # (deadline, rid) FIFOs — expiry sweeps for the three above, so an entry
+        # whose awaited message never arrives can't pile up. Deadlines are all
+        # the same TTL from insertion, so each deque stays sorted.
+        self._draining_deadlines: deque[tuple[float, str]] = deque()
+        self._early_reads_done_deadlines: deque[tuple[float, str]] = deque()
+        self._early_abort_deadlines: deque[tuple[float, str]] = deque()
+
         self.model = model
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
@@ -635,6 +651,18 @@ class Conductor:
         When a new request comes in from the API server, assign workers,
         initialize partition states, and kick off all partitions.
         """
+
+        if body.request_id in self._early_abort_requests:
+            # The abort outran this NEW_REQUEST. The preprocess worker's input
+            # signals exist only now, so this is the first moment we can safely
+            # tell it to drop them; it has already stopped reading the rid.
+            self._early_abort_requests.discard(body.request_id)
+            self._early_reads_done.pop(body.request_id, None)
+            self._send_remove_to_preprocess_worker(body.request_id)
+            logger.info(
+                "Request %s was aborted before ingest; dropping", body.request_id
+            )
+            return
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
             logger.info(
@@ -833,8 +861,20 @@ class Conductor:
             failure_error=failure_error,
             failure_status=failure_status,
         )
+        self._draining_deadlines.append(
+            (time.perf_counter() + self._drain_ttl_s, request_id)
+        )
         if not expected_acks:
             self._finalize_draining(request_id)
+
+    def _send_remove_to_preprocess_worker(self, request_id: str):
+        self.communicator.send(
+            self.PREPROCESS_WORKER,
+            WorkerMessage(
+                message_type=WorkerMessageType.REMOVE_REQUEST,
+                body=RemoveRequest(request_id),
+            ),
+        )
 
     def _finalize_draining(self, request_id: str):
         """Every reader has drained: send the hard RemoveRequest to all
@@ -870,11 +910,50 @@ class Conductor:
         dr = self.draining.get(body.request_id)
         if dr is None:
             # Raced ahead of registration (preprocess-worker self-drain on abort).
+            if body.request_id not in self._early_reads_done:
+                self._early_reads_done_deadlines.append(
+                    (time.perf_counter() + self._drain_ttl_s, body.request_id)
+                )
             self._early_reads_done.setdefault(body.request_id, set()).add(body.entity_id)
             return
         dr.expected_acks.discard(body.entity_id)
         if not dr.expected_acks:
             self._finalize_draining(body.request_id)
+
+    @staticmethod
+    def _pop_expired(deadlines: deque[tuple[float, str]], now: float) -> list[str]:
+        expired = []
+        while deadlines and deadlines[0][0] <= now:
+            expired.append(deadlines.popleft()[1])
+        return expired
+
+    def _sweep_expiry(self):
+        """Expire teardown bookkeeping whose awaited message never arrived: push
+        a stalled drain barrier through, and drop stale early-message entries so
+        they can't accumulate for requests that never come back."""
+        now = time.perf_counter()
+        for request_id in self._pop_expired(self._draining_deadlines, now):
+            dr = self.draining.get(request_id)
+            if dr is None:
+                continue  # finalized normally
+            logger.error(
+                "Drain barrier for request %s timed out after %.0fs with no "
+                "READS_DONE from %s; forcing teardown. A stalled reader may "
+                "still hold one of its segments.",
+                request_id, self._drain_ttl_s, sorted(dr.expected_acks),
+            )
+            self._finalize_draining(request_id)
+        for request_id in self._pop_expired(self._early_abort_deadlines, now):
+            if request_id in self._early_abort_requests:
+                self._early_abort_requests.discard(request_id)
+                logger.debug(
+                    "Dropping stale abort tombstone for request %s", request_id
+                )
+        for request_id in self._pop_expired(self._early_reads_done_deadlines, now):
+            if self._early_reads_done.pop(request_id, None) is not None:
+                logger.debug(
+                    "Dropping stale early READS_DONE for request %s", request_id
+                )
 
     def _fail_requests(self, body: FailRequests):
         """Tear down requests a worker reported as unservable. Routes through the
@@ -898,13 +977,32 @@ class Conductor:
         """Tear down a request the client abandoned, freeing its worker GPU state."""
         for i, body in enumerate(self.waiting_queue):
             if body.request_id == request_id:
+                # Queued, never dispatched: the preprocess worker is the only
+                # holder of its (persisted) input signals, so hard-remove there.
                 self.waiting_queue.pop(i)
+                self._early_reads_done.pop(request_id, None)
+                self._send_remove_to_preprocess_worker(request_id)
                 logger.info("Aborted request %s before admission", request_id)
                 return
 
         request_data = self.requests.get(request_id)
-        if request_data is None or request_id in self.draining:
-            logger.info("Abort for request %s ignored; already finished, unknown, or draining", request_id)
+        if request_data is None:
+            # Either already torn down (nothing to do) or the abort outran its
+            # NEW_REQUEST. Tombstone it: _ingest_request drops the request and
+            # removes the preprocess worker's signals once they exist. Sending
+            # the RemoveRequest here instead would land before they do and leak
+            # the segment. The tombstone expires on its own (see _sweep_expiry).
+            self._early_abort_requests.add(request_id)
+            self._early_abort_deadlines.append(
+                (time.perf_counter() + self._drain_ttl_s, request_id)
+            )
+            logger.info(
+                "Abort for request %s: unknown; already finished, or racing its "
+                "own ingest", request_id,
+            )
+            return
+        if request_id in self.draining:
+            logger.info("Abort for request %s ignored; already draining", request_id)
             return
         self._remove_request(request_id, request_data)
 
@@ -1298,6 +1396,9 @@ class Conductor:
                 for request_id in dict.fromkeys(completed_requests):
                     if request_id in self.requests and request_id not in self.draining:
                         self._process_request_done(request_id)
+
+                self._sweep_expiry()
+
             except Exception:
                 logger.exception("Conductor error in main loop")
             finally:

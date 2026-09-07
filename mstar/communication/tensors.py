@@ -816,11 +816,13 @@ class TensorCommunicationManager(ABC):
             for ep in self.pending
         )
 
-    def cleanup_request(self, request_id: str):
-        """Refcount/persist-respecting teardown: drop tensors that are safe to
-        GC, defer any still referenced or persisted. Does NOT force-drop
-        persisted signals — that is the conductor-coordinated hard cleanup
-        (``force_cleanup_request``), sent only once every reader has drained.
+    def cleanup_request(self, request_id: str, force: bool = False):
+        """Teardown for a request's tensor state.
+
+        Default (soft): drop tensors that are safe to GC, defer any still
+        referenced or persisted. Does NOT force-drop persisted signals — that
+        is the conductor-coordinated hard cleanup, see
+        :meth:`force_cleanup_request`.
         """
         self.read_finished.pop(request_id, None)
         self.buffered_shards.pop(request_id, None)
@@ -829,7 +831,7 @@ class TensorCommunicationManager(ABC):
         self.req_tx_info.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):
             self.uuid_to_shard_dim.pop(uuid, None)
-            if not self.tensor_store.can_gc(request_id, uuid):
+            if not self.tensor_store.can_gc(request_id, uuid) and not force:
                 logger.warning(
                     "Deferring cleanup of tensor uuid %s "
                     "(awaiting TENSOR_RECEIVED ACK or unpersist)", uuid
@@ -848,22 +850,9 @@ class TensorCommunicationManager(ABC):
         its SHM, ignoring ref counts and persist markers. Safe only after every
         reader has confirmed (READS_DONE) it has no in-flight reads for the
         request. Also reclaims non-persisted buffers whose readers drained
-        before ACKing (which ``cleanup_request`` would otherwise defer forever).
+        before ACKing (which the soft path would otherwise defer forever).
         """
-        self.read_finished.pop(request_id, None)
-        self.buffered_shards.pop(request_id, None)
-        self.sharding_configs.pop(request_id, None)
-        self.req_rx_info.pop(request_id, None)
-        self.req_tx_info.pop(request_id, None)
-        for uuid in self.tensor_store.get_all_uuids(request_id):
-            self.uuid_to_shard_dim.pop(uuid, None)
-            self._cleanup_by_uuid(request_id, uuid)
-
-        self._collect_and_send_acks(
-            request_id,
-            sum([ep.graph_edges for ep in self.pending if ep.request_id == request_id], start=[]),
-        )
-        self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        self.cleanup_request(request_id, force=True)
 
 
 # ---------------------------------------------------------------------------
