@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Alias for the M* engine. Installs the real `m-star` distribution.
+name = "mstar-ai"
+version = "0.2.0"
+description = "Alias for the M* multimodal inference engine (installs m-star)."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{name = "mstar-project"}]
+dependencies = ["m-star"]
+
+[project.urls]
+Homepage = "https://github.com/mstar-project/mstar"
+
+[tool.setuptools]
+packages = []
