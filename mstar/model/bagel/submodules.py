@@ -249,7 +249,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         def declare_step(
             request_ids: list[str], seq_lens: list[int],
         ) -> SubmoduleStep:
-            # One segment per row: `_images_per_request` is 1, so a request's
+            # One segment per row: `_max_images_per_request` is 1, so a request's
             # tokens are one independently-attending image. Padding rows come
             # through with span 0 and attend nothing.
             return SubmoduleStep(
@@ -337,7 +337,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
             len(seq_lens), int(hidden_states.shape[0])
         ):
             return None
-        # A captured bucket fixes the segment count at bs * images_per_request;
+        # A captured bucket fixes the segment count at bs * max_images_per_request;
         # a request carrying more images than that takes the eager path rather
         # than tripping the wrapper's guard.
         n_segments = int(cu_seqlens.numel()) - 1
