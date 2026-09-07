@@ -1,13 +1,14 @@
 # Kimi-K3-pruned75 (224 of 896 experts, 475 GB MXFP4, otherwise the full architecture)
 # on one 8xH100 node, tensor-parallel 8. Weights take ~59 GB per GPU; the KDA state
 # costs ~54 MiB per resident request per rank, so slots, not KV pages, bound concurrency.
-# Budget per rank: 59 GB weights + 3.6 GB MLA cache + 6.9 GB KDA slots + kernel/graph
-# workspaces, on 80 GB.
+# Budget per rank: 60.6 GB weights + 2.7 GB MLA cache + 3.5 GB KDA slots + kernel/graph
+# workspaces, plus ~7 GB of CUDA contexts the other ranks hold on every GPU, on 80 GB.
 model: "kimi_k3"
-max_seq_len: 32768
+max_seq_len: 16384
 model_kwargs:
   checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ckpt/Kimi-K3-pruned75
   max_output_tokens: 2048
+  max_capture_batch_size: 64   # = kda_state.max_num_slots
 node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -15,7 +16,7 @@ node_groups:
     graph_walks: [prefill, decode]
 resources:
   mla_kv:
-    max_num_pages: 2048      # 2048 x 64 tokens x 576 x 2 B x 24 layers = 3.6 GB per rank (bf16)
+    max_num_pages: 1792      # 64 requests x 24 pages (1024+512 tokens) + 128 capture rows; 3.2 GB per rank
     page_size: 64
   kda_state:
-    max_num_slots: 128       # 128 x 54 MiB = 6.9 GB per rank (CUDA-graph captures use the scratch slot)
+    max_num_slots: 64        # 64 x 54 MiB = 3.5 GB per rank (captures/padding use the scratch slot)
