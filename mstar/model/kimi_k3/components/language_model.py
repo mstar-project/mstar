@@ -181,6 +181,8 @@ def prepare_moe_kernels(model: nn.Module, device, backend: str = "auto") -> str:
         return "triton"
     for m in moes:
         m.prepare_flashinfer(mode, dev)
+    # one layer's shapes stand for all: tune the CUTLASS tactics per decode bucket
+    moes[0]._fi.autotune(top_k=moes[0].top_k)
     return mode
 
 
