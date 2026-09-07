@@ -188,6 +188,54 @@ def action_start_frame_offset(action_length: int, video_length: int) -> int:
     )
 
 
+# The published Cosmos3 embodiment-domain table: requests may name their
+# embodiment instead of sending the numeric domain id. droid_lerobot and
+# robomind-franka share a domain (both are a Franka arm with a Robotiq
+# gripper); the agibot names are aliases of one domain likewise.
+EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
+    "no_action": 0,
+    "av": 1,
+    "camera_pose": 2,
+    "hand_pose": 3,
+    "pusht": 4,
+    "libero": 5,
+    "umi": 6,
+    "bridge_orig_lerobot": 7,
+    "droid_lerobot": 8,
+    "robomind-franka": 8,
+    "galbot": 9,
+    "robomind-franka-dual": 12,
+    "robomind-ur": 13,
+    "agibotworld": 15,
+    "agibot_gear_gripper": 15,
+    "agibot_gear_gripper_ext": 15,
+    "fractal": 20,
+}
+
+
+def resolve_action_domain_id(domain_id, domain_name) -> int:
+    """Resolve an action request's embodiment domain. A numeric ``domain_id``
+    wins; otherwise ``domain_name`` looks up the published table. One of the
+    two is required — the domain conditions the action pathway, and a silent
+    default would predict actions for the wrong embodiment."""
+    if domain_id is not None:
+        resolved = int(domain_id)
+        if resolved < 0:
+            raise ValueError(f"Cosmos3 domain_id must be non-negative, got {resolved}.")
+        return resolved
+    if domain_name is None or not str(domain_name).strip():
+        raise ValueError(
+            "Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."
+        )
+    key = str(domain_name).strip().lower()
+    if key not in EMBODIMENT_TO_DOMAIN_ID:
+        raise ValueError(
+            f"Unknown Cosmos3 action domain_name={domain_name!r}; expected one of "
+            f"{sorted(EMBODIMENT_TO_DOMAIN_ID)} or a numeric domain_id."
+        )
+    return EMBODIMENT_TO_DOMAIN_ID[key]
+
+
 # ---------------------------------------------------------------------------
 # Prompt tokenization — ported from pipeline.tokenize_prompt. Image mode
 # (num_frames == 1) and video mode differ only in the system prompt and the

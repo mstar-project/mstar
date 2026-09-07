@@ -234,11 +234,12 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
             plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale,
                                 autocast_dtype)
 
-        def capture_fn(static_inputs, static_cm=None, attn_state=None, **kw):
+        def capture_fn(inp):
             # Route the block loop's attention through the runner-owned wrapper.
             # max_seqlen is unused: the FI-external path ignores it and capture
             # never reaches the flash-attn branch (_fi_override is set).
-            set_fi_override(attn_state)
+            static_inputs = inp.static_inputs
+            set_fi_override(inp.attn_state)
             try:
                 x = self._layer_loop_tail(
                     static_inputs["x"], static_inputs["cu_seqlens"], 0)
@@ -251,7 +252,6 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
             make_static_inputs=make_static_inputs,
             make_attn_state=make_attn_state,
             plan_attn_fn=plan_attn_fn,
-            uses_kv_cache=False,
             total_tokens=list(CAPTURE_TOKENS_AUDIO),
             capture_batch_sizes=list(CAPTURE_BATCH_SIZES_AUDIO),
         )

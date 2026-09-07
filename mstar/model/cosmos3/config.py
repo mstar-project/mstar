@@ -153,6 +153,13 @@ class Cosmos3Config:
     # Default frame count for a video request that doesn't specify ``num_frames``
     # (the Wan VAE downsamples time by 4, so latent frames = 1 + (n - 1) // 4).
     num_frames_video: int = 17
+    # Action-request sampling defaults (all three action modes), following the
+    # reference action serving recipe: 30-step denoise, guidance 1.0, flow
+    # shift 5.0 (the 480p training shift). Checkpoint yamls override — the
+    # released DROID policy serves 4 steps at guidance 3.0.
+    num_inference_steps_action: int = 30
+    guidance_scale_action: float = 1.0
+    flow_shift_action: float = 5.0
 
     # ----- denoise CUDA-graph capture (serving knobs) -----
     # Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier
@@ -167,11 +174,13 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
-    # KV-cache attention backend (a cache_manager.ATTENTION_BACKENDS key).
-    # "dense_gen" (default) runs eager single-request generation attention as
-    # one dense FA3 varlen pass over [frozen text prefix | fresh gen tokens];
-    # captured graphs and multi-request batches fall back to the paged
-    # FlashInfer path. "flashinfer" forces paged everywhere.
+    # Which attention backends the DiT node declares (see
+    # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
+    # paged FlashInfer backend the understanding prefill and the captured
+    # denoise graphs run on, plus a dense FA3 one an eager denoise step runs
+    # instead: one varlen pass over [frozen text prefix | fresh gen tokens],
+    # skipping the paged path's per-step K/V write and wrapper plan.
+    # "flashinfer" declares only the paged backend, so every step uses it.
     attention_backend: str = "dense_gen"
 
     # ----- sub-configs -----

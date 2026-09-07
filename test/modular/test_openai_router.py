@@ -43,6 +43,7 @@ class _StubAPI:
         self.last_submit = None
         self._chunks: dict = {}
         self.next_chunks: list = []
+        self.last_raw_request = None
 
     def submit_request(self, **kw):
         self.last_submit = kw
@@ -50,6 +51,7 @@ class _StubAPI:
         return kw["request_id"]
 
     async def collect_results(self, request_id, raw_request=None):
+        self.last_raw_request = raw_request
         return self._chunks.get(request_id, [])
 
     async def iter_result_chunks(self, request_id):
@@ -153,6 +155,44 @@ def test_images_edits(client_and_stub):
     mk = stub.last_submit["model_kwargs"]
     assert mk.get("cfg_img_scale") == 2.0 and mk.get("cfg_interval") == [0.0, 1.0]
     assert "image" in (stub.last_submit["file_paths"] or {})
+    assert stub.last_raw_request is not None
+
+
+def test_videos_generations_wan22(client_and_stub):
+    # Route-level smoke for the wan22 adapter: the mp4 chunk round-trips as
+    # b64_json and the first-class video fields (size -> width/height,
+    # num_frames, fps) land in model_kwargs alongside extra_body passthrough.
+    client, stub = client_and_stub
+    stub.model_name = "wan22"
+    mp4 = b"\x00\x00\x00 ftypisommp4fake"
+    stub.next_chunks = [_Chunk("video", mp4)]
+    body = client.post(
+        "/v1/videos/generations",
+        json={
+            "model": "wan22", "prompt": "a cat surfing", "size": "832x480",
+            "num_frames": 33, "fps": 16, "seed": 7, "num_inference_steps": 20,
+        },
+    ).json()
+    assert base64.b64decode(body["data"][0]["b64_json"]) == mp4
+    assert stub.last_submit["output_modalities"] == ["video"]
+    assert stub.last_submit["input_modalities"] == ["text"]
+    mk = stub.last_submit["model_kwargs"]
+    assert (mk["width"], mk["height"]) == (832, 480)
+    assert mk["num_frames"] == 33 and mk["fps"] == 16 and mk["seed"] == 7
+    assert mk["num_inference_steps"] == 20  # extra_body passthrough
+
+
+def test_videos_generations_wan22_rejects_video_conditioning(client_and_stub):
+    # wan22 has no video-conditioned mode; the adapter's ValueError must
+    # surface as a 400, not a silent text-to-video fallback.
+    client, stub = client_and_stub
+    stub.model_name = "wan22"
+    r = client.post(
+        "/v1/videos/generations",
+        json={"model": "wan22", "prompt": "x", "video": "data:video/mp4;base64,AAAA"},
+    )
+    assert r.status_code == 400
+    assert "video" in r.json()["error"]["message"]
 
 
 def test_chat_stream(client_and_stub):

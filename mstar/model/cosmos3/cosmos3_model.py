@@ -38,8 +38,16 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    AttnBackend,
+    KVConfig,
+    KVReqConfig,
+    KVSpec,
+    NodeResourceSpec,
+    ResourceReqConfig,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -52,11 +60,17 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.cosmos3 import constants
+from mstar.model.cosmos3.components.packing import ACTION_MODES, resolve_action_domain_id
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
+    ATTN,
+    ATTN_GEN,
+    COND_LABEL,
     IMAGE_GEN_LOOP,
+    KV_CACHE,
+    UNCOND_LABEL,
     VIDEO_GEN_LOOP,
     VIDEO_SOUND_GEN_LOOP,
     Cosmos3AudioDecoderSubmodule,
@@ -171,17 +185,79 @@ class Cosmos3Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [
-            KVCacheConfig(
-                num_layers=self.config.num_hidden_layers,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim=self.config.head_dim,
-                max_seq_len=self.config.max_position_embeddings,
-                num_qo_heads=self.config.num_attention_heads,
-                attention_backend=self.config.attention_backend,
-            )
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The DiT's KV cache and the attention backends over it.
+
+        One cache holds every guidance branch's understanding K/V under its
+        own label. Attention is declared twice because the two pathways want
+        different backends and the choice cannot be per-layer:
+
+        * ``attn`` (paged FlashInfer) is what the understanding tower's
+          prefill writes through — the denoise steps read that K/V back out of
+          the pages, so it has to land there — and what a captured denoise
+          graph replays against, the dense path being eager-only.
+        * ``attn_gen`` (dense FA3) is what an eager denoise step runs: it
+          recomputes all of its K/V every step and only reuses the frozen text
+          prefix, so the paged path's per-step full-buffer write and
+          ``wrapper.plan`` are dead work. ``declare_step`` names one or the
+          other per step; both are drop-in for the same declaration.
+
+        ``attention_backend="flashinfer"`` skips the dense spec, which leaves
+        every step on the paged path.
+
+        The two specs share one ``KVConfig`` object on purpose: a deployment
+        that resizes the cache through ``apply_yaml_overrides`` has to resize
+        what the wrappers are planned against too.
+        """
+        kv_config = KVConfig(
+            num_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            max_seq_len=self.config.max_position_embeddings,
+            num_qo_heads=self.config.num_attention_heads,
+        )
+        specs: list[NodeResourceSpec] = [
+            KVSpec(resource_key=KV_CACHE, nodes={DIT_NODE}, config=kv_config),
+            AttentionSpec(
+                resource_key=ATTN,
+                nodes={DIT_NODE},
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER,
+                ),
+            ),
         ]
+        if self.config.attention_backend == "dense_gen":
+            specs.append(AttentionSpec(
+                resource_key=ATTN_GEN,
+                nodes={DIT_NODE},
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE, backend=AttnBackend.DENSE,
+                ),
+            ))
+        elif self.config.attention_backend != "flashinfer":
+            raise ValueError(
+                f"Unknown Cosmos3 attention_backend "
+                f"{self.config.attention_backend!r} "
+                "(expected 'dense_gen' or 'flashinfer')"
+            )
+        return specs
+
+    def get_request_resource_configs(
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Which cache labels a request is opened with.
+
+        Both guidance branches, unconditionally: a request's guidance regime
+        is only settled at prefill (it follows ``guidance_scale``, which
+        ``process_prompt`` resolves), and naming a label a request never
+        writes costs nothing — labels are created on first write.
+        """
+        del partition_fwd_args, model_kwargs
+        return {
+            KV_CACHE: KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL]),
+        }
 
     def _sound_serving_enabled(self) -> bool:
         """Whether the opt-in sound walk (and its audio_decoder node) is served.
@@ -194,16 +270,6 @@ class Cosmos3Model(Model):
         if self.skip_weight_loading:
             return True
         return (self._ensure_repo() / "sound_tokenizer" / "config.json").exists()
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        types = {
-            DIT_NODE: EngineType.KV_CACHE,
-            VAE_ENCODER_NODE: EngineType.STATELESS,
-            VAE_DECODER_NODE: EngineType.STATELESS,
-        }
-        if self._sound_serving_enabled():
-            types[AUDIO_DECODER_NODE] = EngineType.STATELESS
-        return types
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The DiT supports tensor parallelism: per layer the attention heads and
@@ -626,28 +692,76 @@ class Cosmos3Model(Model):
             except ValueError:
                 pass
 
-        # A video request without an explicit frame count gets the video default
-        # (>1); image requests stay single-frame.
-        default_frames = (
-            self.config.num_frames_video if "video" in (output_modalities or []) else 1
-        )
-        num_frames = int(mk.get("num_frames", default_frames))
-        # The image and video cookbook step counts differ (image 50, video 35);
-        # default by mode and let the request override. The denoise loop runs this
-        # many steps and stops early (Cosmos3DiTSubmodule.check_stop), so the value
+        # Action requests resolve their mode up front: it switches the frame,
+        # step, guidance and flow-shift defaulting below to the action recipe.
+        action_mode = mk.get("action_mode")
+        if action_mode is not None:
+            action_mode = str(action_mode).strip().lower()
+            if action_mode not in ACTION_MODES:
+                raise ValueError(
+                    f"Unsupported Cosmos3 action_mode={mk.get('action_mode')!r}; "
+                    f"expected one of {sorted(ACTION_MODES)}."
+                )
+
+        if action_mode is not None:
+            # An action request predicts one action token per frame, so the
+            # frame count and the chunk length are coupled (num_frames = chunk
+            # or chunk + 1) and default off each other; chunk 16 when neither
+            # is sent (the reference action default).
+            raw_chunk = mk.get("action_chunk_size")
+            raw_frames = mk.get("num_frames")
+            if raw_chunk is not None:
+                action_chunk = int(raw_chunk)
+            elif raw_frames is not None:
+                action_chunk = int(raw_frames) - 1
+            else:
+                action_chunk = 16
+            if action_chunk <= 0:
+                raise ValueError(
+                    f"Cosmos3 action_chunk_size must be positive, got {action_chunk}."
+                )
+            num_frames = int(raw_frames) if raw_frames is not None else action_chunk + 1
+            if num_frames not in (action_chunk, action_chunk + 1):
+                raise ValueError(
+                    "Cosmos3 action requests require num_frames to equal "
+                    "action_chunk_size or action_chunk_size + 1; got "
+                    f"num_frames={num_frames}, action_chunk_size={action_chunk}."
+                )
+            # A bare action request runs the 480p tier (832x480) — the released
+            # policy serving resolution, and the tier whose training shift the
+            # action flow-shift default (5.0) matches.
+            if "size" not in mk and "width" not in mk and "height" not in mk:
+                width, height = 832, 480
+        else:
+            action_chunk = None
+            # A video request without an explicit frame count gets the video
+            # default (>1); image requests stay single-frame.
+            default_frames = (
+                self.config.num_frames_video if "video" in (output_modalities or []) else 1
+            )
+            num_frames = int(mk.get("num_frames", default_frames))
+        # The cookbook step counts differ per mode (image 50, video 35, action
+        # 30 — configs override the action count per checkpoint); default by
+        # mode and let the request override. The denoise loop runs this many
+        # steps and stops early (Cosmos3DiTSubmodule.check_stop), so the value
         # is only bounded above by the loop's static max_iters.
-        default_steps = (
-            self.config.num_inference_steps_video if num_frames > 1
-            else self.config.num_inference_steps
-        )
+        if action_mode is not None:
+            default_steps = self.config.num_inference_steps_action
+        elif num_frames > 1:
+            default_steps = self.config.num_inference_steps_video
+        else:
+            default_steps = self.config.num_inference_steps
         steps = int(mk.get("num_inference_steps", default_steps))
         steps = max(1, min(steps, self.config.max_inference_steps))
+        default_guidance = (
+            self.config.guidance_scale_action if action_mode is not None else 6.0
+        )
         params = {
             "width": int(mk.get("width", width)),
             "height": int(mk.get("height", height)),
             "num_frames": num_frames,
             "fps": float(mk.get("fps", self.config.fps)),
-            "guidance_scale": float(mk.get("guidance_scale", 6.0)),
+            "guidance_scale": float(mk.get("guidance_scale", default_guidance)),
             "num_inference_steps": steps,
             "has_image_condition": "image" in (input_modalities or []),
             "use_karras_sigma": mk.get("use_karras_sigmas"),
@@ -661,7 +775,7 @@ class Cosmos3Model(Model):
         # latent frames taken from the request video (reference recipe defaults:
         # indexes (0, 1), keep "first", flow_shift 10.0). Validated here so a
         # malformed request fails at submission rather than mid-denoise.
-        has_video_condition = "video" in (input_modalities or []) and "action_mode" not in mk
+        has_video_condition = "video" in (input_modalities or []) and action_mode is None
         if has_video_condition:
             from mstar.model.cosmos3.components.packing import normalize_condition_frame_indexes
 
@@ -687,11 +801,13 @@ class Cosmos3Model(Model):
         # reference Cosmos3 t2i recipe: classifier-free guidance only on the
         # timestep interval [400, 1000] (outside it the denoise step runs the
         # conditional branch alone) and flow_shift 3.0. Request kwargs override;
-        # video-to-video defaults to the reference V2V flow_shift; other
-        # image-conditioned / video paths keep their own defaults (full CFG,
-        # scheduler-config flow_shift).
-        is_t2i = num_frames == 1 and not params["has_image_condition"]
+        # action modes default to the action flow shift, video-to-video to the
+        # reference V2V flow shift; other image-conditioned / video paths keep
+        # their own defaults (full CFG, scheduler-config flow_shift).
+        is_t2i = num_frames == 1 and not params["has_image_condition"] and action_mode is None
         fs = mk.get("flow_shift")
+        if fs is None and action_mode is not None:
+            fs = self.config.flow_shift_action
         if fs is None and is_t2i:
             fs = 3.0
         if fs is None and has_video_condition:
@@ -703,16 +819,44 @@ class Cosmos3Model(Model):
             gi = (400.0, 1000.0)
         if gi is not None:
             params["guidance_interval"] = (float(gi[0]), float(gi[1]))
-        # Action requests carry a few extra keys straight through (``action`` is
-        # the clean conditioning action chunk for forward-dynamics).
-        for k in ("action_mode", "action_chunk_size", "raw_action_dim", "domain_id",
-                  "action_fps", "action"):
-            if k in mk:
-                params[k] = mk[k]
+        # Action requests must name their embodiment explicitly — the domain
+        # conditions the action pathway, and a silent default would predict
+        # actions for the wrong robot. ``domain_name`` resolves through the
+        # published embodiment table; a numeric ``domain_id`` wins. The raw
+        # action width is likewise required (forward-dynamics can infer it
+        # from its conditioning ``action`` array) and bounded by the model's
+        # padded action dim.
+        if action_mode is not None:
+            params["action_mode"] = action_mode
+            params["action_chunk_size"] = action_chunk
+            params["domain_id"] = resolve_action_domain_id(
+                mk.get("domain_id"), mk.get("domain_name")
+            )
+            raw_dim = mk.get("raw_action_dim")
+            if raw_dim is None and action_mode == "forward_dynamics" and mk.get("action") is not None:
+                try:
+                    raw_dim = int(torch.as_tensor(mk["action"]).shape[-1])
+                except (TypeError, ValueError, RuntimeError):
+                    raw_dim = None
+            if raw_dim is None:
+                raise ValueError(
+                    "Cosmos3 action requests require 'raw_action_dim' "
+                    "(forward_dynamics may omit it when the 'action' array carries the width)."
+                )
+            raw_dim = int(raw_dim)
+            if not 1 <= raw_dim <= self.config.max_action_dim:
+                raise ValueError(
+                    f"Cosmos3 raw_action_dim must be in [1, {self.config.max_action_dim}], "
+                    f"got {raw_dim}."
+                )
+            params["raw_action_dim"] = raw_dim
+            for k in ("action_fps", "action"):
+                if k in mk:
+                    params[k] = mk[k]
         # Opt-in sound generation: video-only (image and action requests carry
         # no sound band), and only when the served checkpoint/config enable it.
         if mk.get("generate_sound") or mk.get("sound_gen"):
-            if num_frames <= 1 or "action_mode" in params:
+            if num_frames <= 1 or action_mode is not None:
                 raise ValueError(
                     "Cosmos3 sound generation is supported only for video requests "
                     "(num_frames > 1, no action mode)."
@@ -908,7 +1052,12 @@ class Cosmos3Model(Model):
         # checkpoint exactly and halves resident weight memory vs the float32
         # meta default; the engine additionally runs the forward under a bf16
         # autocast (a no-op here).
-        with torch.device("meta" if not self.skip_weight_loading else "cpu"):
+        # Always meta: both branches below call ``to_empty``, which re-allocates
+        # uninitialized storage and drops whatever construction produced, so
+        # building on CPU only pays for allocation + parameter init that is then
+        # thrown away (seconds per billion params on the skip_weight_loading
+        # path). Same shape as the orpheus / higgs_audio builders.
+        with torch.device("meta"):
             model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:

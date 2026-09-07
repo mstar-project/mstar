@@ -11,6 +11,14 @@ import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Resource label constants (LLM node)
+# ---------------------------------------------------------------------------
+KV_CACHE = "kv_cache"
+ATTN = "attn"
+ROPE = "rope"
+SAMPLER = "sampler"
+
 
 @dataclass
 class HiggsAudioModelConfig:

@@ -1,0 +1,6 @@
+# Applies to builds via -f .../docker/Dockerfile (BuildKit per-Dockerfile
+# ignore); the build context is the repository root.
+.git
+.venv*
+**/__pycache__
+*.egg-info

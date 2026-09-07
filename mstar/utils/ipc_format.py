@@ -1,7 +1,8 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
 
-from mstar.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import RxInfo, TxInfo
@@ -108,6 +109,7 @@ class ConductorMessageType(Enum):
     WORKER_GRAPHS_DONE = "worker_graphs_done"
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
+    FAIL_REQUESTS = "fail_requests"
 
 
 @dataclass
@@ -128,7 +130,7 @@ class WorkerGraphsDone(MessageBody):
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
     output_signal_names: int = field(default=0)
-    per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
+    resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
@@ -146,6 +148,18 @@ class SetupDone(MessageBody):
 @dataclass
 class AbortRequest(MessageBody):
     request_id: str
+
+
+@dataclass
+class FailRequests(MessageBody):
+    """A worker reporting requests it can no longer serve.
+
+    ``errors`` maps request_id -> message. It's a dict rather than a
+    (rids, message) pair because per-rid stages (prepare_inputs,
+    postprocess) attribute a distinct error to each request, and one
+    step can fail several of them for different reasons.
+    """
+    errors: dict[str, str]
 
 
 @dataclass

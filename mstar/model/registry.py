@@ -1,30 +1,32 @@
-from mstar.model.bagel.bagel_model import BagelModel
-from mstar.model.base import Model
-from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
-from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
-from mstar.model.whisper.whisper_model import WhisperModel
+from importlib import import_module
 
-MODEL_REGISTRY: dict[str, type[Model]] = {
-    "bagel": BagelModel,
-    "cosmos3": Cosmos3Model,
-    "cosmos3_super": Cosmos3Model,
-    "higgs_audio": HiggsAudioModel,
-    "orpheus": OrpheusModel,
-    "pi05": Pi05Model,
-    "qwen3_omni": Qwen3OmniModel,
-    "vjepa2": VJepa2Model,
-    "vjepa2_ac": VJepa2ACModel,
-    "whisper_large": WhisperModel,
+from mstar.model.base import Model
+
+MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
+    "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
+    "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
+    "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
+    "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
+    "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
+    "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
+    # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the
+    # DROID robot platform (domain droid_lerobot, 10-dim raw actions). Same
+    # class; the checkpoint's config disables the sound pathway (sound_gen
+    # false, no sound_tokenizer/), so the model self-serves without audio.
+    "cosmos3_droid": {"model_path_hf": "nvidia/Cosmos3-Nano-Policy-DROID"},
     # Cosmos3-Super (64B) — same architecture + class; dims (64 layers / 5120
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).
@@ -38,6 +40,7 @@ HF_MODELS: dict[str, dict] = {
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
+    "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
     # (~300M); the same class loads vitl/h/g at 256 or 384 by reading
     # config.json.
@@ -48,6 +51,9 @@ HF_MODELS: dict[str, dict] = {
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.
     "vjepa2_ac": {"model_path_hf": "vjepa2-ac-vitg"},
+    # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
+    # only; the A14B MoE variants are a separate follow-up.
+    "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
@@ -57,4 +63,5 @@ HF_MODELS: dict[str, dict] = {
 def get_model_class(name: str) -> type[Model]:
     if name not in MODEL_REGISTRY:
         raise KeyError(f"Unknown model name: {name!r}. Available: {list(MODEL_REGISTRY.keys())}")
-    return MODEL_REGISTRY[name]
+    module_name, class_name = MODEL_REGISTRY[name]
+    return getattr(import_module(module_name), class_name)

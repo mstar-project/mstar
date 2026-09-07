@@ -26,15 +26,18 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "bagel": "bagel_single_gpu.yaml",
     "bagel_cfg_parallel": "bagel_cfg_parallel.yaml",
     "cosmos3": "cosmos3_nano.yaml",
+    "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
+    "qwen3_tts": "qwen3tts.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
     # ASR (Beta, un-optimized) — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "wan22": "wan22.yaml",
 }
 
 
@@ -85,10 +88,19 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model in ("cosmos3", "cosmos3_super"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
         lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
+    if model == "cosmos3_droid":
+        lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
+        lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
+        lines.append("                           action_mode=\"policy\", domain_name=\"droid_lerobot\",")
+        lines.append("                           raw_action_dim=10, action_chunk_size=16)")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
-    if model in ("orpheus", "qwen3_omni"):
-        voice = "tara" if model == "orpheus" else "Ethan"
+    if model in ("orpheus", "qwen3_omni", "qwen3_tts"):
+        voice = {
+            "orpheus": "tara",
+            "qwen3_omni": "Ethan",
+            "qwen3_tts": "Vivian",
+        }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
@@ -141,6 +153,12 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats"]
     if args.log_stats_file:
         argv += ["--log-stats-file", args.log_stats_file]
+    # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
+    # silently staying on uvicorn would be a footgun.
+    if args.rust_frontend or args.rust_frontend_bin:
+        argv += ["--rust-frontend"]
+    if args.rust_frontend_bin:
+        argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
     print(_next_steps(args.model, args.host, args.port), file=sys.stderr)
 
@@ -176,6 +194,16 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--log-stats-file", default=None,
         help="append per-request profiling stats to this file (implies --log-stats)",
+    )
+    serve.add_argument(
+        "--rust-frontend", action="store_true",
+        help="serve HTTP from the Rust mstar-server binary instead of "
+             "uvicorn/FastAPI (see docs: environment variables / installation)",
+    )
+    serve.add_argument(
+        "--rust-frontend-bin", default=None,
+        help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
+             "$PATH, then rust/server/target/release)",
     )
     serve.set_defaults(func=_serve)
     return parser
