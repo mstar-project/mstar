@@ -107,7 +107,7 @@ class ExecutingBatch:
 
     running_batched: bool = False
 
-    # Enables double-buffering for resources with non-blocking H2D 
+    # Enables double-buffering for resources with non-blocking H2D
     slot: int | None = None
 
     # Selects among a walk's capture buckets; matches SubmoduleStep.cg_key_info
