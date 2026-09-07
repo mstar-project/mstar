@@ -48,7 +48,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
         )
 
     def _cg_wrapper(
-        self, lease: SlotLease, label: str, num_rows: int,
+        self, lease: SlotLease, label: str,
     ) -> RaggedPrefillWrapper:
         """The captured-graph wrapper for one (bucket, slot, label).
 
@@ -64,7 +64,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
             return wrapper
 
         bucket = lease.bucket
-        max_segments = max(self._config.max_segments_for(bucket.bs), num_rows)
+        max_segments = self._config.max_segments_for(bucket.bs)
         # the bucket's own token count is the ceiling; the per-request override
         # is for a runner that buckets by batch size alone
         max_tokens = max(
@@ -144,7 +144,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
                 cu.append(cu[-1] + seg.span)
             cu_seqlens = torch.tensor(cu, dtype=torch.int32)
             if lease is not None:
-                wrapper = self._cg_wrapper(lease, label, len(segments))
+                wrapper = self._cg_wrapper(lease, label)
             else:
                 wrapper = self._eager_wrapper(label)
 
