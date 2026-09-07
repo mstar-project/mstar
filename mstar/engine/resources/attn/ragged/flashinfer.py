@@ -142,7 +142,14 @@ class FlashInferRaggedManager(RaggedAttnManager):
             cu = [0]
             for seg in segments:
                 cu.append(cu[-1] + seg.span)
-            cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+            # Pinned and freshly built per plan: the graph wrapper hands this
+            # straight to FlashInfer's non-blocking H2D, so a reused buffer could
+            # be overwritten while its DMA is still in flight. A fresh pinned
+            # allocation is held by the caching host allocator until the copy
+            # retires, keeping the plan async without a per-step sync.
+            cu_seqlens = torch.tensor(
+                cu, dtype=torch.int32, pin_memory=torch.cuda.is_available()
+            )
             if lease is not None:
                 wrapper = self._cg_wrapper(lease, label)
             else:

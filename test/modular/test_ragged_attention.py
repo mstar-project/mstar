@@ -216,6 +216,25 @@ def test_graph_replay_stable_across_changing_layouts():
         close(*replay(w, graph, static, out, seg_lens, seed=i))
 
 
+def test_graph_replay_survives_a_poisoned_output_tail():
+    """The kernel writes only the planned rows, and reads KV past
+    ``cu_seqlens[-1]`` out to the last segment's tile boundary, masking that
+    overread additively. Finite values die correctly but NaN/Inf survive
+    (NaN + -inf = NaN), so a poisoned tail would corrupt the last segment's
+    real rows. The wrapper owns the output buffer and re-zeros the tail on
+    every plan so no such value can be there.
+    """
+    w = graph_wrapper()
+    graph, static, out = capture_wrapper(w)
+    seg_lens = [100, 60, 30, 0]
+    total = sum(seg_lens)
+
+    w._out_buf[total:].fill_(float("nan"))
+    close(*replay(w, graph, static, out, seg_lens))
+    assert torch.isfinite(out[:total]).all()
+    assert (w._out_buf[total:] == 0).all()
+
+
 def test_graph_mode_pads_fewer_segments():
     w = graph_wrapper()
     w.plan(cu([10, 20]))

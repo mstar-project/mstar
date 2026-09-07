@@ -47,6 +47,7 @@ class RaggedPrefillWrapper:
         self.max_num_segments = max_num_segments
         self.max_total_tokens = max_total_tokens
         self._num_segments = 0
+        self._total_tokens = 0
 
         import flashinfer
 
@@ -69,12 +70,14 @@ class RaggedPrefillWrapper:
                 kv_indptr_buf=self._kv_indptr_buf,
                 backend=backend,
             )
-            # Host staging for the padded indptr; FlashInfer's plan moves it to
-            # host anyway, so building it here avoids a D2H sync per plan.
-            self._cu_host = torch.zeros(
-                max_num_segments + 1,
-                dtype=torch.int32,
-                pin_memory=torch.cuda.is_available(),
+            # Own the output: the kernel writes only the planned rows, and it
+            # reads KV past cu_seqlens[-1] to the last segment's tile boundary,
+            # masking additively. A NaN/Inf left in that tail by another
+            # graph's freed pool block survives the mask and poisons the last
+            # segment. ``plan`` keeps the window finite.
+            self._out_buf = torch.zeros(
+                max_total_tokens, num_qo_heads, self.padded_head_dim,
+                dtype=q_data_type, device=device,
             )
             # FlashInfer latches max rows on the FIRST plan; prime at the
             # bucket ceiling so a small first plan can't cap it.
@@ -82,7 +85,8 @@ class RaggedPrefillWrapper:
         else:
             self._qo_indptr_buf = None
             self._kv_indptr_buf = None
-            self._cu_host = None
+            # eager callers pass exact-size q/k/v; no tail to read
+            self._out_buf = None
             self.attn_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                 workspace_buffer, kv_layout, backend=backend
             )
@@ -120,12 +124,27 @@ class RaggedPrefillWrapper:
                 f"RaggedPrefillWrapper: {total_tokens} tokens exceeds the "
                 f"{self.max_total_tokens} this graph-mode wrapper was built for"
             )
-        self._cu_host[: n_seg + 1].copy_(host)
+        self._num_segments = n_seg
+        self._total_tokens = total_tokens
+        # FlashInfer's plan copies this into the static device buffer with a
+        # non-blocking H2D that can still be in flight when the next step plans,
+        # so the source must be a fresh buffer per plan (never reused) and, to
+        # stay async, pinned — the caching host allocator then holds it until the
+        # copy retires. The graph step already declares a layout padded to the
+        # captured segment count (padding rows attend nothing), so the fresh
+        # pinned buffer the caller hands us is already the right size: use it.
+        if n_seg == self.max_num_segments:
+            return host
+        # A shorter layout is staged into a fresh pinned buffer padded to size.
+        cu = torch.empty(
+            self.max_num_segments + 1, dtype=torch.int32,
+            pin_memory=torch.cuda.is_available(),
+        )
+        cu[: n_seg + 1].copy_(host)
         # Repeating the final offset appends zero-length segments — pads the
         # segment count to the fixed size without adding tokens.
-        self._cu_host[n_seg + 1:] = total_tokens
-        self._num_segments = n_seg
-        return self._cu_host
+        cu[n_seg + 1:] = total_tokens
+        return cu
 
     @torch.compiler.disable
     def plan(self, cu_seqlens: torch.Tensor, causal: bool=False) -> None:
@@ -145,6 +164,10 @@ class RaggedPrefillWrapper:
             sm_scale=self.sm_scale,
             q_data_type=self.q_data_type,
         )
+        if self._out_buf is not None:
+            # rows this layout leaves unwritten, zeroed outside the graph where
+            # the real token count is known; see __init__
+            self._out_buf[self._total_tokens:].zero_()
 
     def _pad_head_dim(self, t: torch.Tensor) -> torch.Tensor:
         if t.shape[-1] == self.padded_head_dim:
@@ -160,11 +183,22 @@ class RaggedPrefillWrapper:
         Returns:
             output: [total_tokens, num_qo_heads, head_dim]
 
-        Rows past the planned ``cu_seqlens[-1]`` are untouched, so an oversized
-        static buffer replays fine — the caller slices.
+        Only rows before the planned ``cu_seqlens[-1]`` are computed; the rest
+        read back zero. An oversized static buffer replays fine, but the caller
+        must still slice — the padding rows are not a valid result.
         """
         qp, kp, vp = (self._pad_head_dim(t.to(self.q_data_type)) for t in (q, k, v))
-        out = self.attn_wrapper.run(qp, kp, vp)
+        if self._out_buf is None:
+            out = self.attn_wrapper.run(qp, kp, vp)
+        else:
+            n = qp.shape[0]
+            assert n <= self.max_total_tokens, (
+                f"RaggedPrefillWrapper: {n} rows exceeds the "
+                f"{self.max_total_tokens} this graph-mode wrapper was built for"
+            )
+            out = self.attn_wrapper.run(qp, kp, vp, out=self._out_buf[:n])
         if self.padded_head_dim != self.head_dim:
             return out[..., : self.head_dim].contiguous()
-        return out
+        # `out` is the shared buffer the next call overwrites; the padded
+        # branch above already returns a copy
+        return out.clone() if self._out_buf is not None else out
