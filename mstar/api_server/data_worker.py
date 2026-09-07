@@ -308,6 +308,7 @@ class PreprocessWorkerThread:
                 input.output_modalities,
                 tensors=tensors,
                 input_metadata=input_metadata,
+                prompt_parts=input.prompt_parts,
                 **(input.model_kwargs or {}),
             )
             if prompt_tensors:
