@@ -94,6 +94,30 @@ class FlashInferMXFP4Experts:
         s_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(s, MXFP4_GROUP)
         return w_il, s_il, torch.ones((), device=w.device, dtype=torch.float32)
 
+    # ------------------------------------------------------------------ tuning
+    @torch.no_grad()
+    def autotune(self, token_counts=(1, 2, 4, 8, 16, 32, 64, 128), top_k: int = 16) -> bool:
+        """Run the routed GEMMs once per decode bucket under FlashInfer's autotuner so the
+        CUTLASS grouped GEMM keeps the best tactic per shape for the process (the default
+        tactic is ~35% slower at one token). Tactics are cached by shape, so one converted
+        layer tunes every layer of the same shape. Returns False when the autotuner is absent."""
+        try:
+            from flashinfer.autotuner import autotune
+        except Exception:
+            return False
+        assert self.converted
+        e, _, half_latent = self.w13.shape
+        latent = half_latent * 2
+        k = min(top_k, e)
+        with autotune(True):
+            for t in token_counts:
+                x = torch.randn(t, latent, device=self.device, dtype=torch.bfloat16)
+                idx = torch.stack([torch.randperm(e, device=self.device)[:k] for _ in range(t)]).to(torch.int32)
+                w = torch.softmax(torch.randn(t, k, device=self.device), -1)
+                for _ in range(2):
+                    self(x, idx, w)
+        return True
+
     # ------------------------------------------------------------------ forward
     @torch.compiler.disable
     def __call__(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
