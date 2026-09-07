@@ -13,9 +13,18 @@ mstar --help
 
 `mstar-ai` and `mstar-project` are alias packages (under
 `packaging/aliases/`) that carry no code and just depend on `m-star`, so
-`pip install mstar-ai` resolves to the same thing. PyPI treats `m-star`,
-`m_star`, `m.star`, and `M-Star` as one name, but `mstar` (no separator) is
-a separate project.
+`pip install mstar-ai` resolves to the same thing. They mirror m-star's
+extras, so `pip install "mstar-ai[all]"` forwards to `m-star[all]`; keep
+their `[project.optional-dependencies]` in sync when m-star's extras change.
+PyPI treats `m-star`, `m_star`, `m.star`, and `M-Star` as one name, but
+`mstar` (no separator) is a separate project.
+
+## Default configs
+
+The deployment YAMLs in `configs/` are shipped in the wheel as package data
+(`[tool.setuptools.package-data]`), so `mstar serve <model>` finds its
+default config after a plain `pip install`. The CLI resolves them via
+`importlib.resources`, falling back to the repo `configs/` for checkouts.
 
 ## Cutting a release
 

@@ -225,12 +225,16 @@ all = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mstar*"]
+# configs is included so the default deployment YAMLs ship in the wheel;
+# the CLI resolves them via importlib.resources for a pip install.
+include = ["mstar*", "configs"]
 exclude = ["tests*", "benchmark*", "examples*"]
 
-# Ship the vendored CUDA source so it can be JIT-compiled on first use.
+# Ship the vendored CUDA source so it can be JIT-compiled on first use, and
+# the default deployment configs so `mstar serve <model>` works when installed.
 [tool.setuptools.package-data]
 "mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"configs" = ["*.yaml"]
 
 [tool.ruff]
 exclude = [".git", ".ruff_cache", ".venv", "ref"]
