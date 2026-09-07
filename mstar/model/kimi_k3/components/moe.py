@@ -1,0 +1,270 @@
+"""Latent MoE layer (spec E): noaux-tc sigmoid router, bf16 latent down/up projections,
+routed experts in the latent space with fused per-rank expert parameters, and the fused
+shared-expert MLP.
+
+Expert storage (per rank, tensor-parallel on the intermediate dim, like
+``ParallelSparseMoeBlock``): ``experts.gate_up_proj [E, 2 * inter_local, latent]`` (gate
+rows then up rows) and ``experts.down_proj [E, latent, inter_local]``. The checkpoint's
+per-expert ``w1`` (gate), ``w3`` (up), ``w2`` (down) tensors are routed into them by the
+model's ``load_weights``; MXFP4-packed experts are dequantized by the loader for now
+(the quantized-parameter path lands with the kernels).
+
+Dispatch: the reference per-expert loop (any device) or, on CUDA, the Triton grouped GEMM
+(``mstar.utils.fused_moe``) once it grows a SiTU epilogue; selected by ``dispatch``.
+"""
+from __future__ import annotations
+
+from functools import partial
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from mstar.distributed.communication import CommGroup
+from mstar.distributed.utils import divide
+from mstar.model.components.distributed.linear import RowParallelLinear
+from mstar.model.components.moe import _down_proj_weight_loader, _gate_up_weight_loader
+from mstar.model.kimi_k3.components.common import (
+    KimiRMSNorm,
+    ReplicatedLinear,
+    replicated_loader,
+    restore_kept_dtypes,
+)
+from mstar.model.kimi_k3.components.mlp import ParallelSiTUMLP
+from mstar.model.kimi_k3.reference.moe import routed_experts_loop
+from mstar.model.kimi_k3.reference.mxfp4 import MXFP4_GROUP, dequant_mxfp4
+from mstar.model.kimi_k3.reference.router import noaux_tc_route
+
+
+def _mxfp4_gate_up_loader(tp_rank, tp_size, full_inter, param, loaded, loaded_shard_id=None):
+    """Route one expert's packed ``w1``/``w3`` (``[inter, K/2]`` bytes or ``[inter, K/32]``
+    scales) into the fused ``[E, 2*inter_local, ...]`` parameter."""
+    kind, expert = loaded_shard_id.split(":")
+    expert = int(expert)
+    inter_local = full_inter // tp_size
+    src = loaded.narrow(0, tp_rank * inter_local, inter_local)
+    row0 = 0 if kind == "gate" else inter_local
+    dst = param.data[expert].narrow(0, row0, inter_local)
+    assert dst.shape == src.shape, (tuple(dst.shape), tuple(src.shape))
+    dst.copy_(src)
+
+
+def _mxfp4_down_loader(tp_rank, tp_size, full_inter, per_col, param, loaded, loaded_shard_id=None):
+    """Route one expert's packed ``w2`` (``[K, inter/2]`` bytes or ``[K, inter/32]`` scales):
+    the rank's slice is along the packed input dim (``per_col`` = 2 or 32 elements per column)."""
+    expert = int(loaded_shard_id.split(":")[1])
+    cols_local = (full_inter // tp_size) // per_col
+    src = loaded.narrow(1, tp_rank * cols_local, cols_local)
+    dst = param.data[expert]
+    assert dst.shape == src.shape, (tuple(dst.shape), tuple(src.shape))
+    dst.copy_(src)
+
+
+class NoAuxTCRouter(nn.Module):
+    """``gate.weight [E, hidden]`` (fp32 math) + ``gate.e_score_correction_bias [E]``."""
+
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int, *, renormalize: bool = True,
+                 routed_scaling_factor: float = 1.0, scoring: str = "sigmoid",
+                 num_expert_group: int = 1, topk_group: int = 1):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
+        self.e_score_correction_bias = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
+        self.top_k = top_k
+        self.renormalize = renormalize
+        self.routed_scaling_factor = routed_scaling_factor
+        self.scoring = scoring
+        self.num_expert_group = num_expert_group
+        self.topk_group = topk_group
+        self.weight.weight_loader = replicated_loader
+        self.e_score_correction_bias.weight_loader = replicated_loader
+        self.e_score_correction_bias._keep_dtype = torch.float32
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self.weight.weight_loader = replicated_loader
+        self.e_score_correction_bias.weight_loader = replicated_loader
+        self.e_score_correction_bias._keep_dtype = torch.float32
+        restore_kept_dtypes(self)
+        return result
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return noaux_tc_route(
+            x, self.weight, self.e_score_correction_bias, self.top_k, scoring=self.scoring,
+            renormalize=self.renormalize, routed_scaling_factor=self.routed_scaling_factor,
+            num_expert_group=self.num_expert_group, topk_group=self.topk_group,
+        )
+
+
+class KimiLatentMoE(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        latent_size: int,
+        num_experts: int,
+        top_k: int,
+        moe_intermediate_size: int,
+        num_shared_experts: int,
+        situ_beta: float = 4.0,
+        situ_linear_beta: float | None = 25.0,
+        latent_norm: bool = True,
+        norm_eps: float = 1e-5,
+        renormalize: bool = True,
+        routed_scaling_factor: float = 1.0,
+        num_expert_group: int = 1,
+        topk_group: int = 1,
+        comm_group: CommGroup | None = None,
+        dispatch: str = "auto",
+        quantized: bool = False,
+    ):
+        super().__init__()
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+        tp_rank, tp_size = comm_group.rank, comm_group.world_size
+        self.hidden_size = hidden_size
+        self.latent_size = latent_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.moe_intermediate_size = moe_intermediate_size
+        self.inter_local = divide(moe_intermediate_size, tp_size)
+        self.situ_beta, self.situ_linear_beta = situ_beta, situ_linear_beta
+        self.dispatch = dispatch
+        self.quantized = quantized
+        if quantized:
+            assert latent_size % MXFP4_GROUP == 0 and self.inter_local % MXFP4_GROUP == 0
+
+        self.gate = NoAuxTCRouter(
+            hidden_size, num_experts, top_k, renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor, num_expert_group=num_expert_group, topk_group=topk_group,
+        )
+        self.routed_expert_down_proj = ReplicatedLinear(hidden_size, latent_size)
+        # row-parallel over the latent: each rank projects its slice of the (replicated,
+        # normalized) latent and the partial rides the same all-reduce as the shared
+        # experts' partial -- one collective on hidden, and 1/tp of the up-proj weights
+        self.routed_expert_up_proj = RowParallelLinear(
+            comm_group, latent_size, hidden_size, bias=False, input_is_parallel=False, reduce_results=False,
+        )
+        self.routed_expert_norm = KimiRMSNorm(latent_size, eps=norm_eps) if latent_norm else None
+        self.experts = nn.Module()
+        if quantized:
+            u8 = torch.uint8
+            il = self.inter_local
+            self.experts.gate_up_packed = nn.Parameter(
+                torch.empty(num_experts, 2 * il, latent_size // 2, dtype=u8), requires_grad=False)
+            self.experts.gate_up_scale = nn.Parameter(
+                torch.empty(num_experts, 2 * il, latent_size // MXFP4_GROUP, dtype=u8), requires_grad=False)
+            self.experts.down_packed = nn.Parameter(
+                torch.empty(num_experts, latent_size, il // 2, dtype=u8), requires_grad=False)
+            self.experts.down_scale = nn.Parameter(
+                torch.empty(num_experts, latent_size, il // MXFP4_GROUP, dtype=u8), requires_grad=False)
+        else:
+            self.experts.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * self.inter_local, latent_size))
+            self.experts.down_proj = nn.Parameter(torch.empty(num_experts, latent_size, self.inter_local))
+        self.shared_experts = None
+        if num_shared_experts:
+            self.shared_experts = ParallelSiTUMLP(
+                hidden_size, moe_intermediate_size * num_shared_experts, comm_group=comm_group,
+                situ_beta=situ_beta, situ_linear_beta=situ_linear_beta, reduce_results=False,
+            )
+        self._tp = (tp_rank, tp_size)
+        self._fi = None  # FlashInferMXFP4Experts once prepare_flashinfer() converted the weights
+        self._attach_loaders()
+
+    def _attach_loaders(self) -> None:
+        tp_rank, tp_size = self._tp
+        full = self.moe_intermediate_size
+        if self.quantized:
+            for prm in (self.experts.gate_up_packed, self.experts.gate_up_scale,
+                        self.experts.down_packed, self.experts.down_scale):
+                prm._keep_dtype = torch.uint8
+            self.experts.gate_up_packed.weight_loader = partial(_mxfp4_gate_up_loader, tp_rank, tp_size, full)
+            self.experts.gate_up_scale.weight_loader = partial(_mxfp4_gate_up_loader, tp_rank, tp_size, full)
+            self.experts.down_packed.weight_loader = partial(_mxfp4_down_loader, tp_rank, tp_size, full, 2)
+            self.experts.down_scale.weight_loader = partial(
+                _mxfp4_down_loader, tp_rank, tp_size, full, MXFP4_GROUP)
+        else:
+            self.experts.gate_up_proj.weight_loader = partial(_gate_up_weight_loader, tp_rank, tp_size, full)
+            self.experts.down_proj.weight_loader = partial(_down_proj_weight_loader, tp_rank, tp_size, full)
+        self.routed_expert_down_proj.weight.weight_loader = replicated_loader
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._attach_loaders()
+        restore_kept_dtypes(self.experts)
+        return result
+
+    def _use_triton(self, z: torch.Tensor) -> bool:
+        if self.dispatch == "reference":
+            return False
+        return z.is_cuda and z.dtype in (torch.bfloat16, torch.float16)
+
+    def prepare_flashinfer(self, mode: str, device: torch.device) -> None:
+        """Convert the packed experts in place to FlashInfer's SM90 mixed-input layout and route
+        ``_routed`` through ``cutlass_fused_moe`` (``mode``: ``w4a16`` or ``humming``). Only for
+        ``quantized`` modules on CUDA; irreversible for this module instance."""
+        from mstar.utils.fused_moe.flashinfer_cutlass import FlashInferMXFP4Experts
+
+        assert self.quantized, "the FlashInfer backend takes MXFP4-packed experts"
+        assert self._fi is None, "already converted"
+        be = FlashInferMXFP4Experts(
+            mode=mode, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device)
+        be.convert(self.experts.gate_up_packed.data, self.experts.gate_up_scale.data,
+                   self.experts.down_packed.data, self.experts.down_scale.data)
+        self._fi = be
+
+    def dequantized_experts(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """bf16 ``(w13 [E, 2*inter_local, latent], w2 [E, latent, inter_local])`` from the packed
+        parameters (reference/CPU path; materializes the experts, so tests only)."""
+        assert self._fi is None, "experts were converted to the FlashInfer layout"
+        e = self.num_experts
+        w13 = torch.stack(
+            [dequant_mxfp4(self.experts.gate_up_packed[i], self.experts.gate_up_scale[i]) for i in range(e)])
+        w2 = torch.stack([dequant_mxfp4(self.experts.down_packed[i], self.experts.down_scale[i]) for i in range(e)])
+        return w13, w2
+
+    def _routed(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+        if self._fi is not None:
+            return self._fi(z, topk_idx, topk_weight)
+        if self.quantized:
+            if self._use_triton(z):
+                from mstar.utils.fused_moe.mxfp4 import fused_experts_mxfp4
+
+                return fused_experts_mxfp4(
+                    z, self.experts.gate_up_packed, self.experts.gate_up_scale,
+                    self.experts.down_packed, self.experts.down_scale, topk_weight, topk_idx,
+                    self.situ_beta, self.situ_linear_beta,
+                )
+            w13, w2 = self.dequantized_experts()
+            return routed_experts_loop(z, topk_idx, topk_weight, w13, w2, self.situ_beta, self.situ_linear_beta)
+        if self._use_triton(z):
+            from mstar.utils.fused_moe.mxfp4 import fused_experts_bf16_situ
+
+            return fused_experts_bf16_situ(
+                z, self.experts.gate_up_proj, self.experts.down_proj, topk_weight, topk_idx,
+                self.situ_beta, self.situ_linear_beta,
+            )
+        return routed_experts_loop(
+            z, topk_idx, topk_weight, self.experts.gate_up_proj, self.experts.down_proj,
+            self.situ_beta, self.situ_linear_beta,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        x = x.reshape(-1, self.hidden_size)
+        topk_idx, topk_weight = self.gate(x)
+        z = self.routed_expert_down_proj(x)
+        y = self._routed(z, topk_idx, topk_weight)
+        if self.comm_group.world_size > 1:
+            y = self.comm_group.all_reduce(y)  # partial sums over the intermediate shards
+        if self.routed_expert_norm is not None:
+            y = self.routed_expert_norm(y)
+        y = self.routed_expert_up_proj(y)  # partial over the latent shards
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(x)  # partial over the intermediate shards
+        if self.comm_group.world_size > 1:
+            y = self.comm_group.all_reduce(y)
+        return y.view(shape)
+
+
+__all__ = ["KimiLatentMoE", "NoAuxTCRouter", "F"]
