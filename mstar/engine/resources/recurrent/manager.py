@@ -207,14 +207,16 @@ class RecurrentStateManager(AttentionResource):
         real = set(ctx.request_ids)
         return {rid for rid in padded if rid not in real}
 
-    def _static_buffers(self, slot: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _static_buffers(self, slot: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One device buffer per capture slot holding ``[slot_ids | has_state | cu_seqlens]``
+        (int32, ``3 * max_bs + 1`` entries) plus its pinned host staging twin, so a plan is a
+        single asynchronous copy. Returns ``(ids, flags, cu, (device, host))`` views."""
         bufs = self._static.get(slot)
         if bufs is None:
-            bufs = self._static[slot] = (
-                torch.full((self._cg_max_bs,), SCRATCH_SLOT, dtype=torch.int32, device=self._device),
-                torch.zeros((self._cg_max_bs,), dtype=torch.bool, device=self._device),
-                torch.zeros((self._cg_max_bs + 1,), dtype=torch.int32, device=self._device),
-            )
+            n = self._cg_max_bs
+            dev = torch.zeros((3 * n + 1,), dtype=torch.int32, device=self._device)
+            host = torch.zeros((3 * n + 1,), dtype=torch.int32, pin_memory=self._device.type == "cuda")
+            bufs = self._static[slot] = (dev[:n], dev[n:2 * n], dev[2 * n:], (dev, host))
         return bufs
 
     def build_cuda_graph_buffers(self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int):
@@ -256,20 +258,25 @@ class RecurrentStateManager(AttentionResource):
         lease: SlotLease | None = ctx.slot_lease
         rows = len(slot_ids)
         if lease is not None:
-            ids_buf, flags_buf, cu_buf = self._static_buffers(lease.slot)
-            assert rows <= ids_buf.numel(), (rows, ids_buf.numel())
-            ids_buf[:rows].copy_(torch.tensor(slot_ids, dtype=torch.int32), non_blocking=True)
-            ids_buf[rows:].fill_(SCRATCH_SLOT)
-            flags_buf[:rows].copy_(torch.tensor(has_state, dtype=torch.bool), non_blocking=True)
-            flags_buf[rows:].fill_(False)
-            cu_buf[: rows + 1].copy_(torch.tensor(cu, dtype=torch.int32), non_blocking=True)
-            # padding rows are empty: their boundaries repeat the last real one
-            cu_buf[rows + 1 :].fill_(cu[-1])
+            ids_buf, flags_buf, cu_buf, (dev, host) = self._static_buffers(lease.slot)
+            n = ids_buf.numel()
+            assert rows <= n, (rows, n)
+            # fill the pinned twin on the host (numpy slice assignment, no tensor constructions),
+            # then one asynchronous copy; padding rows address the scratch slot and their
+            # boundaries repeat the last real one
+            arr = host.numpy()
+            arr[:rows] = slot_ids
+            arr[rows:n] = SCRATCH_SLOT
+            arr[n:n + rows] = has_state
+            arr[n + rows:2 * n] = 0
+            arr[2 * n:2 * n + rows + 1] = cu
+            arr[2 * n + rows + 1:] = cu[-1]  # cu region is n + 1 entries
+            dev.copy_(host, non_blocking=True)
             ids_t, flags_t, cu_t = ids_buf, flags_buf, cu_buf
         else:
-            ids_t = torch.tensor(slot_ids, dtype=torch.int32).to(self._device, non_blocking=True)
-            flags_t = torch.tensor(has_state, dtype=torch.bool).to(self._device, non_blocking=True)
-            cu_t = torch.tensor(cu, dtype=torch.int32).to(self._device, non_blocking=True)
+            packed = torch.tensor([*slot_ids, *[int(h) for h in has_state], *cu], dtype=torch.int32)
+            packed = packed.to(self._device, non_blocking=True)
+            ids_t, flags_t, cu_t = packed[:rows], packed[rows:2 * rows], packed[2 * rows:]
         res = RecurrentPlanOutput(
             slot_ids=ids_t, has_state=flags_t, cu_seqlens=cu_t,
             slot_ids_cpu=slot_ids, has_state_cpu=has_state, cu_seqlens_cpu=cu,
