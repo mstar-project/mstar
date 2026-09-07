@@ -5,6 +5,9 @@ own; installing it pulls in the real `m-star` distribution.
 
 ```
 pip install mstar-project
+pip install "mstar-project[bagel]"   # extras forward to m-star
+pip install "mstar-project[all]"
 ```
 
-is equivalent to `pip install m-star`. Either way you `import mstar`.
+is equivalent to installing `m-star` with the same extras. Either way you
+`import mstar`.
