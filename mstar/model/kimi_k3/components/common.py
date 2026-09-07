@@ -2,6 +2,7 @@
 with a plain copy loader, and dim-0 sharding loaders for per-head parameters."""
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 import torch
@@ -57,12 +58,29 @@ def shard_dim0_loader(tp_rank: int, tp_size: int, param: nn.Parameter, loaded: t
                       loaded_shard_id=None) -> None:
     """Copy this rank's contiguous slice along dim 0 (heads / channels)."""
     assert loaded_shard_id is None
+    full = param.data.shape[0] * tp_size
     n = loaded.shape[0]
+    if n > full:
+        # the released Kimi K3 checkpoints store A_log with head_dim (128) entries for 96
+        # heads; the reference module allocates num_heads and vLLM narrows per rank, i.e.
+        # both use the first num_heads entries
+        _warn_once(f"{tuple(loaded.shape)} -> first {full} entries (parameter is {full} across TP)")
+        loaded = loaded.narrow(0, 0, full)
+        n = full
     assert n % tp_size == 0, (n, tp_size)
     per = n // tp_size
     src = loaded.narrow(0, tp_rank * per, per)
     assert param.data.shape == src.shape, (tuple(param.data.shape), tuple(src.shape))
     param.data.copy_(src)
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _warned:
+        _warned.add(msg)
+        logging.getLogger(__name__).warning("dim-0 shard loader: oversized checkpoint tensor %s", msg)
 
 
 def attach_dim0_loader(param: nn.Parameter, tp_rank: int, tp_size: int) -> None:
