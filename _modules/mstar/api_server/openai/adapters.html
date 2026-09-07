@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -874,6 +875,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptPart</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>  <span class="c1"># for type checkers / IDEs only (annotations are lazy via __future__)</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.protocol</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -892,7 +894,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">file_paths</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
-    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
+    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># Ordered text/attachment sequence. None from entrypoints with no ordering</span>
+    <span class="c1"># to preserve, which keep the legacy attachments-then-text layout.</span>
+    <span class="n">prompt_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 
@@ -900,19 +905,34 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.flatten_messages">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">flatten_messages</span><span class="p">(</span>
     <span class="n">messages</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">,</span> <span class="n">allow_remote</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">"""Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities).</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).</span>
 
-<span class="sd">    Text parts across all messages are concatenated (newline-joined). Image /</span>
-<span class="sd">    audio / video content parts are persisted under ``upload_dir`` and grouped</span>
-<span class="sd">    by modality. (Multi-turn role structure is flattened — a v1 simplification;</span>
-<span class="sd">    the models here apply their own prompt formatting in ``process_prompt``.)</span>
+<span class="sd">    ``parts`` is the ordered sequence as written; the other three derive from</span>
+<span class="sd">    it — text newline-joined, attachments persisted under ``upload_dir`` and</span>
+<span class="sd">    grouped by modality, ``input_modalities`` the per-part modality sequence.</span>
+<span class="sd">    So an attachment's position and a repeated modality both survive.</span>
+<span class="sd">    (Multi-turn role structure is flattened — a v1 simplification; the models</span>
+<span class="sd">    apply their own prompt formatting in ``process_prompt``.)</span>
 <span class="sd">    """</span>
-    <span class="n">text_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="n">file_paths</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">add_file</span><span class="p">(</span><span class="n">modality</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">file_paths</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">modality</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+        <span class="n">paths</span> <span class="o">=</span> <span class="n">file_paths</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">modality</span><span class="p">,</span> <span class="p">[])</span>
+        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">PromptPart</span><span class="p">(</span><span class="n">modality</span><span class="o">=</span><span class="n">modality</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">paths</span><span class="p">)))</span>
+        <span class="n">paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">add_text</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># Adjacent text parts were newline-joined before ordering was kept;</span>
+        <span class="c1"># merge them here so only text an attachment separates gets its own</span>
+        <span class="c1"># part, and the rendered prompt keeps the separator it used to have.</span>
+        <span class="k">if</span> <span class="n">parts</span> <span class="ow">and</span> <span class="n">parts</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
+            <span class="n">parts</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">PromptPart</span><span class="p">(</span>
+                <span class="n">modality</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">parts</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="si">}</span><span class="se">\n</span><span class="si">{</span><span class="n">text</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+            <span class="k">return</span>
+        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">PromptPart</span><span class="p">(</span><span class="n">modality</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="n">text</span><span class="p">))</span>
 
     <span class="k">for</span> <span class="n">msg</span> <span class="ow">in</span> <span class="n">messages</span> <span class="ow">or</span> <span class="p">[]:</span>
         <span class="c1"># Messages may be pydantic ChatMessage objects or plain dicts.</span>
@@ -921,7 +941,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">continue</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">content</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
             <span class="k">if</span> <span class="n">content</span><span class="p">:</span>
-                <span class="n">text_parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">content</span><span class="p">)</span>
+                <span class="n">add_text</span><span class="p">(</span><span class="n">content</span><span class="p">)</span>
             <span class="k">continue</span>
         <span class="k">for</span> <span class="n">part</span> <span class="ow">in</span> <span class="n">content</span><span class="p">:</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">part</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
@@ -929,7 +949,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">ptype</span> <span class="o">=</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"type"</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text"</span><span class="p">):</span>
-                    <span class="n">text_parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">part</span><span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
+                    <span class="n">add_text</span><span class="p">(</span><span class="n">part</span><span class="p">[</span><span class="s2">"text"</span><span class="p">])</span>
             <span class="k">elif</span> <span class="n">ptype</span> <span class="o">==</span> <span class="s2">"image_url"</span><span class="p">:</span>
                 <span class="n">url</span> <span class="o">=</span> <span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"image_url"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"url"</span><span class="p">,</span> <span class="s2">""</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">url</span><span class="p">:</span>
@@ -952,11 +972,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">mod</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">save_base64</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">fmt</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
                     <span class="n">add_file</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">path</span><span class="p">)</span>
 
-    <span class="n">input_modalities</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">file_paths</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+    <span class="n">text_parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">p</span><span class="o">.</span><span class="n">text</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span> <span class="k">if</span> <span class="n">p</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">]</span>
     <span class="n">text</span> <span class="o">=</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">text_parts</span><span class="p">)</span> <span class="k">if</span> <span class="n">text_parts</span> <span class="k">else</span> <span class="kc">None</span>
-    <span class="k">if</span> <span class="n">text</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">input_modalities</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">"text"</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">input_modalities</span></div>
+    <span class="k">return</span> <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="p">[</span><span class="n">p</span><span class="o">.</span><span class="n">modality</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span><span class="p">],</span> <span class="n">parts</span></div>
 
 
 
@@ -1071,7 +1089,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="BagelAdapter.chat_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.BagelAdapter.chat_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">chat_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ChatCompletionRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
-        <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">in_mods</span> <span class="o">=</span> <span class="n">flatten_messages</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">messages</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+        <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">in_mods</span><span class="p">,</span> <span class="n">parts</span> <span class="o">=</span> <span class="n">flatten_messages</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">messages</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
         <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
@@ -1080,6 +1098,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">input_modalities</span><span class="o">=</span><span class="n">in_mods</span><span class="p">,</span>
             <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+            <span class="n">prompt_parts</span><span class="o">=</span><span class="n">parts</span><span class="p">,</span>
         <span class="p">)</span></div>
 
 
@@ -1139,7 +1158,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Qwen3OmniAdapter.chat_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.chat_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">chat_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ChatCompletionRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
-        <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">in_mods</span> <span class="o">=</span> <span class="n">flatten_messages</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">messages</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+        <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">in_mods</span><span class="p">,</span> <span class="n">parts</span> <span class="o">=</span> <span class="n">flatten_messages</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">messages</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
         <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
         <span class="c1"># Speech output also emits text, so request both modalities when audio is asked for.</span>
         <span class="n">want_audio</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">modalities</span> <span class="ow">and</span> <span class="s2">"audio"</span> <span class="ow">in</span> <span class="n">req</span><span class="o">.</span><span class="n">modalities</span><span class="p">)</span>
@@ -1154,6 +1173,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">input_modalities</span><span class="o">=</span><span class="n">in_mods</span><span class="p">,</span>
             <span class="n">output_modalities</span><span class="o">=</span><span class="n">out_mods</span><span class="p">,</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+            <span class="n">prompt_parts</span><span class="o">=</span><span class="n">parts</span><span class="p">,</span>
         <span class="p">)</span></div>
 
 

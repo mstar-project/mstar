@@ -283,6 +283,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -600,7 +601,10 @@ NDJSON stream.</p>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">input_modalities</span></code></p></td>
 <td><p>auto</p></td>
-<td><p>Comma-separated input modalities; auto-detected from the data when omitted.</p></td>
+<td><p>Comma-separated input modalities, one entry per prompt element in order.
+Auto-detected from the uploads and text when omitted, which is what keeps
+the ordering and the count of same-modality attachments; an explicit list
+replaces it.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">output_modalities</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">text</span></code></p></td>

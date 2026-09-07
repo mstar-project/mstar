@@ -32,6 +32,7 @@
    cosmos3
    higgs_audio
    loader
+   multimodal
    orpheus
    pi05
    qwen3_omni

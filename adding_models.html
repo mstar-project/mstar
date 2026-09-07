@@ -282,6 +282,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -706,11 +707,17 @@ one. This is the largest single part of a model, so it has its own section. See
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">get_graph_walk_graphs(self)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">GraphSection]</span></code></dt><dd><p>Return <code class="docutils literal notranslate"><span class="pre">{walk_name:</span> <span class="pre">graph}</span></code>. See <a class="reference internal" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a>.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">process_prompt(self,</span> <span class="pre">prompt,</span> <span class="pre">input_modalities,</span> <span class="pre">output_modalities,</span> <span class="pre">tensors=None,</span> <span class="pre">**kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">NameToTensorList</span></code></dt><dd><p>Tokenize the prompt and produce the initial request tensors, for example
+<dt><code class="docutils literal notranslate"><span class="pre">process_prompt(self,</span> <span class="pre">prompt,</span> <span class="pre">input_modalities,</span> <span class="pre">output_modalities,</span> <span class="pre">tensors=None,</span> <span class="pre">prompt_parts=None,</span> <span class="pre">**kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">NameToTensorList</span></code></dt><dd><p>Tokenize the prompt and produce the initial request tensors, for example
 <code class="docutils literal notranslate"><span class="pre">{&quot;text_inputs&quot;:</span> <span class="pre">[token_ids]}</span></code>. This method runs in the API-server data worker,
 after raw media tensors are loaded. It can therefore read <code class="docutils literal notranslate"><span class="pre">tensors</span></code> (for example
 <code class="docutils literal notranslate"><span class="pre">image_inputs</span></code>, <code class="docutils literal notranslate"><span class="pre">audio_inputs</span></code> or <code class="docutils literal notranslate"><span class="pre">video_inputs</span></code>) to compute derived tensors
 such as <code class="docutils literal notranslate"><span class="pre">pixel_values</span></code>. The returned dict is merged into the request’s tensors.</p>
+<p><code class="docutils literal notranslate"><span class="pre">input_modalities</span></code> is the request layout: one entry per prompt element in the
+order written, so <code class="docutils literal notranslate"><span class="pre">[&quot;image&quot;,</span> <span class="pre">&quot;text&quot;,</span> <span class="pre">&quot;image&quot;]</span></code> is a distinct request from
+<code class="docutils literal notranslate"><span class="pre">[&quot;image&quot;,</span> <span class="pre">&quot;image&quot;,</span> <span class="pre">&quot;text&quot;]</span></code>. <code class="docutils literal notranslate"><span class="pre">prompt_parts</span></code> carries the same sequence with
+the text attached, and is <code class="docutils literal notranslate"><span class="pre">None</span></code> for entrypoints that submit files and text
+separately. <a class="reference internal" href="_autosummary/mstar.model.multimodal.html#module-mstar.model.multimodal" title="mstar.model.multimodal"><code class="xref py py-mod docutils literal notranslate"><span class="pre">mstar.model.multimodal</span></code></a> turns either into the prefill plan
+that <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> and the schedule builder both work from.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">get_initial_forward_pass_args(self,</span> <span class="pre">partition_name,</span> <span class="pre">input_modalities,</span> <span class="pre">output_modalities,</span> <span class="pre">input_signals,</span> <span class="pre">model_kwargs=None)</span> <span class="pre">-&gt;</span> <span class="pre">ForwardPassArgs</span></code></dt><dd><p>Build the first <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.ForwardPassArgs</span></code> for a partition. It names
 the graph walk to start on and the input edges that feed it.</p>

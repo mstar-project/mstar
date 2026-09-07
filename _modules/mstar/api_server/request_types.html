@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -847,6 +848,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.loop_indices</span><span class="w"> </span><span class="kn">import</span> <span class="n">NestedLoopIndices</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.multimodal</span><span class="w"> </span><span class="kn">import</span> <span class="n">PromptPart</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.format</span><span class="w"> </span><span class="kn">import</span> <span class="n">InputInfo</span><span class="p">,</span> <span class="n">RxInfo</span><span class="p">,</span> <span class="n">TxInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphTimings</span>
 
@@ -944,7 +946,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">file_paths</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span>
     <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
     <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
-    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span></div>
+    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span>
+
+    <span class="c1"># Ordered text/attachment sequence, when the entrypoint preserved it.</span>
+    <span class="n">prompt_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 </pre></div>
 
