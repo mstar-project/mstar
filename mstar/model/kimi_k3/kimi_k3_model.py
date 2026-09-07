@@ -61,6 +61,8 @@ class KimiK3Model(Model):
                 setattr(self.config, key, kwargs[key])
         self.default_thinking = bool(kwargs.get("thinking", True))
         self.moe_backend = str(kwargs.get("moe_backend", "auto"))  # see prepare_moe_kernels
+        cap = kwargs.get("max_capture_batch_size")
+        self.max_capture_batch_size = int(cap) if cap is not None else None
         self.tokenizer = KimiK3Tokenizer(self.local_dir)
         self.config.stop_token_ids = frozenset({self.tokenizer.eos_id, self.tokenizer.eot_id})
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -230,7 +232,8 @@ class KimiK3Model(Model):
         graph_safe = select_kda_kernels(language_model, device) and flashinfer_mla_supports(
             self.config.text.kv_lora_rank, self.config.text.qk_rope_head_dim
         )
-        submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config, cuda_graphs=graph_safe)
+        submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config, cuda_graphs=graph_safe,
+                                       max_capture_batch_size=self.max_capture_batch_size)
         self._submodule_cache[node_name] = submodule
         logger.info("Loaded Kimi K3 %s on %s", node_name, device)
         return submodule
