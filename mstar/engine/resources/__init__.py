@@ -38,6 +38,14 @@ from mstar.engine.resources.position.config import (
     PositionStep,
     PosScheme,
 )
+from mstar.engine.resources.recurrent.config import (
+    CommitMode,
+    RecurrentPlanOutput,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStateStep,
+    StatePart,
+)
 from mstar.engine.resources.runner import StepRunner, topo_sort
 from mstar.engine.resources.sampler.config import (
     SamplerSpec,
@@ -94,6 +102,12 @@ __all__ = [
     "PublishedInfo",
     "RaggedAttentionConfig",
     "RaggedAttentionSpec",
+    "CommitMode",
+    "RecurrentPlanOutput",
+    "RecurrentStateConfig",
+    "RecurrentStateSpec",
+    "RecurrentStateStep",
+    "StatePart",
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
