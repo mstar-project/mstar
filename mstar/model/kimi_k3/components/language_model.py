@@ -159,14 +159,21 @@ def select_kda_kernels(model: nn.Module, device) -> bool:
     return bool(getattr(kernels, "cuda_graph_safe", False))
 
 
-MOE_BACKENDS = ("auto", "triton", "w4a16", "humming")
+MOE_BACKENDS = ("auto", "triton", "w4a16", "humming", "marlin")
+
+
+def marlin_supports(moe) -> bool:
+    """Marlin's tiles need the latent width a multiple of 256 and the per-rank expert
+    intermediate width a multiple of 128 (the released K3 shapes at TP1..8 all qualify)."""
+    return moe.latent_size % 256 == 0 and moe.inter_local % 128 == 0
 
 
 def prepare_moe_kernels(model: nn.Module, device, backend: str = "auto") -> str:
-    """Pick the routed-expert kernels: FlashInfer's SM90 CUTLASS MoE (``w4a16`` bf16
-    activations, ``humming`` FP8 activations) for MXFP4 experts on CUDA, the in-tree Triton
-    kernel otherwise. ``auto`` prefers ``w4a16`` (same precision as the Triton path). Returns
-    the backend used."""
+    """Pick the routed-expert kernels for MXFP4 experts on CUDA: ``marlin`` (the Marlin MoE
+    kernel, fastest at decode batch sizes), FlashInfer's SM90 CUTLASS MoE (``w4a16`` bf16
+    activations, ``humming`` FP8 activations), or the in-tree Triton kernel (``triton``, also
+    the reference precision). ``auto`` takes ``marlin`` when its extension builds and the shapes
+    fit, else ``w4a16``, else ``triton``. Returns the backend used."""
     from mstar.model.kimi_k3.components.moe import KimiLatentMoE
 
     assert backend in MOE_BACKENDS, backend
@@ -174,16 +181,29 @@ def prepare_moe_kernels(model: nn.Module, device, backend: str = "auto") -> str:
     moes = [m for m in model.modules() if isinstance(m, KimiLatentMoE)]
     if backend == "triton" or dev.type != "cuda" or not moes or not moes[0].quantized:
         return "triton"
-    mode = "w4a16" if backend == "auto" else backend
-    try:
-        import flashinfer.fused_moe  # noqa: F401
-    except Exception:
-        return "triton"
-    for m in moes:
-        m.prepare_flashinfer(mode, dev)
-    # one layer's shapes stand for all: tune the CUTLASS tactics per decode bucket
-    moes[0]._fi.autotune(top_k=moes[0].top_k)
-    return mode
+    candidates = ["marlin", "w4a16"] if backend == "auto" else [backend]
+    for mode in candidates:
+        try:
+            if mode == "marlin":
+                if not all(marlin_supports(m) for m in moes):
+                    raise RuntimeError("Marlin needs latent % 256 == 0 and inter/TP % 128 == 0")
+                from mstar.utils.fused_moe.marlin import _load_ops
+
+                _load_ops()  # JIT-builds the extension once per machine; raises if it cannot
+            else:
+                import flashinfer.fused_moe  # noqa: F401
+        except Exception as ex:
+            if backend != "auto":
+                raise
+            logger.warning("Kimi K3 MoE backend %s unavailable (%s); trying the next", mode, ex)
+            continue
+        for m in moes:
+            m.prepare_experts_backend(mode, dev)
+        if mode != "marlin":
+            # one layer's shapes stand for all: tune the CUTLASS tactics per decode bucket
+            moes[0]._backend.autotune(top_k=moes[0].top_k)
+        return mode
+    return "triton"
 
 
 class KimiK3ForCausalLM(nn.Module):
