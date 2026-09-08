@@ -14,11 +14,16 @@ from safetensors import safe_open
 
 
 def _resolve_safetensors_device(device: torch.device | str) -> str:
-    """safetensors accepts ``"cuda"`` (no index) and ``"cpu"`` only —
-    not ``"cuda:0"``. Map our device strings to its conventions.
-    """
-    s = str(device)
-    return "cuda" if s.startswith("cuda") else s
+    """The device string ``safe_open`` gets for ``device``: ``"cpu"`` or an indexed
+    ``"cuda:N"`` (safetensors takes both, and resolves a bare ``"cuda"`` to device 0)."""
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return str(dev)
+    # safetensors resolves a bare "cuda" to device 0, not to the current device: every
+    # tensor-parallel rank would stage its checkpoint tensors on GPU 0 (and every rank's
+    # process would hold a context there). Name the index explicitly.
+    index = dev.index if dev.index is not None else torch.cuda.current_device()
+    return f"cuda:{index}"
 
 
 def iter_safetensors_file(
