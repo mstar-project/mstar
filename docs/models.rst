@@ -61,8 +61,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        state) and gated NoPE MLA, Block Attention Residuals, 896-expert latent MoE with
        MXFP4 experts. The expert-pruned ``mgoin/Kimi-K3-pruned75`` (224 experts, 475 GB)
        fits one 8xH100 node at TP8 (``configs/kimi_k3_pruned75_tp8.yaml``); the full
-       1.56 TB checkpoint needs a multi-node deployment. Text only for now (no vision
-       tower), no speculative decoding yet.
+       1.56 TB checkpoint needs a multi-node deployment. Routed experts run on the Marlin
+       MXFP4 MoE kernel (vendored from vLLM, built on first use); FlashInfer's CUTLASS
+       MoE and an in-tree Triton kernel are the alternatives (``moe_backend``). Text only
+       for now (no vision tower), no speculative decoding yet.
 
 Notes
 -----
