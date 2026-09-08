@@ -24,6 +24,23 @@ Communication
        ``0``: always pyzmq. The two transports are wire-compatible, so
        this can be set per-process while the rest of the mesh stays on
        pyzmq.
+   * - ``MSTAR_SYMM_MEM_ALLREDUCE``
+     - ``0``
+     - ``1`` routes small tensor-parallel all-reduces (``CommGroup.all_reduce``)
+       through torch's symmetric-memory kernels instead of NCCL: one-shot (every
+       rank reads its peers' buffers over NVLink and reduces locally) for small
+       messages, two-shot above ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``.
+       On an 8xH100 node a decode-sized all-reduce drops from ~24 µs to ~13 µs
+       (a decode step pays two per layer). Single-node groups with peer access
+       only; falls back to NCCL when the ``symm_mem`` ops are unavailable.
+   * - ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``
+     - ``262144``
+     - Largest message (bytes) the one-shot kernel takes; up to
+       ``MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES`` the two-shot kernel is used.
+   * - ``MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES``
+     - ``4194304``
+     - Largest message (bytes) the symmetric-memory path takes; bigger
+       all-reduces stay on NCCL, whose ring wins at size.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
