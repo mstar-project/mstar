@@ -20,7 +20,27 @@ def rope_apply_qk_inplace(
     high_freq_factor: float | None = None,
     old_context_len: float | None = None,
 ) -> None:
-    """Rotate q and k in place at ``pos_ids``."""
+    """Reject devices without a registered RoPE kernel."""
+    raise NotImplementedError(
+        f"RoPE is only implemented for CUDA and XPU, not {q.device.type}"
+    )
+
+
+@torch.library.register_kernel(rope_apply_qk_inplace, "cuda")
+def _rope_apply_qk_inplace_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    rotary_dim: int | None,
+    interleave: bool,
+    rope_scale: float,
+    rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    """Rotate q and k in place with FlashInfer's CUDA kernel."""
     import flashinfer
 
     rope_kwargs = dict(
