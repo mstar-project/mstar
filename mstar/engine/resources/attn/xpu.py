@@ -1,14 +1,28 @@
 """Paged attention through vllm-xpu-kernels."""
 
+import functools
 from dataclasses import dataclass
 
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
+
+
+@functools.cache
+def _xpu_paged_unavailable_reason() -> str | None:
+    """Return why the XPU paged-attention extension cannot be loaded."""
+    try:
+        import vllm_xpu_kernels._C  # noqa: F401
+        import vllm_xpu_kernels._xpu_C  # noqa: F401
+        from vllm_xpu_kernels.flash_attn_interface import (  # noqa: F401
+            flash_attn_varlen_func,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 @dataclass(frozen=True)
@@ -28,19 +42,20 @@ class XPUPagedAttentionManager(AttentionManager):
         self,
         kv_cache: str,
         device: torch.device,
-        dtype: torch.dtype,
-        kv_config: KVConfig,
     ):
         self._kv_cache_name = kv_cache
         self._device = device
-        self._dtype = dtype
-        self._kv_config = kv_config
         self._current_plans: dict[str, XPUPagedPlan] = {}
 
     def depends_on(self):
         return {self._kv_cache_name}
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        if ctx.slot_lease is not None or ctx.is_preplan:
+            raise RuntimeError(
+                "xpu_paged attention is eager-only: its plan metadata is "
+                "rebuilt for every step and does not have capture-stable addresses"
+            )
         self.reset_default_cursors()
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, (
@@ -82,6 +97,11 @@ class XPUPagedAttentionManager(AttentionManager):
 
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
+        """Return this eager step's query indptr.
+
+        Unlike CUDA-graph FlashInfer buffers, this tensor is newly allocated
+        by every plan and therefore has no address-stability guarantee.
+        """
         plan = self._current_plans.get(label)
         return None if plan is None else plan.cu_q
 

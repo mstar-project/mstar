@@ -28,6 +28,11 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 
+def _rng_offset_stride(device_type: str, vocab_size: int) -> int:
+    """Number of Philox offset units consumed by one sampled row."""
+    return vocab_size if device_type == "xpu" else 1
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": 4096},  num_warps=4,  num_stages=2),
@@ -397,9 +402,16 @@ class Sampler(BaseSampler):
             for i, rid in enumerate(request_ids):
                 self._seen_token_mask[rid].add_tokens(tokens[i:i+1])
 
-        # Advance the per-request RNG offset so the next step draws fresh.
+        # FlashInfer consumes one offset unit per sampled row. The XPU kernel
+        # consumes one Philox region per logit in its row, so advancing by one
+        # would make consecutive decode steps reuse overlapping RNG regions.
+        offset_stride = _rng_offset_stride(
+            logits.device.type, logits.shape[-1],
+        )
         for rid in request_ids:
-            self._step_offset[rid] = self._step_offset.get(rid, 0) + 1
+            self._step_offset[rid] = (
+                self._step_offset.get(rid, 0) + offset_stride
+            )
 
         return tokens
 
@@ -507,6 +519,13 @@ def sample_tokens(
 
         # The XPU kernel accepts one CPU [seed, offset] pair per invocation.
         # Invoke it per row to preserve independent request RNG streams.
+        #
+        # TODO: batch this when the kernel accepts per-row RNG state. The
+        # current loop and scalar .item() checks synchronize once per row and
+        # are intended for the XPU deployment's current batch-size-one path.
+        #
+        # A raw caller that omits seed/offset gets [0, 0], hence deterministic
+        # XPU output; server callers always provide per-request RNG state.
         sampled_rows = []
         seeds_cpu = seed.detach().cpu() if seed is not None else None
         offsets_cpu = (

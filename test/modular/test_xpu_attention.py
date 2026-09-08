@@ -1,5 +1,6 @@
 """CPU-side planning tests for the XPU paged-attention resource."""
 
+import pytest
 import torch
 
 from mstar.engine.resources import (
@@ -13,10 +14,12 @@ from mstar.engine.resources import (
     PositionSpec,
     StepContext,
 )
+from mstar.engine.resources.attn import xpu as xpu_attention
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.xpu import XPUPagedAttentionManager
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
+from mstar.engine.resources.sampler.utils import _rng_offset_stride
 
 
 def _kv_config() -> KVConfig:
@@ -35,8 +38,6 @@ def _manager() -> XPUPagedAttentionManager:
     return XPUPagedAttentionManager(
         kv_cache="kv",
         device=torch.device("cpu"),
-        dtype=torch.bfloat16,
-        kv_config=_kv_config(),
     )
 
 
@@ -57,7 +58,7 @@ def _ctx(views: list[SequenceView]) -> StepContext:
     )
 
 
-def test_xpu_backend_selected_by_spec():
+def _xpu_spec_and_info(device: str = "xpu"):
     kv_config = _kv_config()
     spec = AttentionSpec(
         resource_key="attn",
@@ -67,21 +68,44 @@ def test_xpu_backend_selected_by_spec():
             backend=AttnBackend.XPU_PAGED,
         ),
     )
-    manager = AttentionManager.build(
-        spec,
-        EngineResourceInfo(
-            device=torch.device("cpu"),
-            dependencies={
-                "kv": KVSpec(
-                    resource_key="kv",
-                    nodes={"LLM"},
-                    config=kv_config,
-                ),
-            },
-        ),
+    info = EngineResourceInfo(
+        device=torch.device(device),
+        dependencies={
+            "kv": KVSpec(
+                resource_key="kv",
+                nodes={"LLM"},
+                config=kv_config,
+            ),
+        },
     )
+    return spec, info
+
+
+def test_xpu_backend_selected_by_spec(monkeypatch):
+    monkeypatch.setattr(
+        xpu_attention, "_xpu_paged_unavailable_reason", lambda: None
+    )
+    spec, info = _xpu_spec_and_info()
+    manager = AttentionManager.build(spec, info)
     assert isinstance(manager, XPUPagedAttentionManager)
     assert manager.depends_on() == {"kv"}
+
+
+def test_xpu_backend_rejects_non_xpu_device():
+    spec, info = _xpu_spec_and_info("cpu")
+    with pytest.raises(RuntimeError, match="requires an XPU device"):
+        AttentionManager.build(spec, info)
+
+
+def test_xpu_backend_fails_fast_when_extension_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        xpu_attention,
+        "_xpu_paged_unavailable_reason",
+        lambda: "ImportError: missing extension",
+    )
+    spec, info = _xpu_spec_and_info()
+    with pytest.raises(RuntimeError, match="vllm-xpu-kernels.*missing extension"):
+        AttentionManager.build(spec, info)
 
 
 def test_position_spec_declares_its_kv_dependency():
@@ -91,6 +115,11 @@ def test_position_spec_declares_its_kv_dependency():
         config=PositionConfig(kv_cache="kv"),
     )
     assert spec.depends_on() == {"kv"}
+
+
+def test_xpu_rng_offset_advances_past_the_full_logits_row():
+    assert _rng_offset_stride("xpu", 152064) == 152064
+    assert _rng_offset_stride("cuda", 152064) == 1
 
 
 def test_xpu_plan_uses_kv_view_order_and_pads_block_table():

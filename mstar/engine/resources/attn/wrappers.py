@@ -31,12 +31,12 @@ logger = logging.getLogger(__name__)
 # op with a registered fake, the whole layer loop stays a single graph.
 
 
-@torch.library.custom_op("mstar::flashinfer_rmsnorm", mutates_args=())
-def flashinfer_rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float,
-    norm_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Accelerator RMS norm, returned in ``x``'s original dtype."""
+def _prepare_rmsnorm_inputs(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    norm_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.dtype]:
+    """Apply the dtype contract shared by every RMSNorm kernel."""
     orig_dtype = x.dtype
     device_type = x.device.type
     if norm_dtype is not None:
@@ -44,25 +44,46 @@ def flashinfer_rmsnorm(
     elif torch.is_autocast_enabled(device_type):
         x = x.to(torch.get_autocast_dtype(device_type))
     elif x.dtype == torch.float32 and device_type == "cuda":
-        # unsupported dtype; must recast
         x = x.to(torch.bfloat16)
-
     if weight.dtype != x.dtype:
         weight = weight.to(x.dtype)
+    return x, weight, orig_dtype
 
-    if device_type == "cuda":
-        import flashinfer
 
-        output = flashinfer.norm.rmsnorm(x, weight, eps=eps)
-    elif device_type == "xpu":
-        import vllm_xpu_kernels._C  # noqa: F401
+@torch.library.custom_op("mstar::flashinfer_rmsnorm", mutates_args=())
+def flashinfer_rmsnorm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float,
+    norm_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Portable RMSNorm fallback, returned in ``x``'s original dtype."""
+    x, weight, orig_dtype = _prepare_rmsnorm_inputs(x, weight, norm_dtype)
+    variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+    output = x * torch.rsqrt(variance + eps).to(x.dtype)
+    output = output * weight
+    return output.to(orig_dtype)
 
-        output = torch.empty_like(x)
-        torch.ops._C.rms_norm(output, x, weight, eps)
-    else:
-        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
-        output = x * torch.rsqrt(variance + eps).to(x.dtype)
-        output = output * weight
+
+@torch.library.register_kernel(flashinfer_rmsnorm, "cuda")
+def _flashinfer_rmsnorm_cuda(
+    x: torch.Tensor, weight: torch.Tensor, eps: float,
+    norm_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    import flashinfer
+
+    x, weight, orig_dtype = _prepare_rmsnorm_inputs(x, weight, norm_dtype)
+    return flashinfer.norm.rmsnorm(x, weight, eps=eps).to(orig_dtype)
+
+
+@torch.library.register_kernel(flashinfer_rmsnorm, "xpu")
+def _flashinfer_rmsnorm_xpu(
+    x: torch.Tensor, weight: torch.Tensor, eps: float,
+    norm_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    import vllm_xpu_kernels._C  # noqa: F401
+
+    x, weight, orig_dtype = _prepare_rmsnorm_inputs(x, weight, norm_dtype)
+    output = torch.empty_like(x)
+    torch.ops._C.rms_norm(output, x, weight, eps)
     return output.to(orig_dtype)
 
 
