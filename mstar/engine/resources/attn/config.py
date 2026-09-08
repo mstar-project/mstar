@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 class AttnBackend(Enum):
     FLASHINFER = "flashinfer"
     DENSE = "dense"
+    # DeepSeek-style absorbed multi-head latent attention over a
+    # `KVLayout.MLA` cache (one ckv||kpe latent row per token): FlashInfer's
+    # MLA kernel on sm90 at the Kimi dims (ckv 512, kpe 64), an fp32 SDPA
+    # fallback elsewhere.
+    MLA = "mla"
 
 
 @dataclass
@@ -25,6 +30,12 @@ class AttentionConfig:
     kv_cache: str # name of the KV cache
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
+    # MLA only. `mla_ckv_dim` splits the cache row into ckv (the value width)
+    # and kpe (= head_dim - ckv); `softmax_scale` is the model's score scale
+    # (qk_head_dim ** -0.5 for absorbed MLA -- NOT a function of the latent
+    # width, so the model has to say it).
+    mla_ckv_dim: int | None = None
+    softmax_scale: float | None = None
 
 
 @dataclass

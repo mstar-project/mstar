@@ -14,7 +14,7 @@ from mstar.engine.resources.base import (
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVLayout, KVReqConfig, KVSpec, KVStep
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -210,6 +210,10 @@ class KVManager(AttentionResource):
         )
         self._cpu_pool: CPUPagePool | None = None
         if cfg.cpu_offload_pages > 0:
+            if cfg.layout != KVLayout.NHD:
+                raise NotImplementedError(
+                    f"cpu_offload_pages is NHD-only today; got layout {cfg.layout}"
+                )
             self._cpu_pool = CPUPagePool(
                 config=cfg, kv_cache=self.kv_cache,
                 max_cpu_pages=cfg.cpu_offload_pages,
@@ -1137,13 +1141,16 @@ class KVManager(AttentionResource):
 
     @torch.compiler.disable
     def write_kv(
-        self, k: torch.Tensor, v: torch.Tensor,
+        self, k: torch.Tensor, v: torch.Tensor | None = None,
         layer_idx: int=None, label: str=None, return_tensor: bool = False,
     ) -> torch.Tensor | None:
         """Write K, V into this step's planned slots.
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
+
+        Under the MLA layout ``k`` is the per-token latent and ``v`` is None
+        (see ``write_latent``).
         """
         if layer_idx is None:
             layer_idx = self._default_layer_idx
@@ -1153,8 +1160,22 @@ class KVManager(AttentionResource):
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
-            k=k[:n], v=v[:n],
+            k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
             return_tensor=return_tensor,
         )
+
+    @torch.compiler.disable
+    def write_latent(
+        self, latent: torch.Tensor,
+        layer_idx: int=None, label: str=None,
+    ) -> None:
+        """MLA layout: write this step's per-token latent rows
+        ([num_tokens, head_dim] = ckv||kpe) into the planned slots. The MLA
+        attention backend then reads them straight from ``layer_view``."""
+        if self.kv_cache.layout != KVLayout.MLA:
+            raise ValueError(
+                f"write_latent needs KVLayout.MLA, this cache is {self.kv_cache.layout}"
+            )
+        self.write_kv(latent, None, layer_idx=layer_idx, label=label)
