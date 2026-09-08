@@ -3,12 +3,24 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mstar"
+# Distribution name is "m-star" because the bare "mstar" is taken on PyPI.
+# The import package is still `mstar` and the console scripts are unchanged;
+# `pip install m-star` then `import mstar` works as expected.
+name = "m-star"
 version = "0.2.0"
 description = "Multimodal inference engine"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.12"
+authors = [{name = "mstar-project"}]
+keywords = ["inference", "multimodal", "llm", "serving", "engine"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
 dependencies = [
     "fastapi",
     "numpy",
@@ -24,6 +36,11 @@ dependencies = [
     "gdown",
     "datasets",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mstar-project/mstar"
+Repository = "https://github.com/mstar-project/mstar"
+Issues = "https://github.com/mstar-project/mstar/issues"
 
 [project.scripts]
 mstar = "mstar.cli.main:main"
@@ -211,9 +228,13 @@ where = ["."]
 include = ["mstar*"]
 exclude = ["tests*", "benchmark*", "examples*"]
 
-# Ship the vendored CUDA source so it can be JIT-compiled on first use.
+# Ship the vendored CUDA source so it can be JIT-compiled on first use, and the
+# default deployment configs (copied from repo-root configs/ into
+# mstar/default_configs/ at build time; see setup.py) so `mstar serve <model>`
+# works from a pip install.
 [tool.setuptools.package-data]
 "mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+"mstar.default_configs" = ["*.yaml"]
 
 [tool.ruff]
 exclude = [".git", ".ruff_cache", ".venv", "ref"]

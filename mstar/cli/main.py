@@ -56,11 +56,24 @@ def _resolve_config(model: str, override: str | None) -> str:
         avail = ", ".join(sorted(DEFAULT_CONFIGS))
         sys.exit(f"error: unknown model {model!r}. Known models: {avail}\n"
                  f"       (or pass --config <path.yaml> for a custom deployment)")
-    candidate = _repo_root() / "configs" / DEFAULT_CONFIGS[model]
+    name = DEFAULT_CONFIGS[model]
+    # A pip install ships the default configs as package data under
+    # mstar/default_configs/; find them there first so `mstar serve <model>`
+    # works without a checkout. (A source checkout has only the marker there
+    # and falls through to the repo configs/ below.)
+    try:
+        from importlib.resources import files
+        packaged = files("mstar.default_configs") / name
+        if packaged.is_file():
+            return str(packaged)
+    except (ModuleNotFoundError, FileNotFoundError, TypeError):
+        pass
+    # Repo checkout: <repo>/configs/.
+    candidate = _repo_root() / "configs" / name
     if candidate.exists():
         return str(candidate)
     # Fall back to a CWD-relative configs/ (e.g. running from a checkout).
-    cwd_candidate = Path("configs") / DEFAULT_CONFIGS[model]
+    cwd_candidate = Path("configs") / name
     if cwd_candidate.exists():
         return str(cwd_candidate)
     sys.exit(f"error: default config for {model!r} not found at {candidate}")
