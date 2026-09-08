@@ -153,7 +153,15 @@ class RecurrentStateManager(AttentionResource):
         if got is None:
             return None
         slots[label] = got[0]
+        # a fresh slot starts from zeros in every layer, so the kernels never need to mask a
+        # first step's initial state (the decode path relies on this: it reads the slots
+        # unconditionally); a reload copies the parked state over it afterwards
+        self._zero_slot(got[0])
         return got[0]
+
+    def _zero_slot(self, slot: int) -> None:
+        for part in self._parts.values():
+            part[:, slot].zero_()
 
     def admit(self, step: RecurrentStateStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
@@ -257,6 +265,10 @@ class RecurrentStateManager(AttentionResource):
             slot_ids, has_state, cu, is_decode = self._addressing(list(step.segments))
         lease: SlotLease | None = ctx.slot_lease
         rows = len(slot_ids)
+        if is_decode and (SCRATCH_SLOT in slot_ids or (lease is not None and rows < lease.bucket.bs)):
+            # padding rows (and rows without a slot) run against the scratch slot; keep it at
+            # zeros so their discarded outputs stay finite: two small memsets per step
+            self._zero_slot(SCRATCH_SLOT)
         if lease is not None:
             ids_buf, flags_buf, cu_buf, (dev, host) = self._static_buffers(lease.slot)
             n = ids_buf.numel()
