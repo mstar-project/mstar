@@ -61,3 +61,40 @@ def test_kda_gated_norm_matches_reference():
         ref = gated_rms_norm(o, g, mod.o_norm.weight, mod.norm_eps).float()
     rel = (out - ref).norm() / ref.norm()
     assert rel < 5e-3, rel
+
+
+@cuda
+@pytest.mark.parametrize("t", [1, 9, 64])
+def test_fused_router_matches_reference(t):
+    from mstar.model.kimi_k3.components.moe import NoAuxTCRouter
+    from mstar.model.kimi_k3.reference.router import noaux_tc_route
+
+    torch.manual_seed(0)
+    e, k, h = 224, 16, 512
+    router = NoAuxTCRouter(hidden_size=h, num_experts=e, top_k=k).to(DEV, torch.bfloat16)
+    with torch.no_grad():
+        router.weight.normal_(std=0.02)
+        router.e_score_correction_bias.normal_(std=0.05)
+        x = torch.randn(t, h, device=DEV, dtype=torch.bfloat16)
+        idx, w = router(x)
+        ref_idx, ref_w = noaux_tc_route(
+            x, router.weight, router.e_score_correction_bias, k, scoring=router.scoring,
+            renormalize=router.renormalize, routed_scaling_factor=router.routed_scaling_factor,
+            num_expert_group=router.num_expert_group, topk_group=router.topk_group,
+        )
+    assert idx.shape == (t, k) and w.shape == (t, k) and w.dtype == torch.float32
+    for i in range(t):
+        assert set(idx[i].tolist()) == set(ref_idx[i].tolist())
+    mine = torch.zeros(t, e, device=DEV).scatter_(1, idx.long(), w)
+    ref = torch.zeros(t, e, device=DEV).scatter_(1, ref_idx.long(), ref_w)
+    torch.testing.assert_close(mine, ref, rtol=1e-5, atol=1e-6)
+    # a reloaded gate weight must not be served from the fp32 cache
+    with torch.no_grad():
+        router.weight.copy_(torch.randn_like(router.weight) * 0.02)
+        idx2, _ = router(x)
+        ref_idx2, _ = noaux_tc_route(
+            x, router.weight, router.e_score_correction_bias, k, scoring=router.scoring,
+            renormalize=router.renormalize, routed_scaling_factor=router.routed_scaling_factor,
+            num_expert_group=router.num_expert_group, topk_group=router.topk_group,
+        )
+    assert all(set(idx2[i].tolist()) == set(ref_idx2[i].tolist()) for i in range(t))
