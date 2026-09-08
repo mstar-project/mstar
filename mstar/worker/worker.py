@@ -1406,6 +1406,27 @@ class Worker:
             self.tp_async_nodes is None or node_name in self.tp_async_nodes
         )
 
+    def _verify_tp_async_sched_agrees(self) -> None:
+        """Refuse a per-rank flag mismatch at startup: a follower would wait for
+        a decision the leader never sends, or get a head it cannot build."""
+        for node in sorted(self.parallel_nodes):
+            local = torch.tensor(
+                [int(self._tp_async_for(node))], dtype=torch.int64, device=self.device,
+            )
+            for group in (
+                self.parallel_groups.get_tp_config_for_node(node),
+                self.parallel_groups.get_sp_config_for_node(node),
+            ):
+                if group.world_size == 1:
+                    continue
+                values = group.all_gather(local, dim=0).cpu().tolist()
+                if any(v != values[0] for v in values):
+                    raise RuntimeError(
+                        f"MSTAR_TP_ASYNC_SCHED disagrees across the ranks of {node!r} "
+                        f"(ranks {group.group_members}: async={values}); set it "
+                        "identically on every rank of the instance."
+                    )
+
     def _is_tp_lead_pending(self, pending: PendingBatch) -> bool:
         """``pending`` is a parallel batch this worker leads under TP async."""
         return (
@@ -2511,6 +2532,7 @@ class Worker:
         # reaches warmup at the same wall-clock instant, so subgroup
         # bootstrap completes within the retry budget.
         self.parallel_groups.barrier_all()
+        self._verify_tp_async_sched_agrees()
 
         # CUDA graph capture before entering the main loop
         self.engine_manager.warmup_all()
