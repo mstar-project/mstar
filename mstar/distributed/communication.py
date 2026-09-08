@@ -1,8 +1,34 @@
+import os
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 import torch
 import torch.distributed as dist
+
+DIST_TIMEOUT_ENV = "MSTAR_DIST_TIMEOUT_S"
+
+
+def resolve_dist_timeout(dist_timeout_s: float | None = None) -> dict[str, timedelta]:
+    """Build the ``timeout`` kwarg for ``init_process_group`` / ``new_group``.
+
+    ``MSTAR_DIST_TIMEOUT_S`` overrides the config's ``dist_timeout_s``; with
+    neither set, PyTorch's default applies (``{}``). Large checkpoint loads
+    (hundreds of GB at TP8) exceed that default, so deployments opt in.
+    """
+    raw = os.environ.get(DIST_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            dist_timeout_s = float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"{DIST_TIMEOUT_ENV} must be a number of seconds, got {raw!r}"
+            ) from exc
+    if dist_timeout_s is None:
+        return {}
+    if dist_timeout_s <= 0:
+        raise ValueError(f"Distributed timeout must be positive, got {dist_timeout_s}")
+    return {"timeout": timedelta(seconds=float(dist_timeout_s))}
 
 
 class CommGroup:
@@ -232,6 +258,9 @@ class WorkerParallelGroups:
     _device: torch.device | None = field(default=None, init=False, repr=False)
 
     node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
+    # Process-group timeout in seconds from the deployment config's
+    # ``dist_timeout_s``; ``MSTAR_DIST_TIMEOUT_S`` overrides. None = torch default.
+    dist_timeout_s: float | None = None
 
     def add(self, node: str, comm_group: CommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -278,12 +307,14 @@ class WorkerParallelGroups:
         if not self.any_parallelism:
             return
 
+        timeout_kwargs = resolve_dist_timeout(self.dist_timeout_s)
         dist.init_process_group(
             backend=backend,
             init_method=init_method,
             world_size=self.num_workers,
             rank=self.global_rank,
             device_id=device,
+            **timeout_kwargs,
         )
 
         # One subgroup per distinct rank tuple across BOTH mesh axes —
@@ -293,7 +324,9 @@ class WorkerParallelGroups:
         # an SP group (degenerate meshes) maps to one subgroup.
         rank_tuple_to_pg: dict[tuple[int, ...], "dist.ProcessGroup"] = {}
         for rank_tuple in self.world_parallel_groups:
-            rank_tuple_to_pg[rank_tuple] = dist.new_group(ranks=list(rank_tuple))
+            rank_tuple_to_pg[rank_tuple] = dist.new_group(
+                ranks=list(rank_tuple), **timeout_kwargs
+            )
 
         seen: set[int] = set()
         for comm_group in (
@@ -372,7 +405,8 @@ class GlobalParallelConfig:
     def __init__(
         # leaving type annotation as Any due to circular import
         self, worker_graphs: dict[str, Any],
-        worker_ids: list[str]
+        worker_ids: list[str],
+        dist_timeout_s: float | None = None,
     ):
         self.num_workers = len(worker_ids)
         any_parallelism = any(
@@ -400,6 +434,7 @@ class GlobalParallelConfig:
                 global_rank=i, num_workers=self.num_workers,
                 any_parallelism=any_parallelism,
                 world_parallel_groups=world_parallel_groups,
+                dist_timeout_s=dist_timeout_s,
             ) for i, wid in enumerate(worker_ids)
         }
 
