@@ -7,6 +7,8 @@ the same files. The vision tower is not loaded (a later ``prefill_vision`` walk 
 """
 from __future__ import annotations
 
+import os
+
 import logging
 from pathlib import Path
 
@@ -37,6 +39,13 @@ from mstar.model.kimi_k3.tokenizer import KimiK3Tokenizer
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
+
+
+def _log_gpu_memory(stage: str, device) -> None:
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        logger.info("Kimi K3 %s on %s: %.2f GiB allocated, %.2f GiB reserved", stage, dev,
+                    torch.cuda.memory_allocated(dev) / 2**30, torch.cuda.memory_reserved(dev) / 2**30)
 
 LLM = "LLM"
 
@@ -222,13 +231,34 @@ class KimiK3Model(Model):
             elif getattr(param, "_keep_dtype", False) or name.endswith(("_packed", "_scale")):
                 param.data = param.data.to(torch.uint8)
         language_model.to_empty(device=device)
-        load_weights(language_model, self.local_dir, device=device)
+        if os.environ.get("MSTAR_KIMI_K3_RANDOM_INIT") == "1":
+            # serve a config without its checkpoint (memory / performance experiments):
+            # random weights of the right dtypes, packed experts included
+            logger.warning("MSTAR_KIMI_K3_RANDOM_INIT=1: random weights, the outputs are meaningless")
+            with torch.no_grad():
+                for name, prm in language_model.named_parameters():
+                    if prm.dtype == torch.uint8:
+                        prm.copy_(torch.randint(118, 124, prm.shape, dtype=torch.uint8, device=device)
+                                  if name.endswith("_scale") else
+                                  torch.randint(0, 256, prm.shape, dtype=torch.uint8, device=device))
+                    elif name.endswith("A_log"):
+                        prm.uniform_(0.0, 1.0)
+                    elif name.endswith("dt_bias"):
+                        prm.uniform_(-2.0, 0.0)
+                    elif "norm" in name and prm.ndim == 1:
+                        prm.fill_(1.0)
+                    else:
+                        prm.normal_(std=0.02)
+        else:
+            load_weights(language_model, self.local_dir, device=device)
         language_model.eval()
+        _log_gpu_memory("weights loaded", device)
         from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
         from mstar.model.kimi_k3.components.language_model import prepare_moe_kernels, select_kda_kernels
 
         moe_backend = prepare_moe_kernels(language_model, device, self.moe_backend)
         logger.info("Kimi K3 routed-expert backend: %s", moe_backend)
+        _log_gpu_memory("experts converted", device)
 
         graph_safe = select_kda_kernels(language_model, device) and flashinfer_mla_supports(
             self.config.text.kv_lora_rank, self.config.text.qk_rope_head_dim
