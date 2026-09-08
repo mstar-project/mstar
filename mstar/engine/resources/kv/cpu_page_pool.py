@@ -40,16 +40,11 @@ class CPUPagePool:
         self.page_allocator = PageAllocator(max_cpu_pages)
 
         # same layout as the device cache, on pinned memory so the copies can
-        # be async
+        # be async: the device tensor's shape with its page axis resized
+        shape = list(kv_cache.tensor.shape)
+        shape[1] = max_cpu_pages
         self.cpu_kv_cache = torch.zeros(
-            config.num_layers,
-            max_cpu_pages,
-            2,  # K and V
-            config.page_size,
-            config.num_kv_heads,
-            config.head_dim,
-            dtype=kv_cache.dtype,
-            device="cpu",
+            *shape, dtype=kv_cache.dtype, device="cpu",
         ).pin_memory()
 
         # {request_id: {label: OffloadedStream}}

@@ -14,7 +14,13 @@ from mstar.engine.resources.base import (
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import (
+    KVConfig,
+    KVLayout,
+    KVReqConfig,
+    KVSpec,
+    KVStep,
+)
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -594,7 +600,11 @@ class KVManager(AttentionResource):
             pre_forks=step.pre_forks,
             post_forks=step.post_forks,
         )
-        self._setup_plan_states(res, ctx, ctx.slot_lease)
+        if self.kv_cache.layout != KVLayout.MLA:
+            # an MLA cache is written by its attention resource, which builds
+            # the per-token addressing from these views itself (host-side,
+            # per sub-plan); building it here too would be dead kernels
+            self._setup_plan_states(res, ctx, ctx.slot_lease)
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = res
@@ -1137,13 +1147,14 @@ class KVManager(AttentionResource):
 
     @torch.compiler.disable
     def write_kv(
-        self, k: torch.Tensor, v: torch.Tensor,
+        self, k: torch.Tensor, v: torch.Tensor | None,
         layer_idx: int=None, label: str=None, return_tensor: bool = False,
     ) -> torch.Tensor | None:
         """Write K, V into this step's planned slots.
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
+        Under ``KVLayout.MLA`` ``k`` is the latent row and ``v`` is None.
         """
         if layer_idx is None:
             layer_idx = self._default_layer_idx
@@ -1153,7 +1164,7 @@ class KVManager(AttentionResource):
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
-            k=k[:n], v=v[:n],
+            k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
             return_tensor=return_tensor,
