@@ -40,9 +40,9 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
 )
 from mstar.graph.base import (
     GraphEdge,
@@ -293,7 +293,7 @@ class VJepa2Model(Model):
         # a one-shot forward with nothing for the engine to build
         if self.config.predictor_kind != "ac":
             return []
-        kv = KVConfig(
+        kv = PagedKVConfig(
             num_layers=self.config.ac_predictor.depth,
             num_kv_heads=self.config.ac_predictor.num_heads,
             head_dim=self.config.ac_predictor.predictor_embed_dim // self.config.ac_predictor.num_heads,

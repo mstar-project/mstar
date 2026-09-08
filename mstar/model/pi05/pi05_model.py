@@ -37,9 +37,9 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
 )
@@ -401,7 +401,7 @@ class Pi05Model(Model):
         ``action_gen`` reads the frozen prefix read-only via ``KVStep(commit=
         False)`` while ``prefill`` commits it.
         """
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=self.config.num_layers,
             num_kv_heads=self.config.num_kv_heads,
             head_dim=self.config.head_dim,

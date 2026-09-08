@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -20,18 +21,23 @@ class KVLayout(Enum):
     # TODO: can add more, like HND, MLA
 
 
-@dataclass
-class KVConfig:
+@dataclass(kw_only=True)
+class KVConfig(ABC):
+    """The model geometry every KV storage strategy needs, and nothing else.
+
+    What a cache *holds* (layers, heads, head dim) is a checkpoint fact and
+    lives here; how it is *stored* — paged or ringed, is storage policy and
+    lives in a subclass. ``KVSpec`` dispatches on which one it was handed.
+
+    ``kw_only`` is load-bearing, not style: ``num_qo_heads`` carries a default
+    here while both subclasses add required fields, which is an invalid
+    positional dataclass field order.
+    """
+
     num_layers: int
     num_kv_heads: int
     head_dim: int
-    max_seq_len: int
-    max_num_pages: int = 2048
-    page_size: int = 128
-    num_qo_heads: int = None
-    layout: KVLayout = KVLayout.NHD
-    # pages of pinned host memory to keep for offloading; 0 disables it
-    cpu_offload_pages: int = 0
+    num_qo_heads: int | None = None
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -55,6 +61,82 @@ class KVConfig:
         else:
             self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
         self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
+
+    @abstractmethod
+    def apply_yaml_overrides(self, **kwargs) -> None:
+        """Patch this deployment's tunables; see ``NodeResourceSpec``.
+
+        Abstract so each storage policy names exactly what it accepts and lets
+        the rest raise — a paged key against a ring config is a typo, and the
+        spec's contract is that a typo is loud.
+        """
+
+
+@dataclass(kw_only=True)
+class PagedKVConfig(KVConfig):
+    """Fixed-size pages, appended to as a sequence grows. The default."""
+
+    max_seq_len: int
+    max_num_pages: int = 2048
+    page_size: int = 128
+    layout: KVLayout = KVLayout.NHD
+    # pages of pinned host memory to keep for offloading; 0 disables it
+    cpu_offload_pages: int = 0
+
+    def apply_yaml_overrides(
+        self,
+        max_num_pages: int | None = None,
+        page_size: int | None = None,
+        max_seq_len: int | None = None,
+        cpu_offload_pages: int | None = None,
+    ) -> None:
+        """How much cache this deployment gets, and how it is cut up."""
+        for name, value in (
+            ("max_num_pages", max_num_pages),
+            ("page_size", page_size),
+            ("max_seq_len", max_seq_len),
+            ("cpu_offload_pages", cpu_offload_pages),
+        ):
+            if value is not None:
+                setattr(self, name, value)
+
+
+@dataclass(frozen=True)
+class RingKVLayerConfig:
+    """One layer's ring geometry. Layers can hold frames at different strides."""
+
+    ring_frames: int
+    ring_buckets: int
+    pinned_dilation: int
+
+
+@dataclass(kw_only=True)
+class RingKVConfig(KVConfig):
+    """A fixed horizon of frame slots per layer, overwritten in place.
+
+    Every layer's storage is allocated once and reused for the life of the process,
+    and a write to an occupied slot is the intended behaviour.
+    """
+
+    tokens_per_frame: int
+    layers: tuple[RingKVLayerConfig, ...]
+    batch_size: int = 1
+
+    def __post_init__(self):
+        super().__post_init__()
+        if len(self.layers) != self.num_layers:
+            raise ValueError(
+                f"ring geometry has {len(self.layers)} layers but num_layers is "
+                f"{self.num_layers}; each layer's ring is declared separately."
+            )
+
+    def apply_yaml_overrides(self, **kwargs) -> None:
+        """Nothing here is a deployment knob."""
+        if kwargs:
+            raise TypeError(
+                "ring KV geometry is a checkpoint fact, not a deployment tunable; "
+                f"got {sorted(kwargs)}"
+            )
 
 
 @dataclass
@@ -80,26 +162,19 @@ class KVSpec(NodeResourceSpec):
 
     @property
     def resource_class(self) -> "type[Resource]":
+        if isinstance(self.config, RingKVConfig):
+            from mstar.engine.resources.kv.ring.manager import RingKVManager
+
+            return RingKVManager
+
         from mstar.engine.resources.kv.manager import KVManager
 
         return KVManager
 
-    def apply_yaml_overrides(
-        self,
-        max_num_pages: int | None = None,
-        page_size: int | None = None,
-        max_seq_len: int | None = None,
-        cpu_offload_pages: int | None = None,
-    ):
-        """How much cache this deployment gets, and how it is cut up."""
-        for name, value in (
-            ("max_num_pages", max_num_pages),
-            ("page_size", page_size),
-            ("max_seq_len", max_seq_len),
-            ("cpu_offload_pages", cpu_offload_pages),
-        ):
-            if value is not None:
-                setattr(self.config, name, value)
+    def apply_yaml_overrides(self, **kwargs):
+        """Forwarded to the config: which keys are legal is a property of the
+        storage strategy, so the config answers for them."""
+        self.config.apply_yaml_overrides(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -111,3 +186,40 @@ class KVStep(ResourceStep):
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, kw_only=True)
+class RingKVStep(ResourceStep):
+    """What a ring KV resource is told about one step: which frame it is.
+
+    A *sibling* of ``KVStep``, not a subclass. Every field ``KVStep`` carries —
+    ``commit``, ``combined_labels``, ``pre_forks``, ``post_forks`` — is a fact
+    about a growing cache with named streams, and ``RingKVManager`` reads none
+    of them. Inheriting them would let a declarer set one and expect it to mean
+    something; ``commit=False`` in particular would read as "do not write this
+    frame", which is not a thing the ring can be told (the write happens inside
+    the forward, and the four frozen passes are the model's own concern —
+    ``RingKVManager.set_frozen``). Same split as ``PagedKVConfig`` /
+    ``RingKVConfig``, for the same reason.
+
+    ``frame_pos`` is this step's host-side ring clock — the same ``int`` the
+    submodule's ``prepare_inputs`` derives the ``[1]`` device tensor from,
+    never a second source. It is declared so that ``admit``
+    can check it advances by exactly one per committed frame. A clock that
+    desynchronizes from the ring raises nothing on its own; it silently
+    rewrites history, and the step boundary is the one place per
+    frame where the engine holds both the declared clock and the last committed
+    one.
+
+    ``None`` means "no clock declared, skip the check", for a declarer with no
+    single frame to name — a batch of more than one request, which ``admit``
+    refuses on its own terms, with a better message than a guess here
+    would produce. It is required rather than defaulted so that skipping the
+    check is a decision someone typed, not one they inherited.
+
+    ``kw_only`` is load-bearing: ``ResourceStep.segments`` is defaulted, and a
+    required field cannot follow a defaulted one positionally. Keyword-only
+    fields are exempt from that ordering rule.
+    """
+
+    frame_pos: int | None

@@ -42,10 +42,10 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
-    KVConfig,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     ResourceReqConfig,
 )
 from mstar.graph.base import (
@@ -205,11 +205,11 @@ class Cosmos3Model(Model):
         ``attention_backend="flashinfer"`` skips the dense spec, which leaves
         every step on the paged path.
 
-        The two specs share one ``KVConfig`` object on purpose: a deployment
+        The two specs share one ``PagedKVConfig`` object on purpose: a deployment
         that resizes the cache through ``apply_yaml_overrides`` has to resize
         what the wrappers are planned against too.
         """
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.head_dim,
