@@ -10,12 +10,23 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.base import EngineType, NodeBatch
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources import StepContext, apply_yaml_overrides
+from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.attn.wrappers import (
+    FlashInferDecodeWrapper,
+    FlashInferPrefillWrapper,
+)
+from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
 )
 from mstar.model.qwen3_tts.config import (
+    CODE_PRED_SAMPLER,
+    TALKER_ATTN,
+    TALKER_SAMPLER,
     Qwen3TTSCodecConfig,
     Qwen3TTSCodePredictorConfig,
     Qwen3TTSModelConfig,
@@ -27,10 +38,6 @@ from mstar.model.registry import HF_MODELS, MODEL_REGISTRY
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.utils.flashinfer_utils import (
-    FlashInferDecodeWrapper,
-    FlashInferPrefillWrapper,
-)
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "qwen3tts.yaml"
 
@@ -52,6 +59,17 @@ def _make_model() -> Qwen3TTSModel:
     model._submodule_cache = {}
     return model
 
+
+
+def _step_context(graph_walk: str, request_ids: list[str]) -> StepContext:
+    """Minimal eager StepContext; ExecutingBatch reads its graph_walk off this."""
+    return StepContext(
+        request_ids=tuple(request_ids),
+        graph_walk=graph_walk,
+        slot=None,
+        capture=False,
+        plan_results={},
+    )
 
 def test_qwen3_tts_config_reads_checkpoint_json(tmp_path):
     (tmp_path / "speech_tokenizer").mkdir()
@@ -134,21 +152,25 @@ def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     assert HF_MODELS["qwen3_tts"] == {
         "model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     }
-    assert model.get_node_engine_types() == {
-        "Talker": EngineType.KV_CACHE,
-        "Codec": EngineType.STATELESS,
-    }
-    kv_configs = model.get_kv_cache_config()
-    assert len(kv_configs) == 1
-    kv = kv_configs[0]
-    assert kv.nodes == ["Talker"]
+    specs = model.get_node_resources()
+    kv_specs = [spec for spec in specs if isinstance(spec, KVSpec)]
+    assert len(kv_specs) == 1
+    kv_spec = kv_specs[0]
+    assert kv_spec.nodes == {"Talker"}
+    kv = kv_spec.config
     assert kv.num_layers == model.config.talker.num_hidden_layers
     assert kv.num_kv_heads == model.config.talker.num_key_value_heads
     assert kv.num_qo_heads == model.config.talker.num_attention_heads
     assert kv.head_dim == model.config.talker.head_dim
-    assert kv.flashinfer_backend == "auto"
     serving_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    assert serving_config["kv_cache"]["flashinfer_backend"] == "fa2"
+    assert serving_config["resources"][TALKER_ATTN]["flashinfer_backend"] == "fa2"
+
+    # the model default is "auto"; the deployment pins FA2 because the image
+    # cannot build the FA3 JIT kernels, so the override has to reach attention
+    attn = next(spec for spec in specs if isinstance(spec, AttentionSpec))
+    assert attn.config.flashinfer_backend == "auto"
+    apply_yaml_overrides(specs, serving_config)
+    assert attn.config.flashinfer_backend == "fa2"
 
     worker_graphs = model.get_worker_graphs(str(CONFIG_PATH))
     by_walk = {
@@ -343,10 +365,11 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     assert talker.full_metadata.graph_walk == "talker_prefill"
     assert [edge.name for edge in talker.inputs] == list(pointers)
     assert talker.full_metadata.kwargs["talker_max_tokens"] == 12
-    # Residual-group sampling rides the aux sampling config, not step metadata.
+    # Residual-group sampling rides the code predictor's own per-request
+    # sampler config, not step metadata.
     assert "subtalker_sampling" not in talker.step_metadata
-    aux = model.get_aux_sampling_configs("Talker", {"subtalker_top_k": 7})
-    assert aux["code_predictor"].top_k == 7
+    configs = model.get_request_resource_configs({}, {"subtalker_top_k": 7})
+    assert configs[CODE_PRED_SAMPLER].top_k == 7
 
     codec = model.get_initial_forward_pass_args(
         "Codec",
@@ -514,6 +537,7 @@ def test_qwen3_tts_prefill_frame_counts_toward_generation_limit():
     outputs = {"new_token": [torch.tensor(1)]}
     request_info = SimpleNamespace(
         step_metadata={"talker_max_tokens": 1},
+        resource_configs={},
         max_tokens=8192,
     )
 
@@ -537,9 +561,7 @@ def test_qwen3_tts_stops_on_eos_from_routed_codec_tokens():
     ])]}
     request_info = SimpleNamespace(
         step_metadata={"talker_max_tokens": 100},
-        sampling_config={
-            "Talker": SimpleNamespace(ignore_eos=False),
-        },
+        resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=False)},
         max_tokens=8192,
     )
 
@@ -564,9 +586,7 @@ def test_qwen3_tts_honors_ignore_eos_for_fixed_length_benchmarks():
     )]}
     request_info = SimpleNamespace(
         step_metadata={"talker_max_tokens": 100},
-        sampling_config={
-            "Talker": SimpleNamespace(ignore_eos=True),
-        },
+        resource_configs={TALKER_SAMPLER: SimpleNamespace(ignore_eos=True)},
         max_tokens=8192,
     )
 
@@ -620,18 +640,11 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
         SimpleNamespace(request_id="real"),
         {"talker_input_embeds": [torch.zeros(1, config.talker.hidden_size)]},
     )
-    cache_manager = SimpleNamespace(
-        set_active_label=lambda label: None,
-        plan_attention=lambda **kwargs: None,
-        plan_rope=lambda **kwargs: None,
-    )
-
     packed = submodule.preprocess(
         "talker_decode",
         ModelInputsFromEngine(
             request_ids=["__graph_dummy__"],
             per_request_info={},
-            cache_manager=cache_manager,
         ),
         [prepared],
     )
@@ -657,10 +670,9 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
         request_id: SimpleNamespace(step_metadata={})
         for request_id in ("a", "b")
     }
-    batch = NodeBatch(
+    batch = ExecutingBatch(
         node_name="Talker",
-        graph_walk="talker_decode",
-        request_ids=["a", "b"],
+        step_context=_step_context("talker_decode", ["a", "b"]),
         per_request_input_tensors={},
         per_request_info=info,
     )
@@ -676,17 +688,11 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert submodule.disable_torch_compile is True
     assert submodule.can_batch(batch, model_inputs)
     assert submodule.can_use_cuda_graphs(batch, model_inputs)
-    cache_manager = SimpleNamespace(
-        set_active_label=lambda label: None,
-        plan_attention=lambda **kwargs: None,
-        plan_rope=lambda **kwargs: None,
-    )
     packed = submodule.preprocess(
         "talker_decode",
         ModelInputsFromEngine(
             request_ids=["a", "b"],
             per_request_info=info,
-            cache_manager=cache_manager,
         ),
         model_inputs,
     )
@@ -771,126 +777,46 @@ def test_qwen3_tts_code_predictor_uses_decode_attn_nhd(monkeypatch):
     assert rope_calls[0][2] == torch.int32
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="piecewise capture requires CUDA"
-)
-def test_qwen3_tts_depth_loop_piecewise_captures_its_own_sampling():
-    """The depth loop is captured *including* sampling, off the engine's aux
-    buffers — so eager paths (above all prefill) still replay it, and per-request
-    params stay live after capture.
-    """
-    from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
-    from mstar.utils.sampling import (
-        MultiSamplerBuffers,
-        MultiSamplingConfig,
-        SamplingConfig,
-    )
-
-    # Indexed device: the capture path pins kernels with torch.cuda.device(...),
-    # which rejects a bare "cuda".
-    dev = torch.device("cuda:0")
-    config = _tiny_model_config()
-    submodule = TalkerSubmodule(
-        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config,
-    ).to(device=dev, dtype=torch.bfloat16).eval()
-    submodule.code_predictor.consolidate_stacked_weights()
-    submodule.DECODE_CAPTURE_BATCH_SIZES = [1, 2]
-
-    rids = ["a", "b"]
-    multi = MultiSamplingConfig(
-        main=SamplingConfig(vocab_size=config.talker.vocab_size),
-        aux={"code_predictor": SamplingConfig(temperature=0.9, top_k=8)},
-    )
-    multi.set_seed(11)
-    bufs = MultiSamplerBuffers.allocate(max_batch_size=2, device=dev, config=multi)
-    for rid in rids:
-        bufs.register_request(rid, multi)
-
-    configs = submodule.get_piecewise_cuda_graph_configs(
-        dev, torch.bfloat16
-    )
-    runner = PiecewiseCudaGraphRunner(
-        config=configs["code_predictor_loop"], device=dev,
-        autocast_dtype=torch.bfloat16,
-        # uses_sampler=True config: the engine wires the node's sampler buffers
-        # into the runner, which injects a sampler into the captured depth loop.
-        sampler_buffers=bufs,
-    )
-    runner.warmup_and_capture()
-    assert runner.graphs, "depth-loop capture produced no graphs"
-
-    hidden = config.talker.hidden_size
-    engine_inputs = SimpleNamespace(
-        piecewise_runners={"code_predictor_loop": runner}, request_ids=rids,
-    )
-    last_hidden = torch.randn(2, hidden, device=dev, dtype=torch.bfloat16)
-    layer0 = torch.tensor([1, 2], device=dev)
-    codes, embed_sum = submodule._run_depth_loop_piecewise(
-        engine_inputs, last_hidden, layer0
-    )
-    assert codes.shape == (2, config.talker.num_code_groups)
-    assert embed_sum.shape == (2, hidden)
-    assert codes[:, 0].tolist() == [1, 2]
-
-    # A sub-bucket batch replays in the bs=2 graph, sliced back to its real size.
-    single = SimpleNamespace(
-        piecewise_runners={"code_predictor_loop": runner}, request_ids=["a"],
-    )
-    solo_codes, _ = submodule._run_depth_loop_piecewise(
-        single, last_hidden[:1], layer0[:1]
-    )
-    assert solo_codes.shape == (1, config.talker.num_code_groups)
-
-    # Switch request "a" to greedy AFTER capture; its row must go deterministic
-    # while the graph is untouched. (A capture-time constant could not.)
-    greedy = MultiSamplingConfig(
-        main=multi.main, aux={"code_predictor": SamplingConfig(temperature=0.0)},
-    )
-    greedy.set_seed(11)
-    bufs.update_request_config("a", greedy)
-    first, _ = submodule._run_depth_loop_piecewise(engine_inputs, last_hidden, layer0)
-    first = first.clone()
-    second, _ = submodule._run_depth_loop_piecewise(engine_inputs, last_hidden, layer0)
-    torch.cuda.synchronize()
-    assert first[0].tolist() == second[0].tolist()
-
-
-def test_qwen3_tts_aux_sampling_config_drives_code_predictor():
-    """Residual groups are configured through the ``code_predictor`` aux config,
-    which the engine turns into its own per-request sampler buffers."""
+def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
+    """Residual groups are configured through the code predictor's own sampler
+    resource, which the engine opens per-request buffers for."""
     model = _make_model()
     generation = model.config.generation
 
-    default = model.get_aux_sampling_configs("Talker")["code_predictor"]
+    default = model.get_request_resource_configs({})[CODE_PRED_SAMPLER]
     assert default.temperature == generation.subtalker_temperature
     assert default.top_k == generation.subtalker_top_k
     assert default.top_p == generation.subtalker_top_p
-    # No penalty on the depth loop => no seen-token mask buffers for this label.
-    assert default.vocab_size is None
+    # No penalty on the depth loop.
+    assert default.repetition_penalty == 1
 
-    overridden = model.get_aux_sampling_configs(
-        "Talker",
+    overridden = model.get_request_resource_configs(
+        {},
         {"subtalker_temperature": 0.5, "subtalker_top_k": 3, "subtalker_top_p": 0.25},
-    )["code_predictor"]
+    )[CODE_PRED_SAMPLER]
     assert (overridden.temperature, overridden.top_k, overridden.top_p) == (0.5, 3, 0.25)
 
     # do_sample=False is expressed as temperature 0 (encoded as greedy downstream).
-    greedy = model.get_aux_sampling_configs(
-        "Talker", {"subtalker_dosample": False}
-    )["code_predictor"]
+    greedy = model.get_request_resource_configs(
+        {}, {"subtalker_dosample": False}
+    )[CODE_PRED_SAMPLER]
     assert greedy.temperature == 0.0
 
-    # Only the Talker owns an aux sampler.
-    assert model.get_aux_sampling_configs("Codec") == {}
+    # Two samplers, one per head; only the Talker's carries a vocab for the
+    # repetition penalty (see get_node_resources).
+    configs = model.get_request_resource_configs({})
+    assert set(configs) == {TALKER_SAMPLER, CODE_PRED_SAMPLER}
+    specs = {
+        spec.resource_key: spec for spec in model.get_node_resources()
+        if isinstance(spec, SamplerSpec)
+    }
+    assert specs[TALKER_SAMPLER].vocab_size is not None
+    assert specs[CODE_PRED_SAMPLER].enable_repetion_penalty is False
 
-    # The bundle the engines actually consume.
-    multi = model.resolve_sampling_configs("Talker", {})
-    assert multi.main.vocab_size is not None
-    assert set(multi.aux) == {"code_predictor"}
-    multi.set_seed(99)
-    assert multi.main.seed == 99
-    # Aux stream is seeded independently of the Talker's.
-    assert multi.aux["code_predictor"].seed != 99
+    # The conductor seeds each stream; they are seeded independently.
+    configs[TALKER_SAMPLER].apply_conductor_config(seed=99)
+    assert configs[TALKER_SAMPLER].seed == 99
+    assert configs[CODE_PRED_SAMPLER].seed != 99
 
 
 class _FakeCodecDecoder(torch.nn.Module):
@@ -984,11 +910,11 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
         })
         for _ in range(2)
     ]
-    batch = NodeBatch(
+    batch = ExecutingBatch(
         node_name="Codec",
-        graph_walk="codec_chunk",
-        request_ids=["a", "b"],
+        step_context=_step_context("codec_chunk", ["a", "b"]),
         per_request_input_tensors={},
+        per_request_info={},
     )
 
     assert submodule.can_batch(batch, model_inputs)

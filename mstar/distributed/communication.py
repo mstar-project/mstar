@@ -163,6 +163,43 @@ class CommGroup:
 
 
 @dataclass
+class JointGroups:
+    tp_group: CommGroup
+    sp_group: CommGroup
+
+    @property
+    def rank(self):
+        """This worker's rank within ``node``'s lockstep instance — the
+        TP x SP block, row-major [sp][tp] to match
+        ``WorkerGraph._instance_ranks``. 0 iff this worker leads the
+        instance (it is rank 0 in both its TP and SP comm groups)."""
+        return self.sp_group.rank * self.tp_group.world_size + self.tp_group.rank
+
+    @property
+    def world_size(self):
+        """Total ranks in ``node``'s lockstep instance (tp_size * sp_size)."""
+        return  self.tp_group.world_size * self.sp_group.world_size
+
+    def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        """Broadcast from joint rank ``src`` to the whole TP x SP block.
+
+        ``src`` is indexed like ``rank`` (row-major [sp][tp]); each subgroup
+        takes its own coordinate out of it, since ``CommGroup.broadcast``
+        indexes its own members. TP first: that fills src's SP row across
+        every TP column, which the SP pass then broadcasts down.
+        """
+        if not 0 <= src < self.world_size:
+            raise ValueError(
+                f"broadcast src {src} outside the joint group "
+                f"(world size {self.world_size})"
+            )
+        sp_src, tp_src = divmod(src, self.tp_group.world_size)
+        tensor = self.tp_group.broadcast(tensor, tp_src)
+        return self.sp_group.broadcast(tensor, sp_src)
+
+
+
+@dataclass
 class WorkerParallelGroups:
     """Per-worker view of the parallelism comm groups in the run.
 
@@ -193,6 +230,8 @@ class WorkerParallelGroups:
     node_to_tp_group: dict[str, CommGroup] = field(default_factory=dict)
     node_to_sp_group: dict[str, CommGroup] = field(default_factory=dict)
     _device: torch.device | None = field(default=None, init=False, repr=False)
+
+    node_to_joint_group: dict[str, JointGroups] = field(default_factory=dict)
 
     def add(self, node: str, comm_group: CommGroup):
         # disallow colocation of multiple comm groups on the same node
@@ -279,21 +318,38 @@ class WorkerParallelGroups:
             self.node_to_sp_group[node] = CommGroup.trivial()
         return self.node_to_sp_group[node]
 
+    def get_joint_group_for_node(self, node: str) -> JointGroups:
+        if node not in self.node_to_joint_group:
+            self.node_to_joint_group[node] = JointGroups(
+                tp_group=self.get_tp_config_for_node(node),
+                sp_group=self.get_sp_config_for_node(node)
+            )
+        return self.node_to_joint_group[node]
+
     def get_instance_rank_for_node(self, node: str) -> int:
-        """This worker's rank within ``node``'s lockstep instance — the
-        TP x SP block, row-major [sp][tp] to match
-        ``WorkerGraph._instance_ranks``. 0 iff this worker leads the
-        instance (it is rank 0 in both its TP and SP comm groups)."""
-        tp = self.get_tp_config_for_node(node)
-        sp = self.get_sp_config_for_node(node)
-        return sp.rank * tp.world_size + tp.rank
+        return self.get_joint_group_for_node(node).rank
 
     def get_instance_world_size_for_node(self, node: str) -> int:
-        """Total ranks in ``node``'s lockstep instance (tp_size * sp_size)."""
-        return (
-            self.get_tp_config_for_node(node).world_size
-            * self.get_sp_config_for_node(node).world_size
-        )
+        return self.get_joint_group_for_node(node).world_size
+
+    def all_in_same_group(self, nodes: list[str]) -> bool:
+        """Whether every node shares one (tp, sp) group.
+
+        Per dimension, and only where someone parallelizes: unregistered reads
+        as the single-rank group, so a TP-only run would otherwise be rejected
+        for "differing" on SP. By membership, not identity — the lazy getters
+        mint a fresh group per node (and would cache one for a remote node).
+        """
+        for per_node in (self.node_to_tp_group, self.node_to_sp_group):
+            members = [
+                tuple(group.group_members) if group is not None else (0,)
+                for group in (per_node.get(node) for node in nodes)
+            ]
+            if all(len(m) == 1 for m in members):
+                continue
+            if len(set(members)) != 1:
+                return False
+        return True
 
     def barrier_all(self) -> None:
         """Global barrier across every worker process in the run.

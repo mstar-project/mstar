@@ -96,13 +96,23 @@ def _save_bytes(raw: bytes, mime: str, upload_dir: Path) -> tuple[str, str]:
     return modality_from_mime(mime), str(path)
 
 
+def _decode_base64_payload(payload: str) -> bytes:
+    """Decode client-provided base64 after normalizing common wire variants."""
+    # OpenAI-compatible clients may omit padding or wrap the payload at a
+    # fixed column width. Normalize both forms before asking the decoder to
+    # validate the alphabet, so malformed requests fail as client errors.
+    cleaned = "".join(payload.split())
+    padded = cleaned + "=" * (-len(cleaned) % 4)
+    return base64.b64decode(padded, validate=True)
+
+
 def save_data_url(data_url: str, upload_dir: Path) -> tuple[str, str]:
     """Persist a ``data:<mime>;base64,<payload>`` URL. Returns (modality, path)."""
     header, _, payload = data_url.partition(",")
     if not payload:
         raise ValueError("Malformed data URL: missing payload")
     mime = header[len("data:"):].split(";", 1)[0] or "application/octet-stream"
-    raw = base64.b64decode(payload)
+    raw = _decode_base64_payload(payload)
     return _save_bytes(raw, mime, upload_dir)
 
 
@@ -110,7 +120,7 @@ def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tup
     """Persist a bare base64 blob with a known ``fmt`` (e.g. ``"wav"``)."""
     upload_dir = Path(upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    raw = base64.b64decode(b64)
+    raw = _decode_base64_payload(b64)
     # Sanitize the client-controlled fmt: alphanumerics only, so it cannot
     # inject path separators into the upload path.
     clean = "".join(c for c in fmt.lstrip(".") if c.isalnum())

@@ -38,8 +38,16 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    AttnBackend,
+    KVConfig,
+    KVReqConfig,
+    KVSpec,
+    NodeResourceSpec,
+    ResourceReqConfig,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -57,7 +65,12 @@ from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
+    ATTN,
+    ATTN_GEN,
+    COND_LABEL,
     IMAGE_GEN_LOOP,
+    KV_CACHE,
+    UNCOND_LABEL,
     VIDEO_GEN_LOOP,
     VIDEO_SOUND_GEN_LOOP,
     Cosmos3AudioDecoderSubmodule,
@@ -172,17 +185,79 @@ class Cosmos3Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [
-            KVCacheConfig(
-                num_layers=self.config.num_hidden_layers,
-                num_kv_heads=self.config.num_key_value_heads,
-                head_dim=self.config.head_dim,
-                max_seq_len=self.config.max_position_embeddings,
-                num_qo_heads=self.config.num_attention_heads,
-                attention_backend=self.config.attention_backend,
-            )
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The DiT's KV cache and the attention backends over it.
+
+        One cache holds every guidance branch's understanding K/V under its
+        own label. Attention is declared twice because the two pathways want
+        different backends and the choice cannot be per-layer:
+
+        * ``attn`` (paged FlashInfer) is what the understanding tower's
+          prefill writes through — the denoise steps read that K/V back out of
+          the pages, so it has to land there — and what a captured denoise
+          graph replays against, the dense path being eager-only.
+        * ``attn_gen`` (dense FA3) is what an eager denoise step runs: it
+          recomputes all of its K/V every step and only reuses the frozen text
+          prefix, so the paged path's per-step full-buffer write and
+          ``wrapper.plan`` are dead work. ``declare_step`` names one or the
+          other per step; both are drop-in for the same declaration.
+
+        ``attention_backend="flashinfer"`` skips the dense spec, which leaves
+        every step on the paged path.
+
+        The two specs share one ``KVConfig`` object on purpose: a deployment
+        that resizes the cache through ``apply_yaml_overrides`` has to resize
+        what the wrappers are planned against too.
+        """
+        kv_config = KVConfig(
+            num_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            max_seq_len=self.config.max_position_embeddings,
+            num_qo_heads=self.config.num_attention_heads,
+        )
+        specs: list[NodeResourceSpec] = [
+            KVSpec(resource_key=KV_CACHE, nodes={DIT_NODE}, config=kv_config),
+            AttentionSpec(
+                resource_key=ATTN,
+                nodes={DIT_NODE},
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER,
+                ),
+            ),
         ]
+        if self.config.attention_backend == "dense_gen":
+            specs.append(AttentionSpec(
+                resource_key=ATTN_GEN,
+                nodes={DIT_NODE},
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE, backend=AttnBackend.DENSE,
+                ),
+            ))
+        elif self.config.attention_backend != "flashinfer":
+            raise ValueError(
+                f"Unknown Cosmos3 attention_backend "
+                f"{self.config.attention_backend!r} "
+                "(expected 'dense_gen' or 'flashinfer')"
+            )
+        return specs
+
+    def get_request_resource_configs(
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Which cache labels a request is opened with.
+
+        Both guidance branches, unconditionally: a request's guidance regime
+        is only settled at prefill (it follows ``guidance_scale``, which
+        ``process_prompt`` resolves), and naming a label a request never
+        writes costs nothing — labels are created on first write.
+        """
+        del partition_fwd_args, model_kwargs
+        return {
+            KV_CACHE: KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL]),
+        }
 
     def _sound_serving_enabled(self) -> bool:
         """Whether the opt-in sound walk (and its audio_decoder node) is served.
@@ -195,16 +270,6 @@ class Cosmos3Model(Model):
         if self.skip_weight_loading:
             return True
         return (self._ensure_repo() / "sound_tokenizer" / "config.json").exists()
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        types = {
-            DIT_NODE: EngineType.KV_CACHE,
-            VAE_ENCODER_NODE: EngineType.STATELESS,
-            VAE_DECODER_NODE: EngineType.STATELESS,
-        }
-        if self._sound_serving_enabled():
-            types[AUDIO_DECODER_NODE] = EngineType.STATELESS
-        return types
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The DiT supports tensor parallelism: per layer the attention heads and
@@ -987,7 +1052,12 @@ class Cosmos3Model(Model):
         # checkpoint exactly and halves resident weight memory vs the float32
         # meta default; the engine additionally runs the forward under a bf16
         # autocast (a no-op here).
-        with torch.device("meta" if not self.skip_weight_loading else "cpu"):
+        # Always meta: both branches below call ``to_empty``, which re-allocates
+        # uninitialized storage and drops whatever construction produced, so
+        # building on CPU only pays for allocation + parameter init that is then
+        # thrown away (seconds per billion params on the skip_weight_loading
+        # path). Same shape as the orpheus / higgs_audio builders.
+        with torch.device("meta"):
             model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:

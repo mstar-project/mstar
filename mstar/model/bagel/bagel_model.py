@@ -40,9 +40,21 @@ from PIL import Image
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVReqConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
+from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -69,8 +81,17 @@ from mstar.model.bagel.submodules import (
 from mstar.model.base import DECODE, ForwardPassArgs, Model
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
+from mstar.model.multimodal import (
+    TEXT,
+    PromptPart,
+    check_attachments,
+    check_plan,
+    find_media_spans,
+    parts_from_modalities,
+    prefill_plan,
+    split_around_spans,
+)
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +499,66 @@ class BagelModel(Model):
     GEN_TEMPLATE = "<|im_start|>{prompt}<|im_end|><|im_start|>"
     BOS_EOS_TEMPL = "<|im_start|>{prompt}<|im_end|>"
 
+    # The prefill_vit walk re-emits the two sentinels around its own
+    # embeddings, so only the pad interior is dropped from the text spans.
+    IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+
+    # VLM_UNDERSTANDING_SUFFIX minus the text it used to interpolate, which is
+    # now written at its own place in the prompt.
+    UNDERSTANDING_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
+
+    def _placeholder_specs(self) -> dict[str, tuple[int, int, int]]:
+        """``(start, pad, end)`` sentinel ids, read off the tokenizer.
+
+        The tokenizer produced the prompt, so it decides these ids; the config
+        could name ones the prompt does not contain.
+        """
+        pad = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        if pad is None or pad == self.tokenizer.unk_token_id:
+            raise ValueError(
+                "BAGEL's tokenizer has no <|image_pad|>, so an image cannot be "
+                "placed in the prompt"
+            )
+        return {"image": (self.boi_token_id, pad, self.eoi_token_id)}
+
+    def _render_prompt(
+        self, parts: list[PromptPart], *, is_understanding: bool, system_prompt: str
+    ) -> str:
+        """Write the request out in order, attachments as placeholders.
+
+        Understanding opens the user turn before the attachments and closes it
+        after the last; a text run following an attachment carries the newline
+        the old suffix supplied, so every layout that template could express
+        renders to the same string. Generation leaves attachments outside the
+        turn — the prefill_vae/vit walks put the input image ahead of the
+        prompt — and wraps what follows.
+        """
+        # Understanding's old suffix supplied this newline; generation's did not.
+        sep = "\n" if is_understanding else ""
+        body: list[str] = []
+        after_attachment = False
+        for part in parts:
+            if part.modality == TEXT:
+                if part.text:
+                    body.append((sep if after_attachment else "") + part.text)
+                    after_attachment = False
+                continue
+            body.append(self.IMAGE_PLACEHOLDER)
+            after_attachment = True
+
+        if is_understanding:
+            head = self.VLM_UNDERSTANDING_PREFIX.format(system_prompt=system_prompt)
+            tail = "\n" + self.UNDERSTANDING_TAIL if after_attachment else self.UNDERSTANDING_TAIL
+            return head + "".join(body) + tail
+
+        # Generation: attachments written before any text stay outside the turn.
+        lead = 0
+        while lead < len(body) and body[lead] == self.IMAGE_PLACEHOLDER:
+            lead += 1
+        return "".join(body[:lead]) + self.GEN_TEMPLATE.format(
+            prompt="".join(body[lead:])
+        )
+
     def _encode_text(self, text: str) -> torch.Tensor:
         """Tokenize a text segment, falling back to raw bytes when no tokenizer
         is available (dummy-model test path)."""
@@ -491,16 +572,22 @@ class BagelModel(Model):
         input_modalities: list[str],
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
+        prompt_parts: list[PromptPart] | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        """Tokenize user prompt and system prompt (if think_mode).
+        """Tokenize the prompt into one text span per prefill step.
 
         Returns model-specific keys matching get_forward_pass_inputs:
-            "text_inputs"    - tokenized user prompt
+            "text_inputs"    - one tokenized span per text step of the plan
             "system_prompt"  - tokenized system prompt (think_mode only)
 
-        Bagel doesn't need the raw multimodal tensors for process_prompt;
-        images are loaded and handled as ``image_inputs`` by the data worker.
+        The prompt is rendered once with a placeholder per image, tokenized
+        once, and sliced around those placeholders, so text written between two
+        attachments gets its own span and no seam is re-tokenized. The schedule
+        builder walks the same :func:`prefill_plan`.
+
+        Bagel doesn't need the raw multimodal tensors here; images are loaded
+        as ``image_inputs`` by the data worker.
         """
         result: NameToTensorList = {}
 
@@ -511,26 +598,55 @@ class BagelModel(Model):
             think_mode = kwargs.get("think_mode", self.config.think_mode)
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
-            if is_understanding and has_image:
-                if think_mode:
-                    system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
-                segments = [
-                    self.VLM_UNDERSTANDING_PREFIX.format(system_prompt=system_prompt),
-                    self.VLM_UNDERSTANDING_SUFFIX.format(prompt=prompt),
-                ]
-            elif is_understanding:
-                if think_mode:
-                    system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
-                segments = [self.VLM_UNDERSTANDING_TEMPLATE.format(
-                    system_prompt=system_prompt, prompt=prompt
+            parts = parts_from_modalities(
+                input_modalities,
+                [p.text or "" for p in prompt_parts if p.modality == TEXT]
+                if prompt_parts is not None else prompt,
+            )
+            unsupported = {p.modality for p in parts} - {TEXT, "image"}
+            if unsupported:
+                raise ValueError(
+                    f"BAGEL has no encoder for {', '.join(sorted(unsupported))}; "
+                    "it accepts image attachments only"
+                )
+            if tensors is not None:
+                check_attachments(
+                    parts, {"image": len(tensors.get("image_inputs", []))},
+                )
+
+            if think_mode and is_understanding:
+                system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
+
+            if is_understanding and not has_image:
+                # No attachment: one span, one walk, nothing to scan.
+                segments = [self._encode_text(
+                    self.VLM_UNDERSTANDING_TEMPLATE.format(
+                        system_prompt=system_prompt, prompt=prompt
+                    )
                 )]
             else:
-                # Image generation (T2I/I2I): the input image (I2I) is placed
-                # before this text by the prefill_vae/vit walks.
-                segments = [self.GEN_TEMPLATE.format(prompt=prompt)]
-                if think_mode:
-                    segments.insert(0, self.BOS_EOS_TEMPL.format(prompt=GEN_THINK_SYSTEM_PROMPT))
-            result["text_inputs"] = [self._encode_text(seg) for seg in segments]
+                text = self._render_prompt(
+                    parts,
+                    is_understanding=is_understanding,
+                    system_prompt=system_prompt,
+                )
+                input_ids = self._encode_text(text)
+                spans = find_media_spans(input_ids, self._placeholder_specs())
+                segments = split_around_spans(input_ids, spans)
+                check_plan(
+                    prefill_plan(parts, leading_text=is_understanding),
+                    spans,
+                    len(segments),
+                )
+                if think_mode and not is_understanding:
+                    # Not part of the request layout: tokenized on its own and
+                    # prefilled ahead of the plan.
+                    segments.insert(
+                        0, self._encode_text(
+                            self.BOS_EOS_TEMPL.format(prompt=GEN_THINK_SYSTEM_PROMPT)
+                        )
+                    )
+            result["text_inputs"] = segments
 
         # Image edit path: both input and output include "image".
         # request specifies a target width and/or height, resize the input
@@ -603,14 +719,83 @@ class BagelModel(Model):
             return img_byte_arr.getvalue()
         raise ValueError(f"Unsupported modality: {modality!r}")
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [KVCacheConfig(
+    # CFG-parallel deployments add the two guidance branches. Ordinary
+    # deployments only instantiate LLM, so do not make its TP resource depend
+    # on absent, ungrouped nodes.
+    _LLM_NODES = frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})
+
+    def _kv_config(self) -> KVConfig:
+        return KVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_attention_heads,
-        )]
+        )
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The KV cache, the attention over it, positions, and the sampler.
+
+        The labels here are the names the layers bind against
+        (``Attention(attn_key=..., kv_key=..., pos_key=...)``) and the names
+        ``declare_step`` keys its resource steps by, so they are one
+        declaration read from three places.
+        """
+        kv_config = self._kv_config()
+        nodes = set(self._LLM_NODES if self._has_cfg_parallel else {"LLM"})
+        return [
+            KVSpec(resource_key="kv", nodes=nodes, config=kv_config),
+            AttentionSpec(
+                resource_key="attn", nodes=nodes,
+                config=AttentionConfig(kv_cache="kv"),
+            ),
+            PositionSpec(
+                resource_key="rope", nodes=nodes,
+                config=PositionConfig(
+                    kv_cache="kv", rope_theta=self.config.rope_theta,
+                ),
+            ),
+            SamplerSpec(
+                resource_key="sampler", nodes=nodes,
+                vocab_size=self.config.vocab_size,
+            ),
+        ]
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Per-resource knobs a new request is opened with.
+
+        Two things are per-request rather than per-deployment: which cache
+        labels the request will use (guidance doubles them, and it is a
+        property of the request's arguments), and its sampling parameters.
+        The conductor resolves this once and the engine hands each config to
+        its resource at ingest.
+        """
+        from mstar.model.bagel.submodules import LLM_GRAPH_WALKS, active_labels
+
+        model_kwargs = model_kwargs or {}
+        cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
+        sampling = self.get_sampling_config("LLM", model_kwargs)
+        return {
+            # The KV resource reads this in admit_retrieve, to know which of a
+            # published request's streams to pull in. Guidance-off requests
+            # name only "main", so a transfer never drags branches that this
+            # request will not attend.
+            "kv": KVReqConfig(needed_labels_per_node_walk={
+                (node, walk): active_labels(walk, cfg, node)
+                for node in self._LLM_NODES
+                for walk in LLM_GRAPH_WALKS
+            }),
+            "sampler": SamplingReqConfig(
+                temperature=sampling.temperature,
+                top_k=sampling.top_k,
+                top_p=sampling.top_p,
+                ignore_eos=sampling.ignore_eos,
+                repetition_penalty=sampling.repetition_penalty,
+            ),
+        }
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -624,18 +809,6 @@ class BagelModel(Model):
         logger.info(f"Successfully loaded in BAGEL submodule for {node_name}")
         self._submodule_cache[node_name] = submodule
         return submodule
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {
-            "vit_encoder": EngineType.STATELESS,
-            "vae_encoder": EngineType.STATELESS,
-            "init_latents": EngineType.STATELESS,
-            "LLM": EngineType.KV_CACHE,
-            "LLM_cfg_text": EngineType.KV_CACHE,
-            "LLM_cfg_img": EngineType.KV_CACHE,
-            "combine_cfg": EngineType.STATELESS,
-            "vae_decoder": EngineType.STATELESS,
-        }
 
     def get_default_sharding_config(self):
         from mstar.distributed.base import ShardingConfig
@@ -848,35 +1021,45 @@ class BagelModel(Model):
         self, input_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         is_understanding: bool,
+        think_mode: bool = False,
     ):
-        # Build prefill schedule: sequential list of (graph_walk_name, input tensor info)
-        schedule: list[tuple[str, TensorPointerInfo]] = []
-        texts = input_signals.get("text_inputs", [])
+        """Sequential list of ``(graph_walk_name, input tensor info)``.
+
+        Walks the prefill plan, so attachments prefill where they were written
+        and N of them get N walks. Understanding opens with the system span
+        ahead of them; generation opens straight into them, after the
+        think-mode span when there is one.
+        """
+        texts = list(input_signals.get("text_inputs", []))
         images = input_signals.get("image_inputs", [])
 
-        # 1. System prompt
+        schedule: list[tuple[str, TensorPointerInfo]] = []
+        if think_mode and not is_understanding and texts:
+            schedule.append(("prefill_text", texts.pop(0)))
 
-        if len(texts) == 2:
-            # the first text block is the system prompt and should come at the very beginning
-            # (in both thinking and non-thinking mode)
-            input_modalities.insert(0, "text")
-
-        # 2. Walk through interleaved inputs, building sequential steps
-        text_idx, image_idx = 0, 0
-        for mod in input_modalities:
-            if mod == "text":
-                if text_idx >= len(texts):
-                    continue
-                schedule.append(("prefill_text", texts[text_idx]))
-                text_idx += 1
-            elif mod == "image":
-                if image_idx >= len(images):
-                    continue
+        plan = prefill_plan(
+            parts_from_modalities(input_modalities), leading_text=is_understanding,
+        )
+        for step in plan:
+            pool = texts if step.modality == "text" else images
+            if step.index >= len(pool):
+                # ``check_plan`` already failed a mismatch at intake, where a
+                # 400 can still be returned. This runs in the conductor, whose
+                # loop only logs — raising here orphans the request and hangs
+                # the client instead. Same choice as Qwen3-Omni's builder.
+                logger.warning(
+                    "BAGEL prefill plan wants a %s span at index %d but the "
+                    "prompt produced %d; skipping it",
+                    step.modality, step.index, len(pool),
+                )
+                continue
+            if step.modality == "text":
+                schedule.append(("prefill_text", texts[step.index]))
+            else:
                 if not is_understanding:
                     # Generation/editing: VAE encode the image
-                    schedule.append(("prefill_vae", images[image_idx]))
-                schedule.append(("prefill_vit", images[image_idx]))
-                image_idx += 1
+                    schedule.append(("prefill_vae", images[step.index]))
+                schedule.append(("prefill_vit", images[step.index]))
         return schedule
 
     def _requires_cfg(
@@ -895,6 +1078,7 @@ class BagelModel(Model):
     ) -> dict:
         return {
             "is_prefill": full_metadata.is_prefill,
+            "requires_cfg": full_metadata.kwargs["requires_cfg"],
             "cfg_text_scale": full_metadata.kwargs["cfg_text_scale"],
             "cfg_img_scale": full_metadata.kwargs["cfg_img_scale"],
             "cfg_interval": full_metadata.kwargs["cfg_interval"],
@@ -1033,6 +1217,7 @@ class BagelModel(Model):
             input_modalities=input_modalities,
             input_signals=input_signals,
             is_understanding=(target_output == "text"),
+            think_mode=think_mode,
         )
 
         first_graph_walk = schedule[0][0] if schedule else DECODE
@@ -1044,12 +1229,12 @@ class BagelModel(Model):
             "think_mode": think_mode,
             **params,  # CFG params  + gen width / height
         }
+        kwargs["requires_cfg"] = self._requires_cfg(**kwargs)
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk=first_graph_walk,
             is_prefill=bool(schedule),
-            requires_cfg=self._requires_cfg(**kwargs),
             kwargs=kwargs,
         )
         step_metadata =  self._get_step_metadata(full_metadata)

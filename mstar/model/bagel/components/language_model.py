@@ -17,7 +17,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.bagel.config import BagelModelConfig
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -114,11 +114,16 @@ class BagelAttentionMoT(nn.Module):
         self.rope_theta = config.rope_theta
         self.is_causal = config.is_causal
         self.attention_dropout = config.attention_dropout
+        # resources this layer calls, resolved at load; see
+        # components/attention.py and NodeSubmodule.bind_node_resources
+        self.attn = None
+        self.kv = None
+        self.pos = None
 
         if (self.head_dim * self.total_num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
+                f" and `num_heads`: {self.total_num_heads})."
             )
         # Fused QKV: q/k/v are loaded from the separate ``q_proj`` / ``k_proj``
         # / ``v_proj`` checkpoint tensors into one GEMM via the loader's
@@ -183,10 +188,16 @@ class BagelAttentionMoT(nn.Module):
             v.view(-1, self.num_key_value_heads, self.head_dim),
         )
 
+    def bind_resources(self, resources: dict) -> None:
+        self.attn = resources["attn"]
+        self.kv = resources["kv"]
+        self.pos = resources["rope"]
+        # see Attention.bind_resources
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle,
         mode="und",
         static_vae_idxs=True,
         vae_token_indexes=None,
@@ -247,18 +258,15 @@ class BagelAttentionMoT(nn.Module):
                 **mot_kwargs,
             )
 
-        # RoPE: pos_ids pre-computed by plan_rope before the LLM forward
-        query_states, key_states = cache_handle.apply_rope(
-            query_states, key_states, rope_theta=self.rope_theta
+        # RoPE: pos_ids planned from the step declaration before the LLM forward
+        query_states, key_states = self.pos.apply_qk(
+            query_states, key_states, label=self.attend.label,
+            rope_theta=self.rope_theta,
         )
 
-        # Paged attention: plan (page alloc, FlashInfer index tensors) was
-        # done by plan_attention before the LLM forward
-        attn_output = cache_handle.run_attention(
-            q=query_states,
-            k=key_states,
-            v=value_states,
-        )
+        # Paged attention: the plan (page alloc, FlashInfer index tensors)
+        # was driven from the step declaration before the LLM forward
+        attn_output = self.attend(query_states, key_states, value_states)
 
         attn_output = attn_output.reshape(-1, self.local_hidden_size)
 
@@ -303,7 +311,6 @@ class BagelMoTDecoderLayer(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle,
         mode="und",
         static_vae_idxs=True,
         vae_token_indexes=None,
@@ -335,7 +342,6 @@ class BagelMoTDecoderLayer(nn.Module):
         # Self Attention
         query_sequence = self.self_attn(
             query_sequence=query_sequence,
-            cache_handle=cache_handle,
             mode=mode,
             static_vae_idxs=static_vae_idxs,
             vae_token_indexes=vae_token_indexes,
@@ -409,14 +415,12 @@ class BagelLanguageModel(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        write_cache=True,
+        label: str,
         mode="und",
         static_vae_idxs=None,
         vae_token_indexes=None,
         text_indexes=None,
         text_mask=None,
-        custom_advance_pos_id=None,
     ):
         extra_inputs = {}
         if self.use_moe:
@@ -431,18 +435,16 @@ class BagelLanguageModel(nn.Module):
                     static_vae_idxs=static_vae_idxs
                 )
 
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for _layer_idx, decoder_layer in enumerate(self.layers):
-            # torch.compile complains about the attetion module having an integer layer_idx
-            # field that varies across the layers (forcing recompiles), so this is a workaround
-            cache_handle.set_layer_idx(_layer_idx)
+            decoder_layer.self_attn.attend.set_layer_idx(_layer_idx)
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
-                cache_handle=cache_handle,
                 **extra_inputs,
             )
-
-        if write_cache:
-            cache_handle.advance_seq_lens(pos_id_ns=custom_advance_pos_id)
 
         if self.use_moe:
             if mode == "und":
@@ -500,27 +502,23 @@ class BagelForCausalLM(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        cache_handle,
-        write_cache=True,
+        label: str,
         mode="und",
         static_vae_idxs=True,
         vae_token_indexes=None,
         text_indexes=None,
         text_mask=None,
-        custom_advance_pos_id=None,
         **kwargs
     ):
         assert mode in ["und", "gen"]
         outputs = self.model(
             query_sequence=query_sequence,
-            cache_handle=cache_handle,
-            write_cache=write_cache,
+            label=label,
             mode=mode,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
             text_mask=text_mask,
             static_vae_idxs=static_vae_idxs,
-            custom_advance_pos_id=custom_advance_pos_id,
         )
 
         return outputs

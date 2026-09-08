@@ -6,7 +6,7 @@ Two stubs that exist purely so test imports survive on local macOS dev:
    (recompile_limit, specialize_int, etc.) that don't exist on older
    CUDA-less torch builds. We replace the config object with a sink.
 
-2. ``triton`` — mstar.utils.sampling does ``import triton`` at module
+2. ``triton`` — mstar.engine.resources.sampler.utils does ``import triton`` at module
    load. Triton is GPU-only and not installed on macOS. We inject a
    minimal stub so the import succeeds; tests that exercise the kernels
    themselves still need a real GPU.

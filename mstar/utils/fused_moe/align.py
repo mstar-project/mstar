@@ -26,6 +26,55 @@ logger = logging.getLogger(__name__)
 _CSRC = os.path.join(os.path.dirname(__file__), "csrc", "moe_align_block_size.cu")
 
 
+def _clear_stale_build_lock(name: str) -> None:
+    """Remove a ``FileBaton`` lock left behind by a killed build process.
+
+    ``torch.utils.cpp_extension.load`` serialises concurrent builds with a lock
+    file and waits on it in an UNTIMED ``while os.path.exists(...)`` loop. Kill
+    a process while it holds that lock (SIGKILL, OOM, a scheduler preemption)
+    and every later process on the machine hangs in warmup forever, with no
+    error and no log line.
+
+    The baton holds the fd open for the build's duration, so a lock nobody has
+    open is by definition abandoned. Scanning /proc for holders distinguishes
+    that from a genuine build in progress, which mtime alone cannot.
+    """
+    from torch.utils.cpp_extension import _get_build_directory
+
+    try:
+        build_dir = _get_build_directory(name, verbose=False)
+    except Exception:
+        return
+    lock_path = os.path.join(build_dir, "lock")
+    if not os.path.exists(lock_path):
+        return
+    try:
+        target = os.path.realpath(lock_path)
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                for fd in os.listdir(fd_dir):
+                    if os.path.realpath(os.path.join(fd_dir, fd)) == target:
+                        return  # a live build owns it; wait normally
+            except OSError:
+                continue  # process exited, or not ours to read
+    except OSError:
+        return
+    logger.warning(
+        "fused MoE: removing abandoned JIT build lock %s (no process holds it). "
+        "A build process was almost certainly killed mid-compile; without this "
+        "every future load would wait on it forever.",
+        lock_path,
+    )
+    for stale in (lock_path, os.path.join(build_dir, ".ninja_lock")):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+
 @functools.lru_cache(maxsize=1)
 def _cuda_op_available() -> bool:
     """JIT-compile and load the vendored CUDA op; return whether it worked.
@@ -39,6 +88,7 @@ def _cuda_op_available() -> bool:
     try:
         from torch.utils.cpp_extension import load
 
+        _clear_stale_build_lock("_mstar_moe_C")
         load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
         # Touch the op so a registration failure surfaces here, not at call time.
         _ = torch.ops._mstar_moe_C.moe_align_block_size

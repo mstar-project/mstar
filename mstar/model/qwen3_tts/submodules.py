@@ -27,36 +27,45 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
 from mstar.engine.cuda_graph_config import (
-    BasicBatchedCudaGraphConfig,
+    BatchedCudaGraphConfig,
+    CudaGraphConfig,
     PiecewiseBatchedConfig,
+    PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseCudaGraphConfig,
 )
-from mstar.engine.kv_store import PositionInfo
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
 )
-from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
+from mstar.model.qwen3_tts.config import (
+    CODE_PRED_SAMPLER,
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    TALKER_SAMPLER,
+    Qwen3TTSModelConfig,
+)
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     ModelInputsFromEngine,
     NodeInputs,
 )
-from mstar.utils.sampling import (
-    BaseMultiSampler,
-    SeenTokenMask,
-)
+
+# the CodePredictor depth loop, as a piecewise capture region
+DEPTH_LOOP_REGION = "code_predictor_loop"
 
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
@@ -98,6 +107,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.num_codes = config.talker.num_code_groups
         self._suppress_mask: torch.Tensor | None = None
         self._decode_last_token_indices: torch.Tensor | None = None
+
+        # Lazy frame-local CodePredictor KV scratch, overwritten every step.
         self._cp_kv_cache: torch.Tensor | None = None
 
     def _get_suppress_mask(self) -> torch.Tensor:
@@ -151,24 +162,17 @@ class TalkerSubmodule(ARNodeSubmodule):
         return logits
 
     def _get_cp_kv_cache(self, batch_size: int) -> torch.Tensor:
-        """Return the fixed CodePredictor scratch cache for this micro-batch.
+        """Frame-local CodePredictor scratch cache, sliced to this micro-batch.
 
-        CodePredictor attention is local to one 16-group frame, so this cache
-        does not belong to the engine's cross-step paged KV cache. A maximum
-        batch allocation is reused and overwritten for every Talker step,
-        which also gives the captured decode graph stable addresses.
+        TODO: make this a resource. The fixed maximum-batch tensor is
+        overwritten every Talker step and gives the captured decode graph
+        stable addresses.
         """
-        expected = (
-            self.cp_config.num_hidden_layers,
-            self.MAX_BATCH_SIZE,
-            2,
-            self.num_codes,
-            self.cp_config.num_key_value_heads,
-            self.cp_config.head_dim,
-        )
         if self._cp_kv_cache is None:
-            self._cp_kv_cache = torch.empty(
-                expected,
+            cp = self.cp_config
+            self._cp_kv_cache = torch.zeros(
+                (cp.num_hidden_layers, self.MAX_BATCH_SIZE, 2,
+                 self.num_codes, cp.num_key_value_heads, cp.head_dim),
                 dtype=self.model.model.codec_embedding.weight.dtype,
                 device=self.get_device(),
             )
@@ -298,8 +302,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        seen_token_mask: SeenTokenMask | None = None,
-        pos_info: dict[str, PositionInfo] = {},
         **kwargs: Any,
     ) -> ARNodeInputs:
         """Convert routed request tensors into one Talker sequence fragment.
@@ -309,7 +311,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         condition. This method performs no transformer compute; the engine can
         therefore prepare requests before admitting them to a micro-batch.
         """
-        del seen_token_mask, pos_info, kwargs
+        del kwargs
         if graph_walk == "talker_prefill":
             input_embeds = self._build_prefill(
                 fwd_info.request_id,
@@ -365,18 +367,17 @@ class TalkerSubmodule(ARNodeSubmodule):
         request back to the hidden state used for codec-group-0 prediction.
         FlashInfer receives separate sequence lengths and KV page tables.
         """
-        cache_manager = engine_inputs.cache_manager
-        assert cache_manager is not None
-        cache_manager.set_active_label("main")
+
+        del engine_inputs
         seq_lens = [item.input_seq_len for item in inputs]
-        cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
         input_embeds = [
             item.input_embeds for item in inputs if item.input_embeds is not None
         ]
         if graph_walk == "talker_decode":
             if any(seq_len != 1 for seq_len in seq_lens):
                 raise ValueError("Qwen3-TTS decode expects one token per request")
+            # one token per request, so the indices are a fixed arange and a
+            # single-request batch is already packed
             packed_embeds = (
                 input_embeds[0]
                 if len(input_embeds) == 1
@@ -398,6 +399,41 @@ class TalkerSubmodule(ARNodeSubmodule):
             "suppress_eos": self._get_batch_suppress_eos(inputs),
         }
 
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
+        """One causal step over the packed batch; both walks sample group 0.
+
+        CODE_PRED_SAMPLER belongs to whoever runs the depth loop. The region
+        declares it whenever it holds a slot for this step, so declaring it
+        here too would plan and commit it twice; when the region has no slot
+        the loop runs inline and this step owns it. Keyed off the lease rather
+        than the walk, which disagreed with ``_run_frame`` — that picks inline
+        vs piecewise from what the runner can actually serve.
+        """
+        del slot_lease
+        steps = {
+            TALKER_KV: KVStep(),
+            TALKER_ATTN: AttentionStep(causal=True),
+            TALKER_POS: PositionStep(),
+            TALKER_SAMPLER: SamplerStep(apply_penalty=True),
+        }
+        if not (piecewise_leases or {}).get(DEPTH_LOOP_REGION):
+            steps[CODE_PRED_SAMPLER] = SamplerStep(apply_penalty=False)
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            steps=steps,
+        )
+
     def _run_frame(
         self,
         engine_inputs: ModelInputsFromEngine,
@@ -413,16 +449,18 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine-owned static buffers, so this single path serves eager execution
         and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
         """
-        hidden = self.model(input_embeds, engine_inputs.cache_manager)
+        hidden = self.model(input_embeds, label="main")
         last_hidden = hidden.index_select(0, last_token_indices)
         logits = self.model.codec_head(last_hidden)
         logits = self._mask_invalid_logits(logits, suppress_eos)
-        sampler = engine_inputs.sampler
-        assert sampler is not None
+
+        talker_sampler: SamplerResource = engine_inputs.resources[TALKER_SAMPLER]
+        code_pred_sampler: SamplerResource = engine_inputs.resources[CODE_PRED_SAMPLER]
         request_ids = engine_inputs.request_ids
-        # The repetition penalty applies to group 0 only; the depth loop below
-        # stays penalty-free (its aux config declares no vocab_size).
-        layer0_codes = sampler.sample(request_ids, logits, apply_penalty=True)
+
+        # The repetition penalty applies to group 0 only (its SamplerStep sets
+        # apply_penalty); the depth loop's sampler declares no penalty.
+        layer0_codes = talker_sampler.sample(request_ids, logits)
 
         piecewise = self._run_depth_loop_piecewise(
             engine_inputs, last_hidden, layer0_codes
@@ -432,9 +470,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         else:
             all_codes, codec_embed_sum = self._depth_loop(
                 last_hidden, layer0_codes,
-                lambda cp_logits: sampler.sample_aux(
-                    "code_predictor", request_ids, cp_logits
-                ),
+                lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
             )
 
         return {
@@ -489,22 +525,19 @@ class TalkerSubmodule(ARNodeSubmodule):
         return all_codes, codec_embed_sum
 
     def _code_predictor_piecewise_capture(
-        self,
-        static_inputs: dict[str, torch.Tensor],
-        sampler: BaseMultiSampler,
-        **kwargs,
+        self, call: PiecewiseCallInputs,
     ) -> dict[str, torch.Tensor]:
         """Capture entry point: the depth loop *including* its sampling.
 
-        The aux sampler for this bucket reads the engine's static param buffers,
-        so nothing about sampling has to be hoisted out as a static input the
-        way per-step uniforms and scalars used to be.
+        The CODE_PRED_SAMPLER resource reads its params from static buffers the
+        region's ``declare_step`` plans, so nothing about sampling has to be
+        hoisted out as a static input.
         """
-        assert sampler is not None
-        layer0_codes = static_inputs["layer0_codes"]
+        code_pred_sampler: SamplerResource = call.resources[CODE_PRED_SAMPLER]
+        request_ids = call.engine_inputs.request_ids
         all_codes, codec_embed_sum = self._depth_loop(
-            static_inputs["last_hidden"], layer0_codes,
-            lambda cp_logits: sampler.sample_aux("code_predictor", [], cp_logits),
+            call.static_inputs["last_hidden"], call.static_inputs["layer0_codes"],
+            lambda cp_logits: code_pred_sampler.sample(request_ids, cp_logits),
         )
         return {"all_codes": all_codes, "codec_embed_sum": codec_embed_sum}
 
@@ -520,7 +553,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         ``talker_prefill``, which is eager because it is variable-length. Left
         eager, this loop costs ~4x its captured time.
         """
-        runner = engine_inputs.piecewise_runners.get("code_predictor_loop")
+        runner = engine_inputs.piecewise_runners.get(DEPTH_LOOP_REGION)
         batch_size = layer0_codes.shape[0]
         if runner is None or not runner.can_run(batch_size=batch_size):
             return None
@@ -618,9 +651,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         max_tokens = request_info.step_metadata.get(
             "talker_max_tokens", request_info.max_tokens
         )
-        sampling_config = getattr(request_info, "sampling_config", {}).get(
-            "Talker"
-        )
+        sampling_config = request_info.resource_configs.get(TALKER_SAMPLER)
         ignore_eos = bool(getattr(sampling_config, "ignore_eos", False))
         reached_eos = (
             not ignore_eos and token == self.talker_config.codec_eos_token_id
@@ -629,7 +660,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             return {"talker_decode_loop"}
         return set()
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Admit compatible prefill/decode requests to continuous batching.
 
         Both the Talker and the CodePredictor sample per-request off their own
@@ -648,7 +679,7 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[BasicBatchedCudaGraphConfig]:
+    ) -> list[CudaGraphConfig]:
         """Capture fixed one-token Talker decode batches, including sampling.
 
         Dynamic EOS suppression is carried by ``ARNodeInputs`` and packed into
@@ -658,10 +689,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         """
         del tp_world_size
         dtype = self.model.model.codec_embedding.weight.dtype
-        return [BasicBatchedCudaGraphConfig(
+        return [BatchedCudaGraphConfig(
             capture_graph_walk="talker_decode",
-            labels=["main"],
-            requires_cfg=False,
             single_request_inputs=ARNodeInputs(
                 input_embeds=torch.zeros(
                     1,
@@ -692,8 +721,9 @@ class TalkerSubmodule(ARNodeSubmodule):
 
         The whole-walk decode graph already covers this loop; this runner serves
         the paths it can't — chiefly ``talker_prefill``, which stays eager
-        because it is variable-length and runs once per request. It has no
-        engine KV cache: its frame-local cache is a static tensor owned here.
+        because it is variable-length and runs once per request. It uses no
+        paged KV cache: its frame-local cache is the engine's fixed-shape
+        scratch pool.
         """
         del tp_world_size
         hidden_size = self.talker_config.hidden_size
@@ -711,20 +741,36 @@ class TalkerSubmodule(ARNodeSubmodule):
                 ),
             }
 
+        def declare_step(
+            request_ids: list[str], seq_lens: list[int],
+        ) -> SubmoduleStep:
+            # Only the CodePredictor sampler runs in this region (no paged KV);
+            # its step sets up the cg-sampler buffers the capture reads from.
+            del seq_lens
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=1)
+                    for rid in request_ids
+                ],
+                steps={CODE_PRED_SAMPLER: SamplerStep(apply_penalty=False)},
+            )
+
         return {
-            "code_predictor_loop": PiecewiseBatchedConfig(
+            DEPTH_LOOP_REGION: PiecewiseBatchedConfig(
                 capture_fn=self._code_predictor_piecewise_capture,
                 make_static_inputs=make_static_inputs,
+                declare_step=declare_step,
+                # take the slot before the outer declaration, so it can leave
+                # CODE_PRED_SAMPLER to this region
+                lease_before_step=True,
                 seq_len=1,
-                uses_kv_cache=False,
-                uses_sampler=True,
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,
             )
         }
 
     def can_use_cuda_graphs(
-        self, batch: NodeBatch, model_inputs: list[NodeInputs]
+        self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         """Replay the whole decode graph; sampling params are read from buffers,
         so no request's settings can disqualify it."""
@@ -733,14 +779,6 @@ class TalkerSubmodule(ARNodeSubmodule):
         ):
             return False
         return super().can_use_cuda_graphs(batch, model_inputs)
-
-    def get_needed_cache_labels(
-        self,
-        graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str]:
-        del graph_walk, per_request_info
-        return ["main"]
 
 
 # ===========================================================================
@@ -757,7 +795,11 @@ class CodecSubmodule(ARNodeSubmodule):
     emitted; the neural decoder itself has no cross-call state.
     """
 
+    # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
+    # stateless engine, stated directly now that the v1 engine reads these.
     disable_torch_compile = True
+    disable_autocast = True
+
     # The official 114M-parameter decoder materializes large fixed-shape
     # activations while CUDA graphs are captured.  Capturing bs=16 exhausts an
     # H100 once Talker weights and the CodePredictor graphs are resident, so
@@ -780,16 +822,11 @@ class CodecSubmodule(ARNodeSubmodule):
         ):
             self.total_upsample *= factor
 
-    def get_stateless_flavor(self) -> str:
-        return "audio_codec"
-
     def prepare_inputs(
         self,
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        seen_token_mask: SeenTokenMask | None = None,
-        pos_info: dict[str, PositionInfo] = {},
         **kwargs: Any,
     ) -> ARNodeInputs:
         """Remove EOS frames and pad one stream chunk to its capture shape.
@@ -798,7 +835,7 @@ class CodecSubmodule(ARNodeSubmodule):
         ``[quantizers, frames]``; every request is padded to ``chunk + context``
         so differently sized final tails can reuse the same CUDA Graph.
         """
-        del graph_walk, seen_token_mask, pos_info, kwargs
+        del graph_walk, kwargs
         codes = inputs["codec_tokens"][0].to(
             device=self.get_device(), dtype=torch.long
         )
@@ -897,7 +934,7 @@ class CodecSubmodule(ARNodeSubmodule):
         outputs["audio_chunk"][0] = outputs["audio_chunk"][0][start:end]
         state.add("codec_chunk_emitted", True)
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Batch codec requests only when their decoder input shapes match."""
         del batch
         return 0 < len(model_inputs) <= self.MAX_BATCH_SIZE and len({
@@ -910,13 +947,15 @@ class CodecSubmodule(ARNodeSubmodule):
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[BasicBatchedCudaGraphConfig]:
+    ) -> list[CudaGraphConfig]:
         """Capture fixed-length Codec batches for all scheduler buckets."""
         del tp_world_size
-        return [BasicBatchedCudaGraphConfig(
+        return [BatchedCudaGraphConfig(
             capture_graph_walk="codec_chunk",
             single_request_inputs=ARNodeInputs(
-                input_seq_len=self.full_seq_len,
+                # 1, not full_seq_len: batched buckets match on bs, and this
+                # keeps the intern seq_len from aliasing the fixed trailing dims.
+                input_seq_len=1,
                 tensor_inputs={
                     "codec_tokens": torch.zeros(
                         self.config.codec.num_quantizers,
@@ -931,7 +970,7 @@ class CodecSubmodule(ARNodeSubmodule):
         )]
 
     def can_use_cuda_graphs(
-        self, batch: NodeBatch, model_inputs: list[NodeInputs]
+        self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         return (
             batch.graph_walk == "codec_chunk"

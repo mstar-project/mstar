@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.model.multimodal import PromptPart
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
@@ -80,3 +81,6 @@ class PreprocessInput:
     input_modalities: list[str]
     output_modalities: list[str]
     model_kwargs: dict
+
+    # Ordered text/attachment sequence, when the entrypoint preserved it.
+    prompt_parts: list[PromptPart] | None = None
