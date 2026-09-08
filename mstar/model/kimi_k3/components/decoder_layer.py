@@ -50,19 +50,22 @@ class KimiK3DecoderLayer(nn.Module):
 
     def _pre_attn(self, prefix: torch.Tensor, blocks: torch.Tensor):
         if self.use_attn_res:
-            x = self.self_attention_res(prefix, blocks)
+            # the read applies the input norm itself (folded into its kernel on CUDA)
+            x = self.self_attention_res(prefix, blocks, out_norm=self.input_layernorm)
             if self.layer_idx % self.attn_res_block_size == 0:
                 blocks = torch.cat([blocks, prefix.unsqueeze(1)], dim=1)
                 prefix = None
         else:
-            x = prefix
-        return self.input_layernorm(x), prefix, blocks
+            x = self.input_layernorm(prefix)
+        return x, prefix, blocks
 
     def _post_attn(self, prefix: torch.Tensor | None, blocks: torch.Tensor, a: torch.Tensor):
         prefix = a if prefix is None else prefix + a
-        x = self.mlp_res(prefix, blocks) if self.use_attn_res else prefix
-        f = self.ffn(self.post_attention_layernorm(x))
-        return prefix + f, blocks
+        if self.use_attn_res:
+            x = self.mlp_res(prefix, blocks, out_norm=self.post_attention_layernorm)
+        else:
+            x = self.post_attention_layernorm(prefix)
+        return prefix + self.ffn(x), blocks
 
     def forward(self, prefix: torch.Tensor, blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Paged path (attention reads its state from the bound resources)."""
