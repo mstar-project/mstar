@@ -121,8 +121,20 @@ class MarlinMXFP4Experts:
                 return bs
         return 64
 
+    # longest prefill slice per kernel call: bounds the transient ``[m * top_k, latent]`` buffers
+    # (2048 tokens x 16 experts x 3584 x bf16 = 235 MB) instead of a whole 16k-token prefill
+    max_chunk_tokens = 2048
+
     @torch.compiler.disable
     def __call__(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+        n = self.max_chunk_tokens
+        if z.shape[0] <= n:
+            return self._forward(z, topk_idx, topk_weight)
+        # routing is per token, so slices along the token axis are independent
+        return torch.cat([self._forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n])
+                          for i in range(0, z.shape[0], n)])
+
+    def _forward(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
         from mstar.utils.fused_moe.align import moe_align_block_size
         from mstar.utils.fused_moe.mxfp4 import situ_and_mul_triton
 
