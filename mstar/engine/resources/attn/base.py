@@ -97,6 +97,16 @@ class PlanCacheKey(NamedTuple):
     last_page_lens: tuple
 
 
+class EagerSlotKey(NamedTuple):
+    """One eager wrapper — the counterpart of ``CGSlotKey``, slotted for the
+    same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
+    label: str
+    slot: int
+    # decode and prefill take different wrapper classes; cross-attention plans
+    # one wrapper per label either way and leaves this False
+    is_decode: bool = False
+
+
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper
 
 

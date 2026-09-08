@@ -62,8 +62,17 @@ class SubmoduleManagement:
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
     cuda_graph_runner: CudaGraphRunner | None = None
-    _next_slot: int = 0
-    _num_slots: int = 1
+
+    # Rotated globally, not per runner: slot-keyed buffers are shared across
+    # buckets and regions, so per-runner counters let consecutive steps collide
+    # on a slot. Leased from the plan thread and the GPU thread both, hence the
+    # lock.
+    _next_slot: int = field(init=False, default=0)
+    _num_slots: int = field(init=False, default=1)
+    _forced_double_buffer: bool = field(init=False, default=False)
+    _slot_lock: threading.Lock = field(
+        init=False, default_factory=threading.Lock, repr=False
+    )
 
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
@@ -72,22 +81,52 @@ class SubmoduleManagement:
     )
 
     def __post_init__(self):
-        # Double-buffer when anything needs it: a pre-plan resource needs slot
-        # N+1's plan to write buffers replay(N) isn't reading, and a
-        # ``force_double_buffer`` resource has the same hazard off the pre-plan
-        # path (e.g. in the piecewise runner). This is the slot the batch
-        # rotation cycles through; each runner narrows it to its own slot count.
-        double_buffered = any(
-            res.supports_preplan or res.force_double_buffer
-            for res in self.resources.values()
+        # Two hazards want a second slot, both of them the host running ahead of
+        # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
+        # reading, and ``force_double_buffer`` is the same for a resource
+        # staging into a reused host buffer. The latter is not pre-plan
+        # specific — the main runner has it too (see `Resource`).
+        # TODO: submodule-wide, so a capture touching neither kind still pays
+        # double the buffers. Each runner could size its own count from the
+        # resources its captures touch, as PiecewiseCudaGraphRunner does.
+        preplan_enabled = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
+        self._forced_double_buffer = any(
+            res.force_double_buffer for res in self.resources.values()
         )
-        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2")) \
-            if double_buffered else 1
+        double_buffered = self._forced_double_buffer or (
+            preplan_enabled
+            and any(res.supports_preplan for res in self.resources.values())
+        )
+        if not double_buffered:
+            self._num_slots = 1
+            return
+        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
+        if self._num_slots < 2:
+            # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
+            # but neither hazard has a single-buffered form: one slot puts the
+            # next step's staging on top of a DMA that may not have retired.
+            # Turn pre-planning off (MSTAR_PRE_PLAN_SPEC=0) to drop to a slot.
+            logger.warning(
+                "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
+                "double-buffering; using 2 slots.", self._num_slots,
+            )
+            self._num_slots = 2
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
+
+    @property
+    def needs_slot_fence(self) -> bool:
+        """Whether reusing a slot has to wait out the GPU work that last held
+        it — true exactly when a resource stages into a reused host buffer."""
+        return self._forced_double_buffer
 
     def lease_slot(self) -> int:
-        slot = self._next_slot
-        self._next_slot = (self._next_slot + 1) % self._num_slots
-        return slot
+        with self._slot_lock:
+            slot = self._next_slot
+            self._next_slot = (self._next_slot + 1) % self._num_slots
+            return slot
 
     def set_piecewise_slot(self, slot: int) -> None:
         """Point the region runners at this batch's slot, on the GPU thread just
@@ -366,7 +405,7 @@ class Engine:
                 device=self._device,
                 autocast_dtype=self._autocast_dtype_for(submodule),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
-                num_slots=submodule_mgmt._num_slots,
+                num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx
             )
             piecewise[node_name] = self._build_piecewise_runners(
@@ -426,7 +465,7 @@ class Engine:
                 device=self._device,
                 autocast_dtype=node_dtype,
                 joint_comm_group=submodule_mgmt.joint_comm_group,
-                num_slots=submodule_mgmt._num_slots,
+                num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
             )
             runners[label] = runner
@@ -615,18 +654,24 @@ class Engine:
         merged: dict[str, NameToTensorList] = {rid: {} for rid in batch.request_ids}
         launched = False
 
-        # Step 1: loop through all of the requests for admit errors
+        # Step 1: loop through all of the requests for admit errors.
+        # Each request is its own cycle, so each takes its own slot. The
+        # rotation is local: the shared counter advances once per batch, and the
+        # plan thread reads it too.
+        num_slots = submodule_mgmt.num_slots
+        base_slot = batch.slot or 0
         steps: dict[str, SubmoduleStep] = {}
         ctxs: dict[str, StepContext] = {}
-        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
+        for i, (rid, inp) in enumerate(
+            zip(batch.request_ids, batch.inputs, strict=True)
+        ):
             ctxs[rid] = StepContext(
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
-                slot=submodule_mgmt.lease_slot(), capture=False,
+                slot=(base_slot + i) % num_slots, capture=False,
             )
-            # Each request runs its own cycle, so its region lease/replay tracks
-            # its own slot; declare (here) and drive (below) are separate loops,
-            # so set it in both.
+            # declare (here) and drive (below) are separate loops, so the
+            # region runners are pointed at the slot in both
             submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
             admit_outcome, steps[rid] = self._declare_and_admit(
                 batch, rids=[rid], inputs=[inp],
@@ -636,10 +681,21 @@ class Engine:
             if not admit_outcome.ok:
                 return merged
 
-        # Step 2: drive step, plan -> forward -> commit loop
+        # Step 2: drive step, plan -> forward -> commit loop.
+        # Nothing stages before here, so only this loop fences: the rotation
+        # wraps after `num_slots` requests, and reusing a slot before the GPU
+        # is done with it would overwrite staging a queued H2D still reads.
+        fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
+        slot_events: dict[int, torch.cuda.Event] = {}
+
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
             req_info = {rid: batch.per_request_info[rid]}
-            submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
+            slot = ctxs[rid].slot
+            submodule_mgmt.set_piecewise_slot(slot)
+            in_flight = slot_events.get(slot)
+            if in_flight is not None:
+                in_flight.synchronize()
+
             if nvtx:
                 range_push(f"engine.per_request.{rid}")
             try:
@@ -652,6 +708,10 @@ class Engine:
                     merged[rid] = {}
                     continue
                 launched = True
+                if fence:
+                    slot_events[slot] = torch.cuda.Event()
+                    slot_events[slot].record()
+
                 merged.update(self._collect_outputs(
                     submodule_mgmt, None, raw, [inp], req_info,
                     request_ids=[rid], step_request_ids=(rid,),

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 import pytest
+import torch
 
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import (
@@ -158,13 +159,22 @@ class _FakeExecEngine:
     _exec_per_request = Engine._exec_per_request
     _declare_and_admit = Engine._declare_and_admit
 
-    def __init__(self, fail_on: str | None = None):
+    def __init__(self, fail_on: str | None = None, num_slots: int = 1):
         self._enable_nvtx = False
         self._fail_on = fail_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
         self._runner = self
-        self._submodules = {"node": SimpleNamespace(submodule=self)}
+        self._device = torch.device("cpu")
+        # the per-request path's slots; no fence, so no CUDA event is recorded
+        self.piecewise_slots: list[int] = []
+        self.run_slots: list[int] = []
+        self._submodules = {"node": SimpleNamespace(
+            submodule=self,
+            num_slots=num_slots,
+            needs_slot_fence=False,
+            set_piecewise_slot=self.piecewise_slots.append,
+        )}
 
     # --- submodule surface
     def _maybe_lease_piecewise_regions(self, node_name, ctx, inputs):
@@ -196,6 +206,7 @@ class _FakeExecEngine:
         assert step is not None, "the step admitted for this rid must reach it"
         assert tuple(ctx.request_ids) == (rid,), "each rid drives its own ctx"
         self.events.append(("run", rid))
+        self.run_slots.append(ctx.slot)
         return {rid: {"token": 1}}, step
 
     def _collect_outputs(self, *a, **kw):
@@ -203,14 +214,15 @@ class _FakeExecEngine:
         return dict(kw["request_ids"] and {kw["request_ids"][0]: {"token": 1}})
 
 
-def _exec_batch(rids):
+def _exec_batch(rids, slot=0):
     return ExecutingBatch(
         node_name="node",
         per_request_info={rid: object() for rid in rids},
         step_context=StepContext(
-            request_ids=tuple(rids), graph_walk="walk", slot=0, capture=False,
+            request_ids=tuple(rids), graph_walk="walk", slot=slot, capture=False,
         ),
         inputs=[object() for _ in rids],
+        slot=slot,
     )
 
 
@@ -238,3 +250,25 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
     assert not any(kind == "run" for kind, _ in engine.events)
     assert out == {"a": {}, "b": {}}
     assert isinstance(batch.admit_error, AllocationFailed)
+
+
+def test_per_request_rotates_slots_within_the_batch():
+    """Each rid gets its own slot so one's staging can't land on top of the
+    previous one's queued H2D. The rotation is local: it starts at the batch's
+    own slot and wraps, rather than advancing the submodule's shared counter."""
+    engine = _FakeExecEngine(num_slots=2)
+
+    engine._exec_per_request(_exec_batch(["a", "b", "c"], slot=1))
+
+    assert engine.run_slots == [1, 0, 1]
+    # declare and drive are separate loops, so the region runners are pointed
+    # at the slot in both
+    assert engine.piecewise_slots == [1, 0, 1, 1, 0, 1]
+
+
+def test_per_request_keeps_one_slot_when_the_node_is_single_buffered():
+    engine = _FakeExecEngine(num_slots=1)
+
+    engine._exec_per_request(_exec_batch(["a", "b", "c"]))
+
+    assert engine.run_slots == [0, 0, 0]
