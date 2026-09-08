@@ -199,7 +199,11 @@ class KimiLatentMoE(nn.Module):
         if self.quantized:
             for prm in (self.experts.gate_up_packed, self.experts.gate_up_scale,
                         self.experts.down_packed, self.experts.down_scale):
-                prm._keep_dtype = torch.uint8
+                # the checkpoint's packed uint8 layout until a backend converted the experts;
+                # afterwards the parameters hold the kernel layout (Marlin: int32 tiles and
+                # E8M0 scales) and must keep *that* dtype through any later ``_apply``
+                if self._backend is None:
+                    prm._keep_dtype = torch.uint8
             self.experts.gate_up_packed.weight_loader = partial(_mxfp4_gate_up_loader, tp_rank, tp_size, full)
             self.experts.gate_up_scale.weight_loader = partial(_mxfp4_gate_up_loader, tp_rank, tp_size, full)
             self.experts.down_packed.weight_loader = partial(_mxfp4_down_loader, tp_rank, tp_size, full, 2)
@@ -214,6 +218,11 @@ class KimiLatentMoE(nn.Module):
         result = super()._apply(fn, recurse=recurse)
         self._attach_loaders()
         restore_kept_dtypes(self.experts)
+        if self._backend is not None:
+            # a device move or dtype pass rebinds the parameters' storage: the backend must
+            # read the parameters, not copies it kept from the conversion
+            ex = self.experts
+            self._backend.rebind(ex.gate_up_packed.data, ex.gate_up_scale.data, ex.down_packed.data, ex.down_scale.data)
         return result
 
     def _use_triton(self, z: torch.Tensor) -> bool:
