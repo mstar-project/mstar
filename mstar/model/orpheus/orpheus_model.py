@@ -31,9 +31,9 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata, Partit
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -351,7 +351,7 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.head_dim,
