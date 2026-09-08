@@ -66,8 +66,8 @@ class RopeManager(PositionManager):
         self._device = device
         self._kv_cache_name = config.kv_cache
         self._max_seq_len = max_seq_len
-        self._xpu_rope_cache_key: tuple | None = None
-        self._xpu_rope_cache: torch.Tensor | None = None
+        self._rope_cache_key: tuple | None = None
+        self._rope_cache: torch.Tensor | None = None
         if device.type == "xpu":
             if config.llama31_params:
                 raise NotImplementedError(
@@ -80,13 +80,13 @@ class RopeManager(PositionManager):
                     "dependent KV cache's head_dim"
                 )
             cache_dtype = config.rope_dtype or dtype
-            self._xpu_rope_cache_key = (
+            self._rope_cache_key = (
                 rotary_dim,
                 config.rope_scale,
                 config.rope_theta,
                 cache_dtype,
             )
-            self._xpu_rope_cache = self._build_rope_cache(
+            self._rope_cache = self._build_rope_cache(
                 rotary_dim,
                 config.rope_scale,
                 config.rope_theta,
@@ -403,13 +403,13 @@ class RopeManager(PositionManager):
         if q.device.type == "xpu":
             rotary_dim = rotary_dim or q.shape[-1]
             cache_key = (rotary_dim, rope_scale, rope_theta, q.dtype)
-            if cache_key != self._xpu_rope_cache_key:
+            if cache_key != self._rope_cache_key:
                 raise RuntimeError(
-                    "XPU RoPE runtime arguments do not match the cache built "
+                    "RoPE runtime arguments do not match the cache built "
                     f"from PositionConfig: runtime={cache_key}, "
-                    f"configured={self._xpu_rope_cache_key}"
+                    f"configured={self._rope_cache_key}"
                 )
-            cos_sin_cache = self._xpu_rope_cache
+            cos_sin_cache = self._rope_cache
             assert cos_sin_cache is not None
             # vllm-xpu-kernels requires int64 position IDs. Normalize only at
             # this backend boundary so position planning and CUDA stay
