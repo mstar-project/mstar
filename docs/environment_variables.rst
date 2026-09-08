@@ -44,6 +44,24 @@ Communication
        CUDA-graph capture can exceed that default (a 579 GB checkpoint at TP8
        does) — a hung collective takes correspondingly longer to abort. Must
        be set before the conductor spawns workers, which inherit it.
+   * - ``MSTAR_TP_ALLREDUCE``
+     - ``nccl``
+     - Backend for small TP all-reduces (``CommGroup.all_reduce``).
+       ``nccl``: torch.distributed's NCCL ring/tree for every message.
+       ``symm_oneshot`` / ``symm_multimem``: contiguous CUDA messages up to
+       ``MSTAR_TP_SYMM_AR_MAX_KB`` go through torch symmetric memory —
+       one-shot reads every peer's buffer over NVLink and reduces locally;
+       multimem uses NVLS multicast (needs NVSwitch + driver support).
+       Larger messages (prefill) stay on NCCL. At batch-1 decode a TP8 step
+       issues ~160-230 all-reduces of ~10 KB, where NCCL's per-call latency
+       (~15-30 us) dominates and a one-shot kernel is ~5-10 us. Both are
+       CUDA-graph capturable. Reduction order differs from NCCL's, so bf16
+       results can differ at the last bit — measure before flipping. Falls
+       back to NCCL with a warning if symmetric memory cannot be set up.
+   * - ``MSTAR_TP_SYMM_AR_MAX_KB``
+     - ``512``
+     - Size cutoff (KiB) for the symmetric-memory all-reduce path; also the
+       size of the one persistent buffer rendezvoused per comm group.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
