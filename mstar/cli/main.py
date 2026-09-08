@@ -57,11 +57,13 @@ def _resolve_config(model: str, override: str | None) -> str:
         sys.exit(f"error: unknown model {model!r}. Known models: {avail}\n"
                  f"       (or pass --config <path.yaml> for a custom deployment)")
     name = DEFAULT_CONFIGS[model]
-    # A pip install ships the default configs as package data; find them there
-    # first so `mstar serve <model>` works without a checkout.
+    # A pip install ships the default configs as package data under
+    # mstar/default_configs/; find them there first so `mstar serve <model>`
+    # works without a checkout. (A source checkout has only the marker there
+    # and falls through to the repo configs/ below.)
     try:
         from importlib.resources import files
-        packaged = files("configs") / name
+        packaged = files("mstar.default_configs") / name
         if packaged.is_file():
             return str(packaged)
     except (ModuleNotFoundError, FileNotFoundError, TypeError):
