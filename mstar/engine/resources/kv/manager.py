@@ -905,6 +905,34 @@ class KVManager(AttentionResource):
             rank=self._rank, world_size=self._world_size, seq_info=seq_info,
         )
 
+    def stored_len(self, rid: str, label: str = "main") -> int:
+        """Tokens the stream holds, i.e. the position the next one lands at."""
+        with self._lock:
+            return self._streams[rid][label].stored_len
+
+    def rewind(self, rid: str, n: int, label: str = "main") -> None:
+        """Take the last ``n`` committed tokens back off the stream.
+
+        For a model that writes more tokens than it keeps — speculative
+        decoding commits the k+1 verify rows and keeps the accepted prefix.
+        The pages stay with the stream (``page_indices`` is a high-water mark
+        already); the next step overwrites the slots in place. Must run after
+        the step's commit and before the next step's admit reads the length.
+        """
+        if n < 0:
+            raise ValueError(f"rewind by {n} < 0")
+        if n == 0:
+            return
+        with self._lock:
+            stream = self._streams[rid][label]
+            if n > stream.stored_len:
+                raise ValueError(
+                    f"rewind {rid}/{label} by {n} past its {stream.stored_len} tokens"
+                )
+            stream.stored_len -= n
+            # like commit: a claim taken against the old length must not land
+            stream.generation += 1
+
     def reset_request(self, rid: str, free: bool=False):
         streams = self._streams.get(rid)
         if streams is None:
