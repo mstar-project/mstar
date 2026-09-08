@@ -24,11 +24,40 @@ class AttnResRead(nn.Module):
         self.eps = eps
 
     def score_weight(self) -> torch.Tensor:
+        """``res_norm.weight * res_proj.weight`` as one fp32 vector. Cached after the first
+        call on CUDA (the weights are fixed once loaded): recomputing it was three launches
+        per read, 186 reads per decode step."""
+        if not self.training and self.norm.weight.is_cuda:
+            cached = getattr(self, "_score_weight_cache", None)
+            if cached is None or cached.device != self.norm.weight.device:
+                cached = (self.norm.weight.float() * self.proj.weight.reshape(-1).float()).contiguous()
+                self._score_weight_cache = cached
+            return cached
         return self.norm.weight.float() * self.proj.weight.reshape(-1).float()
 
-    def forward(self, prefix: torch.Tensor, blocks: torch.Tensor | None) -> torch.Tensor:
-        if prefix.is_cuda and blocks is not None and blocks.shape[1] > 0:
+    def _apply(self, fn, recurse=True):
+        self._score_weight_cache = None  # weights may move or change dtype
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._score_weight_cache = None
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def forward(
+        self, prefix: torch.Tensor, blocks: torch.Tensor | None, out_norm: nn.Module | None = None,
+    ) -> torch.Tensor:
+        """The read, optionally followed by ``out_norm`` (a ``KimiRMSNorm``): on CUDA the norm
+        is folded into the read's mixing kernel (same arithmetic, one launch less)."""
+        if prefix.is_cuda and prefix.dtype in (torch.bfloat16, torch.float16) and (
+            out_norm is not None or (blocks is not None and blocks.shape[1] > 0)
+        ):
             from mstar.model.kimi_k3.components.attn_res_kernel import attn_res_read_triton
 
-            return attn_res_read_triton(prefix, blocks, self.score_weight(), self.eps)
-        return attn_res_read(prefix, blocks, self.score_weight(), self.eps)
+            if out_norm is None:
+                return attn_res_read_triton(prefix, blocks, self.score_weight(), self.eps)
+            return attn_res_read_triton(
+                prefix, blocks, self.score_weight(), self.eps,
+                out_norm_weight=out_norm.weight, out_eps=out_norm.variance_epsilon,
+            )
+        x = attn_res_read(prefix, blocks, self.score_weight(), self.eps)
+        return x if out_norm is None else out_norm(x)
