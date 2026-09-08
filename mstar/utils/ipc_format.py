@@ -37,6 +37,7 @@ class WorkerMessageType(Enum):
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
+    TP_NO_SPEC = "tp_no_spec"
 
 
 @dataclass
@@ -93,6 +94,16 @@ class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
     request_ids: list[str]
+    speculative: bool = False
+    spec_seq: int = -1
+    spec_from_seq: int = -1
+
+
+@dataclass
+class TPNoSpeculation(MessageBody):
+    node_name: str
+    graph_walk: str
+    spec_from_seq: int
 
 @dataclass
 class WorkerMessage:
