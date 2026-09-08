@@ -21,10 +21,14 @@ PyPI treats `m-star`, `m_star`, `m.star`, and `M-Star` as one name, but
 
 ## Default configs
 
-The deployment YAMLs in `configs/` are shipped in the wheel as package data
-(`[tool.setuptools.package-data]`), so `mstar serve <model>` finds its
-default config after a plain `pip install`. The CLI resolves them via
-`importlib.resources`, falling back to the repo `configs/` for checkouts.
+`configs/` stays the single source of truth at the repo root (unchanged for
+checkouts). At build time `setup.py` copies `configs/*.yaml` into the
+`mstar/default_configs/` package, so the wheel ships them under the `mstar`
+namespace (not as a top-level `configs` package, which would clash with any
+other distribution shipping one). `MANIFEST.in` grafts `configs/` into the
+sdist so a wheel built from the sdist copies them too. Nothing is duplicated
+in git. The CLI resolves via `importlib.resources.files("mstar.default_configs")`
+for a pip install and falls back to the repo `configs/` for checkouts.
 
 ## Cutting a release
 
