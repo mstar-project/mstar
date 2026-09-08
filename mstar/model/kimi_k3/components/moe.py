@@ -168,7 +168,9 @@ class KimiLatentMoE(nn.Module):
                 situ_beta=situ_beta, situ_linear_beta=situ_linear_beta, reduce_results=False,
             )
         self._tp = (tp_rank, tp_size)
-        self._fi = None  # FlashInferMXFP4Experts once prepare_flashinfer() converted the weights
+        # a converted-weight expert backend (FlashInfer CUTLASS or Marlin) once
+        # prepare_experts_backend() ran; it owns the routed forward from then on
+        self._backend = None
         self._attach_loaders()
 
     def _attach_loaders(self) -> None:
@@ -199,24 +201,42 @@ class KimiLatentMoE(nn.Module):
             return False
         return z.is_cuda and z.dtype in (torch.bfloat16, torch.float16)
 
-    def prepare_flashinfer(self, mode: str, device: torch.device) -> None:
-        """Convert the packed experts in place to FlashInfer's SM90 mixed-input layout and route
-        ``_routed`` through ``cutlass_fused_moe`` (``mode``: ``w4a16`` or ``humming``). Only for
-        ``quantized`` modules on CUDA; irreversible for this module instance."""
-        from mstar.utils.fused_moe.flashinfer_cutlass import FlashInferMXFP4Experts
+    EXPERT_BACKENDS = ("w4a16", "humming", "marlin")
 
-        assert self.quantized, "the FlashInfer backend takes MXFP4-packed experts"
-        assert self._fi is None, "already converted"
-        be = FlashInferMXFP4Experts(
-            mode=mode, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device)
-        be.convert(self.experts.gate_up_packed.data, self.experts.gate_up_scale.data,
-                   self.experts.down_packed.data, self.experts.down_scale.data)
-        self._fi = be
+    def prepare_experts_backend(self, backend: str, device: torch.device) -> None:
+        """Convert the packed experts in place to a fused kernel's layout and route ``_routed``
+        through it. ``w4a16``/``humming`` are FlashInfer's SM90 CUTLASS grouped GEMM (bf16 / FP8
+        activations), ``marlin`` the Marlin MXFP4 MoE kernel (SM80+, bf16 activations, the
+        fastest at decode batch sizes). Only for ``quantized`` modules on CUDA; irreversible
+        for this module instance."""
+        assert self.quantized, "the fused expert backends take MXFP4-packed experts"
+        assert self._backend is None, "already converted"
+        assert backend in self.EXPERT_BACKENDS, backend
+        ex = self.experts
+        packed = (ex.gate_up_packed, ex.gate_up_scale, ex.down_packed, ex.down_scale)
+        if backend == "marlin":
+            from mstar.utils.fused_moe.marlin import MarlinMXFP4Experts
+
+            be = MarlinMXFP4Experts(
+                situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device)
+            converted = be.convert(*(prm.data for prm in packed))
+            # the Marlin layouts have other shapes and dtypes: rebind the parameters so the
+            # weights stay registered (device moves, state_dict) and the old ones are freed
+            for prm, new in zip(packed, converted, strict=True):
+                prm.data = new
+                prm._keep_dtype = new.dtype
+        else:
+            from mstar.utils.fused_moe.flashinfer_cutlass import FlashInferMXFP4Experts
+
+            be = FlashInferMXFP4Experts(
+                mode=backend, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device)
+            be.convert(*(prm.data for prm in packed))
+        self._backend = be
 
     def dequantized_experts(self) -> tuple[torch.Tensor, torch.Tensor]:
         """bf16 ``(w13 [E, 2*inter_local, latent], w2 [E, latent, inter_local])`` from the packed
         parameters (reference/CPU path; materializes the experts, so tests only)."""
-        assert self._fi is None, "experts were converted to the FlashInfer layout"
+        assert self._backend is None, "experts were converted to a fused kernel layout"
         e = self.num_experts
         w13 = torch.stack(
             [dequant_mxfp4(self.experts.gate_up_packed[i], self.experts.gate_up_scale[i]) for i in range(e)])
@@ -224,8 +244,8 @@ class KimiLatentMoE(nn.Module):
         return w13, w2
 
     def _routed(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
-        if self._fi is not None:
-            return self._fi(z, topk_idx, topk_weight)
+        if self._backend is not None:
+            return self._backend(z, topk_idx, topk_weight)
         if self.quantized:
             if self._use_triton(z):
                 from mstar.utils.fused_moe.mxfp4 import fused_experts_mxfp4
