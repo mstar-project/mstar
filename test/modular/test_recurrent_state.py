@@ -170,3 +170,42 @@ def test_padded_replay_rows_use_the_scratch_slot():
     for rid in dummies:
         m.reset_request(rid, free=False)
     assert m.num_free_slots == free_before - 1 and m.has_state("a")
+
+
+def test_slots_are_zeroed_on_allocation_and_scratch_on_padded_decode():
+    """The decode kernels read their slots unconditionally, so a slot handed to a new request
+    must hold zeros in every layer (whatever its previous owner left), and the scratch slot the
+    padding rows of a captured replay address is cleared by the plan of a padded decode step."""
+    m = make_manager(max_slots=2)
+    m.ingest_request("a")
+    st, ctx = step([Segment("a", "main", 4)])
+    assert m.admit(st, ctx).ok
+    m.plan(st, ctx); m.commit(st, ctx)
+    slot = m.slot_of("a")
+    # dirty every slot (the allocator may hand out either free one next)
+    for part in ("recurrent", "conv"):
+        m.part(part)[:, 1:].fill_(7.0)
+    m.remove_request("a")
+    m.ingest_request("b")
+    st, ctx = step([Segment("b", "main", 2)])
+    assert m.admit(st, ctx).ok
+    slot = m.slot_of("b")
+    for part in ("recurrent", "conv"):
+        assert torch.count_nonzero(m.part(part)[:, slot]) == 0, part
+    m.plan(st, ctx); m.commit(st, ctx)
+    # a padded decode step (a zero-span row on the scratch slot) clears the scratch slot
+    for part in ("recurrent", "conv"):
+        m.part(part)[:, SCRATCH_SLOT].fill_(3.0)
+    m.ingest_request("__cg_x_0__")
+    segs = [Segment("b", "main", 1), Segment("__cg_x_0__", "main", 1)]
+    s = SubmoduleStep(segments=segs, steps={KEY: RecurrentStateStep()})
+    ctx = StepContext(request_ids=["b"], graph_walk="decode", slot=0, capture=False)
+    ctx.set_padded_rids([x.request_id for x in segs])
+    s.set_ctx(ctx)
+    st = s.get(KEY)
+    assert m.admit(st, ctx).ok
+    out = m.plan(st, ctx)
+    assert out.is_decode and out.slot_ids_cpu[1] == SCRATCH_SLOT
+    for part in ("recurrent", "conv"):
+        assert torch.count_nonzero(m.part(part)[:, SCRATCH_SLOT]) == 0, part
+        assert torch.count_nonzero(m.part(part)[:, slot]) == 0  # b's slot untouched (still zero)
