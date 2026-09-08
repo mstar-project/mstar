@@ -333,6 +333,12 @@ class Engine:
 
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
+            if device.type == "cuda":
+                logger.info(
+                    "resource %s built: %.2f GiB allocated, %.2f GiB reserved on %s",
+                    spec.resource_key, torch.cuda.memory_allocated(device) / 2**30,
+                    torch.cuda.memory_reserved(device) / 2**30, device,
+                )
 
         self._runner = StepRunner(
             self._resources,
