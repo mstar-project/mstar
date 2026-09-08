@@ -80,6 +80,12 @@ class EngineManager:
             # fp32, say) says so; otherwise it takes the engine's.
             node_dtype = submodule.get_autocast_dtype() or autocast_dtype
             submodules[name] = submodule.to(device=device, dtype=node_dtype)
+            if torch.device(device).type == "cuda":
+                logger.info(
+                    "submodule %s on %s: %.2f GiB allocated, %.2f GiB reserved",
+                    name, device, torch.cuda.memory_allocated(device) / 2**30,
+                    torch.cuda.memory_reserved(device) / 2**30,
+                )
 
         engine = Engine(
             autocast_dtype=autocast_dtype,
