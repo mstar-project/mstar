@@ -8,8 +8,8 @@
 * decode (one token per row): ``causal_conv1d_update`` on the gathered conv windows and
   ``fused_recurrent_kda_fwd`` with ``ssm_state_indices`` writing the recurrent slots in place.
 
-Every address the kernels touch comes from tensors (``slot_ids``, ``has_state``,
-``cu_seqlens``), so a captured decode graph replays correctly with new slot ids. The
+Every address the kernels touch comes from tensors (``slot_ids``, ``cu_seqlens``; ``has_state``
+masks the prefill's initial states), so a captured decode graph replays correctly with new slot ids. The
 recurrent state layout is V-first (``[slots, H, V, K]``), the kernels' native layout.
 """
 from __future__ import annotations
@@ -45,18 +45,18 @@ class FLAKDAKernels:
         t = qkv.shape[0]
         conv_w = p.conv_weight.to(qkv.dtype)  # [3P, W]
         if plan.is_decode:
-            # conv: gathered windows, updated in place, scattered back
-            cache = conv_state.index_select(0, slot_ids) * has_state[:, None, None].to(conv_state.dtype)
+            # decode reads the slots as they are: the resource zeroes a slot when it hands it
+            # out (and the scratch slot every padded step), so a row's first decode after its
+            # prefill finds the written state and a fresh slot holds zeros -- no masking, no
+            # gather/scatter of the recurrent states (tens of MB per layer at 64 rows)
+            cache = conv_state.index_select(0, slot_ids)
             y, cache = self._conv_update(qkv.view(rows, 1, -1), cache, weight=conv_w, activation="silu")
             conv_state.index_copy_(0, slot_ids, cache.to(conv_state.dtype))
-            y = y.view(rows, -1)
             # the low-level Triton kernel assumes contiguous [B, T, H, K]: a strided split of
-            # the fused conv output reads the wrong memory for every row after the first
-            q, k, v = (t.contiguous() for t in y.split([h * d, h * d, h * d], dim=-1))
-            # rows without a resident state start from zeros: clear their slots first (a
-            # masked gather/scatter, no host sync, so the step stays CUDA-graph capturable)
-            keep = has_state.to(rec_state.dtype)[:, None, None, None]
-            rec_state.index_copy_(0, slot_ids, rec_state.index_select(0, slot_ids) * keep)
+            # the fused conv output reads the wrong memory for every row after the first, so
+            # re-layout once to [3, rows, P] (one copy) and take contiguous leading slices
+            y3 = y.view(rows, 3, h * d).transpose(0, 1).contiguous()
+            q, k, v = y3[0], y3[1], y3[2]
             # every row is its own one-token sequence (cu_seqlens); without it the kernel
             # would chain the rows as one sequence and carry row i's state into row i+1
             o = self._recurrent(
@@ -78,7 +78,8 @@ class FLAKDAKernels:
             output_final_state=True, activation="silu", cu_seqlens=cu,
         )
         conv_state.index_copy_(0, slot_ids, conv_final.to(conv_state.dtype))
-        q, k, v = (x.contiguous() for x in y.view(t, -1).split([h * d, h * d, h * d], dim=-1))
+        y3 = y.view(t, 3, h * d).transpose(0, 1).contiguous()  # one copy, three contiguous views
+        q, k, v = y3[0], y3[1], y3[2]
         rec_init = rec_state.index_select(0, slot_ids) * has_state[:, None, None, None].to(rec_state.dtype)
         o, rec_final = self._chunk(
             q=q.view(1, t, h, d), k=k.view(1, t, h, d), v=v.view(1, t, h, d),
