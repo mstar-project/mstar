@@ -40,6 +40,15 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.slot_state.config import (
+    SINK_SLOT,
+    SlotSpan,
+    SlotStateConfig,
+    SlotStatePlan,
+    SlotStateSpec,
+    SlotStateStep,
+    SlotTensorSpec,
+)
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -91,9 +100,16 @@ __all__ = [
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
+    "SINK_SLOT",
     "SamplerSpec",
     "SamplerStep",
     "SamplingReqConfig",
+    "SlotSpan",
+    "SlotStateConfig",
+    "SlotStatePlan",
+    "SlotStateSpec",
+    "SlotStateStep",
+    "SlotTensorSpec",
     "Segment",
     "SlotLease",
     "StepContext",
