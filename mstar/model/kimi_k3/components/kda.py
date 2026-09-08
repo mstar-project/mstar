@@ -212,8 +212,25 @@ class ParallelKDAAttention(nn.Module):
     def _finish(self, x: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
         t = x.shape[0]
         g_out = self.g_proj(x).view(t, self.num_heads, self.head_dim)
-        y = gated_rms_norm(o, g_out, self.o_norm.weight, self.norm_eps)
+        y = self._gated_norm(o, g_out)
         return self.o_proj(y.reshape(t, self.num_heads * self.head_dim))
+
+    def _gated_norm(self, o: torch.Tensor, g_out: torch.Tensor) -> torch.Tensor:
+        """``RMSNorm_headdim(o) * weight * sigmoid(g)``: fla's fused Triton kernel on CUDA
+        (fp32 math, same operation order as the reference), the torch reference elsewhere."""
+        if o.is_cuda and o.dtype in (torch.bfloat16, torch.float16):
+            try:
+                from fla.modules.fused_norm_gate import rms_norm_gated
+            except ImportError:
+                rms_norm_gated = None
+            if rms_norm_gated is not None:
+                d = self.head_dim
+                y = rms_norm_gated(
+                    o.reshape(-1, d).contiguous(), g_out.reshape(-1, d).to(o.dtype).contiguous(),
+                    self.o_norm.weight, None, activation="sigmoid", eps=self.norm_eps,
+                )
+                return y.view_as(o)
+        return gated_rms_norm(o, g_out, self.o_norm.weight, self.norm_eps)
 
     # ------------------------------------------------------------------ paths
     def forward(self, x: torch.Tensor) -> torch.Tensor:
