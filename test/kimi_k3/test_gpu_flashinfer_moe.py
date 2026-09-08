@@ -39,7 +39,7 @@ def test_flashinfer_backend_matches_triton(mode, tol):
         z = moe.routed_expert_down_proj(x)
         idx, w = moe.gate(x)
         ref = moe._routed(z, idx, w).float()  # Triton MXFP4 kernel
-        moe.prepare_flashinfer(mode, DEV)
+        moe.prepare_experts_backend(mode, DEV)
         out = moe._routed(z, idx, w).float()
     rel = (out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()
     assert rel < tol, f"{mode}: rel rms {rel:.4f}"
