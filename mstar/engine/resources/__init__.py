@@ -19,6 +19,12 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
+from mstar.engine.resources.attn.mla import (
+    MlaAttentionConfig,
+    MlaAttentionSpec,
+    MlaAttentionStep,
+    MlaSubPlan,
+)
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
@@ -85,6 +91,10 @@ __all__ = [
     "KVReqConfig",
     "KVSpec",
     "KVStep",
+    "MlaAttentionConfig",
+    "MlaAttentionSpec",
+    "MlaAttentionStep",
+    "MlaSubPlan",
     "NodeResourceSpec",
     "PosBackend",
     "PosScheme",
