@@ -60,7 +60,8 @@ class KimiK3Model(Model):
             if key in kwargs:
                 setattr(self.config, key, kwargs[key])
         self.default_thinking = bool(kwargs.get("thinking", True))
-        self.moe_backend = str(kwargs.get("moe_backend", "auto"))  # see prepare_moe_kernels
+        # auto | marlin | w4a16 | humming | triton, see prepare_moe_kernels
+        self.moe_backend = str(kwargs.get("moe_backend", "auto"))
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
         self.tokenizer = KimiK3Tokenizer(self.local_dir)
