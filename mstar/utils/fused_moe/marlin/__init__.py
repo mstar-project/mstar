@@ -114,6 +114,10 @@ class MarlinMXFP4Experts:
         self.s2 = prepare_scales(down_scale, k, inter)
         return self.w13, self.s13, self.w2, self.s2
 
+    def rebind(self, gate_up_packed, gate_up_scale, down_packed, down_scale) -> None:
+        """Point at the (converted) parameter tensors again after their storage was rebound."""
+        self.w13, self.s13, self.w2, self.s2 = gate_up_packed, gate_up_scale, down_packed, down_scale
+
     @staticmethod
     def block_size_m(m: int, top_k: int, e: int) -> int:
         for bs in (8, 16, 32, 48, 64):
