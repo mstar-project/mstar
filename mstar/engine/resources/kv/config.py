@@ -17,7 +17,10 @@ if TYPE_CHECKING:
 
 class KVLayout(Enum):
     NHD = "NHD"
-    # TODO: can add more, like HND, MLA
+    # One latent row per token (DeepSeek-style absorbed MLA): no K/V axis, no
+    # head axis, ``head_dim`` = compressed KV rank + decoupled RoPE dim.
+    MLA = "MLA"
+    # TODO: can add more, like HND
 
 
 @dataclass
@@ -36,6 +39,13 @@ class KVConfig:
     def __post_init__(self):
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
+        if self.layout == KVLayout.MLA and self.num_kv_heads != 1:
+            # the latent is shared by every query head; `shard` keeps it
+            # replicated (one head on every rank) and only splits qo heads
+            raise ValueError(
+                f"KVLayout.MLA stores one latent head; got num_kv_heads="
+                f"{self.num_kv_heads}"
+            )
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
 
