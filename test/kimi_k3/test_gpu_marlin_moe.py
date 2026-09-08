@@ -48,6 +48,12 @@ def test_marlin_backend_matches_triton():
         out = moe._routed(z, idx, w).float()
     rel = (out - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()
     assert rel < 3e-2, f"marlin: rel rms {rel:.4f}"
+    # a long prefill runs in token slices; the slices must reproduce the one-shot result
+    moe._backend.max_chunk_tokens = 8
+    with torch.no_grad():
+        chunked = moe._routed(z, idx, w).float()
+    moe._backend.max_chunk_tokens = 2048
+    torch.testing.assert_close(chunked, out, rtol=0, atol=0)
     # the parameters were rebound to Marlin's layouts (int32 tiles, E8M0 scales), nothing dangling
     assert moe.experts.gate_up_packed.dtype == torch.int32 and moe.experts.gate_up_scale.dtype == torch.float8_e8m0fnu
     with torch.no_grad():
