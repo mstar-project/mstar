@@ -7,7 +7,7 @@ import torch
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVConfig
-from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs, SINK_PAGE
+from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
 
 
