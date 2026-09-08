@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.model.kimi_k3.components.rmsnorm_kernel import kimi_rmsnorm_triton, rmsnorm_supported
 from mstar.model.kimi_k3.reference.situ import situ_and_mul
 
 
@@ -23,6 +24,9 @@ class KimiRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if rmsnorm_supported(x) and self.weight.dtype == x.dtype:
+            # one Triton kernel with the same arithmetic (bit-identical output)
+            return kimi_rmsnorm_triton(x, self.weight, self.variance_epsilon)
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
         return self.weight * xf.to(x.dtype)
@@ -35,6 +39,14 @@ class SiTUAndMul(nn.Module):
         self.linear_beta = linear_beta
 
     def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
+        if gate_up.is_cuda and gate_up.dtype in (torch.bfloat16, torch.float16):
+            # one Triton kernel (fp32 math, like the reference) instead of six elementwise ones
+            from mstar.utils.fused_moe.mxfp4 import situ_and_mul_triton
+
+            x = gate_up.reshape(-1, gate_up.shape[-1]).contiguous()
+            out = torch.empty(x.shape[0], x.shape[1] // 2, dtype=x.dtype, device=x.device)
+            situ_and_mul_triton(x, out, self.beta, self.linear_beta)
+            return out.view(*gate_up.shape[:-1], x.shape[1] // 2)
         return situ_and_mul(gate_up, self.beta, self.linear_beta)
 
 
