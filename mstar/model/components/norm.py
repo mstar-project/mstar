@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mstar.utils.flashinfer_utils import run_rms_norm
+from mstar.engine.resources.rms_norm import run_rms_norm
 
 
 class RMSNorm(nn.Module):
