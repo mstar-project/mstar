@@ -41,11 +41,13 @@ from mstar.model.submodule_base import NodeSubmodule
 logger = logging.getLogger(__name__)
 
 
-def _log_gpu_memory(stage: str, device) -> None:
+def _log_gpu_memory(stage: str, device, model: torch.nn.Module | None = None) -> None:
     dev = torch.device(device)
     if dev.type == "cuda":
-        logger.info("Kimi K3 %s on %s: %.2f GiB allocated, %.2f GiB reserved", stage, dev,
-                    torch.cuda.memory_allocated(dev) / 2**30, torch.cuda.memory_reserved(dev) / 2**30)
+        params = "" if model is None else " (parameters %.2f GiB)" % (
+            sum(p.numel() * p.element_size() for p in model.parameters()) / 2**30)
+        logger.info("Kimi K3 %s on %s: %.2f GiB allocated, %.2f GiB reserved%s", stage, dev,
+                    torch.cuda.memory_allocated(dev) / 2**30, torch.cuda.memory_reserved(dev) / 2**30, params)
 
 LLM = "LLM"
 
@@ -252,13 +254,13 @@ class KimiK3Model(Model):
         else:
             load_weights(language_model, self.local_dir, device=device)
         language_model.eval()
-        _log_gpu_memory("weights loaded", device)
+        _log_gpu_memory("weights loaded", device, language_model)
         from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
         from mstar.model.kimi_k3.components.language_model import prepare_moe_kernels, select_kda_kernels
 
         moe_backend = prepare_moe_kernels(language_model, device, self.moe_backend)
         logger.info("Kimi K3 routed-expert backend: %s", moe_backend)
-        _log_gpu_memory("experts converted", device)
+        _log_gpu_memory("experts converted", device, language_model)
 
         graph_safe = select_kda_kernels(language_model, device) and flashinfer_mla_supports(
             self.config.text.kv_lora_rank, self.config.text.qk_rope_head_dim
