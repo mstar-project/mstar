@@ -23,7 +23,6 @@ def rope_apply_qk_inplace(
     """Rotate q and k in place at ``pos_ids``."""
     import flashinfer
 
-    del cos_sin_cache
     rope_kwargs = dict(
         rotary_dim=rotary_dim, interleave=interleave,
         rope_scale=rope_scale, rope_theta=rope_theta,
@@ -59,7 +58,6 @@ def _rope_apply_qk_inplace_xpu(
     old_context_len: float | None = None,
 ) -> None:
     """Rotate q and k in place with the vllm XPU fused kernel."""
-    del rotary_dim, rope_scale, rope_theta
     if any(
         value is not None
         for value in (low_freq_factor, high_freq_factor, old_context_len)
