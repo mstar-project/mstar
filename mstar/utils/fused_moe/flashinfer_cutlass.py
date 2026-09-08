@@ -69,6 +69,7 @@ class FlashInferMXFP4Experts:
             residual2[i] = r
             scale2_shape = s_il.shape[1:]
         self.w13, self.w2 = gate_up_packed, down_packed
+        self._scale_shapes = (scale13_shape, scale2_shape)  # the folded scale layouts, for rebind()
         s13 = gate_up_scale.view(e, *scale13_shape).view(torch.int32)
         s2 = down_scale.view(e, *scale2_shape).view(torch.int32)
         if self.mode == "humming":
@@ -96,6 +97,18 @@ class FlashInferMXFP4Experts:
 
     # ------------------------------------------------------------------ tuning
     @torch.no_grad()
+    def rebind(self, gate_up_packed, gate_up_scale, down_packed, down_scale) -> None:
+        """Point at the (converted) parameter tensors again after their storage was rebound
+        (a device move). The W4A16 scales are int32 views of the scale parameters; Humming's
+        preprocessed scale tensors are not parameters and stay as they are."""
+        self.w13, self.w2 = gate_up_packed, down_packed
+        if self.mode != "humming":
+            e = gate_up_packed.shape[0]
+            s13_shape, s2_shape = self._scale_shapes
+            self.quant_scales = [
+                gate_up_scale.view(e, *s13_shape).view(torch.int32), down_scale.view(e, *s2_shape).view(torch.int32),
+            ]
+
     def autotune(self, token_counts=(1, 2, 4, 8, 16, 32, 64, 128), top_k: int = 16) -> bool:
         """Run the routed GEMMs once per decode bucket under FlashInfer's autotuner so the
         CUTLASS grouped GEMM keeps the best tactic per shape for the process (the default
