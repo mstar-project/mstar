@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 
 
 class KimiK3LLMSubmodule(ARNodeSubmodule):
+    # Built in explicit dtypes (bf16 activations, fp32 gates and router, packed experts in the
+    # kernel layouts): the engine must neither re-cast it -- ``Module.to(dtype)`` would turn the
+    # E8M0 expert scales into bf16 and back, doubling them and leaving the expert backend on
+    # stale copies (12 GiB per rank on pruned75) -- nor run its forward under autocast.
+    disable_autocast = True
     # the kernels are hand-fused and CUDA-graphed; inductor autotuning breaks on their shapes
     disable_torch_compile = True
     PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
