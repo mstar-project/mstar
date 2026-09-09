@@ -218,10 +218,12 @@ class TestLifecycle:
 
 
 class TestCaptureAndPadding:
-    def test_capture_dummies_lease_and_reset_frees(self):
+    def test_capture_dummies_lease_and_any_reset_releases(self):
         """Capture drives dummy rids as the step's own request_ids: they
-        lease like real ones, reset(free=False) keeps the slot, release_all
-        (free=True) hands it back."""
+        lease like real ones, and every reset (free=False between captures,
+        free=True at release_all) hands the slot back — the runner holds
+        dummies per (config, cg slot), so keeping slots across resets would
+        drain the pool on the second slot's capture."""
         m = _manager(2)
         dummies = ["__cg_x_0__", "__cg_x_1__"]
         for rid in dummies:
@@ -237,9 +239,33 @@ class TestCaptureAndPadding:
         assert plan.slot_index.data_ptr() == m._cg_index[0].data_ptr()
         for rid in dummies:
             m.reset_request(rid, free=False)
-        assert m.num_free == 0 and all(m.committed(r) == 0 for r in dummies)
-        for rid in dummies:
-            m.reset_request(rid, free=True)
+        assert m.num_free == 2 and all(m.committed(r) == 0 for r in dummies)
+        assert all(m.slot_of(r) is None for r in dummies)
+
+    def test_capture_sequence_over_two_cg_slots_fits_the_pool(self):
+        """The runner's capture order on a pool of exactly max_bs slots:
+        (bs, slot 0) then (bs, slot 1) with distinct dummy rows, a reset
+        after each; every capture must admit."""
+        m = _manager(2)
+        b = BucketKey("decode", 2, 2)
+        m.build_cuda_graph_buffers(
+            [CGSlotSpec(bucket=b, slot=s, config=None) for s in (0, 1)], max_bs=2, max_seq_len=2,
+        )
+        for slot in (0, 1):
+            rids = [f"__cg_{slot}_{i}__" for i in range(2)]
+            for rid in rids:
+                m.ingest_request(rid)
+            ctx = _ctx(rids, lease=SlotLease(slot=slot, bucket=b), capture=True)
+            for _ in range(3):  # NUM_WARMUP forwards + the capture, each re-prepared
+                step = _step(rids, [1, 1], "chunk")
+                assert m.admit(step, ctx).ok, slot
+                plan = m.plan(step, ctx)
+                assert plan.slot_index.data_ptr() == m._cg_index[slot].data_ptr()
+                for rid in rids:
+                    m.reset_request(rid, free=False)
+        for slot in (0, 1):
+            for rid in [f"__cg_{slot}_{i}__" for i in range(2)]:
+                m.reset_request(rid, free=True)
         assert m.num_free == 2
 
     def test_padding_rows_read_the_sink_and_never_commit(self):

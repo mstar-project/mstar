@@ -176,14 +176,20 @@ class SlotStateManager(Resource):
 
     def reset_request(self, rid: str, free: bool = False):
         """Padding rows between captures / after a replay: forget what they
-        committed and, when told, hand the slot back."""
+        committed and hand the slot back.
+
+        The slot is released whatever ``free`` says. ``free=False`` is the
+        KV resource's "keep the pages resident so the next replay allocates
+        nothing" — a slot here costs nothing to re-lease (the next admit
+        zeroes it), while keeping it would let the runner's dummy rows,
+        which it holds per (config, cg slot) and resets between captures,
+        drain a pool sized for the serve batch and fail every capture past
+        the first slot. Replay padding rows never lease a slot at all.
+        """
+        del free
         with self._lock:
             self._committed[rid] = 0
-            slot = self._slot_of.get(rid)
-            if slot is not None:
-                self._zero_slot(slot)
-            if free:
-                self._release(rid)
+            self._release(rid)
 
     # -- step lifecycle ---------------------------------------------------
 
