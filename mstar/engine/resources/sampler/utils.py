@@ -651,32 +651,31 @@ class Buffer:
     - ``buf``     ``[max_bs]``   per-step tensor, sliced to ``padded_bs`` and read
       by ``CudaGraphableSampler`` (its address must stay stable across replays).
     - ``master``  ``[capacity]`` slot-indexed cache, one row per active request.
-    - ``row_cpu`` ``[1]`` pinned staging for a single async H2D master-row write.
     """
     # ``[cg_slots, max_bs]``: one per-step row per double-buffer slot, so a
     # pre-plan gathering into one slot doesn't clobber the replay reading another
     buf: torch.Tensor
     master: torch.Tensor
-    row_cpu: torch.Tensor
     default: float
     dtype: torch.dtype
 
     @classmethod
     def allocate(
         cls, max_bs: int, capacity: int, device: torch.device,
-        dtype: torch.dtype, default: float, pinned: bool, cg_slots: int = 1,
+        dtype: torch.dtype, default: float, cg_slots: int = 1,
     ) -> "Buffer":
         return cls(
             buf=torch.full((cg_slots, max_bs), default, dtype=dtype, device=device),
             master=torch.full((capacity,), default, dtype=dtype, device=device),
-            row_cpu=torch.zeros(1, dtype=dtype, pin_memory=pinned),
             default=default,
             dtype=dtype,
         )
 
     def write_master_row(self, slot: int, value) -> None:
-        self.row_cpu[0] = value
-        self.master[slot:slot + 1].copy_(self.row_cpu, non_blocking=True)
+        # Staging through a shared pinned row +
+        # non_blocking H2D raced: the copy runs behind step N-1's kernels, so a
+        # second rid registered in the same step overwrote the row first.
+        self.master[slot:slot + 1].fill_(value)
 
     def grow_master(self, new_capacity: int) -> None:
         new = torch.full(
@@ -708,7 +707,7 @@ class MaskBuffer:
     """Three-tier storage for the per-request seen-token mask ``[*, V]`` (bool).
 
     Mirrors ``Buffer`` but 2-D and sourced from on-device ``SeenTokenMask``
-    tensors, so the master-row write is a GPU->GPU copy (no pinned staging).
+    tensors, so the master-row write is a GPU->GPU copy.
     """
     buf: torch.Tensor       # [cg_slots, max_bs, V] bool
     master: torch.Tensor    # [capacity, V] bool
@@ -753,8 +752,8 @@ class SamplerBuffers:
     """Pre-allocated static buffers for graph-safe sampling.
 
     Each per-request scalar parameter (temperature, top_k, top_p, seed,
-    repetition_penalty) is a ``Buffer`` owning a per-step slice, a slot-indexed
-    master cache, and pinned row staging. The RNG ``offset`` is also a ``Buffer``
+    repetition_penalty) is a ``Buffer`` owning a per-step slice and a slot-indexed
+    master cache. The RNG ``offset`` is also a ``Buffer``
     but round-trips on the GPU with no CPU middleman: gathered from its slot
     master before sampling, advanced in graph (``offset_buf += 1`` per sample),
     then scattered back to the master after replay — so a request's RNG stream
@@ -851,7 +850,7 @@ class SamplerBuffers:
 
         def mk(dtype: torch.dtype, default: float, slots=cg_slots) -> Buffer:
             return Buffer.allocate(
-                max_batch_size, cap, device, dtype, default, pinned, slots
+                max_batch_size, cap, device, dtype, default, slots
             )
 
         # seen token mask is not double-buffered, as it depends on the GPU
@@ -899,9 +898,10 @@ class SamplerBuffers:
     # ------------------------------------------------------------------
 
     def _write_master_row(self, slot: int, cfg: SamplingConfig) -> None:
-        """Push one config row into each scalar master buffer via pinned H2D.
+        """Push one config row into each scalar master buffer.
 
-        Cheap async copies; only runs on register or actual config change
+        Five scalar fills, queued in stream order ahead of the gather that
+        reads them; only runs on register or actual config change
         (change-detection lives in ``update_request_config``). The seen-token
         mask is NOT written here (it changes every step — see
         ``update_request_config``).
