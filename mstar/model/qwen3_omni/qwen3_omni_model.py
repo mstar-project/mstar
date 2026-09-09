@@ -51,6 +51,8 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -66,6 +68,8 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+from mstar.model.qwen3_omni.components.audio_encoder import AUT_ATTN
+from mstar.model.qwen3_omni.components.vision_encoder import QWEN_VIT_ATTN
 from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
@@ -370,7 +374,28 @@ class Qwen3OmniModel(Model):
             num_qo_heads=self.config.talker_text.num_attention_heads,
         )
 
+        vision = self.config.vision
+        audio = self.config.audio_encoder
         return [
+            # The encoder towers attend within one packed forward and cache
+            # nothing, so each stands alone. Separate specs, not two labels on
+            # one: the head geometry differs (vision 1152/16, audio 1280/20).
+            RaggedAttentionSpec(
+                resource_key=QWEN_VIT_ATTN, nodes={"Thinker"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=vision.num_heads,
+                    num_kv_heads=vision.num_heads,
+                    head_dim=vision.hidden_size // vision.num_heads,
+                ),
+            ),
+            RaggedAttentionSpec(
+                resource_key=AUT_ATTN, nodes={"Thinker"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=audio.encoder_attention_heads,
+                    num_kv_heads=audio.encoder_attention_heads,
+                    head_dim=audio.d_model // audio.encoder_attention_heads,
+                ),
+            ),
             KVSpec(
                 resource_key=THINKER_KV,
                 nodes={"Thinker"},

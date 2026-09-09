@@ -854,7 +854,6 @@ class PiecewiseGraphData:
     dummy_rids: list[str]
     shape: PiecewiseCaptureShape
     bucket: BucketKey
-    attn_state: Any = None
 
 
 class PiecewiseOutput:
@@ -1047,11 +1046,7 @@ class PiecewiseCudaGraphRunner:
         step = self._declare(
             dummy_rids, shape.seq_lens, self._bucket(shape), capture=True,
         )
-        attn_state = (
-            self._config.make_attn_state(shape)
-            if self._config.make_attn_state is not None else None
-        )
-        call = self._call_inputs(static_inputs, dummy_rids, attn_state)
+        call = self._call_inputs(static_inputs, dummy_rids)
 
         fn = self._config.capture_fn
         if self._config.compile:
@@ -1064,7 +1059,6 @@ class PiecewiseCudaGraphRunner:
 
         try:
             self._plan(step, shape)
-            self._plan_attn(attn_state, shape, list(shape.seq_lens))
             torch.cuda.synchronize()
             for _ in range(self.NUM_WARMUP):
                 with autocast_scope(self._autocast_dtype):
@@ -1073,7 +1067,6 @@ class PiecewiseCudaGraphRunner:
                 # capture after it) sees the shapes the first plan did
                 self._dummy_rows.reset(dummy_rids)
                 self._plan(step, shape)
-                self._plan_attn(attn_state, shape, list(shape.seq_lens))
             torch.cuda.synchronize()
 
             graph = torch.cuda.CUDAGraph()
@@ -1093,14 +1086,12 @@ class PiecewiseCudaGraphRunner:
             dummy_rids=list(dummy_rids),
             shape=shape,
             bucket=self._bucket(shape),
-            attn_state=attn_state,
         )
 
     def _call_inputs(
         self,
         static_inputs: dict[str, torch.Tensor],
         step_ids: list[str],
-        attn_state: Any = None,
     ) -> PiecewiseCallInputs:
         """What the region is handed, over the padded capture batch.
 
@@ -1116,7 +1107,6 @@ class PiecewiseCudaGraphRunner:
                 resources=dict(self._resources),
             ),
             kwargs=self._config.forward_kwargs,
-            attn_state=attn_state,
         )
 
     def _declare(
@@ -1137,13 +1127,6 @@ class PiecewiseCudaGraphRunner:
             slot_lease=SlotLease(slot=self.SLOT, bucket=bucket),
         ))
         return step
-
-    def _plan_attn(
-        self, attn_state, shape: PiecewiseCaptureShape, seq_lens: list[int],
-    ) -> None:
-        if attn_state is None or self._config.plan_attn_fn is None:
-            return
-        self._config.plan_attn_fn(attn_state, shape, seq_lens)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:
@@ -1273,22 +1256,19 @@ class PiecewiseCudaGraphRunner:
                 # reads whatever is here; zero rather than last step's values
                 buffer[n:].zero_()
 
-        padded_seq_lens = None
-        if request_ids is not None or data.attn_state is not None:
-            padded_seq_lens = self._config.replay_seq_lens(
-                data.shape, seq_lens, real_bs
-            )
         step = None
         if request_ids is not None:
             step_ids = [
                 *request_ids, *data.dummy_rids[real_bs:data.shape.bs]
             ]
             step = self._declare(
-                step_ids, padded_seq_lens, data.bucket, capture=False,
+                step_ids,
+                self._config.replay_seq_lens(data.shape, seq_lens, real_bs),
+                data.bucket,
+                capture=False,
             )
         try:
             self._plan(step, data.shape)
-            self._plan_attn(data.attn_state, data.shape, padded_seq_lens)
             data.graph.replay()
             if step is not None:
                 self._step_runner.commit(step)

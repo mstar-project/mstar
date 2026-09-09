@@ -40,10 +40,61 @@ def test_data_url_roundtrip(tmp_path):
         assert f.read() == raw
 
 
+@pytest.mark.parametrize("raw", [b"R", b"RI", b"\x89PNG hello world"])
+@pytest.mark.parametrize("padded", [True, False])
+@pytest.mark.parametrize("wrap", [0, 4, 76])
+@pytest.mark.parametrize("trailing", ["", "\n", "\r\n"])
+def test_data_url_accepts_unpadded_and_whitespace(raw, padded, wrap, trailing, tmp_path):
+    encoded = base64.b64encode(raw).decode()
+    if not padded:
+        encoded = encoded.rstrip("=")
+    if wrap:
+        encoded = "\n".join(encoded[index : index + wrap] for index in range(0, len(encoded), wrap))
+    modality, path = media_io.save_data_url(
+        "data:image/png;base64," + encoded + trailing,
+        tmp_path,
+    )
+    assert modality == "image" and path.endswith(".png")
+    with open(path, "rb") as f:
+        assert f.read() == raw
+
+
 def test_save_base64_audio(tmp_path):
     raw = b"RIFFfake"
     modality, path = media_io.save_base64(base64.b64encode(raw).decode(), "wav", "audio", tmp_path)
     assert modality == "audio" and path.endswith(".wav")
+
+
+@pytest.mark.parametrize("raw", [b"R", b"RI"])
+def test_save_base64_audio_accepts_unpadded(raw, tmp_path):
+    # Some OpenAI clients strip the trailing "=" from input_audio.data; a
+    # 1- or 2-byte payload is the case that needs 2 or 1 pad chars back.
+    encoded = base64.b64encode(raw).decode().rstrip("=")
+    modality, path = media_io.save_base64(encoded, "wav", "audio", tmp_path)
+    assert modality == "audio" and path.endswith(".wav")
+    with open(path, "rb") as f:
+        assert f.read() == raw
+
+
+@pytest.mark.parametrize("raw", [b"R", b"RI", b"RIFFfake"])
+@pytest.mark.parametrize("padded", [True, False])
+@pytest.mark.parametrize("wrap", [0, 4, 76])
+@pytest.mark.parametrize("trailing", ["", "\n", "\r\n"])
+def test_save_base64_audio_accepts_whitespace(raw, padded, wrap, trailing, tmp_path):
+    # b64decode ignores whitespace, so counting it when restoring padding
+    # computes the padding from the wrong length. A 1-byte payload with one
+    # trailing newline is the smallest case that breaks: the raw length is a
+    # multiple of 4 plus 3, so one "=" is appended to a body that needs two.
+    # MIME encoders wrap at 76 columns, so this arrives from ordinary clients.
+    encoded = base64.b64encode(raw).decode()
+    if not padded:
+        encoded = encoded.rstrip("=")
+    if wrap:
+        encoded = "\n".join(encoded[index : index + wrap] for index in range(0, len(encoded), wrap))
+    modality, path = media_io.save_base64(encoded + trailing, "wav", "audio", tmp_path)
+    assert modality == "audio" and path.endswith(".wav")
+    with open(path, "rb") as f:
+        assert f.read() == raw
 
 
 def test_png_data_url():

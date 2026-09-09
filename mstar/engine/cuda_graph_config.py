@@ -182,9 +182,6 @@ class PiecewiseCallInputs:
     engine_inputs: ModelInputsFromEngine
     # ``config.forward_kwargs``, unchanged
     kwargs: dict[str, Any] = field(default_factory=dict)
-    # The bucket's cacheless attention wrapper, replanned outside the graph
-    # before each replay. None unless the config supplies make_attn_state.
-    attn_state: Any = None
 
     @property
     def resources(self) -> dict[str, Any]:
@@ -219,13 +216,6 @@ class PiecewiseCudaGraphConfig(ABC):
     lease_before_step: bool = False
     # static kwargs threaded into capture_fn (e.g. cond_tokens, is_causal)
     forward_kwargs: dict[str, Any] = field(default_factory=dict)
-    # (5) attention planning without a KV cache, for regions running FlashInfer
-    #     ragged varlen: the plan is host-side, so it cannot live in the graph.
-    #     make_attn_state builds one wrapper per bucket (needs use_cuda_graph=True
-    #     so replanning reuses the captured index buffers); plan_attn_fn replans it
-    #     before each replay.
-    make_attn_state: Callable[[PiecewiseCaptureShape], Any] | None = None
-    plan_attn_fn: Callable[[Any, PiecewiseCaptureShape, list[int]], None] | None = None
     # None => defer to the runner's default batch-size buckets
     capture_batch_sizes: list[int] | None = None
     # Whether to torch.compile capture_fn before capture. Default off; the

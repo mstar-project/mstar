@@ -21,10 +21,9 @@ from mstar.model.components.encoder_telemetry import (
     note_encoder_layout,
     note_encoder_path,
 )
+from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.varlen_attention import (
     capture_legal_backend,
-    make_fi_graph_state,
-    plan_fi_graph_state,
     set_fi_override,
     varlen_attention,
 )
@@ -33,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 # Mirrors HF's BaseModelOutput.last_hidden_state; defined at module scope.
 AudioEncoderOutput = namedtuple("AudioEncoderOutput", ["last_hidden_state"])
+
+# Resource key this encoder's cacheless attention is declared under.
+AUT_ATTN = "aut_attn"
 
 # Measured buckets: s2t (1..7 segments, 36..426 tokens) and s2s (1..16, ~1057).
 CAPTURE_TOKENS_AUDIO = (48, 64, 96, 128, 192, 256, 384, 512, 704, 896, 1088)
@@ -212,9 +214,6 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
             return None
 
         d_model = self.config.d_model
-        num_heads = self.num_heads
-        head_dim = d_model // num_heads
-        scale = head_dim ** -0.5
 
         def make_static_inputs(shape):
             # x matches autocast dtype so the per-replay copy_ is a same-dtype
@@ -227,19 +226,21 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
                                           device=device),
             }
 
-        def make_attn_state(shape):
-            return make_fi_graph_state(device, shape.bs)
-
-        def plan_attn_fn(state, shape, seq_lens):
-            plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale,
-                                autocast_dtype)
+        def declare_step(request_ids, seq_lens):
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=seq_len)
+                    for rid, seq_len in zip(request_ids, seq_lens, strict=True)
+                ],
+                steps={AUT_ATTN: AttentionStep(causal=False)},
+            )
 
         def capture_fn(inp):
             # Route the block loop's attention through the runner-owned wrapper.
             # max_seqlen is unused: the FI-external path ignores it and capture
             # never reaches the flash-attn branch (_fi_override is set).
             static_inputs = inp.static_inputs
-            set_fi_override(inp.attn_state)
+            set_fi_override(inp.resources[AUT_ATTN])
             try:
                 x = self._layer_loop_tail(
                     static_inputs["x"], static_inputs["cu_seqlens"], 0)
@@ -250,8 +251,7 @@ class NativeQwen3OmniAudioEncoder(nn.Module):
         return PiecewisePackedConfig(
             capture_fn=capture_fn,
             make_static_inputs=make_static_inputs,
-            make_attn_state=make_attn_state,
-            plan_attn_fn=plan_attn_fn,
+            declare_step=declare_step,
             total_tokens=list(CAPTURE_TOKENS_AUDIO),
             capture_batch_sizes=list(CAPTURE_BATCH_SIZES_AUDIO),
         )

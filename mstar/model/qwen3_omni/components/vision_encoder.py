@@ -22,10 +22,9 @@ from mstar.model.components.encoder_telemetry import (
     note_encoder_layout,
     note_encoder_path,
 )
+from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.varlen_attention import (
     capture_legal_backend,
-    make_fi_graph_state,
-    plan_fi_graph_state,
     set_fi_override,
     varlen_attention,
 )
@@ -33,6 +32,9 @@ from mstar.model.components.varlen_attention import (
 logger = logging.getLogger(__name__)
 
 # Measured buckets: i2t (1 segment, 576..1024 tokens) and i2s (4 images, ~4096).
+
+# Resource key this encoder's cacheless attention is declared under.
+QWEN_VIT_ATTN = "qwen_vit_attn"
 # MUST stay divisible by spatial_merge_size**2 (=4).
 CAPTURE_TOKENS_VISION = (576, 704, 768, 896, 1024, 1280, 1536, 2048, 3072, 4096)
 # One bs value above the observed max of 4; padding bs up is free.
@@ -204,9 +206,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
             return None
 
         hidden_size = self.config.hidden_size
-        num_heads = self.config.num_heads
-        head_dim = hidden_size // num_heads
-        scale = head_dim ** -0.5
+        head_dim = hidden_size // self.config.num_heads
 
         def make_static_inputs(shape):
             # x in autocast dtype (same-dtype replay copy). cos/sin are per-layout
@@ -224,19 +224,21 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
                                        dtype=torch.float32, device=device),
             }
 
-        def make_attn_state(shape):
-            return make_fi_graph_state(device, shape.bs)
-
-        def plan_attn_fn(state, shape, seq_lens):
-            plan_fi_graph_state(state, seq_lens, num_heads, head_dim, scale,
-                                   autocast_dtype)
+        def declare_step(request_ids, seq_lens):
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=seq_len)
+                    for rid, seq_len in zip(request_ids, seq_lens, strict=True)
+                ],
+                steps={QWEN_VIT_ATTN: AttentionStep(causal=False)},
+            )
 
         def capture_fn(inp):
             # max_seqlen unused (FI-external path ignores it; capture never takes
             # the flash-attn branch). Route attention through the runner wrapper.
             static_inputs = inp.static_inputs
             pos = (static_inputs["pos_cos"], static_inputs["pos_sin"])
-            set_fi_override(inp.attn_state)
+            set_fi_override(inp.resources[QWEN_VIT_ATTN])
             try:
                 merged, deepstack = self._block_loop_tail(
                     static_inputs["x"], static_inputs["cu_seqlens"], 0, pos)
@@ -250,8 +252,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
         return PiecewisePackedConfig(
             capture_fn=capture_fn,
             make_static_inputs=make_static_inputs,
-            make_attn_state=make_attn_state,
-            plan_attn_fn=plan_attn_fn,
+            declare_step=declare_step,
             total_tokens=list(CAPTURE_TOKENS_VISION),
             capture_batch_sizes=list(CAPTURE_BATCH_SIZES_VISION),
         )
