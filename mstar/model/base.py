@@ -524,6 +524,23 @@ class Model(ABC):
         """
         pass
 
+    def release_submodule(self, node_name: str) -> None:
+        """Forget any cached submodule for ``node_name``.
+
+        The ``reload`` residency policy drops a node's weights after each
+        execution and rebuilds it from the checkpoint on the next one. Models
+        cache their submodules — ``_submodule_cache`` is the convention across
+        this package — so without this the "rebuild" hands back the very object
+        whose storage was just released, and the next ``.to(device)`` dies with
+        "Cannot copy out of meta tensor".
+
+        The default drops the conventional cache entry, which covers every model
+        here. Override if yours caches differently.
+        """
+        cache = getattr(self, "_submodule_cache", None)
+        if isinstance(cache, dict):
+            cache.pop(node_name, None)
+
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
 

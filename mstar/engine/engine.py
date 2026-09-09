@@ -53,6 +53,24 @@ logger = logging.getLogger(__name__)
 # launch queue and block a launch (machine/driver dependent).
 _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 
+# Log the allocator's high-water mark as it grows. `nvidia-smi` reports memory
+# *reserved* by the process — caching-allocator blocks that are free but unreturned,
+# plus fragmentation — which is too coarse to see a residency policy's effect.
+# torch.max_memory_allocated is the live figure. Off by default: it costs a
+# device query per step.
+_LOG_PEAK_MEM = os.environ.get("MSTAR_LOG_PEAK_MEM", "0") == "1"
+
+# Node weight residency. A RESIDENT node's weights are loaded to the device once
+# and stay there (the historical behavior, and the default). An ON_DEMAND node
+# is built on the host and moved to the device only while it executes, then
+# evicted — so a model whose components sum past device memory can still run,
+# at the cost of a transfer per phase. Only one ON_DEMAND node is resident at a
+# time, which makes the peak the largest single component rather than the sum.
+RESIDENT = "resident"
+ON_DEMAND = "on_demand"
+RELOAD = "reload"
+RESIDENCY_POLICIES = (RESIDENT, ON_DEMAND, RELOAD)
+
 
 @dataclass
 class SubmoduleManagement:
@@ -200,6 +218,18 @@ class Engine:
         self._autocast_dtype = autocast_dtype
         self._resources: dict[str, Resource] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
+        # Nodes whose weights live on the host between executions, and which
+        # one of them (at most one) is currently on the device.
+        self._on_demand: set[str] = set()
+        # `reload` nodes go further than `on_demand`: their storage is dropped
+        # entirely and rebuilt from the checkpoint on next use. On a unified
+        # memory part (GB10) host and device share one pool, so moving weights
+        # "to the host" frees nothing system-wide — only dropping them does.
+        self._reload: set[str] = set()
+        self._submodule_factory: Callable[[str], NodeSubmodule] | None = None
+        self._submodule_release: Callable[[str], None] | None = None
+        self._resident_on_demand: str | None = None
+        self._peak_mem_gib: float = 0.0
         self._runner: StepRunner = None
 
         self._enable_nvtx = enable_nvtx
@@ -213,8 +243,21 @@ class Engine:
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
+        on_demand_nodes: set[str] | None = None,
+        reload_nodes: set[str] | None = None,
+        submodule_factory: "Callable[[str], NodeSubmodule] | None" = None,
+        submodule_release: "Callable[[str], None] | None" = None,
     ):
         self._device = device
+        self._on_demand = set(on_demand_nodes or ()) & set(submodules.keys())
+        self._reload = set(reload_nodes or ()) & set(submodules.keys())
+        self._submodule_factory = submodule_factory
+        self._submodule_release = submodule_release
+        if self._reload and submodule_factory is None:
+            raise ValueError(
+                "reload-residency nodes need a submodule_factory to rebuild them: "
+                f"{sorted(self._reload)}"
+            )
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype
 
@@ -289,6 +332,10 @@ class Engine:
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
 
+            if node_name in self._on_demand:
+                # Compiled code guards on parameter devices; an evict/reload
+                # cycle would invalidate them every phase.
+                continue
             if getattr(submodule, "disable_torch_compile", False):
                 logger.info("Engine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
@@ -315,10 +362,120 @@ class Engine:
         """This node's autocast dtype, or None for one that opted out."""
         return None if submodule.disable_autocast else self._autocast_dtype
 
+    def _report_peak_mem(self, node_name: str) -> None:
+        """Log the allocator high-water mark whenever it grows materially.
+
+        Gated on MSTAR_LOG_PEAK_MEM. The threshold keeps a long decode loop from
+        logging a line per step while its cache creeps upward.
+        """
+        if not _LOG_PEAK_MEM or self._device is None or self._device.type != "cuda":
+            return
+        peak = torch.cuda.max_memory_allocated(self._device) / (1024 ** 3)
+        if peak > self._peak_mem_gib + 0.25:
+            self._peak_mem_gib = peak
+            logger.info(
+                "peak_mem: %.2f GiB allocated (high-water, after %s)", peak, node_name
+            )
+
+    def _cuda_allocated_gib(self) -> float:
+        if self._device is None or self._device.type != "cuda":
+            return 0.0
+        return torch.cuda.memory_allocated(self._device) / (1024 ** 3)
+
+    @property
+    def _paged(self) -> set[str]:
+        """Nodes that are not permanently resident, under either policy."""
+        return self._on_demand | self._reload
+
+    def _evict(self, node_name: str) -> None:
+        """Release ``node_name``'s device memory under its policy.
+
+        `on_demand` moves the weights to the host — fast to bring back, but on a
+        unified-memory part they still occupy the one physical pool.
+        `reload` drops the storage outright (params become meta tensors, which
+        keeps the module object valid for bookkeeping like cleanup_request) and
+        the next execution rebuilds it from the checkpoint. Slower, and the only
+        thing that actually frees memory when host and device are the same RAM.
+        """
+        submodule = self._submodules[node_name].submodule
+        if node_name in self._reload:
+            # Drop the model's cached reference FIRST: every model here memoises
+            # get_submodule, so a rebuild would otherwise return this same object
+            # after its storage is gone.
+            if self._submodule_release is not None:
+                self._submodule_release(node_name)
+            submodule.to("meta")
+        else:
+            submodule.to("cpu")
+        if self._device is not None and self._device.type == "cuda":
+            torch.cuda.empty_cache()
+        logger.info(
+            "residency: evicted %s (%s), device allocated %.2f GiB",
+            node_name,
+            RELOAD if node_name in self._reload else ON_DEMAND,
+            self._cuda_allocated_gib(),
+        )
+
+    def _load(self, node_name: str) -> None:
+        """Bring ``node_name``'s weights back to the device under its policy."""
+        mgmt = self._submodules[node_name]
+        if node_name in self._reload:
+            # Rebuilt from the checkpoint: the previous storage is gone, so this
+            # is a fresh module and everything bound to the old one must be
+            # rebound.
+            rebuilt = self._submodule_factory(node_name)
+            rebuilt.requires_grad_(False)
+            rebuilt.bind_node_resources(mgmt.resources)
+            mgmt.submodule = rebuilt
+            mgmt.forward = rebuilt.forward
+            mgmt.forward_batched = rebuilt.forward_batched
+        else:
+            mgmt.submodule.to(self._device)
+        logger.info(
+            "residency: loaded %s (%s), device allocated %.2f GiB",
+            node_name,
+            RELOAD if node_name in self._reload else ON_DEMAND,
+            self._cuda_allocated_gib(),
+        )
+
+    def _ensure_resident(self, node_name: str) -> None:
+        """Make ``node_name``'s weights available on the device.
+
+        No-op for RESIDENT nodes (everything, unless a config says otherwise).
+        For a paged node this evicts whichever paged node currently holds the
+        device — at most one ever does — and brings this one in. The eviction is
+        what bounds the peak: components never co-reside, so the high-water mark
+        is the largest single node, not their sum.
+        """
+        if node_name not in self._paged:
+            return
+        if self._resident_on_demand == node_name:
+            return
+
+        if self._resident_on_demand is not None:
+            evicted = self._resident_on_demand
+            # Clear first: a failed load must not leave two nodes claiming
+            # residency, which would let the next call skip the eviction.
+            self._resident_on_demand = None
+            self._evict(evicted)
+
+        self._load(node_name)
+        self._resident_on_demand = node_name
+
     def warmup(self) -> None:
         cg_runners: dict[str, CudaGraphRunner] = {}
         piecewise: dict[str, dict[str, PiecewiseCudaGraphRunner]] = {}
+        # An ON_DEMAND node is skipped everywhere below. A captured graph
+        # records the addresses of the weights it read; evicting them and
+        # reloading elsewhere would leave the replay pointing at freed memory.
+        if self._on_demand:
+            logger.info(
+                "residency: %s are on_demand — no CUDA-graph capture or compile for them",
+                sorted(self._paged),
+            )
         for node_name, submodule_mgmt in self._submodules.items():
+            if node_name in self._paged:
+                continue
             submodule = submodule_mgmt.submodule
             cg_runners[node_name] = CudaGraphRunner(
                 submodule_name=node_name,
@@ -338,11 +495,15 @@ class Engine:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
         for node_name in self._submodules:
+            if node_name in self._paged:
+                continue
             cg_runners[node_name].prepare_for_capture()
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
 
         for node_name, submodule_mgmt in self._submodules.items():
+            if node_name in self._paged:
+                continue
             runner = cg_runners[node_name]
             runner.warmup_and_capture()
             if runner.any_graphs:
@@ -399,6 +560,7 @@ class Engine:
         that rid out rather than losing the batch. A rid the submodule declines
         (returns None) leaves the same way, without being an error.
         """
+        self._ensure_resident(batch.node_name)
         if self._enable_nvtx:
             range_push(f"engine.prepare_inputs.bs{len(batch.request_ids)}")
         try:
@@ -457,6 +619,7 @@ class Engine:
             batch.outputs_ready.set()
             batch.release_waiters()
             return batch.outputs
+        self._ensure_resident(batch.node_name)
         if nvtx:
             range_push(
                 f"engine.{batch.node_name}.{batch.step_context.graph_walk}"
@@ -482,6 +645,7 @@ class Engine:
         finally:
             batch.preplan_event = None
             batch.release_waiters()
+            self._report_peak_mem(batch.node_name)
             if nvtx:
                 range_pop()
 
