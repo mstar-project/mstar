@@ -64,6 +64,12 @@ class MlaAttentionStep(ResourceStep):
     # the one pass the KV segments describe (q = span, kv = stored + span).
     # Every kv length must fit the segment's declared span.
     sub_plans: tuple[MlaSubPlan, ...] | None = None
+    # Which slot the first entry of ``sub_plans`` occupies, and how many the
+    # region has in all. A region can plan its passes in two steps — the
+    # ones a readback does not decide before it, the rest after — and the
+    # later step must land beside, not over, the earlier one's plans.
+    first_sub_plan: int = 0
+    num_sub_plans: int | None = None
 
 
 @functools.cache
@@ -648,22 +654,32 @@ class MlaAttentionManager(AttentionManager):
         target = self._preplan if ctx.is_preplan else self._current
         target.clear()
         page_size = self._kv_config.page_size
+        first = step.first_sub_plan
         for label, kv_out in kv_outputs.items():
             views = kv_out.views
-            sub_plans = step.sub_plans or (MlaSubPlan(
+            # None: the one pass the segments describe; () : nothing to plan
+            # in this phase (a second phase with no chain rows)
+            sub_plans = step.sub_plans if step.sub_plans is not None else (MlaSubPlan(
                 q_lens=tuple(v.to_compute for v in views),
                 kv_lens=tuple(v.length for v in views),
             ),)
+            n_sub = step.num_sub_plans or (first + len(sub_plans))
+            if first + len(sub_plans) > n_sub:
+                raise ValueError(
+                    f"sub-plans {first}..{first + len(sub_plans) - 1} of {n_sub}"
+                )
             hosts = [build_host_plan(views, sp, page_size) for sp in sub_plans]
             if lease is not None:
-                plan = self._cg_plan(lease, label, len(views), len(sub_plans))
+                plan = self._cg_plan(lease, label, len(views), n_sub)
             else:
                 plan = self._eager_plan(
-                    label, len(views), max(h.total_tokens for h in hosts), len(sub_plans),
+                    label, len(views), max((h.total_tokens for h in hosts), default=0), n_sub,
                 )
-            for wrapper, host in zip(plan.wrappers, hosts, strict=False):
-                wrapper.plan(host, causal=step.causal, dtype=self._dtype)
-            plan.host_plans = hosts
+            for i, host in enumerate(hosts):
+                plan.wrappers[first + i].plan(host, causal=step.causal, dtype=self._dtype)
+            if len(plan.host_plans) != n_sub:
+                plan.host_plans = [None] * n_sub
+            plan.host_plans[first:first + len(hosts)] = hosts
             plan.sub = 0
             target[label] = plan
         self._preplanned = ctx.is_preplan

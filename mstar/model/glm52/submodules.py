@@ -255,6 +255,17 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_draft_phase_graph = (
             os.environ.get("MSTAR_GLM52_MTP_DRAFT_PHASE_GRAPH", "1") == "1"
         )
+        # Hoist the accepted-count-independent half of the draft phase above
+        # the verify readback: the full-row sync inputs (rows < e are the
+        # emitted tokens, rows >= e rejected continuations on transient
+        # slots), the contiguous positions P0+1..P0+k+1, and sub-plan 0's
+        # attention plan go in through runner.stage() while the host would
+        # otherwise sit in the .tolist(); only last_rows, chain_pos_* and the
+        # k-1 chain sub-plans wait for e. Bit-exact by construction; default
+        # off until a TP8 arm measures it.
+        self._mtp_phase_prepare = (
+            os.environ.get("MSTAR_GLM52_MTP_PHASE_PREPARE", "0") == "1"
+        )
         # One-shot warnings: an MTP step whose graphs silently run eager is a
         # 13x regression that looks like "MTP is slow".
         self._mtp_trunk_eager_warned = False
@@ -302,9 +313,15 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         res = engine_inputs.resources if engine_inputs is not None else self.node_resources
         return res[ATTN_RESOURCE]
 
-    def _attn_step(self, sub_plans: tuple[MlaSubPlan, ...] | None = None):
+    def _attn_step(
+        self, sub_plans: tuple[MlaSubPlan, ...] | None = None,
+        first_sub_plan: int = 0, num_sub_plans: int | None = None,
+    ):
         if self.config.mla_absorb:
-            return MlaAttentionStep(causal=True, sub_plans=sub_plans)
+            return MlaAttentionStep(
+                causal=True, sub_plans=sub_plans,
+                first_sub_plan=first_sub_plan, num_sub_plans=num_sub_plans,
+            )
         if sub_plans is not None:
             raise RuntimeError("sub-plans need the absorbed MLA attention resource")
         return AttentionStep(causal=True)
@@ -312,6 +329,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def _kv_attn_step(
         self, request_ids: list[str], spans: list[int],
         sub_plans: tuple[MlaSubPlan, ...] | None = None, commit: bool = True,
+        first_sub_plan: int = 0, num_sub_plans: int | None = None,
     ) -> SubmoduleStep:
         """A step over the trunk stream: KV pages for ``spans`` plus the
         attention plan(s). ``commit=False`` for a pass whose rows are
@@ -323,7 +341,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             ],
             steps={
                 KV_RESOURCE: KVStep(commit=commit),
-                ATTN_RESOURCE: self._attn_step(sub_plans),
+                ATTN_RESOURCE: self._attn_step(sub_plans, first_sub_plan, num_sub_plans),
             },
         )
 
@@ -626,7 +644,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     def _draft_phase_region_step(
         self, request_ids: list[str], seq_lens: list[int],
-        e_list: list[int] | None = None,
+        e_list: list[int] | None = None, phase: str | None = None,
     ) -> SubmoduleStep:
         """The draft-phase graph's step: with the stream at P0+e (the trunk's
         k+1 rows committed, k+1-e rewound), sub-plan 0 is the padded sync
@@ -636,29 +654,48 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         span covers the deepest sub-plan so admit reserves its pages.
         ``e_list`` arrives per replay (``run(step_kwargs=)``); capture and
         warmup have fresh streams at 0 and plan e=0 (P0 = 0), which gives
-        every sub-plan a valid shape."""
+        every sub-plan a valid shape.
+
+        ``phase="prepare"`` (``runner.stage`` before the verify readback):
+        sub-plan 0 only, with the stream still at P0+k+1 (nothing rewound
+        yet), so it needs no e and no span. ``phase="finish"`` (the paired
+        ``run``, after the rewind to P0+e): sub-plans 1..k-1 beside it."""
         k = self.config.mtp_num_draft_tokens
         rows = k + 1
         kv = self._kv()
         present = [sl > 0 for sl in seq_lens]
+        stored = [kv.stored_len(rid) if p else 0 for rid, p in zip(request_ids, present, strict=True)]
+        if phase == "prepare":
+            # the trunk's k+1 rows are committed: the sync pass attends
+            # exactly the stream as it stands
+            sub_plans = (MlaSubPlan(
+                q_lens=tuple(rows if p else 0 for p in present),
+                kv_lens=tuple(s if p else 0 for s, p in zip(stored, present, strict=True)),
+            ),)
+            return self._kv_attn_step(
+                request_ids, [0] * len(present), sub_plans, commit=False,
+                first_sub_plan=0, num_sub_plans=k,
+            )
         if e_list is None:
             e_list = [0] * sum(present)
         e_iter = iter(e_list)
         e_by_row = [next(e_iter) if p else 0 for p in present]
-        stored = [kv.stored_len(rid) if p else 0 for rid, p in zip(request_ids, present, strict=True)]
+        chain = [MlaSubPlan(
+            q_lens=tuple(1 if p else 0 for p in present),
+            kv_lens=tuple(s + it if p else 0 for s, p in zip(stored, present, strict=True)),
+        ) for it in range(1, k)]
+        if phase == "finish":
+            spans = [k - 1 if p else 0 for p in present]
+            return self._kv_attn_step(
+                request_ids, spans, tuple(chain), commit=False,
+                first_sub_plan=1, num_sub_plans=k,
+            )
         p0 = [s - e for s, e in zip(stored, e_by_row, strict=True)]
         spans = [max(rows - e, k - 1) if p else 0 for p, e in zip(present, e_by_row, strict=True)]
         sub_plans = [MlaSubPlan(
             q_lens=tuple(rows if p else 0 for p in present),
             kv_lens=tuple(p + rows if pr else 0 for p, pr in zip(p0, present, strict=True)),
-        )]
-        for it in range(1, k):
-            sub_plans.append(MlaSubPlan(
-                q_lens=tuple(1 if p else 0 for p in present),
-                kv_lens=tuple(
-                    s + it if p else 0 for s, p in zip(stored, present, strict=True)
-                ),
-            ))
+        ), *chain]
         return self._kv_attn_step(request_ids, spans, tuple(sub_plans), commit=False)
 
     # ── captured regions ──
@@ -1021,10 +1058,34 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         target_argmax_all = logits.argmax(dim=-1)  # (sum(k+1),)
         total_rows = row_starts[-1]
         timer.mark("trunk")
+        phase_runner = runners.get("phase")
+        rows = self.config.mtp_num_draft_tokens + 1
+        prepared = False
+        pair_rows = self._mtp_pair_rows(hidden, prenorm)
+        if (
+            phase_runner is not None and self._mtp_phase_prepare
+            and all(sl == rows for sl in seq_lens)
+        ):
+            # the e-independent half of the draft phase, while the GPU is
+            # still running the trunk (see _mtp_phase_prepare)
+            pos_full: list[int] = []
+            for rid, sl in zip(request_ids, seq_lens, strict=True):
+                p0 = kv.stored_len(rid) - sl
+                pos_full.extend(range(p0 + 1, p0 + 1 + sl))
+            phase_runner.stage(
+                static_inputs={
+                    "sync_ids": target_argmax_all,
+                    "pair_hidden": pair_rows,
+                    "sync_position_ids": pinned(pos_full, torch.long),
+                },
+                request_ids=request_ids, seq_lens=list(seq_lens),
+                step_kwargs={"phase": "prepare"},
+            )
+            prepared = True
+            timer.mark("prepare")
         host = torch.cat([input_ids, target_argmax_all]).tolist()
         timer.mark("verify_d2h")
         inputs_h, target_h = host[:total_rows], host[total_rows:]
-        pair_rows = self._mtp_pair_rows(hidden, prenorm)
         eos_ids = self.config.eos_token_ids
         results: dict[str, NameToTensorList] = {}
         sync_tokens, pair_hiddens = [], []
@@ -1060,7 +1121,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         drafts = self._mtp_sync_and_draft(
             engine_inputs, sync_tokens, pair_hiddens,
             draft_runner=runners.get("draft"), sync_runner=sync_runner,
-            phase_runner=runners.get("phase"),
+            phase_runner=phase_runner, prepared=prepared,
         )
         for i, rid in enumerate(request_ids):
             emitted = results[rid]["new_token"][0]
@@ -1077,6 +1138,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         draft_runner=None,
         sync_runner=None,
         phase_runner=None,
+        prepared: bool = False,
     ) -> list[torch.Tensor]:
         """Extend the MTP plane over the newly committed tokens, then draft
         k tokens autoregressively. Returns per-request (k,) draft tensors.
@@ -1101,30 +1163,38 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         starts = [kv.stored_len(rid) for rid in request_ids]
         rows = k + 1
 
+        assert not prepared or phase_runner is not None
         if phase_runner is not None:
             # ONE graph for sync + draft-1 head + k-1 chain iterations; the
             # region's step declares k sub-plans from e_list (P0 = start - e)
             assert all(e <= rows for e in e_list), (
                 f"draft-phase graph got rows {e_list} outside [1, {rows}]")
             pos_l, last_l, _ = mtp_sync_padded_layout(e_list, starts, k)
-            sync_ids = torch.zeros(num * rows, dtype=torch.long, device=device)
-            pair_h = torch.zeros(
-                (num * rows, pair_hiddens[0].shape[-1]),
-                dtype=pair_hiddens[0].dtype, device=device)
-            for i, (t, h) in enumerate(zip(sync_tokens, pair_hiddens, strict=True)):
-                sync_ids[i * rows:i * rows + t.shape[0]] = t
-                pair_h[i * rows:i * rows + h.shape[0]] = h
-            phase_inputs = {
-                "sync_ids": sync_ids,
-                "pair_hidden": pair_h,
-                "sync_position_ids": pinned(pos_l, torch.long),
-                "last_rows": pinned(last_l, torch.long),
-            }
+            if prepared:
+                # sync inputs and sub-plan 0 went in through stage() before
+                # the readback; only the e-dependent leftovers travel here
+                phase_inputs = {"last_rows": pinned(last_l, torch.long)}
+                step_kwargs = {"e_list": list(e_list), "phase": "finish"}
+            else:
+                sync_ids = torch.zeros(num * rows, dtype=torch.long, device=device)
+                pair_h = torch.zeros(
+                    (num * rows, pair_hiddens[0].shape[-1]),
+                    dtype=pair_hiddens[0].dtype, device=device)
+                for i, (t, h) in enumerate(zip(sync_tokens, pair_hiddens, strict=True)):
+                    sync_ids[i * rows:i * rows + t.shape[0]] = t
+                    pair_h[i * rows:i * rows + h.shape[0]] = h
+                phase_inputs = {
+                    "sync_ids": sync_ids,
+                    "pair_hidden": pair_h,
+                    "sync_position_ids": pinned(pos_l, torch.long),
+                    "last_rows": pinned(last_l, torch.long),
+                }
+                step_kwargs = {"e_list": list(e_list)}
             for it in range(1, k):
                 phase_inputs[f"chain_pos_{it}"] = pinned([st + it for st in starts], torch.long)
             out = phase_runner.run(
                 static_inputs=phase_inputs, request_ids=request_ids,
-                seq_lens=[rows] * num, step_kwargs={"e_list": list(e_list)},
+                seq_lens=[rows] * num, step_kwargs=step_kwargs,
             )
             self._mtp_timer.mark("draft_phase")
             drafts = out["drafts"]  # (num, k), owned
