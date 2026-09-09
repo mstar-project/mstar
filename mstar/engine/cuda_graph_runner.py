@@ -956,7 +956,7 @@ class PiecewiseCudaGraphRunner:
             # names, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
             step = self._config.declare_step(
-                self._dummy_rows.names(f"{shape.bs}_{shape.total_tokens}", shape.bs),
+                self._dummy_rows.names(self._dummy_key(shape, 0), shape.bs),
                 list(shape.seq_lens),
             )
             if step is not None and any(
@@ -971,6 +971,12 @@ class PiecewiseCudaGraphRunner:
     @property
     def any_graphs(self) -> bool:
         return bool(self._graphs)
+
+    def _dummy_key(self, shape: PiecewiseCaptureShape, slot: int) -> str:
+        """Padding rows are per slot, as in ``CudaGraphRunner``: a slot's plan
+        and commit run against its own tail, so sharing rows between slots puts
+        two graphs on one set of per-request state."""
+        return f"{shape.bs}_{shape.total_tokens}_slot{slot}"
 
     def _bucket(self, shape: PiecewiseCaptureShape) -> BucketKey:
         return BucketKey(
@@ -1074,7 +1080,7 @@ class PiecewiseCudaGraphRunner:
 
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
         dummy_rids = self._dummy_rows.ensure(
-            f"{shape.bs}_{shape.total_tokens}", shape.bs
+            self._dummy_key(shape, slot), shape.bs
         )
         static_inputs = self._config.make_static_inputs(shape)
         step = self._declare(
@@ -1148,21 +1154,32 @@ class PiecewiseCudaGraphRunner:
 
     def _declare(
         self, request_ids: list[str], seq_lens: list[int],
-        bucket: BucketKey, capture: bool, slot: int
+        bucket: BucketKey, capture: bool, slot: int,
+        real_bs: int | None = None,
     ):
-        """The region's step over the padded batch, addressed at its slot."""
+        """The region's step over the padded batch, addressed at its slot.
+
+        The declaration covers every row, but the context reports only the real
+        head as ``request_ids`` and the padding tail on `set_padded_rids`, as
+        the outer path does. A resource sizes its per-request writeback off
+        ``ctx.request_ids``: counting the tail there makes it scatter padding
+        rows back over real state.
+        """
         if self._config.declare_step is None:
             return None
         step = self._config.declare_step(list(request_ids), list(seq_lens))
         if step is None:
             return None
-        step.set_ctx(StepContext(
-            request_ids=tuple(request_ids),
+        n = len(request_ids) if real_bs is None else real_bs
+        ctx = StepContext(
+            request_ids=tuple(request_ids[:n]),
             graph_walk=PIECEWISE_WALK,
             slot=slot,
             capture=capture,
             slot_lease=SlotLease(slot=slot, bucket=bucket),
-        ))
+        )
+        ctx.set_padded_rids(tuple(request_ids))
+        step.set_ctx(ctx)
         return step
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
@@ -1228,6 +1245,7 @@ class PiecewiseCudaGraphRunner:
         return self._graphs[min(fits, key=lambda key: key.seq_len)]
 
     def can_run(self, batch_size: int, total_tokens: int | None = None) -> bool:
+        # return False
         return self._resolve(batch_size, total_tokens) is not None
 
     @property
@@ -1243,6 +1261,7 @@ class PiecewiseCudaGraphRunner:
         Same question ``run`` settles per call, answered early so the outer
         ``declare_step`` can plan the region's resources against it.
         """
+        # return None
         data = self._resolve(batch_size, total_tokens)
         return None if data is None else SlotLease(
             slot=self._current_slot, bucket=data.bucket
@@ -1307,6 +1326,7 @@ class PiecewiseCudaGraphRunner:
                 data.bucket,
                 capture=False,
                 slot=self._current_slot,
+                real_bs=real_bs,
             )
         try:
             self._plan(step, data.shape)

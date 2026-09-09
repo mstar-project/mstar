@@ -682,9 +682,9 @@ class Engine:
                 return merged
 
         # Step 2: drive step, plan -> forward -> commit loop.
-        # Nothing stages before here, so only this loop fences: the rotation
-        # wraps after `num_slots` requests, and reusing a slot before the GPU
-        # is done with it would overwrite staging a queued H2D still reads.
+        # Nothing stages before here, so only this loop fences, in two places:
+        # on reuse inside the loop (the rotation wraps after `num_slots`
+        # requests), and on the way out — see below.
         fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
         slot_events: dict[int, torch.cuda.Event] = {}
 
@@ -719,6 +719,15 @@ class Engine:
             finally:
                 if nvtx:
                     range_pop()
+
+        # The batch leaves the rotation holding one slot, but the loop staged
+        # into every slot it walked. Releasing `commit_done` lets the plan
+        # thread pre-plan the next batch, which stages the slot after this
+        # one's — already used above, with its H2D possibly still queued. Drain
+        # those; this batch's own slot is the one the rotation accounts for.
+        for used, event in slot_events.items():
+            if used != base_slot:
+                event.synchronize()
         batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
