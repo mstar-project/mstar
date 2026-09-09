@@ -216,9 +216,12 @@ def build_model(cfg, seed: int):
             # survived to_empty is uninitialised memory.
             if b is not None and b.is_floating_point():
                 b.zero_()
+    # before the absorbed buffers are derived from the params: a buffer built
+    # from a grad-requiring param carries a grad_fn, and the compiled capture
+    # then tries to backward through the rmsnorm custom op
+    model.requires_grad_(False)
     process_weights_after_loading(model, DEVICE)
     model.eval()
-    model.requires_grad_(False)  # as Engine.load_model does; capture compiles the forward
     return model
 
 
