@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 08, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 09, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -587,10 +587,11 @@ submodules on the GPU. It compiles forwards, captures CUDA graphs, batches reque
 runs each step’s resource lifecycle: admit, plan, forward, commit.</p></li>
 <li><p><strong>Resources</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/</span></code>): the state that a node’s compute uses. This
 includes paged KV caches, the attention planned over them (FlashInfer or dense),
-cross-attention over a fixed context, position embeddings, and samplers. A model
+cross-attention over a fixed context, cacheless (ragged) attention for encoder towers
+that attend within one packed forward, position embeddings, and samplers. A model
 declares which resources each node needs, and the engine builds them. A node that
-declares no resources receives none. ViT and VAE encoders, codec decoders, and
-projection and combine stages are examples.</p></li>
+declares no resources receives none. VAE encoders, codec decoders, and projection and
+combine stages are examples.</p></li>
 <li><p><strong>Models</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/model/</span></code>): each model declares its computation graph, tokenization,
 node resources, and submodules. Registered via <code class="docutils literal notranslate"><span class="pre">mstar/model/registry.py</span></code>.</p></li>
 <li><p><strong>Graph</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/graph/</span></code>): computation-graph primitives — <code class="docutils literal notranslate"><span class="pre">GraphNode</span></code>,
@@ -715,7 +716,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 08, 2026.
+  Last updated on Sep 09, 2026.
   <br/>
 </p>
   </div>

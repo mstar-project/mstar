@@ -32,5 +32,6 @@ mstar.engine.resources.attn
    cross
    dense
    flashinfer
+   ragged
    wrappers
 

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 08, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 09, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -713,6 +713,25 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo"><code class="docutils literal notranslate"><span class="pre">PublishedInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo.update"><code class="docutils literal notranslate"><span class="pre">PublishedInfo.update()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.flashinfer_backend</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.head_dim"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.head_dim</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_for"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_segments_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_per_request"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_segments_per_request</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_tokens_for"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_tokens_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_tokens_per_request"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_tokens_per_request</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.num_kv_heads"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.num_kv_heads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.num_qo_heads"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.num_qo_heads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.shard"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.shard()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.sm_scale"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.sm_scale</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.config"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resource_class</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RequestOffloading"><code class="docutils literal notranslate"><span class="pre">RequestOffloading</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1766,6 +1785,152 @@ resource stays free of the manager and its kernels.</p>
 <dd class="field-even"><p>None</p>
 </dd>
 </dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">RaggedAttentionConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sm_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_segments_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_tokens_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flashinfer_backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Varlen self-attention over segments packed into one forward, with no KV
+cache: the whole layout is this step’s, and nothing carries to the next.</p>
+<p>Head counts are <strong>pre-sharding</strong>; the engine narrows them to the rank’s
+slice at build, as it does for a <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>sm_scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>max_segments_per_request</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>max_tokens_per_request</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>flashinfer_backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend">
+<span class="sig-name descname"><span class="pre">flashinfer_backend</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.head_dim">
+<span class="sig-name descname"><span class="pre">head_dim</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.head_dim" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.max_segments_for">
+<span class="sig-name descname"><span class="pre">max_segments_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">bs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionConfig.max_segments_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_for" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>bs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.max_segments_per_request">
+<span class="sig-name descname"><span class="pre">max_segments_per_request</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_per_request" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.max_tokens_for">
+<span class="sig-name descname"><span class="pre">max_tokens_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">bs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionConfig.max_tokens_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.max_tokens_for" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>bs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.max_tokens_per_request">
+<span class="sig-name descname"><span class="pre">max_tokens_per_request</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.max_tokens_per_request" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.num_kv_heads">
+<span class="sig-name descname"><span class="pre">num_kv_heads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.num_kv_heads" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.num_qo_heads">
+<span class="sig-name descname"><span class="pre">num_qo_heads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.num_qo_heads" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.shard">
+<span class="sig-name descname"><span class="pre">shard</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_shards</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionConfig.shard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.shard" title="Link to this definition">#</a></dt>
+<dd><p>Narrow the head counts to one rank’s slice; see <code class="docutils literal notranslate"><span class="pre">KVConfig.shard</span></code>.</p>
+<p>Idempotent, so a rebuild (or a second manager over one config) is free.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>num_shards</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.sm_scale">
+<span class="sig-name descname"><span class="pre">sm_scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.sm_scale" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">RaggedAttentionSpec</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resource_key</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><span class="pre">set</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><span class="pre">mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig</span></a></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>resource_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><em>RaggedAttentionConfig</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.apply_yaml_overrides">
+<span class="sig-name descname"><span class="pre">apply_yaml_overrides</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">flashinfer_backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_segments_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_tokens_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec.apply_yaml_overrides"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.apply_yaml_overrides" title="Link to this definition">#</a></dt>
+<dd><p>Which kernel to run is the deployment’s call as much as the model’s —
+an image that cannot build FA3 pins FA2 here.</p>
+<p>The two ceilings are here rather than on the model because they size
+CUDA-graph buckets, which is a deployment’s memory/coverage trade.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>flashinfer_backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>max_segments_per_request</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>max_tokens_per_request</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.config">
+<span class="sig-name descname"><span class="pre">config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig" title="mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig"><span class="pre">RaggedAttentionConfig</span></a></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.config" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.resource_class">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.resource_class" title="Link to this definition">#</a></dt>
+<dd><p>What builds this spec. Imported inside the property, so declaring a
+resource stays free of the manager and its kernels.</p>
+<p>The builder, not necessarily the class built: an attention spec names
+<cite>AttentionManager</cite>, whose <cite>build</cite> picks a backend subclass.</p>
 </dd></dl>
 
 </dd></dl>
@@ -2934,6 +3099,25 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo.update"><code class="docutils literal notranslate"><span class="pre">PublishedInfo.update()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.flashinfer_backend</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.head_dim"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.head_dim</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_for"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_segments_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_per_request"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_segments_per_request</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_tokens_for"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_tokens_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_tokens_per_request"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_tokens_per_request</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.num_kv_heads"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.num_kv_heads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.num_qo_heads"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.num_qo_heads</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.shard"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.shard()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.sm_scale"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.sm_scale</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.config"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.resource_class</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RequestOffloading"><code class="docutils literal notranslate"><span class="pre">RequestOffloading</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RequestOffloading.label"><code class="docutils literal notranslate"><span class="pre">RequestOffloading.label</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RequestOffloading.request_id"><code class="docutils literal notranslate"><span class="pre">RequestOffloading.request_id</span></code></a></li>
@@ -3078,7 +3262,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 08, 2026.
+  Last updated on Sep 09, 2026.
   <br/>
 </p>
   </div>

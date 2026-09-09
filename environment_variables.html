@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 08, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 09, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -554,6 +554,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>
@@ -690,6 +691,55 @@ free block, pinned bytes).</p></td>
 </table>
 </div>
 </section>
+<section id="models">
+<h2>Models<a class="headerlink" href="#models" title="Link to this heading">#</a></h2>
+<p>Per-model knobs, read when the submodule is built. They are scoped to one
+model, so they are named for it.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 28.0%" />
+<col style="width: 14.0%" />
+<col style="width: 58.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_BATCHING</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>BAGEL: batch several requests through the ViT encoder in one forward.
+Off by default because flash-attn’s varlen reductions across packed
+images produce small bf16 drift, which at greedy <code class="docutils literal notranslate"><span class="pre">temperature=0</span></code> can
+flip a downstream LLM argmax. When off, <code class="docutils literal notranslate"><span class="pre">prefill_vit</span></code> runs one
+request at a time.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CUDA_GRAPH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>BAGEL: CUDA-graph capture of the ViT block loop, over the node’s ragged
+attention resource (see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>). Off by default: capture
+costs one graph per (batch size, token bucket) and the eager
+flash-attn path is already fast. The win is removing per-layer launch
+overhead on small images.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CG_TOKEN_BUCKETS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">512,1024,2048,4096,4900</span></code></p></td>
+<td><p>Comma-separated token-count buckets to capture, when
+<code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CUDA_GRAPH=1</span></code>. A batch longer than the largest bucket runs
+eagerly. <code class="docutils literal notranslate"><span class="pre">4900</span></code> is <code class="docutils literal notranslate"><span class="pre">70*70</span></code>, the exact length the <code class="docutils literal notranslate"><span class="pre">vllm</span></code>
+preprocess option emits.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_CG_BATCH_SIZES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1,2,4</span></code></p></td>
+<td><p>Comma-separated batch sizes to capture. Read only when
+<code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_BATCHING=1</span></code>; otherwise only batch size 1 is captured.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
 <section id="serving-rust-frontend">
 <h2>Serving (Rust frontend)<a class="headerlink" href="#serving-rust-frontend" title="Link to this heading">#</a></h2>
 <p>Read by the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary and its bridge
@@ -815,6 +865,7 @@ run the Python frontend for sound video.</p></li>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>
@@ -852,7 +903,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 08, 2026.
+  Last updated on Sep 09, 2026.
   <br/>
 </p>
   </div>

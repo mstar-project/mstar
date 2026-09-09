@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 08, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 09, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -562,6 +562,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2a-declare-your-resources">Step 2a — Declare your resources</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#two-samplers-on-one-node">Two samplers on one node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>
@@ -826,7 +827,8 @@ node was called “stateless” in earlier versions.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">depends_on()</span></code> returns the keys of other specs that this spec is built against.
 <code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> and <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code> depend on the <code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> key they name. If a
 spec names a dependency that the model does not declare, loading fails immediately,
-rather than during a forward pass.</p></li>
+rather than during a forward pass. <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> is the one attention spec
+that depends on nothing: it names no cache, because it has none.</p></li>
 </ul>
 <p>The spec types are:</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -856,7 +858,16 @@ a deployment can tune: <code class="docutils literal notranslate"><span class="p
 <td><p>Attention over a context that is written once and never extended. See
 <a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<td><p>Cacheless (ragged) varlen self-attention over the segments packed into one
+forward. Nothing is paged, and nothing carries to the next step.
+<code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> and
+<code class="docutils literal notranslate"><span class="pre">head_dim</span></code> (all pre-sharding, as in <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code>), an <code class="docutils literal notranslate"><span class="pre">sm_scale</span></code> that
+defaults to <code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">**</span> <span class="pre">-0.5</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>, and the two
+CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
+<code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Position tracking and RoPE. <code class="docutils literal notranslate"><span class="pre">scheme</span></code> is <code class="docutils literal notranslate"><span class="pre">PosScheme.SEQUENTIAL</span></code> or
 <code class="docutils literal notranslate"><span class="pre">PosScheme.BLOCK</span></code>. The RoPE parameters are set here: <code class="docutils literal notranslate"><span class="pre">rope_theta</span></code>,
 <code class="docutils literal notranslate"><span class="pre">rope_scale</span></code>, and the Llama-3.1 parameters <code class="docutils literal notranslate"><span class="pre">low_freq_factor</span></code>,
@@ -864,7 +875,7 @@ a deployment can tune: <code class="docutils literal notranslate"><span class="p
 embeddings also declares this spec, because it needs the position counter. Such a
 model never applies RoPE.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
 seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty</span></code> declares a capability, not an
 intention. It selects which kernel variant is recorded into the captured graph.
@@ -936,8 +947,15 @@ and a <code class="docutils literal notranslate"><span class="pre">CrossAttentio
 <tr class="row-even"><td><p>A node that samples with two different sets of parameters</p></td>
 <td><p>Two <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> objects that both name the node, under different keys.</p></td>
 </tr>
-<tr class="row-odd"><td><p>ViT, VAE or audio encoder, codec decoder, projection stage, combine stage</p></td>
-<td><p>Nothing. Declare no spec that names the node.</p></td>
+<tr class="row-odd"><td><p>An encoder tower that attends within the segments of one packed forward</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code>, and nothing else. No <code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> and no
+<code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code>: there is no cache to page and no counter to advance. Needed
+only if the tower’s attention must run inside a CUDA graph; see
+<a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
+</tr>
+<tr class="row-even"><td><p>ViT, VAE or audio encoder, codec decoder, projection stage, combine stage</p></td>
+<td><p>Usually nothing. Declare no spec that names the node, unless the node needs the
+row above.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1012,6 +1030,50 @@ writes into the context label:</p>
 <p>A model with several context sources, such as “audio” and “image”, declares one
 <code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code> per source. Each source is a separate resource, and the source name
 is also the key that the layer binds to.</p>
+</section>
+<section id="cacheless-attention-encoder-towers">
+<span id="id3"></span><h3>Cacheless attention (encoder towers)<a class="headerlink" href="#cacheless-attention-encoder-towers" title="Link to this heading">#</a></h3>
+<p>A ViT or audio encoder attends within its own sequence and keeps nothing afterwards.
+Several images are packed into one forward, and each must attend only within its own
+span. That is varlen, or “ragged”, attention: the whole layout belongs to this step, and
+nothing carries to the next.</p>
+<p>Such a tower needs no resource at all if it calls a varlen kernel directly, passing
+<code class="docutils literal notranslate"><span class="pre">cu_seqlens</span></code> as an argument. Declare a <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> when the tower must run
+inside a CUDA graph. The plan is what makes that possible: the engine plans the layout
+outside the graph, into buffers whose addresses do not change, and the captured region
+attends through them. A kernel that reads <code class="docutils literal notranslate"><span class="pre">cu_seqlens</span></code> as an argument, or builds its
+mask from it, cannot be captured this way.</p>
+<p>BAGEL’s SigLIP2 tower is the reference implementation. The spec stands alone, over the
+encoder node only, and names no cache:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">RaggedAttentionSpec</span><span class="p">(</span>
+    <span class="n">resource_key</span><span class="o">=</span><span class="n">VIT_ATTN</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"vit_encoder"</span><span class="p">},</span>
+    <span class="n">config</span><span class="o">=</span><span class="n">RaggedAttentionConfig</span><span class="p">(</span>
+        <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">vit</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">vit</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+        <span class="n">head_dim</span><span class="o">=</span><span class="n">vit</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">//</span> <span class="n">vit</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
+        <span class="c1"># one image, hence one attending segment, per request</span>
+        <span class="n">max_segments_per_request</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>A layer binds the key as it binds any other resource, then attends through the resource’s
+<code class="docutils literal notranslate"><span class="pre">run(q,</span> <span class="pre">k,</span> <span class="pre">v,</span> <span class="pre">label=None)</span></code>. There is no KV write to pair it with, so no
+<code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code> is involved.</p>
+<p>The step is an ordinary <code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code>, and its <code class="docutils literal notranslate"><span class="pre">segments</span></code> are the entire layout.
+There is no cache to read the layout off, so a label that carries no segment in the
+declaration cannot be attended: the forward raises, rather than silently reusing the
+previous step’s plan. Because the tower is normally captured as a piecewise region, that
+declaration lives in the region’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, and names no <code class="docutils literal notranslate"><span class="pre">KVStep</span></code>. See
+<code class="docutils literal notranslate"><span class="pre">mstar/model/bagel/submodules.py</span></code>, region <code class="docutils literal notranslate"><span class="pre">&quot;vit_block_loop&quot;</span></code>, and <a class="reference internal" href="#piecewise-cuda-graphs-capturing-an-inner-loop">Piecewise CUDA
+graphs (capturing an inner loop)</a>.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The eager varlen path is sometimes good to have. The BAGEL ViT has a head dimension of
+72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
+us to zero-pad to 128. So that tower attends through the resource only when it is
+replaying a captured graph, and runs flash-attn varlen otherwise.</p>
+</div>
 </section>
 </section>
 <section id="step-3-declare-the-computation-graph">
@@ -1135,7 +1197,7 @@ them.</p>
 <p>Two more methods control batching and CUDA graphs: <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> with
 <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, and <code class="docutils literal notranslate"><span class="pre">get_cuda_graph_configs</span></code>. They are described in Step 5.</p>
 <section id="step-4a-declare-the-step">
-<span id="id3"></span><h3>Step 4a — Declare the step<a class="headerlink" href="#step-4a-declare-the-step" title="Link to this heading">#</a></h3>
+<span id="id4"></span><h3>Step 4a — Declare the step<a class="headerlink" href="#step-4a-declare-the-step" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">declare_step</span></code> tells the engine what one batched step does to the node’s resources:
 which cache streams it touches, how much each stream grows, what the attention plan is
 based on, which streams fork, and what is committed after the forward completes.</p>
@@ -1161,7 +1223,9 @@ nothing. A request contributes one segment per label that is active for it.</p><
 <li><p>The <code class="docutils literal notranslate"><span class="pre">segments</span></code> argument of <code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code> is a default value. Any <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code>
 that does not set its own <code class="docutils literal notranslate"><span class="pre">segments</span></code> uses this list.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">KVStep(commit=,</span> <span class="pre">combined_labels=,</span> <span class="pre">pre_forks=,</span> <span class="pre">post_forks=)</span></code>. See below.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">AttentionStep(causal=)</span></code> describes the attention plan.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">AttentionStep(causal=)</span></code> describes the attention plan. A <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code>
+steps through this same type. There, the segments are the whole layout rather than an
+extension of a cache. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">PositionStep(pos_ids=,</span> <span class="pre">advance=)</span></code>. With <code class="docutils literal notranslate"><span class="pre">pos_ids=None</span></code>, positions are derived from
 the stream counters. Pass explicit ids, keyed by plan label, when the model computes
 positions itself.</p></li>
@@ -1229,7 +1293,7 @@ the resources, and <code class="docutils literal notranslate"><span class="pre">
 directly.</p>
 </section>
 <section id="reaching-your-resources">
-<span id="id4"></span><h3>Reaching your resources<a class="headerlink" href="#reaching-your-resources" title="Link to this heading">#</a></h3>
+<span id="id5"></span><h3>Reaching your resources<a class="headerlink" href="#reaching-your-resources" title="Link to this heading">#</a></h3>
 <p>Two places need access to resources, and each has its own mechanism.</p>
 <p><strong>In the forward</strong>, read <code class="docutils literal notranslate"><span class="pre">engine_inputs.resources</span></code>, keyed by <code class="docutils literal notranslate"><span class="pre">resource_key</span></code>:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">text_inputs</span><span class="p">):</span>
@@ -1502,7 +1566,9 @@ resource work over the padded batch. It is separate from the submodule’s
 <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> because the region has its own shape. The runner admits, plans and
 commits this step on each replay. This field replaces the removed <code class="docutils literal notranslate"><span class="pre">uses_kv_cache</span></code>,
 <code class="docutils literal notranslate"><span class="pre">plan_fn</span></code>, <code class="docutils literal notranslate"><span class="pre">advance_seq_lens</span></code> and <code class="docutils literal notranslate"><span class="pre">cache_labels</span></code> fields. A region that reads a KV
-cache declares a <code class="docutils literal notranslate"><span class="pre">KVStep</span></code> and an <code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code> here.</p></li>
+cache declares a <code class="docutils literal notranslate"><span class="pre">KVStep</span></code> and an <code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code> here. A cacheless region that uses
+ragged attention declares only an <code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code>, against its
+<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> key.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">lease_before_step</span></code> makes the runner take this region’s CUDA-graph slot before the
 outer <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> runs, and report the slot in that call’s <code class="docutils literal notranslate"><span class="pre">piecewise_leases</span></code>
 argument. The region still declares, plans and commits its own work. The lease only
@@ -1622,6 +1688,10 @@ Second, the same block loop is used on both the captured path and the eager path
 code exists in one place only. Third, the region’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> covers only the
 captured path. The eager path is covered by the submodule’s own <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, as shown
 under <strong>Splitting the declaration</strong> above.</p>
+<p>BAGEL’s ViT tower is the packed, cacheless counterpart. See
+<code class="docutils literal notranslate"><span class="pre">mstar/model/bagel/submodules.py</span></code>, region <code class="docutils literal notranslate"><span class="pre">&quot;vit_block_loop&quot;</span></code>: a
+<code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig</span></code> whose region declares only ragged attention, with patch
+embedding and the RoPE gathers left eager because they are data-dependent indexing.</p>
 </section>
 </section>
 <section id="step-6-write-a-config-yaml">
@@ -1674,6 +1744,12 @@ that a misspelled setting is never silently ignored:</p>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> / <code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>),
+<code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. The two ceilings size
+CUDA-graph buckets, which is a memory-against-coverage trade the deployment makes,
+not the model.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1790,12 +1866,15 @@ the LLM (Qwen2, which contains the embedding, the transformer, the lm_head and t
 logic), and a VAE decoder. It has four more nodes for the CFG-parallel image-generation
 path described below: <code class="docutils literal notranslate"><span class="pre">init_latents</span></code>, the two branch nodes <code class="docutils literal notranslate"><span class="pre">LLM_cfg_text</span></code> and
 <code class="docutils literal notranslate"><span class="pre">LLM_cfg_img</span></code>, and <code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code>.</p>
-<p>Only the three LLM nodes need resources, and all three share one set of them: the same KV
-pool, attention, positions and sampler. Each spec names all three nodes in its <code class="docutils literal notranslate"><span class="pre">nodes</span></code>
-field:</p>
+<p>The three LLM nodes share one set of resources: the same KV pool, attention, positions and
+sampler. Each of those specs names all three nodes in its <code class="docutils literal notranslate"><span class="pre">nodes</span></code> field. The ViT encoder
+declares one resource of its own, a <code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code> with no cache behind it, so
+that its block loop can be CUDA-graph captured:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_node_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">]:</span>
     <span class="n">nodes</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_LLM_NODES</span><span class="p">)</span>   <span class="c1"># {"LLM", "LLM_cfg_text", "LLM_cfg_img"}</span>
     <span class="k">return</span> <span class="p">[</span>
+        <span class="n">RaggedAttentionSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="n">VIT_ATTN</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"vit_encoder"</span><span class="p">},</span>
+                            <span class="n">config</span><span class="o">=</span><span class="n">RaggedAttentionConfig</span><span class="p">(</span><span class="o">...</span><span class="p">)),</span>
         <span class="n">KVSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="s2">"kv"</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="n">nodes</span><span class="p">,</span> <span class="n">config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="p">()),</span>
         <span class="n">AttentionSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="s2">"attn"</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="n">nodes</span><span class="p">,</span>
                       <span class="n">config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span><span class="n">kv_cache</span><span class="o">=</span><span class="s2">"kv"</span><span class="p">)),</span>
@@ -1807,10 +1886,10 @@ field:</p>
     <span class="p">]</span>
 </pre></div>
 </div>
-<p>No spec names the encoders, <code class="docutils literal notranslate"><span class="pre">init_latents</span></code>, <code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code> or the VAE decoder, so those
-nodes receive no resources. The CFG nodes are always declared, but they are used only when
-the config enables CFG-parallel mode, described under Step 6. A single-GPU config never
-routes requests to them.</p>
+<p>No spec names the VAE encoder, <code class="docutils literal notranslate"><span class="pre">init_latents</span></code>, <code class="docutils literal notranslate"><span class="pre">combine_cfg</span></code> or the VAE decoder, so
+those nodes receive no resources. The CFG nodes are always declared, but they are used
+only when the config enables CFG-parallel mode, described under Step 6. A single-GPU
+config never routes requests to them.</p>
 <p><strong>Per-request resources.</strong> Whether a request uses classifier-free guidance determines
 which cache labels it reads. This is a property of the request, not of the deployment.
 BAGEL’s <code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code> therefore returns a <code class="docutils literal notranslate"><span class="pre">KVReqConfig</span></code> that names
@@ -2120,6 +2199,7 @@ for a full omni-modal model.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2a-declare-your-resources">Step 2a — Declare your resources</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#two-samplers-on-one-node">Two samplers on one node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-3-declare-the-computation-graph">Step 3 — Declare the computation graph</a></li>
@@ -2177,7 +2257,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 08, 2026.
+  Last updated on Sep 09, 2026.
   <br/>
 </p>
   </div>

@@ -20,10 +20,11 @@ High-level components
   runs each step's resource lifecycle: admit, plan, forward, commit.
 - **Resources** (``mstar/engine/resources/``): the state that a node's compute uses. This
   includes paged KV caches, the attention planned over them (FlashInfer or dense),
-  cross-attention over a fixed context, position embeddings, and samplers. A model
+  cross-attention over a fixed context, cacheless (ragged) attention for encoder towers
+  that attend within one packed forward, position embeddings, and samplers. A model
   declares which resources each node needs, and the engine builds them. A node that
-  declares no resources receives none. ViT and VAE encoders, codec decoders, and
-  projection and combine stages are examples.
+  declares no resources receives none. VAE encoders, codec decoders, and projection and
+  combine stages are examples.
 - **Models** (``mstar/model/``): each model declares its computation graph, tokenization,
   node resources, and submodules. Registered via ``mstar/model/registry.py``.
 - **Graph** (``mstar/graph/``): computation-graph primitives — ``GraphNode``,

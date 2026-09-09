@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 08, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 09, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -824,6 +824,8 @@ them by that name:</p>
 <span class="w">    </span><span class="nt">max_num_pages</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">      </span><span class="c1"># also: page_size, max_seq_len, cpu_offload_pages</span>
 <span class="w">  </span><span class="nt">talker_attn</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">flashinfer_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fa2</span><span class="w">  </span><span class="c1"># also: backend (flashinfer / dense)</span>
+<span class="w">  </span><span class="nt">vit_attn</span><span class="p">:</span><span class="w">                  </span><span class="c1"># a cacheless (ragged) attention resource</span>
+<span class="w">    </span><span class="nt">max_segments_per_request</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">  </span><span class="c1"># also: max_tokens_per_request, flashinfer_backend</span>
 </pre></div>
 </div>
 <p>Use one block per resource. A model with two caches, such as Whisper’s decoder cache and
@@ -1064,7 +1066,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 08, 2026.
+  Last updated on Sep 09, 2026.
   <br/>
 </p>
   </div>

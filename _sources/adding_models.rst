@@ -254,7 +254,8 @@ three common fields:
 - ``depends_on()`` returns the keys of other specs that this spec is built against.
   ``AttentionSpec`` and ``PositionSpec`` depend on the ``kv_cache`` key they name. If a
   spec names a dependency that the model does not declare, loading fails immediately,
-  rather than during a forward pass.
+  rather than during a forward pass. ``RaggedAttentionSpec`` is the one attention spec
+  that depends on nothing: it names no cache, because it has none.
 
 The spec types are:
 
@@ -277,6 +278,14 @@ The spec types are:
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a context that is written once and never extended. See
        `Cross-attention (encoder-decoder models)`_.
+   * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
+     - Cacheless (ragged) varlen self-attention over the segments packed into one
+       forward. Nothing is paged, and nothing carries to the next step.
+       ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
+       ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
+       defaults to ``head_dim ** -0.5``, ``flashinfer_backend``, and the two
+       CUDA-graph ceilings ``max_segments_per_request`` and
+       ``max_tokens_per_request``. See `Cacheless attention (encoder towers)`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -348,8 +357,14 @@ appears in no spec, so it receives no resources:
        and a ``CrossAttentionSpec`` over that second cache.
    * - A node that samples with two different sets of parameters
      - Two ``SamplerSpec`` objects that both name the node, under different keys.
+   * - An encoder tower that attends within the segments of one packed forward
+     - A ``RaggedAttentionSpec``, and nothing else. No ``KVSpec`` and no
+       ``PositionSpec``: there is no cache to page and no counter to advance. Needed
+       only if the tower's attention must run inside a CUDA graph; see
+       `Cacheless attention (encoder towers)`_.
    * - ViT, VAE or audio encoder, codec decoder, projection stage, combine stage
-     - Nothing. Declare no spec that names the node.
+     - Usually nothing. Declare no spec that names the node, unless the node needs the
+       row above.
 
 Two samplers on one node
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -432,6 +447,58 @@ writes into the context label::
 A model with several context sources, such as "audio" and "image", declares one
 ``CrossAttentionSpec`` per source. Each source is a separate resource, and the source name
 is also the key that the layer binds to.
+
+.. _Cacheless attention (encoder towers):
+
+Cacheless attention (encoder towers)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ViT or audio encoder attends within its own sequence and keeps nothing afterwards.
+Several images are packed into one forward, and each must attend only within its own
+span. That is varlen, or "ragged", attention: the whole layout belongs to this step, and
+nothing carries to the next.
+
+Such a tower needs no resource at all if it calls a varlen kernel directly, passing
+``cu_seqlens`` as an argument. Declare a ``RaggedAttentionSpec`` when the tower must run
+inside a CUDA graph. The plan is what makes that possible: the engine plans the layout
+outside the graph, into buffers whose addresses do not change, and the captured region
+attends through them. A kernel that reads ``cu_seqlens`` as an argument, or builds its
+mask from it, cannot be captured this way.
+
+BAGEL's SigLIP2 tower is the reference implementation. The spec stands alone, over the
+encoder node only, and names no cache:
+
+.. code-block:: python
+
+   RaggedAttentionSpec(
+       resource_key=VIT_ATTN, nodes={"vit_encoder"},
+       config=RaggedAttentionConfig(
+           num_qo_heads=vit.num_attention_heads,
+           num_kv_heads=vit.num_attention_heads,
+           head_dim=vit.hidden_size // vit.num_attention_heads,
+           # one image, hence one attending segment, per request
+           max_segments_per_request=1,
+       ),
+   )
+
+A layer binds the key as it binds any other resource, then attends through the resource's
+``run(q, k, v, label=None)``. There is no KV write to pair it with, so no
+``AttentionCallable`` is involved.
+
+The step is an ordinary ``AttentionStep``, and its ``segments`` are the entire layout.
+There is no cache to read the layout off, so a label that carries no segment in the
+declaration cannot be attended: the forward raises, rather than silently reusing the
+previous step's plan. Because the tower is normally captured as a piecewise region, that
+declaration lives in the region's ``declare_step``, and names no ``KVStep``. See
+``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``, and `Piecewise CUDA
+graphs (capturing an inner loop)`_.
+
+.. note::
+
+   The eager varlen path is sometimes good to have. The BAGEL ViT has a head dimension of
+   72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
+   us to zero-pad to 128. So that tower attends through the resource only when it is
+   replaying a captured graph, and runs flash-attn varlen otherwise.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -601,7 +668,9 @@ resource key:
 - The ``segments`` argument of ``SubmoduleStep`` is a default value. Any ``ResourceStep``
   that does not set its own ``segments`` uses this list.
 - ``KVStep(commit=, combined_labels=, pre_forks=, post_forks=)``. See below.
-- ``AttentionStep(causal=)`` describes the attention plan.
+- ``AttentionStep(causal=)`` describes the attention plan. A ``RaggedAttentionSpec``
+  steps through this same type. There, the segments are the whole layout rather than an
+  extension of a cache. See `Cacheless attention (encoder towers)`_.
 - ``PositionStep(pos_ids=, advance=)``. With ``pos_ids=None``, positions are derived from
   the stream counters. Pass explicit ids, keyed by plan label, when the model computes
   positions itself.
@@ -955,7 +1024,9 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   ``declare_step`` because the region has its own shape. The runner admits, plans and
   commits this step on each replay. This field replaces the removed ``uses_kv_cache``,
   ``plan_fn``, ``advance_seq_lens`` and ``cache_labels`` fields. A region that reads a KV
-  cache declares a ``KVStep`` and an ``AttentionStep`` here.
+  cache declares a ``KVStep`` and an ``AttentionStep`` here. A cacheless region that uses
+  ragged attention declares only an ``AttentionStep``, against its
+  ``RaggedAttentionSpec`` key.
 - ``lease_before_step`` makes the runner take this region's CUDA-graph slot before the
   outer ``declare_step`` runs, and report the slot in that call's ``piecewise_leases``
   argument. The region still declares, plans and commits its own work. The lease only
@@ -1083,6 +1154,11 @@ code exists in one place only. Third, the region's ``declare_step`` covers only 
 captured path. The eager path is covered by the submodule's own ``declare_step``, as shown
 under **Splitting the declaration** above.
 
+BAGEL's ViT tower is the packed, cacheless counterpart. See
+``mstar/model/bagel/submodules.py``, region ``"vit_block_loop"``: a
+``PiecewisePackedConfig`` whose region declares only ragged attention, with patch
+embedding and the RoPE gathers left eager because they are data-dependent indexing.
+
 .. _config-yaml:
 
 Step 6 — Write a config YAML
@@ -1138,6 +1214,11 @@ that a misspelled setting is never silently ignored:
    * - ``AttentionSpec`` / ``CrossAttentionSpec``
      - ``backend`` (``flashinfer`` / ``dense``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
+   * - ``RaggedAttentionSpec``
+     - ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
+       ``max_segments_per_request``, ``max_tokens_per_request``. The two ceilings size
+       CUDA-graph buckets, which is a memory-against-coverage trade the deployment makes,
+       not the model.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
 example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``, while
@@ -1270,15 +1351,18 @@ logic), and a VAE decoder. It has four more nodes for the CFG-parallel image-gen
 path described below: ``init_latents``, the two branch nodes ``LLM_cfg_text`` and
 ``LLM_cfg_img``, and ``combine_cfg``.
 
-Only the three LLM nodes need resources, and all three share one set of them: the same KV
-pool, attention, positions and sampler. Each spec names all three nodes in its ``nodes``
-field:
+The three LLM nodes share one set of resources: the same KV pool, attention, positions and
+sampler. Each of those specs names all three nodes in its ``nodes`` field. The ViT encoder
+declares one resource of its own, a ``RaggedAttentionSpec`` with no cache behind it, so
+that its block loop can be CUDA-graph captured:
 
 .. code-block:: python
 
    def get_node_resources(self) -> list[NodeResourceSpec]:
        nodes = set(self._LLM_NODES)   # {"LLM", "LLM_cfg_text", "LLM_cfg_img"}
        return [
+           RaggedAttentionSpec(resource_key=VIT_ATTN, nodes={"vit_encoder"},
+                               config=RaggedAttentionConfig(...)),
            KVSpec(resource_key="kv", nodes=nodes, config=self._kv_config()),
            AttentionSpec(resource_key="attn", nodes=nodes,
                          config=AttentionConfig(kv_cache="kv")),
@@ -1289,10 +1373,10 @@ field:
                        vocab_size=self.config.vocab_size),
        ]
 
-No spec names the encoders, ``init_latents``, ``combine_cfg`` or the VAE decoder, so those
-nodes receive no resources. The CFG nodes are always declared, but they are used only when
-the config enables CFG-parallel mode, described under Step 6. A single-GPU config never
-routes requests to them.
+No spec names the VAE encoder, ``init_latents``, ``combine_cfg`` or the VAE decoder, so
+those nodes receive no resources. The CFG nodes are always declared, but they are used
+only when the config enables CFG-parallel mode, described under Step 6. A single-GPU
+config never routes requests to them.
 
 **Per-request resources.** Whether a request uses classifier-free guidance determines
 which cache labels it reads. This is a property of the request, not of the deployment.
