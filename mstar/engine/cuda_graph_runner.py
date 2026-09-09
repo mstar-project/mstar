@@ -1367,7 +1367,11 @@ class PiecewiseCudaGraphRunner:
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
             n = value.shape[0]
-            buffer[:n].copy_(value)
+            # non_blocking: a host-resident input (positions staged through
+            # pinned memory) must not drain the stream, or the host cannot
+            # queue this replay behind the one in flight; the copy is
+            # stream-ordered ahead of the replay either way
+            buffer[:n].copy_(value, non_blocking=True)
             if n < buffer.shape[0]:
                 # the padded tail is real compute for a BATCHED capture, so it
                 # reads whatever is here; zero rather than last step's values
