@@ -98,6 +98,45 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+
+Models
+------
+
+Per-model knobs, read when the submodule is built. They are scoped to one
+model, so they are named for it.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_VIT_BATCHING``
+     - ``0``
+     - BAGEL: batch several requests through the ViT encoder in one forward.
+       Off by default because flash-attn's varlen reductions across packed
+       images produce small bf16 drift, which at greedy ``temperature=0`` can
+       flip a downstream LLM argmax. When off, ``prefill_vit`` runs one
+       request at a time.
+   * - ``MSTAR_VIT_CUDA_GRAPH``
+     - ``0``
+     - BAGEL: CUDA-graph capture of the ViT block loop, over the node's ragged
+       attention resource (see :doc:`adding_models`). Off by default: capture
+       costs one graph per (batch size, token bucket) and the eager
+       flash-attn path is already fast. The win is removing per-layer launch
+       overhead on small images.
+   * - ``MSTAR_VIT_CG_TOKEN_BUCKETS``
+     - ``512,1024,2048,4096,4900``
+     - Comma-separated token-count buckets to capture, when
+       ``MSTAR_VIT_CUDA_GRAPH=1``. A batch longer than the largest bucket runs
+       eagerly. ``4900`` is ``70*70``, the exact length the ``vllm``
+       preprocess option emits.
+   * - ``MSTAR_VIT_CG_BATCH_SIZES``
+     - ``1,2,4``
+     - Comma-separated batch sizes to capture. Read only when
+       ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+
 Serving (Rust frontend)
 -----------------------
 
