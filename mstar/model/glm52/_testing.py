@@ -202,6 +202,8 @@ class EagerPiecewiseRunner:
         self._call_inputs_cls = PiecewiseCallInputs
         self._engine_inputs_cls = ModelInputsFromEngine
         self.calls = 0
+        self.staged = 0
+        self._static = {}
         # like the real runner's prepare_for_capture: the resources size their
         # static per-slot buffers for the largest bucket, and every replay
         # here carries a lease so they take their captured-graph code paths
@@ -232,8 +234,15 @@ class EagerPiecewiseRunner:
     def can_run(self, batch_size, total_tokens=None):
         return self._resolve(batch_size, total_tokens) is not None
 
-    def run(self, static_inputs, request_ids=None, seq_lens=None, real_bs=None,
-            step_kwargs=None):
+    def _buffers_for(self, shape):
+        key = (shape.bs, shape.total_tokens)
+        if key not in self._static:
+            self._static[key] = self._config.make_static_inputs(shape)
+        return self._static[key]
+
+    def _prepare(self, static_inputs, request_ids, seq_lens, step_kwargs):
+        """Copy the inputs into the bucket's (persistent) buffers, declare and
+        plan the step — the half of a replay ``stage`` and ``run`` share."""
         from mstar.engine.resources import SlotLease, StepContext
 
         real_bs = len(request_ids)
@@ -242,7 +251,7 @@ class EagerPiecewiseRunner:
         assert shape is not None
         dummy_rids = self._dummy.ensure(f"{shape.bs}_{shape.total_tokens}", shape.bs)
         step_ids = [*request_ids, *dummy_rids[real_bs:shape.bs]]
-        buffers = self._config.make_static_inputs(shape)
+        buffers = self._buffers_for(shape)
         for name, value in static_inputs.items():
             buf = buffers.get(name)
             if buf is None or not isinstance(value, torch.Tensor):
@@ -262,6 +271,19 @@ class EagerPiecewiseRunner:
         ))
         assert self._runner.admit(step).ok
         self._runner.plan(step)
+        return shape, step, step_ids, buffers, dummy_rids, real_bs, total
+
+    def stage(self, static_inputs, request_ids=None, seq_lens=None, real_bs=None,
+              step_kwargs=None):
+        shape, _step, _ids, _bufs, dummy_rids, real_bs, _ = self._prepare(
+            static_inputs, request_ids, seq_lens, step_kwargs)
+        self._dummy.reset(dummy_rids[real_bs:shape.bs])
+        self.staged += 1
+
+    def run(self, static_inputs, request_ids=None, seq_lens=None, real_bs=None,
+            step_kwargs=None):
+        shape, step, step_ids, buffers, dummy_rids, real_bs, total = self._prepare(
+            static_inputs, request_ids, seq_lens, step_kwargs)
         call = self._call_inputs_cls(
             static_inputs=buffers,
             engine_inputs=self._engine_inputs_cls(

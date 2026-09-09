@@ -1265,6 +1265,95 @@ class PiecewiseCudaGraphRunner:
             slot=self.SLOT, bucket=data.bucket
         )
 
+    def _resolve_call(
+        self, request_ids: list[str] | None, seq_lens: list[int] | None,
+        real_bs: int | None,
+    ) -> tuple[PiecewiseGraphData, int, int | None, bool]:
+        if real_bs is None:
+            if request_ids is not None:
+                real_bs = len(request_ids)
+            elif seq_lens is not None:
+                real_bs = len(seq_lens)
+            else:
+                raise ValueError(
+                    "piecewise run: pass real_bs, request_ids, or seq_lens to "
+                    "determine the batch size"
+                )
+        is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
+        real_total_tokens = sum(seq_lens) if seq_lens is not None else None
+        data = self._resolve(real_bs, real_total_tokens if is_packed else None)
+        if data is None:
+            raise RuntimeError(
+                f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
+                f"total_tokens={real_total_tokens}"
+            )
+        return data, real_bs, real_total_tokens, is_packed
+
+    @staticmethod
+    def _copy_inputs(
+        data: PiecewiseGraphData, static_inputs: dict[str, torch.Tensor],
+    ) -> None:
+        for name, value in static_inputs.items():
+            buffer = data.static_inputs.get(name)
+            if buffer is None or not isinstance(value, torch.Tensor):
+                continue
+            n = value.shape[0]
+            # non_blocking: a host-resident input (positions staged through
+            # pinned memory) must not drain the stream, or the host cannot
+            # queue this replay behind the one in flight; the copy is
+            # stream-ordered ahead of the replay either way
+            buffer[:n].copy_(value, non_blocking=True)
+            if n < buffer.shape[0]:
+                # the padded tail is real compute for a BATCHED capture, so it
+                # reads whatever is here; zero rather than last step's values
+                buffer[n:].zero_()
+
+    def _declare_and_plan(
+        self, data: PiecewiseGraphData, request_ids: list[str] | None,
+        seq_lens: list[int] | None, real_bs: int,
+        step_kwargs: Mapping[str, Any] | None,
+    ):
+        step = None
+        if request_ids is not None:
+            step_ids = [
+                *request_ids, *data.dummy_rids[real_bs:data.shape.bs]
+            ]
+            step = self._declare(
+                step_ids,
+                self._config.replay_seq_lens(data.shape, seq_lens, real_bs),
+                data.bucket,
+                capture=False,
+                step_kwargs=step_kwargs,
+            )
+        self._plan(step, data.shape)
+        return step
+
+    def stage(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[str] | None = None,
+        seq_lens: list[int] | None = None,
+        real_bs: int | None = None,
+        step_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        """The first half of a replay, ahead of a host readback the rest
+        depends on: copy the inputs known now and declare + plan a first
+        step (``step_kwargs`` name it to ``config.declare_step``). The paired
+        ``run`` then copies the remaining inputs, declares + plans the second
+        step beside the first, and replays. A resource that plans a region's
+        passes in two steps must land the second next to the first, not over
+        it (``MlaAttentionStep.first_sub_plan``).
+
+        Host work only; nothing is replayed and nothing commits here, and a
+        ``run`` that never follows leaves no state behind but the plans.
+        """
+        data, real_bs, _, _ = self._resolve_call(request_ids, seq_lens, real_bs)
+        self._copy_inputs(data, static_inputs)
+        try:
+            self._declare_and_plan(data, request_ids, seq_lens, real_bs, step_kwargs)
+        finally:
+            self._dummy_rows.reset(data.dummy_rids[real_bs:data.shape.bs])
+
     def run(
         self,
         static_inputs: dict[str, torch.Tensor],
@@ -1285,55 +1374,12 @@ class PiecewiseCudaGraphRunner:
         for a declaration that depends on this replay's data (a speculative
         step's accepted counts); the capture declares without them.
         """
-        if real_bs is None:
-            if request_ids is not None:
-                real_bs = len(request_ids)
-            elif seq_lens is not None:
-                real_bs = len(seq_lens)
-            else:
-                raise ValueError(
-                    "piecewise run: pass real_bs, request_ids, or seq_lens to "
-                    "determine the batch size"
-                )
-
-        is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
-        real_total_tokens = sum(seq_lens) if seq_lens is not None else None
-        data = self._resolve(real_bs, real_total_tokens if is_packed else None)
-        if data is None:
-            raise RuntimeError(
-                f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
-                f"total_tokens={real_total_tokens}"
-            )
-
-        for name, value in static_inputs.items():
-            buffer = data.static_inputs.get(name)
-            if buffer is None or not isinstance(value, torch.Tensor):
-                continue
-            n = value.shape[0]
-            # non_blocking: a host-resident input (positions staged through
-            # pinned memory) must not drain the stream, or the host cannot
-            # queue this replay behind the one in flight; the copy is
-            # stream-ordered ahead of the replay either way
-            buffer[:n].copy_(value, non_blocking=True)
-            if n < buffer.shape[0]:
-                # the padded tail is real compute for a BATCHED capture, so it
-                # reads whatever is here; zero rather than last step's values
-                buffer[n:].zero_()
-
-        step = None
-        if request_ids is not None:
-            step_ids = [
-                *request_ids, *data.dummy_rids[real_bs:data.shape.bs]
-            ]
-            step = self._declare(
-                step_ids,
-                self._config.replay_seq_lens(data.shape, seq_lens, real_bs),
-                data.bucket,
-                capture=False,
-                step_kwargs=step_kwargs,
-            )
+        data, real_bs, real_total_tokens, is_packed = self._resolve_call(
+            request_ids, seq_lens, real_bs,
+        )
+        self._copy_inputs(data, static_inputs)
         try:
-            self._plan(step, data.shape)
+            step = self._declare_and_plan(data, request_ids, seq_lens, real_bs, step_kwargs)
             data.graph.replay()
             if step is not None:
                 self._step_runner.commit(step)

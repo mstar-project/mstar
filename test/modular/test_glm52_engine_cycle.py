@@ -388,3 +388,20 @@ def test_mtp_regions_batch_of_two_padded_to_four():
     for rid in prompts:
         got = torch.cat(emitted[rid])
         assert torch.equal(got, singles[rid]), f"{rid}: {got.tolist()} vs {singles[rid].tolist()}"
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_mtp_draft_phase_hoist_matches_baseline(monkeypatch, k):
+    """MSTAR_GLM52_MTP_PHASE_PREPARE=1: sub-plan 0 and the sync inputs go in
+    through runner.stage() before the verify readback, the chain sub-plans
+    after; the stream is unchanged and every decode step stages once."""
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PHASE_PREPARE", "1")
+    (base, spec), drivers = _run_pair(
+        k=k, max_tokens=18, ignore_eos=True, mla_absorb=True, regions=True,
+    )
+    assert torch.equal(base, spec), f"{base.tolist()} vs {spec.tolist()}"
+    runners = drivers[1].piecewise
+    phase = runners["mtp_draft_phase"]
+    # the first decode step (the emitted token alone, no bundle) is not k+1
+    # rows and takes the un-hoisted path
+    assert phase.calls - 1 <= phase.staged <= phase.calls and phase.staged > 0
