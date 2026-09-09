@@ -232,9 +232,12 @@ class TestCaptureAndPadding:
         m.build_cuda_graph_buffers(
             [CGSlotSpec(bucket=ctx.slot_lease.bucket, slot=0, config=None)], max_bs=2, max_seq_len=2,
         )
-        step = _step(dummies, [1, 1], "chunk")
+        # a decode capture: single-token rows that never ran a chunk are
+        # legal under ctx.capture (their zero state is what gets recorded)
+        step = _step(dummies, [1, 1], "step")
         assert m.admit(step, ctx).ok
         plan = m.plan(step, ctx)
+        assert plan.mode == "step"
         assert m.num_free == 0
         assert plan.slot_index.data_ptr() == m._cg_index[0].data_ptr()
         for rid in dummies:
@@ -257,7 +260,7 @@ class TestCaptureAndPadding:
                 m.ingest_request(rid)
             ctx = _ctx(rids, lease=SlotLease(slot=slot, bucket=b), capture=True)
             for _ in range(3):  # NUM_WARMUP forwards + the capture, each re-prepared
-                step = _step(rids, [1, 1], "chunk")
+                step = _step(rids, [1, 1], "step")
                 assert m.admit(step, ctx).ok, slot
                 plan = m.plan(step, ctx)
                 assert plan.slot_index.data_ptr() == m._cg_index[slot].data_ptr()

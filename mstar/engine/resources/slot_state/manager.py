@@ -238,7 +238,10 @@ class SlotStateManager(Resource):
             if not is_real:
                 slot = SINK_SLOT
             ctx_start = self._committed.get(rid, 0) if is_real else 0
-            if is_real and step.mode == "step" and ctx_start == 0:
+            # A capture records a single-token step on dummy rows that never
+            # ran a chunk: their zero state is fine to record against (replay
+            # reads real rows), so the guard is for real steps only.
+            if is_real and step.mode == "step" and ctx_start == 0 and not ctx.capture:
                 raise RuntimeError(
                     f"slot state {self.name!r}: single-token step for "
                     f"{rid!r} with no committed tokens — a step before its "
