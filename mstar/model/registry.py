@@ -7,6 +7,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
@@ -31,6 +32,9 @@ HF_MODELS: dict[str, dict] = {
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).
     "cosmos3_super": {"model_path_hf": "nvidia/Cosmos3-Super"},
+    # GLM-5.2: 753B/40B MoE causal LM (MLA + DSA). The official release ships
+    # FP8 e4m3 block-scale under the -FP8 repo id; real serving is TP8.
+    "glm52": {"model_path_hf": "zai-org/GLM-5.2-FP8"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
