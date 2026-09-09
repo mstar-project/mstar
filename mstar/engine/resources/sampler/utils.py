@@ -611,7 +611,7 @@ def sample_tokens(
             seed,
             rand_offset,
         )
-    if logits.device.type == "xpu":
+    elif logits.device.type == "xpu":
         return _sample_xpu(
             logits,
             temperature,
@@ -624,10 +624,11 @@ def sample_tokens(
             seed,
             rand_offset,
         )
-    raise ValueError(
-        f"Sampling is unsupported on device type {logits.device.type!r}; "
-        "expected 'cuda' or 'xpu'."
-    )
+    else:
+        raise ValueError(
+            f"Sampling is unsupported on device type {logits.device.type!r}; "
+            "expected 'cuda' or 'xpu'."
+        )
 
 
 def _to_tensor(
