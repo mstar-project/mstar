@@ -67,7 +67,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # engine's slot-state resource. None on an MLA layer.
         self._kda: Glm5NextKdaStateAccess | None = None
         if self.is_linear_attention:
-            self.self_attn = Glm5NextKdaAttention(config)
+            self.self_attn = Glm5NextKdaAttention(config, comm_group=comm_group)
             # Position of this layer inside the KDA state pool's layer axis.
             self.kda_pos = config.kda_layer_indices.index(layer_idx)
             self.kv_plane = None

@@ -82,6 +82,16 @@ _KDA_FORGET_RE = re.compile(
     r"\.self_attn\.(f_a_proj\.weight|f_b_proj\.weight|dt_bias|A_log)$"
 )
 
+# KDA tensors head-sharded across TP (Glm5NextKdaAttention): the read plan
+# slices these so each rank reads only its head block. Row-sharded by
+# heads x head_dim, by heads, or column-sharded (o_proj's contraction dim).
+_KDA_ROW_QKV_RE = re.compile(
+    r"\.self_attn\.(q_proj|k_proj|v_proj|f_b_proj|g_b_proj|q_conv1d|k_conv1d|v_conv1d)\.weight$"
+)
+_KDA_ROW_QKV_FLAT_RE = re.compile(r"\.self_attn\.dt_bias$")
+_KDA_ROW_HEADS_RE = re.compile(r"\.self_attn\.(A_log|b_proj\.weight)$")
+_KDA_COL_RE = re.compile(r"\.self_attn\.o_proj\.weight$")
+
 # Mirrors glm52.components.mtp.remap_mtp_key / MTP_GLUE_PREFIXES (same four
 # DeepSeek-V3 names). Defined locally because that module drags in the
 # engine stack (cache_manager -> zmq) and this loader must stay importable
@@ -277,10 +287,9 @@ def build_glm5_next_read_plan(
     Cuts per-rank checkpoint IO two ways: (1) keys the model never loads
     (the vision tower, the MTP layer unless ``load_mtp``) are excluded up
     front so the iterator never reads them; (2) routed-expert tensors —
-    ~95% of the checkpoint's
-    306 GB — get ``(dim, start, stop)`` specs so each rank reads only its
-    TP shard. The expert loaders accept these pre-sliced shards
-    shape-driven.
+    ~95% of the checkpoint's 306 GB — and the head-sharded KDA tensors get
+    ``(dim, start, stop)`` specs so each rank reads only its TP shard. The
+    expert and KDA loaders accept these pre-sliced shards shape-driven.
 
     ``load_mtp`` MUST mirror the model's drafting flag: this plan runs
     UPSTREAM of ``skip_vision_and_mtp_keys``, so a plan built without it
@@ -299,6 +308,9 @@ def build_glm5_next_read_plan(
     shard_inter = config.moe_intermediate_size // tp_size
     keys: set[str] = set()
     specs: dict[str, tuple[int, int, int]] = {}
+    kda_layers = set(config.kda_layer_indices)
+    heads_per_rank = config.linear_num_heads // tp_size
+    qkv_per_rank = heads_per_rank * config.linear_head_dim
     if fp8_experts:
         bo, bi = config.quantization_config.weight_block_size
         assert shard_inter % bo == 0 and shard_inter % bi == 0, (
@@ -318,6 +330,14 @@ def build_glm5_next_read_plan(
         ):
             continue  # MTP module off: never read, never transfer
         keys.add(key)
+
+        if tp_size > 1 and layer in kda_layers:
+            if _KDA_ROW_QKV_RE.search(key) or _KDA_ROW_QKV_FLAT_RE.search(key):
+                specs[key] = (0, tp_rank * qkv_per_rank, (tp_rank + 1) * qkv_per_rank)
+            elif _KDA_ROW_HEADS_RE.search(key):
+                specs[key] = (0, tp_rank * heads_per_rank, (tp_rank + 1) * heads_per_rank)
+            elif _KDA_COL_RE.search(key):
+                specs[key] = (1, tp_rank * qkv_per_rank, (tp_rank + 1) * qkv_per_rank)
 
         if not fp8_experts:
             continue

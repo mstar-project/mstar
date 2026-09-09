@@ -19,10 +19,9 @@ What stays model-side is the layer-facing access this module provides:
   ``.item()``, no per-step allocation, capture/compile friendly;
 - in-place slot views for the prefill span loop (host loop, eager phase).
 
-Memory (full model, per TP rank at TP8 once KDA is head-sharded, heads
-64 -> 8): 512 KB recurrent + 18 KB conv per layer x 34 layers ~= 17.6
-MB/request/rank. Until the sharding lands the pool allocates full width
-(~143 MB/request, ~4.6 GB at 32 slots) — size ``max_slots`` on the box.
+Memory (full model, per TP rank at TP8, heads 64 -> 8): 512 KB recurrent +
+18 KB conv per layer x 34 layers ~= 17.6 MB/request/rank, ~0.6 GB at 32
+slots.
 
 MTP (M2): the delta rule is not rewindable, so verify must ``snapshot``
 before the speculative window and ``restore`` on rejection; both are here
@@ -54,9 +53,10 @@ def kda_slot_state_config(
     ``linear_num_heads``, ``linear_head_dim``, ``linear_conv_channels``,
     ``linear_conv_kernel_size``). ``conv_dtype`` must be the KDA projection
     dtype (the continue path ``cat``s the conv tail onto the projected
-    activations bit-exactly). ``shard_dim`` is None on both tensors until
-    the KDA layer is head-sharded across TP — the pool is replicated like
-    the layer.
+    activations bit-exactly). Shapes are the FULL model's; the resource
+    divides the ``shard_dim`` axes (recurrent heads, conv q|k|v channel
+    blocks) by the joint world size, matching ``Glm5NextKdaAttention``'s
+    head-block sharding.
     """
     num_layers = len(config.kda_layer_indices)
     return SlotStateConfig(
@@ -68,6 +68,7 @@ def kda_slot_state_config(
                 ),
                 dtype=torch.float32,
                 slot_dim=1,
+                shard_dim=1,
             ),
             CONV: SlotTensorSpec(
                 shape=(
@@ -76,6 +77,7 @@ def kda_slot_state_config(
                 ),
                 dtype=conv_dtype,
                 slot_dim=1,
+                shard_dim=1,
             ),
         },
         max_slots=max_slots,

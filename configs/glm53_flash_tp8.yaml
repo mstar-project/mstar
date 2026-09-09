@@ -55,11 +55,10 @@ resources:
     page_size: 128
   kda_state:
     # The KDA recurrent + conv state pool (SlotStateManager): one slot per
-    # in-flight request, TP-replicated in this port (34 KDA layers x 64 heads
-    # x 128^2 fp32 recurrent + the bf16 conv tail = ~148 MB/slot/rank ->
-    # ~4.9 GB/rank at 32 slots + the sink row; head-sharding across TP8
-    # cuts that to ~0.6 GB, a model-side follow-up). This is
-    # the decode batch cap: the captured decode buckets are the
+    # in-flight request, head-sharded across TP like the KDA layers (34 KDA
+    # layers x 8 local heads x 128^2 fp32 recurrent + the bf16 conv tail =
+    # ~18.5 MB/slot/rank -> ~0.6 GB/rank at 32 slots + the sink row). This
+    # is the decode batch cap: the captured decode buckets are the
     # DEFAULT_CAPTURE_BATCH_SIZES <= max_slots.
     max_slots: 32
 node_groups:

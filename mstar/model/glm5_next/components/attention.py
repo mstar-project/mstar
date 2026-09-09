@@ -40,12 +40,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.distributed.utils import divide
 from mstar.engine.resources.attn.mla import MLAAttentionManager
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
 from mstar.model.glm5_next.config import ATTN, KV_CACHE, LABEL, Glm5NextModelConfig
-from mstar.model.glm5_next.kda import Glm5NextLinearAttention
+from mstar.model.glm5_next.kda import Glm5NextKdaConfig, Glm5NextLinearAttention
 
 # k_norm eps is hardcoded in the reference indexer (LayerNorm(head_dim,
 # eps=1e-6), weight AND bias) — NOT rms_norm_eps. Same value as glm52's.
@@ -264,8 +265,65 @@ class Glm5NextMLAAttention(nn.Module):
         ).contiguous()
 
 
+def _slice_rows_loader(
+    tp_rank: int, tp_size: int, full_rows: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: str | None = None,
+) -> None:
+    """Head-block row shard of a checkpoint tensor whose dim 0 is
+    ``full_rows`` (q/k/v/f_b/g_b/b projections, dt_bias, A_log).
+
+    Shape-driven like the expert loaders: a full tensor is sliced to this
+    rank's block; a pre-sliced shard (the read plan's fast path, each rank
+    reading only its rows) is written as-is.
+    """
+    del loaded_shard_id
+    rows = divide(full_rows, tp_size)
+    if loaded_weight.shape[0] == full_rows:
+        loaded_weight = loaded_weight[tp_rank * rows:(tp_rank + 1) * rows]
+    elif loaded_weight.shape[0] != rows:
+        raise ValueError(
+            f"KDA tensor has {loaded_weight.shape[0]} rows; expected the full "
+            f"{full_rows} or the per-rank {rows}"
+        )
+    param.data.copy_(loaded_weight)
+
+
+def _slice_cols_loader(
+    tp_rank: int, tp_size: int, full_cols: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: str | None = None,
+) -> None:
+    """Contraction-dim (dim 1) twin of :func:`_slice_rows_loader` for the
+    row-parallel ``o_proj``."""
+    del loaded_shard_id
+    cols = divide(full_cols, tp_size)
+    if loaded_weight.shape[1] == full_cols:
+        loaded_weight = loaded_weight[:, tp_rank * cols:(tp_rank + 1) * cols]
+    elif loaded_weight.shape[1] != cols:
+        raise ValueError(
+            f"KDA o_proj has {loaded_weight.shape[1]} cols; expected the full "
+            f"{full_cols} or the per-rank {cols}"
+        )
+    param.data.copy_(loaded_weight)
+
+
 class Glm5NextKdaAttention(Glm5NextLinearAttention):
-    """``kda.Glm5NextLinearAttention`` + the fused-conv checkpoint loader.
+    """``kda.Glm5NextLinearAttention`` head-sharded across TP + the
+    checkpoint loaders.
+
+    Every KDA quantity is per head (the projections' output columns, the
+    depthwise conv channels, the forget/beta gates, the gated RMSNorm over
+    ``head_dim``, the recurrent state ``S (H, D, D)``), so the layer shards
+    cleanly by head block: this rank instantiates the single-rank math file
+    with ``H / tp`` heads and slices every head-indexed weight to its block
+    on load — q/k/v/f_b/g_b/b column-wise, ``dt_bias``/``A_log`` by the
+    same blocks, the fused conv's q|k|v channel blocks, ``o_proj`` row-wise
+    (contraction dim) — while ``f_a``/``g_a``/``o_norm`` replicate. The
+    output is this rank's ``o_proj`` partial, all-reduced once per layer
+    (exact: the reduction is a sum over head blocks). The per-request state
+    pool shards the same way (``kda_slot_state_config`` shard_dim), so a
+    rank stores only its heads' recurrence.
 
     The stacked-param rules route ``{q,k,v}_conv1d.weight`` shards here with
     shard ids ``"q"``/``"k"``/``"v"``; each lands at its row block of the
@@ -274,27 +332,55 @@ class Glm5NextKdaAttention(Glm5NextLinearAttention):
     bf16 -> fp32 promotion HF's ``_keep_in_fp32_modules_strict`` pins.
     Attached-loader + ``_apply`` reattachment follows the repo's parallel
     linears (attributes on parameters do not survive ``to_empty``).
-
-    TP (M1): shard everything by head block — q/k/v/f_b/g_b/b column-wise,
-    o row-wise, conv channels + dt_bias by the same head blocks, A_log by
-    head; f_a/g_a and o_norm replicate. This class is where that lands so
-    ``kda.py`` stays a single-rank math file. Until it lands, KDA runs
-    REPLICATED on every rank (~9 GB of weights and 8x the FLOPs at TP8)
-    and the state pool sizes full-width (~147.6 MB/request, not the
-    sharded ~18.5) — land the sharding before trusting TP8 bring-up
-    tok/s or pool-memory headroom as baselines.
     """
 
     _CONV_SHARD_ROW = {"q": 0, "k": 1, "v": 2}
 
-    def __init__(self, config, dtype: torch.dtype | None = None) -> None:
+    def __init__(
+        self, config, comm_group: CommGroup | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         if dtype is None:
             dtype = torch.get_default_dtype()
-        super().__init__(config, dtype=dtype)
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+        self.tp_size = comm_group.world_size
+        self.tp_rank = comm_group.rank
+        self.total_num_heads = config.linear_num_heads
+        local_heads = divide(config.linear_num_heads, self.tp_size)
+        # The math file sees a config with this rank's heads only; all its
+        # widths (qkv_dim, conv channels, gate widths) follow from that.
+        local = Glm5NextKdaConfig(
+            hidden_size=config.hidden_size,
+            linear_num_heads=local_heads,
+            linear_head_dim=config.linear_head_dim,
+            linear_conv_kernel_size=config.linear_conv_kernel_size,
+            gate_lower_bound=config.gate_lower_bound,
+            rms_norm_eps=config.rms_norm_eps,
+        )
+        super().__init__(local, dtype=dtype)
+        self.total_qkv_dim = self.total_num_heads * self.head_dim
         self._attach_weight_loaders()
 
     def _attach_weight_loaders(self) -> None:
+        from functools import partial
+
+        rank, size = self.tp_rank, self.tp_size
+        rows = partial(_slice_rows_loader, rank, size, self.total_qkv_dim)
         self.conv1d.weight.weight_loader = self._conv_weight_loader
+        self.q_proj.weight.weight_loader = rows
+        self.k_proj.weight.weight_loader = rows
+        self.v_proj.weight.weight_loader = rows
+        self.forget_gate.f_b_proj.weight.weight_loader = rows
+        self.forget_gate.dt_bias.weight_loader = rows
+        self.g_b_proj.weight.weight_loader = rows
+        heads = partial(_slice_rows_loader, rank, size, self.total_num_heads)
+        self.forget_gate.A_log.weight_loader = heads
+        self.b_proj.weight.weight_loader = heads
+        self.o_proj.weight.weight_loader = partial(
+            _slice_cols_loader, rank, size, self.total_qkv_dim,
+        )
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
@@ -311,11 +397,33 @@ class Glm5NextKdaAttention(Glm5NextLinearAttention):
         if branch is None:
             raise ValueError(
                 f"KDA conv shard id must be q/k/v, got {loaded_shard_id!r}")
-        expected = (self.qkv_dim, 1, self.conv_kernel_size)
-        if tuple(loaded_weight.shape) != expected:
+        full = (self.total_qkv_dim, 1, self.conv_kernel_size)
+        local = (self.qkv_dim, 1, self.conv_kernel_size)
+        if tuple(loaded_weight.shape) == full:
+            loaded_weight = loaded_weight[
+                self.tp_rank * self.qkv_dim:(self.tp_rank + 1) * self.qkv_dim
+            ]
+        elif tuple(loaded_weight.shape) != local:
             raise ValueError(
                 f"{loaded_shard_id}_conv1d.weight has shape "
-                f"{tuple(loaded_weight.shape)}; expected {expected}"
+                f"{tuple(loaded_weight.shape)}; expected {full} or the per-rank {local}"
             )
         rows = slice(branch * self.qkv_dim, (branch + 1) * self.qkv_dim)
         param.data[rows].copy_(loaded_weight)
+
+    # -- TP: sum the o_proj partials once per layer -----------------------
+
+    def prefill(self, hidden_states, recurrent_state=None, conv_state=None, attention_mask=None):
+        output, recurrent_state, conv_state = super().prefill(
+            hidden_states, recurrent_state=recurrent_state,
+            conv_state=conv_state, attention_mask=attention_mask,
+        )
+        if self.tp_size > 1:
+            output = self.comm_group.all_reduce(output)
+        return output, recurrent_state, conv_state
+
+    def decode_step(self, hidden_states, recurrent_state, conv_state):
+        output = super().decode_step(hidden_states, recurrent_state, conv_state)
+        if self.tp_size > 1:
+            output = self.comm_group.all_reduce(output)
+        return output
