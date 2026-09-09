@@ -153,13 +153,38 @@ def test_allocation_failure_still_evicts():
 # --- the unbatchable path admits everything before it runs anything --------
 
 
+class _FakeMgmt:
+    """``SubmoduleManagement``'s slot rotation, as `_exec_per_request` uses it."""
+
+    def __init__(self, submodule, num_slots: int, next_slot: int, seen: list):
+        self.submodule = submodule
+        self.num_slots = num_slots
+        self.needs_slot_fence = False
+        self._next_slot = next_slot
+        self._seen = seen
+
+    @property
+    def next_slot(self) -> int:
+        return self._next_slot
+
+    def lease_slot(self) -> int:
+        slot = self._next_slot
+        self._next_slot = (self._next_slot + 1) % self.num_slots
+        return slot
+
+    def set_piecewise_slot(self, slot: int) -> None:
+        self._seen.append(slot)
+
+
 class _FakeExecEngine:
     """Engine internals bound onto stubs, to drive `_exec_per_request` alone."""
 
     _exec_per_request = Engine._exec_per_request
     _declare_and_admit = Engine._declare_and_admit
 
-    def __init__(self, fail_on: str | None = None, num_slots: int = 1):
+    def __init__(
+        self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
+    ):
         self._enable_nvtx = False
         self._fail_on = fail_on
         # ordered log, so the test can assert admit-all-then-run
@@ -169,12 +194,8 @@ class _FakeExecEngine:
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
-        self._submodules = {"node": SimpleNamespace(
-            submodule=self,
-            num_slots=num_slots,
-            needs_slot_fence=False,
-            set_piecewise_slot=self.piecewise_slots.append,
-        )}
+        self.mgmt = _FakeMgmt(self, num_slots, next_slot, self.piecewise_slots)
+        self._submodules = {"node": self.mgmt}
 
     # --- submodule surface
     def _maybe_lease_piecewise_regions(self, node_name, ctx, inputs):
@@ -254,9 +275,10 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
 
 def test_per_request_rotates_slots_within_the_batch():
     """Each rid gets its own slot so one's staging can't land on top of the
-    previous one's queued H2D. The rotation is local: it starts at the batch's
-    own slot and wraps, rather than advancing the submodule's shared counter."""
-    engine = _FakeExecEngine(num_slots=2)
+    previous one's queued H2D. The slots come off the shared counter — these
+    sub-steps are steps as far as the rotation is concerned."""
+    # the batch leased slot 1, so the counter sits at 0
+    engine = _FakeExecEngine(num_slots=2, next_slot=0)
 
     engine._exec_per_request(_exec_batch(["a", "b", "c"], slot=1))
 
@@ -266,9 +288,21 @@ def test_per_request_rotates_slots_within_the_batch():
     assert engine.piecewise_slots == [1, 0, 1, 1, 0, 1]
 
 
+def test_per_request_leaves_the_counter_one_past_its_last_slot():
+    """What lets the fence drain a single slot: the batch hands the counter on
+    exactly as a single-forward step would, so only `next_slot` can collide."""
+    engine = _FakeExecEngine(num_slots=4, next_slot=1)
+
+    engine._exec_per_request(_exec_batch(["a", "b", "c"], slot=0))
+
+    assert engine.run_slots == [0, 1, 2]
+    assert engine.mgmt.next_slot == 3
+
+
 def test_per_request_keeps_one_slot_when_the_node_is_single_buffered():
     engine = _FakeExecEngine(num_slots=1)
 
     engine._exec_per_request(_exec_batch(["a", "b", "c"]))
 
     assert engine.run_slots == [0, 0, 0]
+    assert engine.mgmt.next_slot == 0

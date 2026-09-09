@@ -122,6 +122,13 @@ class SubmoduleManagement:
         it — true exactly when a resource stages into a reused host buffer."""
         return self._forced_double_buffer
 
+    @property
+    def next_slot(self) -> int:
+        """The slot the next lease hands out. Read unlocked: an int read is
+        atomic under the GIL, and the only other leaser is the plan thread,
+        which is gated on the previous batch's ``commit_done``."""
+        return self._next_slot
+
     def lease_slot(self) -> int:
         with self._slot_lock:
             slot = self._next_slot
@@ -655,11 +662,11 @@ class Engine:
         launched = False
 
         # Step 1: loop through all of the requests for admit errors.
-        # Each request is its own cycle, so each takes its own slot. The
-        # rotation is local: the shared counter advances once per batch, and the
-        # plan thread reads it too.
-        num_slots = submodule_mgmt.num_slots
-        base_slot = batch.slot or 0
+        # Each request is its own cycle, so each takes its own slot off the
+        # shared counter — to the rotation these sub-steps ARE steps. The last
+        # one doesn't advance it, so the batch leaves the counter one past the
+        # slot it last used, exactly as a single-forward step would.
+        slot = batch.slot or 0
         steps: dict[str, SubmoduleStep] = {}
         ctxs: dict[str, StepContext] = {}
         for i, (rid, inp) in enumerate(
@@ -668,8 +675,10 @@ class Engine:
             ctxs[rid] = StepContext(
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
-                slot=(base_slot + i) % num_slots, capture=False,
+                slot=slot, capture=False,
             )
+            if i != len(batch.request_ids) - 1:
+                slot = submodule_mgmt.lease_slot()
             # declare (here) and drive (below) are separate loops, so the
             # region runners are pointed at the slot in both
             submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
@@ -720,14 +729,14 @@ class Engine:
                 if nvtx:
                     range_pop()
 
-        # The batch leaves the rotation holding one slot, but the loop staged
-        # into every slot it walked. Releasing `commit_done` lets the plan
-        # thread pre-plan the next batch, which stages the slot after this
-        # one's — already used above, with its H2D possibly still queued. Drain
-        # those; this batch's own slot is the one the rotation accounts for.
-        for used, event in slot_events.items():
-            if used != base_slot:
-                event.synchronize()
+        # Releasing `commit_done` lets the plan thread pre-plan the next batch,
+        # which stages `next_slot` while this batch's work may still be queued.
+        # Only that slot needs draining: every other one the loop touched is
+        # re-consumed a batch or more later, by which point the worker has
+        # synced on this step.
+        event = slot_events.get(submodule_mgmt.next_slot)
+        if event is not None:
+            event.synchronize()
         batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
