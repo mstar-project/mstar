@@ -490,8 +490,13 @@ def test_kda_state_lifecycle_is_explicit_and_loud():
     kda.pool(RECURRENT)[:, slot].fill_(1.0)
     kda.reset_request("r0")
     assert kda.committed("r0") == 0
-    assert kda.pool(RECURRENT)[:, slot].abs().sum() == 0  # zeroed, slot kept
+    # reset releases the slot (a capture dummy row between captures); the
+    # next lease of that slot zeroes it before any step reads it
+    assert kda.slot_of("r0") is None and kda.num_free == 2
+    step, _ = h.open_step("prefill", ["r0"], [ids[:2]])
     assert kda.slot_of("r0") == slot
+    assert kda.pool(RECURRENT)[:, slot].abs().sum() == 0
+    h.close_step(step)
     h.remove("r0")
     h.remove("r0")  # idempotent, engine may double-retire
     assert kda.num_free == 2 and kda.tracked_requests() == set()

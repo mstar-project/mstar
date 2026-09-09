@@ -109,6 +109,10 @@ class Glm5NextKdaStateAccess:
             dtype=self._conv.dtype, device=self._conv.device,
         )
 
+    @property
+    def conv_dtype(self) -> torch.dtype:
+        return self._conv.dtype
+
     # -- per-step plan ----------------------------------------------------
 
     def current_plan(self) -> SlotStatePlan:

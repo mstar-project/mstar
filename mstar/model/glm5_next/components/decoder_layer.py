@@ -87,8 +87,22 @@ class Glm5NextDecoderLayer(nn.Module):
         self.ffn_hc = build_hyper_connection(config)
 
     def bind_resources(self, resources: dict) -> None:
-        if self.is_linear_attention:
-            self._kda = Glm5NextKdaStateAccess(resources[KDA_STATE])
+        if not self.is_linear_attention:
+            return
+        self._kda = Glm5NextKdaStateAccess(resources[KDA_STATE])
+        # The conv tail is cat'd onto the projected activations bit-exactly
+        # (kda.prefill), so the pool the model declared must match the dtype
+        # the layer was loaded in — a YAML autocast override without a
+        # matching model_kwargs.kda_conv_dtype would otherwise promote the
+        # conv math silently.
+        proj_dtype = self.self_attn.q_proj.weight.dtype
+        pool_dtype = self._kda.conv_dtype
+        if pool_dtype != proj_dtype:
+            raise RuntimeError(
+                f"KDA layer {self.layer_idx}: slot-state conv pool is "
+                f"{pool_dtype} but the KDA projections are {proj_dtype}; pass "
+                "model_kwargs.kda_conv_dtype matching the serve dtype"
+            )
 
     def forward(self, hidden_streams: torch.Tensor) -> torch.Tensor:
         residual = hidden_streams
