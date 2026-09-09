@@ -195,6 +195,7 @@ class ShardingConfig:
         if dest_group is None:
             dest_worker_set = {""}
             dest_worker_to_tp_rank = {"": 0}
+            dest_workers = [""]
             dest_tp_size = 1
             dest_tp_rank = 0
         else:
@@ -202,6 +203,7 @@ class ShardingConfig:
             dest_tp_size = dest_group.tp_size
             dest_tp_rank = dest_group._tp_rank
             dest_worker_to_tp_rank = dest_group._worker_to_tp_rank
+            dest_workers = dest_group._workers
 
         fanout = []
         if shard_dim is None:  # replicated
@@ -239,7 +241,7 @@ class ShardingConfig:
                 if source_shard_starts[0] >= dest_shard_ends[0]:
                     continue  # not reached the point of overlap yet, keep looking
 
-                worker = dest_worker_to_tp_rank[dest_tp_rank]
+                worker = dest_workers[dest_tp_rank]
                 fanout.append(ShardDestination(
                     worker=worker,
                     full_tensor=False,

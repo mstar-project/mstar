@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.engine.resources.kv.config import KVSpec
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.pi05.components.flow_matching import (
@@ -77,7 +78,7 @@ def test_pi05_prefill_is_sequential_vit_then_llm():
     )
     # LLM consumes img_emb + text_inputs (state is encoded in text_inputs
     # as a decimal-string suffix per Pi0.5's prompt format).
-    assert set(second.input_ids) == {"img_emb", "text_inputs"}
+    assert set(second.input_names) == {"img_emb", "text_inputs"}
 
 
 def test_pi05_action_gen_is_loop_with_action_output_emission():
@@ -104,7 +105,12 @@ def test_pi05_action_gen_is_loop_with_action_output_emission():
 
 def test_pi05_kv_cache_config_matches_pi05_config():
     model = _make_model()
-    kv = model.get_kv_cache_config()
+    kv_specs = [
+        spec for spec in model.get_node_resources() if isinstance(spec, KVSpec)
+    ]
+    assert len(kv_specs) == 1
+    assert kv_specs[0].nodes == {"LLM"}
+    kv = kv_specs[0].config
     assert kv.num_layers == model.config.num_layers
     assert kv.num_kv_heads == model.config.num_kv_heads
     assert kv.head_dim == model.config.head_dim
@@ -211,8 +217,14 @@ def test_pi05_postprocess_action_returns_float32_bytes():
 
 def test_sincos_timestep_embedding_shape_and_range():
     t = torch.tensor(0.5)
-    emb = sincos_timestep_embedding(t, dim=16)
-    assert emb.shape == (1, 16)
+    dim = 16
+    # The caller owns the frequency ladder and the output buffer (both are
+    # preallocated once per submodule so the action-gen step is capturable).
+    fraction = torch.linspace(0.0, 1.0, dim // 2, dtype=torch.float64)
+    emb = sincos_timestep_embedding(
+        t, dim=dim, fraction=fraction, output_buffer=torch.empty(1, dim)
+    )
+    assert emb.shape == (1, dim)
     assert torch.all(emb.abs() <= 1.0 + 1e-6)
 
 

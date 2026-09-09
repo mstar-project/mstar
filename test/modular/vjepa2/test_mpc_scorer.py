@@ -24,7 +24,10 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.vjepa2.config import VJepa2Config
+
+_GRAPH_WALK = "prefill_video_mpc"
 
 try:
     from mstar.model.vjepa2.submodules import VJepa2MPCScorerSubmodule
@@ -38,10 +41,17 @@ except (ImportError, AttributeError) as e:  # pragma: no cover - env-specific
 def _make_info() -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id="r0",
-        graph_walk="prefill_video_mpc",
+        graph_walk=_GRAPH_WALK,
         fwd_index=0,
         random_seed=0,
         max_tokens=0,
+    )
+
+
+def _engine_inputs() -> ModelInputsFromEngine:
+    return ModelInputsFromEngine(
+        request_ids=["r0"],
+        per_request_info={"r0": _make_info()},
     )
 
 
@@ -61,7 +71,8 @@ class TestL1Scorer:
         submodule = VJepa2MPCScorerSubmodule(_make_config("l1"))
         with torch.no_grad():
             out = submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -83,7 +94,8 @@ class TestL1Scorer:
         submodule = VJepa2MPCScorerSubmodule(_make_config("l1"))
         with torch.no_grad():
             out = submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -99,7 +111,8 @@ class TestL1Scorer:
         submodule = VJepa2MPCScorerSubmodule(_make_config("l1"))
         with torch.no_grad():
             out = submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -139,7 +152,8 @@ class TestCostFnDispatch:
         submodule = VJepa2MPCScorerSubmodule(_make_config("l1"))
         with torch.no_grad():
             out = submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -152,7 +166,8 @@ class TestCostFnDispatch:
         submodule = VJepa2MPCScorerSubmodule(_make_config("cosine"))
         with torch.no_grad():
             out = submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -168,7 +183,8 @@ class TestCostFnDispatch:
         submodule = VJepa2MPCScorerSubmodule(_make_config("l2"))
         with torch.no_grad():
             out = submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -180,7 +196,8 @@ class TestCostFnDispatch:
         submodule = VJepa2MPCScorerSubmodule(_make_config("nonexistent"))
         with pytest.raises(ValueError, match="Unknown mpc_cost_fn"):
             submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -197,7 +214,8 @@ class TestShapeGuards:
         submodule = VJepa2MPCScorerSubmodule(_make_config("l1"))
         with pytest.raises(ValueError, match="feature shape"):
             submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -210,7 +228,8 @@ class TestShapeGuards:
         submodule = VJepa2MPCScorerSubmodule(_make_config("l1"))
         with pytest.raises(ValueError, match="batch dim 1"):
             submodule(
-                request_info=_make_info(),
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
                 predicted_hidden=pred,
                 goal_hidden=goal,
             )
@@ -273,23 +292,29 @@ class TestMPCPredictor:
         actions = torch.randn(K, t_action, 7)
         states = torch.randn(K, t_action, 7)
 
+        node_inputs = submodule.prepare_inputs(
+            graph_walk=_GRAPH_WALK,
+            fwd_info=_make_info(),
+            inputs={
+                "encoder_hidden": [enc],
+                "actions": [actions],
+                "states": [states],
+            },
+        )
         packed = submodule.preprocess(
-            graph_walk="prefill_video_mpc",
-            per_request_inputs=[
-                {
-                    "encoder_hidden": [enc],
-                    "actions": [actions],
-                    "states": [states],
-                }
-            ],
-            request_ids=["rid_0"],
-            per_request_info={"rid_0": _make_info()},
+            graph_walk=_GRAPH_WALK,
+            engine_inputs=_engine_inputs(),
+            inputs=[node_inputs],
         )
         assert packed["actions"].shape == (K, t_action, 7)
         assert packed["encoder_hidden"].shape == (1, n_tokens, cfg.hidden_size)
 
         with torch.no_grad():
-            out = submodule(request_info=_make_info(), **packed)
+            out = submodule(
+                graph_walk=_GRAPH_WALK,
+                engine_inputs=_engine_inputs(),
+                **packed,
+            )
         pred = out["predicted_hidden"][0]
         # Predictor's output has the same N as encoder input (matches AC
         # predictor's per-frame interleave + final projection).

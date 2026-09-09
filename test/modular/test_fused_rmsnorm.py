@@ -74,7 +74,7 @@ def flashinfer_reference(x, w_norm, pos, eps, rope_theta):
     return q_out.view(M, H, D).to(torch.float32)
 
 
-def test_case(name, M, H, D, eps=1e-6, rope_theta=10000.0, max_pos=2048, seed=0):
+def check_case(name, M, H, D, eps=1e-6, rope_theta=10000.0, max_pos=2048, seed=0):
     print(f"\n=== {name}: M={M}, H={H}, D={D} ===")
     torch.manual_seed(seed)
     device = "cuda"
@@ -166,13 +166,13 @@ def benchmark(M, H, D, eps=1e-6, rope_theta=10000.0, n_iter=200, n_warmup=20):
 
 if __name__ == "__main__":
     # Correctness — typical decode/prefill shapes
-    test_case("decode bs=1, q",   M=1,   H=16, D=128)
-    test_case("decode bs=1, kv",  M=1,   H=4,  D=128)
-    test_case("decode bs=32, q",  M=32,  H=16, D=128)
-    test_case("decode bs=32, kv", M=32,  H=4,  D=128)
-    test_case("prefill q",        M=128, H=16, D=128)
-    test_case("head_dim=64",      M=32,  H=16, D=64)
-    test_case("non-pow-2 M",      M=7,   H=16, D=128)
+    check_case("decode bs=1, q",   M=1,   H=16, D=128)
+    check_case("decode bs=1, kv",  M=1,   H=4,  D=128)
+    check_case("decode bs=32, q",  M=32,  H=16, D=128)
+    check_case("decode bs=32, kv", M=32,  H=4,  D=128)
+    check_case("prefill q",        M=128, H=16, D=128)
+    check_case("head_dim=64",      M=32,  H=16, D=64)
+    check_case("non-pow-2 M",      M=7,   H=16, D=128)
 
     # Benchmark
     benchmark(M=32,  H=16, D=128)

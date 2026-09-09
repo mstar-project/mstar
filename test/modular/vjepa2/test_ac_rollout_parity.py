@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.submodule_base import ModelInputsFromEngine, NameToTensorList
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.config import VJepa2ACPredictorConfig, VJepa2Config
+
+from .fake_resources import bind_fake_resources
 
 # submodules module pulls in mstar.engine at import, which on some local
 # torch builds fails to set dynamo-config attributes that only exist in
@@ -34,6 +38,8 @@ except (ImportError, AttributeError) as e:  # pragma: no cover - env-specific
         f"Cannot import VJepa2ACRolloutPredictorSubmodule in this env: {e}",
         allow_module_level=True,
     )
+
+_GRAPH_WALK = "prefill_video_rollout"
 
 
 def _tiny_config() -> tuple[VJepa2Config, VJepa2ACPredictorConfig]:
@@ -89,6 +95,13 @@ def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPas
     return info
 
 
+def _engine_inputs(info: CurrentForwardPassInfo) -> ModelInputsFromEngine:
+    return ModelInputsFromEngine(
+        request_ids=[info.request_id],
+        per_request_info={info.request_id: info},
+    )
+
+
 def _reference_rollout(
     predictor: VisionTransformerPredictorAC,
     encoder_hidden: torch.Tensor,
@@ -96,37 +109,91 @@ def _reference_rollout(
     states: torch.Tensor,
     extrinsics: torch.Tensor | None,
     num_steps: int,
-    t_ctx: int,
-    window: int,
+    tokens_per_step: int,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Hand-rolled sliding-window AC rollout.
+    """Hand-rolled growing-sequence AC rollout.
 
     Per iter k:
-      * Slice actions/states on the time dim: ``[..., k : k + T_ctx, :]``.
-      * Run the AC predictor (no compile, no caching — pure eager).
-      * Take ``predicted[:, -window:, :]`` as the new tubelet group.
-      * Slide: ``cat([encoder_hidden[:, window:, :], new_tg], dim=1)``.
+      * Take one timestep of actions/states: ``[..., k : k + 1, :]``.
+      * Run the AC predictor under the ``"main"`` label with ``t_0=k``, so
+        the step's K/V lands in the cache and the sequence grows.
+      * Per-step LayerNorm, matching upstream's ``step_predictor`` body.
+      * Feed the result straight back in — the context is the last
+        prediction, nothing is concatenated or slid.
 
-    Returns ``(per_iter_new_tg, per_iter_next_encoder_hidden)`` as Python
-    lists.  Bit-exact with the submodule's ``_rollout_step`` because the
-    submodule's math is identical — the only differences are logging and
-    the register_loop_stop side effect.
+    Returns ``(per_iter_new_tg, per_iter_next_encoder_hidden)``; the two are
+    the same tensor each iter, kept as separate lists so the caller can check
+    both loop-back names.
+
+    Bit-exact with the submodule's ``_rollout_step``: same math, and each
+    side runs against its own freshly-bound cache. What this pins is the
+    submodule's per-iter orchestration — the slicing, the norm, the
+    loop-back wiring. The cache's own correctness is covered by
+    test_ac_kv_cache_parity.py.
     """
+    resources = bind_fake_resources(predictor)
     eh = encoder_hidden
     new_tgs: list[torch.Tensor] = []
     next_ehs: list[torch.Tensor] = []
     with torch.no_grad():
         for k in range(num_steps):
-            end = k + t_ctx
-            acts_k = actions[:, k:end].contiguous()
-            sts_k = states[:, k:end].contiguous()
-            ext_k = extrinsics[:, k:end].contiguous() if extrinsics is not None else None
-            predicted = predictor(eh, acts_k, sts_k, extrinsics=ext_k)
-            new_tg = predicted[:, -window:, :]
-            eh = torch.cat([eh[:, window:, :], new_tg], dim=1)
+            acts_k = actions[:, k:k + 1].contiguous()
+            sts_k = states[:, k:k + 1].contiguous()
+            ext_k = extrinsics[:, k:k + 1].contiguous() if extrinsics is not None else None
+            resources.plan([tokens_per_step])
+            predicted = predictor(
+                eh, acts_k, sts_k, extrinsics=ext_k, t_0=k, label="main",
+            )
+            new_tg = F.layer_norm(predicted, (predicted.size(-1),))
+            eh = new_tg
             new_tgs.append(new_tg)
             next_ehs.append(eh)
     return new_tgs, next_ehs
+
+
+def _step(
+    submodule: VJepa2ACRolloutPredictorSubmodule,
+    info: CurrentForwardPassInfo,
+    encoder_hidden: torch.Tensor,
+    actions: torch.Tensor,
+    states: torch.Tensor,
+    resources=None,
+) -> NameToTensorList:
+    """One engine-shaped rollout step.
+
+    Goes through ``prepare_inputs`` → ``preprocess`` → ``forward`` rather than
+    calling ``forward`` directly: per-iter slicing of the constant
+    actions/states buffers lives in ``prepare_inputs``, so a direct forward
+    would hand the predictor the whole trajectory.
+
+    ``resources`` carries the KV/attention history across steps. Pass one to
+    keep the cache growing over a rollout; leave it None for a fresh cache.
+    """
+    node_inputs = submodule.prepare_inputs(
+        graph_walk=_GRAPH_WALK,
+        fwd_info=info,
+        inputs={
+            "encoder_hidden": [encoder_hidden],
+            "actions": [actions],
+            "states": [states],
+        },
+    )
+    packed = submodule.preprocess(
+        graph_walk=_GRAPH_WALK,
+        engine_inputs=_engine_inputs(info),
+        inputs=[node_inputs],
+    )
+    # The rollout step attends under a plan label, so the blocks need KV +
+    # attention resources bound before the forward.
+    cfg = submodule.config
+    cond_tokens = 3 if cfg.ac_predictor.use_extrinsics else 2
+    tokens_per_req = packed["encoder_hidden"].size(1) + cond_tokens
+    if resources is None:
+        resources = bind_fake_resources(submodule.predictor)
+    resources.plan([tokens_per_req])
+    return submodule.forward(
+        _GRAPH_WALK, _engine_inputs(info), **packed
+    )
 
 
 def _submodule_loop(
@@ -138,19 +205,19 @@ def _submodule_loop(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Drive the submodule H times, threading ``encoder_hidden`` via
     loop-back just like the mstar DynamicLoop does.
+
+    Resources are bound once for the whole rollout so the KV cache grows
+    across iters, as it does in production; rebinding per step would reset
+    the history and make every iter look like a fresh step-0.
     """
+    resources = bind_fake_resources(submodule.predictor)
     eh = encoder_hidden
     new_tgs: list[torch.Tensor] = []
     next_ehs: list[torch.Tensor] = []
     with torch.no_grad():
         for k in range(num_steps):
             info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
-            out = submodule.forward(
-                info,
-                encoder_hidden=eh,
-                actions=actions,
-                states=states,
-            )
+            out = _step(submodule, info, eh, actions, states, resources=resources)
             new_tgs.append(out["predicted_hidden"][0])
             eh = out["encoder_hidden"][0]
             next_ehs.append(eh)
@@ -166,19 +233,20 @@ class TestACRolloutParity:
     def test_bit_exact_parity_h3(self):
         """Running H=3 iterations through the submodule produces the same
         per-iter ``predicted_hidden`` AND ``encoder_hidden`` loop-back as
-        the hand-rolled sliding-window reference.
+        the hand-rolled growing-sequence reference.
         """
         torch.manual_seed(0)
         cfg, _ac = _tiny_config()
         predictor = VisionTransformerPredictorAC(cfg.ac_predictor).eval()
 
         b = 1
-        t_ctx = cfg.grid_depth  # 2
         window = cfg.grid_size * cfg.grid_size  # 16
-        n = t_ctx * window  # 32
+        n = window  # context is one frame group
 
         num_steps = 3
-        t_total = t_ctx + num_steps - 1  # 4
+        t_total = num_steps
+        cond_tokens = 3 if cfg.ac_predictor.use_extrinsics else 2
+        tokens_per_step = n + cond_tokens
 
         encoder_hidden = torch.randn(b, n, cfg.hidden_size)
         actions = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
@@ -193,8 +261,7 @@ class TestACRolloutParity:
             states,
             extrinsics=None,
             num_steps=num_steps,
-            t_ctx=t_ctx,
-            window=window,
+            tokens_per_step=tokens_per_step,
         )
         ours_new, ours_eh = _submodule_loop(
             submodule, encoder_hidden, actions, states, num_steps=num_steps,
@@ -210,10 +277,17 @@ class TestACRolloutParity:
             diff = (r - o).abs().max().item()
             assert diff == 0.0, f"iter {k}: next_encoder_hidden max abs diff = {diff}"
 
-    def test_sliding_window_invariant(self):
-        """After each iter the encoder_hidden head is the prior tail; the
-        encoder_hidden tail is the newly-predicted tubelet group.  This is
-        the core of the sliding-window contract.
+    def test_growing_cache_invariant(self):
+        """History lives in the KV cache, not in the loop-back tensor.
+
+        The rollout does not slide a multi-frame window any more: each iter's
+        context is exactly the previous iter's prediction — one frame group,
+        fixed shape — and everything older is reachable only because the KV
+        cache keeps growing by one step's tokens per iter.
+
+        So the loop-back tensor carries no history of its own (there is no
+        "head is the prior tail" relationship to assert), and the thing that
+        has to hold instead is that the cache accumulates every step.
         """
         torch.manual_seed(1)
         cfg, _ac = _tiny_config()
@@ -221,39 +295,48 @@ class TestACRolloutParity:
         submodule = VJepa2ACRolloutPredictorSubmodule(predictor, cfg)
 
         b = 1
-        t_ctx = cfg.grid_depth
         window = cfg.grid_size * cfg.grid_size
-        n = t_ctx * window
+        n = window  # context is one frame group
         num_steps = 3
-        t_total = t_ctx + num_steps - 1
+        t_total = num_steps
 
         eh = torch.randn(b, n, cfg.hidden_size)
         actions = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
         states = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
 
+        cond_tokens = 3 if cfg.ac_predictor.use_extrinsics else 2
+        tokens_per_step = n + cond_tokens
+        # Bind once so the cache accumulates across iters, as in a real rollout.
+        resources = bind_fake_resources(submodule.predictor)
+
         with torch.no_grad():
             for k in range(num_steps):
                 info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
-                out = submodule.forward(
-                    info,
-                    encoder_hidden=eh,
-                    actions=actions,
-                    states=states,
-                )
+                out = _step(submodule, info, eh, actions, states, resources=resources)
                 predicted = out["predicted_hidden"][0]
                 next_eh = out["encoder_hidden"][0]
+
+                # Fixed-size context every iter — no growth in the tensor.
                 assert predicted.shape == (b, window, cfg.hidden_size)
                 assert next_eh.shape == (b, n, cfg.hidden_size)
-                # Tail of next_eh is the new prediction.
-                torch.testing.assert_close(next_eh[:, -window:, :], predicted)
-                # Head of next_eh is the tail of the prior eh.
-                torch.testing.assert_close(next_eh[:, : n - window, :], eh[:, window:, :])
+                # The loop-back IS the new prediction, in full.
+                torch.testing.assert_close(next_eh, predicted)
+
+                # The cache is what grew: k+1 steps' worth of tokens per layer.
+                for layer_kvs in resources._kv.values():
+                    cached = torch.cat(layer_kvs[0][0], dim=0)
+                    assert cached.shape[0] == (k + 1) * tokens_per_step
+
                 eh = next_eh
 
-    def test_identity_loopback_actions_states(self):
-        """The submodule passes actions/states through unchanged on every
-        iter — identity loop-back is what lets the graph dispatcher keep
-        routing them without the client resending them per iter.
+    def test_prepare_inputs_slices_the_iters_timestep(self):
+        """Per-iter slicing of the constant actions/states buffers.
+
+        The graph deliberately has no actions/states loop-back edges (see the
+        NOTE in ``VJepa2ACModel.get_worker_graphs``): the loop primitives
+        re-pass the client's original buffers every iter, and
+        ``prepare_inputs`` picks out timestep ``iter_idx``. That indexing is
+        what makes the constant buffers behave like a per-iter stream.
         """
         torch.manual_seed(2)
         cfg, _ac = _tiny_config()
@@ -270,20 +353,24 @@ class TestACRolloutParity:
         actions = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
         states = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
 
-        with torch.no_grad():
-            for k in range(3):
-                info = _make_request_info(iter_idx=k, rollout_horizon=3)
-                out = submodule.forward(
-                    info,
-                    encoder_hidden=eh,
-                    actions=actions,
-                    states=states,
-                )
-                # Identity loop-back: the returned tensors are the same
-                # object (or at least bit-exactly equal) as what we passed in.
-                torch.testing.assert_close(out["actions"][0], actions)
-                torch.testing.assert_close(out["states"][0], states)
-                eh = out["encoder_hidden"][0]
+        for k in range(3):
+            info = _make_request_info(iter_idx=k, rollout_horizon=3)
+            node_inputs = submodule.prepare_inputs(
+                graph_walk=_GRAPH_WALK,
+                fwd_info=info,
+                inputs={
+                    "encoder_hidden": [eh],
+                    "actions": [actions],
+                    "states": [states],
+                },
+            )
+            # Exactly one timestep, and it is iter k's.
+            torch.testing.assert_close(
+                node_inputs.tensor_inputs["actions"], actions[:, k : k + 1]
+            )
+            torch.testing.assert_close(
+                node_inputs.tensor_inputs["states"], states[:, k : k + 1]
+            )
 
 
 class TestACRolloutEarlyExit:
@@ -297,14 +384,14 @@ class TestACRolloutEarlyExit:
         submodule = VJepa2ACRolloutPredictorSubmodule(predictor, cfg)
 
         b = 1
-        t_ctx = cfg.grid_depth
-        window = cfg.grid_size * cfg.grid_size
-        n = t_ctx * window
+        # One frame group of context per iter — the rollout's window is
+        # [B, H*W, D], one timestep of actions/states per step.
+        n = cfg.grid_size * cfg.grid_size
         horizon = 3
         # Provide enough trajectory for horizon + 2 iters so the loop can
         # over-shoot and we observe the stop signal actually firing at
         # horizon - 1.
-        t_total = t_ctx + horizon + 2
+        t_total = horizon + 2
 
         eh = torch.randn(b, n, cfg.hidden_size)
         actions = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
@@ -314,12 +401,7 @@ class TestACRolloutEarlyExit:
         with torch.no_grad():
             for k in range(horizon + 2):
                 info = _make_request_info(iter_idx=k, rollout_horizon=horizon)
-                out = submodule.forward(
-                    info,
-                    encoder_hidden=eh,
-                    actions=actions,
-                    states=states,
-                )
+                out = _step(submodule, info, eh, actions, states)
                 eh = out["encoder_hidden"][0]
                 if "rollout_loop" in submodule.check_stop(info.request_id, info, out):
                     stop_seen_at.append(k)
@@ -327,43 +409,3 @@ class TestACRolloutEarlyExit:
         assert stop_seen_at, "submodule never registered a loop stop"
         assert stop_seen_at[0] == horizon - 1
 
-
-class TestACRolloutTrajectoryTooShort:
-    def test_raises_on_short_trajectory(self):
-        """When ``actions/states`` length < iter_idx + T_ctx at some iter,
-        the submodule raises a clear error.  This is a backstop: the model
-        class validates trajectory length up-front in ``process_prompt``
-        when ``rollout_horizon > 1``, but the submodule also guards so
-        programmatic callers (e.g. unit tests) don't get a silent out-of-
-        bounds slice.
-        """
-        torch.manual_seed(4)
-        cfg, _ac = _tiny_config()
-        predictor = VisionTransformerPredictorAC(cfg.ac_predictor).eval()
-        submodule = VJepa2ACRolloutPredictorSubmodule(predictor, cfg)
-
-        b = 1
-        t_ctx = cfg.grid_depth
-        window = cfg.grid_size * cfg.grid_size
-        n = t_ctx * window
-        # Only T_ctx entries — enough for iter 0, but iter 1 slices
-        # [1 : 1 + T_ctx] which runs off the end.
-        t_total = t_ctx
-
-        eh = torch.randn(b, n, cfg.hidden_size)
-        actions = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
-        states = torch.randn(b, t_total, cfg.ac_predictor.action_embed_dim)
-
-        # Iter 0 works (uses actions[0:T_ctx] = full trajectory).
-        with torch.no_grad():
-            info0 = _make_request_info(iter_idx=0, rollout_horizon=3)
-            out0 = submodule.forward(
-                info0, encoder_hidden=eh, actions=actions, states=states,
-            )
-            eh = out0["encoder_hidden"][0]
-
-            info1 = _make_request_info(iter_idx=1, rollout_horizon=3)
-            with pytest.raises(ValueError, match="trajectory too short"):
-                submodule.forward(
-                    info1, encoder_hidden=eh, actions=actions, states=states,
-                )

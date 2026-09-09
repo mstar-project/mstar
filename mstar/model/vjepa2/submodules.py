@@ -716,6 +716,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
                 iter_idx,
             )
             return {"rollout_loop"}
+        return set()
 
 
 class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
@@ -1286,6 +1287,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
                 iter_idx,
             )
             return {"rollout_loop"}
+        return set()
 
 
 # ---------------------------------------------------------------------------

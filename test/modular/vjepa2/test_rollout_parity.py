@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
 from mstar.model.vjepa2.config import VJepa2Config
 
@@ -33,6 +34,8 @@ except (ImportError, AttributeError) as e:  # pragma: no cover - env-specific
         f"Cannot import VJepa2RolloutPredictorSubmodule in this env: {e}",
         allow_module_level=True,
     )
+
+_GRAPH_WALK = "prefill_video_rollout"
 
 
 def _tiny_config() -> VJepa2Config:
@@ -72,6 +75,13 @@ def _make_request_info(iter_idx: int, rollout_horizon: int) -> CurrentForwardPas
     info.dynamic_loop_iter_counts["rollout_loop"] = iter_idx
     info.step_metadata["rollout_horizon"] = rollout_horizon
     return info
+
+
+def _engine_inputs(info: CurrentForwardPassInfo) -> ModelInputsFromEngine:
+    return ModelInputsFromEngine(
+        request_ids=[info.request_id],
+        per_request_info={info.request_id: info},
+    )
 
 
 def _anticipative_reference(
@@ -120,7 +130,9 @@ def _submodule_loop(
     with torch.no_grad():
         for k in range(num_steps):
             info = _make_request_info(iter_idx=k, rollout_horizon=num_steps)
-            out = submodule.forward(info, encoder_hidden=encoder_hidden)
+            out = submodule.forward(
+                _GRAPH_WALK, _engine_inputs(info), encoder_hidden=encoder_hidden
+            )
             predictions.append(out["predicted_hidden"][0])
             encoder_hidden = out["encoder_hidden"][0]
     return predictions
@@ -196,7 +208,9 @@ class TestRolloutParity:
         with torch.no_grad():
             for k in range(3):
                 info = _make_request_info(iter_idx=k, rollout_horizon=3)
-                out = submodule.forward(info, encoder_hidden=encoder_hidden)
+                out = submodule.forward(
+                    _GRAPH_WALK, _engine_inputs(info), encoder_hidden=encoder_hidden
+                )
                 predicted = out["predicted_hidden"][0]
                 next_hidden = out["encoder_hidden"][0]
                 assert predicted.shape == (b, n_pred, config.hidden_size)
@@ -233,7 +247,9 @@ class TestEarlyExit:
             # after iter horizon-1 the submodule should register the stop.
             for k in range(horizon + 2):
                 info = _make_request_info(iter_idx=k, rollout_horizon=horizon)
-                out = submodule.forward(info, encoder_hidden=encoder_hidden)
+                out = submodule.forward(
+                    _GRAPH_WALK, _engine_inputs(info), encoder_hidden=encoder_hidden
+                )
                 encoder_hidden = out["encoder_hidden"][0]
                 if "rollout_loop" in submodule.check_stop(info.request_id, info, out):
                     stop_seen_at.append(k)
