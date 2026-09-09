@@ -47,7 +47,13 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
+from mstar.utils.profiler import (
+    PHASE_PERIOD,
+    StepKernelTrace,
+    phase_buffer,
+    range_pop,
+    range_push,
+)
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
@@ -156,6 +162,10 @@ class Worker:
 
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
+        # Per-kernel trace of a window of GPU-thread executes; inert unless
+        # MSTAR_PROFILE_STEPS is set (see StepKernelTrace). After set_device:
+        # when armed it initialises CUPTI on THIS worker's GPU up front.
+        self._step_trace = StepKernelTrace(worker_id, device=self.device)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -1191,6 +1201,7 @@ class Worker:
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
+            self._step_trace.before_execute()
             with self._span("worker.gpu_thread.exec"):
                 outputs = engine.exec_and_postprocess(node_batch)
             execution_stream = (
@@ -1204,6 +1215,7 @@ class Worker:
                 node_batch.completion_event = event
             return outputs
         finally:
+            self._step_trace.after_execute()
             # Safety net: a step that raised before the forward would otherwise
             # leave the submitter blocked on this for the full wait timeout.
             if node_batch.launch_started_event is not None:
