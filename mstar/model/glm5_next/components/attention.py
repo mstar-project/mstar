@@ -247,7 +247,10 @@ class Glm5NextMLAAttention(nn.Module):
     def process_weights_after_loading(self, device: torch.device | str | None = None) -> None:
         """Build absorbed Q/O projections from the local-head ``kv_b_proj`` shard."""
         del device  # protocol arg; kv_b_proj.weight already carries the right device
-        w = self.kv_b_proj.weight  # (H_local*(Dnope+Dv), L)
+        # Detached: these are derived inference buffers, and the load path is
+        # not under no_grad — a grad_fn here would pin the params' autograd
+        # graph for the model's lifetime.
+        w = self.kv_b_proj.weight.detach()  # (H_local*(Dnope+Dv), L)
         h, d_nope, d_v, latent = (
             self.num_heads, self.qk_nope_head_dim, self.v_head_dim, self.kv_lora_rank)
         w = w.view(h, d_nope + d_v, latent)
@@ -256,7 +259,9 @@ class Glm5NextMLAAttention(nn.Module):
         self.w_vc = w_vc.contiguous()  # (H_local, Dv,    L)
 
         self.fused_qkv_a_proj_weight = torch.cat(
-            [self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight], dim=0).contiguous()
+            [self.q_a_proj.weight.detach(), self.kv_a_proj_with_mqa.weight.detach()],
+            dim=0,
+        ).contiguous()
 
 
 class Glm5NextKdaAttention(Glm5NextLinearAttention):

@@ -1,0 +1,69 @@
+model: "glm5_next"
+# GLM-5.3-Flash TP8 bring-up config for the Laude team1 node (8xH100 80GB),
+# v1 (resource-pool) engine port of the lane's glm53_flash_tp8.yaml.
+# The single official repo ships fp8 e4m3 block-scale, 306 GB / 62 shards
+# -> ~38 GB weights/rank at TP8; with the KV + KDA budgets below the rank
+# ledger is ~39.5 GB of 80, deliberate headroom for activations, graphs,
+# and NCCL during bring-up. Resolve the checkpoint through the shared HF
+# cache: launch with HF_HOME=/data/kvasilev-cd4cf3/hf (download started
+# 2026-08-31), or pin model_kwargs.checkpoint_path to the snapshot dir
+# once the shards land (the glm52_tp8_coriander.yaml precedent).
+#
+# Scope: text-only (the loader skips vision tensors explicitly), MTP off,
+# greedy parity vs the lane's serve output before any perf lever.
+max_seq_len: 2048
+# index_topk = 2048 is the hard ceiling: within that window dense MLA is
+# exactly DSA, and the glm5_next constructor refuses dsa_long_context
+# outright — the k-pool indexer engine path is post-M1.
+#
+# NOT carried over from the lane config:
+#   dist_timeout_s: 3600 — main has no reader for it (it was the deleted
+#     engine's process-group timeout knob). The serve scripts under env/ set
+#     TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC instead; the lane's lesson still
+#     holds — a short process-group timeout kills rank 0 mid-load, err long.
+#   autocast_dtype — the engine takes it from Glm5NextModel.get_autocast_dtype()
+#     (bf16, the Model default). The YAML key is honored on main but is
+#     handed to torch as-is, so a YAML string ("bfloat16") is NOT a dtype;
+#     leave it to the model.
+model_kwargs:
+  # The clamped fp8 fused MoE kernel. "auto" resolves the fused path when a
+  # clamp-capable kernel is present -> removes the .nonzero() host sync ->
+  # decode cuda graphs capture. "reference" is the eager fallback
+  # (bit-faithful, slow); with it active get_cuda_graph_configs returns []
+  # and decode runs eager.
+  moe_quant_kernel: "auto"
+  # MTP off for the first v1 serve: 0 loads no layer-45 draft module and
+  # allocates no draft KV plane. The flag stays present so MTP is a
+  # one-line flip; re-sweep k from scratch there.
+  mtp_num_draft_tokens: 0
+# Per-resource deployment overrides (mstar/engine/resources/spec.py
+# apply_yaml_overrides). Keys are the resource keys glm5_next declares in
+# get_node_resources: kv_cache, attn, sampler, kda_state. A top-level
+# `kv_cache:` block (the lane's form) raises on main.
+resources:
+  kv_cache:
+    # Only the 11 MLA/DSA layers are paged; one latent head per token of
+    # width kv_lora_rank + mla_cache_kpe (512 + 64 = 576) x bf16 = 1.15 KB
+    # /token/plane -> ~12.7 KB/token/rank across the 11 planes (glm52: ~90).
+    # 512 pages x 128-token pages = 64k cached tokens/rank = 32 concurrent
+    # full-length (2048) requests, ~0.8 GB/rank.
+    #
+    # Sized to the real concurrency limiter: the KDA slot pool below. More
+    # pages without more slots buys nothing. KV is so small that pages can
+    # grow ~8x for free once the slot cap is lifted.
+    max_num_pages: 512
+    page_size: 128
+  kda_state:
+    # The KDA recurrent + conv state pool (SlotStateManager): one slot per
+    # in-flight request, TP-replicated in this port (34 KDA layers x 64 heads
+    # x 128^2 fp32 recurrent + the bf16 conv tail = ~148 MB/slot/rank ->
+    # ~4.9 GB/rank at 32 slots + the sink row; head-sharding across TP8
+    # cuts that to ~0.6 GB, a model-side follow-up). This is
+    # the decode batch cap: the captured decode buckets are the
+    # DEFAULT_CAPTURE_BATCH_SIZES <= max_slots.
+    max_slots: 32
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
