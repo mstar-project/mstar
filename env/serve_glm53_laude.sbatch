@@ -71,6 +71,11 @@ LOG=$OUT/serve.log
 # The worktree shares $D/mstar's venv; PYTHONPATH above makes it import
 # mstar (and glm5_next) from this worktree, not $D/mstar.
 VENV=${VENV:-$D/mstar/.venv}
+# Build the fused-MoE align CUDA op ONCE before eight workers race for the
+# same JIT lock (a loser falls back to the uncapturable torch path and drops
+# every captured decode bucket for the whole TP group).
+say "pre-building the fused MoE align op"
+"$VENV/bin/python" -c "from mstar.utils.fused_moe.align import _cuda_op_available as f; print('moe_align cuda op:', f())" 2>&1 | tail -1
 setsid "$VENV/bin/mstar-serve" --config configs/glm53_flash_tp8.yaml \
     --tensor-comm-protocol SHM --socket-path-prefix "$D/tmp/mstar-sockets/" \
     --upload-dir "$D/tmp/mstar-uploads/" --timeout 7200 --host 0.0.0.0 \

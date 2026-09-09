@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 
 import torch
 import triton
@@ -85,21 +86,34 @@ def _cuda_op_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    try:
-        from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import load
 
-        _clear_stale_build_lock("_mstar_moe_C")
-        load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
-        # Touch the op so a registration failure surfaces here, not at call time.
-        _ = torch.ops._mstar_moe_C.moe_align_block_size
-        return True
-    except Exception as e:  # pragma: no cover -- depends on the build toolchain
-        logger.warning(
-            "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
-            "using the slower torch fallback.",
-            e,
-        )
-        return False
+    # Two attempts. With one worker per GPU all building the same extension
+    # at once, the stale-lock sweep above is a race: a worker can remove the
+    # lock a sibling just created, and that sibling's build then fails at
+    # release with ENOENT even though the .so was written. By the retry the
+    # library exists and loads without building — and the fallback below
+    # is not CUDA-graph capturable (bincount syncs), so a rank that loses
+    # the race would drop every captured bucket for the whole TP group.
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            if attempt == 0:
+                _clear_stale_build_lock("_mstar_moe_C")
+            else:
+                time.sleep(2.0)
+            load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
+            # Touch the op so a registration failure surfaces here, not at call time.
+            _ = torch.ops._mstar_moe_C.moe_align_block_size
+            return True
+        except Exception as e:  # pragma: no cover -- depends on the build toolchain
+            last_error = e
+    logger.warning(
+        "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
+        "using the slower torch fallback (NOT CUDA-graph capturable).",
+        last_error,
+    )
+    return False
 
 
 def moe_align_block_size(
