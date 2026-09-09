@@ -1245,7 +1245,6 @@ class PiecewiseCudaGraphRunner:
         return self._graphs[min(fits, key=lambda key: key.seq_len)]
 
     def can_run(self, batch_size: int, total_tokens: int | None = None) -> bool:
-        # return False
         return self._resolve(batch_size, total_tokens) is not None
 
     @property
@@ -1261,7 +1260,6 @@ class PiecewiseCudaGraphRunner:
         Same question ``run`` settles per call, answered early so the outer
         ``declare_step`` can plan the region's resources against it.
         """
-        # return None
         data = self._resolve(batch_size, total_tokens)
         return None if data is None else SlotLease(
             slot=self._current_slot, bucket=data.bucket
