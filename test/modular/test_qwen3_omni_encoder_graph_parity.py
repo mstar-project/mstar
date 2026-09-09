@@ -70,9 +70,20 @@ def _require_flashinfer():
         pytest.skip("flashinfer not importable inside the varlen module")
 
 
-def _build_runner(encoder):
-    """Capture a PiecewiseCudaGraphRunner for one encoder, on test-sized buckets."""
+def _build_runner(encoder, key, num_heads, head_dim):
+    """Capture a PiecewiseCudaGraphRunner for one encoder, on test-sized buckets.
+
+    The encoder attends through the engine's ragged attention resource, so the
+    runner needs that resource and a StepRunner over it -- the same wiring the
+    engine does from ``get_node_resources``.
+    """
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+    from mstar.engine.resources import (
+        RaggedAttentionConfig,
+        RaggedAttentionSpec,
+        StepRunner,
+    )
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
     device = torch.device(DEVICE)
     cfg = encoder.get_piecewise_cuda_graph_config(device, DTYPE)
@@ -82,11 +93,27 @@ def _build_runner(encoder):
     )
     cfg.total_tokens = list(TEST_TOKEN_BUCKETS)
     cfg.capture_batch_sizes = list(TEST_CAPTURE_BS)
+
+    spec = RaggedAttentionSpec(
+        resource_key=key, nodes={"encoder"},
+        config=RaggedAttentionConfig(
+            num_qo_heads=num_heads, num_kv_heads=num_heads, head_dim=head_dim,
+        ),
+    )
+    resources = {key: build_resource(
+        spec, EngineResourceInfo(device=device, kv_dtype=DTYPE)
+    )}
     runner = PiecewiseCudaGraphRunner(
-        config=cfg, device=device, autocast_dtype=DTYPE,
+        label="encoder_block_loop",
+        config=cfg,
+        resources=resources,
+        step_runner=StepRunner(resources, node_resources={"encoder": [key]}),
+        device=device,
+        autocast_dtype=DTYPE,
+        node_name="encoder",
     )
     runner.warmup_and_capture()
-    assert runner.graphs, "PiecewiseCudaGraphRunner captured no graphs"
+    assert runner.any_graphs, "PiecewiseCudaGraphRunner captured no graphs"
     return runner
 
 
@@ -118,7 +145,10 @@ def test_vision_encoder_graph_eager_hf_parity():
 
     with torch.no_grad():
         emb_eager, _ds_e = nat(pv, g)                      # piecewise_runner=None
-    runner = _build_runner(nat)
+    from mstar.model.qwen3_omni.components.vision_encoder import QWEN_VIT_ATTN
+    runner = _build_runner(
+        nat, QWEN_VIT_ATTN, cfg.num_heads, cfg.hidden_size // cfg.num_heads,
+    )
     before = TEL.encoder_path_counts()
     with torch.no_grad():
         emb_graph, _ds_g = nat(pv, g, piecewise_runner=runner)
@@ -159,7 +189,11 @@ def test_audio_encoder_graph_eager_hf_parity():
 
     with torch.no_grad():
         out_eager = nat(feat, lens)                        # piecewise_runner=None
-    runner = _build_runner(nat)
+    from mstar.model.qwen3_omni.components.audio_encoder import AUT_ATTN
+    runner = _build_runner(
+        nat, AUT_ATTN, cfg.encoder_attention_heads,
+        cfg.d_model // cfg.encoder_attention_heads,
+    )
     before = TEL.encoder_path_counts()
     with torch.no_grad():
         out_graph = nat(feat, lens, piecewise_runner=runner)

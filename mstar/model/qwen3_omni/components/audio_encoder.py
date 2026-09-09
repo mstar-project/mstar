@@ -38,8 +38,10 @@ AUT_ATTN = "aut_attn"
 
 # Measured buckets: s2t (1..7 segments, 36..426 tokens) and s2s (1..16, ~1057).
 CAPTURE_TOKENS_AUDIO = (48, 64, 96, 128, 192, 256, 384, 512, 704, 896, 1088)
-# One bs value: crossed with total_tokens, so extras multiply graphs and 128 MiB
-# workspaces, while padding bs up is free.
+# One bs value: crossed with total_tokens, so extras multiply captured graphs.
+# NOTE: padding bs up is not numerically free (see CAPTURE_BATCH_SIZES_VISION);
+# this stays at one bucket because s2t/s2s span 1..16 segments and audio holds
+# its graph-vs-eager tolerance here, but the same drift applies.
 CAPTURE_BATCH_SIZES_AUDIO = (32,)
 
 
