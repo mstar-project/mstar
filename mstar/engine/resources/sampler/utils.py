@@ -416,6 +416,145 @@ class Sampler(BaseSampler):
         return tokens
 
 
+def _sample_cuda(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    repetition_penalty: float | torch.Tensor,
+    seen_token_mask: torch.Tensor | None,
+    run_greedy: bool,
+    all_top_k_zero: bool | None,
+    seed: torch.Tensor | None,
+    rand_offset: torch.Tensor | None,
+) -> torch.Tensor:
+    """Sample normalized CUDA inputs with FlashInfer."""
+    import flashinfer
+
+    # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
+    # (reads probs) to the same device/stream so the write-before-read is
+    # ordered without an explicit sync. Otherwise FlashInfer runs on the
+    # worker's current-device stream while probs lives off-device (e.g. BAGEL
+    # LLM on rank 1) — a cross-stream race that yields garbage.
+    with torch.cuda.device(logits.device):
+        # Fast path: top_k is disabled for every request in the batch. One Triton
+        # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
+        # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
+        # deterministically picks argmax on one-hot rows, matching greedy semantics.
+        if all_top_k_zero is True:
+            probs = fused_temperature_softmax(
+                logits, temperature,
+                penalty=repetition_penalty if seen_token_mask is not None else None,
+                seen_mask=seen_token_mask,
+                include_greedy=run_greedy,
+            )
+            result = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, top_p,
+                deterministic=True,
+                seed=seed, offset=rand_offset,
+            )
+            return result[0] if isinstance(result, tuple) else result
+
+        probs = fused_temperature_softmax(
+            logits, temperature,
+            penalty=repetition_penalty if seen_token_mask is not None else None,
+            seen_mask=seen_token_mask,
+            include_greedy=run_greedy,
+        )
+        result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p,
+            deterministic=True,
+            seed=seed, offset=rand_offset,
+        )
+        return result[0] if isinstance(result, tuple) else result
+
+
+def _sample_xpu(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    repetition_penalty: float | torch.Tensor,
+    seen_token_mask: torch.Tensor | None,
+    run_greedy: bool,
+    any_top_k_zero: bool | None,
+    seed: torch.Tensor | None,
+    rand_offset: torch.Tensor | None,
+) -> torch.Tensor:
+    """Sample normalized XPU inputs with vllm-xpu-kernels."""
+    import vllm_xpu_kernels._xpu_C  # noqa: F401
+
+    batch_size = logits.shape[0]
+    scores = logits.float()
+    if seen_token_mask is not None:
+        penalty = repetition_penalty[:, None]
+        penalized = torch.where(
+            scores < 0, scores * penalty, scores / penalty,
+        )
+        scores = torch.where(seen_token_mask, penalized, scores)
+
+    greedy = temperature == 0
+    safe_temperature = torch.where(
+        greedy, torch.ones_like(temperature), temperature,
+    )
+    scores = (scores / safe_temperature[:, None]).contiguous()
+    greedy_tokens = scores.argmax(dim=-1) if run_greedy else None
+
+    # The XPU kernel accepts one CPU [seed, offset] pair per invocation.
+    # Invoke it per row to preserve independent request RNG streams.
+    #
+    # TODO: batch this when the kernel accepts per-row RNG state. The
+    # current loop and scalar .item() checks synchronize once per row and
+    # are intended for the XPU deployment's current batch-size-one path.
+    #
+    # TODO: These device-to-host copies synchronize the asynchronous worker
+    # loop even if batched. The long-term fix is for the Sampler resource to
+    # pass the CPU seed/offset copies already maintained by SamplerBuffers.
+    #
+    # A raw caller that omits seed/offset gets [0, 0], hence deterministic
+    # XPU output; server callers always provide per-request RNG state.
+    sampled_rows = []
+    seeds_cpu = seed.detach().cpu() if seed is not None else None
+    offsets_cpu = (
+        rand_offset.detach().cpu() if rand_offset is not None else None
+    )
+    for row in range(batch_size):
+        sampled = torch.empty(
+            1, dtype=torch.int64, device=logits.device,
+        )
+        row_seed = int(seeds_cpu[row]) if seeds_cpu is not None else 0
+        row_offset = (
+            int(offsets_cpu[row]) if offsets_cpu is not None else 0
+        )
+        seed_offset = torch.tensor(
+            [row_seed, row_offset], dtype=torch.int64,
+        )
+
+        row_k = top_k[row:row + 1].to(torch.int64)
+        if any_top_k_zero is not False and int(row_k.item()) == 0:
+            row_k = None
+        row_p = top_p[row:row + 1]
+        if float(row_p.item()) >= 1.0:
+            row_p = None
+
+        torch.ops._xpu_C.topk_topp_sampler(
+            sampled,
+            None,
+            scores[row:row + 1],
+            row_k,
+            row_p,
+            "raw_logits",
+            seed_offset,
+            1.0,
+        )
+        sampled_rows.append(sampled[0])
+
+    sampled = torch.stack(sampled_rows)
+    if greedy_tokens is not None:
+        sampled = torch.where(greedy, greedy_tokens, sampled)
+    return sampled
+
+
 def sample_tokens(
     logits: torch.Tensor,
     temperature: float | torch.Tensor = 0.6,
@@ -460,118 +599,35 @@ def sample_tokens(
     run_greedy = True if any_greedy is None else any_greedy
 
     if logits.device.type == "cuda":
-        import flashinfer
-
-        # Pin the Triton prep kernel (writes probs) and the FlashInfer sampler
-        # (reads probs) to the same device/stream so the write-before-read is
-        # ordered without an explicit sync. Otherwise FlashInfer runs on the
-        # worker's current-device stream while probs lives off-device (e.g. BAGEL
-        # LLM on rank 1) — a cross-stream race that yields garbage.
-        with torch.cuda.device(logits.device):
-            # Fast path: top_k is disabled for every request in the batch. One Triton
-            # kernel fuses (optional rep-penalty) + (temperature-scaled softmax) +
-            # (argmax → one-hot for greedy rows). FlashInfer's sample-from-probs then
-            # deterministically picks argmax on one-hot rows, matching greedy semantics.
-            if all_top_k_zero is True:
-                probs = fused_temperature_softmax(
-                    logits, temperature,
-                    penalty=repetition_penalty if seen_token_mask is not None else None,
-                    seen_mask=seen_token_mask,
-                    include_greedy=run_greedy,
-                )
-                result = flashinfer.sampling.top_p_sampling_from_probs(
-                    probs, top_p,
-                    deterministic=True,
-                    seed=seed, offset=rand_offset,
-                )
-                return result[0] if isinstance(result, tuple) else result
-
-            probs = fused_temperature_softmax(
-                logits, temperature,
-                penalty=repetition_penalty if seen_token_mask is not None else None,
-                seen_mask=seen_token_mask,
-                include_greedy=run_greedy,
-            )
-            result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k, top_p,
-                deterministic=True,
-                seed=seed, offset=rand_offset
-            )
-            return result[0] if isinstance(result, tuple) else result
-
-    elif logits.device.type == "xpu":
-        import vllm_xpu_kernels._xpu_C  # noqa: F401
-
-        scores = logits.float()
-        if seen_token_mask is not None:
-            penalty = repetition_penalty[:, None]
-            penalized = torch.where(
-                scores < 0, scores * penalty, scores / penalty,
-            )
-            scores = torch.where(seen_token_mask, penalized, scores)
-
-        greedy = temperature == 0
-        safe_temperature = torch.where(
-            greedy, torch.ones_like(temperature), temperature,
+        return _sample_cuda(
+            logits,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            seen_token_mask,
+            run_greedy,
+            all_top_k_zero,
+            seed,
+            rand_offset,
         )
-        scores = (scores / safe_temperature[:, None]).contiguous()
-        greedy_tokens = scores.argmax(dim=-1) if run_greedy else None
-
-        # The XPU kernel accepts one CPU [seed, offset] pair per invocation.
-        # Invoke it per row to preserve independent request RNG streams.
-        #
-        # TODO: batch this when the kernel accepts per-row RNG state. The
-        # current loop and scalar .item() checks synchronize once per row and
-        # are intended for the XPU deployment's current batch-size-one path.
-        #
-        # A raw caller that omits seed/offset gets [0, 0], hence deterministic
-        # XPU output; server callers always provide per-request RNG state.
-        sampled_rows = []
-        seeds_cpu = seed.detach().cpu() if seed is not None else None
-        offsets_cpu = (
-            rand_offset.detach().cpu() if rand_offset is not None else None
+    if logits.device.type == "xpu":
+        return _sample_xpu(
+            logits,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            seen_token_mask,
+            run_greedy,
+            any_top_k_zero,
+            seed,
+            rand_offset,
         )
-        for row in range(batch_size):
-            sampled = torch.empty(
-                1, dtype=torch.int64, device=logits.device,
-            )
-            row_seed = int(seeds_cpu[row]) if seeds_cpu is not None else 0
-            row_offset = (
-                int(offsets_cpu[row]) if offsets_cpu is not None else 0
-            )
-            seed_offset = torch.tensor(
-                [row_seed, row_offset], dtype=torch.int64,
-            )
-
-            row_k = top_k[row:row + 1].to(torch.int64)
-            if any_top_k_zero is not False and int(row_k.item()) == 0:
-                row_k = None
-            row_p = top_p[row:row + 1]
-            if float(row_p.item()) >= 1.0:
-                row_p = None
-
-            torch.ops._xpu_C.topk_topp_sampler(
-                sampled,
-                None,
-                scores[row:row + 1],
-                row_k,
-                row_p,
-                "raw_logits",
-                seed_offset,
-                1.0,
-            )
-            sampled_rows.append(sampled[0])
-
-        sampled = torch.stack(sampled_rows)
-        if greedy_tokens is not None:
-            sampled = torch.where(greedy, greedy_tokens, sampled)
-        return sampled
-
-    else:
-        raise ValueError(
-            f"Sampling is unsupported on device type {logits.device.type!r}; "
-            "expected 'cuda' or 'xpu'."
-        )
+    raise ValueError(
+        f"Sampling is unsupported on device type {logits.device.type!r}; "
+        "expected 'cuda' or 'xpu'."
+    )
 
 
 def _to_tensor(
