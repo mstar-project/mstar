@@ -46,6 +46,12 @@ class FlashInferRaggedManager(RaggedAttnManager):
             sm_scale=config.sm_scale,
             backend=config.flashinfer_backend,
         )
+    
+    @property
+    def force_double_buffer(self):
+        # FlashInfer's plan stages the schedule into a pinned buffer it holds
+        # per wrapper and H2Ds it on the stream
+        return True
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str,
