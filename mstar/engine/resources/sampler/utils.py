@@ -33,6 +33,23 @@ def _rng_offset_stride(device_type: str, vocab_size: int) -> int:
     return vocab_size if device_type == "xpu" else 1
 
 
+def _xpu_generator_seed_offset(
+    generator: torch.Generator,
+    num_random_values: int,
+) -> tuple[int, int]:
+    """Read XPU generator state and reserve an aligned Philox offset range."""
+    state = generator.get_state()
+    state_values = state.view(torch.int64)
+    seed = int(state_values[0])
+    offset = int(state_values[1])
+    if num_random_values:
+        # PyTorch requires the stored XPU generator offset to be a multiple of 4.
+        next_offset = (offset + num_random_values + 3) // 4 * 4
+        state_values[1] = next_offset
+        generator.set_state(state)
+    return seed, offset
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_SIZE": 4096},  num_warps=4,  num_stages=2),
@@ -511,23 +528,42 @@ def _sample_xpu(
     # loop even if batched. The long-term fix is for the Sampler resource to
     # pass the CPU seed/offset copies already maintained by SamplerBuffers.
     #
-    # A raw caller that omits seed/offset gets [0, 0], hence deterministic
-    # XPU output; server callers always provide per-request RNG state.
+    # Raw callers may omit seed and/or offset. Match CUDA's behavior by filling
+    # missing values from the default XPU generator. When offset is omitted,
+    # reserve one Philox region per logit and advance the generator state.
     sampled_rows = []
     seeds_cpu = seed.detach().cpu() if seed is not None else None
     offsets_cpu = (
         rand_offset.detach().cpu() if rand_offset is not None else None
     )
+    if seeds_cpu is None or offsets_cpu is None:
+        device_index = logits.device.index
+        if device_index is None:
+            device_index = torch.xpu.current_device()
+        generator = torch.xpu.default_generators[device_index]
+        default_seed, default_offset = _xpu_generator_seed_offset(
+            generator,
+            logits.numel() if offsets_cpu is None else 0,
+        )
+        if seeds_cpu is None:
+            seeds_cpu = torch.full(
+                (batch_size,), default_seed, dtype=torch.int64,
+            )
+        if offsets_cpu is None:
+            offsets_cpu = (
+                torch.arange(batch_size, dtype=torch.int64)
+                * logits.shape[1]
+                + default_offset
+            )
+
+    assert seeds_cpu is not None and offsets_cpu is not None
     for row in range(batch_size):
         sampled = torch.empty(
             1, dtype=torch.int64, device=logits.device,
         )
-        row_seed = int(seeds_cpu[row]) if seeds_cpu is not None else 0
-        row_offset = (
-            int(offsets_cpu[row]) if offsets_cpu is not None else 0
-        )
         seed_offset = torch.tensor(
-            [row_seed, row_offset], dtype=torch.int64,
+            [int(seeds_cpu[row]), int(offsets_cpu[row])],
+            dtype=torch.int64,
         )
 
         row_k = top_k[row:row + 1].to(torch.int64)
