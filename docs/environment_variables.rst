@@ -164,6 +164,116 @@ model, so they are named for it.
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
 
+CUDA graphs (captured forwards)
+-------------------------------
+
+Read by :mod:`mstar.engine.cuda_graph_runner`.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 8 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_GRAPH_COMPILE_MODE``
+     - unset
+     - Overrides the ``torch.compile`` mode of every captured forward (whole
+       forwards and piecewise regions). Unset, each capture config's own
+       ``compile_mode`` applies, else ``max-autotune-no-cudagraphs``.
+       ``default`` keeps Inductor's fusion but takes cuBLAS for every GEMM
+       and skips autotuning: at decode shapes max-autotune's warm-L2
+       benchmark can pick Triton GEMM templates that run 2x slower than
+       cuBLAS split-K once the weights stream from HBM (GLM-5.2 trunk at
+       per-rank dims: -8 %, capture 130 s -> 27 s; TP8 90.03 -> 96.97 tok/s,
+       stream bit-exact). GLM-5.2's configs name ``default``. An unknown mode
+       fails at import.
+   * - ``MSTAR_INDUCTOR_GEMM_BACKENDS``
+     - unset
+     - When set (e.g. ``ATEN`` or ``ATEN,TRITON``), restricts Inductor's
+       ``max_autotune_gemm_backends``; only matters under an autotuning mode.
+   * - ``MSTAR_PROFILE_STEPS``
+     - unset
+     - ``<first>:<count>``: per-kernel ``torch.profiler`` trace of ``count``
+       consecutive GPU-thread executes starting at the ``first``-th
+       (:class:`mstar.utils.profiler.StepKernelTrace`), written under
+       ``MSTAR_PROFILE_DIR``; summarise with ``env/kernel_trace_summary.py``.
+       ``MSTAR_PROFILE_NSYS=1`` emits NVTX ranges instead.
+
+GLM-5.2 (MTP, capture, collectives)
+-----------------------------------
+
+Read by :mod:`mstar.model.glm52`. Every knob is a measured default with an
+escape hatch; the ones that change numerics are called out. "Bit-exact"
+refers to the 3264-token greedy stream of the TP8 bench against plain
+(MTP-off, captured) decode.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 8 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_GLM52_GRAPH_COMPILE``
+     - ``1``
+     - Capture the ``torch.compile``'d forward into the CUDA graphs. ``0``
+       captures the eager forward — escape hatch for an Inductor-subprocess
+       Triton crash that once failed every capture and silently degraded the
+       fast config to eager. Stream capture alone still removes launch
+       overhead; Inductor fusion is what ``0`` gives up.
+   * - ``MSTAR_GLM52_MTP_PAIR_POSTNORM``
+     - ``1``
+     - MTP draft input pairing uses the trunk's post-norm hidden state (the
+       reference convention): per-position acceptance p1/p2 0.89/0.74 vs
+       pre-norm's 0.77/0.33. ``0`` restores pre-norm pairing. Changes which
+       tokens are drafted, never which are emitted.
+   * - ``MSTAR_GLM52_MTP_CAPTURE_SYNC``
+     - ``1``
+     - Capture the decode sync pass as a padded ``(bs, k+1)`` piecewise
+       graph (bit-identical to the eager pass). ``0`` runs it eager.
+   * - ``MSTAR_GLM52_MTP_CAPTURE_PREFILL``
+     - ``1``
+     - Capture the MTP prefill trunk over the same token buckets the k=0
+       config captures (TTFT 305 ms eager vs 57 ms). Sample, plane sync and
+       draft chain stay outside the graph. ``0`` runs prefill eager.
+   * - ``MSTAR_GLM52_MTP_PREFILL_DRAFTS``
+     - ``1``
+     - Bundle the first drafts with the prefill output so the first decode
+       step is a speculated ``(k+1)``-row step like every other. ``0`` drops
+       the bundle: one unspeculated step per request.
+   * - ``MSTAR_GLM52_MTP_DRAFT_PHASE_GRAPH``
+     - ``1``
+     - The whole decode draft phase as ONE captured graph: padded sync pass,
+       draft-1 head and the ``k-1`` chain iterations over ``k`` attention
+       sub-plans planned before a single replay (the three-replay version
+       was host-bound at ~5 ms/step; one replay is ~1.2 ms). Requires sync
+       capture. ``0`` restores the three-graph path, still the fallback for
+       missing buckets.
+   * - ``MSTAR_GLM52_MOE_FUSED_ALLREDUCE``
+     - ``0``
+     - Add the shared-expert output to the routed partial before the TP
+       all-reduce and reduce once (the ``DeepseekV2MoE`` layout): one
+       collective fewer per MoE layer (233 -> 158 all-reduces per TP8 decode
+       step). ``1`` enables. Off by default: bf16 rounding order moves; the
+       TP8 arms that enabled it stayed bit-exact on the bench, which is a
+       measurement, not a guarantee.
+   * - ``MSTAR_GLM52_MTP_STEP_TIMING``
+     - ``0``
+     - ``N`` > 0 logs the per-phase GPU|host split (trunk, verify readback,
+       draft phase, tail) of every ``N``-th decode step from CUDA events. The
+       GPU column is stream-elapsed time between events and includes idle
+       the GPU spends waiting on the host; read it next to the host column.
+   * - ``MSTAR_GLM52_MTP_PHASE_PREPARE``
+     - ``0``
+     - ``1`` stages the e-independent half of the decode draft phase (slot
+       indices, the contiguous positions, sub-plan 0's attention plan)
+       through ``PiecewiseCudaGraphRunner.stage()`` while the host waits on
+       the verify readback; only the accepted-count-dependent rows and the
+       ``k-1`` chain sub-plans wait for ``e``. Bit-exact by construction
+       (TP8 arm: 110.74 -> 111.71 tok/s, draft-phase host 1.34 -> 0.97 ms).
+       Off until a clean flag-off control on the same tree confirms the gap.
+
 Serving (Rust frontend)
 -----------------------
 
