@@ -168,3 +168,43 @@ class ParallelAttention(nn.Module):
         attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
+
+
+class ParallelCrossAttention(nn.Module):
+    """
+    TODO(#160): the projections are plain ``nn.Linear`` — this module is not
+    yet TP/SP-compatible (no column/row-parallel splits over heads). A
+    tensor-parallel cross-attention variant is needed to serve the decoder
+    under TP alongside the self-attention path.
+    """
+
+    def __init__(
+        self,
+        *,
+        comm_group: CommGroup | None = None,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
+        q_bias: bool = True,
+        k_bias: bool = False,
+        v_bias: bool = True,
+        o_bias: bool = True,
+        source: str = "default",
+        cross_key: str | None = None,
+        context_kv_key: str | None = None,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.source = source
+        self._cross_key = cross_key or source
+        self._context_kv_key = context_kv_key
+        self.cross = None
+        self.context_kv = None
+        inner = num_heads * head_dim
+
+        
+        self.q_proj = nn.Linear(hidden_size, inner, bias=q_bias)
+        self.k_proj = nn.Linear(hidden_size, inner, bias=k_bias)
+        self.v_proj = nn.Linear(hidden_size, inner, bias=v_bias)
+        self.out_proj = nn.Linear(inner, hidden_size, bias=o_bias)

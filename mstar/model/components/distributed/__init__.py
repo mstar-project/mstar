@@ -13,7 +13,7 @@ embedding all-reduces shard contributions before the first transformer
 layer, and the LM head all-gathers logits along the vocab dim before
 returning, so the sampler stays vocab-oblivious.
 """
-from mstar.model.components.distributed.attention import ParallelAttention
+from mstar.model.components.distributed.attention import (ParallelAttention, ParallelCrossAttention)
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
@@ -29,6 +29,7 @@ __all__ = [
     "QKVParallelLinear",
     "RowParallelLinear",
     "ParallelAttention",
+    "ParallelCrossAttention",
     "ParallelGatedMLP",
     "VocabParallelEmbedding",
 ]
