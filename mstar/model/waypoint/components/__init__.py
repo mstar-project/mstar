@@ -7,14 +7,23 @@ runs unconditionally in the reference's ``WorldEngine.__init__``, so the
 it takes the patched **fused QKV** and keeps the unpatched **packed**
 ``MLPFusion.fc1``, because that patch *splits* the packed weight rather than
 merging it, and packed is the checkpoint's own storage. Both forms are
-algebraically identical (measured 0.0 either way). See
-``docs/waypoint/CONTRACTS.md`` section 5.
+algebraically identical (measured 0.0 either way).
 
-``kv_backend.py`` is deliberately *not* part of the module tree: the ring KV
-cache is plain classes holding eagerly-allocated tensors, so a meta build and
-``to_empty`` cannot touch it, and so it can be swapped for an engine-owned cache
-behind ``WaypointKVBackend`` without the DiT noticing (backlog B1). The TAEHV
-streaming VAE (``taehv.py``) is phase 7 and does not exist yet.
+**Nothing here owns the world state.** The ring KV cache and the FlexAttention
+kernel are engine resources (``engine/resources/kv/ring/``,
+``engine/resources/attn/flex.py``), bound onto ``WaypointDiT`` and its 24
+``WaypointAttention`` layers at load by ``NodeSubmodule.bind_node_resources``.
+That keeps the rings out of the module tree, where ``to_empty(device)``,
+``state_dict()`` and the weight loader would each have a buffer of ours to leave
+holding garbage. The superseded model-owned implementation (``kv_backend.py``,
+with its ``FlexRingBackend`` and ``WaypointKVBackend`` protocol) was deleted
+once the equivalence gate against it passed bit-exactly; ``git show
+d31c3e70:mstar/model/waypoint/components/kv_backend.py`` is the last version.
+
+``ring_memory_bytes`` / ``describe_ring_memory`` moved up a level to
+``waypoint/ring_geometry.py``: they are ``WaypointConfig`` arithmetic for
+sizing a deployment and never needed a component to exist. The TAEHV streaming
+VAE (``taehv.py``) is phase 7 and does not exist yet.
 """
 
 from mstar.model.waypoint.components.attention import WaypointAttention
@@ -22,15 +31,6 @@ from mstar.model.waypoint.components.dit import (
     WaypointDiT,
     WaypointDiTBlock,
     WaypointPosIds,
-)
-from mstar.model.waypoint.components.kv_backend import (
-    FlexRingBackend,
-    LayerRingCache,
-    WaypointKVBackend,
-    describe_ring_memory,
-    flex_attention_masked,
-    make_block_mask,
-    ring_memory_bytes,
 )
 from mstar.model.waypoint.components.layers import (
     FP32_MODULE_PATHS,
@@ -58,8 +58,6 @@ __all__ = [
     "CondHead",
     "ControllerInputEmbedding",
     "DeviceTableCache",
-    "FlexRingBackend",
-    "LayerRingCache",
     "MLPFusion",
     "NoiseConditioner",
     "OrthoRoPE",
@@ -67,14 +65,9 @@ __all__ = [
     "WaypointAttention",
     "WaypointDiT",
     "WaypointDiTBlock",
-    "WaypointKVBackend",
     "WaypointPosIds",
     "ada_gate",
     "ada_rmsnorm",
     "apply_ortho_rope",
-    "describe_ring_memory",
-    "flex_attention_masked",
-    "make_block_mask",
-    "ring_memory_bytes",
     "rms_norm",
 ]

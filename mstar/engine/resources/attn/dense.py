@@ -8,7 +8,7 @@ import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import StepContext
 
@@ -110,7 +110,7 @@ class DenseAttentionManager(AttentionManager):
         kv_cache: str,
         device: torch.device,
         dtype: torch.dtype,
-        kv_config: KVConfig,
+        kv_config: PagedKVConfig,
     ):
         self._kv_cache_name = kv_cache
         self._device = device
