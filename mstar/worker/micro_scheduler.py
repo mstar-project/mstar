@@ -223,16 +223,9 @@ class MicroScheduler:
 
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
-        target_node_name: str | None = None,
-        target_graph_walk: str | None = None,
         exclude_target: tuple[str, str] | None = None,
     ) -> ScheduledBatch | None:
         if len(self.tp_batches_pending_schedule) == 0:
-            return
-        # A popped ScheduleTPNode has no re-queue path and must be submitted
-        # unconditionally. Targeted calls (the speculation fresh-rid merge) may
-        # reject what they are handed, so never serve them from this FIFO.
-        if target_node_name is not None or target_graph_walk is not None:
             return
         first_tp_node: ScheduleTPNode = self.tp_batches_pending_schedule[0]
         if exclude_target is not None and \
@@ -316,12 +309,12 @@ class MicroScheduler:
         # Rank 0 already committed to this batch and will sit on the collective
         # inside the forward until every follower joins it, so a follower that
         # skipped the batch because one of its rids failed locally would hang
-        # the whole TP group.
-        tp_follow_batch = self._try_schedule_tp_follow(
-            worker_graphs_manager,
-            target_node_name=target_node_name,
-            target_graph_walk=target_graph_walk,
-            exclude_target=exclude_target,
+        # the whole TP group. A popped ScheduleTPNode ha sno re-queue path
+        # and must be submitted unconditionally. So that a targeted call,
+        # (the speculation fresh-rid merge, which may reject what it is
+        # handed) is never served from the FIFO.
+        tp_follow_batch = None if target is not None else self._try_schedule_tp_follow(
+            worker_graphs_manager, exclude_target=exclude_target,
         )
         if tp_follow_batch is None:
             self.num_consec_tp_follower_batches = 0
