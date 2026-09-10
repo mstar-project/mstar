@@ -30,7 +30,10 @@ HF_COS_MIN = 0.99
 # a bucket; capture cost is trivial at this model size.  A layout that fits none
 # of these would fall back to eager, and the path assertion below catches that.
 TEST_TOKEN_BUCKETS = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
-TEST_CAPTURE_BS = [32]
+# Segment-count buckets come from the encoder under test, so the parity checks
+# below exercise the configuration that actually ships. Padding a bucket above
+# the real segment count perturbs the replayed result -- see
+# test_padded_capture_bucket_still_drifts.
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -70,7 +73,7 @@ def _require_flashinfer():
         pytest.skip("flashinfer not importable inside the varlen module")
 
 
-def _build_runner(encoder, key, num_heads, head_dim):
+def _build_runner(encoder, key, num_heads, head_dim, capture_bs):
     """Capture a PiecewiseCudaGraphRunner for one encoder, on test-sized buckets.
 
     The encoder attends through the engine's ragged attention resource, so the
@@ -92,7 +95,7 @@ def _build_runner(encoder, key, num_heads, head_dim):
         "unreachable, so production would silently run eager"
     )
     cfg.total_tokens = list(TEST_TOKEN_BUCKETS)
-    cfg.capture_batch_sizes = list(TEST_CAPTURE_BS)
+    cfg.capture_batch_sizes = list(capture_bs)
 
     spec = RaggedAttentionSpec(
         resource_key=key, nodes={"encoder"},
@@ -145,9 +148,13 @@ def test_vision_encoder_graph_eager_hf_parity():
 
     with torch.no_grad():
         emb_eager, _ds_e = nat(pv, g)                      # piecewise_runner=None
-    from mstar.model.qwen3_omni.components.vision_encoder import QWEN_VIT_ATTN
+    from mstar.model.qwen3_omni.components.vision_encoder import (
+        CAPTURE_BATCH_SIZES_VISION,
+        QWEN_VIT_ATTN,
+    )
     runner = _build_runner(
         nat, QWEN_VIT_ATTN, cfg.num_heads, cfg.hidden_size // cfg.num_heads,
+        CAPTURE_BATCH_SIZES_VISION,
     )
     before = TEL.encoder_path_counts()
     with torch.no_grad():
@@ -189,10 +196,14 @@ def test_audio_encoder_graph_eager_hf_parity():
 
     with torch.no_grad():
         out_eager = nat(feat, lens)                        # piecewise_runner=None
-    from mstar.model.qwen3_omni.components.audio_encoder import AUT_ATTN
+    from mstar.model.qwen3_omni.components.audio_encoder import (
+        AUT_ATTN,
+        CAPTURE_BATCH_SIZES_AUDIO,
+    )
     runner = _build_runner(
         nat, AUT_ATTN, cfg.encoder_attention_heads,
         cfg.d_model // cfg.encoder_attention_heads,
+        CAPTURE_BATCH_SIZES_AUDIO,
     )
     before = TEL.encoder_path_counts()
     with torch.no_grad():
@@ -263,3 +274,49 @@ def test_varlen_attention_uses_flashinfer_under_capture_override():
         ) = saved
         VA.set_fi_override(_restore_override)
     assert called["flashinfer"] and not called["flash"]
+
+
+@requires_cuda
+@pytest.mark.xfail(
+    strict=True,
+    reason="A capture bucket wider than the real segment count perturbs the "
+           "replayed result; error grows with the padding (0 pad exact, 28 pad "
+           "5.2e-3). Mechanism unresolved -- not the ragged resource, which is "
+           "bit-exact against flash-attn with the same padding, and not "
+           "cu_seqlens, which the ragged path never reads. Production avoids it "
+           "by bucketing the observed segment counts (CAPTURE_BATCH_SIZES_VISION). "
+           "If this XPASSes the drift is gone: drop the xfail and widen the "
+           "buckets back.",
+)
+def test_padded_capture_bucket_still_drifts():
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeVisionEncoder,
+    )
+
+    from mstar.model.qwen3_omni.components.vision_encoder import (
+        NativeQwen3OmniVisionEncoder,
+        QWEN_VIT_ATTN,
+    )
+    _require_flashinfer()
+    torch.manual_seed(0)
+    cfg = _small_vision_cfg()
+    hf = Qwen3OmniMoeVisionEncoder._from_config(
+        cfg, attn_implementation="sdpa").to(DEVICE, DTYPE).eval()
+    nat = NativeQwen3OmniVisionEncoder(cfg).to(DEVICE, DTYPE).eval()
+    nat.load_state_dict(hf.state_dict(), strict=False)
+
+    rows = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
+    g = torch.tensor([[1, 8, 8]], device=DEVICE)          # one image -> one segment
+    pv = torch.randn(8 * 8, rows, device=DEVICE, dtype=DTYPE)
+
+    with torch.no_grad():
+        emb_eager, _ = nat(pv, g)
+    runner = _build_runner(
+        nat, QWEN_VIT_ATTN, cfg.num_heads, cfg.hidden_size // cfg.num_heads,
+        [32],                                             # 31 padding segments
+    )
+    with torch.no_grad():
+        emb_graph, _ = nat(pv, g, piecewise_runner=runner)
+    torch.cuda.synchronize()
+    maxabs = (emb_graph.float() - emb_eager.float()).abs().max().item()
+    assert maxabs < GRAPH_EAGER_MAXABS, f"padded-bucket max-abs={maxabs:.3e}"
