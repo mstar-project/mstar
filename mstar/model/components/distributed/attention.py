@@ -1,4 +1,4 @@
-"""TP-aware multi-head attention.
+"""TP-aware self- and cross-attention.
 
 Mirrors ``mstar.model.components.Attention`` but with the QKV projection
 sharded across heads via ``QKVParallelLinear`` and the output projection
@@ -24,8 +24,10 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.distributed.utils import divide
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -201,7 +203,7 @@ class ParallelCrossAttention(nn.Module):
 
         self.hidden_size = hidden_size
         self.total_num_heads = num_heads
-        self.num_heads = num_heads/comm_group.world_size
+        self.num_heads = divide(num_heads,comm_group.world_size)
         self.head_dim = head_dim
 
         self.source = source
@@ -210,11 +212,33 @@ class ParallelCrossAttention(nn.Module):
         self.cross = None
         self.context_kv = None
         inner = num_heads * head_dim
-        
-        self.q_proj = nn.Linear(hidden_size, inner, bias=q_bias)
-        self.k_proj = nn.Linear(hidden_size, inner, bias=k_bias)
-        self.v_proj = nn.Linear(hidden_size, inner, bias=v_bias)
-        self.out_proj = nn.Linear(inner, hidden_size, bias=o_bias)
+
+        self.q_proj = ColumnParallelLinear(
+            comm_group=comm_group, 
+            input_size=hidden_size,
+            output_size=inner, 
+            bias=q_bias,
+        )
+        self.k_proj = ColumnParallelLinear(
+            comm_group=comm_group, 
+            input_size=hidden_size,
+            output_size=inner, 
+            bias=k_bias,
+        )
+        self.v_proj = ColumnParallelLinear(
+            comm_group=comm_group, 
+            input_size=hidden_size,
+            output_size=inner, 
+            bias=v_bias,
+        )
+        self.out_proj = RowParallelLinear(
+            comm_group=comm_group,
+            input_size=inner,
+            output_size=hidden_size,
+            bias=o_bias,
+            input_is_parallel=True,
+            reduce_results=True,
+        )
 
     def compute_kv(
         self, encoder_states: torch.Tensor,
