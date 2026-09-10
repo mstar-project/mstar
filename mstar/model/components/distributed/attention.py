@@ -194,17 +194,66 @@ class ParallelCrossAttention(nn.Module):
         context_kv_key: str | None = None,
     ):
         super().__init__()
-        self.num_heads = num_heads
+
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+
+        self.hidden_size = hidden_size
+        self.total_num_heads = num_heads
+        self.num_heads = num_heads/comm_group.world_size
         self.head_dim = head_dim
+
         self.source = source
         self._cross_key = cross_key or source
         self._context_kv_key = context_kv_key
         self.cross = None
         self.context_kv = None
         inner = num_heads * head_dim
-
         
         self.q_proj = nn.Linear(hidden_size, inner, bias=q_bias)
         self.k_proj = nn.Linear(hidden_size, inner, bias=k_bias)
         self.v_proj = nn.Linear(hidden_size, inner, bias=v_bias)
         self.out_proj = nn.Linear(inner, hidden_size, bias=o_bias)
+
+    def compute_kv(
+        self, encoder_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project the encoder context to K/V for the cross-attention pool.
+
+        ``(enc_len, hidden) -> (k, v)``, each ``(enc_len, num_heads, head_dim)``.
+        Override to reshape for a model-specific pool layout.
+        """
+        enc_len = encoder_states.shape[0]
+        k = self.k_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
+        v = self.v_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
+        return k, v
+
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve this source's cross-attention resource and the cache
+        holding its context. See ``NodeSubmodule.bind_node_resources``."""
+        self.cross = resources[self._cross_key]
+        key = self._context_kv_key
+        if key is None:
+            # the resource already names the cache it attends
+            key = self.cross.context_cache_key
+        self.context_kv = resources[key]
+
+    # Same cursor API as AttentionCallable, so a layer loop drives self- and
+    # cross-attention the same way. Not an AttentionCallable itself: nothing is
+    # written here, and the context cache is a different resource.
+    def bind_step(self, label: str) -> None:
+        self.cross.set_default_label(label)
+
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self.context_kv.set_default_layer_idx(layer_idx)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Label and layer index come off the resources' cursors; see
+        ``Attention.forward``."""
+        num_tokens = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
+        # nothing is written here: the context was written once at encode time
+        attn = self.cross.run(q, kv_cache_layer=self.context_kv.layer_view())
+        attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
+        return self.out_proj(attn)
