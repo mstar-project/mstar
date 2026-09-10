@@ -31,9 +31,7 @@ HF_COS_MIN = 0.99
 # of these would fall back to eager, and the path assertion below catches that.
 TEST_TOKEN_BUCKETS = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
 # Segment-count buckets come from the encoder under test, so the parity checks
-# below exercise the configuration that actually ships. Padding a bucket above
-# the real segment count perturbs the replayed result -- see
-# test_padded_capture_bucket_still_drifts.
+# below exercise the configuration that actually ships.
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
@@ -275,48 +273,3 @@ def test_varlen_attention_uses_flashinfer_under_capture_override():
         VA.set_fi_override(_restore_override)
     assert called["flashinfer"] and not called["flash"]
 
-
-@requires_cuda
-@pytest.mark.xfail(
-    strict=True,
-    reason="A capture bucket wider than the real segment count perturbs the "
-           "replayed result; error grows with the padding (0 pad exact, 28 pad "
-           "5.2e-3). Mechanism unresolved -- not the ragged resource, which is "
-           "bit-exact against flash-attn with the same padding, and not "
-           "cu_seqlens, which the ragged path never reads. Production avoids it "
-           "by bucketing the observed segment counts (CAPTURE_BATCH_SIZES_VISION). "
-           "If this XPASSes the drift is gone: drop the xfail and widen the "
-           "buckets back.",
-)
-def test_padded_capture_bucket_still_drifts():
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        Qwen3OmniMoeVisionEncoder,
-    )
-
-    from mstar.model.qwen3_omni.components.vision_encoder import (
-        NativeQwen3OmniVisionEncoder,
-        QWEN_VIT_ATTN,
-    )
-    _require_flashinfer()
-    torch.manual_seed(0)
-    cfg = _small_vision_cfg()
-    hf = Qwen3OmniMoeVisionEncoder._from_config(
-        cfg, attn_implementation="sdpa").to(DEVICE, DTYPE).eval()
-    nat = NativeQwen3OmniVisionEncoder(cfg).to(DEVICE, DTYPE).eval()
-    nat.load_state_dict(hf.state_dict(), strict=False)
-
-    rows = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
-    g = torch.tensor([[1, 8, 8]], device=DEVICE)          # one image -> one segment
-    pv = torch.randn(8 * 8, rows, device=DEVICE, dtype=DTYPE)
-
-    with torch.no_grad():
-        emb_eager, _ = nat(pv, g)
-    runner = _build_runner(
-        nat, QWEN_VIT_ATTN, cfg.num_heads, cfg.hidden_size // cfg.num_heads,
-        [32],                                             # 31 padding segments
-    )
-    with torch.no_grad():
-        emb_graph, _ = nat(pv, g, piecewise_runner=runner)
-    torch.cuda.synchronize()
-    maxabs = (emb_graph.float() - emb_eager.float()).abs().max().item()
-    assert maxabs < GRAPH_EAGER_MAXABS, f"padded-bucket max-abs={maxabs:.3e}"

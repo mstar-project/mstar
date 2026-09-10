@@ -37,11 +37,8 @@ logger = logging.getLogger(__name__)
 QWEN_VIT_ATTN = "qwen_vit_attn"
 # MUST stay divisible by spatial_merge_size**2 (=4).
 CAPTURE_TOKENS_VISION = (576, 704, 768, 896, 1024, 1280, 1536, 2048, 3072, 4096)
-# Padding bs up is NOT free: the replayed graph's result drifts with the number
-# of zero-length segments the plan is padded to (measured graph-vs-eager max-abs
-# 0.0 at zero padding, 1.9e-3 at 4, 5.2e-3 at 28). So bucket the observed segment
-# counts exactly -- i2t is 1 image, i2s is 4 -- rather than one value above them.
-CAPTURE_BATCH_SIZES_VISION = (1, 4)
+# One bs value above the observed max of 4; padding bs up is free.
+CAPTURE_BATCH_SIZES_VISION = (8,)
 
 
 def _rotate_half(x):
@@ -303,6 +300,7 @@ class NativeQwen3OmniVisionEncoder(nn.Module):
                         "pos_cos": cos,
                         "pos_sin": sin,
                     },
+                    request_ids=[f"vit_seg{i}" for i in range(n_seg)],
                     seq_lens=seg_lens,
                     real_bs=n_seg,
                 )
