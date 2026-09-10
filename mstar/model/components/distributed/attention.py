@@ -214,21 +214,21 @@ class ParallelCrossAttention(nn.Module):
         inner = num_heads * head_dim
 
         self.q_proj = ColumnParallelLinear(
-            comm_group=comm_group, 
+            comm_group=comm_group,
             input_size=hidden_size,
-            output_size=inner, 
+            output_size=inner,
             bias=q_bias,
         )
         self.k_proj = ColumnParallelLinear(
-            comm_group=comm_group, 
+            comm_group=comm_group,
             input_size=hidden_size,
-            output_size=inner, 
+            output_size=inner,
             bias=k_bias,
         )
         self.v_proj = ColumnParallelLinear(
-            comm_group=comm_group, 
+            comm_group=comm_group,
             input_size=hidden_size,
-            output_size=inner, 
+            output_size=inner,
             bias=v_bias,
         )
         self.out_proj = RowParallelLinear(
