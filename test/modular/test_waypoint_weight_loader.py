@@ -4,12 +4,12 @@ The Waypoint-1.5-1B checkpoint is not on this machine and must not be
 downloaded, so the bar here is not numerical parity — it is **every claim the
 loader makes about keys, shapes, slices and counts, checked against a state dict
 built from the reference's own key spellings** (``world_engine/src/model/
-world_model.py::load_state_dict``, transcribed in ``docs/waypoint/PARAM_TREE.md``).
+world_model.py::load_state_dict``).
 Everything runs on CPU with no checkpoint and no GPU.
 
 Why that bar and not a looser one: almost every way this loader can be wrong is
-*shape-legal*. ``PARAM_TREE.md`` section 8 lists sixteen failure modes and
-labels nine of them silent — a q/k/v fusion built as ``cat([q, v, k])``, an
+*shape-legal*. Of the sixteen known failure modes, nine are silent — a q/k/v
+fusion built as ``cat([q, v, k])``, an
 ``fc1_x``/``fc1_c`` merge in the wrong column order, ``attn``/``mlp`` cond_proj
 slots swapped, an ``unpatchify`` permute dropped. Each of those loads without an
 exception and produces plausible video. So the synthetic tensors are
@@ -26,8 +26,8 @@ the shipped loader and that all four reproduced before the fix:
 * **F2** — the ``cond_proj`` tie check probed ``[:, :64]``, so a divergence past
   column 64 loaded clean with ``verify_cond_proj_tie=True``.
 * **F3** — ``attn_cond_head.bias_in`` was dropped unconditionally, so a file
-  carrying only that spelling (``PARAM_TREE.md`` section 10.2 leaves which one
-  the real file has unresolved) failed with 24 unloaded ``cond_head.bias_in``.
+  carrying only that spelling (which one the real file has could not be
+  resolved statically) failed with 24 unloaded ``cond_head.bias_in``.
   The reference falls back to it (``world_model.py:386-389``).
 * **F4** — shape validation ran before the drop filter, so a ``.cond_heads.`` key
   ending in ``.k_proj.weight`` raised a GQA error about a key T12 discards.
@@ -323,7 +323,7 @@ def test_parameter_census_matches_the_720p_checkpoint():
 
 
 # ---------------------------------------------------------------------------
-# 2. The cond_proj tie lifecycle (CONTRACTS section 6.1)
+# 2. The cond_proj tie lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -472,7 +472,7 @@ def test_cond_proj_slots_follow_the_half_head_names(tmp_path):
 
     ``CondHead.forward`` is unpacked as ``s0, b0, g0, s1, b1, g1``; 0-2 drive the
     attention sublayer and 3-5 the MLP. All six are ``[D, D]``, so swapping T5
-    and T6 is mechanically invisible and numerically catastrophic (S5).
+    and T6 is mechanically invisible and numerically catastrophic.
     """
     config = tiny_config()
     state, _ = synthetic_checkpoint(config, spelling=LEGACY)
