@@ -16,7 +16,7 @@ follow and drive most of this file:
     stride 8. See ``global_layers`` / ``ring_frames``.
   * Every frame costs 5 forwards: 4 non-committing Euler denoise passes over
     ``scheduler_sigmas``, then 1 committing pass at sigma=0 that writes the
-    settled K/V into the ring. See ``docs/waypoint/CONTRACTS.md``.
+    settled K/V into the ring.
 """
 
 from dataclasses import dataclass, field
@@ -118,7 +118,7 @@ class WaypointConfig:
     # is bit-exact -- unwritten blocks are absent from the BlockMask, and the
     # stable argsort that orders the visited blocks is unaffected by trailing
     # False entries -- and saves ~1.35 GiB. Set True to restore the reference's
-    # allocation for an A/B parity run. See docs/waypoint/CONTRACTS.md.
+    # allocation for an A/B parity run.
     full_global_ring: bool = False
 
     # torch.compile the two OUTER regions (denoise pass, cache pass), matching
@@ -127,9 +127,10 @@ class WaypointConfig:
     # This is a throughput knob only. It does NOT govern attention correctness:
     # the BlockMask carries a no-op mask_mod, so eager flex_attention ignores it and
     # attends to unwritten ring slots (measured: 2.7e-01 off a masked-dense
-    # reference, silently). kv_backend pins its own torch.compile around the
+    # reference, silently). The FLEX attention resource
+    # (engine/resources/attn/flex.py) pins its own torch.compile around the
     # flex_attention call for that reason. Unlike wan22, this model has no
-    # eager reference-equivalence mode -- see CONTRACTS.md section 2.3.1.
+    # eager reference-equivalence mode.
     compile_dit: bool = True
 
     # Guard rails the ported modules assert against, kept here so a drifting

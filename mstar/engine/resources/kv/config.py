@@ -120,7 +120,8 @@ class RingKVConfig(KVConfig):
 
     tokens_per_frame: int
     layers: tuple[RingKVLayerConfig, ...]
-    batch_size: int = 1
+    # How many worlds are resident at once. NOT a batch.
+    num_worlds: int = 1
 
     def __post_init__(self):
         super().__post_init__()
@@ -129,14 +130,26 @@ class RingKVConfig(KVConfig):
                 f"ring geometry has {len(self.layers)} layers but num_layers is "
                 f"{self.num_layers}; each layer's ring is declared separately."
             )
+        if self.num_worlds < 1:
+            raise ValueError(
+                f"num_worlds must be >= 1; got {self.num_worlds}. A node serving "
+                "zero worlds refuses every request at admit."
+            )
 
-    def apply_yaml_overrides(self, **kwargs) -> None:
-        """Nothing here is a deployment knob."""
+    def apply_yaml_overrides(self, num_worlds: int | None = None, **kwargs) -> None:
+        """``num_worlds`` only. Nothing else here is a deployment knob."""
         if kwargs:
             raise TypeError(
                 "ring KV geometry is a checkpoint fact, not a deployment tunable; "
                 f"got {sorted(kwargs)}"
             )
+        if num_worlds is not None:
+            if int(num_worlds) < 1:
+                raise ValueError(
+                    f"num_worlds must be >= 1; got {num_worlds}. A node serving "
+                    "zero worlds refuses every request at admit."
+                )
+            self.num_worlds = int(num_worlds)
 
 
 @dataclass
@@ -190,36 +203,6 @@ class KVStep(ResourceStep):
 
 @dataclass(frozen=True, kw_only=True)
 class RingKVStep(ResourceStep):
-    """What a ring KV resource is told about one step: which frame it is.
+    """One ring clock per request in the step's batch."""
 
-    A *sibling* of ``KVStep``, not a subclass. Every field ``KVStep`` carries —
-    ``commit``, ``combined_labels``, ``pre_forks``, ``post_forks`` — is a fact
-    about a growing cache with named streams, and ``RingKVManager`` reads none
-    of them. Inheriting them would let a declarer set one and expect it to mean
-    something; ``commit=False`` in particular would read as "do not write this
-    frame", which is not a thing the ring can be told (the write happens inside
-    the forward, and the four frozen passes are the model's own concern —
-    ``RingKVManager.set_frozen``). Same split as ``PagedKVConfig`` /
-    ``RingKVConfig``, for the same reason.
-
-    ``frame_pos`` is this step's host-side ring clock — the same ``int`` the
-    submodule's ``prepare_inputs`` derives the ``[1]`` device tensor from,
-    never a second source. It is declared so that ``admit``
-    can check it advances by exactly one per committed frame. A clock that
-    desynchronizes from the ring raises nothing on its own; it silently
-    rewrites history, and the step boundary is the one place per
-    frame where the engine holds both the declared clock and the last committed
-    one.
-
-    ``None`` means "no clock declared, skip the check", for a declarer with no
-    single frame to name — a batch of more than one request, which ``admit``
-    refuses on its own terms, with a better message than a guess here
-    would produce. It is required rather than defaulted so that skipping the
-    check is a decision someone typed, not one they inherited.
-
-    ``kw_only`` is load-bearing: ``ResourceStep.segments`` is defaulted, and a
-    required field cannot follow a defaulted one positionally. Keyword-only
-    fields are exempt from that ordering rule.
-    """
-
-    frame_pos: int | None
+    frames: tuple[tuple[str, int], ...]

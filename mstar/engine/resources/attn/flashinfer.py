@@ -13,7 +13,7 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import SlotLease, StepContext
 
@@ -24,7 +24,7 @@ class FlashInferManager(AttentionManager):
         kv_cache: str,
         device: torch.device,
         dtype: torch.dtype,
-        kv_config: KVConfig,
+        kv_config: PagedKVConfig,
         backend: str="auto",
     ):
         self._kv_cache_name = kv_cache

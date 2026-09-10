@@ -9,10 +9,10 @@ The order is fixed and ``retie_cond_proj()`` must follow ``to_empty``:
 ``Module._apply`` has no cross-module memo, so ``to_empty(device)`` silently
 un-aliases the six ``cond_proj`` matrices that blocks 1..23 share with block 0.
 Nothing raises; the symptoms are +0.6B resident parameters and 23 blocks of
-``cond_proj`` the loader never fills (``CONTRACTS.md`` section 6.1).
+``cond_proj`` the loader never fills.
 
-Authoritative key map: ``docs/waypoint/PARAM_TREE.md``. Thirteen transforms sit
-between the checkpoint's 369 keys and this module's 174 parameters:
+The key map. Thirteen transforms sit between the checkpoint's 369 keys and this
+module's 174 parameters:
 
 ===  ==============================================================  ===========
 T0   ``transformer.blocks.{i}.`` -> ``blocks.{i}.``                  prefix
@@ -30,13 +30,12 @@ T11  ``attn.{q,k,v}_proj`` -> ``attn.qkv_proj``                      fuse dim 0
 T12  any ``.cond_heads.`` key (note the plural)                      drop
 ===  ==============================================================  ===========
 
-T0 is not in ``PARAM_TREE.md``: it assumes the reference's two-level
-``WorldModel``/``WorldDiT`` split, whereas ``components/dit.py`` collapses them
+T0 has no counterpart in the reference, which keeps a two-level
+``WorldModel``/``WorldDiT`` split where ``components/dit.py`` collapses them
 into one ``WaypointDiT`` whose blocks live at ``blocks.{i}``. Both spellings are
 accepted here, as are the canonical post-transform spellings the reference's own
-``pop``/``setdefault`` transforms tolerate (``PARAM_TREE.md`` section 3.5) —
-which spelling the shipped file uses could not be established statically
-(section 10.1), so guessing one was not an option.
+``pop``/``setdefault`` transforms tolerate — which spelling the shipped file
+uses could not be established statically, so guessing one was not an option.
 
 Three things this file does that the mstar machinery does not give you:
 
@@ -50,12 +49,12 @@ Three things this file does that the mstar machinery does not give you:
   * **Per-shard completeness.** ``load_weights_into`` returns *target* names, and
     q/k/v all share one target, so ``set(named_parameters()) - loaded`` is
     satisfied by any one of the three: a ``k_proj`` missing from every layer
-    passes the wan22-style check silently (``PARAM_TREE.md`` S11d). The remapper
+    passes the wan22-style check silently. The remapper
     therefore tallies ``(target, shard_id)`` pairs and the contract checks those
     too. Same hole, same fix, for ``fc1_x``/``fc1_c``.
   * **The reshaping transforms T1/T2 have no hook at all**, so they ride a thin
-    adapter over the shard iterator, which is also where the config facts
-    ``PARAM_TREE.md`` section 10.4 flags as transcribed-not-read (``n_kv_heads``,
+    adapter over the shard iterator, which is also where the config facts that
+    were transcribed rather than read off the checkpoint (``n_kv_heads``,
     ``patch``) get validated against the tensor shapes actually on disk.
 
 Completeness is a hard contract: a checkpoint key that reaches no parameter, a
@@ -67,8 +66,8 @@ Two consequences of "two keys writing the same slot" that a naive
 ``(target, shard_id)`` tally does not cover, and that both fusions have:
 
   * A **pre-fused** key (``attn.qkv_proj.weight``, ``ctrl_mlpfusion.mlp.fc1``
-    — canonical spellings ``PARAM_TREE.md`` section 3.5 says the reference
-    tolerates) claims ``(target, None)``, which does not collide with
+    — the canonical spellings the reference tolerates) claims
+    ``(target, None)``, which does not collide with
     ``(target, "q")``. Left alone, a file carrying both spellings assembles one
     parameter out of both sources in whatever order the shard iterator happens
     to yield — Q and K off the fused blob, V off ``v_proj``, no error. So
@@ -133,9 +132,9 @@ __all__ = [
 # without changing ``retie_cond_proj`` (which this file does not own) is not a
 # supported edit.
 #
-# Block 0 is also what the reference's own __init__ ties to, what CONTRACTS
-# section 6 and ``layers.CondHead``'s docstring prescribe, and what PARAM_TREE
-# section 4.9's fill-forward loop uses as its reference.
+# Block 0 is also what the reference's own __init__ ties to, what
+# ``layers.CondHead``'s docstring says, and what PARAM_TREE section 4.9's
+# fill-forward loop uses as its reference.
 #
 # The choice only matters if the 24 stored copies disagree, which is exactly the
 # silent divergence PARAM_TREE flags as S9 — so ``verify_cond_proj_tie`` checks
@@ -695,9 +694,9 @@ def parameter_census(dit: WaypointDiT) -> tuple[int, int, int]:
     the 720P checkpoint this is ``(174, 1_281_958_040, 1_860_771_992)`` — the
     "1.28B resident / 1.86B stored" figures.
 
-    Those differ by 2,048 from ``PARAM_TREE.md`` section 5.2's 1,281,960,088 /
-    1,860,774,040: that arithmetic carries ``ctrl_cfg.null_emb`` ``[1, 1, 2048]``
-    in both totals, and the port drops it (T10).
+    Counting straight off the checkpoint gives 1,281,960,088 / 1,860,774,040,
+    2,048 more in each: that arithmetic carries ``ctrl_cfg.null_emb``
+    ``[1, 1, 2048]`` in both totals, and the port drops it (T10).
     """
     params = dict(dit.named_parameters())
     return (
@@ -730,8 +729,7 @@ def _assert_cond_proj_tied(dit: WaypointDiT, config: WaypointConfig) -> None:
             f"cond_proj is not tied: named_parameters() reports {len(tied)} cond_proj "
             f"tensors, expected {CondHead.n_cond} (one physical set, aliased by all "
             f"{config.n_layers} blocks). to_empty(device) un-ties them and "
-            "retie_cond_proj() must be called after it, not before (CONTRACTS "
-            "section 6.1)."
+            "retie_cond_proj() must be called after it, not before."
         )
     # COND_PROJ_SOURCE_BLOCK is a record of which block retie_cond_proj aliases
     # the others onto, not a choice this file gets to make; assert it rather than
@@ -845,7 +843,7 @@ def build_waypoint_dit(
         dit = WaypointDiT(config)
     dit.cast_serving_dtypes()
     dit.to_empty(device=device)
-    # MUST follow to_empty, which un-aliases the shared cond_proj (CONTRACTS 6.1).
+    # MUST follow to_empty, which un-aliases the shared cond_proj.
     dit.retie_cond_proj()
     _assert_cond_proj_tied(dit, config)
 
@@ -866,7 +864,7 @@ def build_waypoint_dit(
     # (target, shard_id) -> the checkpoint key that claimed it. This is the
     # per-shard tally: load_weights_into's returned set holds target names only,
     # so q, k and v all collapse to one entry and a k_proj missing from every
-    # layer would satisfy `set(params) - loaded` (PARAM_TREE S11d). Recorded here
+    # layer would satisfy `set(params) - loaded`. Recorded here
     # rather than in _SliceShardLoader because the remapper is the one place that
     # sees both the original key (for the error message) and the resolved target.
     arrivals: dict[tuple[str, str | int | None], str] = {}

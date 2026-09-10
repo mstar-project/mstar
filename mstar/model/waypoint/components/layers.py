@@ -20,7 +20,7 @@ Two things in this file are load-bearing beyond "it is the same arithmetic":
     it an ordinary ``nn.Module`` that runs its own body under
     ``autocast(enabled=False)`` on ``.float()`` inputs, and publishes
     ``FP32_MODULE_PATHS`` for ``WaypointDiT.cast_serving_dtypes()`` to re-pin
-    after the global bf16 cast. See ``docs/waypoint/CONTRACTS.md`` section 4.1.
+    after the global bf16 cast.
 
 The Fourier frequency table is derived state, not checkpoint state. The
 reference registers it as a non-persistent buffer, which under mstar's meta
@@ -237,8 +237,7 @@ class MLPFusion(nn.Module):
 
     The split is at compute time only. Do not turn it into stored ``fc1_x`` /
     ``fc1_c`` parameters: the checkpoint stores them split, and the loader's job
-    is to ``cat(dim=1)`` them back into ``mlp.fc1`` (CONTRACTS section 6,
-    transform 7).
+    is to ``cat(dim=1)`` them back into ``mlp.fc1`` (loader transform 7).
     """
 
     def __init__(self, config: WaypointConfig):
@@ -285,12 +284,12 @@ class CondHead(nn.Module):
     constructor therefore yields 24 independent copies at serve time — no error,
     just 0.6B of duplicated resident weights and 23 blocks whose ``cond_proj``
     the loader never fills. Once tied, ``named_parameters()`` deduplicates, so
-    the loader's completeness check sees block 0's set only, as CONTRACTS
-    section 6 assumes.
+    the loader's completeness check sees block 0's set only, which is what it
+    assumes.
 
     The checkpoint spells this head as two half-heads, ``attn_cond_head``
     (indices 0..2) and ``mlp_cond_head`` (indices 3..5), with a ``bias_in`` on
-    each; the loader merges them and keeps the mlp one. See CONTRACTS section 6.
+    each; the loader merges them and keeps the mlp one.
     """
 
     n_cond = 6
