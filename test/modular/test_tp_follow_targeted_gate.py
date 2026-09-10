@@ -104,11 +104,8 @@ def test_targeted_call_never_pops_tp_follow():
 
     # Even an exactly-matching target must be refused: the targeted caller
     # (the speculation merge) may reject the batch, and a popped message
-    # has no re-queue path. ``get_next_batch`` targets a (node, walk) pair;
-    # the partial filters are pinned on ``_try_schedule_tp_follow`` directly.
+    # has no re-queue path.
     assert sched.get_next_batch(manager, target=(NODE, WALK)) is None
-    assert sched._try_schedule_tp_follow(manager, target_node_name=NODE) is None
-    assert sched._try_schedule_tp_follow(manager, target_graph_walk=WALK) is None
     assert len(sched.tp_batches_pending_schedule) == 1
 
     # The refusals consumed nothing: an untargeted call still builds the

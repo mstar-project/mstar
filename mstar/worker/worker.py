@@ -1828,9 +1828,9 @@ class Worker:
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
                 speculation.scheduled_batch.node_objects.pop(r, None)
-                for edge in speculation.consumed_streaming_edges.get(rid, []):
-                    self._return_speculative_streaming_edge(rid, edge)
-                speculation.consumed_streaming_edges.pop(rid, None)
+                for edge in speculation.consumed_streaming_edges.get(r, []):
+                    self._return_speculative_streaming_edge(r, edge)
+                speculation.consumed_streaming_edges.pop(r, None)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
 
