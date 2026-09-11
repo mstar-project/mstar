@@ -1,10 +1,10 @@
 from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
     RecurrentBlockConfig,
+    RecurrentGeometry,
     RecurrentStateConfig,
     RecurrentStateSpec,
     RecurrentStep,
-    delta_net_blocks,
-    delta_net_conv_dim,
 )
 from mstar.engine.resources.recurrent.pool import (
     NO_SLOT,
@@ -16,12 +16,12 @@ from mstar.engine.resources.recurrent.pool import (
 __all__ = [
     "NO_SLOT",
     "SINK_SLOT",
+    "DeltaNetGeometry",
+    "RecurrentGeometry",
     "RecurrentAddressing",
     "RecurrentBlockConfig",
     "RecurrentStateConfig",
     "RecurrentStatePool",
     "RecurrentStateSpec",
     "RecurrentStep",
-    "delta_net_blocks",
-    "delta_net_conv_dim",
 ]

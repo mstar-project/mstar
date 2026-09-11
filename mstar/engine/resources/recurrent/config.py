@@ -14,6 +14,7 @@ sequence. Capacity is a slot count, not a byte budget that scales with length,
 and a fork is a fixed-size copy rather than a page-count-dependent one.
 """
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from math import prod
 from typing import TYPE_CHECKING
@@ -61,54 +62,120 @@ class RecurrentBlockConfig:
         return self.numel * torch.empty((), dtype=self.dtype).element_size()
 
 
-def delta_net_conv_dim(
-    num_k_heads: int, head_k_dim: int, num_v_heads: int, head_v_dim: int,
-) -> int:
-    """The depthwise conv runs over [q | k | v] concatenated."""
-    return 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+class RecurrentGeometry(ABC):
+    @abstractmethod
+    def to_blocks(self, *args, **kwargs) -> dict[str, RecurrentBlockConfig]:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def from_blocks(
+        cls, blocks: dict[str, RecurrentBlockConfig],
+    ) -> "RecurrentGeometry":
+        pass
 
 
-def delta_net_blocks(
-    num_k_heads: int,
-    num_v_heads: int,
-    head_k_dim: int,
-    head_v_dim: int,
-    conv_kernel_size: int,
-    state_dtype: torch.dtype = torch.float32,
-    conv_dtype: torch.dtype = torch.bfloat16,
-) -> dict[str, RecurrentBlockConfig]:
-    """Blocks for the delta-net family: gated delta rule (Qwen3.5, Qwen3-Next)
-    and Kimi delta attention (Kimi Linear, GLM-5.3).
+@dataclass(frozen=True)
+class DeltaNetGeometry(RecurrentGeometry):
+    """Head geometry of the delta-net family: gated delta rule (Qwen3.5,
+    Qwen3-Next) and Kimi delta attention (Kimi Linear, GLM-5.3).
 
-    Both carry the same two: a K-last [HV, V, K] state matrix — the layout
-    FlashInfer's pool paths want, and what lets one pool serve either — and a
-    short conv window holding every tap but the current token's.
+    Both carry the same two blocks: a K-last [HV, V, K] state matrix — the
+    layout FlashInfer's pool paths want, and what lets one pool serve either —
+    and a short conv window holding every tap but the current token's.
 
-    Head counts are pre-sharding; ``shard_dims`` narrows them at build, as a
-    ``KVConfig``'s head counts are.
+    ``to_blocks`` and ``from_blocks`` are inverses, so a backend reads its
+    geometry off the pool it was pointed at rather than the model declaring it
+    twice and the two drifting.
     """
-    conv_dim = delta_net_conv_dim(
-        num_k_heads, head_k_dim, num_v_heads, head_v_dim
-    )
-    return {
-        "state": RecurrentBlockConfig(
-            shape=(num_v_heads, head_v_dim, head_k_dim),
-            dtype=state_dtype,
-            shard_dims=(0,),
-        ),
-        "conv": RecurrentBlockConfig(
-            shape=(conv_dim, conv_kernel_size - 1),
-            dtype=conv_dtype,
-            shard_dims=(0,),
-        ),
-    }
+
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    conv_kernel_size: int
+
+    @property
+    def conv_dim(self) -> int:
+        """The depthwise conv runs over [q | k | v] concatenated."""
+        return (
+            2 * self.num_k_heads * self.head_k_dim
+            + self.num_v_heads * self.head_v_dim
+        )
+
+    def to_blocks(
+        self,
+        state_dtype: torch.dtype = torch.float32,
+        conv_dtype: torch.dtype = torch.bfloat16,
+    ) -> dict[str, RecurrentBlockConfig]:
+        """Pool blocks for this geometry.
+
+        Head counts are pre-sharding; ``shard_dims`` narrows them at build, as
+        a ``KVConfig``'s head counts are.
+        """
+        return {
+            "state": RecurrentBlockConfig(
+                shape=(self.num_v_heads, self.head_v_dim, self.head_k_dim),
+                dtype=state_dtype,
+                shard_dims=(0,),
+            ),
+            "conv": RecurrentBlockConfig(
+                shape=(self.conv_dim, self.conv_kernel_size - 1),
+                dtype=conv_dtype,
+                shard_dims=(0,),
+            ),
+        }
+
+    @classmethod
+    def from_blocks(
+        cls, blocks: dict[str, RecurrentBlockConfig],
+    ) -> "DeltaNetGeometry":
+        """Recover head counts from block shapes. Works on sharded shapes,
+        since every axis involved shards.
+
+        Raises if the shapes are not a delta-net's — the check that a pool and
+        the resource planning against it were built for the same model.
+        """
+        for name in ("state", "conv"):
+            if name not in blocks:
+                raise ValueError(
+                    f"not a delta-net state pool: no {name!r} block, got "
+                    f"{sorted(blocks)}"
+                )
+        state, conv = blocks["state"].shape, blocks["conv"].shape
+        if len(state) != 3:
+            raise ValueError(
+                f"delta-net 'state' block must be [HV, V, K], got {state}"
+            )
+        if len(conv) != 2:
+            raise ValueError(
+                f"delta-net 'conv' block must be [conv_dim, width], got {conv}"
+            )
+        num_v_heads, head_v_dim, head_k_dim = state
+        conv_dim, width = conv
+
+        # conv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+        key_span = conv_dim - num_v_heads * head_v_dim
+        if key_span <= 0 or key_span % (2 * head_k_dim):
+            raise ValueError(
+                f"conv block {conv} does not match state block {state}: "
+                f"[q|k|v] over {num_v_heads}x{head_v_dim} values leaves "
+                f"{key_span} for 2 x num_k_heads x {head_k_dim}"
+            )
+        return cls(
+            num_k_heads=key_span // (2 * head_k_dim),
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            conv_kernel_size=width + 1,
+        )
 
 
 @dataclass
 class RecurrentStateConfig:
     # The total number of recurrent layers, not total transformer layers
     num_layers: int
-    # Named blocks, e.g. what `delta_net_blocks` returns. A backend declares
+    # Named blocks, e.g. what `DeltaNetGeometry.to_blocks` returns. A backend declares
     # what it needs; the pool allocates one tensor per block and hands back
     # per-layer views.
     blocks: dict[str, RecurrentBlockConfig] = field(default_factory=dict)
