@@ -14,6 +14,7 @@ add.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.utils.flashinfer_utils import run_rms_norm
@@ -60,6 +61,42 @@ class RMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         return f"{self.hidden_size}, eps={self.variance_epsilon}, gemma_mode={self.gemma_mode}"
+
+
+class RMSNormGated(nn.Module):
+    """RMSNorm scaled by a SiLU gate, for the delta-net family.
+
+    Normalizes over the last dim and then applies the gate — the order
+    matters and is the reverse of what the name suggests. Qwen3.5 and
+    Qwen3-Next both carry a ``[head_v_dim]`` weight, so this runs per head
+    over a ``[tokens, num_v_heads, head_v_dim]`` input.
+
+    Not folded into ``RMSNorm`` as a flag: the fp32 dance below is exactly
+    HF's, kept that way for parity, and differs from the FlashInfer fused
+    path ``RMSNorm`` takes.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(
+        self, hidden_states: torch.Tensor, gate: torch.Tensor,
+    ) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+        var = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.variance_epsilon)
+        # back to the input dtype before the weight, then gated in fp32:
+        # both casts are load-bearing for matching HF bit for bit
+        x = self.weight * x.to(input_dtype)
+        x = x * F.silu(gate.to(torch.float32))
+        return x.to(input_dtype)
+
+    def extra_repr(self) -> str:
+        return f"{self.hidden_size}, eps={self.variance_epsilon}"
 
 
 class AdaRMSNorm(nn.Module):

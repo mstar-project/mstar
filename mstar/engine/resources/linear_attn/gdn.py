@@ -285,6 +285,12 @@ class GDNManager(LinearAttnManager):
         plan = self.current_plan(label)
         q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
         k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
+        # both kernels demand contiguous inputs, and a caller that split one
+        # projection into q/k/v hands over views that are not. A no-op when
+        # they already are.
+        v = v.contiguous()
+        a = a.contiguous()
+        b = b.contiguous()
 
         if plan.decode is not None:
             return self._run_decode(
