@@ -47,6 +47,10 @@ mstar = "mstar.cli.main:main"
 mstar-serve = "mstar.api_server.entrypoint:main"
 
 [project.optional-dependencies]
+# OmniVoice reuses the reference package for weight loading, the rule-based
+# duration estimator and the pydub silence trim; mstar owns the graph.
+omnivoice = ["omnivoice>=0.1"]
+
 dev = [
     "ruff<=0.16",
     "pytest",

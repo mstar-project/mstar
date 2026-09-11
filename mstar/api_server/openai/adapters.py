@@ -325,6 +325,63 @@ class OrpheusAdapter(OpenAIAdapter):
         )
 
 
+
+class OmniVoiceAdapter(OpenAIAdapter):
+    """OmniVoice: zero-shot TTS in three modes over one endpoint.
+
+    Mode follows from what the caller sends, as it does in the reference:
+    ``ref_audio`` + ``ref_text`` clones a voice, ``instruct`` designs one from a
+    description, and neither lets the model pick. ``voice`` is accepted as an
+    alias for ``instruct`` so an OpenAI client that only knows the standard
+    field can still reach voice design.
+
+    ``speed`` is a real OmniVoice knob (it scales the estimated duration), so
+    unlike the other speech adapters it is forwarded rather than dropped. The
+    decoding knobs -- ``num_step``, ``guidance_scale``, ``t_shift``,
+    ``language``, ``duration``, the two temperatures -- arrive through
+    ``extra_body`` and stay per-request all the way to the unmask loop.
+
+    ``temperature`` / ``top_p`` are NOT mapped: OmniVoice does not sample one
+    token per position, it ranks the whole canvas by confidence. The nearest
+    knobs are ``class_temperature`` (which token) and ``position_temperature``
+    (which cell reveals next), and silently aliasing the OpenAI fields onto
+    either would mislead.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None) and not mk.get("instruct"):
+            mk["instruct"] = req.voice
+        mk.pop("voice", None)
+        if getattr(req, "speed", None) is not None:
+            mk.setdefault("speed", req.speed)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+
+        file_paths = None
+        ref_audio = mk.pop("ref_audio", None)
+        input_modalities = ["text"]
+        if ref_audio:
+            # A data URL, a base64 blob, a local path or (when allowed) a URL.
+            path, _mime = media_io.resolve_media_ref(
+                ref_audio, upload_dir, allow_remote=True
+            )
+            # Keyed by modality: the data worker iterates the dict and
+            # loads each group through the matching loader.
+            file_paths = {"audio": [path]}
+            input_modalities = ["text", "audio"]
+
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -454,6 +511,7 @@ class Wan22Adapter(OpenAIAdapter):
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
+    "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
