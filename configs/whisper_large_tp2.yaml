@@ -1,0 +1,14 @@
+model: "whisper_large"
+max_seq_len: 448
+resources:
+  kv_cache:
+    cpu_offload_pages: 128
+  cross_kv_cache:
+    cpu_offload_pages: 128
+node_groups:
+  #Cannot parallelize the encoder as it is the original one from HuggingFace.
+  -node_names: [audio_encoder] 
+    ranks: [0]
+  - node_names: [decoder]
+    ranks: [0, 1]
+    tp_size: 2

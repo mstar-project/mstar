@@ -394,7 +394,7 @@ class WhisperModel(Model):
             return self._create_encoder_submodule(device)
         elif node_name == "decoder":
             return self._create_decoder_submodule(
-                device, autocast_dtype=autocast_dtype,
+                device, autocast_dtype=autocast_dtype, tp_group=tp_group,
             )
         return None
 
@@ -427,14 +427,14 @@ class WhisperModel(Model):
         return name.replace("self_attn.out_proj", "self_attn.o_proj")
 
     def _create_decoder_submodule(
-        self, device: str, autocast_dtype: torch.dtype | None = None,
+        self, device: str, autocast_dtype: torch.dtype | None = None, tp_group=None
     ) -> NodeSubmodule:
         from mstar.model.loader import load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.whisper.components.decoder import WhisperDecoderModel
 
         with torch.device("meta"):
-            decoder = WhisperDecoderModel(self.config)
+            decoder = WhisperDecoderModel(self.config, comm_group=tp_group)
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         if autocast_dtype is not None:

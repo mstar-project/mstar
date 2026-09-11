@@ -28,7 +28,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components.attention import Attention, CrossAttention
+from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed.attention import ParallelAttention, ParallelCrossAttention
 from mstar.model.whisper.config import (
     ATTN,
     CONTEXT_LABEL,
@@ -40,10 +41,11 @@ from mstar.model.whisper.config import (
 
 
 class WhisperDecoderLayer(nn.Module):
-    def __init__(self, config: WhisperModelConfig):
+    def __init__(self, config: WhisperModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         self.self_attn_layer_norm = nn.LayerNorm(config.d_model)
-        self.self_attn = Attention(
+        self.self_attn = ParallelAttention(
+            comm_group=comm_group,
             hidden_size=config.d_model,
             num_heads=config.decoder_attention_heads,
             num_kv_heads=config.decoder_attention_heads,
@@ -57,7 +59,8 @@ class WhisperDecoderLayer(nn.Module):
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(config.d_model)
         # Whisper's bias layout is the shared default (q/v/o biased, k not).
-        self.encoder_attn = CrossAttention(
+        self.encoder_attn = ParallelCrossAttention(
+            comm_group=comm_group,
             hidden_size=config.d_model,
             num_heads=config.decoder_attention_heads,
             head_dim=config.head_dim,
@@ -86,13 +89,13 @@ class WhisperDecoderLayer(nn.Module):
 class WhisperDecoderModel(nn.Module):
     """Decoder stack; parameter paths mirror HF's ``model.decoder.*``."""
 
-    def __init__(self, config: WhisperModelConfig):
+    def __init__(self, config: WhisperModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
         self.embed_positions = nn.Embedding(config.max_target_positions, config.d_model)
         self.layers = nn.ModuleList(
-            [WhisperDecoderLayer(config) for _ in range(config.decoder_layers)]
+            [WhisperDecoderLayer(config, comm_group=comm_group) for _ in range(config.decoder_layers)]
         )
         self.layer_norm = nn.LayerNorm(config.d_model)
 
