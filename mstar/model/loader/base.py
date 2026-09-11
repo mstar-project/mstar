@@ -164,6 +164,16 @@ LLAMA_STACKED_PARAMS: list[StackedParamRule] = [
     StackedParamRule(".gate_up_proj", ".up_proj",   1),
 ]
 
+# Standard fused-projection routing used by WHISPER:
+# checkpoint stores ``q/k/v_proj`` separately; the
+# model holds fused ``qkv_proj``parameters with
+# per-shard ``weight_loader`` methods.
+WHISPER_STACKED_PARAMS: list[StackedParamRule] = [
+    StackedParamRule(".qkv_proj",     ".q_proj",    "q"),
+    StackedParamRule(".qkv_proj",     ".k_proj",    "k"),
+    StackedParamRule(".qkv_proj",     ".v_proj",    "v"),
+]
+
 
 def load_hf_weights(
     module: nn.Module,

@@ -16,6 +16,7 @@ iterator and calls ``model.load_weights(...)``.
 from mstar.model.loader.base import (
     HF_DEFAULT_SKIP_FRAGMENTS,
     LLAMA_STACKED_PARAMS,
+    WHISPER_STACKED_PARAMS,
     StackedParamRule,
     default_weight_loader,
     load_hf_weights,
@@ -30,6 +31,7 @@ from mstar.model.loader.iterators import (
 __all__ = [
     "HF_DEFAULT_SKIP_FRAGMENTS",
     "LLAMA_STACKED_PARAMS",
+    "WHISPER_STACKED_PARAMS",
     "StackedParamRule",
     "default_weight_loader",
     "load_hf_weights",
