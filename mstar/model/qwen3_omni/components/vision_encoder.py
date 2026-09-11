@@ -18,11 +18,11 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     get_vision_position_ids,
 )
 
+from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.encoder_telemetry import (
     note_encoder_layout,
     note_encoder_path,
 )
-from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.varlen_attention import (
     capture_legal_backend,
     set_fi_override,

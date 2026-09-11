@@ -48,11 +48,11 @@ from mstar.engine.resources import (
     NodeResourceSpec,
     PositionConfig,
     PositionSpec,
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -67,8 +67,8 @@ from mstar.model.multimodal import (
     prefill_plan,
     split_around_spans,
 )
-from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.components.audio_encoder import AUT_ATTN
+from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
 from mstar.model.qwen3_omni.components.vision_encoder import QWEN_VIT_ATTN
 from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,

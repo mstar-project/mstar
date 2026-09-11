@@ -220,7 +220,7 @@ class NativeAudioEncoderSubmodule(NodeSubmodule):
             embeds = embeds.squeeze(0)
         return {"audio_embeds": [embeds]}
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         # Safe pad-free batching needs one feature_lens entry per request so the
         # output split is unambiguous; otherwise defer to sequential forward.
         for mi in model_inputs:
@@ -422,7 +422,7 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
             "deepstack": deepstack if deepstack else [torch.tensor([])],
         }
 
-    def can_batch(self, batch: NodeBatch, model_inputs: list[NodeInputs]) -> bool:
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
 
 

@@ -17,11 +17,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 
+from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.encoder_telemetry import (
     note_encoder_layout,
     note_encoder_path,
 )
-from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.components.varlen_attention import (
     capture_legal_backend,
     set_fi_override,
