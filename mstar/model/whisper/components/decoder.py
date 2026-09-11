@@ -100,11 +100,13 @@ class WhisperDecoderModel(nn.Module):
         self.layer_norm = nn.LayerNorm(config.d_model)
 
     def zero_missing_biases(self) -> None:
-        """Zero the self-attn ``k_proj`` biases absent from the HF checkpoint
-        (allocated because the shared ``Attention`` has one qkv_bias flag)."""
+        """Zero the fused K-bias slice absent from the HF checkpoint."""
         with torch.no_grad():
             for layer in self.layers:
-                layer.self_attn.k_proj.bias.zero_()
+                attn = layer.self_attn
+                q_size = attn.num_heads * attn.head_dim
+                k_size = attn.num_kv_heads * attn.head_dim
+                attn.qkv_proj.bias[q_size:q_size + k_size].zero_()
 
     def embed(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor,
