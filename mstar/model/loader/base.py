@@ -169,9 +169,9 @@ LLAMA_STACKED_PARAMS: list[StackedParamRule] = [
 # model holds fused ``qkv_proj``parameters with
 # per-shard ``weight_loader`` methods.
 WHISPER_STACKED_PARAMS: list[StackedParamRule] = [
-    StackedParamRule("self_attn.qkv_proj",     ".q_proj",    "q"),
-    StackedParamRule("self_attn.qkv_proj",     ".k_proj",    "k"),
-    StackedParamRule("self_attn.qkv_proj",     ".v_proj",    "v"),
+    StackedParamRule("self_attn.qkv_proj",     "self_attn.q_proj",    "q"),
+    StackedParamRule("self_attn.qkv_proj",     "self_attn.k_proj",    "k"),
+    StackedParamRule("self_attn.qkv_proj",     "self_attn.v_proj",    "v"),
 ]
 
 
