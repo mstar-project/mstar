@@ -115,11 +115,35 @@ class RecurrentStateConfig:
 
     # Slots the pool can hand out at once. A request holds one per label, so
     # this bounds concurrent requests times their labels, not requests alone.
+    # The sink, when there is one, comes out of this the way SINK_PAGE comes
+    # out of a KV cache's `max_num_pages`.
     max_slots: int = 256
+
+    # Whether padding rows address a real sink slot or a negative sentinel.
+    #
+    # Not the model author's call: it turns on what the backend's kernels do
+    # with an unaddressed row, and they disagree. FlashInfer's fp32 GDN decode
+    # skips a -1 row entirely; its bf16 fast path redirects -1 onto slot 0 and
+    # writes there anyway. A sink is correct under both, so it is the default
+    # and the sentinel is opt-in.
+    #
+    # TODO: derive this from (backend, dtype, ...) once there is more than one
+    # backend to ask, and drop the knob.
+    disable_sink_slot: bool = False
 
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
+        if not self.disable_sink_slot and self.max_slots < 2:
+            raise ValueError(
+                f"max_slots={self.max_slots} leaves nothing to hand out: the "
+                "sink takes one. Raise it or set disable_sink_slot."
+            )
+
+    @property
+    def usable_slots(self) -> int:
+        """Slots requests can hold; the sink is not one of them."""
+        return self.max_slots - (0 if self.disable_sink_slot else 1)
 
     def shard(self, num_shards: int) -> None:
         """Narrow every block's sharded axes; see ``KVConfig.shard``.

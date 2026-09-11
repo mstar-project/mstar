@@ -8,12 +8,14 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.engine.resources.recurrent.pool import (
     NO_SLOT,
+    SINK_SLOT,
     RecurrentAddressing,
     RecurrentStatePool,
 )
 
 __all__ = [
     "NO_SLOT",
+    "SINK_SLOT",
     "RecurrentAddressing",
     "RecurrentBlockConfig",
     "RecurrentStateConfig",

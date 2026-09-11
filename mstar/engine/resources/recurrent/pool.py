@@ -33,10 +33,11 @@ from mstar.engine.resources.step import (
 
 logger = logging.getLogger(__name__)
 
-# A row addressing no slot. Every backend the pool serves has to treat this as
-# "skip", which FlashInfer's pool paths already do (see the -1 handling in
-# `gated_delta_rule_decode_pretranspose`). Padding rows from a capture bucket
-# and zero-span segments both land here.
+# Where a padding tail or zero-span row points. SINK_SLOT is held out of
+# circulation like the KV cache's SINK_PAGE and absorbs writes nothing reads —
+# the one place slot ids are not unique. NO_SLOT asks the backend to skip the
+# row, which only some kernels honour.
+SINK_SLOT = 0
 NO_SLOT = -1
 
 
@@ -93,7 +94,11 @@ class RecurrentStatePool(Resource):
 
         # rid -> label -> slot. Mirrors `KVManager._streams`.
         self._slots: dict[str, dict[str, SlotState]] = {}
-        self._free: list[int] = list(range(config.max_slots))
+        # reversed so `pop` hands out ascending ids, as the page allocator does
+        self._free: list[int] = list(reversed(range(config.max_slots)))
+        if not config.disable_sink_slot:
+            sink = self._free.pop()
+            assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
         # guards `_slots`/`_free` against a concurrent admit/plan/commit or
         # reset/remove on another thread; see `KVManager._lock`
         self._lock = threading.RLock()
@@ -105,9 +110,10 @@ class RecurrentStatePool(Resource):
         self._current: dict[str, RecurrentAddressing] = {}
 
         logger.info(
-            "recurrent state pool: %d slots x %d layers, %.2f MiB "
-            "(%.2f KiB/slot), blocks=%s",
-            config.max_slots, config.num_layers,
+            "recurrent state pool: %d usable slots (+%d sink) x %d layers, "
+            "%.2f MiB (%.2f KiB/slot), blocks=%s",
+            config.usable_slots, config.max_slots - config.usable_slots,
+            config.num_layers,
             config.total_bytes / 2**20, config.slot_bytes / 2**10,
             {n: tuple(b.shape) for n, b in config.blocks.items()},
         )
@@ -125,6 +131,11 @@ class RecurrentStatePool(Resource):
     @property
     def num_free_slots(self) -> int:
         return len(self._free)
+
+    @property
+    def pad_index(self) -> int:
+        """What an unaddressed row points at."""
+        return NO_SLOT if self.config.disable_sink_slot else SINK_SLOT
 
     # Request lifecycle
 
@@ -202,8 +213,8 @@ class RecurrentStatePool(Resource):
             ok=False,
             reason=AllocationFailed(
                 message=(
-                    f"recurrent state pool is full: {self.config.max_slots} "
-                    f"slots, none free for {rid}/{label}"
+                    f"recurrent state pool is full: {self.config.usable_slots} "
+                    f"usable slots, none free for {rid}/{label}"
                 ),
                 # named for the KV cache's unit; one slot is what is short here
                 pages_short=1,
@@ -278,12 +289,13 @@ class RecurrentStatePool(Resource):
     def _build_addressing(
         self, label: str, segments: list[Segment], ctx: StepContext,
     ) -> RecurrentAddressing:
+        pad = self.pad_index
         indices = []
         has_state = []
         for seg in segments:
             slot = self._slots.get(seg.request_id, {}).get(label)
             if slot is None or seg.span <= 0:
-                indices.append(NO_SLOT)
+                indices.append(pad)
                 has_state.append(False)
             else:
                 indices.append(slot.index)
@@ -306,7 +318,7 @@ class RecurrentStatePool(Resource):
         # replay off its padding with the plan's indptrs; a recurrent kernel
         # has no such thing and reads every row of the batch, so a stale index
         # here is a write to a slot whose request is not in this step.
-        target.slot_indices[num_rows:].fill_(NO_SLOT)
+        target.slot_indices[num_rows:].fill_(pad)
         target.has_state[num_rows:].fill_(False)
         return RecurrentAddressing(
             slot_indices=target.slot_indices,
@@ -345,7 +357,7 @@ class RecurrentStatePool(Resource):
     def _new_buffers(self, size: int) -> RecurrentAddressing:
         return RecurrentAddressing(
             slot_indices=torch.full(
-                (size,), NO_SLOT, dtype=torch.int32, device=self._device
+                (size,), self.pad_index, dtype=torch.int32, device=self._device
             ),
             has_state=torch.zeros(size, dtype=torch.bool, device=self._device),
             num_rows=0,
