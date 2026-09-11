@@ -88,6 +88,23 @@ pytestmark = [
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _true_fp32_matmul():
+    """Pin real fp32 matmuls for the duration of each parity test.
+
+    Importing ``mstar.engine`` runs ``torch.set_float32_matmul_precision('high')``
+    at module scope, which turns on TF32 process-wide. TF32 keeps only ~10
+    mantissa bits, so the two implementations' matmuls diverge at ~1e-3
+    relative and that compounds over 24 layers — the encoder check lands at
+    ~0.93 instead of ~1e-3. These tests compare two fp32 implementations
+    against each other, so they need the real thing.
+    """
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    yield
+    torch.set_float32_matmul_precision(previous)
+
+
 @pytest.fixture(scope="module")
 def device() -> torch.device:
     return torch.device("cuda:0")
@@ -165,15 +182,41 @@ def sample_video(our_config, device):
 # ---------------------------------------------------------------------------
 
 
+def _assert_parity(ours, ref, *, what, rel_tol=1e-4, mean_rel_tol=1e-5):
+    """Compare two fp32 implementations by error relative to output scale.
+
+    A bare ``max abs diff < 1e-3`` is mis-scaled here: encoder outputs reach
+    |x| ~ 39, and 24 layers of fp32 accumulate ~3e-5 relative error between
+    two implementations that order their reductions differently (measured:
+    max 1.1e-3 absolute, mean 1.0e-5, mean *signed* 5e-9 — noise, not bias).
+
+    Max alone is a single-element statistic, so it is scaled by the tensor's
+    own magnitude and paired with a mean check that would catch a broad
+    systematic shift the max could hide.
+    """
+    assert ours.shape == ref.shape, f"{what}: {tuple(ours.shape)} vs {tuple(ref.shape)}"
+    scale = ref.abs().max().item()
+    diff = (ours - ref).abs()
+    rel = diff.max().item() / scale
+    mean_rel = diff.mean().item() / scale
+    assert rel < rel_tol, (
+        f"{what}: max abs diff {diff.max().item():.3e} is {rel:.2e} of scale "
+        f"{scale:.3f} (limit {rel_tol:.0e})"
+    )
+    assert mean_rel < mean_rel_tol, (
+        f"{what}: mean abs diff {diff.mean().item():.3e} is {mean_rel:.2e} of "
+        f"scale {scale:.3f} (limit {mean_rel_tol:.0e}) — looks like a "
+        f"systematic shift rather than accumulation noise"
+    )
+
+
 def test_encoder_parity(hf_model, our_encoder, sample_video):
     """Our VJEPA2Encoder output matches HF's encoder output exactly (eager
     attention, fp32)."""
     with torch.no_grad():
         hf_out = hf_model.encoder(pixel_values_videos=sample_video).last_hidden_state
         ours_out = our_encoder(sample_video)
-    assert ours_out.shape == hf_out.shape
-    diff = (ours_out - hf_out).abs().max().item()
-    assert diff < 1e-3, f"encoder max abs diff = {diff}"
+    _assert_parity(ours_out, hf_out, what="encoder")
 
 
 def test_full_model_parity_default_masks(hf_model, our_encoder, our_predictor, sample_video):
@@ -228,9 +271,7 @@ def test_encoder_only_mode(hf_model, our_encoder, sample_video):
     with torch.no_grad():
         hf_out = hf_model.get_vision_features(sample_video)
         ours_out = our_encoder(sample_video)
-    assert ours_out.shape == hf_out.shape
-    diff = (ours_out - hf_out).abs().max().item()
-    assert diff < 1e-3, f"encoder-only max abs diff = {diff}"
+    _assert_parity(ours_out, hf_out, what="encoder-only")
 
 
 def test_ac_predictor_instantiation_and_forward(device):
