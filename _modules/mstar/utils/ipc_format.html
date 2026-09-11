@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 10, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 11, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -676,6 +676,7 @@ window.runMermaid = runMermaid;</script>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
@@ -896,7 +897,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">UNPERSIST_TENSORS</span> <span class="o">=</span> <span class="s2">"unpersist"</span>
     <span class="n">TENSOR_RECEIVED</span> <span class="o">=</span> <span class="s2">"tensor_received"</span>
     <span class="n">SCHEDULE_TP</span> <span class="o">=</span> <span class="s2">"schedule_tp"</span>
-    <span class="n">STOP_LOOPS</span> <span class="o">=</span> <span class="s2">"stop_loops"</span></div>
+    <span class="n">STOP_LOOPS</span> <span class="o">=</span> <span class="s2">"stop_loops"</span>
+    <span class="n">TP_NO_SPEC</span> <span class="o">=</span> <span class="s2">"tp_no_spec"</span></div>
 
 
 
@@ -976,7 +978,20 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">ScheduleTPNode</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
     <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span></div>
+    <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">speculative</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">spec_seq</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+    <span class="n">spec_from_seq</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span></div>
+
+
+
+<div class="viewcode-block" id="TPNoSpeculation">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.TPNoSpeculation">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">TPNoSpeculation</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+    <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">spec_from_seq</span><span class="p">:</span> <span class="nb">int</span></div>
 
 
 <div class="viewcode-block" id="WorkerMessage">
@@ -1122,7 +1137,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 10, 2026.
+  Last updated on Sep 11, 2026.
   <br/>
 </p>
   </div>

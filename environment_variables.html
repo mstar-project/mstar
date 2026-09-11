@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 10, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 11, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -323,6 +323,7 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
@@ -559,6 +560,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
 </ul>
             </nav>
         </div>
@@ -815,6 +817,66 @@ run the Python frontend for sound video.</p></li>
 </ul>
 </section>
 </section>
+<section id="worker-scheduling">
+<h2>Worker scheduling<a class="headerlink" href="#worker-scheduling" title="Link to this heading">#</a></h2>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 28.0%" />
+<col style="width: 14.0%" />
+<col style="width: 58.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Async scheduling for lockstep-parallel (TP / SP) nodes. <code class="docutils literal notranslate"><span class="pre">1</span></code>: the
+instance leader speculates step N+1 of the parallel node during
+forward N (the existing single-worker speculation machinery, gate
+opened) and broadcasts it at once as a speculative
+<code class="docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code>; followers rebuild the identical batch during
+their own forward N and every rank submits N+1 the moment N
+completes. Removes the per-step serial build/plan from the group’s
+critical path. Voids (allocation failure, per-rid failure, a
+continuing request without loop-back output) are derived by each
+rank from replicated state, never signalled. A comma-separated
+list of node names (<code class="docutils literal notranslate"><span class="pre">thinker,talker</span></code>) enables it for those
+parallel nodes only. <code class="docutils literal notranslate"><span class="pre">0</span></code>: the serial path — leader schedules
+after N, followers rebuild after the broadcast. Set it identically
+on every rank of an instance: the workers compare it at startup and
+refuse to start on a mismatch. Leave <code class="docutils literal notranslate"><span class="pre">MSTAR_ENGINE_STEP_SYNC</span></code> at
+<code class="docutils literal notranslate"><span class="pre">0</span></code> with it: that throttle holds the GPU thread until step N drains,
+which serialises the very overlap this flag buys.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PRE_PLAN_SPEC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Pre-plan the speculative batch’s attention on a dedicated thread
+while the previous replay runs. <code class="docutils literal notranslate"><span class="pre">0</span></code> plans inline on the GPU
+thread.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONSECUTIVE_SPEC_STEPS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1024</span></code></p></td>
+<td><p>Cap on back-to-back speculative steps before the leader yields to
+other ready work.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SPEC_PEEK_FOR_FAIRNESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>Yield the speculation chain only when another (node, walk) is
+actually ready right now; <code class="docutils literal notranslate"><span class="pre">0</span></code> uses the consecutive-step cap alone.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PHASE_TIMING</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>: every N iterations log per-phase p50/p95/mean of the
+worker main loop (speculate, await_gpu, submit_spec, …).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
 </section>
 
 
@@ -870,6 +932,7 @@ run the Python frontend for sound video.</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
 </ul>
   </nav></div>
 
@@ -903,7 +966,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 10, 2026.
+  Last updated on Sep 11, 2026.
   <br/>
 </p>
   </div>

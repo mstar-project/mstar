@@ -29,6 +29,7 @@
 
    adarms_norm
    attention
+   containers
    flashinfer_utils
    fused_moe
    ipc_format

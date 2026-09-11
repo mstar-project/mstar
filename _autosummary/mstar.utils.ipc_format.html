@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.0.0" />
-    <meta name="docbuild:last-update" content="Sep 10, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 11, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -323,6 +323,7 @@
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
@@ -619,6 +620,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.graph_walk"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.node_name"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.request_ids"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.request_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_from_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_from_seq</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_seq</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.speculative"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.speculative</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.SetupDone"><code class="docutils literal notranslate"><span class="pre">SetupDone</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -637,6 +641,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.StopLoops.loop_stop_times"><code class="docutils literal notranslate"><span class="pre">StopLoops.loop_stop_times</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.StopLoops.partition_name"><code class="docutils literal notranslate"><span class="pre">StopLoops.partition_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.StopLoops.request_id"><code class="docutils literal notranslate"><span class="pre">StopLoops.request_id</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation.graph_walk"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation.graph_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation.node_name"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation.node_name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation.spec_from_seq"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation.spec_from_seq</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TensorReceived"><code class="docutils literal notranslate"><span class="pre">TensorReceived</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -679,6 +689,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.SCHEDULE_TP"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.SCHEDULE_TP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.STOP_LOOPS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.STOP_LOOPS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TENSOR_RECEIVED"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TENSOR_RECEIVED</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TP_NO_SPEC</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNPERSIST_TENSORS</span></code></a></li>
 </ul>
 </li>
@@ -728,7 +739,7 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.RemoveRequest" title="mstar.utils.ipc_format.RemoveRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a>(request_id, source)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ScheduleTPNode" title="mstar.utils.ipc_format.ScheduleTPNode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code></a>(node_name, graph_walk, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ScheduleTPNode" title="mstar.utils.ipc_format.ScheduleTPNode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ScheduleTPNode</span></code></a>(node_name, graph_walk, ...[, ...])</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.SetupDone" title="mstar.utils.ipc_format.SetupDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SetupDone</span></code></a>(worker_id)</p></td>
@@ -740,19 +751,22 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.StopLoops" title="mstar.utils.ipc_format.StopLoops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StopLoops</span></code></a>(request_id, loop_names, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TensorReceived" title="mstar.utils.ipc_format.TensorReceived"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorReceived</span></code></a>(request_id, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TPNoSpeculation" title="mstar.utils.ipc_format.TPNoSpeculation"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TPNoSpeculation</span></code></a>(node_name, graph_walk, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TensorReceived" title="mstar.utils.ipc_format.TensorReceived"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorReceived</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -1052,7 +1066,7 @@ step can fail several of them for different reasons.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">ScheduleTPNode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#ScheduleTPNode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">ScheduleTPNode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_ids</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">speculative</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spec_seq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">-1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spec_from_seq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#ScheduleTPNode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1060,6 +1074,9 @@ step can fail several of them for different reasons.</p>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>speculative</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>spec_seq</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>spec_from_seq</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1076,6 +1093,21 @@ step can fail several of them for different reasons.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode.request_ids">
 <span class="sig-name descname"><span class="pre">request_ids</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode.request_ids" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode.spec_from_seq">
+<span class="sig-name descname"><span class="pre">spec_from_seq</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">-1</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_from_seq" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode.spec_seq">
+<span class="sig-name descname"><span class="pre">spec_seq</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">-1</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_seq" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ScheduleTPNode.speculative">
+<span class="sig-name descname"><span class="pre">speculative</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ScheduleTPNode.speculative" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1154,6 +1186,36 @@ step can fail several of them for different reasons.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.StopLoops.request_id">
 <span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.StopLoops.request_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.TPNoSpeculation">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">TPNoSpeculation</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">spec_from_seq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#TPNoSpeculation"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.TPNoSpeculation" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>spec_from_seq</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.TPNoSpeculation.graph_walk">
+<span class="sig-name descname"><span class="pre">graph_walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.TPNoSpeculation.graph_walk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.TPNoSpeculation.node_name">
+<span class="sig-name descname"><span class="pre">node_name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.TPNoSpeculation.node_name" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.TPNoSpeculation.spec_from_seq">
+<span class="sig-name descname"><span class="pre">spec_from_seq</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.TPNoSpeculation.spec_from_seq" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1367,6 +1429,11 @@ step can fail several of them for different reasons.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC">
+<span class="sig-name descname"><span class="pre">TP_NO_SPEC</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'tp_no_spec'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS">
 <span class="sig-name descname"><span class="pre">UNPERSIST_TENSORS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'unpersist'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -1488,6 +1555,9 @@ step can fail several of them for different reasons.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.graph_walk"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.graph_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.node_name"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.node_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.request_ids"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.request_ids</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_from_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_from_seq</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.spec_seq"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.spec_seq</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ScheduleTPNode.speculative"><code class="docutils literal notranslate"><span class="pre">ScheduleTPNode.speculative</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.SetupDone"><code class="docutils literal notranslate"><span class="pre">SetupDone</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1506,6 +1576,12 @@ step can fail several of them for different reasons.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.StopLoops.loop_stop_times"><code class="docutils literal notranslate"><span class="pre">StopLoops.loop_stop_times</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.StopLoops.partition_name"><code class="docutils literal notranslate"><span class="pre">StopLoops.partition_name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.StopLoops.request_id"><code class="docutils literal notranslate"><span class="pre">StopLoops.request_id</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation.graph_walk"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation.graph_walk</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation.node_name"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation.node_name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TPNoSpeculation.spec_from_seq"><code class="docutils literal notranslate"><span class="pre">TPNoSpeculation.spec_from_seq</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TensorReceived"><code class="docutils literal notranslate"><span class="pre">TensorReceived</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1548,6 +1624,7 @@ step can fail several of them for different reasons.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.SCHEDULE_TP"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.SCHEDULE_TP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.STOP_LOOPS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.STOP_LOOPS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TENSOR_RECEIVED"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TENSOR_RECEIVED</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TP_NO_SPEC</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNPERSIST_TENSORS</span></code></a></li>
 </ul>
 </li>
@@ -1584,7 +1661,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 10, 2026.
+  Last updated on Sep 11, 2026.
   <br/>
 </p>
   </div>

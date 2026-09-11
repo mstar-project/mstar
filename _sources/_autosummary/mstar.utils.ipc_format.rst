@@ -31,6 +31,7 @@ mstar.utils.ipc\_format
       SetupDone
       Status
       StopLoops
+      TPNoSpeculation
       TensorReceived
       UnpersistTensors
       WorkerGraphsDone
