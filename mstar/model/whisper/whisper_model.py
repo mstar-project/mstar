@@ -370,6 +370,15 @@ class WhisperModel(Model):
         raise ValueError(f"Unsupported modality for Whisper: {modality!r}")
 
     # -------------------------------------------------------------------
+    # Model ABC: sharding
+    # -------------------------------------------------------------------
+
+    def get_default_sharding_config(self):
+        from mstar.distributed.base import ShardingConfig
+
+        return ShardingConfig(groups=[], tp_enabled_nodes={"decoder"}, shard_dim={})
+
+    # -------------------------------------------------------------------
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
 
