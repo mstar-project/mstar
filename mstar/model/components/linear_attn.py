@@ -95,6 +95,25 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(head_v_dim, eps=rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=proj_bias)
 
+    def _apply(self, fn, recurse: bool = True):
+        """Keep the fp32 parameters fp32 through any ``.to(dtype)``.
+
+        FlashInfer's GDN kernels assert on these three, and the checkpoint
+        stores them fp32. A whole-module cast to bf16 — which the engine does
+        once at load, after the model is built — would otherwise silently
+        downcast them and fail at the first decode. Owning the invariant here
+        means it survives whoever calls ``.to``.
+        """
+        out = super()._apply(fn, recurse)
+        for param in (
+            getattr(self, "A_log", None),
+            getattr(self, "dt_bias", None),
+            getattr(getattr(self, "norm", None), "weight", None),
+        ):
+            if param is not None and param.dtype != torch.float32:
+                param.data = param.data.float()
+        return out
+
     def bind_resources(self, resources: dict) -> None:
         """Resolve the resources this layer calls. See
         ``NodeSubmodule.bind_node_resources``."""

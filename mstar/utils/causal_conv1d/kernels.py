@@ -529,6 +529,7 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    seqlens_cpu: torch.Tensor | None = None,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -595,7 +596,15 @@ def causal_conv1d_fn(
         batch_ptr = metadata.batch_ptr
         token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
     else:
-        seqlens = query_start_loc.diff().to("cpu")
+        # mstar: `query_start_loc.diff().to("cpu")` is a device sync, so it
+        # cannot run under CUDA-graph capture. The caller already knows the
+        # spans on the host at plan time and passes them here; falling back
+        # to the readback keeps upstream's behaviour for other callers.
+        seqlens = (
+            seqlens_cpu
+            if seqlens_cpu is not None
+            else query_start_loc.diff().to("cpu")
+        )
         args = seqlens
         MAX_NUM_PROGRAMS = 1024
 

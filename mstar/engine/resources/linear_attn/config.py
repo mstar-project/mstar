@@ -35,7 +35,7 @@ class LinearAttnBackend(Enum):
 @dataclass
 class LinearAttnConfig:
     recurrent_state: str  # name of the recurrent state pool
-    variant: LinearAttnVariant = LinearAttnVariant.GDN
+    variant: LinearAttnVariant
     backend: LinearAttnBackend = LinearAttnBackend.FLASHINFER
 
     # Defaults to head_k_dim ** -0.5 off the pool's geometry, as the kernels'

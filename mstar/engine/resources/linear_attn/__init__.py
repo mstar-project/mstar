@@ -6,18 +6,22 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnStep,
     LinearAttnVariant,
 )
-from mstar.engine.resources.linear_attn.gdn import (
+from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodePlan,
-    GDNManager,
-    GDNPlan,
+    GDNDecodeWrapper,
     GDNPrefillPlan,
+    GDNPrefillWrapper,
+    GDNWrapper,
 )
 
 __all__ = [
     "GDNDecodePlan",
+    "GDNDecodeWrapper",
     "GDNManager",
-    "GDNPlan",
     "GDNPrefillPlan",
+    "GDNPrefillWrapper",
+    "GDNWrapper",
     "LinearAttnBackend",
     "LinearAttnConfig",
     "LinearAttnManager",

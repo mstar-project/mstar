@@ -1,0 +1,21 @@
+model: "qwen3_5"
+max_seq_len: 32768
+node_groups:
+  # Text and images. Video is refused — see `process_prompt`; it needs the
+  # per-frame timestamp spans, not a new encoder. Colocated because the
+  # encoder runs once per request and then idles.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+resources:
+  # A delta-net slot is ~50 MiB per request (24 layers x 32 heads x 128 x 128
+  # fp32), so the pool's 256-slot default would reserve ~12.5 GiB before any
+  # KV.
+  #
+  # The floor is set by CUDA-graph capture, not by serving concurrency. The
+  # graph runner holds a dummy row per (config, slot) until the whole pass
+  # finishes, so the high-water mark is
+  #   decode (2 slots x 32) + prefill (2 slots x 8) = 80, plus the sink.
+  # 96 covers that with headroom and costs ~4.8 GiB; the residue is handed back
+  # once capture ends, so steady-state concurrency is the full 95.
+  gdn_state:
+    max_slots: 96

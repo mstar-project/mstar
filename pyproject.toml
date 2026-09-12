@@ -273,6 +273,8 @@ ignore = [
 "test/modular/test_phase1.py" = ["E402"]
 # Imports are deliberately placed after module-level pytest.importorskip().
 "test/rust/*.py" = ["E402"]
+# Vendored from vLLM and kept diffable against upstream; see its docstring.
+"mstar/utils/causal_conv1d/kernels.py" = ["B007", "F841", "PLR5501"]
 
 [tool.ruff.format]
 quote-style = "double"

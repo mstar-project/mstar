@@ -15,16 +15,21 @@ its per-layer block arrives as a plain tensor argument to ``run``, the way
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 
 import torch
 
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
+from mstar.engine.resources.linear_attn.wrappers import (
+    GDNDecodeWrapper,
+    GDNPrefillWrapper,
+    GDNWrapper,
+)
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import Segment, SlotLease, StepContext
+from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -39,40 +44,6 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
     ),
     12: (torch.float32,),
 }
-
-
-@dataclass(frozen=True)
-class GDNDecodePlan:
-    """Every row is one token; row i is token i."""
-
-    slots: torch.Tensor  # [n] int32, straight off the pool's addressing
-    num_rows: int
-
-
-@dataclass(frozen=True)
-class GDNPrefillPlan:
-    """Rows of any span, including 1 and 0."""
-
-    slots: torch.Tensor       # [n] int32
-    cu_seqlens: torch.Tensor  # [n + 1] int32
-    has_state: torch.Tensor   # [n] bool, False where the slot reads as zeros
-    num_rows: int
-
-
-@dataclass(frozen=True)
-class GDNPlan:
-    """One label's layout for this step.
-
-    Exactly one half is set today: without chunked prefill a batch is either
-    all single-token rows or not, and the chunked kernel takes the rest whole.
-    The pair is kept so a later split — running the faster decode kernel over
-    the single-token rows of a mixed batch — is a change here and not to
-    callers.
-    """
-
-    decode: GDNDecodePlan | None
-    prefill: GDNPrefillPlan | None
-    total_tokens: int
 
 
 class GDNManager(LinearAttnManager):
@@ -99,16 +70,21 @@ class GDNManager(LinearAttnManager):
         allowed = _PREFILL_STATE_DTYPES.get(major, (torch.float32,))
         # Cast only where the arch cannot read the pool as it stands. A bf16
         # pool on SM90 round-trips through fp32 for prefill and is read
-        # directly by decode, so the scatter casts back (see `_run_prefill`).
+        # directly by decode, so the scatter casts back — see
+        # `GDNPrefillWrapper.run`.
         self._prefill_dtype = (
             state_dtype if state_dtype in allowed else torch.float32
         )
         self._check_state_dtype(state_dtype, geometry, has_sink)
 
+        # See `build_cuda_graph_buffers`.
         self._cg_max_bs = 0
-        self._cg_plans: dict[CGSlotKey, torch.Tensor] = {}
-        self._eager_plans: dict[str, torch.Tensor] = {}
-        self._current: dict[str, GDNPlan] = {}
+        self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}
+
+        # (label, is_decode) -> wrapper
+        self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
+
+        self._current: dict[str, GDNWrapper] = {}
 
     @staticmethod
     def _check_state_dtype(
@@ -169,73 +145,74 @@ class GDNManager(LinearAttnManager):
             out.setdefault(seg.label, []).append(seg)
         return out
 
+    def _get_wrapper(
+        self, label: str, is_decode: bool, lease: SlotLease | None = None,
+    ) -> GDNWrapper:
+        """The wrapper this (label, walk) plans into, built once and reused.
+
+        Under capture it is keyed per (bucket, slot, label) and sized to the
+        bucket: the captured graph holds the addresses of the wrapper's
+        buffers, so one that reallocated on a later, larger layout would leave
+        the replay reading freed memory.
+        """
+        if lease is None:
+            # Both walks can run eagerly under one label, and they hold
+            # different wrapper types — so `is_decode` has to be in the key.
+            key, store = (label, is_decode), self._eager_wrappers
+            bs, tok = None, None
+        else:
+            key = CGSlotKey(lease.bucket, lease.slot, label)
+            store = self._cg_wrappers
+            bs = max(self._cg_max_bs, lease.bucket.bs)
+            tok = lease.bucket.num_tokens
+
+        if key not in store:
+            if is_decode:
+                store[key] = GDNDecodeWrapper(
+                    device=self._device,
+                    pad_slot_id=PAD_SLOT_ID,
+                    sm_scale=self.config.sm_scale,
+                    bs=bs,
+                    cuda_graph=lease is not None,
+                )
+            else:
+                store[key] = GDNPrefillWrapper(
+                    device=self._device,
+                    pad_slot_id=PAD_SLOT_ID,
+                    sm_scale=self.config.sm_scale,
+                    prefill_dtype=self._prefill_dtype,
+                    bs=bs,
+                    num_tokens=tok,
+                    cuda_graph=lease is not None,
+                )
+        return store[key]
+
     def _build_plan(
         self,
         label: str,
         segments: list[Segment],
         addressing: RecurrentAddressing,
         ctx: StepContext,
-    ) -> GDNPlan:
+    ) -> GDNWrapper:
         spans = [seg.span for seg in segments]
         num_rows = len(spans)
-        total = sum(spans)
-        # Both halves address every row, so slots are a narrow of the pool's
+        # Both walks address every row, so slots are a narrow of the pool's
         # addressing — no gather, and padding rows keep pointing at the sink.
         slots = addressing.slot_indices[:num_rows]
 
-        if spans and all(s == 1 for s in spans):
-            return GDNPlan(
-                decode=GDNDecodePlan(slots=slots, num_rows=num_rows),
-                prefill=None,
-                total_tokens=total,
-            )
-
-        cu = [0]
-        for span in spans:
-            cu.append(cu[-1] + span)
-        buf = self._cu_buffer(label, ctx, num_rows)
-        buf[: len(cu)].copy_(
-            torch.tensor(
-                cu, dtype=torch.int32, pin_memory=torch.cuda.is_available()
-            ),
-            non_blocking=True,
-        )
-        return GDNPlan(
-            decode=None,
-            prefill=GDNPrefillPlan(
-                slots=slots,
-                cu_seqlens=buf[: len(cu)],
-                has_state=addressing.has_state[:num_rows],
-                num_rows=num_rows,
-            ),
-            total_tokens=total,
-        )
-
-    def _cu_buffer(
-        self, label: str, ctx: StepContext, num_rows: int,
-    ) -> torch.Tensor:
-        """The cu_seqlens buffer this step stages into.
-
-        Under capture it is static and per (bucket, slot, label), built on the
-        first plan for that key and sized to the bucket rather than to this
-        plan's row count — a bucket replays at several layouts.
-        """
-        lease = ctx.slot_lease
-        if lease is None:
-            key, store, rows = label, self._eager_plans, num_rows
+        # Without chunked prefill a batch is either all single-token rows or
+        # not, so one walk owns the whole step. Splitting a mixed batch — the
+        # faster decode kernel over its single-token rows — would be a change
+        # here and not to callers.
+        is_decode = bool(spans) and all(s == 1 for s in spans)
+        wrapper = self._get_wrapper(label, is_decode, ctx.slot_lease)
+        if is_decode:
+            wrapper.plan(spans, slots)
         else:
-            key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
-            store = self._cg_plans
-            rows = max(self._cg_max_bs, lease.bucket.bs, num_rows)
+            wrapper.plan(spans, slots, addressing.has_state[:num_rows])
+        return wrapper
 
-        found = store.get(key)
-        if found is None or found.numel() < rows + 1:
-            found = store[key] = torch.zeros(
-                rows + 1, dtype=torch.int32, device=self._device
-            )
-        return found
-
-    def current_plan(self, label: str | None = None) -> GDNPlan:
+    def current_plan(self, label: str | None = None) -> GDNWrapper:
         if label is None:
             label = self._default_label
         found = self._current.get(label)
@@ -292,65 +269,9 @@ class GDNManager(LinearAttnManager):
         a = a.contiguous()
         b = b.contiguous()
 
-        if plan.decode is not None:
-            return self._run_decode(
-                plan.decode, q, k, v, a, b, state_layer, a_log, dt_bias
-            )
-        return self._run_prefill(
-            plan.prefill, q, k, v, a, b, state_layer, a_log, dt_bias
-        )
-
-    def _run_decode(self, plan, q, k, v, g, beta, state, a_log, dt_bias):
-        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
-
-        # row i is token i, so the token axis is just unsqueezed
-        out, _ = gated_delta_rule_decode_pretranspose(
-            q=q.unsqueeze(1), k=k.unsqueeze(1), v=v.unsqueeze(1),
-            state=None,
-            A_log=a_log,
-            a=g.unsqueeze(1),
-            dt_bias=dt_bias,
-            b=beta.unsqueeze(1),
-            scale=self.config.sm_scale,
-            initial_state=state,
-            initial_state_indices=plan.slots,
-            use_qk_l2norm=False,
-        )
-        return out.squeeze(1)
-
-    def _run_prefill(self, plan, q, k, v, a, b, state, a_log, dt_bias):
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
-
-        # The chunked kernel takes the decay and the learning rate already
-        # formed, where the decode kernel takes `a`/`b` raw and forms them from
-        # the same two weights. Keep the formula here so the paths agree.
-        g = -torch.exp(a_log.float()) * torch.nn.functional.softplus(
-            a.float() + dt_bias.float()
-        )
-        beta = torch.sigmoid(b.float())
-
-        slots = plan.slots.to(torch.int64)
-        # SM90 takes packed, sequence-ordered state — `state_indices` is
-        # SM100/SM103 only — so gather here and scatter back. Once per prefill
-        # step rather than per token, and prefill stays eager-cheap.
-        initial = torch.index_select(state, 0, slots).to(self._prefill_dtype)
-        # zero the rows that start fresh, by multiply rather than boolean mask:
-        # `initial[~mask] = 0` is a data-dependent shape and cannot be captured
-        initial.mul_(plan.has_state.to(initial.dtype).view(-1, 1, 1, 1))
-
-        out, final = chunk_gated_delta_rule(
-            q=q, k=k, v=v,
-            # FlashInfer wants the decay exponentiated; FLA's takes log space
-            g=torch.exp(g),
-            beta=beta,
-            scale=self.config.sm_scale,
-            initial_state=initial,
-            output_final_state=True,
-            cu_seqlens=plan.cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-        )
-        state.index_copy_(0, slots, final.to(state.dtype))
-        return out
+        # Both wrappers take the gates raw: prefill forms the decay and the
+        # learning rate itself, decode hands them to a kernel that does.
+        return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
 
     @torch.compiler.disable
     def run_conv(
@@ -373,30 +294,10 @@ class GDNManager(LinearAttnManager):
         and with the sink off they carry -1, which is this kernel's own
         ``PAD_SLOT_ID``.
         """
-        from mstar.utils.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-
-        plan = self.current_plan(label)
-        if plan.decode is not None:
-            return causal_conv1d_update(
-                x=x,
-                conv_state=conv_layer,
-                weight=weight,
-                bias=bias,
-                activation=activation,
-                conv_state_indices=plan.decode.slots,
-            )
-        # the varlen kernel is feature-major
-        out = causal_conv1d_fn(
-            x=x.transpose(0, 1),
-            weight=weight,
-            bias=bias,
-            conv_states=conv_layer,
-            query_start_loc=plan.prefill.cu_seqlens,
-            cache_indices=plan.prefill.slots,
-            has_initial_state=plan.prefill.has_state,
+        return self.current_plan(label).run_conv(
+            x=x, conv_layer=conv_layer, weight=weight, bias=bias,
             activation=activation,
         )
-        return out.transpose(0, 1)
 
     # Engine lifecycle
 
@@ -404,9 +305,13 @@ class GDNManager(LinearAttnManager):
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
+        # A floor under every capture wrapper's row count, applied when one is
+        # built. The engine announces the widest batch it will capture before
+        # any bucket plans, and a wrapper that sized itself to its own bucket
+        # alone would reallocate if a wider layout ever reached it.
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
 
     def cleanup(self):
-        self._cg_plans.clear()
-        self._eager_plans.clear()
+        self._cg_wrappers.clear()
+        self._eager_wrappers.clear()
         self._current.clear()

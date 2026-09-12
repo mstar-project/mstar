@@ -96,8 +96,45 @@ def apply_partial_mrope(
 
 
 def text_position_ids(
-    seq_len: int, start_pos: int = 0, device: torch.device | None = None,
+    seq_len: int, start_pos: float = 0, device: torch.device | None = None,
 ) -> torch.Tensor:
     """``[3, seq_len]`` for a pure-text span: all three grids advance together."""
     pos = torch.arange(seq_len, dtype=torch.float, device=device) + float(start_pos)
     return pos.unsqueeze(0).expand(3, -1).contiguous()
+
+
+def vision_position_ids(
+    grid_thw: torch.Tensor,
+    spatial_merge_size: int,
+    start_pos: float = 0,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """``[3, t * h' * w']`` for one image, where ``h' = h // merge``.
+
+    The three grids stop moving together here: T is constant across a frame
+    while H and W sweep the merged patch grid, all three based at
+    ``start_pos``. Order is row-major over ``(t, h', w')``, which is the order
+    the merger emits tokens in.
+    """
+    t, h, w = (int(v) for v in grid_thw.tolist())
+    h //= spatial_merge_size
+    w //= spatial_merge_size
+    def axis(n: int) -> torch.Tensor:
+        return torch.arange(n, dtype=torch.float, device=device) + start_pos
+
+    grids = torch.meshgrid(axis(t), axis(h), axis(w), indexing="ij")
+    return torch.stack(grids, dim=0).reshape(3, -1)
+
+
+def vision_position_advance(
+    grid_thw: torch.Tensor, spatial_merge_size: int,
+) -> int:
+    """How far one image moves the position cursor.
+
+    Not its token count: the grids run in parallel rather than in sequence, so
+    an image spans ``max(h', w')`` positions while occupying ``t * h' * w'``
+    tokens. Feeding the token count here would leave a gap the size of the
+    image before the text that follows it.
+    """
+    _, h, w = (int(v) for v in grid_thw.tolist())
+    return max(h, w) // spatial_merge_size

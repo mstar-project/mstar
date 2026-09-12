@@ -29,6 +29,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",
     "orpheus": "orpheus_colocated.yaml",
+    "qwen3_5": "qwen3_5.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "pi05": "pi05.yaml",
