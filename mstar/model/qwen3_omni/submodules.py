@@ -161,6 +161,7 @@ class NativeAudioEncoderSubmodule(NodeSubmodule):
     # sees a fixed set of shapes; static specialization is safe and avoids
     # Inductor's dynamic-shape guards.
     torch_compile_dynamic = False
+    disable_torch_compile_batched = True
 
     def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
@@ -343,6 +344,7 @@ class NativeVisionEncoderSubmodule(NodeSubmodule):
     # Same rationale as NativeAudioEncoderSubmodule: the block loop runs on
     # piecewise capture buckets, so forward sees a fixed set of shapes.
     torch_compile_dynamic = False
+    disable_torch_compile_batched = True
 
     def __init__(self, vision_encoder: nn.Module, config: Qwen3OmniModelConfig):
         super().__init__()
