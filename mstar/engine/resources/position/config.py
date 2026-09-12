@@ -62,6 +62,9 @@ class PositionConfig:
 class PositionSpec(NodeResourceSpec):
     config: PositionConfig
 
+    def depends_on(self) -> set[str]:
+        return {self.config.kv_cache}
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.position.manager import PositionManager

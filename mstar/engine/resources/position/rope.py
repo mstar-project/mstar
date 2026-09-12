@@ -13,13 +13,34 @@ import torch
 @torch.library.custom_op("mstar::rope_apply_qk_inplace", mutates_args={"q", "k"})
 def rope_apply_qk_inplace(
     q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
     rotary_dim: int | None, interleave: bool,
     rope_scale: float, rope_theta: float,
     low_freq_factor: float | None = None,
     high_freq_factor: float | None = None,
     old_context_len: float | None = None,
 ) -> None:
-    """Rotate q and k in place at ``pos_ids``."""
+    """Reject devices without a registered RoPE kernel."""
+    raise NotImplementedError(
+        f"RoPE is only implemented for CUDA and XPU, not {q.device.type}"
+    )
+
+
+@torch.library.register_kernel(rope_apply_qk_inplace, "cuda")
+def _rope_apply_qk_inplace_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    rotary_dim: int | None,
+    interleave: bool,
+    rope_scale: float,
+    rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    """Rotate q and k in place with FlashInfer's CUDA kernel."""
     import flashinfer
 
     rope_kwargs = dict(
@@ -42,9 +63,47 @@ def rope_apply_qk_inplace(
         )
 
 
+@torch.library.register_kernel(rope_apply_qk_inplace, "xpu")
+def _rope_apply_qk_inplace_xpu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    rotary_dim: int | None,
+    interleave: bool,
+    rope_scale: float,
+    rope_theta: float,
+    low_freq_factor: float | None = None,
+    high_freq_factor: float | None = None,
+    old_context_len: float | None = None,
+) -> None:
+    """Rotate q and k in place with the vllm XPU fused kernel."""
+    if any(
+        value is not None
+        for value in (low_freq_factor, high_freq_factor, old_context_len)
+    ):
+        raise NotImplementedError(
+            "Llama 3.1 RoPE scaling is not implemented for XPU"
+        )
+    if cos_sin_cache is None:
+        raise RuntimeError("XPU RoPE requires a precomputed cos/sin cache")
+
+    import vllm_xpu_kernels._C  # noqa: F401
+
+    torch.ops._C.rotary_embedding(
+        pos_ids,
+        q,
+        k,
+        q.shape[-1],
+        cos_sin_cache,
+        not interleave,
+    )
+
+
 @rope_apply_qk_inplace.register_fake
 def _rope_apply_qk_inplace_fake(
     q: torch.Tensor, k: torch.Tensor, pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
     rotary_dim: int | None, interleave: bool,
     rope_scale: float, rope_theta: float,
     low_freq_factor: float | None = None,

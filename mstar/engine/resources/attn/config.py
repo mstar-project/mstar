@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 class AttnBackend(Enum):
     FLASHINFER = "flashinfer"
     DENSE = "dense"
+    XPU_PAGED = "xpu_paged"
 
 
 @dataclass
