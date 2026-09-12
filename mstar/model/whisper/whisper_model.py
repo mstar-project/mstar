@@ -438,7 +438,7 @@ class WhisperModel(Model):
     def _create_decoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None, tp_group=None
     ) -> NodeSubmodule:
-        from mstar.model.loader import load_hf_weights, WHISPER_STACKED_PARAMS
+        from mstar.model.loader import WHISPER_STACKED_PARAMS, load_hf_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
         from mstar.model.whisper.components.decoder import WhisperDecoderModel
 

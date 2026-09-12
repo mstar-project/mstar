@@ -173,11 +173,10 @@ class ParallelAttention(nn.Module):
 
 
 class ParallelCrossAttention(nn.Module):
-    """
-    TODO(#160): the projections are plain ``nn.Linear`` — this module is not
-    yet TP/SP-compatible (no column/row-parallel splits over heads). A
-    tensor-parallel cross-attention variant is needed to serve the decoder
-    under TP alongside the self-attention path.
+    """Cross-attention split across tensor-parallel ranks.
+
+    Each rank handles a subset of attention heads, then the output projection
+    combines their contributions with an all-reduce.
     """
 
     def __init__(
