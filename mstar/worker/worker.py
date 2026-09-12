@@ -2590,7 +2590,7 @@ class Worker:
         # await_gpu (which releases the GIL), so plan()'s Python work isn't
         # contended by main thread's fast/slow postprocess
         #
-        # With double-buffered wrappers (CudaGraphRunner.NUM_SLOTS=2) and
+        # With double-buffered wrappers (MSTAR_NUM_SLOTS=2) and
         # advance_event signaling, plan(N+1) runs concurrent with replay(N)
         # on the disjoint slot — the actual GPU overlap. plan_executor waits
         # on prev_advance_event (signaled right after advance_seq_lens(N) on

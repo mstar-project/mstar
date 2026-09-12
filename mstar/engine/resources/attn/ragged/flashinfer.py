@@ -4,7 +4,7 @@ from collections.abc import Iterable
 
 import torch
 
-from mstar.engine.resources.attn.base import WorkspacePool
+from mstar.engine.resources.attn.base import EagerSlotKey, WorkspacePool
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig
@@ -29,7 +29,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
 
         # Persistent, because constructing one allocates FlashInfer's own
         # buffers and is far from free per step.
-        self._eager_plan_states: dict[str, RaggedPrefillWrapper] = {}
+        self._eager_plan_states: dict[EagerSlotKey, RaggedPrefillWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, RaggedPrefillWrapper] = {}
 
         self._preplan_states: dict[str, RaggedPrefillWrapper] = {}
@@ -46,6 +46,12 @@ class FlashInferRaggedManager(RaggedAttnManager):
             sm_scale=config.sm_scale,
             backend=config.flashinfer_backend,
         )
+
+    @property
+    def force_double_buffer(self):
+        # FlashInfer's plan stages the schedule into a pinned buffer it holds
+        # per wrapper and H2Ds it on the stream
+        return True
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str,
@@ -80,12 +86,17 @@ class FlashInferRaggedManager(RaggedAttnManager):
         self._cg_plan_states[key] = wrapper
         return wrapper
 
-    def _eager_wrapper(self, label: str) -> RaggedPrefillWrapper:
-        """The persistent eager wrapper for one label."""
-        wrapper = self._eager_plan_states.get(label)
+    def _eager_wrapper(self, label: str, slot: int) -> RaggedPrefillWrapper:
+        """The persistent eager wrapper for one (label, slot).
+
+        Slotted for the same reason the captured ones are, and on the same
+        workspace; see `FlashInferManager._eager_wrapper`.
+        """
+        key = EagerSlotKey(label=label, slot=slot)
+        wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            wrapper = self._eager_plan_states[label] = RaggedPrefillWrapper(
-                workspace_buffer=self._workspaces.get(label),
+            wrapper = self._eager_plan_states[key] = RaggedPrefillWrapper(
+                workspace_buffer=self._workspaces.get(label, slot),
                 **self._kwargs,
             )
         return wrapper
@@ -109,8 +120,8 @@ class FlashInferRaggedManager(RaggedAttnManager):
 
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: eager wrappers share one "
-            "workspace per label with the forward still in flight"
+            "preplan requires a cuda graph step: an eager wrapper shares its "
+            "workspace with the captured one on the same slot"
         )
         assert not (self._preplanned and ctx.is_preplan), (
             "ragged attention preplan is already pending; clear_preplan before "
@@ -153,7 +164,7 @@ class FlashInferRaggedManager(RaggedAttnManager):
             if lease is not None:
                 wrapper = self._cg_wrapper(lease, label)
             else:
-                wrapper = self._eager_wrapper(label)
+                wrapper = self._eager_wrapper(label, ctx.slot)
 
             # TODO: cache the latest plan state
             wrapper.plan(cu_seqlens=cu_seqlens, causal=step.causal)
