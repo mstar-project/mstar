@@ -297,6 +297,95 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
 
 
 # ---------------------------------------------------------------------------
+# Teardown: cleanup_request (soft) vs force_cleanup_request (hard) + drain gate
+# ---------------------------------------------------------------------------
+
+def _store_persisted_input(mgr, request_id, name="in"):
+    """Mirror the data worker's input-signal path: store, register for send, and
+    mark persisted (ref_cnt stays 0 — persist is the only thing holding it)."""
+    info = mgr.store_and_return_tensor_info(request_id, {name: [torch.randn(4, 8)]})
+    tensor_info = info[name][0]
+    mgr.register_for_send(request_id, [tensor_info])
+    mgr.set_persist(request_id, tensor_info.uuid, persist=True)
+    return tensor_info.uuid
+
+
+def test_cleanup_request_defers_persisted_tensor():
+    """Regression for the abort SHM bug: a persisted input-signal (ref_cnt==0,
+    kept alive only by the persist flag) must NOT be unlinked by cleanup_request.
+    Force-dropping it here is exactly what unlinked a segment under a peer's
+    still-scheduled read and killed the rank."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(
+            tmpdir, entity_id="api_server_preprocess_worker", request_id="req1"
+        )
+        uuid = _store_persisted_input(mgr, "req1")
+        path = os.path.join(tmpdir, f"mstar_api_server_preprocess_worker_{uuid}")
+        assert os.path.isfile(path)
+        assert not mgr.tensor_store.can_gc("req1", uuid)  # persist holds it
+
+        mgr.cleanup_request("req1")
+        assert os.path.isfile(path)  # deferred, not force-unlinked
+
+
+def test_force_cleanup_request_drops_persisted_tensor():
+    """Phase-2 hard cleanup drops the persisted signal unconditionally — safe
+    only after every reader has drained (READS_DONE)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(
+            tmpdir, entity_id="api_server_preprocess_worker", request_id="req1"
+        )
+        uuid = _store_persisted_input(mgr, "req1")
+        path = os.path.join(tmpdir, f"mstar_api_server_preprocess_worker_{uuid}")
+        assert os.path.isfile(path)
+
+        mgr.force_cleanup_request("req1")
+        assert not os.path.isfile(path)
+        assert not mgr.tensor_store.check_uuid_presence("req1", uuid)
+
+
+def test_force_cleanup_request_reclaims_unacked_buffer():
+    """Hard cleanup also reclaims a non-persisted output buffer still held by its
+    awaiting-ack ref — the ~leaked segments cleanup_request would defer forever."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        producer = _make_manager(tmpdir, entity_id="worker_0", request_id="req1")
+        _, uuid = _produce_registered_output(producer, "req1")
+        shm_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
+        assert os.path.isfile(shm_path)
+        assert not producer.tensor_store.can_gc("req1", uuid)  # held by send ref
+
+        producer.force_cleanup_request("req1")
+        assert not os.path.isfile(shm_path)  # dropped regardless of ref count
+
+
+def test_has_inflight_reads_tracks_pending_futures():
+    """The drain gate: only an outstanding async read future counts. Synchronous
+    (SHM) reads land in pending with future=None and are already done."""
+    from mstar.communication.tensors import FutureAndPointers
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        assert not mgr.has_inflight_reads("req1")
+
+        # Completed synchronous read (future=None) does not count.
+        mgr.pending.append(
+            FutureAndPointers(future=None, graph_edges=[], request_id="req1")
+        )
+        assert not mgr.has_inflight_reads("req1")
+
+        # An unresolved async future does.
+        class _Fut:
+            def done(self):
+                return False
+
+        mgr.pending.append(
+            FutureAndPointers(future=_Fut(), graph_edges=[], request_id="req1")
+        )
+        assert mgr.has_inflight_reads("req1")
+        assert not mgr.has_inflight_reads("other-req")
+
+
+# ---------------------------------------------------------------------------
 # Factory tests
 # ---------------------------------------------------------------------------
 

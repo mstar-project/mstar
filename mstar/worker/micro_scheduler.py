@@ -1,6 +1,6 @@
 import logging
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -145,6 +145,12 @@ class MicroScheduler:
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: set[str] = set()
 
+        # rid -> number of committed (ZMQ received) tp follow batches still
+        # queued. On the fail/abort path we drain these before ACKing READS_DONE
+        # so the worker graph queues aren't torn down while a follow still needs
+        # to pop from them.
+        self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
+
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
@@ -173,6 +179,8 @@ class MicroScheduler:
         self, message: ScheduleTPNode
     ):
         self.tp_batches_pending_schedule.append(message)
+        for rid in message.request_ids:
+            self.pending_tp_follow_count[rid] += 1
 
     # TP-follow FIFO accessors for the follower's async path (head only).
 
@@ -182,7 +190,17 @@ class MicroScheduler:
         return self.tp_batches_pending_schedule[0]
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
-        return self.tp_batches_pending_schedule.popleft()
+        # Sole exit for a queued follow batch: every consumer (the serial path
+        # and the async follower's build / drop / void paths) pops here, so the
+        # drain refcount is discharged in one place.
+        message = self.tp_batches_pending_schedule.popleft()
+        for rid in message.request_ids:
+            if rid not in self.pending_tp_follow_count:
+                continue
+            self.pending_tp_follow_count[rid] -= 1
+            if self.pending_tp_follow_count[rid] <= 0:
+                self.pending_tp_follow_count.pop(rid, None)
+        return message
 
     def pop_ready_rids(
         self, worker_graphs_manager: WorkerGraphsManager,
@@ -247,7 +265,7 @@ class MicroScheduler:
             return
         node_objects, request_to_worker_graph = popped
 
-        self.tp_batches_pending_schedule.popleft()
+        self.pop_tp_follow_head()
 
         return ScheduledBatch(
             node_name=first_tp_node.node_name,
@@ -682,4 +700,5 @@ class MicroScheduler:
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
+        self.pending_tp_follow_count.pop(rid, None)
 
