@@ -280,8 +280,11 @@ class Engine:
         """Apply torch.compile to submodule forward paths.
 
         Compiles each submodule's ``forward`` and ``forward_batched`` with the
-        default mode (fullgraph=False, dynamic=None), which in general provides
-        performance gains without frequent slow recompiles.
+        default mode (fullgraph=False, dynamic from the submodule), which in general provides
+        performance gains without frequent slow recompiles. A submodule whose
+        batched path takes dynamic varlen shapes sets
+        ``disable_torch_compile_batched`` to keep that path eager, since
+        Inductor there either recompiles per shape or fails on its host reads.
         """
         if not torch.cuda.is_available():
             return
@@ -293,17 +296,19 @@ class Engine:
                 logger.info("Engine: torch.compile disabled for %s (submodule opt-out)", node_name)
                 continue
 
+            dynamic = getattr(submodule, "torch_compile_dynamic", None)
             try:
                 submodule_mgmt.forward = torch.compile(
                     submodule.forward,
                     fullgraph=False,
-                    dynamic=None,
+                    dynamic=dynamic,
                 )
-                submodule_mgmt.forward_batched = torch.compile(
-                    submodule.forward_batched,
-                    fullgraph=False,
-                    dynamic=None,
-                )
+                if not getattr(submodule, "disable_torch_compile_batched", False):
+                    submodule_mgmt.forward_batched = torch.compile(
+                        submodule.forward_batched,
+                        fullgraph=False,
+                        dynamic=dynamic,
+                    )
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(

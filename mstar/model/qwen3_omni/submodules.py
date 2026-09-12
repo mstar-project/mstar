@@ -140,6 +140,97 @@ class AudioEncoderSubmodule(NodeSubmodule):
         return {"audio_embeds": [audio_embeds]}
 
 
+class NativeAudioEncoderSubmodule(NodeSubmodule):
+    """Native AuT submodule with cross-request batching.
+
+    The audio encoder is varlen-packed (per-request windows via ``cu_seqlens``),
+    so batching N requests needs no padding: concatenate their mel features along
+    time, pass a multi-entry ``feature_lens``, run one forward, and slice the
+    packed output back per request. Mirrors the Code2Wav preprocess/forward_batched
+    contract. Batched-no-graph already beats the HF baseline, so no torch.compile /
+    CUDA graphs are declared (the issue warns they don't uniformly help encoders).
+
+    Batching scope (see ``can_batch``): cross-request batching only engages when
+    every request carries exactly ONE ``feature_lens`` segment, so the per-request
+    output split is unambiguous. A request with multiple audio clips
+    (multi-segment ``feature_lens``) falls back to the sequential ``forward`` —
+    it is still correct, just not batched with its peers.
+    """
+
+    # The layer loop runs on piecewise capture buckets, so forward only ever
+    # sees a fixed set of shapes; static specialization is safe and avoids
+    # Inductor's dynamic-shape guards.
+    torch_compile_dynamic = False
+    disable_torch_compile_batched = True
+
+    def __init__(self, audio_encoder: nn.Module, config: Qwen3OmniModelConfig):
+        super().__init__()
+        self.audio_encoder = audio_encoder
+        self.config = config
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        return NodeInputs(tensor_inputs={
+            "audio_features": inputs["audio_features"][0],
+            "audio_seqlens": inputs.get("audio_seqlens", [None])[0],
+        })
+
+    @staticmethod
+    def _req_token_count(seqlens: torch.Tensor) -> int:
+        from mstar.model.qwen3_omni.components.audio_encoder import _feat_extract_output_lengths
+        return int(_feat_extract_output_lengths(seqlens.reshape(-1)).sum())
+
+    def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]):
+        feats = [i.tensor_inputs["audio_features"] for i in inputs]
+        lens = [i.tensor_inputs["audio_seqlens"].reshape(-1) for i in inputs]
+        counts = [self._req_token_count(l) for l in lens]
+        return {
+            "audio_features": torch.cat(feats, dim=1),   # (mel, sum_T)
+            "audio_seqlens": torch.cat(lens),            # (sum_segments,)
+            "req_token_counts": counts,
+        }
+
+    def get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1):
+        cfg = self.audio_encoder.get_piecewise_cuda_graph_config(device, autocast_dtype)
+        return {"layer_loop": cfg} if cfg is not None else {}
+
+    def forward_batched(self, graph_walk, engine_inputs, audio_features,
+                        audio_seqlens, req_token_counts=None, **kwargs):
+        embeds = self.audio_encoder(
+            audio_features, audio_seqlens,
+            piecewise_runner=engine_inputs.piecewise_runners.get("layer_loop"),
+        ).last_hidden_state
+        if embeds.dim() == 3:
+            embeds = embeds.squeeze(0)
+        request_ids = engine_inputs.request_ids
+        if req_token_counts is None:  # single-segment-per-request fallback
+            req_token_counts = [self._req_token_count(audio_seqlens[i:i + 1])
+                                for i in range(len(request_ids))]
+        results: dict[str, NameToTensorList] = {}
+        off = 0
+        for rid, c in zip(request_ids, req_token_counts, strict=False):
+            results[rid] = {"audio_embeds": [embeds[off:off + c]]}
+            off += c
+        return results
+
+    def forward(self, graph_walk, engine_inputs, audio_features, audio_seqlens, **kwargs):
+        embeds = self.audio_encoder(
+            audio_features, audio_seqlens,
+            piecewise_runner=engine_inputs.piecewise_runners.get("layer_loop"),
+        ).last_hidden_state
+        if embeds.dim() == 3:
+            embeds = embeds.squeeze(0)
+        return {"audio_embeds": [embeds]}
+
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        # Safe pad-free batching needs one feature_lens entry per request so the
+        # output split is unambiguous; otherwise defer to sequential forward.
+        for mi in model_inputs:
+            sl = mi.tensor_inputs.get("audio_seqlens")
+            if sl is None or sl.reshape(-1).numel() != 1:
+                return False
+        return True
+
+
 # ===================================================================
 # 2. VisionEncoderSubmodule (enc_dec engine)
 # ===================================================================
@@ -237,6 +328,104 @@ class VisionEncoderSubmodule(NodeSubmodule):
             "vision_embeds": [vision_embeds],
             "deepstack": deepstack if deepstack is not None else [torch.tensor([])],
         }
+
+
+class NativeVisionEncoderSubmodule(NodeSubmodule):
+    """Native ViT submodule with cross-request batching + DeepStack.
+
+    Multiple images batch with no padding: concatenate their patch rows and
+    ``grid_thw`` rows, run one forward (per-image attention isolated by the
+    encoder's ``cu_seqlens``), then slice the merged tokens AND each DeepStack
+    level back per request. Same output contract as ``VisionEncoderSubmodule``
+    (``vision_embeds`` + positionally-spliced ``deepstack``) so nothing upstream
+    of ``vision_encoder.forward`` changes.
+    """
+
+    # Same rationale as NativeAudioEncoderSubmodule: the block loop runs on
+    # piecewise capture buckets, so forward sees a fixed set of shapes.
+    torch_compile_dynamic = False
+    disable_torch_compile_batched = True
+
+    def __init__(self, vision_encoder: nn.Module, config: Qwen3OmniModelConfig):
+        super().__init__()
+        self.vision_encoder = vision_encoder
+        self.config = config
+        # Source the merge factor from the encoder it was built with (not the
+        # mstar config) so the per-request token split can never diverge from
+        # what the encoder actually produces.
+        self.merge_sq = vision_encoder.spatial_merge_size ** 2
+
+    def _merged_tokens(self, grid_thw: torch.Tensor) -> int:
+        g = grid_thw if grid_thw.dim() == 2 else grid_thw.unsqueeze(0)
+        return int((g[:, 0] * g[:, 1] * g[:, 2]).sum() // self.merge_sq)
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        pixel_values = inputs["pixel_values"][0]
+        grid_thw = inputs.get("image_grid_thw", inputs.get("grid_thw", [None]))[0]
+        if grid_thw is None:
+            raise ValueError("NativeVisionEncoder: 'image_grid_thw' input is None.")
+        if grid_thw.dim() == 1:
+            grid_thw = grid_thw.unsqueeze(0)
+        return NodeInputs(tensor_inputs={"pixel_values": pixel_values, "grid_thw": grid_thw})
+
+    def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]):
+        pvs = [i.tensor_inputs["pixel_values"] for i in inputs]
+        grids = [i.tensor_inputs["grid_thw"] for i in inputs]
+        counts = [self._merged_tokens(g) for g in grids]
+        return {
+            "pixel_values": torch.cat(pvs, dim=0),
+            "grid_thw": torch.cat(grids, dim=0),
+            "req_token_counts": counts,
+        }
+
+    def _run(self, pixel_values, grid_thw, piecewise_runner=None):
+        out = self.vision_encoder(
+            pixel_values, grid_thw=grid_thw, piecewise_runner=piecewise_runner,
+        )
+        if isinstance(out, tuple):
+            embeds, deepstack = out
+        else:
+            embeds, deepstack = out.pooler_output, out.deepstack_features
+        if isinstance(deepstack, torch.Tensor):
+            deepstack = [deepstack]
+        return embeds, deepstack
+
+    def get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1):
+        cfg = self.vision_encoder.get_piecewise_cuda_graph_config(device, autocast_dtype)
+        return {"block_loop": cfg} if cfg is not None else {}
+
+    def forward_batched(self, graph_walk, engine_inputs, pixel_values, grid_thw,
+                        req_token_counts=None, **kwargs):
+        embeds, deepstack = self._run(
+            pixel_values, grid_thw,
+            piecewise_runner=engine_inputs.piecewise_runners.get("block_loop"),
+        )
+        request_ids = engine_inputs.request_ids
+        if req_token_counts is None:  # one-image-per-request fallback
+            g = grid_thw if grid_thw.dim() == 2 else grid_thw.unsqueeze(0)
+            req_token_counts = [self._merged_tokens(g[i:i + 1]) for i in range(len(request_ids))]
+        results: dict[str, NameToTensorList] = {}
+        off = 0
+        for rid, c in zip(request_ids, req_token_counts, strict=False):
+            results[rid] = {
+                "vision_embeds": [embeds[off:off + c]],
+                "deepstack": [d[off:off + c] for d in deepstack],
+            }
+            off += c
+        return results
+
+    def forward(self, graph_walk, engine_inputs, pixel_values, grid_thw, **kwargs):
+        embeds, deepstack = self._run(
+            pixel_values, grid_thw,
+            piecewise_runner=engine_inputs.piecewise_runners.get("block_loop"),
+        )
+        return {
+            "vision_embeds": [embeds],
+            "deepstack": deepstack if deepstack else [torch.tensor([])],
+        }
+
+    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
+        return True
 
 
 # ===================================================================
@@ -461,6 +650,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 device,
                 self.config.thinker.position_id_per_seconds,
             )
+            # M-RoPE parity: the legacy M* layout pinned audio h/w to a constant
+            # while HF ramps them with temporal, so h/w is set to temporal here
+            # to make the 3D position_ids byte-identical to HF get_rope_index.
+            audio_pos_ids = audio_pos_ids.clone()
+            audio_pos_ids[1] = audio_pos_ids[0]
+            audio_pos_ids[2] = audio_pos_ids[0]
             end_pos_ids = get_rope_index_text(
                 1, start_pos + 1 + audio_len, device
             )
@@ -496,8 +691,11 @@ class ThinkerSubmodule(ARNodeSubmodule):
             grid_thw = inputs.get("image_grid_thw", [None])[0]
             seconds_per_grid = inputs.get("video_second_per_grid", [])
             seconds_per_grid = seconds_per_grid[0].item() if seconds_per_grid else None
+            # Keep grid_thw on CPU: get_rope_index_vision only reads scalar grid
+            # values (now CPU no-ops) and builds every tensor with device=device,
+            # so the .to(device) here only induced GPU->CPU .item() syncs in rope.
             vision_pos_ids = get_rope_index_vision(
-                grid_thw.to(device),
+                grid_thw,
                 start_pos + 1,  # leave room for the BOS token
                 position_id_per_seconds=self.config.thinker.position_id_per_seconds,
                 device=device,
@@ -507,7 +705,24 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
             # Sentinel token positions (text-like).
             start_pos_ids = get_rope_index_text(1, start_pos, device)
-            end_pos_base = float(vision_pos_ids.max().item()) + 1
+            # Derive end_pos_base from the CPU grid (avoids a GPU max-reduction sync);
+            # mirrors get_rope_index_vision's spatial/temporal max.
+            vstart = start_pos + 1
+            sms = self.config.vision.spatial_merge_size
+            _grid = grid_thw if grid_thw.dim() == 2 else grid_thw.unsqueeze(0)
+            _max_pos = float("-inf")
+            for _row in _grid:
+                gt, gh, gw = int(_row[0]), int(_row[1]), int(_row[2])
+                spatial_max = max(gh // sms, gw // sms) - 1 + vstart
+                if seconds_per_grid is None:
+                    temporal_max = vstart
+                else:
+                    temporal_max = (
+                        (gt - 1) * seconds_per_grid
+                        * self.config.thinker.position_id_per_seconds
+                    )
+                _max_pos = max(_max_pos, spatial_max, temporal_max)
+            end_pos_base = float(_max_pos) + 1
             end_pos_ids = get_rope_index_text(1, end_pos_base, device)
 
             pos_ids = torch.cat(
@@ -614,12 +829,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             assert len(inputs) == 1, \
                 "Batching not implemented for Thinker vision prefill"
             inp = inputs[0]
-            # Q3(b): emit deepstack as separate keys ``deepstack_<i>`` so each
-            # tensor gets its own static buffer in the captured config (the
-            # runner's static-buffer interning is per-key and tensor-typed;
-            # passing a list-of-tensors under one key would not get interned
-            # and addresses captured into the graph would be stale at replay).
-            # ``forward_batched``/``forward`` reassemble the list from kwargs.
             num_deepstack = len(self.config.vision.deepstack_visual_indexes)
             deepstack_list = inp.tensor_inputs.get("deepstack")
             if deepstack_list is None or (
@@ -994,7 +1203,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             outputs.pop("new_token", None)
 
         if not request_info.step_metadata.get("audio_output", True):
-            # drop thinker_states and thinker_match
+            # drop thinker_states and thinker_mask
             outputs.pop("thinker_states", None)
             outputs.pop("thinker_mask", None)
         else:
@@ -1195,7 +1404,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, thinker_hidden: torch.Tensor
     ):
         # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
-        # Text hidden: [pad*4, bos, proj[3]] (9 tokens)
+        # Text hidden: [pad*4, bos, proj[3]] (6 tokens)
         # (note that the assistant prefix was handled in the previous prefill stage)
 
         # Text part of assistant prefix
@@ -1215,7 +1424,7 @@ class TalkerSubmodule(ARNodeSubmodule):
     ):
         # Build assistant prefix (matching HF/sglang-omni/vllm-omni pattern):
         # Codec hidden: [codec_embed(nothink, think_bos, think_eos,
-        #                speaker, pad, bos)] (9 tokens)
+        #                speaker, pad, bos)] (6 tokens)
         tc = self.config.talker
         speaker_id = tc.speaker_id.get(speaker.lower())
         if speaker_id is None:
@@ -1381,7 +1590,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         **kwargs
     ):
         """
-        Runs the Talker LLM for stages that grpoh walks that sample a token
+        Runs the Talker LLM for stages that graph walks that sample a token
         and feed into the code predictor.
 
         ``last_token_indices`` (when provided) is used to ``index_select`` the

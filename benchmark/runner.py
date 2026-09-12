@@ -257,8 +257,17 @@ class Benchmark:
                 "output_bytes": dict(m.output_bytes),
             })
 
+        import dataclasses
+
+        def _ls(x):
+            return dataclasses.asdict(x) if x is not None else None
+
+        def _lsmap(d):
+            return {k: _ls(v) for k, v in (d or {}).items()}
+
         payload = {
             "system": "ours",
+            "inference_system": self.config.inference_system.value,
             "model": getattr(self.config.model, "__class__", type(self.config.model)).__name__,
             "request_type": self.config.request_type.value,
             "profiling_type": self.config.profiling_type.value,
@@ -273,6 +282,15 @@ class Benchmark:
             "jct_p95_ms": _pct(jcts_ms, 95),
             "jct_p99_ms": _pct(jcts_ms, 99),
             "request_throughput": (agg.request_throughput or 0.0),
+            "text_token_throughput": agg.text_token_throughput,
+            "audio_seconds_throughput": agg.audio_seconds_throughput,
+            "audio_duration_mean_s": agg.audio_duration_mean_s,
+            "batch_size": agg.batch_size,
+            "max_concurrency": agg.max_concurrency,
+            "ttft": _lsmap(agg.ttft),
+            "itl": _lsmap(agg.itl),
+            "e2e_latency": _ls(agg.e2e_latency),
+            "rtf": _ls(agg.rtf),
             "per_request": per_request,
         }
 

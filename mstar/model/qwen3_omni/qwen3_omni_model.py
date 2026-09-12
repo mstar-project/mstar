@@ -48,6 +48,8 @@ from mstar.engine.resources import (
     NodeResourceSpec,
     PositionConfig,
     PositionSpec,
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
@@ -65,7 +67,9 @@ from mstar.model.multimodal import (
     prefill_plan,
     split_around_spans,
 )
+from mstar.model.qwen3_omni.components.audio_encoder import AUT_ATTN
 from mstar.model.qwen3_omni.components.talker import Qwen3OmniCodePredictor
+from mstar.model.qwen3_omni.components.vision_encoder import QWEN_VIT_ATTN
 from mstar.model.qwen3_omni.config import (
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
@@ -84,6 +88,48 @@ from mstar.streaming.topology import Connection, PartitionTopology, StreamingGra
 
 logger = logging.getLogger(__name__)
 
+
+def gpu_log_mel(waveform, mel_filters, window, n_fft, hop):
+    """GPU log-mel matching HF ``WhisperFeatureExtractor._np_extract_fbank_features``.
+
+    ``waveform`` (any 1-D-reshapable tensor) -> ``(n_mel, T)`` float32 on the input
+    device, ``T = floor(len/hop)`` (== HF's valid, un-padded frame count). Same hann
+    window (periodic), center+reflect STFT, power spectrogram, drop-last-frame, log10,
+    per-clip max-8 clamp, and (x+4)/4 normalization. Module-level so the parity test
+    (test_qwen3_omni_gpu_mel_parity.py) guards the exact production transform.
+    """
+    wav = waveform.reshape(-1)
+    stft = torch.stft(wav, n_fft=n_fft, hop_length=hop, window=window,
+                      center=True, pad_mode="reflect", return_complex=True)  # (n_freq, T+1)
+    mag = stft[..., :-1].abs().pow(2)                 # drop last frame -> (n_freq, T)
+    mel = mel_filters.T @ mag                         # (n_mel, T)
+    log = torch.clamp(mel, min=1e-10).log10()
+    log = torch.maximum(log, log.max() - 8.0)
+    log = (log + 4.0) / 4.0
+    return log.to(torch.float32)
+
+
+def _hf_encoder_attn_impl() -> str:
+    """Pick the attention implementation for the HF-wrapper encoder fallback.
+
+    The HF ``Qwen3OmniMoe{Audio,Vision}Encoder`` classes hard-fail at init if
+    asked for ``flash_attention_2`` without the ``flash_attn`` package present
+    (transformers raises ImportError rather than degrading). The native encoder
+    path already degrades gracefully to torch SDPA when flash_attn is missing
+    (see bagel vit_encoder), so the HF path must do the same to keep both
+    variants benchmarkable on the *same* hardware footing. We only request FA2
+    when flash_attn actually imports.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("flash_attn") is not None:
+        return "flash_attention_2"
+    logger.warning(
+        "flash_attn is not available; HF-wrapper encoders will fall back to "
+        "torch SDPA (slower than FA2 varlen, but matches the native path's "
+        "fallback so the M*-old vs M*-new comparison stays on equal footing)."
+    )
+    return "sdpa"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -103,6 +149,133 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
         logger.warning("Error downloading from HuggingFace: %s", str(e))
         return repo_id
     return str(Path(local_dir))
+
+
+# Device-agnostic port of HF's Qwen2VLImageProcessor: same torchvision bicubic
+# resize in the same order, so grid_thw is bit-exact and pixel_values match HF to
+# cos>0.9999 (test_qwen3_omni_image_parity). Measured against the HF processor:
+# 6.9 -> 1.3 ms at 512x512 and 16.7 -> 6.0 ms at 1024x768 on CPU, 0.26 / 0.27 ms on
+# an H200. data_worker loads images on CPU, so only the CPU column applies today.
+
+
+def _image_preprocess_gpu(img: "torch.Tensor", **kwargs):
+    """``_image_preprocess`` on CUDA, wherever the input happens to live.
+
+    The core runs on the input's own device; data_worker loads on CPU, so callers
+    that want the GPU say so explicitly here rather than the core guessing.
+    """
+    return _image_preprocess(img.to("cuda"), **kwargs)
+
+
+def _smart_resize(
+    height: int,
+    width: int,
+    factor: int,
+    min_pixels: int,
+    max_pixels: int,
+) -> tuple[int, int]:
+    """Port of HF ``smart_resize`` (Qwen2VLImageProcessor).  Pure python ints."""
+    import math
+
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(
+            "absolute aspect ratio must be smaller than 200, got "
+            f"{max(height, width) / min(height, width)}"
+        )
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar
+
+
+def _image_preprocess(
+    img: "torch.Tensor",
+    *,
+    patch_size: int,
+    temporal_patch_size: int,
+    merge_size: int,
+    min_pixels: int,
+    max_pixels: int,
+    image_mean,
+    image_std,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Resize + rescale + normalize + patchify a single image on its device.
+
+    ``img`` is a (C, H, W) tensor, float in [0, 1] (as produced by data_worker,
+    which loads on CPU) or uint8 in [0, 255]. Every op runs on the input's own
+    device, so this is CPU today and needs no change to run on an accelerator
+    once one hands it a device tensor.  Returns ``(pixel_values, grid_thw)``
+    matching HF's ``Qwen2VLImageProcessor`` output for one image:
+    ``pixel_values`` is 2-D ``(grid_h*grid_w, C*temporal*patch*patch)`` and
+    ``grid_thw`` is ``(1, 3)`` long ``[[1, grid_h, grid_w]]``.
+    """
+    from torchvision.transforms.v2.functional import InterpolationMode
+    from torchvision.transforms.v2.functional import resize as tv_resize
+
+    # Normalise layout to (C, H, W) and dtype to uint8 in [0, 255], exactly as
+    # the CPU path does before handing the array to HF (which then casts to
+    # uint8 -> tvF.resize).
+    if img.dim() == 3 and img.shape[-1] in (1, 3) and img.shape[0] not in (1, 3):
+        img = img.permute(2, 0, 1)  # HWC -> CHW
+    if img.dtype.is_floating_point:
+        img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
+    else:
+        img_u8 = img.to(torch.uint8)
+    img_u8 = img_u8.contiguous()
+
+    C, H, W = img_u8.shape
+    factor = patch_size * merge_size
+    h_bar, w_bar = _smart_resize(H, W, factor, min_pixels, max_pixels)
+
+    # Resize on-device with the same torchvision kernel HF's fast backend uses
+    # (bicubic + antialias on uint8).
+    resized = tv_resize(
+        img_u8,
+        [h_bar, w_bar],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    )
+
+    # Fused rescale (1/255) + normalize, matching HF's
+    # ``_fuse_mean_std_and_rescale_factor``: mean *= 255, std *= 255, then
+    # (x - mean) / std on the float32 image.
+    dev = resized.device
+    mean_t = torch.as_tensor(image_mean, device=dev, dtype=torch.float32) * 255.0
+    std_t = torch.as_tensor(image_std, device=dev, dtype=torch.float32) * 255.0
+    patches = resized.to(torch.float32)
+    patches = (patches - mean_t[:, None, None]) / std_t[:, None, None]
+    patches = patches.unsqueeze(0)  # (1, C, h_bar, w_bar)
+
+    grid_h, grid_w = h_bar // patch_size, w_bar // patch_size
+    patches = patches.reshape(
+        1,
+        C,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    )
+    # [batch, grid_h/merge, grid_w/merge, merge, merge, channel, patch, patch]
+    patches = patches.permute(0, 2, 5, 3, 6, 1, 4, 7)
+    flatten_patches = (
+        patches.unsqueeze(6)
+        .expand(-1, -1, -1, -1, -1, -1, temporal_patch_size, -1, -1)
+        .reshape(
+            grid_h * grid_w,
+            C * temporal_patch_size * patch_size * patch_size,
+        )
+    )
+    grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+    return flatten_patches, grid_thw
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +320,12 @@ class Qwen3OmniModel(Model):
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
 
+        # Allow yaml model_kwargs / constructor kwargs to toggle native encoders
+        # (e.g. model_kwargs: {native_audio_encoder: true, native_vision_encoder: true}).
+        for _flag in ("native_audio_encoder", "native_vision_encoder"):
+            if _flag in kwargs:
+                setattr(self.config, _flag, bool(kwargs[_flag]))
+
         # Tokenizer (Thinker uses a Qwen-family tokenizer)
         self.tokenizer = AutoTokenizer.from_pretrained(
             local_dir, cache_dir=cache_dir, trust_remote_code=True,
@@ -172,6 +351,10 @@ class Qwen3OmniModel(Model):
         # Lazy submodule cache -- each worker only loads what it needs
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
+        # log-mel state: cached filterbank + window per device, built lazily on
+        # the first audio request.
+        self._gpu_mel_state: dict | None = None
+
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
@@ -191,7 +374,28 @@ class Qwen3OmniModel(Model):
             num_qo_heads=self.config.talker_text.num_attention_heads,
         )
 
+        vision = self.config.vision
+        audio = self.config.audio_encoder
         return [
+            # The encoder towers attend within one packed forward and cache
+            # nothing, so each stands alone. Separate specs, not two labels on
+            # one: the head geometry differs (vision 1152/16, audio 1280/20).
+            RaggedAttentionSpec(
+                resource_key=QWEN_VIT_ATTN, nodes={"Thinker"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=vision.num_heads,
+                    num_kv_heads=vision.num_heads,
+                    head_dim=vision.hidden_size // vision.num_heads,
+                ),
+            ),
+            RaggedAttentionSpec(
+                resource_key=AUT_ATTN, nodes={"Thinker"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=audio.encoder_attention_heads,
+                    num_kv_heads=audio.encoder_attention_heads,
+                    head_dim=audio.d_model // audio.encoder_attention_heads,
+                ),
+            ),
             KVSpec(
                 resource_key=THINKER_KV,
                 nodes={"Thinker"},
@@ -1008,6 +1212,20 @@ class Qwen3OmniModel(Model):
     # Model ABC: prompt processing
     # -----------------------------------------------------------------------
 
+    def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
+        """Keep the decoded image as uint8 instead of the base class's float [0, 1].
+
+        ``_image_preprocess`` resizes on uint8 to match HF's image processor, so the
+        base class's ``float()/255.0`` is converted straight back — two passes over
+        the tensor that cancel, and a 4x larger tensor to carry in between (69 vs
+        17 MiB for a 3000x2000 image). Skipping it is ~35-40% of preprocessing time
+        (1.19 -> 0.75 ms at 512x512, 154 -> 125 ms at 3000x2000). The base class
+        keeps returning float because other models consume that range directly.
+        """
+        import torchvision
+
+        return TensorAndMetadata(torchvision.io.decode_image(filepath).to(device))
+
     def load_video(
         self, filepath: str, device: str
     ) -> TensorAndMetadata:
@@ -1049,6 +1267,44 @@ class Qwen3OmniModel(Model):
                 continue
             specs[modality] = ids
         return specs
+
+    def _audio_mel_gpu(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``_audio_mel`` on CUDA, wherever the input happens to live."""
+        return self._audio_mel(waveform.to("cuda"))
+
+    def _audio_mel(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Log-mel matching HF ``WhisperFeatureExtractor``, on the input's device.
+
+        The HF feature_extractor runs the STFT + mel filterbank + log on the CPU
+        (numpy); for a 30 s clip that is ~tens of ms on the TTFT critical path and
+        is amplified under host-CPU contention (the same poll-loop sensitivity that
+        inflates M*'s TTFT). This computes the identical transform on the GPU.
+
+        Returns ``(input_features (n_mel, T) float32 CPU, audio_seqlen (1,) long)``
+        — byte-compatible with the HF path's per-audio output so everything
+        downstream is unchanged. Numerically matches HF to cos>=0.9999 / max-abs
+        ~1e-5 (test_qwen3_omni_gpu_mel_parity.py): same hann window (periodic),
+        center+reflect STFT, power spectrogram, drop-last-frame, log10, max-8 clamp,
+        (x+4)/4. ``T = floor(len/hop)`` == HF's valid (un-padded) frame count.
+        """
+        fe = self._processor.feature_extractor
+        dev = waveform.device
+        st = self._gpu_mel_state
+        if st is None or st["dev"] != dev:
+            import numpy as np
+            st = {
+                "dev": dev,
+                "filters": torch.tensor(np.asarray(fe.mel_filters),
+                                        dtype=torch.float32, device=dev),  # (n_freq, n_mel)
+                "window": torch.hann_window(fe.n_fft, periodic=True, device=dev),
+                "n_fft": fe.n_fft, "hop": fe.hop_length,
+            }
+            self._gpu_mel_state = st
+        wav = waveform.to(dev, torch.float32)
+        log = gpu_log_mel(wav, st["filters"], st["window"], st["n_fft"], st["hop"])
+        feat = log.cpu()                                  # CPU float32 == HF contract
+        seqlen = torch.tensor([feat.shape[1]], dtype=torch.long)
+        return feat, seqlen
 
     def process_prompt(
         self,
@@ -1094,24 +1350,19 @@ class Qwen3OmniModel(Model):
         raw_audio_inputs = tensors.get("audio_inputs", [])
         raw_video_inputs = tensors.get("video_inputs", [])
 
-        pil_images: list = []
-        for img in raw_image_inputs:
-            # data_worker.py provides images as (C, H, W) float32 in [0, 1]
-            # on the GPU.  HF processors expect PIL/numpy uint8 (H, W, C)
-            # in [0, 255] -- otherwise the default do_rescale=True double-
-            # rescales and the model sees a near-zero (essentially black)
-            # tensor regardless of the actual image content.
-            if img.dtype.is_floating_point:
-                img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
-            else:
-                img_u8 = img
-            if img_u8.dim() == 3 and img_u8.shape[0] in (1, 3):
-                img_u8 = img_u8.permute(1, 2, 0)  # CHW -> HWC
-            pil_images.append(img_u8.cpu().contiguous().numpy())
+        # Image preprocessing runs on the image's own device, so the raw tensors
+        # are kept as-is and never round-trip through CPU/numpy
+        # (see _image_preprocess).
 
+        # Our log-mel runs on the waveform's own device and beats the HF CPU
+        # feature extractor on either (2.1 vs 3.5 ms for a 5 s clip on CPU,
+        # 0.39 ms on an H200), matching it to cos>=0.9999
+        # (test_qwen3_omni_gpu_mel_parity), so it is the only path.
+        _use_mel = self._processor is not None
         np_audios: list = []
-        for waveform in raw_audio_inputs:
-            np_audios.append(waveform.cpu().numpy())
+        if not _use_mel:
+            for waveform in raw_audio_inputs:
+                np_audios.append(waveform.cpu().numpy())
 
         # HF puts modality content INSIDE the user turn, each attachment
         # rendered as ``<|x_start|><|x_pad|><|x_end|>`` at its own place:
@@ -1161,7 +1412,6 @@ class Qwen3OmniModel(Model):
             tokenize=False,
             add_generation_prompt=True,
         )
-
         input_ids = self.tokenizer(text, return_tensors="pt")["input_ids"][0]
         spans = find_media_spans(input_ids, self._placeholder_specs())
         segments = split_around_spans(input_ids, spans)
@@ -1178,33 +1428,49 @@ class Qwen3OmniModel(Model):
 
         # Run image_processor / feature_extractor SEPARATELY for the
         # modality outputs.  These don't touch text_inputs.
-        for img in pil_images:
+        # Each image is processed fully on its own device (no CPU round-trip).
+        for img in raw_image_inputs:
             img_proc = self._processor.image_processor
-            img_out = img_proc(images=[img], return_tensors="pt")
-            result["pixel_values"].append(img_out["pixel_values"])
-            result["image_grid_thw"] += img_out["image_grid_thw"]
+            pv, grid_thw = _image_preprocess_gpu(
+                img,
+                patch_size=img_proc.patch_size,
+                temporal_patch_size=img_proc.temporal_patch_size,
+                merge_size=img_proc.merge_size,
+                min_pixels=img_proc.size["shortest_edge"],
+                max_pixels=img_proc.size["longest_edge"],
+                image_mean=img_proc.image_mean,
+                image_std=img_proc.image_std,
+            )
+            result["pixel_values"].append(pv)
+            result["image_grid_thw"] += list(grid_thw)
 
-        for audio in np_audios:
-            feat_extractor = self._processor.feature_extractor
-            sr = getattr(feat_extractor, "sampling_rate", 16000)
-            aud_out = feat_extractor(
-                audio, sampling_rate=sr,
-                padding=True,
-                truncation=False,
-                return_attention_mask=True,
-                return_tensors="pt"
-            )
-            aud_out["input_features"] = (
-                aud_out["input_features"]
-                .permute(0, 2, 1)[aud_out["attention_mask"].bool()]
-                .permute(1, 0)
-            )
-            result["audio_seqlens"].append(
-                aud_out["attention_mask"].sum(-1).to(torch.long)
-            )
-            result["audio_features"].append(
-                aud_out["input_features"]
-            )
+        if _use_mel:
+            for waveform in raw_audio_inputs:
+                feat, seqlen = self._audio_mel_gpu(waveform)   # (n_mel, T), (1,)
+                result["audio_seqlens"].append(seqlen)
+                result["audio_features"].append(feat)
+        else:
+            for audio in np_audios:
+                feat_extractor = self._processor.feature_extractor
+                sr = getattr(feat_extractor, "sampling_rate", 16000)
+                aud_out = feat_extractor(
+                    audio, sampling_rate=sr,
+                    padding=True,
+                    truncation=False,
+                    return_attention_mask=True,
+                    return_tensors="pt"
+                )
+                aud_out["input_features"] = (
+                    aud_out["input_features"]
+                    .permute(0, 2, 1)[aud_out["attention_mask"].bool()]
+                    .permute(1, 0)
+                )
+                result["audio_seqlens"].append(
+                    aud_out["attention_mask"].sum(-1).to(torch.long)
+                )
+                result["audio_features"].append(
+                    aud_out["input_features"]
+                )
 
         # Video uses the video_processor; left as TODO since our
         # prefill_vision walk doesn't yet handle video frame stacks.
@@ -1547,24 +1813,43 @@ class Qwen3OmniModel(Model):
         )
 
     def _create_audio_encoder_submodule(self, device: str) -> NodeSubmodule:
-        """Load the audio encoder (AuT) from HF weights."""
-        # Reuse HF audio encoder directly (Whisper-style, not perf-critical)
+        """Load the audio encoder (AuT) from HF weights.
+
+        Two paths, selected by ``config.native_audio_encoder``:
+          * native (default on): batched, transformers-decoupled mstar module
+            (``NativeAudioEncoderSubmodule``). Numerically matches HF (fp32
+            exact; bf16 within the parity bar). Throughput gain over the HF
+            wrapper is modest — ~1.2-1.7x in the SDPA microbenchmark, peaking at
+            batch 4-8 (see benchmark/artifacts/README_qwen3_omni_encoders.md);
+            the win is cross-request batching, not a faster attention kernel.
+          * HF wrapper (fallback/reference, kept for one release).
+        """
         from transformers import AutoConfig
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeAudioEncoder,
-        )
 
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
-        # Load config only (no weights)
-        config = AutoConfig.from_pretrained(
-            self.local_dir,
-            trust_remote_code=True,
-        )
-
-        # This should be a Qwen3OmniMoeConfig
+        config = AutoConfig.from_pretrained(self.local_dir, trust_remote_code=True)
         audio_config = config.thinker_config.audio_config
+
+        if getattr(self.config, "native_audio_encoder", False):
+            from mstar.model.qwen3_omni.components.audio_encoder import (
+                NativeQwen3OmniAudioEncoder,
+            )
+            from mstar.model.qwen3_omni.submodules import NativeAudioEncoderSubmodule
+            audio_encoder = NativeQwen3OmniAudioEncoder(audio_config).to(device)
+            load_weights_from_hf_shards(
+                repo_dir=self.local_dir,
+                modules=[ModuleAndPrefix(audio_encoder, prefix="thinker.audio_tower")],
+                device=device,
+            )
+            audio_encoder.eval()
+            return NativeAudioEncoderSubmodule(audio_encoder=audio_encoder, config=self.config)
+
+        # ---- HF-wrapper fallback path ----
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeAudioEncoder,
+        )
 
         # Build the audio encoder from config.
         # IMPORTANT: pass attn_implementation="flash_attention_2" so the
@@ -1574,7 +1859,7 @@ class Qwen3OmniModel(Model):
         # which is significantly slower than FA2's varlen path.
         patch_hf_fa2_int_maxlen()
         audio_encoder = Qwen3OmniMoeAudioEncoder._from_config(
-            audio_config, attn_implementation="flash_attention_2"
+            audio_config, attn_implementation=_hf_encoder_attn_impl()
         )
 
         load_weights_from_hf_shards(
@@ -1588,24 +1873,46 @@ class Qwen3OmniModel(Model):
         return AudioEncoderSubmodule(audio_encoder=audio_encoder, config=self.config)
 
     def _create_vision_encoder_submodule(self, device: str) -> NodeSubmodule:
-        """Load the vision encoder (SigLIP2 ViT) from HF weights."""
-        # Reuse HF vision encoder directly
+        """Load the vision encoder (SigLIP2 ViT) from HF weights.
+
+        Two paths, selected by ``config.native_vision_encoder``:
+          * native (default on): batched, varlen mstar module
+            (``NativeVisionEncoderSubmodule``). Numerically matches HF (fp32
+            exact; bf16 within bar) for the pooler output and every DeepStack
+            level. The large per-image speedup comes almost entirely from
+            computing the patch embed as an ``F.linear`` instead of HF's bf16
+            ``Conv3d`` (kernel==stride), which hits a cuDNN low-precision cliff
+            (~3.3 s/image on H100) — the same swap could in principle be applied
+            to the HF path. Attention is the same ``flash_attn_varlen_func``
+            primitive HF uses, not a shape-specialized kernel.
+          * HF wrapper (fallback/reference, kept for one release).
+        """
         from transformers import AutoConfig
-        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeVisionEncoder,
-        )
 
         from mstar.model.qwen3_omni.components.attention import patch_hf_fa2_int_maxlen
         from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
 
-        # Load full config (no weights)
-        config = AutoConfig.from_pretrained(
-            self.local_dir,
-            trust_remote_code=True,
-        )
-
-        # Extract the vision sub-config
+        config = AutoConfig.from_pretrained(self.local_dir, trust_remote_code=True)
         vision_config = config.thinker_config.vision_config
+
+        if getattr(self.config, "native_vision_encoder", False):
+            from mstar.model.qwen3_omni.components.vision_encoder import (
+                NativeQwen3OmniVisionEncoder,
+            )
+            from mstar.model.qwen3_omni.submodules import NativeVisionEncoderSubmodule
+            vision_encoder = NativeQwen3OmniVisionEncoder(vision_config).to(device)
+            load_weights_from_hf_shards(
+                repo_dir=self.local_dir,
+                modules=[ModuleAndPrefix(vision_encoder, prefix="thinker.visual")],
+                device=device,
+            )
+            vision_encoder.eval()
+            return NativeVisionEncoderSubmodule(vision_encoder=vision_encoder, config=self.config)
+
+        # ---- HF-wrapper fallback path ----
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoeVisionEncoder,
+        )
 
         # Build the vision encoder.
         # CRITICAL: pass attn_implementation="flash_attention_2". Without
@@ -1619,7 +1926,7 @@ class Qwen3OmniModel(Model):
         # per layer handles all frames at once via cu_seqlens.
         patch_hf_fa2_int_maxlen()
         vision_encoder = Qwen3OmniMoeVisionEncoder._from_config(
-            vision_config, attn_implementation="flash_attention_2"
+            vision_config, attn_implementation=_hf_encoder_attn_impl()
         )
 
         load_weights_from_hf_shards(
