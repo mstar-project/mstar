@@ -88,7 +88,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     try:
         result = await serving_chat.create_chat_completion(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
     if request.stream:
         return StreamingResponse(
             result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"}

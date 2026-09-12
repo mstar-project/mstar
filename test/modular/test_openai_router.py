@@ -99,6 +99,23 @@ def test_chat_text(client_and_stub):
     assert stub.last_submit["model_kwargs"]["max_output_tokens"] == 16
 
 
+def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "bagel",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%"}}],
+            }],
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "server_error"
+
+
 def test_chat_audio_output(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "qwen3_omni"

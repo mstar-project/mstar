@@ -1,0 +1,4 @@
+# Carry the default deployment configs into the sdist so a wheel built from it
+# can copy them into mstar/default_configs/ (see setup.py).
+graft configs
+global-exclude __pycache__ *.py[cod]

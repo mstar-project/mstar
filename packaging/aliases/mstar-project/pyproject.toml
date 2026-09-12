@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Alias for the M* engine. Installs the real `m-star` distribution.
+name = "mstar-project"
+version = "0.2.0"
+description = "Alias for the M* multimodal inference engine (installs m-star)."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{name = "mstar-project"}]
+dependencies = ["m-star"]
+
+# Mirror m-star's extras so `mstar-project[bagel]`, `mstar-project[all]`, etc.
+# forward to the real package instead of silently installing the bare engine.
+# Keep in sync with m-star's [project.optional-dependencies].
+[project.optional-dependencies]
+dev = ["m-star[dev]"]
+audio = ["m-star[audio]"]
+dynamo = ["m-star[dynamo]"]
+bagel = ["m-star[bagel]"]
+cosmos3 = ["m-star[cosmos3]"]
+qwen3_omni = ["m-star[qwen3_omni]"]
+qwen3_tts = ["m-star[qwen3_tts]"]
+orpheus = ["m-star[orpheus]"]
+pi05 = ["m-star[pi05]"]
+vjepa2 = ["m-star[vjepa2]"]
+wan22 = ["m-star[wan22]"]
+vjepa2_ac = ["m-star[vjepa2_ac]"]
+asr = ["m-star[asr]"]
+all = ["m-star[all]"]
+
+[project.urls]
+Homepage = "https://github.com/mstar-project/mstar"
+
+[tool.setuptools]
+packages = []

@@ -36,6 +36,9 @@ class ScheduledBatch:
     node_objects: dict[str,GraphNode]
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[str, str] = None
+    # ``ScheduleTPNode.spec_seq`` this batch came off the TP-follow FIFO with,
+    # -1 otherwise. ``split_off_first`` / ``merge`` only ever see -1.
+    tp_seq: int = -1
 
     def merge(self, other: "ScheduledBatch") -> None:
         """Fold ``other``'s requests in, ours first — they have waited longer."""
@@ -179,23 +182,70 @@ class MicroScheduler:
         for rid in message.request_ids:
             self.pending_tp_follow_count[rid] += 1
 
+    # TP-follow FIFO accessors for the follower's async path (head only).
+
+    def peek_tp_follow(self) -> ScheduleTPNode | None:
+        if not self.tp_batches_pending_schedule:
+            return None
+        return self.tp_batches_pending_schedule[0]
+
+    def pop_tp_follow_head(self) -> ScheduleTPNode:
+        # Sole exit for a queued follow batch: every consumer (the serial path
+        # and the async follower's build / drop / void paths) pops here, so the
+        # drain refcount is discharged in one place.
+        message = self.tp_batches_pending_schedule.popleft()
+        for rid in message.request_ids:
+            if rid not in self.pending_tp_follow_count:
+                continue
+            self.pending_tp_follow_count[rid] -= 1
+            if self.pending_tp_follow_count[rid] <= 0:
+                self.pending_tp_follow_count.pop(rid, None)
+        return message
+
+    def pop_ready_rids(
+        self, worker_graphs_manager: WorkerGraphsManager,
+        node_name: str, graph_walk: str, request_ids: list[str],
+    ) -> tuple[dict[str, GraphNode], dict[str, str]] | None:
+        """Pop ``node_name`` for exactly ``request_ids``, all or none.
+        Checked for every rid before anything is popped, so the caller
+        retries later for a partially ready set."""
+        if not request_ids:
+            return {}, {}
+        node_partition = worker_graphs_manager.get_partition_for_node(node_name)
+        wgid = worker_graphs_manager.get_worker_graph_id_for_node(
+            request_ids[0], node_name, graph_walk=graph_walk,
+        )
+        queue = worker_graphs_manager.queues[wgid]
+        for rid in request_ids:
+            # An unknown rid (removed on this rank) counts as not ready.
+            wg = queue.per_request_queues.get(rid)
+            if wg is None or node_name not in wg.ready_node_names:
+                return None
+            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
+            # Engine-level readiness
+            if not self._check_ready(node_name, rid, fwd_info):
+                return None
+
+        node_objects: dict[str, GraphNode] = {}
+        request_to_worker_graph: dict[str, str] = {}
+        for rid in request_ids:
+            popped = queue.pop_ready_nodes(rid, [node_name])
+            if popped:
+                assert len(popped) == 1
+                node_objects[rid] = popped[0]
+                request_to_worker_graph[rid] = wgid
+
+        self.batch_number += 1
+        self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
+        return node_objects, request_to_worker_graph
+
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
-        target_node_name: str | None = None,
-        target_graph_walk: str | None = None,
         exclude_target: tuple[str, str] | None = None,
     ) -> ScheduledBatch | None:
         if len(self.tp_batches_pending_schedule) == 0:
             return
         first_tp_node: ScheduleTPNode = self.tp_batches_pending_schedule[0]
-        # Respect the caller's filters: a targeted call (e.g. the speculation
-        # path asking for one specific node/walk) must not be handed a TP
-        # follower batch for some other node, or the caller will merge those
-        # node objects into a batch labeled with the target's name.
-        if target_node_name is not None and first_tp_node.node_name != target_node_name:
-            return
-        if target_graph_walk is not None and first_tp_node.graph_walk != target_graph_walk:
-            return
         if exclude_target is not None and \
                 (first_tp_node.node_name, first_tp_node.graph_walk) == exclude_target:
             return
@@ -205,53 +255,24 @@ class MicroScheduler:
                     (first_tp_node.node_name, first_tp_node.graph_walk)
                 ):
             return
-        # check if batch is ready
-        node_partition = worker_graphs_manager.get_partition_for_node(first_tp_node.node_name)
-        # Use the leader's graph walk, not this worker's current one: the
-        # follower may lag or lead the leader's partition state.
-        wgid = worker_graphs_manager.get_worker_graph_id_for_node(
-            first_tp_node.request_ids[0], first_tp_node.node_name,
-            graph_walk=first_tp_node.graph_walk,
+        # Check readiness for every rid to pop all-or-none. Use the
+        # leader's graph walk.
+        popped = self.pop_ready_rids(
+            worker_graphs_manager, first_tp_node.node_name,
+            first_tp_node.graph_walk, first_tp_node.request_ids,
         )
-        queue = worker_graphs_manager.queues[wgid]
-        for rid in first_tp_node.request_ids:
-            wg = queue.per_request_queues[rid]
-            if first_tp_node.node_name not in wg.ready_node_names:
-                return
-            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
-            # check if the node is ready on the engine level
-            # (e.g., for AR, whether the kv cache is read in)
-            if not self._check_ready(first_tp_node.node_name, rid, fwd_info):
-                return
+        if popped is None:
+            return
+        node_objects, request_to_worker_graph = popped
 
-        node_objects = {}
-        request_to_worker_graph = {}
-
-        # TODO: this code is also repeated below, should pull into a helper fn
-        for rid in first_tp_node.request_ids:
-            popped = queue.pop_ready_nodes(rid, [first_tp_node.node_name])
-            if popped:
-                assert len(popped) == 1
-                node_objects[rid] = popped[0]
-                request_to_worker_graph[rid] = wgid
-
-        for rid in first_tp_node.request_ids:
-            self.pending_tp_follow_count[rid] -= 1
-            if self.pending_tp_follow_count[rid] <= 0:
-                self.pending_tp_follow_count.pop(rid, None)
-
-        self.batch_number += 1
-        self.node_and_walk_to_last_batch_num[(
-            first_tp_node.node_name, first_tp_node.graph_walk
-        )] = self.batch_number
-
-        self.tp_batches_pending_schedule.popleft()
+        self.pop_tp_follow_head()
 
         return ScheduledBatch(
             node_name=first_tp_node.node_name,
             graph_walk=first_tp_node.graph_walk,
             node_objects=node_objects,
             request_to_worker_graph=request_to_worker_graph,
+            tp_seq=first_tp_node.spec_seq,
         )
 
 
@@ -306,12 +327,12 @@ class MicroScheduler:
         # Rank 0 already committed to this batch and will sit on the collective
         # inside the forward until every follower joins it, so a follower that
         # skipped the batch because one of its rids failed locally would hang
-        # the whole TP group.
-        tp_follow_batch = self._try_schedule_tp_follow(
-            worker_graphs_manager,
-            target_node_name=target_node_name,
-            target_graph_walk=target_graph_walk,
-            exclude_target=exclude_target,
+        # the whole TP group. A popped ScheduleTPNode ha sno re-queue path
+        # and must be submitted unconditionally. So that a targeted call,
+        # (the speculation fresh-rid merge, which may reject what it is
+        # handed) is never served from the FIFO.
+        tp_follow_batch = None if target is not None else self._try_schedule_tp_follow(
+            worker_graphs_manager, exclude_target=exclude_target,
         )
         if tp_follow_batch is None:
             self.num_consec_tp_follower_batches = 0
