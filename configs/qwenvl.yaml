@@ -1,0 +1,12 @@
+model: "qwenvl"
+# PR 0 proves fixed-prompt correctness; it does not reserve the model's full
+# advertised 256K context on one GPU. 128 pages x 128 tokens = 16K resident
+# KV tokens, keeping the 48-layer BF16 cache near 1.5 GiB instead of ~24 GiB.
+max_seq_len: 16384
+kv_cache:
+  max_num_pages: 128
+# PR 0 correctness baseline: keep vision and the language model colocated on
+# one rank. Tensor parallelism is an explicit later acceptance slice.
+node_groups:
+  - node_names: [vision_encoder, LLM]
+    ranks: [0]
