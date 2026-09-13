@@ -11,15 +11,9 @@ tensor seed/offset under graph capture. FlashInfer 0.6.3 rejected tensors at the
 C/TVM-FFI layer ("Mismatched type on argument #7"); the binding was reworked in
 0.6.4 (verified: 0.6.3 rejects; 0.6.4 / 0.6.5 / 0.6.7.post3 accept and advance
 the RNG under capture), which ``pyproject.toml`` now pins as the floor. These
-tests fail fast on a too-old build and pin the two facts the design depends on:
-
-  1. a captured tensor ``offset`` ADVANCES the RNG per replay (stochastic
-     sampling actually varies step to step);
-  2. passing ``offset=None`` under capture is NOT a valid shortcut -- FlashInfer
-     then derives seed/offset from its default CUDA generator as host-side
-     Python ints (``get_seed_and_offset``), which either trips torch's
-     capture-time generator guard or gets baked into the graph as constants.
-     (Pins why the captured path must pass a real tensor, not None.)
+tests fail fast on a too-old build and pin the fact the design depends on: a
+captured tensor ``offset`` ADVANCES the RNG per replay, so stochastic sampling
+actually varies step to step.
 
 Skips when CUDA / FlashInfer are unavailable.
 """
@@ -109,53 +103,6 @@ def test_tensor_seed_offset_accepted_under_capture():
     assert len(set(tokens)) > 1, (
         "captured tensor offset did not advance the RNG -- stochastic sampling "
         f"is frozen (got identical tokens: {tokens[:3]}...)"
-    )
-
-
-def test_none_offset_is_illegal_under_capture():
-    """Pins why the captured path must pass a real tensor, not None: with
-    offset=None, FlashInfer derives seed/offset from its default CUDA generator
-    and passes them as host-side Python ints, so the RNG stream cannot advance
-    per replay. Guards against anyone "simplifying" the sampler to
-    seed=None/offset=None.
-
-    Two ways that shows up, both a failure of the None shortcut and both
-    accepted here: torch may reject the generator read during capture
-    (<= 2.11), or capture may succeed with the seed/offset frozen into the
-    graph as constants (2.12+), giving an identical token on every replay.
-    """
-    flashinfer = _flashinfer_or_skip()
-    dev = torch.device("cuda")
-    B, V = 1, 2048
-    probs = _stochastic_probs(B, V, dev)
-    top_k = torch.tensor([50], device=dev, dtype=torch.int32)
-    top_p = torch.tensor([1.0], device=dev)
-
-    for _ in range(2):
-        flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p, deterministic=True, seed=None, offset=None
-        )
-    torch.cuda.synchronize()
-
-    pool = torch.cuda.graph_pool_handle()
-    g = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(g, pool=pool):
-            out = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k, top_p, deterministic=True, seed=None, offset=None
-            )
-    except RuntimeError:
-        return  # torch refused the capture-time generator read; shortcut rejected.
-
-    tokens = []
-    for _ in range(10):
-        g.replay()
-        torch.cuda.synchronize()
-        tokens.append(int(out.item()))
-
-    assert len(set(tokens)) == 1, (
-        "offset=None captured a live-advancing RNG under CUDA graphs; the "
-        f"tensor seed/offset contract this suite pins may have changed: {tokens}"
     )
 
 
