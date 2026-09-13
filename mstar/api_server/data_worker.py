@@ -30,6 +30,7 @@ from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, ProcessPromptOutput
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
+from mstar.utils import profiler
 from mstar.utils.ipc_format import (
     AbortRequest,
     ConductorMessage,
@@ -115,6 +116,7 @@ class PreprocessWorker:
         tcp_transfer_device="",
         enable_prof: bool=False,
         model_config: dict | None = None,
+        enable_nvtx: bool=False,
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -166,6 +168,7 @@ class PreprocessWorker:
                 model=model,
                 enable_prof=enable_prof,
                 model_config=model_config,
+                enable_nvtx=enable_nvtx,
             )
         )
         self.thread.start()
@@ -331,6 +334,7 @@ class PreprocessWorkerThread:
         model: Model | None = None,
         enable_prof: bool=False,
         model_config: dict | None = None,
+        enable_nvtx: bool=False,
     ):
         # keying a stream needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no stream
@@ -360,6 +364,10 @@ class PreprocessWorkerThread:
         self.device = device
         self.model = model
         self.enable_prof = enable_prof
+        # This thread turns each output tensor into client-ready bytes. At 720p
+        # that is an 11 MiB SHM read plus a postprocess copy per engine step,
+        # downstream of the last worker-side NVTX range.
+        self.enable_nvtx = enable_nvtx
 
         self.in_flight_requests = set()
         self.tensor_uuid_to_metadata_per_request = {}
@@ -692,11 +700,21 @@ class PreprocessWorkerThread:
                             request_id,
                             loop_indices,
                         )
+                        if self.enable_nvtx:
+                            profiler.range_push(f"dataworker.get_tensor.{modality}")
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
+                        if self.enable_nvtx:
+                            profiler.range_pop()
+                            profiler.range_push(f"dataworker.postprocess.{modality}")
                         postprocessed = self.model.postprocess(
                             tensor, modality,
                             request_kwargs=self.request_model_kwargs.get(request_id),
                         )
+                        if self.enable_nvtx:
+                            profiler.range_pop()
+                            profiler.mark(
+                                f"dataworker.postprocessed.bytes[{len(postprocessed)}]"
+                            )
 
                         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                             tensor_info.uuid] or {}
@@ -734,6 +752,8 @@ class PreprocessWorkerThread:
                                     f"expected {expected_bytes} bytes, got {len(postprocessed)}"
                                 )
 
+                        if self.enable_nvtx:
+                            profiler.range_push("dataworker.queue_output")
                         self._queue_completed_output(
                             request_id,
                             sequence,
@@ -744,6 +764,8 @@ class PreprocessWorkerThread:
                                 metadata=chunk_metadata,
                             ),
                         )
+                        if self.enable_nvtx:
+                            profiler.range_pop()
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
