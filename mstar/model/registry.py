@@ -55,12 +55,11 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
-    # Waypoint-1.5-1B (autoregressive video world model).  The key pins the
-    # 720P variant, which is the checkpoint's default `variant`; the 360P
-    # sibling is the same weights under a different latent grid, selected with
-    # `model_kwargs: {variant: waypoint-1.5-1b-360p}`.  The TAEHV decoder lives
-    # in a separate repo (`config.ae_uri`) and is not loaded yet.
-    "waypoint": {"model_path_hf": "Overworld/Waypoint-1.5-1B"},
+    # Waypoint owns a variant -> Hub repository mapping. None is intentional:
+    # it lets WaypointModel distinguish the registry default from an explicit
+    # local path or Hub ID, then select the 720P or 360P repository named by the
+    # YAML `variant`. TAEHV is resolved independently from config.ae_uri.
+    "waypoint": {"model_path_hf": None},
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},

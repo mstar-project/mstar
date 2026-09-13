@@ -66,6 +66,8 @@ from mstar.engine.resources.kv.config import (
     RingKVConfig,
     RingKVLayerConfig,
 )
+from mstar.engine.resources.kv.ring.cache import LayerRingCache
+from mstar.engine.resources.kv.ring.manager import RingPlan
 
 BLOCK = _DEFAULT_SPARSE_BLOCK_SIZE  # 128
 TPF = BLOCK  # one frame per sparse block keeps the geometry readable
@@ -212,6 +214,147 @@ def test_plan_clears_the_inherited_cursors():
     )
     assert manager.default_label == "main"
     assert manager._default_layer_idx is None
+
+
+def test_plan_stages_one_reused_mask_per_geometry_and_slot(monkeypatch):
+    config = RingKVConfig(
+        num_layers=4,
+        num_kv_heads=N_KV_HEADS,
+        head_dim=D_HEAD,
+        num_qo_heads=N_QO_HEADS,
+        tokens_per_frame=TPF,
+        num_worlds=2,
+        layers=(
+            RingKVLayerConfig(4, 4, 1),
+            RingKVLayerConfig(4, 4, 1),
+            RingKVLayerConfig(4, 2, 2),
+            RingKVLayerConfig(4, 2, 2),
+        ),
+    )
+    manager = build_attention(AttnBackend.FLEX, config)
+    ctx = StepContext(
+        request_ids=("r",), graph_walk="rollout", slot=1, capture=False,
+        plan_results={"kv": RingPlan("r", 1, 5)},
+    )
+
+    manager.plan(AttentionStep(), ctx)
+
+    assert manager.needs_token_visibility is False
+    assert len(manager._planned_masks) == 2
+    local = manager._mask_for(1, manager._geometry(config.layers[0]))
+    assert local is manager._mask_for(1, manager._geometry(config.layers[1]))
+    global_mask = manager._mask_for(1, manager._geometry(config.layers[2]))
+    assert global_mask is manager._mask_for(1, manager._geometry(config.layers[3]))
+    assert local is not global_mask
+
+    # One block per frame. World 1 starts after world 0's five-block span.
+    assert local.full_kv_num_blocks.unique().tolist() == [4]
+    assert local.full_kv_indices[0, 0, 0, :4].tolist() == [5, 7, 8, 9]
+    assert global_mask.full_kv_num_blocks.unique().tolist() == [3]
+    assert global_mask.full_kv_indices[0, 0, 0, :3].tolist() == [5, 6, 9]
+
+    addresses = {
+        key: (value.full_kv_num_blocks.data_ptr(), value.full_kv_indices.data_ptr())
+        for key, value in manager._planned_masks.items()
+    }
+    table_addresses = {
+        key: (value[0].data_ptr(), value[1].data_ptr())
+        for key, value in manager._visibility_tables.items()
+    }
+    monkeypatch.setattr(
+        torch,
+        "tensor",
+        lambda *args, **kwargs: pytest.fail(
+            "mask planning must not allocate a new staging tensor"
+        ),
+    )
+    ctx.plan_results["kv"] = RingPlan("r", 1, 6)
+    manager.plan(AttentionStep(), ctx)
+    assert addresses == {
+        key: (value.full_kv_num_blocks.data_ptr(), value.full_kv_indices.data_ptr())
+        for key, value in manager._planned_masks.items()
+    }
+    assert table_addresses == {
+        key: (value[0].data_ptr(), value[1].data_ptr())
+        for key, value in manager._visibility_tables.items()
+    }
+
+
+def test_planned_masks_match_ring_visibility_across_wraps_and_worlds():
+    """The host plan must reproduce the ring's pre-commit visibility exactly.
+
+    This crosses two wraps of both geometries while alternating worlds. It
+    compares against ``LayerRingCache.upsert``'s independently maintained
+    ``written`` state, so a clock, dilation, overwrite, scratch, or world-offset
+    error in the planner cannot satisfy the test by sharing its formula.
+    """
+    layers = (
+        RingKVLayerConfig(ring_frames=4, ring_buckets=4, pinned_dilation=1),
+        RingKVLayerConfig(ring_frames=4, ring_buckets=2, pinned_dilation=2),
+    )
+    config = RingKVConfig(
+        num_layers=len(layers),
+        num_kv_heads=N_KV_HEADS,
+        head_dim=D_HEAD,
+        num_qo_heads=N_QO_HEADS,
+        tokens_per_frame=TPF,
+        num_worlds=2,
+        layers=layers,
+    )
+    manager = build_attention(AttnBackend.FLEX, config)
+    caches = [
+        LayerRingCache(
+            num_worlds=config.num_worlds,
+            n_kv_heads=config.num_kv_heads,
+            ring_frames=layer.ring_frames,
+            ring_buckets=layer.ring_buckets,
+            d_head=config.head_dim,
+            tokens_per_frame=config.tokens_per_frame,
+            pinned_dilation=layer.pinned_dilation,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        for layer in layers
+    ]
+    kv = torch.zeros(2, 1, N_KV_HEADS, TPF, D_HEAD)
+
+    for frame in range(10):
+        for world in (0, 1):
+            expected = []
+            for cache in caches:
+                *_, visible = cache.upsert(
+                    kv,
+                    torch.tensor(frame, dtype=torch.int64),
+                    True,
+                    torch.tensor([world], dtype=torch.int64),
+                )
+                expected.append(
+                    visible.view(-1, BLOCK).all(-1).nonzero().flatten().tolist()
+                )
+
+            ctx = StepContext(
+                request_ids=(f"r{world}",),
+                graph_walk="rollout",
+                slot=0,
+                capture=False,
+                plan_results={"kv": RingPlan(f"r{world}", world, frame)},
+            )
+            manager.plan(AttentionStep(), ctx)
+
+            for layer, expected_blocks in zip(layers, expected, strict=True):
+                mask = manager._mask_for(0, manager._geometry(layer))
+                count = int(mask.full_kv_num_blocks[0, 0, 0])
+                assert mask.full_kv_indices[0, 0, 0, :count].tolist() == expected_blocks
+
+
+def test_capture_plan_requires_preallocated_mask_addresses():
+    manager = build_attention(AttnBackend.FLEX, ring_config())
+    ctx = StepContext(
+        request_ids=("r",), graph_walk="rollout", slot=0, capture=True,
+        plan_results={"kv": RingPlan("r", 0, 0)},
+    )
+    with pytest.raises(RuntimeError, match="not allocated before CUDA graph capture"):
+        manager.plan(AttentionStep(), ctx)
 
 
 # ---------------------------------------------------------------------------

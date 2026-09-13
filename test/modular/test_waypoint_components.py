@@ -95,6 +95,9 @@ def reduced_config(**overrides) -> WaypointConfig:
         "global_window": 32,
         "global_pinned_dilation": 8,
         "n_buttons": 8,
+        # Structural CPU tests use fp32 inputs. Reference-compatible serving is
+        # exercised separately with bf16 tables and scheduler values.
+        "reference_compat": False,
     }
     return WaypointConfig(**{**base, **overrides})
 
@@ -656,7 +659,7 @@ def grid_positions(config: WaypointConfig, frame: int):
 
 
 def test_ortho_rope_angles_match_the_reference_construction_bitwise():
-    config = waypoint_1_5_1b_720p()
+    config = dataclasses.replace(waypoint_1_5_1b_720p(), reference_compat=False)
     module = OrthoRoPEAngles(config)
     x_pos, y_pos, t_pos = grid_positions(config, frame=5)
 

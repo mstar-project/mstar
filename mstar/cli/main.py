@@ -38,6 +38,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
+    "waypoint": "waypoint.yaml",
 }
 
 

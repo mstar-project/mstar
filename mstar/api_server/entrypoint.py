@@ -32,7 +32,10 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action", "scalar", "tensor"})
+SUPPORTED_MODALITIES = frozenset({
+    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
+})
+STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -110,6 +113,10 @@ def _conductor_process_target(
     )
     try:
         conductor.run()
+    except KeyboardInterrupt:
+        # The API parent uses SIGINT for a graceful child shutdown. Treat that
+        # as the normal stop signal after allowing the conductor to unwind.
+        pass
     finally:
         conductor.shutdown()
 
@@ -274,6 +281,15 @@ class APIServer:
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:
                 raise ValueError(f"Unsupported modality: {m!r}")
+        if "video_frame" in input_modalities:
+            raise ValueError("'video_frame' is an output-only modality")
+        streaming_only = STREAMING_ONLY_MODALITIES.intersection(output_modalities)
+        if streaming_only and not streaming:
+            names = ", ".join(sorted(streaming_only))
+            raise ValueError(
+                f"Output modality {names} requires streaming=True; raw frame "
+                "chunks cannot be returned as an aggregated response."
+            )
 
         # Register pending request
         with self.request_lock:
@@ -734,6 +750,16 @@ async def generate(
         raise HTTPException(status_code=503, detail="Server not ready")
 
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
+    streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
+    if streaming_only and not streaming:
+        names = ", ".join(sorted(streaming_only))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Output modality {names} requires streaming=true; raw frame "
+                "chunks cannot be returned as an aggregated response."
+            ),
+        )
 
     # --- save uploaded files, grouped by modality ----------------
     file_paths: dict[str, list[str]] = {}
@@ -776,6 +802,12 @@ async def generate(
             in_mods = [m for m in in_mods if m != "text"]
     else:
         in_mods = [p.modality for p in parts]
+
+    if "video_frame" in in_mods:
+        raise HTTPException(
+            status_code=400,
+            detail="'video_frame' is an output-only modality",
+        )
 
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None

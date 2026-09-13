@@ -130,9 +130,13 @@ class RingKVConfig(KVConfig):
                 f"ring geometry has {len(self.layers)} layers but num_layers is "
                 f"{self.num_layers}; each layer's ring is declared separately."
             )
-        if self.num_worlds < 1:
+        if (
+            not isinstance(self.num_worlds, int)
+            or isinstance(self.num_worlds, bool)
+            or self.num_worlds < 1
+        ):
             raise ValueError(
-                f"num_worlds must be >= 1; got {self.num_worlds}. A node serving "
+                f"num_worlds must be a positive int; got {self.num_worlds!r}. A node serving "
                 "zero worlds refuses every request at admit."
             )
 
@@ -144,12 +148,16 @@ class RingKVConfig(KVConfig):
                 f"got {sorted(kwargs)}"
             )
         if num_worlds is not None:
-            if int(num_worlds) < 1:
+            if (
+                not isinstance(num_worlds, int)
+                or isinstance(num_worlds, bool)
+                or num_worlds < 1
+            ):
                 raise ValueError(
-                    f"num_worlds must be >= 1; got {num_worlds}. A node serving "
+                    f"num_worlds must be a positive int; got {num_worlds!r}. A node serving "
                     "zero worlds refuses every request at admit."
                 )
-            self.num_worlds = int(num_worlds)
+            self.num_worlds = num_worlds
 
 
 @dataclass

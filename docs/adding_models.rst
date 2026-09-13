@@ -265,19 +265,25 @@ The spec types are:
 
    * - Spec
      - What it builds
-   * - ``KVSpec(config=KVConfig(...))``
-     - A paged KV cache. ``KVConfig`` holds ``num_layers``, ``num_kv_heads``,
-       ``head_dim``, ``max_seq_len`` and ``num_qo_heads``. It also holds three fields that
-       a deployment can tune: ``max_num_pages``, ``page_size`` and ``cpu_offload_pages``
-       (the number of pinned host pages used for offload; 0 disables offload).
+   * - ``KVSpec(config=PagedKVConfig(...))``
+     - A paged KV cache. ``KVConfig`` is the abstract base for common model geometry;
+       ``PagedKVConfig`` adds ``max_seq_len`` and the deployment-tunable
+       ``max_num_pages``, ``page_size`` and ``cpu_offload_pages`` fields.
+   * - ``KVSpec(config=RingKVConfig(...))``
+     - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
+       ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_worlds``.
+       Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
-       ``AttnBackend.FLASHINFER`` (the default) or ``AttnBackend.DENSE``.
+       ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE`` or
+       ``AttnBackend.FLEX``. FlashInfer and dense attention require a
+       ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"``.
+       ``"fa3"`` when the FlashInfer backend is selected.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
-     - Attention over a context that is written once and never extended. See
-       `Cross-attention (encoder-decoder models)`_.
+     - Attention over a paged context that is written once and never extended. Only
+       the FlashInfer backend is implemented. See `Cross-attention (encoder-decoder
+       models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
        forward. Nothing is paged, and nothing carries to the next step.
@@ -310,7 +316,7 @@ appears in no spec, so it receives no resources:
 
    # mstar/model/orpheus/orpheus_model.py
    def get_node_resources(self) -> list[NodeResourceSpec]:
-       kv_config = KVConfig(
+       kv_config = PagedKVConfig(
            num_layers=self.config.num_hidden_layers,
            num_kv_heads=self.config.num_key_value_heads,
            head_dim=self.config.head_dim,
@@ -925,6 +931,9 @@ Both types share the base ``CudaGraphConfig`` fields:
   engine's eager batch size for the walk. The default is ``True``, so the engine never
   batches beyond a captured size.
 - ``compile`` runs ``torch.compile`` before capture. The default is ``True``.
+- ``required`` makes every bucket in the config mandatory. If capture fails locally or
+  on another participating rank, warmup raises after rank-wide agreement instead of
+  dropping the bucket and falling back to eager execution. The default is ``False``.
 
 ``BatchedCudaGraphConfig`` also accepts ``total_tokens_multiplier``. Use it when one
 request's step commits KV across several labels that are combined into a single plan, as
@@ -1036,6 +1045,9 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
+- ``required`` makes every declared shape mandatory. If any participating rank cannot
+  capture one, warmup raises instead of leaving that shape on the eager path. The default
+  is ``False``.
 
 **Splitting the declaration.** When a region leases its own slot, exactly one of the two
 declarations must own each resource. The common pattern is for the outer ``declare_step``
@@ -1209,10 +1221,15 @@ that a misspelled setting is never silently ignored:
 
    * - Spec
      - Accepts
-   * - ``KVSpec``
+   * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``
-   * - ``AttentionSpec`` / ``CrossAttentionSpec``
-     - ``backend`` (``flashinfer`` / ``dense``), ``flashinfer_backend``
+   * - ``KVSpec`` with ``RingKVConfig``
+     - ``num_worlds``
+   * - ``AttentionSpec``
+     - ``backend`` (``flashinfer`` / ``dense`` / ``flex``),
+       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
+   * - ``CrossAttentionSpec``
+     - ``backend`` (only ``flashinfer`` is implemented), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
    * - ``RaggedAttentionSpec``
      - ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
@@ -1221,8 +1238,9 @@ that a misspelled setting is never silently ignored:
        not the model.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
-example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``, while
-``configs/cosmos3_nano.yaml`` sets the page count under its KV key.
+example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
+``configs/cosmos3_nano.yaml`` sets the page count under its paged KV key, and
+``configs/waypoint.yaml`` sets the resident world count under its ring KV key.
 
 .. note::
 
