@@ -1,0 +1,36 @@
+# Example add-model instance spec (a TEMPLATE — copy to <model>.toml and edit).
+#
+# The task is described by client-facing MODALITIES, not walks (walks are an
+# mstar implementation detail the agent chooses). Real per-model instances are
+# gitignored (see .gitignore); only this example is tracked. Run one with:
+#   python -m tools.vibesys add-model <model> {show,build-image,build,run}
+#
+# Provide a concrete oracle next to <model>.toml as <model>.reference.py
+# (sample_input / to_request / from_response / load / oracle). See example.reference.py.
+
+[model]
+name = "mymodel"
+hf_id = "org/my-model"               # HF checkpoint (weights + reference impl)
+revision = ""                        # optional: pin a revision
+reference_model = "wan22"            # mstar model to copy STRUCTURE from (wan22, qwen3_omni, orpheus, ...)
+served_model_name = "mymodel"        # the "model" field clients send
+endpoint = "/v1/videos/generations"  # client-facing OpenAI route
+port = 8000
+modality = "video_generation"        # selects the vibeval templates + vibesys --modality
+input_modalities = ["text"]          # what the client sends
+output_modalities = ["video"]        # what the client gets
+accuracy_mode = "strict"             # strict (fidelity vs the reference oracle) | smoke (validity only)
+
+[accuracy]
+compare = "ssim"                     # output-level metric: ssim | audio_mse | cosine | logit_kl | exact_tokens
+tol = 0.25                           # pass if the output is within tol of the reference
+
+[headline]
+metric = "latency_p50_ms"            # reasonable-latency target (not an optimization goal)
+result_arg = "--output-json"
+
+# Optional: point reference.py at the upstream repo to read/derive the architecture.
+# [official_source]
+# repo = "https://github.com/org/my-model"
+# subdir = ""
+# revision = ""
