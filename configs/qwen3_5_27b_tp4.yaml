@@ -1,0 +1,12 @@
+model: "qwen3_5_27b"
+max_seq_len: 32768
+node_groups:
+  - node_names: [vision_encoder]
+    ranks: [0]
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3]
+    tp_size: 4
+
+resources:
+  gdn_state:
+    max_slots: 96

@@ -60,7 +60,7 @@ HF_MODELS: dict[str, dict] = {
 }
 
 # qwen 3.5 family: dense (MoE TODO)
-qwen_3_5_dense_sizes = ("0.8", "2", "4", "9")
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
 MODEL_REGISTRY.update({
     f"qwen3_5_{size}b": ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel") \
         for size in qwen_3_5_dense_sizes
