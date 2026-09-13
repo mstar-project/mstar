@@ -11,7 +11,6 @@ built here and threaded in as cos/sin.
 """
 
 import logging
-import os
 from typing import Any
 
 import torch

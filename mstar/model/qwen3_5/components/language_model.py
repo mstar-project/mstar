@@ -5,15 +5,33 @@ by the linear layers and the KV cache by the full ones — so each layer is give
 its position among its own kind, not its position in the stack. See
 ``Qwen3_5Config.resource_layer_index``.
 
-TODO: make this TP aware. Involves tricky weight loading for the GDN layers.
+Tensor parallelism shards by head throughout — q-heads for attention, k/v-heads
+for the delta net — and the engine shards the KV cache and the recurrent pool to
+match without being told, so ``get_node_resources`` stays unsharded. The
+checkpoint keeps ``q/k/v`` and ``gate/up`` apart, so every projection maps to
+one parallel linear and the weight loader's names stay one-to-one.
+
+Two head counts are not the q-heads: ``num_key_value_heads`` is 4 or 2, so past
+that degree the K/V heads replicate (see ``KVColumnParallelLinear``), and the
+delta net's are its own (see ``GatedDeltaNet``).
 """
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from mstar.model.components import Attention, DecoderLayer, GatedMLP, RMSNorm
-from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
+from mstar.distributed.communication import CommGroup
+from mstar.distributed.utils import divide
+from mstar.model.components import Attention, DecoderLayer, RMSNorm
+from mstar.model.components.distributed import (
+    ColumnParallelLinear,
+    KVColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
+from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
+from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused
+from mstar.model.components.linear_attn import GDNProjLayout
 from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
@@ -57,22 +75,54 @@ class Qwen3_5Attention(Attention):
 
     def __init__(
         self, *, output_gate: bool = True, rope_cache: RopeCache | None = None,
+        comm_group: CommGroup | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.output_gate = output_gate
         self.rope_cache = rope_cache
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+        tp = comm_group.world_size
         if self.q_norm is not None:
-            # the parent builds Llama-style; Qwen3.5's are Gemma-style too
+            # the parent builds Llama-style; Qwen3.5's are Gemma-style too.
+            # `head_dim` is a head *dim*, so it does not shard.
             eps = self.q_norm.variance_epsilon
             self.q_norm = RMSNorm(self.head_dim, eps=eps, gemma_mode=True)
             self.k_norm = RMSNorm(self.head_dim, eps=eps, gemma_mode=True)
-        if output_gate:
-            self.q_proj = nn.Linear(
-                self.input_hidden_size,
-                self.num_heads * self.head_dim * 2,
-                bias=self.q_proj.bias is not None,
-            )
+
+        qkv_bias = self.q_proj.bias is not None
+        o_bias = self.o_proj.bias is not None
+        self.total_num_heads = self.num_heads
+        self.num_heads = divide(self.num_heads, tp)
+
+        # The gate rides inside each head's block — `[q(head_dim) | gate]` per
+        # head — so sharding *across* heads leaves it intact and this is an
+        # ordinary column shard at double width.
+        self.q_proj = ColumnParallelLinear(
+            comm_group=comm_group, input_size=self.input_hidden_size,
+            output_size=self.total_num_heads * self.head_dim * (2 if output_gate else 1),
+            bias=qkv_bias,
+        )
+        self.k_proj = KVColumnParallelLinear(
+            comm_group=comm_group, input_size=self.input_hidden_size,
+            head_size=self.head_dim, total_num_kv_heads=self.num_kv_heads,
+            bias=qkv_bias,
+        )
+        self.v_proj = KVColumnParallelLinear(
+            comm_group=comm_group, input_size=self.input_hidden_size,
+            head_size=self.head_dim, total_num_kv_heads=self.num_kv_heads,
+            bias=qkv_bias,
+        )
+        self.total_num_kv_heads = self.num_kv_heads
+        self.num_kv_heads = self.k_proj.num_kv_heads
+        self.o_proj = RowParallelLinear(
+            comm_group=comm_group,
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=self.input_hidden_size, bias=o_bias,
+            input_is_parallel=True, reduce_results=True,
+        )
 
     def _apply_rope(self, q, k, label):
         """Interleaved 3D MRoPE over the partial rotary dim.
@@ -122,17 +172,22 @@ def _norm(config: Qwen3_5Config) -> RMSNorm:
     return RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma_mode=True)
 
 
-def _build_mlp(config: Qwen3_5Config) -> nn.Module:
-    return GatedMLP(
+def _build_mlp(config: Qwen3_5Config, comm_group: CommGroup) -> nn.Module:
+    # Unfused, so `gate_proj` / `up_proj` keep the checkpoint's own names and
+    # the weight loader needs no stacked-shard rules.
+    return ParallelGatedMLPUnfused(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
+        comm_group=comm_group,
         activation="silu",
     )
 
 
-def _build_linear_attn_layer(config: Qwen3_5Config) -> DecoderLayer:
+def _build_linear_attn_layer(
+    config: Qwen3_5Config, comm_group: CommGroup,
+) -> DecoderLayer:
     return DecoderLayer(
-        self_attn=GatedDeltaNet(
+        self_attn=ParallelGatedDeltaNet(
             hidden_size=config.hidden_size,
             num_k_heads=config.linear_num_key_heads,
             num_v_heads=config.linear_num_value_heads,
@@ -143,15 +198,16 @@ def _build_linear_attn_layer(config: Qwen3_5Config) -> DecoderLayer:
             rms_norm_eps=config.rms_norm_eps,
             linear_attn_key=LINEAR_ATTN,
             state_key=GDN_STATE,
+            comm_group=comm_group,
         ),
-        mlp=_build_mlp(config),
+        mlp=_build_mlp(config, comm_group),
         input_layernorm=_norm(config),
         post_attention_layernorm=_norm(config),
     )
 
 
 def _build_full_attn_layer(
-    config: Qwen3_5Config, rope_cache: RopeCache,
+    config: Qwen3_5Config, rope_cache: RopeCache, comm_group: CommGroup,
 ) -> DecoderLayer:
     return DecoderLayer(
         self_attn=Qwen3_5Attention(
@@ -167,23 +223,31 @@ def _build_full_attn_layer(
             attn_key=ATTN,
             kv_key=KV_CACHE,
             pos_key=ROPE,
+            comm_group=comm_group,
         ),
-        mlp=_build_mlp(config),
+        mlp=_build_mlp(config, comm_group),
         input_layernorm=_norm(config),
         post_attention_layernorm=_norm(config),
     )
 
 
 class Qwen3_5LanguageModel(nn.Module):
-    def __init__(self, config: Qwen3_5Config):
+    def __init__(
+        self, config: Qwen3_5Config, comm_group: CommGroup | None = None,
+    ):
         super().__init__()
         self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size, comm_group=comm_group,
+        )
         self.rope_cache = RopeCache()
         self.layers = nn.ModuleList(
-            _build_linear_attn_layer(config)
+            _build_linear_attn_layer(config, comm_group)
             if kind == LINEAR_ATTENTION
-            else _build_full_attn_layer(config, self.rope_cache)
+            else _build_full_attn_layer(config, self.rope_cache, comm_group)
             for kind in config.layer_types
         )
         self.register_buffer(
@@ -236,11 +300,23 @@ class Qwen3_5LanguageModel(nn.Module):
 
 
 class Qwen3_5ForCausalLM(nn.Module):
-    def __init__(self, config: Qwen3_5Config):
+    def __init__(
+        self, config: Qwen3_5Config, comm_group: CommGroup | None = None,
+    ):
         super().__init__()
         self.config = config
-        self.model = Qwen3_5LanguageModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model = Qwen3_5LanguageModel(config, comm_group)
+        # All-gathers the vocab before returning, so the sampler stays
+        # vocab-oblivious. Its shard is `[vocab/tp, hidden]`, the same shape
+        # the vocab-parallel embedding holds — which is what lets the tie
+        # below keep working per rank.
+        self.lm_head = ColumnParallelLinear(
+            comm_group=self.model.comm_group,
+            input_size=config.hidden_size,
+            output_size=config.vocab_size,
+            bias=False,
+            gather_output=True,
+        )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 

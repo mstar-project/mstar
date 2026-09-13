@@ -17,6 +17,11 @@ that is what ``_project_fused`` does, and it is also why the fused layout needs
 a weight loader of its own under tensor parallelism.
 
 Everything downstream of the flat ``[q|k|v]`` is shared between the two.
+
+Head counts here are whatever the caller passes. ``ParallelGatedDeltaNet`` in
+``components/distributed`` passes one rank's share and swaps the projections,
+so this module stays free of any distributed import — the same direction the
+rest of ``components`` runs in.
 """
 from __future__ import annotations
 
@@ -59,11 +64,11 @@ class GatedDeltaNet(nn.Module):
         self.pool = None
 
         self.hidden_size = hidden_size
+        self.layout = layout
         self.num_k_heads = num_k_heads
         self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.layout = layout
 
         self.key_dim = num_k_heads * head_k_dim
         self.value_dim = num_v_heads * head_v_dim
@@ -88,12 +93,30 @@ class GatedDeltaNet(nn.Module):
             groups=self.conv_dim, bias=conv_bias,
         )
         # fp32 in the checkpoint, and the kernels require it
-        self.A_log = nn.Parameter(torch.zeros(num_v_heads, dtype=torch.float32))
-        self.dt_bias = nn.Parameter(torch.zeros(num_v_heads, dtype=torch.float32))
+        self.A_log = nn.Parameter(
+            torch.zeros(self.num_v_heads, dtype=torch.float32)
+        )
+        self.dt_bias = nn.Parameter(
+            torch.zeros(self.num_v_heads, dtype=torch.float32)
+        )
 
-        # per head: the checkpoint's weight is [head_v_dim]
+        # per head: the checkpoint's weight is [head_v_dim], so it is the one
+        # thing here that does not shard — a head dim, not a head count
         self.norm = RMSNormGated(head_v_dim, eps=rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=proj_bias)
+        self._attach_weight_loaders()
+
+    # ------------------------------------------------------------------
+    # Weight loading
+    # ------------------------------------------------------------------
+
+    def _attach_weight_loaders(self) -> None:
+        """Hook: bind any loader that is not a parameter's own.
+
+        Nothing to do without sharding — the plain projections load whole.
+        ``_apply`` re-runs it because ``.to(...)`` re-allocates Parameters and
+        drops attribute attachments, and that happens before weights load.
+        """
 
     def _apply(self, fn, recurse: bool = True):
         """Keep the fp32 parameters fp32 through any ``.to(dtype)``.
@@ -112,6 +135,7 @@ class GatedDeltaNet(nn.Module):
         ):
             if param is not None and param.dtype != torch.float32:
                 param.data = param.data.float()
+        self._attach_weight_loaders()
         return out
 
     def bind_resources(self, resources: dict) -> None:

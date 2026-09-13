@@ -29,7 +29,6 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",
     "orpheus": "orpheus_colocated.yaml",
-    "qwen3_5": "qwen3_5.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "pi05": "pi05.yaml",
@@ -40,6 +39,13 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
 }
+
+# qwen 3.5 series (dense)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9")
+DEFAULT_CONFIGS.update({
+    f"qwen3_5_{size}b": f"qwen3_5_{size}b.yaml" \
+        for size in qwen_3_5_dense_sizes
+})
 
 
 def _repo_root() -> Path:

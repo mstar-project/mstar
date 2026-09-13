@@ -290,6 +290,69 @@ class QKVParallelLinear(ColumnParallelLinear):
         dst.copy_(src)
 
 
+class KVColumnParallelLinear(ColumnParallelLinear):
+    """One K or V projection, sharded by head, replicated when heads run out.
+
+    For models whose checkpoint keeps ``k_proj`` / ``v_proj`` apart rather than
+    fused into a QKV block. ``QKVParallelLinear`` already handles this case,
+    but only for the fused layout.
+
+    The replication is not an optimization — it is what keeps the model and the
+    KV cache agreeing. ``KVConfig.shard`` gives every rank one whole head once
+    ``tp_size >= total_num_kv_heads``, so a plain column shard, which would hand
+    each rank a *fraction* of a head, would silently disagree with the cache it
+    writes into.
+    """
+
+    def __init__(
+        self,
+        comm_group: CommGroup,
+        input_size: int,
+        head_size: int,
+        total_num_kv_heads: int,
+        bias: bool = False,
+        dtype: torch.dtype | None = None,
+    ):
+        tp_size = comm_group.world_size
+        self.head_size = head_size
+        self.total_num_kv_heads = total_num_kv_heads
+        if tp_size >= total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(tp_size, total_num_kv_heads)
+        else:
+            self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+            self.num_kv_head_replicas = 1
+        super().__init__(
+            comm_group=comm_group,
+            input_size=input_size,
+            # so the parent's `divide` lands on this rank's real head count
+            output_size=self.num_kv_heads * head_size * tp_size,
+            bias=bias,
+            dtype=dtype,
+        )
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | str | None = None,
+    ):
+        assert loaded_shard_id is None
+        per_partition = self.num_kv_heads * self.head_size
+        # ranks sharing a head read the same slice
+        index = (
+            self.tp_rank // self.num_kv_head_replicas
+            if self.num_kv_head_replicas > 1
+            else self.tp_rank
+        )
+        shard = loaded_weight.narrow(0, index * per_partition, per_partition)
+        assert param.data.shape == shard.shape, (
+            f"weight_loader shape mismatch: param {tuple(param.data.shape)} "
+            f"vs shard {tuple(shard.shape)}"
+        )
+        param.data.copy_(shard)
+
+
 class RowParallelLinear(nn.Module):
     """Linear layer with row parallelism.
 

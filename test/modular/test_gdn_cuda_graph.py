@@ -39,7 +39,12 @@ from mstar.engine.resources.recurrent import (
     RecurrentStep,
 )
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
-from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
+from mstar.model.components.distributed import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
+from mstar.model.components.linear_attn import GDNProjLayout
 from mstar.model.components.norm import RMSNorm
 
 GDN_STATE, LINEAR_ATTN = "gdn_state", "linear_attn"
@@ -90,7 +95,7 @@ class Stack(torch.nn.Module):
         super().__init__()
         g, hidden, depth = shape["geometry"], shape["hidden"], shape["num_layers"]
         self.layers = torch.nn.ModuleList(
-            GatedDeltaNet(
+            ParallelGatedDeltaNet(
                 hidden_size=hidden,
                 num_k_heads=g.num_k_heads,
                 num_v_heads=g.num_v_heads,
@@ -107,6 +112,20 @@ class Stack(torch.nn.Module):
         self.norms = torch.nn.ModuleList(
             RMSNorm(hidden, eps=1e-6, gemma_mode=True) for _ in range(depth)
         )
+        # The mixer's projections are tensor-parallel linears: they allocate
+        # with `torch.empty` and expect a checkpoint to fill them, which is
+        # cheap and safe in the engine because the weight loader refuses to
+        # leave a parameter unfilled. Nothing loads one here, so seed them —
+        # unwritten pages read as zeros in a fresh process and as whatever the
+        # last test left once the caching allocator has been used, which is
+        # the difference between this passing alone and failing in a suite.
+        torch.manual_seed(0)
+        for module in self.modules():
+            if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
+                module.weight.data.normal_(0.0, 0.02)
+                if module.bias is not None:
+                    module.bias.data.zero_()
+
         self.to(device=device, dtype=torch.bfloat16)
         self.requires_grad_(False).eval()
         for layer in self.layers:

@@ -10,7 +10,6 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
-    "qwen3_5": ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
@@ -40,9 +39,6 @@ HF_MODELS: dict[str, dict] = {
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
-    # Qwen3.5 dense: hybrid stack, 3 gated-delta-net layers per full-attention
-    # layer. Text-only for now — the vision tower is declared but unbuilt.
-    "qwen3_5": {"model_path_hf": "Qwen/Qwen3.5-4B"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
@@ -62,6 +58,17 @@ HF_MODELS: dict[str, dict] = {
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
 }
+
+# qwen 3.5 family: dense (MoE TODO)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9")
+MODEL_REGISTRY.update({
+    f"qwen3_5_{size}b": ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel") \
+        for size in qwen_3_5_dense_sizes
+})
+HF_MODELS.update({
+    f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
+        for size in qwen_3_5_dense_sizes
+})
 
 
 def get_model_class(name: str) -> type[Model]:

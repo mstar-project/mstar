@@ -11,6 +11,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv.config import KVConfig, KVSpec
 from mstar.engine.resources.linear_attn.config import (
@@ -591,19 +592,27 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
+    def get_default_sharding_config(self) -> ShardingConfig:
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
+        )
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, autocast_dtype)
+        submodule = self._create_submodule(
+            node_name, device, autocast_dtype, tp_group,
+        )
         self._submodule_cache[node_name] = submodule
         return submodule
 
     def _create_submodule(
         self, node_name: str, device: str,
         autocast_dtype: torch.dtype | None = None,
+        tp_group=None,
     ) -> NodeSubmodule | None:
         from mstar.model.qwen3_5.submodules import (
             LLMSubmodule,
@@ -638,7 +647,9 @@ class Qwen3_5DenseModel(Model):
 
         from mstar.model.qwen3_5.weight_loader import load_qwen3_5_weights
 
-        model = self._build(lambda: Qwen3_5ForCausalLM(self.config), dtype, device)
+        model = self._build(
+            lambda: Qwen3_5ForCausalLM(self.config, tp_group), dtype, device,
+        )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)

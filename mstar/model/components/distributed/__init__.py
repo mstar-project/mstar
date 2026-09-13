@@ -17,18 +17,22 @@ from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.model.components.distributed.embedding import VocabParallelEmbedding
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
+    KVColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
+from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 
 __all__ = [
     "ColumnParallelLinear",
+    "KVColumnParallelLinear",
     "MergedColumnParallelLinear",
     "QKVParallelLinear",
     "RowParallelLinear",
     "ParallelAttention",
+    "ParallelGatedDeltaNet",
     "ParallelGatedMLP",
     "VocabParallelEmbedding",
 ]
