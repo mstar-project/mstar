@@ -18,6 +18,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.utils import profiler
 
 logger = logging.getLogger(__name__)
 
@@ -786,7 +787,13 @@ class CudaGraphRunner:
 
     def _replay(self, lease: SlotLease) -> dict:
         slot = self.slot_for(lease)
+        # The launch, not the GPU work: replay is async, so this range measures
+        # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
+        if self._enable_nvtx:
+            profiler.range_push(f"cg.replay.slot[{lease.slot}]")
         slot.graph.replay()
+        if self._enable_nvtx:
+            profiler.range_pop()
         return slot.static_outputs
 
     def run_forward(

@@ -29,3 +29,9 @@ mstar/worker/ASYNC_REDESIGN.md
 # local AI-assistant context (kept local, not published — cf. vllm-omni)
 CLAUDE.md
 AGENTS.md
+.claude_scratch/
+
+# Waypoint port records are release artifacts, even when a developer's shared
+# bare-worktree exclude hides docs/waypoint locally.
+!docs/waypoint/
+!docs/waypoint/**

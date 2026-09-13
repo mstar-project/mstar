@@ -15,6 +15,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
+    "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
 }
 
@@ -54,6 +55,11 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
+    # Waypoint owns a variant -> Hub repository mapping. None is intentional:
+    # it lets WaypointModel distinguish the registry default from an explicit
+    # local path or Hub ID, then select the 720P or 360P repository named by the
+    # YAML `variant`. TAEHV is resolved independently from config.ae_uri.
+    "waypoint": {"model_path_hf": None},
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},

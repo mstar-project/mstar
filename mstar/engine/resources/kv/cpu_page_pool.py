@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
+from mstar.engine.resources.kv.cache import KVCache, PageAllocator, PagedKVConfig
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class CPUPagePool:
 
     def __init__(
         self,
-        config: KVConfig,
+        config: PagedKVConfig,
         kv_cache: KVCache,
         max_cpu_pages: int,
     ):

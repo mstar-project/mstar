@@ -44,10 +44,10 @@ from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConduc
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     RaggedAttentionConfig,
@@ -716,8 +716,8 @@ class BagelModel(Model):
     # (CFG branches), so they share one set of resources.
     _LLM_NODES = frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})
 
-    def _kv_config(self) -> KVConfig:
-        return KVConfig(
+    def _kv_config(self) -> PagedKVConfig:
+        return PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,

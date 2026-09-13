@@ -73,16 +73,21 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+   * - ``.[waypoint]``
+     - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
+       and ``tensordict`` for reference validation. The pinned TAEHV implementation
+       must be installed separately as shown below; keeping its direct URL out of
+       package metadata allows ``m-star`` to be published on PyPI.
    * - ``.[audio]``
      - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
    * - ``.[all]``
-     - The union of every model extra above — installs the full runtime for all model
-       families in one shot. Convenient for a machine that serves multiple models; heavier
-       and slower to install than a single family's extra. (Still excludes ``flash-attn`` —
-       see `flash-attn (Qwen3-Omni)`_.)
+     - The union of the index-hosted dependencies from every model extra above.
+       Convenient for a machine that serves multiple models; heavier and slower to
+       install than a single family's extra. It excludes the separately installed
+       TAEHV and ``flash-attn`` packages; see below and `flash-attn (Qwen3-Omni)`_.
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -90,11 +95,33 @@ Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
    uv pip install --torch-backend=auto -e ".[bagel,audio,dev]"
 
+Waypoint's dependencies and pinned TAEHV source are two installs. PyPI and other
+standards-conformant indices reject distributions whose metadata declares a direct-URL
+dependency, so the ``waypoint`` extra intentionally does not name TAEHV. Check the
+installer version before installing its source archive: an old pip may report success
+while producing an empty ``UNKNOWN`` wheel.
+
+.. code-block:: bash
+
+   uv --version                 # must be 0.4.0 or newer
+   uv pip install --torch-backend=auto -e ".[waypoint]"
+   uv pip install --no-deps \
+     "taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip"
+
+Or, in an existing Python 3.12 environment:
+
+.. code-block:: bash
+
+   python -m pip install --upgrade "pip>=24.3"
+   python -m pip install -e ".[waypoint]"
+   python -m pip install --no-deps \
+     "taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip"
+
 .. tip::
 
-   If you're just getting started or have the disk/time to spare, ``.[all]`` is the
-   recommended install — it pulls every model family's runtime so any model works out of
-   the box, with no need to track which extra goes with which model:
+   If you're just getting started or have the disk/time to spare, ``.[all]`` installs all
+   index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
+   command above, and Qwen3-Omni still needs ``flash-attn``:
 
    .. code-block:: bash
 

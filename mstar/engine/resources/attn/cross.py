@@ -20,7 +20,7 @@ from mstar.engine.resources.base import (
     CGSlotKey,
     EngineResourceInfo,
 )
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     KVPlanOutputs,
@@ -81,7 +81,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         context_label: str,
         device: torch.device,
         dtype: torch.dtype,
-        kv_config: KVConfig,
+        kv_config: PagedKVConfig,
         backend: str = "auto",
     ):
         self._kv_cache_name = kv_cache
@@ -301,7 +301,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         assert len(all_pages) <= self._kv_config.max_num_pages, (
             f"cross attention plan {plan_label!r} indexes {len(all_pages)} "
             f"pages but the context cache holds {self._kv_config.max_num_pages}; "
-            "raise max_num_pages on the context cache's KVConfig"
+            "raise max_num_pages on the context cache's PagedKVConfig"
         )
 
         return PagedIndptrs(

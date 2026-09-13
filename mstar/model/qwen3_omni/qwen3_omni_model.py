@@ -43,9 +43,9 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -176,14 +176,14 @@ class Qwen3OmniModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        thinker_kv = KVConfig(
+        thinker_kv = PagedKVConfig(
             num_layers=self.config.thinker_text.num_hidden_layers,
             num_kv_heads=self.config.thinker_text.num_key_value_heads,
             head_dim=self.config.thinker_head_dim,
             max_seq_len=self.config.thinker_text.max_position_embeddings,
             num_qo_heads=self.config.thinker_text.num_attention_heads,
         )
-        talker_kv = KVConfig(
+        talker_kv = PagedKVConfig(
             num_layers=self.config.talker_text.num_hidden_layers,
             num_kv_heads=self.config.talker_text.num_key_value_heads,
             head_dim=self.config.talker_head_dim,

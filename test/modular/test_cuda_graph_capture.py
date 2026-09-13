@@ -23,9 +23,15 @@ import torch
 from mstar.engine.cuda_graph_runner import CudaGraphRunner
 from mstar.engine.resources import BucketKey, CGSlotSpec
 
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="capture allocates a graph pool"
-)
+
+@pytest.fixture(autouse=True)
+def fake_cuda_runtime(monkeypatch):
+    """The only real CUDA calls on this path are the graph pool handle and the
+    memory readings around it; `_FakeRunner` stands in for the capture itself.
+    Stubbing them keeps these policy tests running where there is no GPU."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda.graphs, "graph_pool_handle", lambda: object())
 
 
 class _Group:
@@ -57,7 +63,8 @@ class _FakeRunner:
         self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
         peer_flags: list[bool] | None = None,
     ):
-        self._device = torch.device("cuda")
+        # only carries the rank-agreement flag vector; nothing is captured here
+        self._device = torch.device("cpu")
         self._submodule_name = "node"
         self._num_slots = num_slots
         self._specs = specs
@@ -106,7 +113,6 @@ def _specs(walks=("decode",), num_slots=2):
     return out
 
 
-@requires_cuda
 def test_a_fully_captured_bucket_registers_every_slot_in_index_order():
     runner = _FakeRunner(_specs())
 
@@ -118,7 +124,6 @@ def test_a_fully_captured_bucket_registers_every_slot_in_index_order():
     )
 
 
-@requires_cuda
 def test_a_bucket_missing_a_slot_is_dropped_whole():
     """The regression: slot 0 failing used to leave the bucket registered with
     slot 1's graph sitting at index 0, and only one slot to double-buffer on."""
@@ -129,7 +134,6 @@ def test_a_bucket_missing_a_slot_is_dropped_whole():
     assert runner._buckets == {}, "a half-captured bucket must not be usable"
 
 
-@requires_cuda
 def test_one_bucket_failing_does_not_take_the_others_with_it():
     runner = _FakeRunner(
         _specs(walks=("decode", "prefill")), fail={("decode", 1)},
@@ -142,7 +146,6 @@ def test_one_bucket_failing_does_not_take_the_others_with_it():
     assert bucket.slots == ["prefill:slot0", "prefill:slot1"]
 
 
-@requires_cuda
 def test_every_rank_barriers_once_per_spec_whatever_happens():
     """Capture can fail on one rank and not another; if the failing rank
     barriered fewer times the others would hang waiting for it."""
@@ -157,7 +160,6 @@ def test_every_rank_barriers_once_per_spec_whatever_happens():
     ))
 
 
-@requires_cuda
 def test_a_bucket_another_rank_dropped_is_dropped_here_too():
     """Capture failure is per-rank. If this rank kept a bucket the peer
     dropped, it would lease and replay while the peer ran eager — and a
@@ -173,7 +175,6 @@ def test_a_bucket_another_rank_dropped_is_dropped_here_too():
     assert [key.graph_walk for key in runner._buckets] == ["decode"]
 
 
-@requires_cuda
 def test_a_bucket_this_rank_dropped_stays_dropped_when_the_peer_kept_it():
     runner = _FakeRunner(
         _specs(walks=("decode", "prefill")),
@@ -186,7 +187,6 @@ def test_a_bucket_this_rank_dropped_stays_dropped_when_the_peer_kept_it():
     assert [key.graph_walk for key in runner._buckets] == ["prefill"]
 
 
-@requires_cuda
 def test_ranks_agree_on_the_full_candidate_list_not_just_local_successes():
     """The reduced vector is ordered by the configs, which every rank shares,
     so a rank that captured nothing still lines its flags up with the rest."""
@@ -201,7 +201,6 @@ def test_ranks_agree_on_the_full_candidate_list_not_just_local_successes():
     assert runner._buckets == {}
 
 
-@requires_cuda
 def test_capture_hands_the_padding_rows_pages_back():
     """A capture gives its padding rows real spans; a replay pads with
     zero-length ones, so that storage is residue the traffic should get."""
@@ -212,7 +211,6 @@ def test_capture_hands_the_padding_rows_pages_back():
     assert runner._dummy_rows.released
 
 
-@requires_cuda
 def test_single_slot_runners_still_register():
     """No pre-planning resource means one slot per bucket, which is complete."""
     runner = _FakeRunner(_specs(num_slots=1), num_slots=1)

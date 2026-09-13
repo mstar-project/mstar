@@ -1,0 +1,62 @@
+{
+  "checkpoint": "/tmp/waypoint-hf-cache/models--Overworld--Waypoint-1.5-1B-360P/snapshots/35acd20e649fe79c1c1002df456696408547202d",
+  "checkpoint_revision": "35acd20e649fe79c1c1002df456696408547202d",
+  "checkpoint_sha256": "a2cdccb5eb074afc48a1c99b0868cebef38cf944d4b366aed2a866f50c8101d9",
+  "controls": "canonical 40-action record_oracle.py sequence",
+  "decoded_rgb_frames_including_internal_prime": 164,
+  "denoise_and_commit_passes": 201,
+  "derived_tables": [
+    "denoise_step_emb.freq",
+    "rope_angles.xy",
+    "rope_angles.inv_t"
+  ],
+  "device": "NVIDIA H100 80GB HBM3",
+  "device_index_visible": 0,
+  "dtype": "torch.bfloat16",
+  "elapsed_pytest_seconds": 37.79,
+  "generated_latent_frames": 40,
+  "maximum_absolute_differences": {
+    "conditioner": 0.0,
+    "decoder_histories": 0.0,
+    "encoder": 0.0,
+    "latents": 0.0,
+    "passes": 0.0,
+    "pixels": 0,
+    "ring_kv": 0.0,
+    "stages": 0.0,
+    "tables": 0.0
+  },
+  "noise": {
+    "seed": 42,
+    "source": "seeded CPU fp32 then cast to CUDA BF16"
+  },
+  "python": "3.10.12",
+  "reference_compat": true,
+  "reference_source": "/mnt/storage/garv901/waypoint-1.5-1B/world_engine",
+  "rollout_latent_frames": 41,
+  "scheduler_sigmas": [
+    1.0,
+    0.9,
+    0.75,
+    0.3,
+    0.0
+  ],
+  "scope": {
+    "attention": "shared mstar flex_attention_masked kernel",
+    "dit_execution": "eager on both sides",
+    "reference": "live same-process world_engine",
+    "stored_oracle": "not used; existing artifacts belong to the 720p checkpoint",
+    "taehv": "upstream streaming state versus functional explicit nine-history path"
+  },
+  "seed_sha256": "c61c9393311d7281f793d86329dca343e12c93bf0409980a186eb39269cf6862",
+  "stage_probes": {
+    "sigmas": [
+      1.0,
+      0.0
+    ],
+    "stages_per_probe": 30
+  },
+  "status": "passed",
+  "torch": "2.9.1+cu128",
+  "variant": "waypoint-1.5-1b-360p"
+}

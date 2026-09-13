@@ -28,11 +28,15 @@ from mstar.model.multimodal import PromptPart
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
+from mstar.utils import profiler
 from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action", "scalar", "tensor"})
+SUPPORTED_MODALITIES = frozenset({
+    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
+})
+STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -110,6 +114,10 @@ def _conductor_process_target(
     )
     try:
         conductor.run()
+    except KeyboardInterrupt:
+        # The API parent uses SIGINT for a graceful child shutdown. Treat that
+        # as the normal stop signal after allowing the conductor to unwind.
+        pass
     finally:
         conductor.shutdown()
 
@@ -156,6 +164,15 @@ class PendingRequest:
     error_status: int = 500
 
 
+def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
+    """Serialize one result chunk as an NDJSON line."""
+    return json.dumps({
+        "modality": chunk.modality,
+        "data": base64.b64encode(chunk.data).decode("ascii"),
+        "metadata": chunk.metadata,
+    }) + "\n"
+
+
 class APIServer:
     """Accept multimodal requests, forward to conductor, collect results."""
 
@@ -171,10 +188,17 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        enable_nvtx: bool = False,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
+
+        # The result-delivery path runs on this process, not the worker's, so its
+        # cost is invisible to worker-side markers. Streaming a 720p chunk means
+        # base64-encoding 11 MiB into 14.7 MiB of ASCII and copying that again
+        # through json.dumps, once per engine step.
+        self.enable_nvtx = enable_nvtx
 
         # Per-request profiling: when enabled, a RequestProfile is collected for
         # each request and pretty-printed when the request finishes. ``log_stats_file``
@@ -195,7 +219,8 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats
+            enable_prof=self.log_stats,
+            enable_nvtx=enable_nvtx,
         )
 
         # Concurrent request tracking
@@ -274,6 +299,15 @@ class APIServer:
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:
                 raise ValueError(f"Unsupported modality: {m!r}")
+        if "video_frame" in input_modalities:
+            raise ValueError("'video_frame' is an output-only modality")
+        streaming_only = STREAMING_ONLY_MODALITIES.intersection(output_modalities)
+        if streaming_only and not streaming:
+            names = ", ".join(sorted(streaming_only))
+            raise ValueError(
+                f"Output modality {names} requires streaming=True; raw frame "
+                "chunks cannot be returned as an aggregated response."
+            )
 
         # Register pending request
         with self.request_lock:
@@ -536,6 +570,8 @@ class APIServer:
                         done = True
 
                 for chunk in new_chunks:
+                    if self.enable_nvtx:
+                        profiler.mark("apiserver.chunk_available")
                     yield chunk
 
                 if done:
@@ -576,15 +612,29 @@ class APIServer:
     async def async_stream_results(self, request_id: str):
         """Yield NDJSON lines as result chunks arrive (``/generate`` format)."""
         async for chunk in self.iter_result_chunks(request_id):
-            yield self._chunk_to_ndjson(chunk)
+            line = self._chunk_to_ndjson(chunk)
+            if self.enable_nvtx:
+                profiler.mark(f"apiserver.yield_line.bytes[{len(line)}]")
+            yield line
 
-    @staticmethod
-    def _chunk_to_ndjson(chunk: ResultChunk) -> str:
-        return json.dumps({
+    def _chunk_to_ndjson(self, chunk: ResultChunk) -> str:
+        if not self.enable_nvtx:
+            return _chunk_to_ndjson_payload(chunk)
+
+        # Split rather than wrapped as one range: the question these markers
+        # answer is which of the two full passes over the payload dominates.
+        profiler.range_push(f"apiserver.b64encode.bytes[{len(chunk.data)}]")
+        encoded = base64.b64encode(chunk.data).decode("ascii")
+        profiler.range_pop()
+
+        profiler.range_push(f"apiserver.json_dumps.chars[{len(encoded)}]")
+        line = json.dumps({
             "modality": chunk.modality,
-            "data": base64.b64encode(chunk.data).decode("ascii"),
+            "data": encoded,
             "metadata": chunk.metadata,
         }) + "\n"
+        profiler.range_pop()
+        return line
 
     # ----------------------------------------------------------
     # Non-streaming helper
@@ -734,6 +784,16 @@ async def generate(
         raise HTTPException(status_code=503, detail="Server not ready")
 
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
+    streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
+    if streaming_only and not streaming:
+        names = ", ".join(sorted(streaming_only))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Output modality {names} requires streaming=true; raw frame "
+                "chunks cannot be returned as an aggregated response."
+            ),
+        )
 
     # --- save uploaded files, grouped by modality ----------------
     file_paths: dict[str, list[str]] = {}
@@ -776,6 +836,12 @@ async def generate(
             in_mods = [m for m in in_mods if m != "text"]
     else:
         in_mods = [p.modality for p in parts]
+
+    if "video_frame" in in_mods:
+        raise HTTPException(
+            status_code=400,
+            detail="'video_frame' is an output-only modality",
+        )
 
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
@@ -961,6 +1027,7 @@ def main(argv: list[str] | None = None):
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
+        enable_nvtx=args.enable_nvtx,
     )
 
     # Spawn conductor in a separate process

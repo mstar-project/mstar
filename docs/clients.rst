@@ -34,7 +34,7 @@ NDJSON stream.
    * - ``output_modalities``
      - ``text``
      - Comma-separated desired outputs (e.g. ``text``, ``image``, ``audio``, ``video``,
-       ``action``).
+       ``video_frame``, ``action``). ``video_frame`` is streaming-only raw RGB24.
    * - ``streaming``
      - ``true``
      - ``true`` → NDJSON stream of chunks; ``false`` → one JSON document.
@@ -121,7 +121,10 @@ Result and event types live in ``mstar.client``:
 - ``AudioBuffer`` — decoded PCM with ``.sample_rate``; ``.to_wav(path)``, ``.to_numpy()``,
   ``len(...)``.
 - Stream events — ``TextChunk(text)``, ``ImageChunk(data)`` (``.save(path)``),
-  ``AudioChunk(pcm, sample_rate)``.
+  ``AudioChunk(pcm, sample_rate)``, and ``VideoFrameChunk(data, metadata)``. A
+  video-frame chunk validates its width, height, fps, pixel format and frame range;
+  ``.to_numpy()`` returns a zero-copy ``[frame_count, height, width, 3]`` uint8 view.
+  Raw ``video_frame`` requests require ``stream=True``.
 
 .. code-block:: python
 
@@ -171,8 +174,10 @@ Endpoints and model coverage:
      - ``bagel``
      - Image editing (image + prompt → image).
 
-Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``) return ``404`` on
-``/v1/*``; use ``/generate`` or the SDK for them.
+Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``, ``waypoint``)
+return ``404`` on ``/v1/*``; use ``/generate`` or the SDK for them. In particular,
+Waypoint emits live RGB frame chunks and is not routed through the encoded-video
+``/v1/videos/generations`` endpoint.
 
 .. code-block:: python
 
