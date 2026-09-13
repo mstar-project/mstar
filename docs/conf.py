@@ -1,19 +1,13 @@
 import os
 import sys
 from datetime import datetime
+from importlib.metadata import version as _pkg_version
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
-try:
-    from mstar import __version__ as package_version
-except Exception:  # noqa: BLE001
-    try:
-        from importlib.metadata import version as _pkg_version
-
-        package_version = _pkg_version("mstar")
-    except Exception:  # noqa: BLE001
-        package_version = "0.0.0"
+# "m-star" is the distribution name whereas "mstar" is the import name.
+package_version = _pkg_version("m-star")
 
 project = "M*"
 author = "M* Team"
