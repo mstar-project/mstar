@@ -28,6 +28,7 @@ from mstar.model.multimodal import PromptPart
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
+from mstar.utils import profiler
 from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,15 @@ class PendingRequest:
     error_status: int = 500
 
 
+def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
+    """Serialize one result chunk as an NDJSON line."""
+    return json.dumps({
+        "modality": chunk.modality,
+        "data": base64.b64encode(chunk.data).decode("ascii"),
+        "metadata": chunk.metadata,
+    }) + "\n"
+
+
 class APIServer:
     """Accept multimodal requests, forward to conductor, collect results."""
 
@@ -178,10 +188,17 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        enable_nvtx: bool = False,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
+
+        # The result-delivery path runs on this process, not the worker's, so its
+        # cost is invisible to worker-side markers. Streaming a 720p chunk means
+        # base64-encoding 11 MiB into 14.7 MiB of ASCII and copying that again
+        # through json.dumps, once per engine step.
+        self.enable_nvtx = enable_nvtx
 
         # Per-request profiling: when enabled, a RequestProfile is collected for
         # each request and pretty-printed when the request finishes. ``log_stats_file``
@@ -202,7 +219,8 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats
+            enable_prof=self.log_stats,
+            enable_nvtx=enable_nvtx,
         )
 
         # Concurrent request tracking
@@ -552,6 +570,8 @@ class APIServer:
                         done = True
 
                 for chunk in new_chunks:
+                    if self.enable_nvtx:
+                        profiler.mark("apiserver.chunk_available")
                     yield chunk
 
                 if done:
@@ -592,15 +612,29 @@ class APIServer:
     async def async_stream_results(self, request_id: str):
         """Yield NDJSON lines as result chunks arrive (``/generate`` format)."""
         async for chunk in self.iter_result_chunks(request_id):
-            yield self._chunk_to_ndjson(chunk)
+            line = self._chunk_to_ndjson(chunk)
+            if self.enable_nvtx:
+                profiler.mark(f"apiserver.yield_line.bytes[{len(line)}]")
+            yield line
 
-    @staticmethod
-    def _chunk_to_ndjson(chunk: ResultChunk) -> str:
-        return json.dumps({
+    def _chunk_to_ndjson(self, chunk: ResultChunk) -> str:
+        if not self.enable_nvtx:
+            return _chunk_to_ndjson_payload(chunk)
+
+        # Split rather than wrapped as one range: the question these markers
+        # answer is which of the two full passes over the payload dominates.
+        profiler.range_push(f"apiserver.b64encode.bytes[{len(chunk.data)}]")
+        encoded = base64.b64encode(chunk.data).decode("ascii")
+        profiler.range_pop()
+
+        profiler.range_push(f"apiserver.json_dumps.chars[{len(encoded)}]")
+        line = json.dumps({
             "modality": chunk.modality,
-            "data": base64.b64encode(chunk.data).decode("ascii"),
+            "data": encoded,
             "metadata": chunk.metadata,
         }) + "\n"
+        profiler.range_pop()
+        return line
 
     # ----------------------------------------------------------
     # Non-streaming helper
@@ -993,6 +1027,7 @@ def main(argv: list[str] | None = None):
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
+        enable_nvtx=args.enable_nvtx,
     )
 
     # Spawn conductor in a separate process

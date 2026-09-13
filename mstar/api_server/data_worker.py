@@ -27,6 +27,7 @@ from mstar.communication.communicator import BaseCommunicator, CommProtocol, mak
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.model.base import Model
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
+from mstar.utils import profiler
 from mstar.utils.ipc_format import (
     AbortRequest,
     ConductorMessage,
@@ -97,7 +98,8 @@ class PreprocessWorker:
         socket_path_prefix: str = "/tmp/mstar",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         tcp_transfer_device="",
-        enable_prof: bool=False
+        enable_prof: bool=False,
+        enable_nvtx: bool=False,
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -145,7 +147,8 @@ class PreprocessWorker:
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
-                enable_prof=enable_prof
+                enable_prof=enable_prof,
+                enable_nvtx=enable_nvtx,
             )
         )
         self.thread.start()
@@ -279,7 +282,8 @@ class PreprocessWorkerThread:
         tensor_manager,
         device: str = "cpu",
         model: Model | None = None,
-        enable_prof: bool=False
+        enable_prof: bool=False,
+        enable_nvtx: bool=False,
     ):
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
@@ -293,6 +297,10 @@ class PreprocessWorkerThread:
         self.device = device
         self.model = model
         self.enable_prof = enable_prof
+        # This thread turns each output tensor into client-ready bytes. At 720p
+        # that is an 11 MiB SHM read plus a postprocess copy per engine step,
+        # downstream of the last worker-side NVTX range.
+        self.enable_nvtx = enable_nvtx
 
         self.tensor_uuid_to_metadata_per_request = {}
         # The request's model_kwargs, kept so output postprocessing can
@@ -573,14 +581,24 @@ class PreprocessWorkerThread:
                             request_id,
                             loop_indices,
                         )
+                        if self.enable_nvtx:
+                            profiler.range_push(f"dataworker.get_tensor.{modality}")
                         tensor = self.tensor_manager.get_tensor(
                             request_id=request_id,
                             uuid=tensor_info.uuid
                         )
+                        if self.enable_nvtx:
+                            profiler.range_pop()
+                            profiler.range_push(f"dataworker.postprocess.{modality}")
                         postprocessed = self.model.postprocess(
                             tensor, modality,
                             request_kwargs=self.request_model_kwargs.get(request_id),
                         )
+                        if self.enable_nvtx:
+                            profiler.range_pop()
+                            profiler.mark(
+                                f"dataworker.postprocessed.bytes[{len(postprocessed)}]"
+                            )
 
                         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                             tensor_info.uuid] or {}
@@ -618,6 +636,8 @@ class PreprocessWorkerThread:
                                     f"expected {expected_bytes} bytes, got {len(postprocessed)}"
                                 )
 
+                        if self.enable_nvtx:
+                            profiler.range_push("dataworker.queue_output")
                         self._queue_completed_output(
                             request_id,
                             sequence,
@@ -628,6 +648,8 @@ class PreprocessWorkerThread:
                                 metadata=chunk_metadata,
                             ),
                         )
+                        if self.enable_nvtx:
+                            profiler.range_pop()
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
