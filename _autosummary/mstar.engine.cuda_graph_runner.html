@@ -562,7 +562,6 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.CAPTURE_BATCH_SIZES"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.CAPTURE_BATCH_SIZES</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.NUM_SLOTS"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.NUM_SLOTS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.NUM_WARMUP"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.NUM_WARMUP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.any_graphs"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.any_graphs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.can_run()</span></code></a></li>
@@ -603,13 +602,13 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.CAPTURE_BATCH_SIZES"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.CAPTURE_BATCH_SIZES</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.NUM_WARMUP"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.NUM_WARMUP</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.SLOT"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.SLOT</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.any_graphs"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.any_graphs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.can_run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_before_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_before_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.prepare_for_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.prepare_for_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.run"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.run()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.set_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.set_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.warmup_and_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.warmup_and_capture()</span></code></a></li>
 </ul>
 </li>
@@ -620,6 +619,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData.shape"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphData.shape</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_inputs"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphData.static_inputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_outputs"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphData.static_outputs</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.bs"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey.bs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.seq_len"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey.seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey.slot</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseOutput"><code class="docutils literal notranslate"><span class="pre">PiecewiseOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -680,7 +685,10 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData" title="mstar.engine.cuda_graph_runner.PiecewiseGraphData"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PiecewiseGraphData</span></code></a>(graph, static_inputs, ...)</p></td>
 <td><p>One captured region, for one (bs, total_tokens) bucket.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.PiecewiseOutput" title="mstar.engine.cuda_graph_runner.PiecewiseOutput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PiecewiseOutput</span></code></a>(outputs, real_len)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey" title="mstar.engine.cuda_graph_runner.PiecewiseGraphKey"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PiecewiseGraphKey</span></code></a>(bs, seq_len, slot)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.PiecewiseOutput" title="mstar.engine.cuda_graph_runner.PiecewiseOutput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PiecewiseOutput</span></code></a>(outputs, real_len)</p></td>
 <td><p>Dict-like view over a captured region's output buffers.</p></td>
 </tr>
 </tbody>
@@ -719,7 +727,7 @@
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">CudaGraphRunner</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">submodule_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">submodule</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resources</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_runner</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_nvtx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#CudaGraphRunner"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">CudaGraphRunner</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">submodule_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">submodule</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resources</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_runner</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_slots</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_nvtx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#CudaGraphRunner"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -731,6 +739,7 @@
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
 <li><p><strong>autocast_dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>joint_comm_group</strong> (<em>JointGroups</em>)</p></li>
+<li><p><strong>num_slots</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>enable_nvtx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
@@ -738,11 +747,6 @@
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.CAPTURE_BATCH_SIZES">
 <span class="sig-name descname"><span class="pre">CAPTURE_BATCH_SIZES</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4,</span> <span class="pre">8,</span> <span class="pre">16,</span> <span class="pre">32,</span> <span class="pre">64]</span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.CAPTURE_BATCH_SIZES" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.NUM_SLOTS">
-<span class="sig-name descname"><span class="pre">NUM_SLOTS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2</span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.NUM_SLOTS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -807,7 +811,7 @@ passes it to <code class="docutils literal notranslate"><span class="pre">prepro
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot">
-<span class="sig-name descname"><span class="pre">lease_slot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cg_key_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#CudaGraphRunner.lease_slot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">lease_slot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cg_key_info</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#CudaGraphRunner.lease_slot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot" title="Link to this definition">#</a></dt>
 <dd><p>Pick the bucket and double-buffer slot an upcoming step replays on.</p>
 <p><code class="docutils literal notranslate"><span class="pre">num_tokens=None</span></code> means the batch’s inputs aren’t built yet, so the
 bucket comes from the batched-capture search instead.</p>
@@ -819,9 +823,9 @@ back so both submissions target the same slot.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>bs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>slot</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>num_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>cg_key_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>slot</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1189,7 +1193,7 @@ replay pads with zero-length rows, so it is capture-time residue.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">PiecewiseCudaGraphRunner</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resources</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_runner</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseCudaGraphRunner"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">PiecewiseCudaGraphRunner</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resources</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_runner</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_slots</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseCudaGraphRunner"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Captures one inner callable of a submodule’s forward as a CUDA graph.</p>
 <p>Where <code class="docutils literal notranslate"><span class="pre">CudaGraphRunner</span></code> replays a whole <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> under engine
@@ -1209,6 +1213,7 @@ and the captured graph reads them at fixed addresses.</p>
 <li><p><strong>step_runner</strong> (<a class="reference internal" href="mstar.engine.resources.runner.html#mstar.engine.resources.runner.StepRunner" title="mstar.engine.resources.runner.StepRunner"><em>StepRunner</em></a>)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
 <li><p><strong>autocast_dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>num_slots</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>joint_comm_group</strong> (<em>JointGroups</em><em> | </em><em>None</em>)</p></li>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
@@ -1222,11 +1227,6 @@ and the captured graph reads them at fixed addresses.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.NUM_WARMUP">
 <span class="sig-name descname"><span class="pre">NUM_WARMUP</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2</span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.NUM_WARMUP" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.SLOT">
-<span class="sig-name descname"><span class="pre">SLOT</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.SLOT" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
@@ -1312,6 +1312,16 @@ is baked into the graph.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.set_slot">
+<span class="sig-name descname"><span class="pre">set_slot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slot</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseCudaGraphRunner.set_slot"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.set_slot" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>slot</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.warmup_and_capture">
 <span class="sig-name descname"><span class="pre">warmup_and_capture</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseCudaGraphRunner.warmup_and_capture"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.warmup_and_capture" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1369,6 +1379,39 @@ is baked into the graph.</p>
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_outputs">
 <span class="sig-name descname"><span class="pre">static_outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><span class="pre">Tensor</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_outputs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseGraphKey">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">PiecewiseGraphKey</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">bs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseGraphKey"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>bs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>slot</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseGraphKey.bs">
+<span class="sig-name descname"><span class="pre">bs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.bs" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseGraphKey.seq_len">
+<span class="sig-name descname"><span class="pre">seq_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.seq_len" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseGraphKey.slot">
+<span class="sig-name descname"><span class="pre">slot</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.slot" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
 
 </dd></dl>
 
@@ -1531,7 +1574,6 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.CAPTURE_BATCH_SIZES"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.CAPTURE_BATCH_SIZES</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.NUM_SLOTS"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.NUM_SLOTS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.NUM_WARMUP"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.NUM_WARMUP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.any_graphs"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.any_graphs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.can_run()</span></code></a></li>
@@ -1572,13 +1614,13 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.CAPTURE_BATCH_SIZES"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.CAPTURE_BATCH_SIZES</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.NUM_WARMUP"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.NUM_WARMUP</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.SLOT"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.SLOT</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.any_graphs"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.any_graphs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.can_run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_before_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_before_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.prepare_for_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.prepare_for_capture()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.run"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.run()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.set_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.set_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.warmup_and_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.warmup_and_capture()</span></code></a></li>
 </ul>
 </li>
@@ -1589,6 +1631,12 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData.shape"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphData.shape</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_inputs"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphData.static_inputs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphData.static_outputs"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphData.static_outputs</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.bs"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey.bs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.seq_len"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey.seq_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseGraphKey.slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseGraphKey.slot</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseOutput"><code class="docutils literal notranslate"><span class="pre">PiecewiseOutput</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

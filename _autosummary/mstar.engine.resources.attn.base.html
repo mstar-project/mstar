@@ -559,6 +559,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.requires_kv_write"><code class="docutils literal notranslate"><span class="pre">AttentionManager.requires_kv_write</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey.is_decode"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey.is_decode</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey.label"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey.label</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey.slot"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey.slot</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.PlanCacheKey"><code class="docutils literal notranslate"><span class="pre">PlanCacheKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.PlanCacheKey.last_page_lens"><code class="docutils literal notranslate"><span class="pre">PlanCacheKey.last_page_lens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.PlanCacheKey.page_indices"><code class="docutils literal notranslate"><span class="pre">PlanCacheKey.page_indices</span></code></a></li>
@@ -593,10 +599,13 @@ backend in a spec does not load the other two.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.AttentionManager" title="mstar.engine.resources.attn.base.AttentionManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AttentionManager</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.PlanCacheKey" title="mstar.engine.resources.attn.base.PlanCacheKey"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PlanCacheKey</span></code></a>(q_seq_lens, page_indices, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.EagerSlotKey" title="mstar.engine.resources.attn.base.EagerSlotKey"><code class="xref py py-obj docutils literal notranslate"><span class="pre">EagerSlotKey</span></code></a>(label, slot[, is_decode])</p></td>
+<td><p>One eager wrapper — the counterpart of <code class="docutils literal notranslate"><span class="pre">CGSlotKey</span></code>, slotted for the same reason (FlashInfer's plan stages into a pinned buffer per wrapper).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.PlanCacheKey" title="mstar.engine.resources.attn.base.PlanCacheKey"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PlanCacheKey</span></code></a>(q_seq_lens, page_indices, ...)</p></td>
 <td><p>Fingerprint of a wrapper <code class="docutils literal notranslate"><span class="pre">plan</span></code> call's inputs.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.WorkspacePool" title="mstar.engine.resources.attn.base.WorkspacePool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkspacePool</span></code></a>(device)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.attn.base.WorkspacePool" title="mstar.engine.resources.attn.base.WorkspacePool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkspacePool</span></code></a>(device)</p></td>
 <td><p>FlashInfer workspace buffers, one per (plan label, cg slot).</p></td>
 </tr>
 </tbody>
@@ -634,6 +643,41 @@ kernel (the dense one). A layer therefore reads</p>
 <p>out = self.attn.run(q, label, kv.layer_view(i), k=k, v=v, layer_idx=i)</p>
 </div></blockquote>
 <p>and stays correct whichever backend the spec named.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.EagerSlotKey">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.base.</span></span><span class="sig-name descname"><span class="pre">EagerSlotKey</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">slot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">is_decode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#EagerSlotKey"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.EagerSlotKey" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.NamedTuple" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">NamedTuple</span></code></a></p>
+<p>One eager wrapper — the counterpart of <code class="docutils literal notranslate"><span class="pre">CGSlotKey</span></code>, slotted for the
+same reason (FlashInfer’s plan stages into a pinned buffer per wrapper).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>slot</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>is_decode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.EagerSlotKey.is_decode">
+<span class="sig-name descname"><span class="pre">is_decode</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.base.EagerSlotKey.is_decode" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.EagerSlotKey.label">
+<span class="sig-name descname"><span class="pre">label</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.base.EagerSlotKey.label" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.EagerSlotKey.slot">
+<span class="sig-name descname"><span class="pre">slot</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.attn.base.EagerSlotKey.slot" title="Link to this definition">#</a></dt>
+<dd><p>Alias for field number 1</p>
 </dd></dl>
 
 </dd></dl>
@@ -755,6 +799,12 @@ these outlive any single step.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager"><code class="docutils literal notranslate"><span class="pre">AttentionManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.build"><code class="docutils literal notranslate"><span class="pre">AttentionManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.requires_kv_write"><code class="docutils literal notranslate"><span class="pre">AttentionManager.requires_kv_write</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey.is_decode"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey.is_decode</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey.label"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey.label</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.EagerSlotKey.slot"><code class="docutils literal notranslate"><span class="pre">EagerSlotKey.slot</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.PlanCacheKey"><code class="docutils literal notranslate"><span class="pre">PlanCacheKey</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

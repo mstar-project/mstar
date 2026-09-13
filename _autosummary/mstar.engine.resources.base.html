@@ -598,6 +598,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.clear_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.commit"><code class="docutils literal notranslate"><span class="pre">Resource.commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.depends_on"><code class="docutils literal notranslate"><span class="pre">Resource.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.force_double_buffer"><code class="docutils literal notranslate"><span class="pre">Resource.force_double_buffer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">Resource.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.ingest_request"><code class="docutils literal notranslate"><span class="pre">Resource.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.is_offloaded"><code class="docutils literal notranslate"><span class="pre">Resource.is_offloaded()</span></code></a></li>
@@ -988,6 +989,24 @@ earlier call already sized.</p>
 </dl>
 </dd></dl>
 
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.force_double_buffer">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">force_double_buffer</span></span><a class="headerlink" href="#mstar.engine.resources.base.Resource.force_double_buffer" title="Link to this definition">#</a></dt>
+<dd><p>Whether this resource needs double-buffering even off the pre-plan path.</p>
+<p>A resource that stages a step’s layout into a reused host buffer and
+issues a non-blocking H2D into a graph-read device buffer has a race the
+moment the CPU runs ahead of the GPU: plan(N+1) can overwrite the buffer
+before step N’s DMA has retired, and the replay attends with N+1’s data.
+The buffer need not be ours — FlashInfer’s <code class="docutils literal notranslate"><span class="pre">plan</span></code> holds one per
+wrapper, which is why the attention managers key theirs per slot.
+The main runner already double-buffers whenever a resource
+<code class="docutils literal notranslate"><span class="pre">supports_preplan</span></code>; this flag extends that to a runner that has no
+pre-plan path but still replays such a resource — notably the piecewise
+runner — and makes <code class="docutils literal notranslate"><span class="pre">_exec_per_request</span></code> fence before it reuses a slot,
+since its sub-steps all run inside one step. Off by default; a resource
+opts in only if it has this hazard.</p>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.get_offload_priority">
 <span class="sig-name descname"><span class="pre">get_offload_priority</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.get_offload_priority"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.get_offload_priority" title="Link to this definition">#</a></dt>
@@ -1258,6 +1277,7 @@ eviction candidate however cold it is. Distinct from
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.clear_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.commit"><code class="docutils literal notranslate"><span class="pre">Resource.commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.depends_on"><code class="docutils literal notranslate"><span class="pre">Resource.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.force_double_buffer"><code class="docutils literal notranslate"><span class="pre">Resource.force_double_buffer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">Resource.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.ingest_request"><code class="docutils literal notranslate"><span class="pre">Resource.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.is_offloaded"><code class="docutils literal notranslate"><span class="pre">Resource.is_offloaded()</span></code></a></li>

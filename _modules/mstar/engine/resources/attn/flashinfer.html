@@ -852,6 +852,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">AttentionManager</span><span class="p">,</span>
     <span class="n">AttentionWrapper</span><span class="p">,</span>
+    <span class="n">EagerSlotKey</span><span class="p">,</span>
     <span class="n">WorkspacePool</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span>
@@ -883,9 +884,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># label to plan state</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
-        <span class="c1"># (label, is_decode) -&gt; wrapper; persistent, because constructing one</span>
-        <span class="c1"># allocates FlashInfer's own workspaces and is far from free per step</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">],</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># persistent, because constructing one allocates FlashInfer's own</span>
+        <span class="c1"># workspaces and is far from free per step</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -952,14 +953,21 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
         <span class="k">return</span> <span class="n">wrapper</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_eager_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AttentionWrapper</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""The persistent eager wrapper for one (label, kind)."""</span>
-        <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_eager_wrapper</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AttentionWrapper</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The persistent eager wrapper for one (label, kind, slot).</span>
+
+<span class="sd">        Takes the workspace this slot's captured wrappers already hold: the</span>
+<span class="sd">        two never run at once, since the pipeline retires step N before the</span>
+<span class="sd">        host stages N+2 and a slot repeats no sooner than that.</span>
+<span class="sd">        """</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="n">EagerSlotKey</span><span class="p">(</span><span class="n">label</span><span class="o">=</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span> <span class="n">is_decode</span><span class="o">=</span><span class="n">is_decode</span><span class="p">)</span>
         <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">cls</span> <span class="o">=</span> <span class="n">FlashInferDecodeWrapper</span> <span class="k">if</span> <span class="n">is_decode</span> <span class="k">else</span> <span class="n">FlashInferPrefillWrapper</span>
             <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">),</span>
+                <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="p">),</span>
                 <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">wrapper</span>
@@ -968,14 +976,22 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="kc">True</span>
 
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">force_double_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># FlashInfer's plan stages the schedule into a pinned buffer it holds</span>
+        <span class="c1"># per wrapper and H2Ds it on the stream (scheduler.cuh's</span>
+        <span class="c1"># cudaMemcpyAsync out of page_locked_int_workspace_buffer), so one</span>
+        <span class="c1"># wrapper per slot is what keeps plan(N+1) off step N's queued copy.</span>
+        <span class="k">return</span> <span class="kc">True</span>
+
 <div class="viewcode-block" id="FlashInferManager.plan">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.plan">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">reset_default_cursors</span><span class="p">()</span>
         <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
         <span class="k">assert</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="ow">or</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
-            <span class="s2">"preplan requires a cuda graph step: eager wrappers share one "</span>
-            <span class="s2">"workspace per label with the forward still in flight"</span>
+            <span class="s2">"preplan requires a cuda graph step: an eager wrapper shares its "</span>
+            <span class="s2">"workspace with the captured one on the same slot"</span>
         <span class="p">)</span>
         <span class="k">assert</span> <span class="ow">not</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="ow">and</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">),</span> <span class="p">(</span>
             <span class="s2">"attention preplan is already pending; clear_preplan before "</span>
@@ -1006,7 +1022,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">is_decode</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span>
                     <span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>
                 <span class="p">)</span>
-                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">)</span>
+                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
 
             <span class="c1"># TODO: cache the latest plan state</span>
             <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>

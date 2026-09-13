@@ -1030,6 +1030,25 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="kc">False</span>
 
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">force_double_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Whether this resource needs double-buffering even off the pre-plan path.</span>
+
+<span class="sd">        A resource that stages a step's layout into a reused host buffer and</span>
+<span class="sd">        issues a non-blocking H2D into a graph-read device buffer has a race the</span>
+<span class="sd">        moment the CPU runs ahead of the GPU: plan(N+1) can overwrite the buffer</span>
+<span class="sd">        before step N's DMA has retired, and the replay attends with N+1's data.</span>
+<span class="sd">        The buffer need not be ours — FlashInfer's ``plan`` holds one per</span>
+<span class="sd">        wrapper, which is why the attention managers key theirs per slot.</span>
+<span class="sd">        The main runner already double-buffers whenever a resource</span>
+<span class="sd">        ``supports_preplan``; this flag extends that to a runner that has no</span>
+<span class="sd">        pre-plan path but still replays such a resource — notably the piecewise</span>
+<span class="sd">        runner — and makes ``_exec_per_request`` fence before it reuses a slot,</span>
+<span class="sd">        since its sub-steps all run inside one step. Off by default; a resource</span>
+<span class="sd">        opts in only if it has this hazard.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
 <div class="viewcode-block" id="Resource.clear_preplan">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.clear_preplan">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>

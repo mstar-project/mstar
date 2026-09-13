@@ -31,6 +31,7 @@ mstar.engine.cuda\_graph\_runner
       DummyRowPool
       PiecewiseCudaGraphRunner
       PiecewiseGraphData
+      PiecewiseGraphKey
       PiecewiseOutput
    
    

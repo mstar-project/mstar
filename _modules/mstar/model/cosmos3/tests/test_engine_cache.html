@@ -1092,6 +1092,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">lease</span> <span class="o">=</span> <span class="n">cg_runner</span><span class="o">.</span><span class="n">lease_slot</span><span class="p">(</span>
             <span class="n">graph_walk</span><span class="o">=</span><span class="n">walk</span><span class="p">,</span>
             <span class="n">bs</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">real_ids</span><span class="p">),</span>
+            <span class="n">slot</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
             <span class="n">num_tokens</span><span class="o">=</span><span class="nb">sum</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">input_seq_len</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">),</span>
             <span class="n">cg_key_info</span><span class="o">=</span><span class="n">dit</span><span class="o">.</span><span class="n">cg_key_info</span><span class="p">(</span><span class="n">walk</span><span class="p">,</span> <span class="n">step_fwds</span><span class="p">),</span>
         <span class="p">)</span>
@@ -1692,7 +1693,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">cg_runner</span> <span class="o">=</span> <span class="n">CudaGraphRunner</span><span class="p">(</span>
         <span class="n">submodule_name</span><span class="o">=</span><span class="s2">"dit"</span><span class="p">,</span> <span class="n">submodule</span><span class="o">=</span><span class="n">dit</span><span class="p">,</span> <span class="n">resources</span><span class="o">=</span><span class="n">resources</span><span class="p">,</span>
         <span class="n">step_runner</span><span class="o">=</span><span class="n">StepRunner</span><span class="p">(</span><span class="n">resources</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">dev</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-        <span class="n">joint_comm_group</span><span class="o">=</span><span class="n">groups</span><span class="p">,</span>
+        <span class="n">joint_comm_group</span><span class="o">=</span><span class="n">groups</span><span class="p">,</span> <span class="n">num_slots</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">cg_runner</span><span class="o">.</span><span class="n">warmup_and_capture</span><span class="p">()</span>
     <span class="k">assert</span> <span class="n">cg_runner</span><span class="o">.</span><span class="n">any_graphs</span><span class="p">,</span> <span class="s2">"no CUDA graph captured for cosmos3 image_gen"</span>

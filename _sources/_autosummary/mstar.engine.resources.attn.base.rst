@@ -18,6 +18,7 @@ mstar.engine.resources.attn.base
    .. autosummary::
    
       AttentionManager
+      EagerSlotKey
       PlanCacheKey
       WorkspacePool
    

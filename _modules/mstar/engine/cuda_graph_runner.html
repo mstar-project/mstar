@@ -846,10 +846,9 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>Source code for mstar.engine.cuda_graph_runner</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -1023,11 +1022,6 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="CudaGraphRunner">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphRunner</span><span class="p">:</span>
-    <span class="c1"># Double-buffer: capture two graphs per config key, when the node has a</span>
-    <span class="c1"># resource that pre-plans. Replay alternates so plan(N+1) on the inactive</span>
-    <span class="c1"># slot can run concurrent with replay(N) on the active slot. Override via</span>
-    <span class="c1"># MSTAR_NUM_SLOTS=1 to disable double-buffer</span>
-    <span class="n">NUM_SLOTS</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_NUM_SLOTS"</span><span class="p">,</span> <span class="s2">"2"</span><span class="p">))</span>
     <span class="n">CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="n">DEFAULT_CAPTURE_BATCH_SIZES</span>
     <span class="n">NUM_WARMUP</span> <span class="o">=</span> <span class="mi">2</span>
 
@@ -1040,6 +1034,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
         <span class="n">autocast_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">joint_comm_group</span><span class="p">:</span> <span class="n">JointGroups</span><span class="p">,</span>
+        <span class="n">num_slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span> <span class="o">=</span> <span class="n">submodule_name</span>
@@ -1055,19 +1050,12 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span> <span class="o">=</span> <span class="n">autocast_dtype</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_enable_nvtx</span> <span class="o">=</span> <span class="n">enable_nvtx</span>
 
-        <span class="c1"># A second slot only buys something when a resource can plan a step</span>
-        <span class="c1"># ahead: the point is for that plan to write buffers the in-flight</span>
-        <span class="c1"># replay isn't reading. With nothing to pre-plan, the slots would hold</span>
-        <span class="c1"># identical graphs and double the capture time and memory.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">NUM_SLOTS</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span>
-            <span class="n">resource</span><span class="o">.</span><span class="n">supports_preplan</span> <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="n">resources</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
-        <span class="p">)</span> <span class="k">else</span> <span class="mi">1</span>
+        <span class="c1"># How many slots to double-buffer; the caller decides (pre-plan or a</span>
+        <span class="c1"># force_double_buffer resource), since without either the slots would</span>
+        <span class="c1"># hold identical graphs and double the capture time and memory.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">=</span> <span class="n">num_slots</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CudaGraphBucket</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-
-        <span class="c1"># Rotated globally, not per bucket: slot-keyed buffers are shared across</span>
-        <span class="c1"># buckets, so per-bucket counters let consecutive steps collide on a slot.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_next_slot</span> <span class="o">=</span> <span class="mi">0</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="c1"># set by prepare_for_capture; capture reuses it rather than re-deriving</span>
@@ -1575,9 +1563,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="CudaGraphRunner.lease_slot">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">lease_slot</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cg_key_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SlotLease</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Pick the bucket and double-buffer slot an upcoming step replays on.</span>
 
@@ -1596,9 +1585,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">key</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">bucket</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
-        <span class="k">if</span> <span class="n">slot</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">slot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_next_slot</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_next_slot</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_next_slot</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span>
+
         <span class="c1"># Hand back the bucket the capture ran under, not the alias this walk</span>
         <span class="c1"># found it by. Resources key their per-slot state (attention wrappers,</span>
         <span class="c1"># position buffers) on `lease.bucket`, so a lease naming an aliased</span>
@@ -1841,6 +1828,15 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="PiecewiseGraphKey">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphKey">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseGraphKey</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+    <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">seq_len</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
 <div class="viewcode-block" id="PiecewiseCudaGraphRunner">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PiecewiseCudaGraphRunner</span><span class="p">:</span>
@@ -1858,9 +1854,6 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="n">DEFAULT_CAPTURE_BATCH_SIZES</span>
     <span class="n">NUM_WARMUP</span> <span class="o">=</span> <span class="mi">2</span>
-    <span class="c1"># A region can't overlap itself, and there is no pre-plan path into one, so</span>
-    <span class="c1"># a single slot suffices.</span>
-    <span class="n">SLOT</span> <span class="o">=</span> <span class="mi">0</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1870,6 +1863,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">step_runner</span><span class="p">:</span> <span class="n">StepRunner</span><span class="p">,</span>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
         <span class="n">autocast_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">num_slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">joint_comm_group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
@@ -1887,15 +1881,53 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_capture_batch_sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
             <span class="n">config</span><span class="o">.</span><span class="n">capture_batch_sizes</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">CAPTURE_BATCH_SIZES</span>
         <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">PiecewiseGraphData</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">PiecewiseGraphKey</span><span class="p">,</span> <span class="n">PiecewiseGraphData</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span> <span class="o">=</span> <span class="n">DummyRowPool</span><span class="p">(</span>
             <span class="n">prefix</span><span class="o">=</span><span class="sa">f</span><span class="s2">"pw_</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">step_runner</span><span class="o">=</span><span class="n">step_runner</span><span class="p">,</span> <span class="n">resources</span><span class="o">=</span><span class="n">resources</span><span class="p">,</span>
         <span class="p">)</span>
 
+        <span class="c1"># how many slots the caller allows; `prepare_for_capture` narrows it to</span>
+        <span class="c1"># what this region actually needs</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_max_slots</span> <span class="o">=</span> <span class="n">num_slots</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_current_slot</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_size_slots</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A region has no pre-plan path, so a second slot buys nothing unless a</span>
+<span class="sd">        resource its step touches stages into a reused host buffer behind an</span>
+<span class="sd">        async H2D (see ``Resource.force_double_buffer``)."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_slots</span> <span class="o">&lt;=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_capture_batch_sizes</span><span class="p">):</span>
+            <span class="c1"># names, not `ensure`: the declaration only labels its rows, and</span>
+            <span class="c1"># ingesting here would run before the buffers are built</span>
+            <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">names</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">),</span>
+                <span class="nb">list</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">),</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">any</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">force_double_buffer</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">steps</span>
+            <span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_slots</span>
+                <span class="k">return</span>
+
+<div class="viewcode-block" id="PiecewiseCudaGraphRunner.set_slot">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.set_slot">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_slot</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_current_slot</span> <span class="o">=</span> <span class="n">slot</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span></div>
+
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">any_graphs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="nb">bool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_dummy_key</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Padding rows are per slot, as in ``CudaGraphRunner``: a slot's plan</span>
+<span class="sd">        and commit run against its own tail, so sharing rows between slots puts</span>
+<span class="sd">        two graphs on one set of per-request state."""</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">_slot</span><span class="si">{</span><span class="n">slot</span><span class="si">}</span><span class="s2">"</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_bucket</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BucketKey</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">BucketKey</span><span class="p">(</span>
@@ -1912,15 +1944,17 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_for_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Claim this region's static buffers; see ``CudaGraphRunner``."""</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_shapes</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_size_slots</span><span class="p">()</span>
             <span class="n">shapes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_capture_batch_sizes</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">shapes</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">build_cuda_graph_buffers</span><span class="p">(</span>
                     <span class="p">[</span>
                         <span class="n">CGSlotSpec</span><span class="p">(</span>
-                            <span class="n">bucket</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span> <span class="n">slot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">SLOT</span><span class="p">,</span>
+                            <span class="n">bucket</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span>
                             <span class="n">config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="p">,</span>
                         <span class="p">)</span>
                         <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">shapes</span>
+                        <span class="k">for</span> <span class="n">slot</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">)</span>
                     <span class="p">],</span>
                     <span class="n">max_bs</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span> <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">shapes</span><span class="p">),</span>
                     <span class="n">max_seq_len</span><span class="o">=</span><span class="nb">max</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span> <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">shapes</span><span class="p">),</span>
@@ -1952,25 +1986,30 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="n">captured</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">ordered</span><span class="p">:</span>
-            <span class="c1"># keep ranks in lockstep: the region may hold collectives, and a</span>
-            <span class="c1"># rank still in pre-capture setup would mismatch one already in the</span>
-            <span class="c1"># warmup forward</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
-            <span class="k">try</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
-                <span class="n">captured</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">shape_captured</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">for</span> <span class="n">slot</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">):</span>
+                <span class="c1"># keep ranks in lockstep: the region may hold collectives, and a</span>
+                <span class="c1"># rank still in pre-capture setup would mismatch one already in the</span>
+                <span class="c1"># warmup forward. Every rank walks all the slots even after a</span>
+                <span class="c1"># failure here, or the barrier counts diverge and they hang.</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">)</span>
+                <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                    <span class="n">shape_captured</span> <span class="o">=</span> <span class="kc">False</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                        <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: failed to capture bs=</span><span class="si">%d</span><span class="s2"> "</span>
+                        <span class="s2">"total_tokens=</span><span class="si">%d</span><span class="s2"> slot=</span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span>
+                        <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                    <span class="p">)</span>
+            <span class="n">captured</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">shape_captured</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">shape_captured</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                    <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span>
-                <span class="p">)</span>
-            <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
-                <span class="n">captured</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">False</span><span class="p">)</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                    <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: failed to capture bs=</span><span class="si">%d</span><span class="s2"> "</span>
-                    <span class="s2">"total_tokens=</span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span>
-                    <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                    <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
+                    <span class="s2">"(</span><span class="si">%d</span><span class="s2"> slots)"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">,</span>
                 <span class="p">)</span>
 
         <span class="c1"># `ordered` comes from the config, so every rank agrees on the order</span>
@@ -1981,21 +2020,29 @@ window.runMermaid = runMermaid;</script>
         <span class="p">):</span>
             <span class="k">if</span> <span class="n">ok</span><span class="p">:</span>
                 <span class="k">continue</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="o">.</span><span class="n">pop</span><span class="p">((</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># all-or-nothing per shape: a shape missing a slot can't rotate</span>
+            <span class="n">dropped</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">slot</span> <span class="k">for</span> <span class="n">slot</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">PiecewiseGraphKey</span><span class="p">(</span>
+                    <span class="n">bs</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">seq_len</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span>
+                <span class="p">),</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="p">]</span>
+            <span class="k">if</span> <span class="n">dropped</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                    <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: dropping bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2">, "</span>
-                    <span class="s2">"captured here but not on every rank"</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span>
+                    <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: dropping bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
+                    <span class="s2">"slots=</span><span class="si">%s</span><span class="s2">, not captured on every rank / for every slot"</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">dropped</span><span class="p">,</span>
                 <span class="p">)</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">dummy_rids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">ensure</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span>
         <span class="p">)</span>
         <span class="n">static_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">make_static_inputs</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
         <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_declare</span><span class="p">(</span>
             <span class="n">dummy_rids</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_bucket</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span> <span class="n">capture</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">slot</span><span class="o">=</span><span class="n">slot</span>
         <span class="p">)</span>
         <span class="n">call</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_call_inputs</span><span class="p">(</span><span class="n">static_inputs</span><span class="p">,</span> <span class="n">dummy_rids</span><span class="p">)</span>
 
@@ -2030,7 +2077,9 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># the same ids, so their plan finds the storage already resident</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">)</span>
 
-        <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[(</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">)]</span> <span class="o">=</span> <span class="n">PiecewiseGraphData</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[</span><span class="n">PiecewiseGraphKey</span><span class="p">(</span>
+            <span class="n">bs</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">seq_len</span><span class="o">=</span><span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span>
+        <span class="p">)]</span> <span class="o">=</span> <span class="n">PiecewiseGraphData</span><span class="p">(</span>
             <span class="n">graph</span><span class="o">=</span><span class="n">graph</span><span class="p">,</span>
             <span class="n">static_inputs</span><span class="o">=</span><span class="n">static_inputs</span><span class="p">,</span>
             <span class="n">static_outputs</span><span class="o">=</span><span class="n">static_outputs</span><span class="p">,</span>
@@ -2062,21 +2111,32 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_declare</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
-        <span class="n">bucket</span><span class="p">:</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">capture</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span>
+        <span class="n">bucket</span><span class="p">:</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">capture</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">real_bs</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
-<span class="w">        </span><span class="sd">"""The region's step over the padded batch, addressed at its slot."""</span>
+<span class="w">        </span><span class="sd">"""The region's step over the padded batch, addressed at its slot.</span>
+
+<span class="sd">        The declaration covers every row, but the context reports only the real</span>
+<span class="sd">        head as ``request_ids`` and the padding tail on `set_padded_rids`, as</span>
+<span class="sd">        the outer path does. A resource sizes its per-request writeback off</span>
+<span class="sd">        ``ctx.request_ids``: counting the tail there makes it scatter padding</span>
+<span class="sd">        rows back over real state.</span>
+<span class="sd">        """</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">request_ids</span><span class="p">),</span> <span class="nb">list</span><span class="p">(</span><span class="n">seq_lens</span><span class="p">))</span>
         <span class="k">if</span> <span class="n">step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
-        <span class="n">step</span><span class="o">.</span><span class="n">set_ctx</span><span class="p">(</span><span class="n">StepContext</span><span class="p">(</span>
-            <span class="n">request_ids</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">request_ids</span><span class="p">),</span>
+        <span class="n">n</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">)</span> <span class="k">if</span> <span class="n">real_bs</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">real_bs</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="n">StepContext</span><span class="p">(</span>
+            <span class="n">request_ids</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">request_ids</span><span class="p">[:</span><span class="n">n</span><span class="p">]),</span>
             <span class="n">graph_walk</span><span class="o">=</span><span class="n">PIECEWISE_WALK</span><span class="p">,</span>
-            <span class="n">slot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">SLOT</span><span class="p">,</span>
+            <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span>
             <span class="n">capture</span><span class="o">=</span><span class="n">capture</span><span class="p">,</span>
-            <span class="n">slot_lease</span><span class="o">=</span><span class="n">SlotLease</span><span class="p">(</span><span class="n">slot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">SLOT</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">bucket</span><span class="p">),</span>
-        <span class="p">))</span>
+            <span class="n">slot_lease</span><span class="o">=</span><span class="n">SlotLease</span><span class="p">(</span><span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">bucket</span><span class="p">),</span>
+        <span class="p">)</span>
+        <span class="n">ctx</span><span class="o">.</span><span class="n">set_padded_rids</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">request_ids</span><span class="p">))</span>
+        <span class="n">step</span><span class="o">.</span><span class="n">set_ctx</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">step</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -2125,18 +2185,21 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">padded_bs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_config_type</span><span class="p">()</span> <span class="o">==</span> <span class="n">PiecewiseConfigType</span><span class="o">.</span><span class="n">BATCHED</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
-                <span class="p">(</span><span class="n">padded_bs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">seq_len</span> <span class="o">*</span> <span class="n">padded_bs</span><span class="p">)</span>
-            <span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">PiecewiseGraphKey</span><span class="p">(</span>
+                <span class="n">bs</span><span class="o">=</span><span class="n">padded_bs</span><span class="p">,</span> <span class="n">seq_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">seq_len</span> <span class="o">*</span> <span class="n">padded_bs</span><span class="p">,</span>
+                <span class="n">slot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_current_slot</span>
+            <span class="p">))</span>
         <span class="k">if</span> <span class="n">total_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
-        <span class="n">candidates</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
-            <span class="n">tokens</span> <span class="k">for</span> <span class="p">(</span><span class="n">bs</span><span class="p">,</span> <span class="n">tokens</span><span class="p">)</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span>
-            <span class="k">if</span> <span class="n">bs</span> <span class="o">==</span> <span class="n">padded_bs</span> <span class="ow">and</span> <span class="n">tokens</span> <span class="o">&gt;=</span> <span class="n">total_tokens</span>
-        <span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">candidates</span><span class="p">:</span>
+        <span class="n">fits</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span>
+            <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">bs</span> <span class="o">==</span> <span class="n">padded_bs</span>
+            <span class="ow">and</span> <span class="n">key</span><span class="o">.</span><span class="n">slot</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_slot</span>
+            <span class="ow">and</span> <span class="n">key</span><span class="o">.</span><span class="n">seq_len</span> <span class="o">&gt;=</span> <span class="n">total_tokens</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">fits</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[(</span><span class="n">padded_bs</span><span class="p">,</span> <span class="n">candidates</span><span class="p">[</span><span class="mi">0</span><span class="p">])]</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">[</span><span class="nb">min</span><span class="p">(</span><span class="n">fits</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">key</span><span class="p">:</span> <span class="n">key</span><span class="o">.</span><span class="n">seq_len</span><span class="p">)]</span>
 
 <div class="viewcode-block" id="PiecewiseCudaGraphRunner.can_run">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.can_run">[docs]</a>
@@ -2161,7 +2224,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        """</span>
         <span class="n">data</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resolve</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">total_tokens</span><span class="p">)</span>
         <span class="k">return</span> <span class="kc">None</span> <span class="k">if</span> <span class="n">data</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">SlotLease</span><span class="p">(</span>
-            <span class="n">slot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">SLOT</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">bucket</span>
+            <span class="n">slot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_current_slot</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">data</span><span class="o">.</span><span class="n">bucket</span>
         <span class="p">)</span></div>
 
 
@@ -2225,6 +2288,8 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">replay_seq_lens</span><span class="p">(</span><span class="n">data</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">,</span> <span class="n">real_bs</span><span class="p">),</span>
                 <span class="n">data</span><span class="o">.</span><span class="n">bucket</span><span class="p">,</span>
                 <span class="n">capture</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                <span class="n">slot</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_current_slot</span><span class="p">,</span>
+                <span class="n">real_bs</span><span class="o">=</span><span class="n">real_bs</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">try</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">data</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>

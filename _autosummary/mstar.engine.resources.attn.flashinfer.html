@@ -557,6 +557,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager"><code class="docutils literal notranslate"><span class="pre">FlashInferManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.clear_preplan"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.depends_on"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.force_double_buffer"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.force_double_buffer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.run"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.run()</span></code></a></li>
@@ -611,6 +612,24 @@
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.flashinfer.FlashInferManager.depends_on">
 <span class="sig-name descname"><span class="pre">depends_on</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/flashinfer.html#FlashInferManager.depends_on"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.depends_on" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.flashinfer.FlashInferManager.force_double_buffer">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">force_double_buffer</span></span><a class="headerlink" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.force_double_buffer" title="Link to this definition">#</a></dt>
+<dd><p>Whether this resource needs double-buffering even off the pre-plan path.</p>
+<p>A resource that stages a step’s layout into a reused host buffer and
+issues a non-blocking H2D into a graph-read device buffer has a race the
+moment the CPU runs ahead of the GPU: plan(N+1) can overwrite the buffer
+before step N’s DMA has retired, and the replay attends with N+1’s data.
+The buffer need not be ours — FlashInfer’s <code class="docutils literal notranslate"><span class="pre">plan</span></code> holds one per
+wrapper, which is why the attention managers key theirs per slot.
+The main runner already double-buffers whenever a resource
+<code class="docutils literal notranslate"><span class="pre">supports_preplan</span></code>; this flag extends that to a runner that has no
+pre-plan path but still replays such a resource — notably the piecewise
+runner — and makes <code class="docutils literal notranslate"><span class="pre">_exec_per_request</span></code> fence before it reuses a slot,
+since its sub-steps all run inside one step. Off by default; a resource
+opts in only if it has this hazard.</p>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.flashinfer.FlashInferManager.plan">
@@ -736,6 +755,7 @@ from prefill.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager"><code class="docutils literal notranslate"><span class="pre">FlashInferManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.clear_preplan"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.depends_on"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.depends_on()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.force_double_buffer"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.force_double_buffer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.plan"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.qo_indptr_buf"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.qo_indptr_buf()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.flashinfer.FlashInferManager.run"><code class="docutils literal notranslate"><span class="pre">FlashInferManager.run()</span></code></a></li>

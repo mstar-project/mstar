@@ -953,6 +953,19 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="EagerSlotKey">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.EagerSlotKey">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">EagerSlotKey</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One eager wrapper — the counterpart of ``CGSlotKey``, slotted for the</span>
+<span class="sd">    same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""</span>
+    <span class="n">label</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># decode and prefill take different wrapper classes; cross-attention plans</span>
+    <span class="c1"># one wrapper per label either way and leaves this False</span>
+    <span class="n">is_decode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
+
+
+
 <span class="n">AttentionWrapper</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span> <span class="o">|</span> <span class="n">FlashInferDecodeWrapper</span>
 
 
