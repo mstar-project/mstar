@@ -521,6 +521,7 @@ def piecewise_runner(mgr, capture_fn):
         step_runner=step_runner,
         device=DEVICE,
         autocast_dtype=DTYPE,
+        num_slots=1,
         node_name="encoder",
     )
     runner.warmup_and_capture()
