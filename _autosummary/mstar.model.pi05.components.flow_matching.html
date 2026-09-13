@@ -638,15 +638,18 @@ PaliGemma can embed alongside image and language tokens.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>t</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – scalar or 1D tensor of timesteps in [0, 1].</p></li>
 <li><p><strong>dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – embedding dimension. Must be even.</p></li>
+<li><p><strong>fraction</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – <code class="docutils literal notranslate"><span class="pre">(dim</span> <span class="pre">//</span> <span class="pre">2,)</span></code> frequency ladder, caller-owned so it is
+allocated once rather than per step (see
+<code class="docutils literal notranslate"><span class="pre">Pi05LLMSubmodule._get_timestep_emb_fraction</span></code>).</p></li>
+<li><p><strong>output_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – <code class="docutils literal notranslate"><span class="pre">(len(t),</span> <span class="pre">dim)</span></code> destination, written in place and
+returned; preallocated so the action-gen step stays capturable.</p></li>
 <li><p><strong>max_period</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>) – frequency range for the sinusoidal basis.</p></li>
-<li><p><strong>fraction</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>output_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>min_period</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
 <li><p><strong>max_period</strong></p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>Tensor of shape <code class="docutils literal notranslate"><span class="pre">(*t.shape,</span> <span class="pre">dim)</span></code> with the sin/cos embedding.</p>
+<dd class="field-even"><p><code class="docutils literal notranslate"><span class="pre">output_buffer</span></code>, filled with the sin/cos embedding.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>

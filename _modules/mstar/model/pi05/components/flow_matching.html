@@ -866,10 +866,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    Args:</span>
 <span class="sd">        t: scalar or 1D tensor of timesteps in [0, 1].</span>
 <span class="sd">        dim: embedding dimension. Must be even.</span>
+<span class="sd">        fraction: ``(dim // 2,)`` frequency ladder, caller-owned so it is</span>
+<span class="sd">            allocated once rather than per step (see</span>
+<span class="sd">            ``Pi05LLMSubmodule._get_timestep_emb_fraction``).</span>
+<span class="sd">        output_buffer: ``(len(t), dim)`` destination, written in place and</span>
+<span class="sd">            returned; preallocated so the action-gen step stays capturable.</span>
 <span class="sd">        min_period / max_period: frequency range for the sinusoidal basis.</span>
 
 <span class="sd">    Returns:</span>
-<span class="sd">        Tensor of shape ``(*t.shape, dim)`` with the sin/cos embedding.</span>
+<span class="sd">        ``output_buffer``, filled with the sin/cos embedding.</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="n">dim</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"sincos embedding requires even dim, got </span><span class="si">{</span><span class="n">dim</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
