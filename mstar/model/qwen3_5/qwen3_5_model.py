@@ -230,7 +230,6 @@ class Qwen3_5DenseModel(Model):
                         next_node=EMIT_TO_CLIENT,
                         name="text_inputs",
                         output_modality="text",
-                        conductor_new_token=True,
                     ),
                 ],
             ),

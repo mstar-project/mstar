@@ -69,7 +69,7 @@ class GDNPrefillPlan:
     """Rows of any span, including 1 and 0."""
 
     slots: torch.Tensor       # [n] int32
-    cu_seqlens: torch.Tensor  # [n + 1] int32
+    cu_seqlens: torch.Tensor  # [n + 1] int64
     has_state: torch.Tensor   # [n] bool, False where the slot reads as zeros
     num_rows: int
 
@@ -196,7 +196,7 @@ class GDNPrefillWrapper(GDNWrapper):
         capacity = max(num_rows, self._bs) if self._cuda_graph else num_rows
         if capacity > self._rows_capacity:
             self._cu_buffer = torch.zeros(
-                capacity + 1, dtype=torch.int32, device=self._device
+                capacity + 1, dtype=torch.int64, device=self._device
             )
             self._rows_capacity = capacity
 
