@@ -136,7 +136,13 @@ class LayerRingCache:
         self.written[lo + self.ring_len : hi].fill_(True)
 
     def upsert(
-        self, kv: Tensor, frame_pos: Tensor, commit: bool, world_idx: Tensor
+        self,
+        kv: Tensor,
+        frame_pos: Tensor,
+        commit: bool,
+        world_idx: Tensor,
+        *,
+        build_visibility: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """``kv`` is ``[2, 1, H_kv, tokens_per_frame, D]`` for exactly one frame
         of one world;
@@ -172,23 +178,27 @@ class LayerRingCache:
 
         write_step = frame_pos.remainder(self.pinned_dilation) == 0
         mask_written = self._mask_written
-        mask_written.copy_(self.written)
-        mask_written &= self._world_of_slot == world_idx
-        mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
+        if build_visibility:
+            mask_written.copy_(self.written)
+            mask_written &= self._world_of_slot == world_idx
+            mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
 
         if commit:
             dst = torch.where(write_step, ring_idx, current_idx)
             ring_scatter(self.kv, self.written, dst, kv, True)
 
         k, v = self.kv.unbind(0)
-        # ALIASING HAZARD. The third return value IS `self._mask_written`, this
+        # ALIASING HAZARD. When ``build_visibility`` is true, the third return
+        # value IS `self._mask_written`, this
         # layer's preallocated scratch, handed out by reference and overwritten
         # in place by the next `upsert` on this layer. A consumer that stashes
         # it and reads it later reads some *later* frame's visibility -- which
         # is a mask off by one or more frames, and with worlds resident it can
         # now also be another world's mask entirely.
         #
-        # The obligation on the consumer: read it (build the block mask, or
+        # When false, the value is intentionally stale and must be ignored by
+        # the planned attention backend. The obligation on a fallback consumer:
+        # read it (build the block mask, or
         # clone it) before the next upsert on this same layer. The 4+1 schedule
         # satisfies that trivially.
         return k, v, mask_written

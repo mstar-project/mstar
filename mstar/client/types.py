@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -68,8 +69,100 @@ class AudioChunk:
         return np.frombuffer(self.pcm, dtype="<i2")
 
 
+@dataclass
+class VideoFrameChunk:
+    """A contiguous batch of raw RGB24 frames from a native stream.
+
+    The wire payload is deliberately not an encoded video container. Metadata
+    supplies the shape and timing needed to interpret it without copying.
+    """
+
+    data: bytes
+    metadata: dict
+    width: int = field(init=False)
+    height: int = field(init=False)
+    fps: float = field(init=False)
+    pixel_format: str = field(init=False)
+    frame_index: int = field(init=False)
+    frame_count: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes):
+            raise ValueError(
+                f"video_frame data must be immutable bytes; got {type(self.data).__name__}"
+            )
+        if not isinstance(self.metadata, dict):
+            raise ValueError(
+                f"video_frame metadata must be a dict; got {type(self.metadata).__name__}"
+            )
+        required = (
+            "width", "height", "fps", "pixel_format", "frame_index", "frame_count",
+        )
+        missing = [name for name in required if name not in self.metadata]
+        if missing:
+            raise ValueError(
+                "video_frame metadata is missing required field(s): "
+                + ", ".join(missing)
+            )
+
+        width = self.metadata["width"]
+        height = self.metadata["height"]
+        frame_index = self.metadata["frame_index"]
+        frame_count = self.metadata["frame_count"]
+        for name, value, minimum in (
+            ("width", width, 1),
+            ("height", height, 1),
+            ("frame_index", frame_index, 0),
+            ("frame_count", frame_count, 1),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(
+                    f"video_frame metadata {name!r} must be an int >= {minimum}; "
+                    f"got {value!r}"
+                )
+
+        fps = self.metadata["fps"]
+        if (
+            isinstance(fps, bool)
+            or not isinstance(fps, (int, float))
+            or not math.isfinite(fps)
+            or fps <= 0
+        ):
+            raise ValueError(
+                f"video_frame metadata 'fps' must be a finite positive number; got {fps!r}"
+            )
+        pixel_format = self.metadata["pixel_format"]
+        if pixel_format != "rgb24":
+            raise ValueError(
+                "video_frame metadata 'pixel_format' must be 'rgb24'; "
+                f"got {pixel_format!r}"
+            )
+
+        expected = frame_count * height * width * 3
+        if len(self.data) != expected:
+            raise ValueError(
+                "video_frame payload length does not match its metadata: "
+                f"expected {expected} bytes, got {len(self.data)}"
+            )
+
+        self.width = width
+        self.height = height
+        self.fps = float(fps)
+        self.pixel_format = pixel_format
+        self.frame_index = frame_index
+        self.frame_count = frame_count
+
+    def to_numpy(self):
+        """Return a zero-copy, read-only ``[T, H, W, 3]`` uint8 view."""
+        import numpy as np
+
+        return np.frombuffer(self.data, dtype=np.uint8).reshape(
+            self.frame_count, self.height, self.width, 3
+        )
+
+
 # A streaming iteration yields one of these per output chunk.
-StreamEvent = TextChunk | ImageChunk | AudioChunk
+StreamEvent = TextChunk | ImageChunk | AudioChunk | VideoFrameChunk
 
 
 @dataclass

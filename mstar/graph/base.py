@@ -69,7 +69,7 @@ class GraphEdge:
     conductor_new_token: bool = field(default=False)  # counted by the conductor toward the output-token total
     is_streaming: bool = field(default=False)  # streaming edge: tokens accumulate at destination buffer
     # only for EMIT_TO_CLIENT
-    output_modality: str = field(default="")  # text | image | video | audio
+    output_modality: str = field(default="")  # text | image | video | video_frame | audio
     _persist_for_loop: bool = field(default=False)
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done

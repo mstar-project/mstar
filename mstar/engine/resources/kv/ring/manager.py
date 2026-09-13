@@ -3,6 +3,8 @@ this one reserves nothing. Every layer's ring is allocated once at
 ``build`` and reused for the life of the process,.
 """
 
+from typing import NamedTuple
+
 import torch
 from torch import Tensor
 
@@ -22,7 +24,15 @@ from mstar.engine.resources.step import (
     StepContext,
 )
 
-__all__ = ["RingKVManager"]
+__all__ = ["RingKVManager", "RingPlan"]
+
+
+class RingPlan(NamedTuple):
+    """Host facts downstream resources need to stage this fixed ring view."""
+
+    request_id: str
+    world_idx: int
+    frame_pos: int
 
 
 class RingKVManager(AttentionResource):
@@ -106,7 +116,14 @@ class RingKVManager(AttentionResource):
         return self._worlds.get(rid)
 
     def upsert(
-        self, k: Tensor, v: Tensor, layer_idx: int, frame_pos: Tensor, *, commit: bool
+        self,
+        k: Tensor,
+        v: Tensor,
+        layer_idx: int,
+        frame_pos: Tensor,
+        *,
+        commit: bool,
+        build_visibility: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Write one frame's K/V for ``layer_idx`` and return what to attend to.
 
@@ -127,7 +144,8 @@ class RingKVManager(AttentionResource):
         # rings), so indexing on it is graph-safe.
         kv = torch.stack([k, v], dim=0)
         return self.layers[layer_idx].upsert(
-            kv, frame_pos, commit, self._static_world_idx
+            kv, frame_pos, commit, self._static_world_idx,
+            build_visibility=build_visibility,
         )
 
     def _reset_world(self, rid: str) -> None:
@@ -148,7 +166,7 @@ class RingKVManager(AttentionResource):
 
     @torch.no_grad()
     def get_state(self, rid: str) -> dict:
-        """Snapshot one request's world. Cloned, so the caller can hold it 
+        """Snapshot one request's world. Cloned, so the caller can hold it
         across further rollout steps that mutate the rings in place.
         """
         world_idx = self._require_world(rid, "get_state")
@@ -305,10 +323,9 @@ class RingKVManager(AttentionResource):
                 self._worlds[rid] = world_idx
         return ADMIT_OK
 
-    def plan(self, step: ResourceStep, ctx: StepContext) -> None:
+    def plan(self, step: ResourceStep, ctx: StepContext) -> RingPlan:
         """Stage this step's world index. Its ring addresses stay in the graph."""
 
-        del step
         rids = {*ctx.request_ids}
         if len(rids) != 1:
             raise ValueError(
@@ -322,6 +339,8 @@ class RingKVManager(AttentionResource):
         # through the address the graph baked, without allocating a staging
         # tensor 24 times a second.
         self._static_world_idx.fill_(world_idx)
+        frames = self._step_frames(step)
+        return RingPlan(rid, world_idx, frames[rid])
 
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """Record the frame each request just committed. Metadata only."""

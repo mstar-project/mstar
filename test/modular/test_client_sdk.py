@@ -55,6 +55,9 @@ def test_coerce_and_build_files():
     c = MStarClient("http://x")
     assert c._coerce_file("images", 0, b"\x89PNG") == ("image_0.png", b"\x89PNG")
     assert c._build_files(None, b"\x00\x01", None) == [("files", ("audio_0.wav", b"\x00\x01"))]
+    assert c._build_files(("seed.png", b"\x89PNG"), None, None) == [
+        ("files", ("seed.png", b"\x89PNG")),
+    ]
 
 
 def test_stream_without_content_type_charset():
@@ -71,9 +74,56 @@ def test_stream_without_content_type_charset():
     c = MStarClient("http://x")
     ctx = mock.MagicMock()
     ctx.__enter__.return_value = resp
-    with mock.patch.object(c._session, "post", return_value=ctx):
+    with (
+        mock.patch.object(c._session, "post", return_value=ctx),
+        mock.patch.object(resp, "iter_lines", wraps=resp.iter_lines) as iter_lines,
+    ):
         events = list(c._stream("http://x/generate", {}, None))
     assert [e.text for e in events] == ["hi"]
+    iter_lines.assert_called_once_with(
+        chunk_size=1024 * 1024,
+        decode_unicode=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {
+                "modality": "error",
+                "data": base64.b64encode(b"capture failed").decode(),
+                "metadata": {"status": 500},
+            },
+            r"Server stream failed \(status 500\): capture failed",
+        ),
+        ({"error": "bridge failed"}, "Server stream failed: bridge failed"),
+    ],
+)
+def test_stream_raises_in_band_server_errors(payload, message):
+    requests = pytest.importorskip("requests")
+    resp = requests.Response()
+    resp.status_code = 200
+    resp.headers["Content-Type"] = "application/x-ndjson"
+    resp.raw = io.BytesIO((json.dumps(payload) + "\n").encode())
+
+    client = MStarClient("http://x")
+    ctx = mock.MagicMock()
+    ctx.__enter__.return_value = resp
+    with mock.patch.object(client._session, "post", return_value=ctx):
+        with pytest.raises(RuntimeError, match=message):
+            list(client._stream("http://x/generate", {}, None))
+
+
+@pytest.mark.parametrize("modality", ["action", "scalar", "tensor", "video"])
+def test_to_event_preserves_text_compatible_modality_fallback(modality):
+    event = MStarClient._to_event({
+        "modality": modality,
+        "bytes": b"[1, 2, 3]",
+        "metadata": {"sequence": 4},
+    })
+    assert event.text == "[1, 2, 3]"
+    assert event.metadata == {"sequence": 4}
 
 
 def test_audiobuffer_wav_bytes():

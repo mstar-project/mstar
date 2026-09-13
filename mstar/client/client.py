@@ -30,11 +30,13 @@ from mstar.client.types import (
     ImageChunk,
     StreamEvent,
     TextChunk,
+    VideoFrameChunk,
 )
 
 # When attaching raw bytes we need a filename whose extension lets the server
 # infer the modality (it keys off the extension).
 _DEFAULT_EXT = {"images": "png", "audio": "wav", "video": "mp4"}
+_STREAM_READ_CHUNK_SIZE = 1024 * 1024
 _MODALITY_OF = {"images": "image", "audio": "audio", "video": "video"}
 
 MediaItem = "str | bytes | Path | tuple[str, bytes]"
@@ -78,9 +80,14 @@ class MStarClient:
         dropped so server-side defaults apply.
 
         Returns a :class:`GenerateResult` when ``stream=False``, or an iterator
-        of :class:`StreamEvent` (``TextChunk`` / ``ImageChunk`` / ``AudioChunk``)
-        when ``stream=True``.
+        of :class:`StreamEvent` when ``stream=True``. Raw ``video_frame`` output
+        is streaming-only and yields :class:`VideoFrameChunk` objects.
         """
+        if "video_frame" in output_modalities and not stream:
+            raise ValueError(
+                "output modality 'video_frame' requires stream=True; raw frame "
+                "chunks cannot be returned as an aggregated response"
+            )
         files = self._build_files(images, audio, video)
         data: dict[str, str] = {
             "output_modalities": ",".join(output_modalities),
@@ -162,7 +169,13 @@ class MStarClient:
         for kind, items in (("images", images), ("audio", audio), ("video", video)):
             if not items:
                 continue
-            if isinstance(items, (str, bytes, bytearray, Path)):
+            named_bytes = (
+                isinstance(items, tuple)
+                and len(items) == 2
+                and isinstance(items[0], str)
+                and isinstance(items[1], (bytes, bytearray))
+            )
+            if isinstance(items, (str, bytes, bytearray, Path)) or named_bytes:
                 items = [items]
             for i, item in enumerate(items):
                 fname, blob = self._coerce_file(kind, i, item)
@@ -191,7 +204,13 @@ class MStarClient:
             # UTF-8 (the NDJSON encoding) instead of dropping every line.
             if resp.encoding is None:
                 resp.encoding = "utf-8"
-            for line in resp.iter_lines(decode_unicode=True):
+            # Raw RGB frame events are multi-megabyte NDJSON lines. Requests'
+            # 512-byte default repeatedly concatenates the growing partial
+            # line and becomes quadratic at 720p, so read them in large slabs.
+            for line in resp.iter_lines(
+                chunk_size=_STREAM_READ_CHUNK_SIZE,
+                decode_unicode=True,
+            ):
                 if not isinstance(line, str):
                     continue
                 parsed = parse_ndjson_line(line)
@@ -204,11 +223,23 @@ class MStarClient:
         modality = parsed["modality"]
         raw = parsed["bytes"]
         meta = parsed["metadata"]
+        if modality == "error":
+            status = meta.get("status")
+            status_suffix = f" (status {status})" if status is not None else ""
+            raise RuntimeError(
+                f"Server stream failed{status_suffix}: "
+                f"{raw.decode('utf-8', 'replace')}"
+            )
+        if modality == "text":
+            return TextChunk(raw.decode("utf-8", "replace"), meta)
         if modality == "image":
             return ImageChunk(raw, meta)
         if modality == "audio":
             return AudioChunk(raw, int(meta.get("sample_rate", 24000)), meta)
-        # text and any unrecognized modality decode as utf-8 text
+        if modality == "video_frame":
+            return VideoFrameChunk(raw, meta)
+        # Existing action/scalar/tensor streams are text-compatible. Keep the
+        # historical fallback while giving raw video frames their strict type.
         return TextChunk(raw.decode("utf-8", "replace"), meta)
 
     @staticmethod
