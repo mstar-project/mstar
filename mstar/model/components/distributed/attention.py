@@ -1,4 +1,4 @@
-"""TP-aware multi-head attention.
+"""TP-aware self- and cross-attention.
 
 Mirrors ``mstar.model.components.Attention`` but with the QKV projection
 sharded across heads via ``QKVParallelLinear`` and the output projection
@@ -24,8 +24,10 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.distributed.utils import divide
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -168,3 +170,113 @@ class ParallelAttention(nn.Module):
         attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)
+
+
+class ParallelCrossAttention(nn.Module):
+    """Cross-attention split across tensor-parallel ranks.
+
+    Each rank handles a subset of attention heads, then the output projection
+    combines their contributions with an all-reduce.
+    """
+
+    def __init__(
+        self,
+        *,
+        comm_group: CommGroup | None = None,
+        hidden_size: int,
+        num_heads: int,
+        head_dim: int,
+        q_bias: bool = True,
+        k_bias: bool = False,
+        v_bias: bool = True,
+        o_bias: bool = True,
+        source: str = "default",
+        cross_key: str | None = None,
+        context_kv_key: str | None = None,
+    ):
+        super().__init__()
+
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+
+        self.hidden_size = hidden_size
+        self.total_num_heads = num_heads
+        self.num_heads = divide(num_heads,comm_group.world_size)
+        self.head_dim = head_dim
+
+        self.source = source
+        self._cross_key = cross_key or source
+        self._context_kv_key = context_kv_key
+        self.cross = None
+        self.context_kv = None
+        inner = num_heads * head_dim
+
+        self.q_proj = ColumnParallelLinear(
+            comm_group=comm_group,
+            input_size=hidden_size,
+            output_size=inner,
+            bias=q_bias,
+        )
+        self.k_proj = ColumnParallelLinear(
+            comm_group=comm_group,
+            input_size=hidden_size,
+            output_size=inner,
+            bias=k_bias,
+        )
+        self.v_proj = ColumnParallelLinear(
+            comm_group=comm_group,
+            input_size=hidden_size,
+            output_size=inner,
+            bias=v_bias,
+        )
+        self.out_proj = RowParallelLinear(
+            comm_group=comm_group,
+            input_size=inner,
+            output_size=hidden_size,
+            bias=o_bias,
+            input_is_parallel=True,
+            reduce_results=True,
+        )
+
+    def compute_kv(
+        self, encoder_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project the encoder context to K/V for the cross-attention pool.
+
+        ``(enc_len, hidden) -> (k, v)``, each ``(enc_len, num_heads, head_dim)``.
+        Override to reshape for a model-specific pool layout.
+        """
+        enc_len = encoder_states.shape[0]
+        k = self.k_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
+        v = self.v_proj(encoder_states).view(enc_len, self.num_heads, self.head_dim)
+        return k, v
+
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve this source's cross-attention resource and the cache
+        holding its context. See ``NodeSubmodule.bind_node_resources``."""
+        self.cross = resources[self._cross_key]
+        key = self._context_kv_key
+        if key is None:
+            # the resource already names the cache it attends
+            key = self.cross.context_cache_key
+        self.context_kv = resources[key]
+
+    # Same cursor API as AttentionCallable, so a layer loop drives self- and
+    # cross-attention the same way. Not an AttentionCallable itself: nothing is
+    # written here, and the context cache is a different resource.
+    def bind_step(self, label: str) -> None:
+        self.cross.set_default_label(label)
+
+    def set_layer_idx(self, layer_idx: int) -> None:
+        self.context_kv.set_default_layer_idx(layer_idx)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Label and layer index come off the resources' cursors; see
+        ``Attention.forward``."""
+        num_tokens = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
+        # nothing is written here: the context was written once at encode time
+        attn = self.cross.run(q, kv_cache_layer=self.context_kv.layer_view())
+        attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
+        return self.out_proj(attn)

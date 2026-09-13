@@ -1240,7 +1240,7 @@ To shard a node across several GPUs, add ``tp_size`` to its ``node_groups`` entr
 builds one ``comm_group`` per shard.
 
 A node is sharded only if its components are built from the tensor-parallel modules in
-``mstar/model/components/distributed``: ``ParallelAttention``, ``ParallelGatedMLP``,
+``mstar/model/components/distributed``: ``ParallelAttention``, ``ParallelCrossAttention``, ``ParallelGatedMLP``,
 ``ColumnParallelLinear``, ``RowParallelLinear``, ``VocabParallelEmbedding`` and others.
 The ``weight_loader`` of each such parameter slices it automatically. See `Loading
 weights`_. A node whose components do not use these modules is replicated on every rank
