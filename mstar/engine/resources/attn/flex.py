@@ -21,7 +21,9 @@ from torch.nn.attention.flex_attention import (
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.base import CGSlotSpec
 from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.ring.manager import RingPlan
 from mstar.engine.resources.step import StepContext
 
 __all__ = ["FlexAttentionManager", "flex_attention_masked", "make_block_mask"]
@@ -94,8 +96,12 @@ def make_block_mask(q_len: int, kv_len: int, written: Tensor) -> BlockMask:
     )
 
     # No partial blocks at all -- these two exist only to satisfy the signature.
-    kv_num_blocks = torch.zeros((1, 1, q_blocks), dtype=torch.int32, device=written.device)
-    kv_indices = torch.zeros((1, 1, q_blocks, kv_blocks), dtype=torch.int32, device=written.device)
+    kv_num_blocks = torch.zeros(
+        (1, 1, q_blocks), dtype=torch.int32, device=written.device
+    )
+    kv_indices = torch.zeros(
+        (1, 1, q_blocks, kv_blocks), dtype=torch.int32, device=written.device
+    )
 
     return BlockMask.from_kv_blocks(
         kv_num_blocks,
@@ -108,6 +114,29 @@ def make_block_mask(q_len: int, kv_len: int, written: Tensor) -> BlockMask:
         compute_q_blocks=False,
     )
 
+
+def _empty_block_mask(q_len: int, kv_len: int, device: torch.device) -> BlockMask:
+    """Allocate a fixed-address mask whose visible prefix is staged in plan."""
+    block_size = _DEFAULT_SPARSE_BLOCK_SIZE
+    q_blocks, kv_blocks = q_len // block_size, kv_len // block_size
+    full_kv_num_blocks = torch.zeros(
+        (1, 1, q_blocks), dtype=torch.int32, device=device
+    )
+    full_kv_indices = torch.zeros(
+        (1, 1, q_blocks, kv_blocks), dtype=torch.int32, device=device
+    )
+    kv_num_blocks = torch.zeros_like(full_kv_num_blocks)
+    kv_indices = torch.zeros_like(full_kv_indices)
+    return BlockMask.from_kv_blocks(
+        kv_num_blocks,
+        kv_indices,
+        full_kv_num_blocks,
+        full_kv_indices,
+        BLOCK_SIZE=block_size,
+        mask_mod=None,
+        seq_lengths=(q_len, kv_len),
+        compute_q_blocks=False,
+    )
 
 class FlexAttentionManager(AttentionManager):
     """Attention against a ring KV cache, through ``flex_attention``.
@@ -138,6 +167,11 @@ class FlexAttentionManager(AttentionManager):
         self._device = device
         self._dtype = dtype
         self._kv_config = kv_config
+        self._planned_masks: dict[tuple[int, tuple[int, int, int]], BlockMask] = {}
+        self._visibility_tables: dict[
+            tuple[int, int, int], tuple[Tensor, Tensor, int]
+        ] = {}
+        self._active_slot: int | None = None
 
     def depends_on(self) -> set[str]:
         return {self._kv_cache_name}
@@ -160,15 +194,158 @@ class FlexAttentionManager(AttentionManager):
         """
         return False
 
-    def plan(self, step: AttentionStep, ctx: StepContext) -> None:
-        """Nothing to plan: the mask is a function of the ring's own
-        visibility row, which the KV resource hands to ``attend`` per layer.
+    @property
+    def needs_token_visibility(self) -> bool:
+        """Whether the ring must construct its legacy token-level mask.
 
-        The cursors are still cleared, per ``AttentionResource``: a step that
-        never binds them must not inherit the previous step's.
+        Engine execution stages a block mask in ``plan`` and does not need the
+        per-layer row. The fallback remains useful for standalone numerical
+        calls that invoke ``attend`` without a resource plan.
         """
-        del step, ctx
+        return self._active_slot is None
+
+    @staticmethod
+    def _geometry(layer) -> tuple[int, int, int]:
+        return (layer.ring_frames, layer.ring_buckets, layer.pinned_dilation)
+
+    def _mask_for(
+        self, slot: int, geometry: tuple[int, int, int], *, create: bool = False,
+    ) -> BlockMask:
+        key = (slot, geometry)
+        mask = self._planned_masks.get(key)
+        if mask is None and create:
+            ring_frames, _, _ = geometry
+            capacity = (ring_frames + 1) * self._kv_config.tokens_per_frame
+            capacity *= self._kv_config.num_worlds
+            mask = _empty_block_mask(
+                self._kv_config.tokens_per_frame, capacity, self._device
+            )
+            self._planned_masks[key] = mask
+            self._visibility_table_for(geometry)
+        if mask is None:
+            raise RuntimeError(
+                f"FlexAttention mask for slot={slot}, geometry={geometry} was not "
+                "allocated before CUDA graph capture"
+            )
+        return mask
+
+    def _visibility_table_for(
+        self, geometry: tuple[int, int, int],
+    ) -> tuple[Tensor, Tensor, int]:
+        """Return immutable device rows for every distinct ring phase.
+
+        Before the first wrap, visibility grows with ``frame_pos``. Once every
+        addressable bucket has been written, it is periodic over
+        ``ring_buckets * pinned_dilation`` frames. Keeping both the growing and
+        periodic phases makes the lookup finite even though rollout clocks are
+        not capped by the resource itself.
+        """
+        existing = self._visibility_tables.get(geometry)
+        if existing is not None:
+            return existing
+
+        ring_frames, ring_buckets, dilation = geometry
+        period = ring_buckets * dilation
+        blocks_per_frame = (
+            self._kv_config.tokens_per_frame // _DEFAULT_SPARSE_BLOCK_SIZE
+        )
+        total_blocks = (
+            (ring_frames + 1) * blocks_per_frame * self._kv_config.num_worlds
+        )
+        counts: list[list[int]] = []
+        rows: list[list[list[int]]] = []
+        for world_idx in range(self._kv_config.num_worlds):
+            world_counts = []
+            world_rows = []
+            for frame_pos in range(2 * period):
+                visible = self._visible_blocks_for(
+                    geometry, world_idx=world_idx, frame_pos=frame_pos
+                )
+                world_counts.append(len(visible))
+                world_rows.append(visible + [0] * (total_blocks - len(visible)))
+            counts.append(world_counts)
+            rows.append(world_rows)
+
+        table = (
+            torch.tensor(counts, dtype=torch.int32, device=self._device),
+            torch.tensor(rows, dtype=torch.int32, device=self._device),
+            period,
+        )
+        self._visibility_tables[geometry] = table
+        return table
+
+    def build_cuda_graph_buffers(
+        self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
+    ) -> None:
+        del max_bs, max_seq_len
+        geometries = {self._geometry(layer) for layer in self._kv_config.layers}
+        for slot in {spec.slot for spec in slots}:
+            for geometry in geometries:
+                self._mask_for(slot, geometry, create=True)
+
+    def _visible_blocks_for(
+        self,
+        geometry: tuple[int, int, int],
+        *,
+        world_idx: int,
+        frame_pos: int,
+    ) -> list[int]:
+        tokens = self._kv_config.tokens_per_frame
+        blocks_per_frame = tokens // _DEFAULT_SPARSE_BLOCK_SIZE
+        ring_frames, ring_buckets, dilation = geometry
+        capacity_blocks = (ring_frames + 1) * blocks_per_frame
+        world_base = world_idx * capacity_blocks
+
+        committed = range(0, frame_pos, dilation)
+        slots = {
+            (frame // dilation) % ring_buckets for frame in committed
+        }
+        if frame_pos % dilation == 0:
+            slots.discard((frame_pos // dilation) % ring_buckets)
+
+        visible: list[int] = []
+        for ring_slot in sorted(slots):
+            start = world_base + ring_slot * blocks_per_frame
+            visible.extend(range(start, start + blocks_per_frame))
+        scratch = world_base + ring_frames * blocks_per_frame
+        visible.extend(range(scratch, scratch + blocks_per_frame))
+        return visible
+
+    def _stage(
+        self,
+        mask: BlockMask,
+        geometry: tuple[int, int, int],
+        plan: RingPlan,
+    ) -> None:
+        counts, indices, period = self._visibility_table_for(geometry)
+        phase = (
+            plan.frame_pos
+            if plan.frame_pos < period
+            else period + plan.frame_pos % period
+        )
+        mask.full_kv_num_blocks.copy_(counts[plan.world_idx, phase])
+        mask.full_kv_indices.copy_(indices[plan.world_idx, phase])
+
+    def plan(self, step: AttentionStep, ctx: StepContext) -> None:
+        """Stage one local/global visibility mask for this frame and slot."""
+        del step
         self.reset_default_cursors()
+        ring_plan = ctx.plan_results.get(self._kv_cache_name)
+        if ring_plan is None:
+            # Keeps standalone manager tests and non-ring diagnostic calls able
+            # to use the visibility tensor supplied directly to attend().
+            self._active_slot = None
+            return
+        if not isinstance(ring_plan, RingPlan):
+            raise TypeError(
+                f"FlexAttention expected RingPlan from {self._kv_cache_name!r}; "
+                f"got {type(ring_plan).__name__}"
+            )
+        self._active_slot = ctx.slot
+        geometries = {self._geometry(layer) for layer in self._kv_config.layers}
+        for geometry in geometries:
+            mask = self._mask_for(ctx.slot, geometry, create=not ctx.capture)
+            self._stage(mask, geometry, ring_plan)
 
     def attend(
         self,
@@ -178,6 +355,7 @@ class FlexAttentionManager(AttentionManager):
         visible: Tensor,
         *,
         enable_gqa: bool,
+        layer_idx: int | None = None,
     ) -> Tensor:
         """One layer's attention over the ring.
 
@@ -188,13 +366,11 @@ class FlexAttentionManager(AttentionManager):
         which is the entire reason this backend exists. Returns
         ``[B, H_q, T, D]``.
         """
-        # Rebuilt every call. The mask is pass-invariant by construction (all
-        # passes over one frame see byte-identical KV), so a cache keyed on
-        # (layer_idx, frame_pos) would collapse 120 rebuilds per frame to 24.
-        # Deliberately NOT taken: there is no measurement of what the rebuild
-        # costs against the rest of the frame, and a stale mask is
-        # exactly the failure this backend is here to prevent. Measure first.
-        block_mask = make_block_mask(q.size(-2), k.size(-2), visible)
+        if self._active_slot is None or layer_idx is None:
+            block_mask = make_block_mask(q.size(-2), k.size(-2), visible)
+        else:
+            geometry = self._geometry(self._kv_config.layers[layer_idx])
+            block_mask = self._mask_for(self._active_slot, geometry)
         # `flex_attention_masked`, never bare `flex_attention`: with a no-op
         # `mask_mod` the eager path ignores the block mask entirely and attends
         # to unwritten ring slots. See the note at its definition.

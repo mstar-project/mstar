@@ -1,0 +1,39 @@
+model: "waypoint"
+
+# Checkpoint selection, numerical behavior, and execution mode are explicit inputs.
+# Local `checkpoint_dir` / `ae_path` overrides can be added here without changing
+# the registry entry. The exact-table path is experimental and must be opted into
+# with `reference_compat: false`. `compile_dit` and `cuda_graph` are independent;
+# failed CUDA graph capture falls back to the selected DiT execution mode.
+model_kwargs:
+  variant: "waypoint-1.5-1b-720p"
+  reference_compat: true
+  compile_dit: true
+  cuda_graph: true
+  full_global_ring: false
+
+# The world state is a ring, not a paged KV cache, so nothing here is sized in
+# sequence positions; max_seq_len only satisfies the conductor's config check
+# and matches one frame's token count.
+max_seq_len: 512
+
+# The primary bound on the world pool. `WaypointModel.get_worker_graphs`
+# refuses to build unless this is a positive int no larger than
+# `resources.kv.num_worlds`: a world is claimed at admit, by which point a
+# request the pool cannot hold can only be failed terminally, and the
+# conductor's FIFO admit queue that prevents that exists only when this is set.
+max_concurrent_requests: 1
+
+resources:
+  kv:
+    # ~816 MiB of ring per world at 720P. Raise together with
+    # max_concurrent_requests; the two are checked against each other.
+    num_worlds: 1
+
+# 1.28B DiT plus a ~7M-parameter TAEHV, all on rank 0. One group, not wan22's
+# split: the rollout Loop body is dit -> vae_decoder, and the decoder is a
+# streaming model whose frames must be decoded exactly once in emission order,
+# so there is nothing to gain from putting a worker boundary inside the loop.
+node_groups:
+  - node_names: [vae_encoder, dit, vae_decoder]
+    ranks: [0]

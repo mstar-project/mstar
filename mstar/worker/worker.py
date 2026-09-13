@@ -630,6 +630,7 @@ class Worker:
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
+        logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
@@ -1491,7 +1492,12 @@ class Worker:
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
-        logger.debug("Executing batch for node %s", node_batch.node_name)
+        logger.debug(
+            "Executing: %s graph_walk=%s %s",
+            node_batch.node_name,
+            batch.graph_walk,
+            node_batch.request_ids,
+        )
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)

@@ -229,8 +229,8 @@ def test_num_worlds_is_the_one_yaml_tunable():
     assert kv.total_slots(0) == 4 * kv.capacity(0)
 
 
-@pytest.mark.parametrize("bad", [0, -1])
-def test_zero_worlds_is_refused_at_both_entry_points(bad):
+@pytest.mark.parametrize("bad", [0, -1, True, 1.0, 1.9, "2"])
+def test_invalid_num_worlds_is_refused_at_both_entry_points(bad):
     """A node sized for zero worlds refuses every request at admit — a
     deployment that boots, reports healthy, and serves nothing."""
     with pytest.raises(ValueError, match="num_worlds"):
@@ -426,7 +426,9 @@ def test_concurrent_requests_get_distinct_worlds(num_worlds):
 
     worlds = [kv.world_of(rid) for rid in rids]
     assert None not in worlds
-    assert len(set(worlds)) == num_worlds, f"worlds collided: {dict(zip(rids, worlds))}"
+    assert len(set(worlds)) == num_worlds, (
+        f"worlds collided: {dict(zip(rids, worlds, strict=True))}"
+    )
     assert set(worlds) == set(range(num_worlds)), "a world was skipped"
     assert not kv._free_worlds
 
@@ -1137,6 +1139,31 @@ def test_upsert_returns_the_whole_buffer_and_delegates_by_layer():
         assert visible.shape == (total,)
         assert k_all.shape[0] == 1, "the world dim is folded into tokens, not dim 0"
         assert k_all.data_ptr() == kv.layers[layer_idx].kv.data_ptr()
+
+
+def test_planned_attention_skips_per_upsert_visibility_reconstruction():
+    """A planned block mask makes the token-level scratch row dead output."""
+    kv = _manager()
+    _open(kv, "r")
+    kv.plan(_step("r"), _ctx("r"))
+    layer = kv.layers[0]
+    layer._mask_written.copy_(
+        torch.arange(layer.total_slots).remainder(2).to(torch.bool)
+    )
+    sentinel = layer._mask_written.clone()
+    k, v = _frame(kv, torch.Generator().manual_seed(91))
+
+    _, _, returned = kv.upsert(
+        k,
+        v,
+        0,
+        torch.tensor(0, dtype=torch.int64),
+        commit=False,
+        build_visibility=False,
+    )
+
+    assert returned.data_ptr() == layer._mask_written.data_ptr()
+    assert torch.equal(returned, sentinel)
 
 
 def test_frozen_passes_leave_the_ring_byte_identical():

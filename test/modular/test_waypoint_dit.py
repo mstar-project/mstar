@@ -64,6 +64,9 @@ def reduced_config(**overrides) -> WaypointConfig:
         "global_window": 32,
         "global_pinned_dilation": 8,
         "n_buttons": 8,
+        # Most CPU unit inputs are fp32. Reference-compatible serving is bf16
+        # and has its own numerical tests; keep these structural tests exact.
+        "reference_compat": False,
     }
     return WaypointConfig(**{**base, **overrides})
 
@@ -170,7 +173,10 @@ class RecordingRingKV:
 
     # -- the model-facing surface, delegated ---------------------------------
 
-    def upsert(self, k, v, layer_idx, frame_pos, *, commit):
+    def upsert(
+        self, k, v, layer_idx, frame_pos, *, commit, build_visibility=True,
+    ):
+        del build_visibility
         self.upserts.append(
             {
                 "commit": commit,
@@ -571,7 +577,10 @@ class CaptureKV:
     def __init__(self):
         self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-    def upsert(self, k, v, layer_idx, frame_pos, *, commit):
+    def upsert(
+        self, k, v, layer_idx, frame_pos, *, commit, build_visibility=True,
+    ):
+        del build_visibility
         self.calls.append((k.detach().clone(), v.detach().clone()))
         return k, v, None
 
@@ -584,7 +593,8 @@ class DenseAttn:
 
     requires_kv_write = False
 
-    def attend(self, q, k, v, visible, *, enable_gqa):
+    def attend(self, q, k, v, visible, *, enable_gqa, layer_idx=None):
+        del layer_idx
         assert visible is None, "CaptureKV returns no visibility row"
         return torch.nn.functional.scaled_dot_product_attention(q, k, v, enable_gqa=enable_gqa)
 
