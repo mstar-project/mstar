@@ -804,7 +804,26 @@ class TensorCommunicationManager(ABC):
     def increment_ref(self, request_id: str, uuid: str, n: int = 1):
         self.tensor_store.increment_ref(request_id, uuid, n=n)
 
-    def cleanup_request(self, request_id: str):
+    def has_inflight_reads(self, request_id: str) -> bool:
+        """Whether any async read for this request is still touching a remote
+        segment. Synchronous (SHM) reads complete inside ``start_read_tensors``
+        with ``future=None``, so they never count here; only outstanding
+        async (RDMA) futures do. Gates the READS_DONE ACK during a drain.
+        """
+        return any(
+            ep.request_id == request_id
+            and ep.future is not None and not ep.future.done()
+            for ep in self.pending
+        )
+
+    def cleanup_request(self, request_id: str, force: bool = False):
+        """Teardown for a request's tensor state.
+
+        Default (soft): drop tensors that are safe to GC, defer any still
+        referenced or persisted. Does NOT force-drop persisted signals — that
+        is the conductor-coordinated hard cleanup, see
+        :meth:`force_cleanup_request`.
+        """
         self.read_finished.pop(request_id, None)
         self.buffered_shards.pop(request_id, None)
         self.sharding_configs.pop(request_id, None)
@@ -812,11 +831,10 @@ class TensorCommunicationManager(ABC):
         self.req_tx_info.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):
             self.uuid_to_shard_dim.pop(uuid, None)
-            self.tensor_store.set_metadata(request_id, uuid, persist=False)
-            if not self.tensor_store.can_gc(request_id, uuid):
+            if not self.tensor_store.can_gc(request_id, uuid) and not force:
                 logger.warning(
                     "Deferring cleanup of tensor uuid %s "
-                    "(awaiting TENSOR_RECEIVED ACK)", uuid
+                    "(awaiting TENSOR_RECEIVED ACK or unpersist)", uuid
                 )
                 continue
             self._cleanup_by_uuid(request_id, uuid)
@@ -826,6 +844,15 @@ class TensorCommunicationManager(ABC):
             sum([ep.graph_edges for ep in self.pending if ep.request_id == request_id], start=[]),
         )
         self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+
+    def force_cleanup_request(self, request_id: str):
+        """Unconditional teardown: drop every tensor for the request and unlink
+        its SHM, ignoring ref counts and persist markers. Safe only after every
+        reader has confirmed (READS_DONE) it has no in-flight reads for the
+        request. Also reclaims non-persisted buffers whose readers drained
+        before ACKing (which the soft path would otherwise defer forever).
+        """
+        self.cleanup_request(request_id, force=True)
 
 
 # ---------------------------------------------------------------------------
