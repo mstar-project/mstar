@@ -38,6 +38,12 @@ SUPPORTED_MODALITIES = frozenset({
 })
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
+NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
+# Opt-in framing for raw binary payloads, requested via ``Accept``. Duplicated
+# rather than shared with ``mstar.client.media`` so the SDK keeps its stdlib-only
+# import contract; ``test_binary_framing.py`` asserts the two stay equal.
+BINARY_STREAM_MEDIA_TYPE = "application/vnd.mstar.frames"
+
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
 for _mod, _exts in {
@@ -171,6 +177,26 @@ def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
         "data": base64.b64encode(chunk.data).decode("ascii"),
         "metadata": chunk.metadata,
     }) + "\n"
+
+
+def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
+    """Serialize one result chunk as a header line plus its untouched payload.
+
+    ``nbytes`` lets the reader frame by length instead of by delimiter, and no
+    delimiter means no escaping — which is the only reason the NDJSON form has
+    to base64 the payload. A 720p video_frame chunk costs two full passes over
+    ~14.7 MB in that form (base64, then ``json.dumps`` escape-scanning every
+    character it just produced); here the payload is handed on by reference.
+
+    ``json.dumps`` escapes control characters, so the header can never contain
+    a raw newline and the reader's line split is always unambiguous.
+    """
+    header = json.dumps({
+        "modality": chunk.modality,
+        "nbytes": len(chunk.data),
+        "metadata": chunk.metadata,
+    }, separators=(",", ":"))
+    return header.encode("utf-8") + b"\n", chunk.data
 
 
 class APIServer:
@@ -609,13 +635,57 @@ class APIServer:
             if not finished:
                 self.abort_request(request_id)
 
-    async def async_stream_results(self, request_id: str):
-        """Yield NDJSON lines as result chunks arrive (``/generate`` format)."""
+    def async_stream_results(self, request_id: str, binary: bool = False):
+        """Yield the serialized body of ``/generate`` one piece at a time.
+
+        ``binary`` selects the length-framed form negotiated through ``Accept``.
+        The default stays NDJSON, so a client that did not negotiate — including
+        the Rust frontend, which never reads ``Accept`` — sees today's bytes.
+
+        Deliberately a plain ``def`` returning the chosen async generator rather
+        than an ``async def`` delegating to it: the branch is per-request, not
+        per-chunk, and this keeps both bodies flat.
+        """
+        if binary:
+            return self._stream_binary(request_id)
+        return self._stream_ndjson(request_id)
+
+    async def _stream_ndjson(self, request_id: str):
         async for chunk in self.iter_result_chunks(request_id):
             line = self._chunk_to_ndjson(chunk)
-            if self.enable_nvtx:
-                profiler.mark(f"apiserver.yield_line.bytes[{len(line)}]")
-            yield line
+            if not self.enable_nvtx:
+                yield line
+                continue
+            profiler.mark(f"apiserver.yield_line.bytes[{len(line)}]")
+            # Spans the handoff to Starlette/uvicorn: chunked-transfer framing
+            # and the socket writes for ~14.7 MB, plus any transport
+            # backpressure. The generator resumes only once that is done, so
+            # this range is the server's share of the client's blocking read.
+            profiler.range_push(f"apiserver.socket_write.bytes[{len(line)}]")
+            try:
+                yield line
+            finally:
+                profiler.range_pop()
+
+    async def _stream_binary(self, request_id: str):
+        async for chunk in self.iter_result_chunks(request_id):
+            header, payload = _chunk_to_binary_frame(chunk)
+            # Two yields rather than one concatenation: joining them would copy
+            # the whole payload to prepend ~100 bytes, which is the class of
+            # work this framing exists to remove.
+            yield header
+            if not self.enable_nvtx:
+                yield payload
+                continue
+            profiler.mark(f"apiserver.yield_frame.bytes[{len(payload)}]")
+            # Same range name as the NDJSON path on purpose: it is the column
+            # the gap budget in STREAMING_GAP_BUDGET.md is built from, so the
+            # two protocols stay directly comparable in one analyzer run.
+            profiler.range_push(f"apiserver.socket_write.bytes[{len(payload)}]")
+            try:
+                yield payload
+            finally:
+                profiler.range_pop()
 
     def _chunk_to_ndjson(self, chunk: ResultChunk) -> str:
         if not self.enable_nvtx:
@@ -870,10 +940,14 @@ async def generate(
         )
 
         if streaming:
+            # Substring match, not RFC 7231 q-value parsing: the value is a
+            # private vendor type that appears in no other media range, and a
+            # client that does not ask for it keeps the historical NDJSON body.
+            binary = BINARY_STREAM_MEDIA_TYPE in request.headers.get("accept", "")
             return StreamingResponse(
-                api_server.async_stream_results(request_id),
-                media_type="application/x-ndjson",
-                headers={"Cache-Control": "no-cache"},
+                api_server.async_stream_results(request_id, binary=binary),
+                media_type=BINARY_STREAM_MEDIA_TYPE if binary else NDJSON_STREAM_MEDIA_TYPE,
+                headers={"Cache-Control": "no-cache", "Vary": "Accept"},
             )
 
         chunks = await api_server.collect_results(request_id, request)
