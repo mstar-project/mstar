@@ -680,9 +680,14 @@ class APIServer:
 # FastAPI application
 # ------------------------------------------------------------------
 
+# Behind an ingress that serves the app under a sub-path -- Run:AI routes a
+# workload at /<project>/<job-name>/ and does NOT strip the prefix before it
+# reaches the pod -- FastAPI has to be told, or every route 404s on a path it
+# considers unknown. Empty by default, so a direct deployment is unaffected.
 app = FastAPI(
     title="mstar API",
     description="Multimodal Inference API",
+    root_path=os.environ.get("MSTAR_ROOT_PATH", ""),
 )
 app.add_middleware(
     CORSMiddleware,
