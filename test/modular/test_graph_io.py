@@ -143,14 +143,17 @@ def test_speculation_strict_mode_partial_spec_not_ready():
     assert ar_decode.ready_signals.is_ready
 
     # Now speculatively ingest ONLY one of the two anticipated outputs.
-    io.ingest_for_speculation(GraphEdge(name="token", next_node="ar_decode"))
+    ready = io.ingest_for_speculation(
+        [GraphEdge(name="token", next_node="ar_decode")], "ar_decode"
+    )
     # Strict gate: speculative_signals alone doesn't cover input_names, so
-    # the node must not appear in ready_for_speculation despite the union
-    # with ready_signals being a full set.
-    assert io.ready_for_speculation == []
+    # the node must not be returned as ready despite the union with
+    # ready_signals being a full set.
+    assert ready == []
 
-    io.ingest_for_speculation(GraphEdge(name="kv_cache", next_node="ar_decode"))
-    ready = io.ready_for_speculation
+    ready = io.ingest_for_speculation(
+        [GraphEdge(name="kv_cache", next_node="ar_decode")], "ar_decode"
+    )
     assert len(ready) == 1
     assert ready[0].node_name == "ar_decode"
     assert ready[0].is_new_loop_iter is True

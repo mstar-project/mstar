@@ -52,6 +52,8 @@ def test_preprocess_failure_emits_error_chunk():
     wt.out_queue = queue.Queue()
     wt.result_tensor_queue = queue.Queue()
     wt.cleanup_request_queue = queue.Queue()
+    wt.abort_request_queue = queue.Queue()
+    wt.discard_tensor_queue = queue.Queue()
     wt.stop_event = threading.Event()
     wt.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
     cleaned = []
