@@ -22,7 +22,12 @@ from typing import Iterator
 
 import requests
 
-from mstar.client.media import parse_ndjson_line
+from mstar.client.media import (
+    BINARY_STREAM_MEDIA_TYPE,
+    NDJSON_STREAM_MEDIA_TYPE,
+    iter_binary_frames,
+    parse_ndjson_line,
+)
 from mstar.client.types import (
     AudioBuffer,
     AudioChunk,
@@ -42,16 +47,42 @@ _MODALITY_OF = {"images": "image", "audio": "audio", "video": "video"}
 MediaItem = "str | bytes | Path | tuple[str, bytes]"
 
 
+def _load_nvtx():
+    """Return ``(range_push, range_pop)``, importing torch only on demand.
+
+    The SDK's dependency contract is stdlib + ``requests`` (+ ``numpy``), so
+    the profiler import cannot happen at module scope. Only a caller that
+    explicitly asks for NVTX pays for it, and such a caller is by definition
+    running under a CUDA profiler already.
+    """
+    from mstar.utils.profiler import range_pop, range_push
+
+    return range_push, range_pop
+
+
 class MStarClient:
     def __init__(
         self,
         base_url: str = "http://localhost:8000",
         timeout: float = 600.0,
         session: requests.Session | None = None,
+        enable_nvtx: bool = False,
+        prefer_binary: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._session = session or requests.Session()
+        # Ask for length-framed binary payloads, but decide how to parse from
+        # the response's Content-Type. A server that does not implement the
+        # framing — an older build, or the Rust frontend, neither of which reads
+        # ``Accept`` — answers NDJSON and the historical path handles it. Set
+        # False to force NDJSON, which the streaming benchmark uses to A/B.
+        self._prefer_binary = prefer_binary
+        # Splits the client's share of the streaming gap into the blocking
+        # socket read and the decode of the line it returns. Without this the
+        # whole of both lands in the caller's "waiting for a chunk" range and
+        # is indistinguishable from server time.
+        self._nvtx = _load_nvtx() if enable_nvtx else None
 
     # ------------------------------------------------------------------
     # Core
@@ -193,11 +224,65 @@ class MStarClient:
             return item[0], bytes(item[1])
         raise TypeError(f"Unsupported {kind} item type: {type(item)!r}")
 
+    def _stream_headers(self) -> dict[str, str]:
+        if not self._prefer_binary:
+            return {}
+        return {
+            "Accept": f"{BINARY_STREAM_MEDIA_TYPE}, {NDJSON_STREAM_MEDIA_TYPE};q=0.9",
+            # Compressing ~11 MB of near-incompressible RGB per chunk would put
+            # back the byte-proportional CPU pass this framing exists to remove.
+            "Accept-Encoding": "identity",
+        }
+
+    def _stream_binary(self, resp) -> Iterator[StreamEvent]:
+        """Consume a length-framed response body off the raw socket."""
+        encoding = resp.headers.get("content-encoding", "").lower()
+        if encoding and encoding != "identity":
+            # ``resp.raw.read`` hands back undecoded bytes, so a compressed body
+            # would surface as an unreadable header. Fail with the cause named.
+            raise RuntimeError(
+                f"Binary frame stream arrived with Content-Encoding {encoding!r}; "
+                "only 'identity' can be read from the raw socket"
+            )
+        frames = iter_binary_frames(resp.raw)
+        if self._nvtx is None:
+            for parsed in frames:
+                yield self._to_event(parsed)
+            return
+
+        range_push, range_pop = self._nvtx
+        while True:
+            # The blocking socket read plus frame reassembly. Counterpart of
+            # ``client.iter_lines`` on the NDJSON path; there is no decode step
+            # to measure after it, which is the point.
+            range_push("client.read_frame")
+            try:
+                parsed = next(frames)
+            except StopIteration:
+                range_pop()
+                break
+            range_pop()
+            range_push("client.to_event")
+            event = self._to_event(parsed)
+            range_pop()
+            yield event
+
     def _stream(self, url, data, files) -> Iterator[StreamEvent]:
         with self._session.post(
-            url, data=data, files=files or None, stream=True, timeout=self.timeout
+            url,
+            data=data,
+            files=files or None,
+            stream=True,
+            timeout=self.timeout,
+            headers=self._stream_headers(),
         ) as resp:
             resp.raise_for_status()
+            # Branch on what the server actually sent, not on what was asked
+            # for: that is what makes the negotiation safe against servers that
+            # ignore ``Accept`` entirely.
+            if resp.headers.get("content-type", "").startswith(BINARY_STREAM_MEDIA_TYPE):
+                yield from self._stream_binary(resp)
+                return
             # ``decode_unicode=True`` only yields ``str`` when ``resp.encoding``
             # is set, and that is derived from the Content-Type charset. The
             # server streams ``application/x-ndjson`` without one, so default to
@@ -207,16 +292,45 @@ class MStarClient:
             # Raw RGB frame events are multi-megabyte NDJSON lines. Requests'
             # 512-byte default repeatedly concatenates the growing partial
             # line and becomes quadratic at 720p, so read them in large slabs.
-            for line in resp.iter_lines(
+            lines = resp.iter_lines(
                 chunk_size=_STREAM_READ_CHUNK_SIZE,
                 decode_unicode=True,
-            ):
+            )
+            if self._nvtx is None:
+                for line in lines:
+                    if not isinstance(line, str):
+                        continue
+                    parsed = parse_ndjson_line(line)
+                    if parsed is None:
+                        continue
+                    yield self._to_event(parsed)
+                return
+
+            range_push, range_pop = self._nvtx
+            while True:
+                # Socket read, UTF-8 decode and line reassembly. At 720p one
+                # line is ~14.7 MB of ASCII, so this is where transport time
+                # and the client's own copying both land.
+                range_push("client.iter_lines")
+                try:
+                    line = next(lines)
+                except StopIteration:
+                    range_pop()
+                    break
+                range_pop()
                 if not isinstance(line, str):
                     continue
+                # json.loads over that line plus the base64 decode back to
+                # the original 11 MiB of RGB.
+                range_push(f"client.parse_ndjson.chars[{len(line)}]")
                 parsed = parse_ndjson_line(line)
+                range_pop()
                 if parsed is None:
                     continue
-                yield self._to_event(parsed)
+                range_push("client.to_event")
+                event = self._to_event(parsed)
+                range_pop()
+                yield event
 
     @staticmethod
     def _to_event(parsed: dict) -> StreamEvent:

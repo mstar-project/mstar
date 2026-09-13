@@ -130,3 +130,76 @@ def test_audiobuffer_wav_bytes():
     pcm = np.array([0, 16000, -16000], dtype="<i2").tobytes()
     wav = AudioBuffer(pcm, 24000).wav_bytes()
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE" and wav[44:] == pcm
+
+
+def _fake_response(content_type: str, body: bytes, extra_headers=None):
+    requests = pytest.importorskip("requests")
+    resp = requests.Response()
+    resp.status_code = 200
+    resp.headers["Content-Type"] = content_type
+    for key, value in (extra_headers or {}).items():
+        resp.headers[key] = value
+    resp.raw = io.BytesIO(body)
+    return resp
+
+
+def _stream_with(client, resp):
+    ctx = mock.MagicMock()
+    ctx.__enter__.return_value = resp
+    with mock.patch.object(client._session, "post", return_value=ctx) as post:
+        events = list(client._stream("http://x/generate", {}, None))
+    return events, post
+
+
+def test_stream_takes_the_binary_path_when_the_server_says_so():
+    from mstar.api_server.entrypoint import _chunk_to_binary_frame
+    from mstar.api_server.request_types import ResultChunk
+    from mstar.client.media import BINARY_STREAM_MEDIA_TYPE
+
+    payload = bytes(range(256)) * 8
+    header, body = _chunk_to_binary_frame(
+        ResultChunk(request_id="r", modality="text", data=payload, metadata={})
+    )
+    resp = _fake_response(BINARY_STREAM_MEDIA_TYPE, header + body)
+
+    events, post = _stream_with(MStarClient("http://x"), resp)
+
+    assert [e.text for e in events] == [payload.decode("utf-8", "replace")]
+    headers = post.call_args.kwargs["headers"]
+    assert BINARY_STREAM_MEDIA_TYPE in headers["Accept"]
+    assert headers["Accept-Encoding"] == "identity"
+
+
+def test_stream_falls_back_to_ndjson_when_the_server_ignores_accept():
+    """An older server or the Rust frontend answers x-ndjson regardless of what
+    was asked for; the client keys off the response, so nothing breaks."""
+    line = json.dumps({"modality": "text", "data": base64.b64encode(b"hi").decode(), "metadata": {}})
+    resp = _fake_response("application/x-ndjson", (line + "\n").encode())
+
+    with mock.patch.object(resp, "iter_lines", wraps=resp.iter_lines) as iter_lines:
+        events, _ = _stream_with(MStarClient("http://x"), resp)
+
+    assert [e.text for e in events] == ["hi"]
+    iter_lines.assert_called_once_with(chunk_size=1024 * 1024, decode_unicode=True)
+
+
+def test_stream_sends_no_negotiation_headers_when_binary_is_disabled():
+    line = json.dumps({"modality": "text", "data": base64.b64encode(b"hi").decode(), "metadata": {}})
+    resp = _fake_response("application/x-ndjson", (line + "\n").encode())
+
+    events, post = _stream_with(MStarClient("http://x", prefer_binary=False), resp)
+
+    assert [e.text for e in events] == ["hi"]
+    assert post.call_args.kwargs["headers"] == {}
+
+
+def test_stream_names_content_encoding_as_the_cause_on_a_compressed_binary_body():
+    """``resp.raw.read`` bypasses urllib3's decoder, so a gzipped body would
+    otherwise surface as an unreadable frame header."""
+    from mstar.client.media import BINARY_STREAM_MEDIA_TYPE
+
+    resp = _fake_response(
+        BINARY_STREAM_MEDIA_TYPE, b"\x1f\x8b garbage", {"Content-Encoding": "gzip"}
+    )
+    with pytest.raises(RuntimeError, match="Content-Encoding 'gzip'"):
+        _stream_with(MStarClient("http://x"), resp)
