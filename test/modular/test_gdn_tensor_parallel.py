@@ -267,3 +267,36 @@ def test_fused_layout_refuses_tp_rather_than_sharding_it_wrong():
             layout=GDNProjLayout.FUSED,
             comm_group=CommGroup(0, 0, [0, 1]),
         )
+
+
+def test_untied_lm_head_is_remapped_from_the_checkpoint_root():
+    """9B and 27B untie the head; the tied sizes carry no tensor for it.
+
+    An untied `lm_head.weight` sits at the checkpoint's *root*, outside
+    `model.language_model.`, so a remapper that only passes that prefix drops
+    it and the load fails with one unfilled parameter.
+    """
+    from mstar.model.qwen3_5.weight_loader import qwen3_5_name_remapper
+
+    assert qwen3_5_name_remapper("lm_head.weight") == "lm_head.weight"
+    assert (
+        qwen3_5_name_remapper("model.language_model.layers.0.linear_attn.A_log")
+        == "model.layers.0.self_attn.A_log"
+    )
+    # the vision tower and the MTP head load separately, or not at all
+    assert qwen3_5_name_remapper("model.visual.blocks.0.attn.qkv.weight") is None
+    assert qwen3_5_name_remapper("mtp.layers.0.self_attn.q_proj.weight") is None
+
+
+@pytest.mark.parametrize("tied", [True, False])
+def test_head_is_expected_only_when_untied(tied):
+    """Tied, `named_parameters` dedupes it away; untied, it must be loaded."""
+    from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
+
+    config = tiny_config()
+    config.tie_word_embeddings = tied
+    model = Qwen3_5ForCausalLM(config, CommGroup(0, 0, [0]))
+    names = {n for n, _ in model.named_parameters()}
+    assert ("lm_head.weight" in names) is not tied
+    if tied:
+        assert model.lm_head.weight is model.model.embed_tokens.weight
