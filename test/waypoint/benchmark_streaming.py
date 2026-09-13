@@ -43,6 +43,7 @@ if str(REPO) not in sys.path:
 import serve_rollout as rollout  # noqa: E402
 
 from mstar.client import MStarClient, VideoFrameChunk  # noqa: E402
+from mstar.utils import profiler  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -176,6 +177,7 @@ def _measure_stream(
     stall_threshold_seconds: float,
     clock: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], None] = time.sleep,
+    enable_nvtx: bool = False,
 ) -> tuple[dict, list[str]]:
     """Consume one stream while retaining only timings and an incremental hash."""
     stream = client.stream(
@@ -188,6 +190,8 @@ def _measure_stream(
         seed=rng_seed,
     )
     iterator = iter(stream)
+    if enable_nvtx:
+        profiler.range_push(f"benchmark.stream[{request_id}]")
     started = clock()
     observations: list[ChunkObservation] = []
     failures: list[str] = []
@@ -196,11 +200,22 @@ def _measure_stream(
 
     while True:
         try:
+            # The span the sustained ratio is built from: SDK decode plus the
+            # blocking socket read, ending at the instant `arrived` is stamped.
+            if enable_nvtx:
+                profiler.range_push(f"benchmark.await_chunk[{len(observations)}]")
             event = next(iterator)
+            if enable_nvtx:
+                profiler.range_pop()
         except StopIteration:
+            if enable_nvtx:
+                profiler.range_pop()  # the await range
+                profiler.range_pop()  # benchmark.stream
             completed = clock()
             break
         arrived = clock()
+        if enable_nvtx:
+            profiler.mark(f"benchmark.chunk_arrival[{len(observations)}]")
         if not isinstance(event, VideoFrameChunk):
             failures.append(
                 f"stream event {len(observations)} was {type(event).__name__}, not VideoFrameChunk"
@@ -513,6 +528,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
                 rng_seed=args.seed,
                 consumer_pause_seconds=0.0,
                 stall_threshold_seconds=stall_threshold,
+                enable_nvtx=args.enable_nvtx,
             )
             failures.extend(f"warmup: {failure}" for failure in warmup_failures)
             rollout._wait_for_cleanup(
@@ -540,6 +556,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
                 rng_seed=args.seed,
                 consumer_pause_seconds=pause,
                 stall_threshold_seconds=stall_threshold,
+                enable_nvtx=args.enable_nvtx,
             )
             failures.extend(f"{name}: {failure}" for failure in stream_failures)
             rollout._wait_for_cleanup(
