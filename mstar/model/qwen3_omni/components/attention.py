@@ -5,8 +5,9 @@ fused QKV projection, and TP-sharded o_proj). The Qwen3-specific piece
 is the 3D MRoPE path used by the Thinker — for ``use_mrope=True`` the
 RoPE call goes through ``apply_interleaved_mrope`` with externally
 provided ``cos_sin_3d`` instead of the cache handle. Talker uses
-standard 1D RoPE (``use_mrope=False``) and inherits the parent's
-``_apply_rope`` as-is.
+standard 1D RoPE (``use_mrope=False``) through the step surface's
+``apply_rope``. Every rope and attention call names its layer and plan
+key explicitly.
 
 Follows the same shape conventions as the shared attention:
   q: [tokens, num_heads, head_dim]
@@ -19,8 +20,41 @@ from typing import Optional, Tuple
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.distributed import ParallelAttention
+
+_fa2_maxlen_patched = False
+
+
+def patch_hf_fa2_int_maxlen() -> None:
+    """Make HF's FA2 encoder path torch.compile-able.
+
+    ``Qwen3OmniMoeAudioAttention`` / ``Qwen3OmniMoeVisionAttention`` compute
+    ``max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()`` and hand that
+    0-dim tensor to ``flash_attn_varlen_func``, whose schema declares
+    ``max_seqlen_q/k`` as ``SymInt``. Eager tolerates it (the arg parser
+    unwraps a 0-dim tensor); dynamo's fake-tensor propagation does not, and
+    the encoder forward dies with "Expected a value of type 'int'".
+
+    Wrap the registered ``flash_attention_2`` interface so those two kwargs
+    arrive as ints. Idempotent, and a no-op for callers already passing ints.
+    """
+    global _fa2_maxlen_patched
+    if _fa2_maxlen_patched:
+        return
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    inner = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+
+    def fa2_int_maxlen(*args, max_length_q=None, max_length_k=None, **kwargs):
+        if isinstance(max_length_q, torch.Tensor):
+            max_length_q = max_length_q.item()
+        if isinstance(max_length_k, torch.Tensor):
+            max_length_k = max_length_k.item()
+        return inner(*args, max_length_q=max_length_q, max_length_k=max_length_k, **kwargs)
+
+    ALL_ATTENTION_FUNCTIONS.register("flash_attention_2", fa2_int_maxlen)
+    _fa2_maxlen_patched = True
 
 
 class Qwen3OmniAttention(ParallelAttention):
@@ -42,6 +76,9 @@ class Qwen3OmniAttention(ParallelAttention):
         rms_norm_eps: float = 1e-6,
         use_mrope: bool = False,
         comm_group: CommGroup | None = None,
+        attn_key: str = "attn",
+        kv_key: str = "kv",
+        pos_key: str | None = "rope"
     ):
         super().__init__(
             comm_group=comm_group,
@@ -54,13 +91,16 @@ class Qwen3OmniAttention(ParallelAttention):
             qk_norm=True,
             rms_norm_eps=rms_norm_eps,
             rope_theta=rope_theta,
+            attn_key=attn_key,
+            kv_key=kv_key,
+            pos_key=pos_key
+
         )
         self.use_mrope = use_mrope
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
     ) -> torch.Tensor:
@@ -73,8 +113,8 @@ class Qwen3OmniAttention(ParallelAttention):
             cos, sin = cos_sin_3d
             q, k = apply_interleaved_mrope(q, k, cos, sin)
         else:
-            q, k = self._apply_rope(q, k, cache_handle)
+            q, k = self._apply_rope(q, k, self.attend.label)
 
-        attn_output = cache_handle.run_attention(q=q, k=k, v=v)
+        attn_output = self.attend(q, k, v)
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

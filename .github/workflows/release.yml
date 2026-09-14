@@ -1,0 +1,28 @@
+name: Publish to PyPI
+
+# Publishes the m-star distribution when a GitHub Release is published.
+# Uses PyPI Trusted Publishing (OIDC) — no API token or secret needed.
+# Configure a pending publisher on PyPI first: project m-star, owner
+# mstar-project, repo mstar, workflow release.yml, environment pypi.
+#
+# The alias packages under packaging/aliases/ change rarely and are
+# published by hand; they are not built here.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1

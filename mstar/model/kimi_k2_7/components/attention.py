@@ -8,18 +8,34 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components.distributed import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.norm import RMSNorm
 from mstar.model.kimi_k2_7.components.rope import KimiYarnRotaryEmbedding, yarn_get_mscale
-from mstar.model.kimi_k2_7.config import KimiK2Config
+from mstar.model.kimi_k2_7.config import ATTN, KV_CACHE, ROPE, KimiK2Config
 
 
 class KimiMLAAttention(nn.Module):
-    def __init__(self, config: KimiK2Config, comm_group: CommGroup | None = None) -> None:
+    def __init__(
+        self,
+        config: KimiK2Config,
+        comm_group: CommGroup | None = None,
+        attn_key: str = ATTN,
+        kv_key: str = KV_CACHE,
+        pos_key: str = ROPE,
+    ) -> None:
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
+
+        self._attn_key = attn_key
+        self._kv_key = kv_key
+        self._pos_key = pos_key
+        # resolved in `bind_resources`, once at load
+        self.attn = None
+        self.kv = None
+        self.pos = None
+        self.attend: AttentionCallable | None = None
 
         self.tp_size = comm_group.world_size
         self.total_num_heads = config.num_attention_heads
@@ -78,14 +94,30 @@ class KimiMLAAttention(nn.Module):
             self.register_buffer("w_vc", None, persistent=False)  # (H_local, Dv,    L)
             self.register_buffer("fused_qkv_a_proj_weight", None, persistent=False)  # (q_lora+L+Drope, hidden)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve the resources this layer calls. See
+        ``NodeSubmodule.bind_node_resources``."""
+        self.attn = resources.get(self._attn_key)
+        self.kv = resources.get(self._kv_key)
+        self.pos = resources.get(self._pos_key)
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+
+    @property
+    def position_ids(self) -> torch.Tensor:
+        """This step's packed position ids.
+
+        Off the position resource rather than a forward argument: Kimi applies
+        its own DeepSeek-yarn rotary (``apply_qk`` is the generic 1-D kernel),
+        so it takes the ids and leaves the rope to the layer. Under a captured
+        replay these are the resource's static buffer.
+        """
+        return self.pos.pos_ids(self.attend.label)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Label and layer index come off the resources' cursors; see
+        ``ParallelAttention.forward``."""
         if self.mla_absorb:
-            return self._forward_absorbed(hidden_states, cache_handle, position_ids)
+            return self._forward_absorbed(hidden_states)
 
         # Naive/materialized MLA — the reduced-capability fallback (see the
         # ``mla_absorb`` note in config.py), not a co-equal path. It projects the
@@ -96,7 +128,7 @@ class KimiMLAAttention(nn.Module):
         #
         # Two numerical quirks follow from reusing that MHA interface: q/k/v are
         # padded to ``padded_head_dim`` (FlashInfer paged kernels only accept
-        # 64/128/256), and because ``run_attention`` then scales by
+        # 64/128/256), and because the kernel then scales by
         # 1/sqrt(padded_head_dim), DeepSeek's intended qk_head_dim**-0.5 * mscale**2
         # is folded into q via ``softmax_scale_boost`` below.
         num_tokens = hidden_states.shape[0]
@@ -113,7 +145,7 @@ class KimiMLAAttention(nn.Module):
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # shared MQA rope key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe)
+        q_pe, k_pe = self.rotary(self.position_ids, q_pe, k_pe)
 
         q = torch.cat([q_nope, q_pe], dim=-1)  # (T, H, Dqk)
         k_pe = k_pe.expand(num_tokens, h, self.qk_rope_head_dim)
@@ -125,16 +157,11 @@ class KimiMLAAttention(nn.Module):
         v = F.pad(v, [0, self.padded_head_dim - self.v_head_dim])  # (T, H, Dpad)
 
         q = q * self.softmax_scale_boost
-        attn = cache_handle.run_attention(q=q, k=k, v=v)  # (T, H, Dpad)
+        attn = self.attend(q, k, v)  # (T, H, Dpad)
         attn = attn[..., : self.v_head_dim].reshape(num_tokens, h * self.v_head_dim)
         return self.o_proj(attn)
 
-    def _forward_absorbed(
-        self,
-        hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    def _forward_absorbed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run MLA over the compressed latent cache after folding kv_b into Q/O."""
         if self.w_kc is None or self.w_vc is None:
             raise RuntimeError(
@@ -164,11 +191,11 @@ class KimiMLAAttention(nn.Module):
         kv_c = self.kv_a_layernorm(kv_a).view(num_tokens, 1, self.kv_lora_rank)  # (T,1,L)
         k_pe = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)  # (T,1,Drope) shared MQA key
 
-        q_pe, k_pe = self.rotary(position_ids, q_pe, k_pe)
+        q_pe, k_pe = self.rotary(self.position_ids, q_pe, k_pe)
 
         q_nope = torch.einsum("thd,hdl->thl", q_nope, self.w_kc)
 
-        attn_latent = cache_handle.run_attention_mla(
+        attn_latent = self.attend.run_mla(
             q_nope=q_nope, q_pe=q_pe, kv_c=kv_c, k_pe=k_pe)
 
         out = torch.einsum("thl,hdl->thd", attn_latent, self.w_vc)

@@ -4,8 +4,9 @@ max_seq_len: 8192
 # Per-rank KV pool. With 2D tp*sp = 4 each rank holds num_kv_heads / 4 heads, so
 # the cache is half the per-page memory of the TP=2 config; 384 pages cover t2i
 # plus 256p/480p video with headroom for activations.
-kv_cache:
-  max_num_pages: 384
+resources:
+  kv:
+    max_num_pages: 384
 # Super (64B, ~128 GB bf16) needs tensor parallelism just to fit its weights
 # (~64 GB/rank at tp_size=2). Ulysses sequence parallelism is layered on top to
 # shard the replicated diffusion activations that TP alone leaves full — the

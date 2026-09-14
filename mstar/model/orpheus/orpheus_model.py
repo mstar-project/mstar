@@ -28,16 +28,25 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition, StreamingConnectionState
-from mstar.engine.base import EngineType
-from mstar.engine.kv_cache_engine import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.orpheus.config import OrpheusModelConfig
+from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -81,28 +90,6 @@ class OrpheusModel(Model):
 
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
-    # -------------------------------------------------------------------
-    # Model ABC: KV cache config
-    # -------------------------------------------------------------------
-
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [KVCacheConfig(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_attention_heads,
-        )]
-
-    # -------------------------------------------------------------------
-    # Model ABC: node engine types
-    # -------------------------------------------------------------------
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {
-            "LLM": EngineType.KV_CACHE,
-            "snac_decoder": EngineType.STATELESS,
-        }
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -359,26 +346,70 @@ class OrpheusModel(Model):
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
 
-    def get_sampling_config(
-        self, node_name: str,
+    # -------------------------------------------------------------------
+    # Model ABC: resources
+    # -------------------------------------------------------------------
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        kv_config = KVConfig(
+            num_layers=self.config.num_hidden_layers,
+            num_kv_heads=self.config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            max_seq_len=self.config.max_position_embeddings,
+            num_qo_heads=self.config.num_attention_heads,
+        )
+        return [
+            KVSpec(
+                resource_key=KV_CACHE,
+                nodes={"LLM"},
+                config=kv_config
+            ),
+            AttentionSpec(
+                resource_key=ATTN,
+                nodes={"LLM"},
+                config=AttentionConfig(
+                    kv_cache=KV_CACHE,
+                ),
+            ),
+            SamplerSpec(
+                resource_key=SAMPLER,
+                nodes={"LLM"},
+                vocab_size=self.config.vocab_size,
+                enable_repetion_penalty=True
+            ),
+            PositionSpec(
+                resource_key=ROPE,
+                nodes={"LLM"},
+                config=PositionConfig(
+                    kv_cache=KV_CACHE,
+                    rope_theta=self.config.rope_theta,
+                    rope_scale=self.config.rope_scaling["factor"],
+                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
+                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
+                    old_context_len=self.config.rope_scaling["original_max_position_embeddings"],
+                )
+            )
+        ]
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    )  -> SamplingConfig | None:
-        # Per-request overrides take precedence over the model-level config
-        # defaults, so OpenAI-style ``temperature`` / ``top_p`` (and
-        # ``repetition_penalty``) passed through ``model_kwargs`` are honored.
+    ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
         model_kwargs = model_kwargs or {}
         keys = [
             "temperature", "top_p", "repetition_penalty",
             "ignore_eos"
         ]
-        params = {
-            k: model_kwargs.get(k, getattr(self.config, k))
-            for k in keys
+        return {
+            SAMPLER: SamplingReqConfig(
+                **{
+                    k: model_kwargs.get(k, getattr(self.config, k))
+                    for k in keys
+                }
+            )
         }
-        return SamplingConfig(
-            vocab_size=self.config.vocab_size,
-            **params
-        )
+
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate

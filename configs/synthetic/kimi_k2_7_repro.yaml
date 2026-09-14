@@ -7,9 +7,10 @@ max_seq_len: 512
 model_kwargs:
   config_variant: reduced
   tokenizer_mode: byte
-kv_cache:
-  max_num_pages: 256
-  page_size: 128
+resources:
+  kv_cache:
+    max_num_pages: 256
+    page_size: 128
 node_groups:
   - node_names: [LLM]
     ranks: [0]

@@ -3,7 +3,7 @@ import sys
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.base import EngineType
+from mstar.engine.resources import AttentionSpec, KVSpec, PositionSpec, SamplerSpec
 from mstar.graph.base import Loop
 from mstar.model.kimi_k2_7.config import KimiK2Config
 from mstar.model.kimi_k2_7.kimi_model import KimiK2Model
@@ -16,7 +16,7 @@ def _make_model() -> KimiK2Model:
     return model
 
 
-def test_kimi_graph_walks_and_engine_types():
+def test_kimi_graph_walks():
     model = _make_model()
 
     walks = model.get_graph_walk_graphs()
@@ -24,16 +24,20 @@ def test_kimi_graph_walks_and_engine_types():
     assert isinstance(walks["decode"], Loop)
     assert walks["decode"].name == "decode_loop"
 
-    assert model.get_node_engine_types() == {"LLM": EngineType.KV_CACHE}
+
+def test_kimi_declares_one_resource_of_each_kind_on_the_llm_node():
+    specs = _make_model().get_node_resources()
+    assert [type(spec) for spec in specs] == [
+        KVSpec, AttentionSpec, SamplerSpec, PositionSpec
+    ]
+    assert all(spec.nodes == {"LLM"} for spec in specs)
 
 
 def test_kimi_kv_cache_config_matches_reduced_mla_dims():
     model = _make_model()
     cfg = model.config
 
-    kv = model.get_kv_cache_config()
-    assert len(kv) == 1
-    (kv,) = kv
+    kv, _attn = model._kv_and_attn_specs()
 
     assert kv.num_layers == cfg.num_hidden_layers == 2
     assert kv.num_kv_heads == cfg.num_attention_heads == 4

@@ -1,7 +1,8 @@
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
 
-from mstar.conductor.request_info import CurrentForwardPassInfo, PerLabelSeqInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import RxInfo, TxInfo
@@ -36,6 +37,7 @@ class WorkerMessageType(Enum):
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
+    TP_NO_SPEC = "tp_no_spec"
 
 
 @dataclass
@@ -92,6 +94,16 @@ class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
     request_ids: list[str]
+    speculative: bool = False
+    spec_seq: int = -1
+    spec_from_seq: int = -1
+
+
+@dataclass
+class TPNoSpeculation(MessageBody):
+    node_name: str
+    graph_walk: str
+    spec_from_seq: int
 
 @dataclass
 class WorkerMessage:
@@ -129,7 +141,7 @@ class WorkerGraphsDone(MessageBody):
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
     output_signal_names: int = field(default=0)
-    per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
+    resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
     stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream

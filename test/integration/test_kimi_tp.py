@@ -5,6 +5,7 @@ import socket
 
 import pytest
 import torch
+from kimi_reference import bind_fakes
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.kimi_k2_7.components.attention import KimiMLAAttention
@@ -31,32 +32,6 @@ class _NoCommGroup(CommGroup):
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         return input_
-
-
-class _MockMLACache:
-
-    def __init__(self, head_dim: int) -> None:
-        self.scale = head_dim ** -0.5
-
-    def set_layer_idx(self, _i):
-        pass
-
-    def set_active_label(self, _l):
-        pass
-
-    def advance_seq_lens(self, *_a, **_k):
-        pass
-
-    def run_attention(self, q, k, v):
-        qt, kt, vt = (t.transpose(0, 1).float() for t in (q, k, v))  # (H,T,D)
-        scores = torch.einsum("hqd,hkd->hqk", qt, kt) * self.scale
-        num_tokens = q.shape[0]
-        causal = torch.triu(
-            torch.full((num_tokens, num_tokens), float("-inf"), device=q.device),
-            diagonal=1,
-        )
-        attn = (scores + causal).softmax(-1)
-        return torch.einsum("hqk,hkd->hqd", attn, vt).transpose(0, 1).to(q.dtype)
 
 
 def _source_weights(cfg: KimiK2Config, seed: int) -> dict:
@@ -122,6 +97,12 @@ def _load_decoder(layer: KimiDecoderLayer, src: dict) -> None:
     layer.post_attention_layernorm.weight.data.copy_(src["post_ln"].to(DEVICE, DTYPE))
 
 
+def _run(module, h, head_dim, pos):
+    """The module over fake resources: binds a step, then hidden states alone."""
+    bind_fakes(module, head_dim ** -0.5, pos)
+    return module(h)
+
+
 def _inputs(cfg: KimiK2Config, num_tokens: int, seed: int):
     g = torch.Generator().manual_seed(seed)
     h = (torch.randn(num_tokens, cfg.hidden_size, generator=g) * 0.1).to(DEVICE, DTYPE)
@@ -136,14 +117,14 @@ def test_mla_attention_tp2_sim_matches_tp1():
     ref = KimiMLAAttention(cfg, CommGroup.trivial()).to(DEVICE, DTYPE)
     _load_attention(ref, src)
     assert ref.num_heads == cfg.num_attention_heads
-    out_ref = ref(h, _MockMLACache(cfg.padded_head_dim), pos)
+    out_ref = _run(ref, h, cfg.padded_head_dim, pos)
 
     partials = []
     for rank in range(TP):
         attn = KimiMLAAttention(cfg, _NoCommGroup(rank)).to(DEVICE, DTYPE)
         assert attn.num_heads == cfg.num_attention_heads // TP
         _load_attention(attn, src)
-        partials.append(attn(h, _MockMLACache(cfg.padded_head_dim), pos))
+        partials.append(_run(attn, h, cfg.padded_head_dim, pos))
 
     out_tp2 = partials[0] + partials[1]
     max_abs = (out_tp2 - out_ref).abs().max().item()
@@ -182,12 +163,12 @@ def test_tp2_sim_is_stable_across_repeats():
         h, pos = _inputs(cfg, num_tokens=6, seed=202)
         ref = KimiMLAAttention(cfg, CommGroup.trivial()).to(DEVICE, DTYPE)
         _load_attention(ref, src)
-        o_ref = ref(h, _MockMLACache(cfg.padded_head_dim), pos)
+        o_ref = _run(ref, h, cfg.padded_head_dim, pos)
         parts = []
         for rank in range(TP):
             a = KimiMLAAttention(cfg, _NoCommGroup(rank)).to(DEVICE, DTYPE)
             _load_attention(a, src)
-            parts.append(a(h, _MockMLACache(cfg.padded_head_dim), pos))
+            parts.append(_run(a, h, cfg.padded_head_dim, pos))
         return (parts[0] + parts[1] - o_ref).abs().max().item()
 
     diffs = [attn_diff() for _ in range(3)]
@@ -229,9 +210,9 @@ def _nccl_worker(rank: int, world_size: int, port: int, result_path: str) -> Non
         _load_decoder(dec, src)
         assert isinstance(dec.mlp, KimiSparseMoeBlock)
 
-        attn_tp2 = attn(h, _MockMLACache(cfg.padded_head_dim), pos)
+        attn_tp2 = _run(attn, h, cfg.padded_head_dim, pos)
         moe_tp2 = moe(h)
-        dec_tp2 = dec(h, _MockMLACache(cfg.padded_head_dim), pos)
+        dec_tp2 = _run(dec, h, cfg.padded_head_dim, pos)
 
         attn_ref = KimiMLAAttention(cfg, CommGroup.trivial()).to(DEVICE, DTYPE)
         _load_attention(attn_ref, src)
@@ -240,9 +221,9 @@ def _nccl_worker(rank: int, world_size: int, port: int, result_path: str) -> Non
         dec_ref = KimiDecoderLayer(cfg, layer_idx=1, comm_group=CommGroup.trivial()).to(DEVICE, DTYPE)
         _load_decoder(dec_ref, src)
 
-        o_attn = attn_ref(h, _MockMLACache(cfg.padded_head_dim), pos)
+        o_attn = _run(attn_ref, h, cfg.padded_head_dim, pos)
         o_moe = moe_ref(h)
-        o_dec = dec_ref(h, _MockMLACache(cfg.padded_head_dim), pos)
+        o_dec = _run(dec_ref, h, cfg.padded_head_dim, pos)
 
         diffs = {
             "attn": (attn_tp2 - o_attn).abs().max().item(),

@@ -16,6 +16,9 @@ class _Sub(NodeSubmodule):
     def forward(self, *args, **kwargs):
         return {}
 
+    def prepare_inputs(self, *args, **kwargs):
+        return None
+
 
 def test_add_routes_by_value_kind():
     st = PerRequestState()

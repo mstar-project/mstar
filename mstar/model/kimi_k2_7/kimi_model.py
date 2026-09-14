@@ -10,14 +10,25 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_cache_engine import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    AttnBackend,
+    KVConfig,
+    KVLayout,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.kimi_k2_7.config import KimiK2Config
+from mstar.model.kimi_k2_7.config import ATTN, KV_CACHE, ROPE, SAMPLER, KimiK2Config
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -79,32 +90,86 @@ class KimiK2Model(Model):
             )
         return self._tokenizer
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        if self.config.mla_absorb:
-            from mstar.model.kimi_k2_7.components.rope import yarn_get_mscale
-            rope = self.config.rope_scaling
-            mscale = yarn_get_mscale(rope["factor"], rope.get("mscale_all_dim", 0.0))
-            softmax_scale = self.config.qk_head_dim ** -0.5 * mscale * mscale
-            return [KVCacheConfig(
-                num_layers=self.config.num_hidden_layers,
-                num_kv_heads=1,
-                head_dim=self.config.kv_lora_rank + self.config.qk_rope_head_dim,
-                max_seq_len=self.config.max_position_embeddings,
-                num_qo_heads=self.config.num_attention_heads,
-                attention_backend="mla_absorb",
-                softmax_scale=softmax_scale,
-                mla_ckv_dim=self.config.kv_lora_rank,
-            )]
-        return [KVCacheConfig(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_attention_heads,
-            head_dim=self.config.padded_head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_attention_heads,
-        )]
+    def _kv_and_attn_specs(self) -> list[NodeResourceSpec]:
+        """The cache's shape and the backend over it, which Kimi picks
+        together: absorbed MLA caches one latent per token, naive full K/V."""
+        cfg = self.config
+        if not cfg.mla_absorb:
+            return [
+                KVConfig(
+                    num_layers=cfg.num_hidden_layers,
+                    num_kv_heads=cfg.num_attention_heads,
+                    head_dim=cfg.padded_head_dim,
+                    max_seq_len=cfg.max_position_embeddings,
+                    num_qo_heads=cfg.num_attention_heads,
+                ),
+                AttentionConfig(kv_cache=KV_CACHE),
+            ]
 
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        return {LLM_NODE: EngineType.KV_CACHE}
+        from mstar.model.kimi_k2_7.components.rope import yarn_get_mscale
+
+        rope = cfg.rope_scaling
+        mscale = yarn_get_mscale(rope["factor"], rope.get("mscale_all_dim", 0.0))
+        return [
+            KVConfig(
+                num_layers=cfg.num_hidden_layers,
+                num_kv_heads=1,
+                head_dim=cfg.kv_lora_rank + cfg.qk_rope_head_dim,
+                max_seq_len=cfg.max_position_embeddings,
+                num_qo_heads=cfg.num_attention_heads,
+                layout=KVLayout.MLA,
+            ),
+            AttentionConfig(
+                kv_cache=KV_CACHE,
+                backend=AttnBackend.MLA,
+                # MLA scales by the unabsorbed qk_head_dim, which the latent
+                # width does not carry
+                softmax_scale=cfg.qk_head_dim ** -0.5 * mscale * mscale,
+                mla_ckv_dim=cfg.kv_lora_rank,
+            ),
+        ]
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        kv_config, attn_config = self._kv_and_attn_specs()
+        return [
+            KVSpec(resource_key=KV_CACHE, nodes={LLM_NODE}, config=kv_config),
+            AttentionSpec(resource_key=ATTN, nodes={LLM_NODE}, config=attn_config),
+            SamplerSpec(
+                resource_key=SAMPLER,
+                nodes={LLM_NODE},
+                vocab_size=self.config.vocab_size,
+                enable_repetion_penalty=True,
+            ),
+            # Kimi applies its own DeepSeek-yarn rotary in the layer, so this
+            # only tracks the position counters; the rope params here are
+            # unused (see `KimiMLAAttention.position_ids`).
+            PositionSpec(
+                resource_key=ROPE,
+                nodes={LLM_NODE},
+                config=PositionConfig(
+                    kv_cache=KV_CACHE,
+                    rotary_dim=self.config.qk_rope_head_dim,
+                    rope_theta=self.config.rope_theta,
+                ),
+            ),
+        ]
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
+        model_kwargs = model_kwargs or {}
+        return {
+            SAMPLER: SamplingReqConfig(
+                **{
+                    key: model_kwargs.get(key, getattr(self.config, key))
+                    for key in (
+                        "temperature", "top_p", "repetition_penalty", "ignore_eos",
+                    )
+                }
+            )
+        }
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
@@ -227,19 +292,6 @@ class KimiK2Model(Model):
             return {"text_inputs": [input_ids]}
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
         return {"text_inputs": [input_ids]}
-
-    def get_sampling_config(
-        self,
-        node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> SamplingConfig | None:
-        model_kwargs = model_kwargs or {}
-        return SamplingConfig(
-            vocab_size=self.config.vocab_size,
-            temperature=model_kwargs.get("temperature", self.config.temperature),
-            top_p=model_kwargs.get("top_p", self.config.top_p),
-            ignore_eos=model_kwargs.get("ignore_eos", self.config.ignore_eos),
-        )
 
     def postprocess(
         self,

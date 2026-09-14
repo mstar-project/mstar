@@ -24,6 +24,7 @@ from starlette.concurrency import run_in_threadpool
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.model.multimodal import PromptPart
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
@@ -270,6 +271,7 @@ class APIServer:
         input_modalities: list[str],
         output_modalities: list[str],
         model_kwargs: dict | None = None,
+        prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
     ) -> str:
@@ -305,7 +307,8 @@ class APIServer:
             file_paths=file_paths,
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            model_kwargs=model_kwargs
+            model_kwargs=model_kwargs,
+            prompt_parts=prompt_parts,
         ))
 
         logger.info(
@@ -748,6 +751,7 @@ async def generate(
 
     # --- save uploaded files, grouped by modality ----------------
     file_paths: dict[str, list[str]] = {}
+    parts: list[PromptPart] = []
     if files:
         for f in files:
             modality = _detect_modality(f.filename or "")
@@ -756,22 +760,50 @@ async def generate(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
                 )
-            save_name = f"{uuid.uuid4()}_{f.filename}"
+            # Sanitize: only the final path component of the client name;
+            # embedded separators (../) would escape upload_dir.
+            base = os.path.basename(f.filename or "") or "upload"
+            save_name = f"{uuid.uuid4()}_{base}"
             save_path = api_server.upload_dir / save_name
             content = await f.read()
             await run_in_threadpool(save_path.write_bytes, content)
-            file_paths.setdefault(modality, []).append(str(save_path))
+            paths = file_paths.setdefault(modality, [])
+            parts.append(PromptPart(modality=modality, index=len(paths)))
+            paths.append(str(save_path))
+    if text:
+        parts.append(PromptPart(modality="text", text=text))
 
     # --- resolve input modalities --------------------------------
+    # An explicit list is then the layout on its own, so the derived parts go
+    # rather than disagree with it.
     if input_modalities is not None:
         in_mods = [m.strip() for m in input_modalities.split(",") if m.strip()]
-    else:
-        in_mods: list[str] = []
-        in_mods.extend(file_paths.keys())
-        if text:
+        parts = []
+        # A layout with no text slot would drop the prompt on the floor; it
+        # went at the end before ordering was kept, so put it back there.
+        if text and "text" not in in_mods:
             in_mods.append("text")
+        # And a declared text slot with no text renders to nothing, so the
+        # prompt has one fewer span than the layout plans for. Drop it here,
+        # where intake and the schedule builder both still read the same list.
+        if not text:
+            in_mods = [m for m in in_mods if m != "text"]
+    else:
+        in_mods = [p.modality for p in parts]
 
-    parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
+    try:
+        parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=400,
+            detail="model_kwargs must be valid JSON",
+        ) from e
+
+    if parsed_kwargs is not None and not isinstance(parsed_kwargs, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="model_kwargs must be a JSON object",
+        )
 
     try:
         request_id = api_server.submit_request(
@@ -780,6 +812,7 @@ async def generate(
             input_modalities=in_mods,
             output_modalities=out_mods,
             model_kwargs=parsed_kwargs,
+            prompt_parts=parts or None,
             streaming=streaming,
             request_id=request_id,
         )
@@ -899,6 +932,17 @@ def main(argv: list[str] | None = None):
         "--log-stats-file", type=str, default=None,
         help="Append per-request profiling stats to this file (implies --log-stats)",
     )
+    parser.add_argument(
+        "--rust-frontend", action="store_true",
+        help="Serve HTTP from the Rust mstar-server binary instead of "
+             "uvicorn/FastAPI; the Python process keeps preprocessing "
+             "and the conductor protocol",
+    )
+    parser.add_argument(
+        "--rust-frontend-bin", type=str, default=None,
+        help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
+             "$PATH, then rust/server/target/release)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -959,15 +1003,42 @@ def main(argv: list[str] | None = None):
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
 
+    rust_proc = None
+    bridge_dir = None
     try:
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
         api_server.finalize_setup()
-        logger.info("Starting mstar API server on %s:%s", args.host, args.port)
-        uvicorn.run(app, host=args.host, port=args.port, access_log=False)
+        if args.rust_frontend:
+            import tempfile
+
+            from mstar.api_server.rust_frontend import (
+                RustFrontendBridge,
+                find_server_binary,
+                launch_rust_server,
+            )
+
+            bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
+            # Forward --host to the Rust frontend (it binds 127.0.0.1 by
+            # default; --host 0.0.0.0 for the multi-node / container case).
+            os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
+            rust_proc = launch_rust_server(
+                find_server_binary(args.rust_frontend_bin), model_name,
+                args.port, bridge_dir, args.upload_dir)
+            logger.info("Starting mstar API server (Rust frontend) on port %s",
+                        args.port)
+            RustFrontendBridge(api_server, bridge_dir).run()
+        else:
+            logger.info("Starting mstar API server on %s:%s", args.host, args.port)
+            uvicorn.run(app, host=args.host, port=args.port, access_log=False)
     except KeyboardInterrupt:
         pass
     finally:
+        if rust_proc is not None:
+            rust_proc.terminate()
+        if bridge_dir is not None:
+            import shutil
+            shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
         _shutdown_conductor_process(conductor_proc)

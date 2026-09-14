@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from kimi_reference import bind_fakes
 
 from mstar.model.kimi_k2_7.components.decoder_layer import KimiDecoderLayer
 from mstar.model.kimi_k2_7.components.moe import KimiSparseMoeBlock
@@ -149,20 +150,6 @@ def _ref_decoder_layer(layer, cfg, h, pos):
     return h1 + _ref_mlp_forward(layer.mlp, cfg, mlp_in)
 
 
-class _MockMLACache:
-    def __init__(self, head_dim):
-        self.scale = head_dim ** -0.5
-
-    def set_layer_idx(self, _i):
-        pass
-
-    def advance_seq_lens(self, *_a, **_k):
-        pass
-
-    def run_attention(self, q, k, v):
-        return _sdpa_causal(q, k, v, self.scale)
-
-
 def _build_layer(cfg, layer_idx, dtype):
     layer = KimiDecoderLayer(cfg, layer_idx).to(device=DEVICE, dtype=dtype)
     a = layer.self_attn
@@ -200,7 +187,8 @@ def test_dense_decoder_layer_matches_reference():
     h = torch.randn(T, cfg.hidden_size, device=DEVICE, dtype=dtype) * 0.1
     pos = torch.arange(T, device=DEVICE)
 
-    got = layer(h, _MockMLACache(cfg.qk_head_dim), pos)
+    bind_fakes(layer, cfg.qk_head_dim ** -0.5, pos)
+    got = layer(h)
     expected = _ref_decoder_layer(layer, cfg, h, pos)
 
     assert got.shape == (T, cfg.hidden_size)
@@ -218,7 +206,8 @@ def test_moe_decoder_layer_matches_reference():
     h = torch.randn(T, cfg.hidden_size, device=DEVICE, dtype=dtype) * 0.1
     pos = torch.arange(T, device=DEVICE)
 
-    got = layer(h, _MockMLACache(cfg.qk_head_dim), pos)
+    bind_fakes(layer, cfg.qk_head_dim ** -0.5, pos)
+    got = layer(h)
     expected = _ref_decoder_layer(layer, cfg, h, pos)
 
     assert got.shape == (T, cfg.hidden_size)

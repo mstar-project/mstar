@@ -4,21 +4,16 @@ The Talker samples stochastically (temperature ~0.9, top_k ~50) under CUDA-graph
 capture. ``CudaGraphableSampler.sample`` passes per-request philox
 ``seed``/``offset`` as captured int tensors and advances ``offset_buf += 1``
 in-graph so each replay steps the RNG (see the comments in
-``mstar/utils/sampling.py`` about a frozen offset never reaching EOS).
+``mstar/engine/resources/sampler/utils.py`` about a frozen offset never reaching EOS).
 
 This requires a FlashInfer build whose ``*_sampling_from_probs`` binding accepts
 tensor seed/offset under graph capture. FlashInfer 0.6.3 rejected tensors at the
 C/TVM-FFI layer ("Mismatched type on argument #7"); the binding was reworked in
 0.6.4 (verified: 0.6.3 rejects; 0.6.4 / 0.6.5 / 0.6.7.post3 accept and advance
 the RNG under capture), which ``pyproject.toml`` now pins as the floor. These
-tests fail fast on a too-old build and pin the two facts the design depends on:
-
-  1. a captured tensor ``offset`` ADVANCES the RNG per replay (stochastic
-     sampling actually varies step to step);
-  2. passing ``offset=None`` under capture is NOT a valid shortcut -- it makes
-     FlashInfer read its default CUDA generator's ``current_seed()``, which is
-     illegal during capture. (Pins why the captured path must pass a real
-     tensor, not None.)
+tests fail fast on a too-old build and pin the fact the design depends on: a
+captured tensor ``offset`` ADVANCES the RNG per replay, so stochastic sampling
+actually varies step to step.
 
 Skips when CUDA / FlashInfer are unavailable.
 """
@@ -111,64 +106,28 @@ def test_tensor_seed_offset_accepted_under_capture():
     )
 
 
-def test_none_offset_is_illegal_under_capture():
-    """Pins why the captured path must pass a real tensor, not None: with
-    offset=None, FlashInfer falls back to its default CUDA generator, whose
-    current_seed() read is illegal during graph capture. Guards against anyone
-    "simplifying" the sampler to seed=None/offset=None."""
-    flashinfer = _flashinfer_or_skip()
-    dev = torch.device("cuda")
-    B, V = 1, 2048
-    probs = _stochastic_probs(B, V, dev)
-    top_k = torch.tensor([50], device=dev, dtype=torch.int32)
-    top_p = torch.tensor([1.0], device=dev)
-
-    for _ in range(2):
-        flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            probs, top_k, top_p, deterministic=True, seed=None, offset=None
-        )
-    torch.cuda.synchronize()
-
-    pool = torch.cuda.graph_pool_handle()
-    g = torch.cuda.CUDAGraph()
-    with pytest.raises(RuntimeError, match="(?i)current_seed|graph capture"):
-        with torch.cuda.graph(g, pool=pool):
-            flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k, top_p, deterministic=True, seed=None, offset=None
-            )
-
-
-def test_aux_sampling_config_is_live_after_capture():
-    """An aux label's params must come from its buffers, not from capture-time
-    constants: capture a graph that samples via ``sample_aux``, then change the
-    aux config and replay. The replay must honour the new params.
+def test_sampling_config_is_live_after_capture():
+    """Sampling params must come from the buffers, not from capture-time
+    constants: capture a graph that samples, then change the request's config
+    and replay. The replay must honour the new params.
 
     Pins the fix for the old ``sample_with_config``, which took Python scalars
     and so froze temperature/top_k/top_p into the captured kernel launch.
     """
     _flashinfer_or_skip()
-    from mstar.utils.sampling import (
-        MultiSamplerBuffers,
-        MultiSamplingConfig,
-        SamplingConfig,
-    )
+    from mstar.engine.resources.sampler.utils import SamplerBuffers, SamplingConfig
 
     dev = torch.device("cuda")
     V = 16
-    rid, label = "r1", "code_predictor"
+    rid = "r1"
+    SLOT = 0
 
-    def cfg(temperature: float, top_k: int) -> MultiSamplingConfig:
-        c = MultiSamplingConfig(
-            main=SamplingConfig(),
-            aux={label: SamplingConfig(temperature=temperature, top_k=top_k)},
-        )
+    def cfg(temperature: float, top_k: int) -> SamplingConfig:
+        c = SamplingConfig(temperature=temperature, top_k=top_k)
         c.set_seed(7)
         return c
 
-    # allocate() creates one SamplerBuffers per label named in the config.
-    bufs = MultiSamplerBuffers.allocate(
-        max_batch_size=1, device=dev, config=cfg(5.0, 0),
-    )
+    bufs = SamplerBuffers.allocate(max_batch_size=1, device=dev)
     bufs.register_request(rid, cfg(5.0, 0))
 
     # Near-uniform logits so a wide top_k actually produces varied samples,
@@ -178,18 +137,22 @@ def test_aux_sampling_config_is_live_after_capture():
     logits[0, 3] = 5.0
     argmax = 3
 
-    sampler = bufs.gather_for_request_ids([rid], padded_bs=1)
+    # zero-copy views of the slot's buffers, so one sampler spans capture and
+    # every later gather
+    sampler = bufs.sampler_for(1, SLOT)
+    bufs.gather_static([rid], 1, SLOT)
+    bufs.gather_dynamic([rid], 1, SLOT)
     for _ in range(2):  # warm up triton autotune + flashinfer outside capture
-        sampler.sample_aux(label, [rid], logits)
+        sampler.sample([rid], logits)
     torch.cuda.synchronize()
 
     pool = torch.cuda.graph_pool_handle()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g, pool=pool):
-        out = sampler.sample_aux(label, [rid], logits)
+        out = sampler.sample([rid], logits)
 
     # Phase 1 (captured config): temperature 5.0, top_k disabled -> varied.
-    bufs.gather_for_request_ids([rid], padded_bs=1)
+    bufs.gather_static([rid], 1, SLOT)
     hot = []
     for _ in range(20):
         g.replay()
@@ -199,13 +162,13 @@ def test_aux_sampling_config_is_live_after_capture():
 
     # Phase 2: swap in top_k=1. Same graph, no recapture -> must be argmax.
     bufs.update_request_config(rid, cfg(5.0, 1))
-    bufs.gather_for_request_ids([rid], padded_bs=1)
+    bufs.gather_static([rid], 1, SLOT)
     greedy = []
     for _ in range(20):
         g.replay()
         torch.cuda.synchronize()
         greedy.append(int(out.item()))
     assert set(greedy) == {argmax}, (
-        "aux sampling params were frozen at capture: after switching to "
+        "sampling params were frozen at capture: after switching to "
         f"top_k=1 the replay should return argmax={argmax}, got {sorted(set(greedy))}"
     )

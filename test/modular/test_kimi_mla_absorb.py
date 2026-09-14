@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+from mstar.engine.resources import AttnBackend, KVLayout
 from mstar.model.kimi_k2_7.components.attention import KimiMLAAttention
 from mstar.model.kimi_k2_7.components.rope import (
     _yarn_find_correction_range,
@@ -147,20 +148,22 @@ def test_absorbed_math_matches_deepseek():
     torch.testing.assert_close(absorbed, reference, rtol=1e-4, atol=1e-4)
 
 
-def _kv_cfg(mla_absorb):
+def _kv_and_attn(mla_absorb):
     m = object.__new__(KimiK2Model)          # skip __init__ (tokenizer/weights/GPU)
     m.config = KimiK2Config.reduced()
     m.config.mla_absorb = mla_absorb
-    return m.get_kv_cache_config()[0]
+    return m._kv_and_attn_specs()
 
 
 def test_kv_cache_config_absorbed_shrinks_latent():
     cfg = KimiK2Config.reduced()
-    kv = _kv_cfg(mla_absorb=True)
+    kv, attn = _kv_and_attn(mla_absorb=True)
     assert kv.num_kv_heads == 1
     assert kv.head_dim == cfg.kv_lora_rank + cfg.qk_rope_head_dim  # 32 + 8 = 40
     assert kv.num_qo_heads == cfg.num_attention_heads              # 4 (q still sharded)
-    assert kv.attention_backend == "mla_absorb"
+    assert kv.layout is KVLayout.MLA
+    assert attn.backend is AttnBackend.MLA
+    assert attn.mla_ckv_dim == cfg.kv_lora_rank
     naive_elems = 2 * cfg.num_attention_heads * cfg.padded_head_dim
     absorbed_elems = kv.num_kv_heads * kv.head_dim
     assert naive_elems == 512 and absorbed_elems == 40
@@ -168,7 +171,9 @@ def test_kv_cache_config_absorbed_shrinks_latent():
 
 def test_kv_cache_config_flag_off_is_naive():
     cfg = KimiK2Config.reduced()
-    kv = _kv_cfg(mla_absorb=False)
+    kv, attn = _kv_and_attn(mla_absorb=False)
     assert kv.num_kv_heads == cfg.num_attention_heads   # 4
     assert kv.head_dim == cfg.padded_head_dim           # 64
-    assert kv.attention_backend == "flashinfer"         # default naive backend
+    assert kv.layout is KVLayout.NHD
+    assert attn.backend is AttnBackend.FLASHINFER       # default naive backend
+    assert attn.mla_ckv_dim is None

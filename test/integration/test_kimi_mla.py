@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from kimi_reference import FakeResources, bind_fakes
 
 from mstar.model.kimi_k2_7.components.attention import KimiMLAAttention
 from mstar.model.kimi_k2_7.components.rope import (
@@ -40,32 +41,6 @@ def _ref_yarn_rope(pos, q_pe, k_pe, rotary_dim, base, factor, max_pos,
     qr = q_pe.float() * cos + rotate_gptj(q_pe.float()) * sin
     kr = k_pe.float() * cos + rotate_gptj(k_pe.float()) * sin
     return qr.to(q_pe.dtype), kr.to(k_pe.dtype)
-
-
-class _MockMLACache:
-
-    def __init__(self, head_dim: int):
-        self.scale = head_dim ** -0.5
-        self.captured: dict = {}
-
-    def set_layer_idx(self, _i):  # noqa: D401
-        pass
-
-    def set_active_label(self, _l):
-        pass
-
-    def advance_seq_lens(self, *_a, **_k):
-        pass
-
-    def run_attention(self, q, k, v):
-        self.captured = {"q": q.clone(), "k": k.clone(), "v": v.clone()}
-        qt, kt, vt = (t.transpose(0, 1).float() for t in (q, k, v))  # (H,T,D)
-        scores = torch.einsum("hqd,hkd->hqk", qt, kt) * self.scale
-        num_tokens = q.shape[0]
-        causal = torch.triu(
-            torch.full((num_tokens, num_tokens), float("-inf"), device=q.device), diagonal=1)
-        attn = (scores + causal).softmax(-1)
-        return torch.einsum("hqk,hkd->hqd", attn, vt).transpose(0, 1).to(q.dtype)
 
 
 def _rope_kwargs(cfg):
@@ -135,11 +110,11 @@ def test_mla_qkv_assembly_matches_reference():
     cfg = KimiK2Config.reduced()
     dtype = torch.bfloat16
     attn = _build_attention(cfg, dtype)
-    cache = _MockMLACache(cfg.padded_head_dim)
     h = torch.randn(5, cfg.hidden_size, device=DEVICE, dtype=dtype) * 0.1
     pos = torch.arange(5, device=DEVICE)
+    cache = bind_fakes(attn, cfg.padded_head_dim ** -0.5, pos)
 
-    attn(h, cache, pos)  # populates cache.captured with the assembled q/k/v
+    attn(h)  # populates cache.captured with the assembled q/k/v
     ref_q, ref_k, ref_v = _ref_mla(attn, cfg, h, pos, cache.scale, attn.softmax_scale_boost)
 
     torch.testing.assert_close(cache.captured["q"], ref_q, rtol=2e-2, atol=2e-2)
@@ -152,14 +127,14 @@ def test_mla_attention_forward_matches_reference():
     cfg = KimiK2Config.reduced()
     dtype = torch.bfloat16
     attn = _build_attention(cfg, dtype)
-    cache = _MockMLACache(cfg.padded_head_dim)
     h = torch.randn(7, cfg.hidden_size, device=DEVICE, dtype=dtype) * 0.1
     pos = torch.arange(7, device=DEVICE)
+    cache = bind_fakes(attn, cfg.padded_head_dim ** -0.5, pos)
 
-    got = attn(h, cache, pos)
+    got = attn(h)
 
     ref_q, ref_k, ref_v = _ref_mla(attn, cfg, h, pos, cache.scale, attn.softmax_scale_boost)
-    ref_attn = _MockMLACache(cfg.padded_head_dim).run_attention(ref_q, ref_k, ref_v)
+    ref_attn = FakeResources(cache.scale, pos).run(ref_q, k=ref_k, v=ref_v)
     ref_out = ref_attn[..., : cfg.v_head_dim].reshape(7, attn.num_heads * cfg.v_head_dim)
     expected = F.linear(ref_out, attn.o_proj.weight)
 

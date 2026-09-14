@@ -1,5 +1,6 @@
 import pytest
 import torch
+from kimi_reference import bind_fakes
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.kimi_k2_7._testing import fake_quantize_weight
@@ -24,19 +25,6 @@ def _sdpa_causal(q, k, v, scale):
     attn = (torch.einsum("hqd,hkd->hqk", qt, kt) * scale + causal).softmax(-1)
     return torch.einsum("hqk,hkd->hqd", attn, vt).transpose(0, 1).to(q.dtype)
 
-
-class _MockMLACache:
-    def __init__(self, head_dim):
-        self.scale = head_dim ** -0.5
-
-    def set_layer_idx(self, _i):
-        pass
-
-    def advance_seq_lens(self, *_a, **_k):
-        pass
-
-    def run_attention(self, q, k, v):
-        return _sdpa_causal(q, k, v, self.scale)
 
 def _fill_layer(layer, cfg):
     a = layer.self_attn
@@ -209,8 +197,10 @@ def test_inkernel_weight_loading_and_forward_vs_dequant_on_load(tmp_path):
     ids = torch.randint(0, cfg_b.vocab_size, (T,), device=DEVICE)
     pos = torch.arange(T, device=DEVICE)
     with torch.no_grad():
-        got = model_b(ids, _MockMLACache(cfg_b.padded_head_dim), pos)
-        expected = model_a(ids, _MockMLACache(cfg_a.padded_head_dim), pos)
+        bind_fakes(model_b, cfg_b.padded_head_dim ** -0.5, pos)
+        got = model_b(ids, label="main")
+        bind_fakes(model_a, cfg_a.padded_head_dim ** -0.5, pos)
+        expected = model_a(ids, label="main")
     assert got.shape == (T, cfg_b.vocab_size)
     torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
 

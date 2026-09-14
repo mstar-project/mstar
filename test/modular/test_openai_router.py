@@ -43,6 +43,7 @@ class _StubAPI:
         self.last_submit = None
         self._chunks: dict = {}
         self.next_chunks: list = []
+        self.last_raw_request = None
 
     def submit_request(self, **kw):
         self.last_submit = kw
@@ -50,6 +51,7 @@ class _StubAPI:
         return kw["request_id"]
 
     async def collect_results(self, request_id, raw_request=None):
+        self.last_raw_request = raw_request
         return self._chunks.get(request_id, [])
 
     async def iter_result_chunks(self, request_id):
@@ -95,6 +97,23 @@ def test_chat_text(client_and_stub):
     ).json()
     assert body["choices"][0]["message"]["content"] == "Hello world"
     assert stub.last_submit["model_kwargs"]["max_output_tokens"] == 16
+
+
+def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "bagel",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%"}}],
+            }],
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "server_error"
 
 
 def test_chat_audio_output(client_and_stub):
@@ -153,6 +172,7 @@ def test_images_edits(client_and_stub):
     mk = stub.last_submit["model_kwargs"]
     assert mk.get("cfg_img_scale") == 2.0 and mk.get("cfg_interval") == [0.0, 1.0]
     assert "image" in (stub.last_submit["file_paths"] or {})
+    assert stub.last_raw_request is not None
 
 
 def test_videos_generations_wan22(client_and_stub):

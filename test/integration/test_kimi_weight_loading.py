@@ -1,5 +1,6 @@
 import pytest
 import torch
+from kimi_reference import bind_fakes
 
 from mstar.model.kimi_k2_7.components.causal_lm import KimiForCausalLM
 from mstar.model.kimi_k2_7.components.moe import KimiSparseMoeBlock
@@ -22,19 +23,6 @@ def _sdpa_causal(q, k, v, scale):
     attn = (torch.einsum("hqd,hkd->hqk", qt, kt) * scale + causal).softmax(-1)
     return torch.einsum("hqk,hkd->hqd", attn, vt).transpose(0, 1).to(q.dtype)
 
-
-class _MockMLACache:
-    def __init__(self, head_dim):
-        self.scale = head_dim ** -0.5
-
-    def set_layer_idx(self, _i):
-        pass
-
-    def advance_seq_lens(self, *_a, **_k):
-        pass
-
-    def run_attention(self, q, k, v):
-        return _sdpa_causal(q, k, v, self.scale)
 
 def _fill_layer(layer, cfg):
     a = layer.self_attn
@@ -164,7 +152,9 @@ def test_weight_loading_roundtrip_and_forward(tmp_path):
     ids = torch.randint(0, cfg.vocab_size, (T,), device=DEVICE)
     pos = torch.arange(T, device=DEVICE)
     with torch.no_grad():
-        got = model(ids, _MockMLACache(cfg.padded_head_dim), pos)
-        expected = ref(ids, _MockMLACache(cfg.padded_head_dim), pos)
+        bind_fakes(model, cfg.padded_head_dim ** -0.5, pos)
+        got = model(ids, label="main")
+        bind_fakes(ref, cfg.padded_head_dim ** -0.5, pos)
+        expected = ref(ids, label="main")
     assert got.shape == (T, cfg.vocab_size)
     torch.testing.assert_close(got, expected, rtol=1e-3, atol=1e-3)

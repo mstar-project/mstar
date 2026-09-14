@@ -4,8 +4,9 @@ max_seq_len: 8192
 # Per-rank KV pool. With 2D tensor + sequence parallelism each rank holds
 # num_kv_heads / (tp_size * sp_size) heads, so the cache is light; 1024 pages
 # leave ample headroom.
-kv_cache:
-  max_num_pages: 1024
+resources:
+  kv:
+    max_num_pages: 1024
 # 2D parallel mesh over 4 ranks: tensor-parallel (heads/weights shard, the
 # row-parallel projections all-reduce) composed with Ulysses sequence-parallel
 # (the generation sequence shards, an all-to-all swaps sequence for heads around

@@ -19,10 +19,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
+from mstar.model.qwen3_tts.config import (
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
+    Qwen3TTSModelConfig,
+    Qwen3TTSTalkerConfig,
+)
 from mstar.utils.attention import apply_rope_pos_ids, decode_attn_nhd
 
 # ---------------------------------------------------------------------------
@@ -61,6 +66,9 @@ class Qwen3TTSTalkerLayer(nn.Module):
             qk_norm=True,
             rms_norm_eps=config.rms_norm_eps,
             comm_group=comm_group,
+            attn_key=TALKER_ATTN,
+            kv_key=TALKER_KV,
+            pos_key=TALKER_POS,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps
@@ -75,11 +83,12 @@ class Qwen3TTSTalkerLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cache_handle)
+        hidden_states = self.self_attn(
+            hidden_states,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -110,18 +119,22 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
     ) -> torch.Tensor:
         hidden_states = input_embeds
+        # Which of the node's KV streams the layers write (`label`) and which
+        # layer of it are cursors on the shared resources: bind the label once,
+        # advance the index per layer. Passing them as arguments instead would
+        # make inductor specialize on the int. The resources own the pages, so
+        # module code stays clear of the allocator.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, layer in enumerate(self.layers):
-            # One cache handle owns every layer's paged K/V tensor. Selecting
-            # the layer before attention keeps module code independent of the
-            # physical page allocator.
-            cache_handle.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states, cache_handle)
-        # Sequence lengths advance once per forward, after every layer wrote
-        # K/V for the same packed token range.
-        cache_handle.advance_seq_lens()
+            layer.self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states = layer(hidden_states)
+        # Sequence lengths still advance once per forward, after every layer
+        # wrote K/V for the same packed range — the runner does it now, on the
+        # step this forward was declared from.
         return self.norm(hidden_states)
 
 
@@ -148,9 +161,10 @@ class Qwen3TTSTalkerModel(nn.Module):
     def forward(
         self,
         input_embeds: torch.Tensor,
-        cache_handle: BatchedCacheManager,
+        *,
+        label: str,
     ) -> torch.Tensor:
-        return self.model(input_embeds, cache_handle)
+        return self.model(input_embeds, label=label)
 
 
 # ---------------------------------------------------------------------------

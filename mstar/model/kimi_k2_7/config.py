@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 
 from mstar.model.components.quantization import CompressedTensorsQuantConfig
 
+# Resource keys the model declares and the layers resolve against.
+KV_CACHE = "kv_cache"
+ATTN = "attn"
+SAMPLER = "sampler"
+ROPE = "rope"
+
 
 @dataclass
 class KimiK2Config:
@@ -58,6 +64,7 @@ class KimiK2Config:
     pad_token_id: int = 163839
     temperature: float = 1.0
     top_p: float = 1.0
+    repetition_penalty: float = 1.0
     ignore_eos: bool = False
 
     num_nextn_predict_layers: int = 0

@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from kimi_reference import bind_fakes
 
 from mstar.model.kimi_k2_7.components.causal_lm import KimiForCausalLM
 from mstar.model.kimi_k2_7.components.moe import KimiSparseMoeBlock
@@ -158,22 +159,6 @@ def _ref_forward(model, cfg, ids, pos):
     return F.linear(h, model.lm_head.weight)
 
 
-class _MockMLACache:
-    def __init__(self, head_dim):
-        self.scale = head_dim ** -0.5
-        self.layer_idx = 0
-        self.advance_calls = 0
-
-    def set_layer_idx(self, i):
-        self.layer_idx = i
-
-    def advance_seq_lens(self, *_a, **_k):
-        self.advance_calls += 1
-
-    def run_attention(self, q, k, v):
-        return _sdpa_causal(q, k, v, self.scale)
-
-
 def _fill_layer(layer, cfg):
     a = layer.self_attn
     for lin in (a.q_a_proj, a.q_b_proj, a.kv_a_proj_with_mqa, a.kv_b_proj, a.o_proj):
@@ -219,12 +204,12 @@ def test_full_forward_logits_match_reference():
     ids = torch.randint(0, cfg.vocab_size, (T,), device=DEVICE)
     pos = torch.arange(T, device=DEVICE)
 
-    cache = _MockMLACache(cfg.padded_head_dim)
+    bind_fakes(model, cfg.padded_head_dim ** -0.5, pos)
     with torch.no_grad():
-        got = model(ids, cache, pos)
+        got = model(ids, label="main")
     expected = _ref_forward(model, cfg, ids, pos)
 
-    # advance_seq_lens belongs after the layer loop, not once per layer.
-    assert cache.advance_calls == 1
+    # what `advance_seq_lens` used to be checked for here is the runner's now:
+    # the stream advance comes off the step declaration, not the layer loop
     assert got.shape == (T, cfg.vocab_size)
     torch.testing.assert_close(got, expected, rtol=3e-2, atol=3e-2)

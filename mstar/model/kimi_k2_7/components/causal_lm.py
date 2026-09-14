@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.kimi_k2_7.components.decoder_layer import KimiDecoderLayer
 from mstar.model.kimi_k2_7.components.language_model import (
     build_embedding,
@@ -29,19 +28,16 @@ class KimiLanguageModel(nn.Module):
         )
         self.norm = build_rmsnorm(config)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, *, label: str) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int.
+        self.layers[0].self_attn.attend.bind_step(label)
         for layer_idx, decoder_layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
-            hidden_states = decoder_layer(
-                hidden_states, cache_handle, position_ids
-            )
-        cache_handle.advance_seq_lens()
+            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            hidden_states = decoder_layer(hidden_states)
+        # the advance is the runner's now, off the step declaration
         return self.norm(hidden_states)
 
 
@@ -55,14 +51,9 @@ class KimiForCausalLM(nn.Module):
         self.lm_head = build_lm_head(config, comm_group=comm_group)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-        position_ids: torch.Tensor,
-        **kwargs,
+        self, input_ids: torch.Tensor, *, label: str, **kwargs,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, cache_handle, position_ids)
-        return self.lm_head(hidden_states)
+        return self.lm_head(self.model(input_ids, label=label))
 
     def load_weights(self, weights, **kwargs) -> set[str]:
         from mstar.model.kimi_k2_7.weight_loader import load_kimi_hf_weights

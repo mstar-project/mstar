@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+from kimi_reference import bind_fakes
 
 from mstar.model.kimi_k2_7.components.attention import KimiMLAAttention
 from mstar.model.kimi_k2_7.components.rope import (
@@ -80,29 +81,6 @@ def _ref_deepseek_mla(attn, cfg, h, pos):
     return F.linear(out, attn.o_proj.weight)
 
 
-class _MockMLALatentCache:
-
-    def __init__(self, sm_scale):
-        self.sm_scale = sm_scale
-
-    def set_layer_idx(self, _i):
-        pass
-
-    def set_active_label(self, _l):
-        pass
-
-    def advance_seq_lens(self, *_a, **_k):
-        pass
-
-    def run_attention_mla(self, q_nope, q_pe, kv_c, k_pe):
-        t, heads, latent = q_nope.shape
-        d_rope = q_pe.shape[-1]
-        query = torch.cat([q_nope, q_pe], dim=-1)                 # (T,H,L+Drope)
-        kv_c_h = kv_c.expand(t, heads, latent)                    # MQA broadcast
-        key = torch.cat([kv_c_h, k_pe.expand(t, heads, d_rope)], dim=-1)
-        return _sdpa_causal(query, key, kv_c_h, self.sm_scale)    # (T,H,L)
-
-
 def _build_attention(cfg, dtype):
     attn = KimiMLAAttention(cfg).to(device=DEVICE, dtype=dtype)
     for lin in (attn.q_a_proj, attn.q_b_proj, attn.kv_a_proj_with_mqa,
@@ -126,9 +104,9 @@ def test_absorbed_forward_matches_deepseek():
     h = torch.randn(t, cfg.hidden_size, device=DEVICE, dtype=dtype) * 0.1
     pos = torch.arange(t, device=DEVICE)
 
-    cache = _MockMLALatentCache(_deepseek_scale(cfg))
+    cache = bind_fakes(attn, _deepseek_scale(cfg), pos)
     with torch.no_grad():
-        got = attn(h, cache, pos)
+        got = attn(h)
 
     expected = _ref_deepseek_mla(attn, cfg, h, pos)
     assert got.shape == (t, cfg.hidden_size)

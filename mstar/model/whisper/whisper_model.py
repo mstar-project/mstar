@@ -16,9 +16,10 @@ Graph walks:
               engine samples the first transcript token from the logits)
     decode  — decoder loop; each step feeds the sampled token back
 
-The engine has no native cross-attention support: cross-attn K/V depend
-only on the encoder output, so the decoder submodule computes them once
-at prefill and keeps them per-request (see ``WhisperDecoderSubmodule``).
+Cross-attention K/V depend only on the encoder output, so the decoder
+projects them once at prefill and writes them into a context KV stream;
+every later step declares a zero-span segment on that label and runs the
+engine's pre-planned cross-attention resource.
 """
 
 import logging
@@ -31,14 +32,34 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_store import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    CrossAttentionConfig,
+    CrossAttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.whisper.config import WhisperModelConfig
-from mstar.utils.sampling import SamplingConfig
+from mstar.model.whisper.config import (
+    ATTN,
+    CONTEXT_LABEL,
+    CROSS_ATTN,
+    CROSS_KV_CACHE,
+    KV_CACHE,
+    POS,
+    SAMPLER,
+    WhisperModelConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,44 +109,83 @@ class WhisperModel(Model):
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     # -------------------------------------------------------------------
-    # Model ABC: KV cache config
+    # Model ABC: resources
     # -------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        from mstar.engine.kv_store import CrossAttnKVConfig
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """Decoder self-attention KV + a separate encoder-context KV.
 
-        return [KVCacheConfig(
+        Two caches rather than two labels on one: the self-attention resource
+        plans a wrapper per label of the cache it names, so a shared cache
+        would have it planning the 1500-token context every step for nothing.
+        ``audio_encoder`` is stateless.
+        """
+        # Sequences cap at max_target_positions (448) = 4 pages per
+        # request; 128 pages ≈ 32 concurrent requests at ~2.7 GB
+        # (vs 43 GB with the 2048-page default).
+        kv_config = KVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
             max_seq_len=self.config.max_target_positions,
             num_qo_heads=self.config.decoder_attention_heads,
-            nodes=["decoder"],
-            # Sequences cap at max_target_positions (448) = 4 pages per
-            # request; 128 pages ≈ 32 concurrent requests at ~2.7 GB
-            # (vs 43 GB with the 2048-page default).
             max_num_pages=128,
-            # Encoder-context pool for cross-attention (issue #160): the
-            # fixed 30 s window is max_source_positions (1500) tokens = 12
-            # pages per request; 192 pages ≈ 16 concurrent at ~4 GB.
-            cross_attn={
-                "default": CrossAttnKVConfig(
-                    num_kv_heads=self.config.decoder_attention_heads,
-                    head_dim=self.config.head_dim,
-                    max_context_len=self.config.max_source_positions,
-                    max_num_pages=192,
+        )
+        # The fixed 30 s window is max_source_positions (1500) tokens = 12
+        # pages per request; 192 pages ≈ 16 concurrent at ~4 GB.
+        context_kv_config = KVConfig(
+            num_layers=self.config.decoder_layers,
+            num_kv_heads=self.config.decoder_attention_heads,
+            head_dim=self.config.head_dim,
+            max_seq_len=self.config.max_source_positions,
+            num_qo_heads=self.config.decoder_attention_heads,
+            max_num_pages=192,
+        )
+        return [
+            KVSpec(resource_key=KV_CACHE, nodes={"decoder"}, config=kv_config),
+            AttentionSpec(
+                resource_key=ATTN, nodes={"decoder"},
+                config=AttentionConfig(kv_cache=KV_CACHE),
+            ),
+            KVSpec(
+                resource_key=CROSS_KV_CACHE, nodes={"decoder"},
+                config=context_kv_config,
+            ),
+            CrossAttentionSpec(
+                resource_key=CROSS_ATTN, nodes={"decoder"},
+                config=CrossAttentionConfig(
+                    kv_cache=CROSS_KV_CACHE,
+                    query_kv_cache=KV_CACHE,
+                    context_label=CONTEXT_LABEL,
                 ),
-            },
-        )]
+            ),
+            PositionSpec(
+                resource_key=POS, nodes={"decoder"},
+                # No RoPE: this exists for the position counter, whose planned
+                # ids drive the learned ``embed_positions`` lookup.
+                config=PositionConfig(kv_cache=KV_CACHE),
+            ),
+            SamplerSpec(
+                resource_key=SAMPLER, nodes={"decoder"},
+                vocab_size=self.config.vocab_size,
+                # ASR transcription decodes greedily; no seen-token buffers.
+                enable_repetion_penalty=False,
+            ),
+        ]
 
-    # -------------------------------------------------------------------
-    # Model ABC: node engine types
-    # -------------------------------------------------------------------
-
-    def get_node_engine_types(self) -> dict[str, EngineType]:
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
+        model_kwargs = model_kwargs or {}
         return {
-            "audio_encoder": EngineType.STATELESS,
-            "decoder": EngineType.KV_CACHE,
+            SAMPLER: SamplingReqConfig(
+                # ASR default is greedy (temperature 0 -> argmax).
+                temperature=model_kwargs.get("temperature", 0.0),
+                top_p=model_kwargs.get("top_p", 1.0),
+                ignore_eos=model_kwargs.get("ignore_eos", False),
+            )
         }
 
     # -------------------------------------------------------------------
@@ -296,21 +356,8 @@ class WhisperModel(Model):
         }
 
     # -------------------------------------------------------------------
-    # Model ABC: sampling / postprocess
+    # Model ABC: postprocess
     # -------------------------------------------------------------------
-
-    def get_sampling_config(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    ) -> SamplingConfig | None:
-        model_kwargs = model_kwargs or {}
-        return SamplingConfig(
-            vocab_size=self.config.vocab_size,
-            # ASR default is greedy (temperature 0 -> argmax).
-            temperature=model_kwargs.get("temperature", 0.0),
-            top_p=model_kwargs.get("top_p", 1.0),
-            ignore_eos=model_kwargs.get("ignore_eos", False),
-        )
 
     def postprocess(
         self,
