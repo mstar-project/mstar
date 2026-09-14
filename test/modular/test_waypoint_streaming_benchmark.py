@@ -155,11 +155,31 @@ def test_measurement_loop_consumes_typed_chunks_and_pauses_only_between_them(
     assert len(client.kwargs["actions"]) == 2
 
 
+def test_startup_latency_is_none_until_samples_are_asked_for(benchmark):
+    """The key is always present, so a consumer never has to guess the shape."""
+    assert benchmark["_startup_latency_metrics"]([]) is None
+
+
+def test_startup_latency_summarizes_every_sample(benchmark):
+    metrics = benchmark["_startup_latency_metrics"]([0.40, 0.10, 0.20, 0.30])
+
+    assert metrics == {
+        "sample_count": 4,
+        "p50": pytest.approx(0.25),
+        "p95": pytest.approx(0.385),
+        "mean": pytest.approx(0.25),
+        "minimum": 0.10,
+        "maximum": 0.40,
+    }
+
+
 @pytest.mark.parametrize(
     "extra, message",
     [
         (["--steps", "0"], "--steps must be positive"),
         (["--warmup-steps", "-1"], "--warmup-steps cannot be negative"),
+        (["--startup-repeats", "-1"], "--startup-repeats cannot be negative"),
+        (["--startup-steps", "0"], "--startup-steps must be positive"),
         (["--slow-consumer-delay", "-0.1"], "--slow-consumer-delay cannot be negative"),
         (["--stall-threshold", "0"], "--stall-threshold must be positive"),
         (["--memory-sample-interval", "0"], "--memory-sample-interval must be positive"),

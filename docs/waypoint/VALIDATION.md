@@ -14,13 +14,13 @@ exact command, environment, artifact location, and result when closing a row.
 | NUM-001 | Live reference-compatible parity | Passed at 360p and 720p | Native-checkpoint same-process tables, conditioner, every DiT stage, five passes, ring writes, 41 rollout latents, functional TAEHV state, and pixels passed with zero tolerance on H100 at both resolutions. |
 | REQ-001 | Request and prime semantics | Passed | CPU tests reject non-positive steps and wrong action counts and prove idle prime preserves action zero; live sequential and interleaved 360p/720p runs emitted no seed frames and exact generated counts. |
 | GRAPH-001 | Optional DiT compile | Passed | Post-load table materialization, `fullgraph=True` construction, and bounded compiled/eager equivalence are tested; both full-size variants compiled on H100. |
-| GRAPH-002 | Optional capture and eager fallback | CPU mode-selection coverage added; existing capture path passed on H100 | `cuda_graph=False` declares no buckets; attempted captures are optional and use the engine's eager fallback on failure. All four graph-enabled buckets previously captured at both resolutions. A full server graph-off run remains to be recorded. |
+| GRAPH-002 | Optional capture and eager fallback | CPU mode-selection coverage added; existing capture path passed on H100 | `cuda_graph=False` declares no buckets; attempted captures are optional and use the engine's eager fallback on failure. All five graph-enabled buckets captured at both resolutions, the fifth being the `dit: prime` bucket added by `PRIME-GRAPH-001`; `capture_dit_prime=False` declares four and serves prime eagerly. A full server graph-off run remains to be recorded. |
 | MASK-001 | Planned masks and replay sync | Passed | Tests cover one staged local/global mask per geometry and graph slot; full 360p and 720p profiles each prove 16/16 graph replay and zero blocking CUDA calls inside steady DiT forwards. |
 | AE-001 | Functional TAEHV execution paths | Passed | Nine-history state, fixed graph interfaces, isolation, cleanup, real-weight parity, optional capture declarations, and full-size eight-step streams pass at both resolutions. |
 | FRAME-001 | Typed RGB protocol | Passed | Server/SDK tests cover metadata, contiguous RGB24 bytes, zero-copy NumPy shape, indexing, errors, non-streaming rejection, ordered delivery, and live 360p/720p typed consumption. |
 | E2E-360 | 360p normal serving path | Passed | Registry-selected Hub source + `EngineManager`, all buckets, SDK stream, exact counts, deterministic concurrent worlds, cleanup, slot reuse, and bounded memory passed. |
 | E2E-720 | 720p normal serving path | Passed | Local source + `EngineManager`, all buckets, typed SDK stream, exact counts, byte-identical sequential reuse, full-size two-world interleaving, cleanup, bounded memory, and full eight-step profiler soak passed. |
-| WORLD-001 | World isolation and reuse | Passed | Full server two-world DiT execution interleaved at both resolutions, reproduced distinct solo baselines byte-for-byte, cleaned every request, reused slots, and had -2.0/-49.5 MiB host PSS and 0/0 MiB GPU quiescent growth after warmup at 360p/720p. |
+| WORLD-001 | World isolation and reuse | Passed | Full server two-world DiT execution interleaved at both resolutions, reproduced distinct solo baselines byte-for-byte, cleaned every request, reused slots, and had -2.0/-49.5 MiB host PSS and 0/0 MiB GPU quiescent growth after warmup at 360p/720p. Re-run 2026-09-14 with the `dit: prime` graph live: same verdict at both resolutions, 0 MiB GPU growth. |
 | STREAM-001 | Post-MVP streaming baseline | Passed without a release threshold | Captured 16-step baseline and slow-consumer runs at both resolutions record TTFF, sustained media/wall ratio, p50/p95 gaps, jitter, stalls, backpressure, host PSS, and GPU memory in retained JSON artifacts. |
 
 ## Historical Evidence
@@ -92,6 +92,14 @@ end-to-end gates.
 | 2026-09-11 | Post-rebase Python API/SDK/worker and native Rust checks | Historical: 51 Python tests and 16 Rust wire tests passed; `cargo check --locked` passed | Python raw-frame handling remains in scope. The Waypoint-specific Rust changes covered by this run were later reverted. Socket tests ran outside the restricted sandbox. |
 | 2026-09-11 | `pytest -q test/modular/test_waypoint_packaging.py test/modular/test_waypoint_checkpoint.py test/modular/test_video_frame_protocol.py` | 73 passed, 2 warnings | Post-fix CLI/alias/metadata/pinned-TAEHV contracts and the complete Python raw-frame protocol gate. |
 | 2026-09-12 | `PYTHONPATH=. pytest -q test/modular/test_video_frame_protocol.py test/modular/test_client_sdk.py test/modular/test_api_completion_guard.py` after reverting Waypoint-specific Rust frontend changes | 45 passed, 2 existing FastAPI deprecation warnings | Confirms the supported Python server/SDK frame path is unaffected; `rust/server/src/main.rs` and `test/rust/test_rust_frontend.py` have no remaining Waypoint diff. |
+| 2026-09-14 | `PYTHONPATH=. pytest -q` over `test_waypoint_shell.py`, `test_waypoint_checkpoint.py`, `test_waypoint_dit.py`, `test_waypoint_components.py`, `test_waypoint_streaming_benchmark.py`, `test_cuda_graph_capture.py`; CPU-only sandbox | 210 passed; `ruff check` clean on all 8 changed files | `PRIME-GRAPH-001` contracts: both DiT walks declared in `[rollout, prime]` order, `capture_dit_prime=False` declares rollout only, one shared static-input family, new `--startup-repeats`/`--startup-steps` CLI validation and percentile math |
+| 2026-09-14 | `WAYPOINT_GPU_TESTS=1 pytest -q test/modular/test_waypoint_gpu.py`; H100 80GB, slurm job 6027 | 13 passed (10 pre-existing, 3 new) | Prime replay equals the uncaptured prime by ring snapshot; the prime graph returns its own static input buffer; prime-then-rollout through both graphs is bit-exact against eager, with anti-vacuity assertions on each |
+| 2026-09-14 | `pytest -q test/modular/test_piecewise_config_signature.py test/modular/test_cuda_graph_capture.py`; H100, slurm job 6027 | 11 passed | Capture-policy and piecewise-signature contracts unchanged by the new bucket |
+| 2026-09-14 | `benchmark_streaming.py --variant {360p,720p} --protocol binary --steps 16 --startup-repeats 20`, `capture_dit_prime` default vs `false`; H100, slurm job 6028 | Five capture lines with the flag on, four with it off, at both resolutions. 360p startup p50 63.10 -> 55.13 ms and p95 67.72 -> 58.12 ms; 720p blocked result superseded by job 6033 | `PRIME-GRAPH-001` startup A/B. Payload SHA-256 identical per resolution across arms, `correctness.passed` true, zero stalls |
+| 2026-09-14 | Same benchmark at 720p with the arms reversed, 30 samples per arm; H100, slurm job 6033 | Identical capture-off code moved p50 14.06 ms and p95 54.15 ms by run position alone. Position-balanced over both jobs: p50 142.53 -> 141.95 ms, p95 167.24 -> 154.55 ms, peak GPU 5576 -> 5476 MiB | Controls the arm-ordering confound that made the first blocked 720p A/B read as a regression |
+| 2026-09-14 | `nsys profile` + `check_nsys_replay.py --rollout-range "worker[worker_0].node[dit].graph_walk[prime]" --expected-forwards 3`, capture on and off; H100, slurm jobs 6029 and 6030 | On: `forwards=3 graph_replays=3 sync_or_blocking_calls=0`. Off: `forwards=3 graph_replays=0 sync_or_blocking_calls=1` with 6 `cudaMalloc` and 2 `cudaFree` inside the forward | Prime replay contract, and proof the gate discriminates. Same traces hold the steady rollout range at `forwards=33 graph_replays=33 sync_or_blocking_calls=0` |
+| 2026-09-14 | `serve_rollout.py --variant {720p,360p} --source hub --steps 8 --worlds 2 --concurrent-waves 4 --measure-memory --physical-gpu 0`, `capture_dit_prime` default; H100, slurm job 6035 | PASS at both resolutions, exit 0, five capture lines each including `dit: prime`. 720p peak host 6465.7 MiB / GPU 6380.0 MiB, quiet 6465.8 / 6380.0. 360p peak 6227.6 / 4916.0, quiet 6232.9 / 4916.0 | `WORLD-001` re-run with the prime graph live: four interleaved two-world waves reproduce the solo baselines byte for byte, every request cleaned, slots reused, 0 MiB GPU growth |
+| 2026-09-14 | `pytest -q test/modular/test_waypoint_reference_equivalence.py test/modular/test_waypoint_pixel_equivalence.py`; H100, slurm job 6035 | 19 skipped, not run | Not runnable on this host: these fixtures root at `/mnt/storage/garv901/waypoint-1.5-1B`, which does not exist here, and no oracle frames are present. Not a coverage gap for `PRIME-GRAPH-001` -- both files construct the model directly with `capture=False` and never build a graph. Numerical coverage for the prime bucket comes from `test_waypoint_gpu.py` bit-exactness and the unchanged payload SHA-256 across every benchmark arm |
 
 ## GPU Reproduction Commands
 
@@ -188,6 +196,53 @@ env CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python3 test/waypoint/benchmark_streamin
 needed network access to resolve the pinned TAEHV source archive. A later clean
 Python 3.12/uv resolution and separate real pinned artifact build closed CKPT-003;
 the archive is now intentionally installed outside the index-safe project metadata.
+
+### 2026-09-14 DiT prime capture (PRIME-GRAPH-001)
+
+One H100 80GB, Hub weights from the offline HF cache, upstream `default.jpg` as
+the seed. Allocation: `sbatch --partition=team1 --gres=gpu:1 --cpus-per-task=32
+--mem=200G`, `--physical-gpu 0`, `MSTAR_ENGINE_STEP_SYNC=0`, `HF_HUB_OFFLINE=1`.
+
+The control arm is a copy of `configs/waypoint.yaml` with `capture_dit_prime:
+false` added; the default arm passes no `--config`. The `--protocol binary` flag
+in the commands below ships with the binary-framing change, not with this one.
+
+```bash
+# startup A/B, run once per arm per resolution (jobs 6028 and 6033)
+PYTHONPATH=. python3 test/waypoint/benchmark_streaming.py \
+  --variant 720p --source hub --cache-dir "$HF_CACHE" --seed-image "$SEED" \
+  --physical-gpu 0 --protocol binary \
+  --steps 16 --warmup-steps 1 --slow-consumer-delay 0.25 \
+  --startup-repeats 20 --startup-steps 1 \
+  --startup-timeout 1800 --request-timeout 1200 \
+  --artifact 720p-on.json --log 720p-on-server.log
+#   ... and the same with `--config <noprime.yaml>` for the off arm.
+# Job 6033 repeated 720p with the arms swapped and 30 samples each; run both
+# orders, because arm position moves this metric more than the change does.
+
+# prime replay contract, capture on and off (jobs 6029 and 6030)
+PYTHONPATH=. nsys profile \
+  --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --trace-fork-before-exec=true --cuda-graph-trace=graph --force-overwrite=true \
+  -o prime-720p-on python3 test/waypoint/benchmark_streaming.py \
+    --variant 720p --source hub --cache-dir "$HF_CACHE" --seed-image "$SEED" \
+    --physical-gpu 0 --protocol binary --enable-nvtx \
+    --steps 16 --warmup-steps 1 --slow-consumer-delay 0.25 \
+    --artifact prime-720p-on.json --log prime-720p-on-server.log
+
+nsys export -t sqlite -f true -o prime-720p-on.sqlite prime-720p-on.nsys-rep
+python3 test/waypoint/check_nsys_replay.py prime-720p-on.sqlite \
+  --rollout-range "worker[worker_0].node[dit].graph_walk[prime]" \
+  --expected-forwards 3          # warmup + baseline + slow_consumer each prime once
+python3 test/waypoint/check_nsys_replay.py prime-720p-on.sqlite \
+  --expected-forwards 33         # steady rollout, unchanged control
+```
+
+Retained artifacts: `baselines/prime-capture-2026-09-14-360p-{on,off}.json` and
+`baselines/prime-capture-2026-09-14-720p-{on,off}-arm{1,2}.json`. The `-arm1` and
+`-arm2` suffixes record which position each arm ran in, which is load-bearing for
+reading the 720p numbers. Results are in `OPTIMIZATION_BACKLOG.md`
+`## PRIME-GRAPH-001`.
 
 ## End-to-End Acceptance Checklist
 

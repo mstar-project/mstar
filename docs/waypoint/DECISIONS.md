@@ -30,17 +30,20 @@
 ## WP-003: Optional CUDA Graph Acceleration
 
 - **Status:** Supersedes the required-capture policy, 2026-09-11
-- **Decision:** `cuda_graph=True` attempts capture for encoder prime, steady DiT
-  rollout, decoder initialization, and steady decoder execution. Capture failure
-  falls back to eager execution; `cuda_graph=False` declares no capture buckets.
-  `compile_dit` independently controls the two outer DiT regions.
+- **Decision:** `cuda_graph=True` attempts capture for encoder prime, DiT prime,
+  steady DiT rollout, decoder initialization, and steady decoder execution. Capture
+  failure falls back to eager execution; `cuda_graph=False` declares no capture
+  buckets. `compile_dit` independently controls the two outer DiT regions.
 - **Reason:** CUDA graphs are an acceleration mechanism, not part of the model's
   numerical contract. The engine already supports eager fallback, and Waypoint's
   ring, mask planning, and functional AE state have eager execution paths.
 - **Constraint:** The masked FlexAttention primitive remains compiled because bare
   eager `flex_attention` ignores this BlockMask's block-index visibility data.
-- **Exception:** The one-time DiT prime/cache pass is compiled with
-  `fullgraph=True` only when `compile_dit=True`, and remains uncaptured.
+- **Amendment:** `PRIME-GRAPH-001` promoted the one-time DiT prime/cache pass from
+  compiled-only to captured on 2026-09-14. `capture_dit_prime` defaults to `True`
+  and is subordinate to `cuda_graph`; setting it `False` keeps the uncaptured prime
+  reachable as the startup-latency control arm. `compile_dit` still independently
+  controls that pass's `fullgraph=True` region either way.
 
 ## WP-004: Internal Prime Is Not User Output
 
