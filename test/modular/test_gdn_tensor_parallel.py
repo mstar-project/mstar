@@ -7,8 +7,11 @@ compare against the single-rank load.
 
 The one that matters is ``[q|k|v]``. It is a single checkpoint tensor over
 ``conv_dim``, and a flat ``chunk(conv_dim, tp)`` — the obvious thing — hands
-rank 0 the whole of q plus half of k. Both the conv weight and ``in_proj_qkv``
-carry that layout, so both get checked.
+rank 0 the whole of q plus half of k. Both the conv weight and the ``[q|k|v]``
+part of the fused projection carry that layout, so both get checked.
+
+The four input projections live in one ``in_proj_fused`` parameter (one GEMM
+at decode), so the checks pull each block back out by offset.
 
 No collectives are involved: nothing calls ``forward``, so this runs on CPU in
 CI rather than needing a real process group.
@@ -22,6 +25,8 @@ import torch
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
 from mstar.model.components.linear_attn import GDNProjLayout
+from mstar.model.loader.base import load_weights_into
+from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS
 
 HIDDEN = 256
 NUM_K_HEADS = 4
@@ -33,6 +38,10 @@ KEY_DIM = NUM_K_HEADS * HEAD_K
 VALUE_DIM = NUM_V_HEADS * HEAD_V
 CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 QKV_BLOCKS = [KEY_DIM, KEY_DIM, VALUE_DIM]
+# the fused projection's blocks, in order: [q|k|v|z|a|pad|b]. The pad keeps
+# `b` 16-byte aligned per rank, so its width depends on tp — read the real
+# widths off the module rather than recomputing them here.
+BLOCK_INDEX = {"q": 0, "k": 1, "v": 2, "z": 3, "a": 4, "pad": 5, "b": 6}
 
 
 def build(tp: int, rank: int) -> ParallelGatedDeltaNet:
@@ -64,15 +73,71 @@ def reference_weights() -> dict[str, torch.Tensor]:
     }
 
 
-def load(module: ParallelGatedDeltaNet, weights: dict[str, torch.Tensor]) -> None:
-    params = dict(module.named_parameters())
+def load(module, weights: dict[str, torch.Tensor], source=None) -> None:
+    """Load through the real routing, so the stacked rules are under test too.
+
+    The rules match on ``.in_proj_*``, so names need a module prefix — hence
+    the holder, which stands in for the decoder layer.
+
+    A name that is already a *fused* parameter's own arrives whole rather than
+    per shard; ``test_whole_stack_reassembles_across_ranks`` produces those,
+    because its checkpoint is a built model. Splitting them per block here
+    keeps the production loader strict about needing a shard id. ``source`` is
+    the module they came from — needed because the alignment pad is sized per
+    rank, so the incoming blocks are not the destination's widths.
+    """
+    holder = torch.nn.Module()
+    holder.mix = module
+    params = dict(holder.named_parameters())
+    modules = dict(holder.named_modules())
+    src_modules = dict(source.named_modules()) if source is not None else {}
+
+    by_rule, loaded = [], set()
     for name, tensor in weights.items():
-        param = params[name]
-        loader = getattr(param, "weight_loader", None)
-        if loader is None:
-            param.data.copy_(tensor)
-        else:
-            loader(param, tensor)
+        key = f"mix.{name}"
+        owner_name = key.rsplit(".", 1)[0]
+        owner = modules.get(owner_name)
+        sizes = getattr(owner, "output_sizes", None)
+        if sizes is None or not key.endswith(".weight"):
+            by_rule.append((key, tensor))
+            continue
+        src = src_modules.get(name.rsplit(".", 1)[0])
+        offset = 0
+        for block, size in enumerate(getattr(src, "output_sizes", sizes)):
+            # the alignment pad is the one block whose width differs between
+            # degrees, and it holds no weight — everything else loads
+            if size and size == sizes[block]:
+                owner.weight_loader(
+                    params[key], tensor.narrow(0, offset, size), block,
+                )
+            offset += size
+        loaded.add(key)
+
+    loaded |= load_weights_into(holder, by_rule, stacked_params=_STACKED_PARAMS)
+    assert loaded == set(params), set(params) - loaded
+
+
+def fused_block(module: ParallelGatedDeltaNet, name: str, tp: int) -> torch.Tensor:
+    """This rank's slice of one block of the fused input projection."""
+    per = [size // tp for size in module.in_proj_fused.output_sizes]
+    index = BLOCK_INDEX[name]
+    return module.in_proj_fused.weight.data.narrow(
+        0, sum(per[:index]), per[index],
+    )
+
+
+def drop_pad(tensor: torch.Tensor, sizes: list[int]) -> torch.Tensor:
+    """Everything but the alignment block, so tp=1 and tp=2 compare.
+
+    The pad's width is set by the *local* head count, so it differs between
+    degrees — it is layout, not weight, and nothing ever reads it.
+    """
+    keep, offset = [], 0
+    for index, size in enumerate(sizes):
+        if index != BLOCK_INDEX["pad"]:
+            keep.append(tensor.narrow(0, offset, size))
+        offset += size
+    return torch.cat(keep, dim=0)
 
 
 def rejoin_blocks(shards: list[torch.Tensor], blocks: list[int]) -> torch.Tensor:
@@ -94,9 +159,11 @@ def test_qkv_and_conv_shard_per_block(tp):
     for module in ranks:
         load(module, ref)
 
-    rejoined = rejoin_blocks(
-        [m.in_proj_qkv.weight.data for m in ranks], QKV_BLOCKS,
-    )
+    qkv_per_rank = [
+        torch.cat([fused_block(m, n, tp) for n in ("q", "k", "v")], dim=0)
+        for m in ranks
+    ]
+    rejoined = rejoin_blocks(qkv_per_rank, QKV_BLOCKS)
     torch.testing.assert_close(rejoined, ref["in_proj_qkv.weight"])
 
     conv = rejoin_blocks(
@@ -105,7 +172,7 @@ def test_qkv_and_conv_shard_per_block(tp):
     torch.testing.assert_close(conv, ref["conv1d.weight"].view(-1, CONV_WIDTH))
 
     # and the naive split really would have been wrong
-    naive = torch.cat([m.in_proj_qkv.weight.data for m in ranks], dim=0)
+    naive = torch.cat(qkv_per_rank, dim=0)
     assert not torch.equal(naive, ref["in_proj_qkv.weight"])
 
 
@@ -116,11 +183,12 @@ def test_every_parameter_reassembles(tp):
     for module in ranks:
         load(module, ref)
 
-    for name, dim in [
-        ("in_proj_z.weight", 0), ("in_proj_a.weight", 0),
-        ("in_proj_b.weight", 0), ("A_log", 0), ("dt_bias", 0),
-        ("out_proj.weight", 1),
-    ]:
+    for block in ("z", "a", "b"):
+        got = torch.cat([fused_block(m, block, tp) for m in ranks], dim=0)
+        name = f"in_proj_{block}.weight"
+        torch.testing.assert_close(got, ref[name].to(got.dtype), msg=name)
+
+    for name, dim in [("A_log", 0), ("dt_bias", 0), ("out_proj.weight", 1)]:
         got = torch.cat(
             [dict(m.named_parameters())[name].data for m in ranks], dim=dim,
         )
@@ -195,10 +263,15 @@ def rejoin(
     Dispatches on the module that *owns the layout*, which for the conv is the
     mixer rather than the `Conv1d` the weight hangs off.
     """
-    from mstar.model.components.distributed import RowParallelLinear
+    from mstar.model.components.distributed import (
+        MergedColumnParallelLinear,
+        RowParallelLinear,
+    )
 
     owner = modules[name.rsplit(".", 1)[0]]
-    if type(owner).__name__ == "_FusedBlockColumnParallelLinear":
+    # covers the delta net's [q|k|v|z|a|b] and the MLP's [gate|up] alike:
+    # every block is divided separately, so a flat cat would be wrong
+    if isinstance(owner, MergedColumnParallelLinear) and name.endswith("weight"):
         return rejoin_blocks(shards, owner.output_sizes)
     if name.endswith("conv1d.weight"):
         mixer = modules[name[: -len(".conv1d.weight")]]
@@ -232,14 +305,22 @@ def test_whole_stack_reassembles_across_ranks():
 
     ranks = [Qwen3_5ForCausalLM(config, CommGroup(r, r, [0, 1])) for r in (0, 1)]
     for module in ranks:
-        load(module, checkpoint)
+        load(module, checkpoint, source=ref)
 
     modules = dict(ranks[0].named_modules())
+    ref_modules = dict(ref.named_modules())
     per_rank = [dict(m.named_parameters()) for m in ranks]
     checked, replicated = 0, 0
     for name, want in checkpoint.items():
         shards = [p[name].data for p in per_rank]
         got = rejoin(name, modules, shards)
+        owner = modules[name.rsplit(".", 1)[0]]
+        if type(owner).__name__ == "_FusedBlockColumnParallelLinear":
+            # tp=1 and tp=2 pad `b` differently; compare the weights, not it
+            got = drop_pad(got, owner.output_sizes)
+            want = drop_pad(
+                want, ref_modules[name.rsplit(".", 1)[0]].output_sizes,
+            )
         torch.testing.assert_close(
             got, want, msg=lambda s, n=name: f"{n}: {s}",
         )
@@ -250,9 +331,15 @@ def test_whole_stack_reassembles_across_ranks():
 
     # Everything halves except the norms, which are head *dims* and layer
     # norms — replicated by design, and the only thing a rank holds whole.
+    # The alignment pad is storage a rank carries and the reference does not.
     total = sum(p.numel() for p in ref.parameters())
+    pad = sum(
+        module.output_sizes[BLOCK_INDEX["pad"]] // 2 * module.weight.shape[1]
+        for module in ranks[0].modules()
+        if type(module).__name__ == "_FusedBlockColumnParallelLinear"
+    )
     assert sum(p.numel() for p in ranks[0].parameters()) == (
-        (total - replicated) // 2 + replicated
+        (total - replicated) // 2 + replicated + pad
     )
     assert 0 < replicated < total // 100, (
         f"{replicated} replicated of {total} — norms only, so this should be tiny"

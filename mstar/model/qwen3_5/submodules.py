@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # Capped, because every captured row holds a recurrent slot until the whole
     # capture pass finishes: the runner keys its dummy rows per (config, slot),
     # so the pool's high-water mark is

@@ -8,8 +8,10 @@ its position among its own kind, not its position in the stack. See
 Tensor parallelism shards by head throughout — q-heads for attention, k/v-heads
 for the delta net — and the engine shards the KV cache and the recurrent pool to
 match without being told, so ``get_node_resources`` stays unsharded. The
-checkpoint keeps ``q/k/v`` and ``gate/up`` apart, so every projection maps to
-one parallel linear and the weight loader's names stay one-to-one.
+checkpoint keeps ``gate/up`` and the delta net's four projections apart; we
+fuse each group into one GEMM and route the checkpoint's tensors in by shard
+id, because at decode width those GEMMs are latency-bound rather than
+bandwidth-bound. ``q/k/v`` stay apart — see ``Qwen3_5Attention``.
 
 Two head counts are not the q-heads: ``num_key_value_heads`` is 4 or 2, so past
 that degree the K/V heads replicate (see ``KVColumnParallelLinear``), and the
@@ -30,7 +32,7 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
-from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused
+from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.linear_attn import GDNProjLayout
 from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
@@ -173,9 +175,9 @@ def _norm(config: Qwen3_5Config) -> RMSNorm:
 
 
 def _build_mlp(config: Qwen3_5Config, comm_group: CommGroup) -> nn.Module:
-    # Unfused, so `gate_proj` / `up_proj` keep the checkpoint's own names and
-    # the weight loader needs no stacked-shard rules.
-    return ParallelGatedMLPUnfused(
+    # Fused gate/up: one GEMM per layer instead of two. The checkpoint's
+    # separate tensors route in by shard id — see `_STACKED_PARAMS`.
+    return ParallelGatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         comm_group=comm_group,

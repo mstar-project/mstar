@@ -86,6 +86,12 @@ class GDNManager(LinearAttnManager):
 
         self._current: dict[str, GDNWrapper] = {}
 
+        # Pre-planning. Nothing here mutates live state — the wrappers are
+        # built once and their plans are per-step descriptors — so staging is
+        # just caching the result. Follows the pool, which it depends on.
+        self._preplanned = False
+        self._cached_plan_output: dict[str, GDNWrapper] | None = None
+
     @staticmethod
     def _check_state_dtype(
         state_dtype: torch.dtype, geometry: DeltaNetGeometry, has_sink: bool,
@@ -127,8 +133,21 @@ class GDNManager(LinearAttnManager):
 
     # Step lifecycle
 
+    @property
+    def supports_preplan(self):
+        return True
+
     def plan(self, step: LinearAttnStep, ctx: StepContext):
+        assert not (self._preplanned and ctx.is_preplan), (
+            "linear-attn preplan is already pending; clear_preplan before "
+            "planning a different step ahead"
+        )
         self.reset_default_cursors()
+        if self._preplanned:
+            self._current = self._cached_plan_output
+            self.clear_preplan()
+            return self._current
+
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
 
         self._current = {}
@@ -136,7 +155,16 @@ class GDNManager(LinearAttnManager):
             self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx
             )
+        if ctx.is_preplan:
+            self._preplanned = True
+            self._cached_plan_output = self._current
         return self._current
+
+    def clear_preplan(self):
+        # The wrappers' plan state is overwritten by whatever plans next, so
+        # an abandoned stage leaves nothing to rewind.
+        self._preplanned = False
+        self._cached_plan_output = None
 
     @staticmethod
     def _group_by_label(segments) -> dict[str, list[Segment]]:
@@ -172,6 +200,7 @@ class GDNManager(LinearAttnManager):
                     device=self._device,
                     pad_slot_id=PAD_SLOT_ID,
                     sm_scale=self.config.sm_scale,
+                    qk_l2norm=self.config.qk_l2norm,
                     bs=bs,
                     cuda_graph=lease is not None,
                 )
@@ -180,6 +209,7 @@ class GDNManager(LinearAttnManager):
                     device=self._device,
                     pad_slot_id=PAD_SLOT_ID,
                     sm_scale=self.config.sm_scale,
+                    qk_l2norm=self.config.qk_l2norm,
                     prefill_dtype=self._prefill_dtype,
                     bs=bs,
                     num_tokens=tok,
@@ -255,13 +285,16 @@ class GDNManager(LinearAttnManager):
         there is no output buffer to stitch: each kernel already writes the
         batch in order.
 
-        q and k are L2-normalized here rather than in the kernels. Both take a
-        flag for it, but the SM90 prefill kernel silently ignores its one and
-        returns NaN for any sequence long enough to matter.
+        q and k are L2-normalized wherever the kernel will not do it. Both take
+        a flag, but only the decode one honours it: the SM90 chunked kernel
+        silently ignores its own and returns NaN for any sequence long enough
+        to matter. Doing it here costs a norm, a divide and two casts per
+        tensor per layer, so the decode path leaves it to the kernel.
         """
         plan = self.current_plan(label)
-        q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
-        k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
+        if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
+            q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
+            k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
         # both kernels demand contiguous inputs, and a caller that split one
         # projection into q/k/v hands over views that are not. A no-op when
         # they already are.

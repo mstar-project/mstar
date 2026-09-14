@@ -149,6 +149,20 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
+    def _gdn_state_dtype(self) -> torch.dtype:
+        """bf16 where FlashInfer's fused decode kernel takes it, else fp32.
+
+        That kernel is K=V=128 only, and falling off it costs both ways: the
+        state is read and written every step, so fp32 doubles the traffic, and
+        the fallback path L2-normalises q and k in eager ops rather than in the
+        kernel. Measured at bs=16 that was ~0.2ms a step in `norm`+`div` alone.
+        """
+        head_dims_ok = (
+            self.config.linear_key_head_dim == 128
+            and self.config.linear_value_head_dim == 128
+        )
+        return torch.bfloat16 if head_dims_ok else torch.float32
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         num_kv_layers = len(self.config.full_layer_indices)
         num_gdn_layers = len(self.config.linear_layer_indices)
@@ -181,7 +195,7 @@ class Qwen3_5DenseModel(Model):
                         head_k_dim=self.config.linear_key_head_dim,
                         head_v_dim=self.config.linear_value_head_dim,
                         conv_kernel_size=self.config.linear_conv_kernel_dim
-                    ).to_blocks()
+                    ).to_blocks(state_dtype=self._gdn_state_dtype()),
                 )
             ),
             LinearAttnSpec(
@@ -209,7 +223,6 @@ class Qwen3_5DenseModel(Model):
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
                     name="new_token",
-                    conductor_new_token=True,
                     persist=True,
                     output_modality="text"
                 ),
@@ -230,8 +243,6 @@ class Qwen3_5DenseModel(Model):
                         next_node=EMIT_TO_CLIENT,
                         name="text_inputs",
                         output_modality="text",
-                        # counted toward the conductor's `max_output_tokens`
-                        conductor_new_token=True,
                     ),
                 ],
             ),
@@ -261,7 +272,6 @@ class Qwen3_5DenseModel(Model):
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
                         name="new_token",
-                        conductor_new_token=True,
                         persist=True,
                         output_modality="text",
                     ),

@@ -26,11 +26,15 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.distributed.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
+from mstar.model.components.linear_attn import (
+    SPLIT_SHARD_BLOCKS,
+    GatedDeltaNet,
+    GDNProjLayout,
+    gate_pad,
+)
 
 
 def _shard_blocks(
@@ -50,28 +54,37 @@ def _shard_blocks(
 
 
 class _FusedBlockColumnParallelLinear(MergedColumnParallelLinear):
-    """A merged column-parallel linear whose checkpoint tensor arrives whole.
+    """A merged column-parallel linear whose checkpoint tensors span blocks.
 
-    The parent wants one call per block with a ``loaded_shard_id``; the
-    delta-net checkpoint stores a single ``[q|k|v]`` weight. Splitting here
-    keeps the weight loader's names one-to-one with the checkpoint's.
+    The parent wants one call per block; the delta-net checkpoint stores
+    ``[q|k|v]`` as a single tensor and z/a/b as one each. ``shard_map`` says
+    which blocks a given checkpoint tensor covers, so the loader's names stay
+    one-to-one with the checkpoint's.
     """
+
+    def __init__(self, *, shard_map: dict[str, tuple[int, ...]], **kwargs):
+        # before super(), which attaches the bound loader below
+        self._shard_map = shard_map
+        super().__init__(**kwargs)
 
     def weight_loader(
         self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: int | None = None,
+        loaded_shard_id: str | int | None = None,
     ):
-        if loaded_shard_id is not None:
-            return super().weight_loader(param, loaded_weight, loaded_shard_id)
+        # an int is already a block index — only names go through the map
+        blocks = (
+            (loaded_shard_id,) if isinstance(loaded_shard_id, int)
+            else self._shard_map[loaded_shard_id]
+        )
         offset = 0
-        for shard_id, size in enumerate(self.output_sizes):
+        for block in blocks:
+            size = self.output_sizes[block]
             super().weight_loader(
-                param, loaded_weight.narrow(0, offset, size), shard_id,
+                param, loaded_weight.narrow(0, offset, size), block,
             )
             offset += size
-        return None
 
 
 class ParallelGatedDeltaNet(GatedDeltaNet):
@@ -141,21 +154,18 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
         # the fused layout keeps the base's plain projections; it refuses tp>1
         # above, so there is nothing to shard
         if layout is GDNProjLayout.SPLIT:
-            self.in_proj_qkv = _FusedBlockColumnParallelLinear(
+            # Every block shards on dim 0 by head count, so one merged linear
+            # covers them all — the base's forward splits the result. Widths
+            # here are the checkpoint's; the pad is sized from the *local* head
+            # count and scaled up, since alignment is a per-rank property.
+            self.in_proj_fused = _FusedBlockColumnParallelLinear(
                 comm_group=comm_group, input_size=hidden_size,
-                output_sizes=self._qkv_blocks, bias=proj_bias,
-            )
-            self.in_proj_z = ColumnParallelLinear(
-                comm_group=comm_group, input_size=hidden_size,
-                output_size=self.total_value_dim, bias=proj_bias,
-            )
-            self.in_proj_a = ColumnParallelLinear(
-                comm_group=comm_group, input_size=hidden_size,
-                output_size=num_v_heads, bias=proj_bias,
-            )
-            self.in_proj_b = ColumnParallelLinear(
-                comm_group=comm_group, input_size=hidden_size,
-                output_size=num_v_heads, bias=proj_bias,
+                output_sizes=[
+                    self.total_key_dim, self.total_key_dim,
+                    self.total_value_dim, self.total_value_dim,
+                    num_v_heads, gate_pad(self.num_v_heads) * tp, num_v_heads,
+                ],
+                bias=proj_bias, shard_map=SPLIT_SHARD_BLOCKS,
             )
         self.out_proj = RowParallelLinear(
             comm_group=comm_group, input_size=self.total_value_dim,

@@ -25,6 +25,7 @@ class GDNWrapper(ABC):
         device: torch.device,
         pad_slot_id: int,
         sm_scale: float | None=None,
+        qk_l2norm: bool=True,
         num_tokens: int | None=None,
         bs: int | None=None,
         cuda_graph: bool=False
@@ -42,7 +43,13 @@ class GDNWrapper(ABC):
         self._cuda_graph = cuda_graph
         self._capacity = -1
         self._sm_scale = sm_scale
+        self._qk_l2norm = qk_l2norm
         self._device = device
+
+    # Whether this wrapper's kernel honours its own q/k L2-norm flag. The SM90
+    # chunked kernel takes one and ignores it, returning NaN once a sequence is
+    # long enough to matter, so the prefill path is normalised by the caller.
+    qk_l2norm_in_kernel: bool = False
 
     @abstractmethod
     def plan(self, *args, **kwargs):
@@ -99,6 +106,7 @@ class GDNPrefillWrapper(GDNWrapper):
         device: torch.device,
         pad_slot_id: int,
         sm_scale: float | None=None,
+        qk_l2norm: bool=True,
         prefill_dtype: torch.dtype = torch.float32,
         num_tokens: int | None=None,
         bs: int | None=None,
@@ -108,6 +116,7 @@ class GDNPrefillWrapper(GDNWrapper):
             device=device,
             pad_slot_id=pad_slot_id,
             sm_scale=sm_scale,
+            qk_l2norm=qk_l2norm,
             num_tokens=num_tokens,
             bs=bs,
             cuda_graph=cuda_graph
@@ -325,6 +334,8 @@ class GDNPrefillWrapper(GDNWrapper):
             initial_state=initial,
             output_final_state=True,
             cu_seqlens=self._plan_state.cu_seqlens,
+            # ignored by this kernel (see `qk_l2norm_in_kernel`); the caller
+            # has already normalised q and k
             use_qk_l2norm_in_kernel=False,
         )
         state.index_copy_(0, slots, final.to(state.dtype))
@@ -345,6 +356,7 @@ class GDNDecodeWrapper(GDNWrapper):
         device: torch.device,
         pad_slot_id: int,
         sm_scale: float | None=None,
+        qk_l2norm: bool=True,
         bs: int | None=None,
         cuda_graph: bool=False
     ):
@@ -352,12 +364,17 @@ class GDNDecodeWrapper(GDNWrapper):
             device=device,
             pad_slot_id=pad_slot_id,
             sm_scale=sm_scale,
+            qk_l2norm=qk_l2norm,
             num_tokens=bs,
             bs=bs,
             cuda_graph=cuda_graph
         )
 
         self._plan_state: GDNDecodePlan | None = None
+
+    # The cutlass decode kernel really does normalise in-kernel, which saves
+    # the caller a norm + divide + two casts per q and k, per layer, per step.
+    qk_l2norm_in_kernel: bool = True
 
     def plan(
         self, spans: list[int], slots: torch.Tensor
@@ -398,6 +415,6 @@ class GDNDecodeWrapper(GDNWrapper):
             scale=self._sm_scale,
             initial_state=state,
             initial_state_indices=self._plan_state.slots,
-            use_qk_l2norm=False,
+            use_qk_l2norm=self._qk_l2norm,
         )
         return out.squeeze(1)

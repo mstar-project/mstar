@@ -1,11 +1,14 @@
 """Loading a Qwen3.5 checkpoint into this stack.
 
-A pure rename in both towers: every tensor matches ours in shape, so nothing
-is split, fused or transposed on the way in. Two rules cover all 426 text
-tensors — the checkpoint nests the text stack under ``language_model`` and
-names the gated-delta-net mixer ``linear_attn`` where ours calls both mixers
-``self_attn``. The 297 vision tensors need only their ``model.visual.``
+Mostly a rename: the checkpoint nests the text stack under ``language_model``
+and names the gated-delta-net mixer ``linear_attn`` where ours calls both
+mixers ``self_attn``. The 297 vision tensors need only their ``model.visual.``
 prefix stripped.
+
+What is not a rename is fusion. We hold the MLP's gate/up as one GEMM and the
+delta net's four input projections as another, so six checkpoint tensors per
+layer-pair land in two parameters; ``_STACKED_PARAMS`` routes each by shard id
+to the fused parameter's ``weight_loader``.
 
 The two towers load separately because they are separate nodes: a worker
 holding only ``LLM`` never builds the ViT, and vice versa. The MTP head
@@ -18,8 +21,20 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from mstar.model.loader.base import load_weights_into
+from mstar.model.loader.base import StackedParamRule, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_shards
+
+# The shard ids are the fused parameters' own: ints index
+# `MergedColumnParallelLinear.output_sizes`, the delta net's names key
+# `SPLIT_SHARD_BLOCKS`.
+_STACKED_PARAMS: list[StackedParamRule] = [
+    StackedParamRule(".gate_up_proj", ".gate_proj", 0),
+    StackedParamRule(".gate_up_proj", ".up_proj", 1),
+    StackedParamRule(".in_proj_fused", ".in_proj_qkv", "qkv"),
+    StackedParamRule(".in_proj_fused", ".in_proj_z", "z"),
+    StackedParamRule(".in_proj_fused", ".in_proj_a", "a"),
+    StackedParamRule(".in_proj_fused", ".in_proj_b", "b"),
+]
 
 _TEXT_PREFIX = "model.language_model."
 _VISION_PREFIX = "model.visual."
@@ -52,6 +67,7 @@ def _load(
     remapper,
     selectors: list[dict],
     expected: set[str],
+    stacked: list[StackedParamRule] | None = None,
 ) -> set[str]:
     """Fill ``expected`` from the shards each selector picks out, or raise.
 
@@ -69,6 +85,7 @@ def _load(
             model,
             iter_safetensors_shards(Path(path), device=device, **selector),
             name_remapper=remapper,
+            stacked_params=stacked,
         )
     missing = sorted(expected - loaded)
     if missing:
@@ -98,6 +115,7 @@ def load_qwen3_5_weights(
             # (and `named_parameters` dedupes it away besides)
             if not (tied and n == _LM_HEAD)
         },
+        stacked=_STACKED_PARAMS,
     )
 
 

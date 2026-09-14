@@ -46,6 +46,12 @@ class LinearAttnConfig:
     # formula in the KDA kernel. None keeps the softplus one.
     gate_lower_bound: float | None = None
 
+    # L2-normalise q and k inside the delta-rule kernel. Qwen3.5 wants this —
+    # both HF (`modeling_qwen3_5.py`, chunked and recurrent paths) and vLLM
+    # pass it — and skipping it is a silent numerical divergence rather than an
+    # error, so the default is on.
+    qk_l2norm: bool = True
+
 
 @dataclass
 class LinearAttnSpec(NodeResourceSpec):

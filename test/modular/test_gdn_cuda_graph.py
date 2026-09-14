@@ -151,8 +151,10 @@ class Stack(torch.nn.Module):
             layer.mix.set_layer_idx(i)
             h = norm(x)
             tokens = h.shape[0]
+            # one fused GEMM, split back out — see GatedDeltaNet._project_split
+            qkv_proj, z, a, b = layer._project_split(h)
             qkv = layer.mix.conv(
-                layer.in_proj_qkv(h),
+                qkv_proj,
                 weight=layer.conv1d.weight.squeeze(1),
                 bias=layer.conv1d.bias,
             )
@@ -161,14 +163,13 @@ class Stack(torch.nn.Module):
                 qkv, [layer.key_dim, layer.key_dim, layer.value_dim], dim=-1,
             )
             core = layer.mix(
-                q.view(tokens, layer.num_k_heads, layer.head_k_dim),
-                k.view(tokens, layer.num_k_heads, layer.head_k_dim),
-                v.view(tokens, layer.num_v_heads, layer.head_v_dim),
-                layer.in_proj_a(h), layer.in_proj_b(h),
+                q.reshape(tokens, layer.num_k_heads, layer.head_k_dim),
+                k.reshape(tokens, layer.num_k_heads, layer.head_k_dim),
+                v.reshape(tokens, layer.num_v_heads, layer.head_v_dim),
+                a, b,
                 layer.A_log, layer.dt_bias,
             )
             after_rule = torch.isfinite(core).all()
-            z = layer.in_proj_z(h).view(tokens, layer.num_v_heads, layer.head_v_dim)
             x = x + layer.out_proj(
                 layer.norm(core, z).reshape(tokens, layer.value_dim)
             )

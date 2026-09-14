@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 import time as _time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -48,6 +48,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
+from mstar.utils.numa import pin_to_device_numa_node
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
@@ -150,12 +151,18 @@ class Worker:
         # record into it too; run() owns the periodic flush.
         self._phase_period = PHASE_PERIOD
         self._phase_buf = phase_buffer()
+        # (start, end) CUDA events per step, drained once they land
+        self._gpu_spans: deque = deque(maxlen=64)
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
 
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
+            # put the pinned buffers on whichever node we land on.
+            pinned = pin_to_device_numa_node(self.device)
+            if pinned:
+                logger.info("Worker %s: pinned to %s", worker_id, pinned)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -1150,6 +1157,20 @@ class Worker:
         if self._phase_period > 0:
             self._phase_buf[name].append(dt)
 
+    def _drain_gpu_spans(self) -> None:
+        """Record the GPU times whose events have landed, leaving the rest.
+
+        Only completed pairs: reading one still in flight blocks the host on
+        the GPU, which is the thing being measured.
+        """
+        while self._gpu_spans:
+            start, end = self._gpu_spans[0]
+            if not end.query():
+                return
+            self._gpu_spans.popleft()
+            # elapsed_time is ms; the phase buffer holds seconds
+            self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
+
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1191,17 +1212,35 @@ class Worker:
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
-            with self._span("worker.gpu_thread.exec"):
-                outputs = engine.exec_and_postprocess(node_batch)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
                 if self.device.type != "cpu"
                 else None
             )
+            # How long the step takes *on the device*, as opposed to the host
+            # time to submit it. Both are needed to say whether a slow iter was
+            # starved or just busy, and the phase timers only see the host.
+            gpu_start = None
+            if self._phase_period and execution_stream is not None:
+                gpu_start = torch.Event(enable_timing=True)
+                gpu_start.record(execution_stream)
+            if self._phase_period:
+                # after prepare_inputs, which can drop rids — this is the row
+                # count the forward really pays for
+                self._phase_record(
+                    f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
+                )
+            with self._span("worker.gpu_thread.exec"):
+                outputs = engine.exec_and_postprocess(node_batch)
             if execution_stream is not None:
                 event = torch.Event()
                 event.record(execution_stream)
                 node_batch.completion_event = event
+                if gpu_start is not None:
+                    gpu_end = torch.Event(enable_timing=True)
+                    gpu_end.record(execution_stream)
+                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._drain_gpu_spans()
             return outputs
         finally:
             # Safety net: a step that raised before the forward would otherwise
@@ -2252,10 +2291,15 @@ class Worker:
             for name, vs in samples:
                 vs = sorted(vs)
                 n = len(vs)
-                p50 = vs[n // 2] * 1000
-                p95 = vs[min(n - 1, int(n * 0.95))] * 1000
-                mean = (sum(vs) / n) * 1000
-                parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+                # a trailing '#' marks a count, not a duration
+                scale, unit = (1, "") if name.endswith("#") else (1000, "ms")
+                p50 = vs[n // 2] * scale
+                p95 = vs[min(n - 1, int(n * 0.95))] * scale
+                mean = (sum(vs) / n) * scale
+                parts.append(
+                    f"{name}: p50={p50:.2f}{unit} p95={p95:.2f}{unit} "
+                    f"mean={mean:.2f}{unit} n={n}"
+                )
             logger.info(
                 "Worker %s phase-timing iter=%d: %s",
                 self.worker_id, phase_iter[0], " | ".join(parts),

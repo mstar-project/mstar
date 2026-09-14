@@ -501,7 +501,7 @@ class CudaGraphRunner:
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
-            self._dummy_rows.reset(dummy_rids)
+            self._dummy_rows.reset(dummy_rids, free=True)
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -815,12 +815,9 @@ class CudaGraphRunner:
 
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
-
-        Their pages stay resident (``free=False``), so the next step's plan for
-        this slot allocates nothing for the tail.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
-        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs])
+        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
 
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.

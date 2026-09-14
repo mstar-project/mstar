@@ -15,7 +15,7 @@ and a fork is a fixed-size copy rather than a page-count-dependent one.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import prod
 from typing import TYPE_CHECKING
 
@@ -240,14 +240,36 @@ class RecurrentStateSpec(NodeResourceSpec):
 
         return RecurrentStatePool
 
-    def apply_yaml_overrides(self, max_slots: int | None = None):
-        """How many slots this deployment gets.
+    def apply_yaml_overrides(
+        self, max_slots: int | None = None, state_dtype: str | None = None,
+    ):
+        """How many slots this deployment gets, and how precise they are.
 
-        Block shapes are not tunable: they are the model's, and a pool sized
+        Block *shapes* are not tunable: they are the model's, and a pool sized
         for shapes the backend does not produce is a crash, not a slow run.
+        The state's dtype is a deployment call — it trades precision that
+        accumulates over a whole generation against half the bandwidth on a
+        tensor read and written every step, and it decides which kernels the
+        backend can reach. The model's default stands unless this is set.
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
+        if state_dtype is not None:
+            try:
+                dtype = getattr(torch, state_dtype)
+            except AttributeError:
+                dtype = None
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"state_dtype {state_dtype!r} is not a torch dtype"
+                )
+            block = self.config.blocks.get("state")
+            if block is None:
+                raise ValueError(
+                    "state_dtype was set but this pool has no 'state' block; "
+                    f"it has {sorted(self.config.blocks)}"
+                )
+            self.config.blocks["state"] = replace(block, dtype=dtype)
 
 
 @dataclass(frozen=True)
