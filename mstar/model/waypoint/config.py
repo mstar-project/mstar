@@ -136,11 +136,18 @@ class WaypointConfig:
     # primitive, which stays compiled for correctness (engine/resources/attn/flex.py).
     compile_dit: bool = True
 
-    # Attempt fixed-shape CUDA graph capture for the encoder prime, steady DiT
-    # rollout, and decoder prime/rollout paths. An optimization: disabled
-    # declares no buckets, and a failed capture falls back to eager submodule
-    # forwards.
+    # Attempt fixed-shape CUDA graph capture for the encoder prime, DiT prime,
+    # steady DiT rollout, and decoder prime/rollout paths. An optimization:
+    # disabled declares no buckets, and a failed capture falls back to eager
+    # submodule forwards.
     cuda_graph: bool = True
+
+    # Also capture the one-time DiT prime/cache pass. Subordinate to
+    # ``cuda_graph``: disabled leaves the steady rollout graph alone and serves
+    # prime through the compiled eager forward. On by default since
+    # PRIME-GRAPH-001 measured lower startup p95 at both resolutions; False is
+    # that A/B's control arm and stays reachable.
+    capture_dit_prime: bool = True
 
     # Guard rails the ported modules assert against, kept here so a drifting
     # checkpoint fails loudly at construction rather than silently mis-serving.

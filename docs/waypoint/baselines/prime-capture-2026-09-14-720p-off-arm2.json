@@ -1,0 +1,163 @@
+{
+  "backpressure": {
+    "configured_consumer_pause_seconds": 0.25,
+    "injected_pause_seconds": 3.75,
+    "observed_request_wall_increase_seconds": 3.561310931108892,
+    "payloads_match": true,
+    "peak_gpu_memory_change_mib": 0.0,
+    "peak_host_pss_change_mib": 22.1943359375,
+    "sustained_media_to_wall_ratio_change": -1.4269639410436483,
+    "time_to_first_frame_change_seconds": 0.0035902209347113967,
+    "wall_increase_beyond_injected_pause_seconds": -0.18868906889110804
+  },
+  "benchmark": "waypoint_streaming_viability",
+  "configuration": {
+    "memory_sample_interval_seconds": 0.1,
+    "physical_gpu": 0,
+    "rng_seed": 112464007,
+    "server_command": [
+      "/shared/home/garv901-55613a/mstar-worktrees/graphapi-testing/.venv/bin/python",
+      "/shared/home/garv901-55613a/waypoint-int/mstar/mstar/api_server/entrypoint.py",
+      "--config",
+      "/tmp/waypoint-stream-benchmark-66tmtpb6/run.yaml",
+      "--port",
+      "48653",
+      "--host",
+      "127.0.0.1",
+      "--socket-path-prefix",
+      "/tmp/waypoint-stream-benchmark-66tmtpb6/sock",
+      "--upload-dir",
+      "/tmp/waypoint-stream-benchmark-66tmtpb6/uploads",
+      "--tensor-comm-protocol",
+      "SHM",
+      "--log-level",
+      "INFO",
+      "--timeout",
+      "1200.0",
+      "--cache-dir",
+      "/shared/home/garv901-55613a/waypoint-int/_ckpt/hf/hub"
+    ],
+    "server_log": "/tmp/primegraph/720p-off-server.log",
+    "slow_consumer_delay_seconds": 0.25,
+    "stall_threshold_seconds": 0.26666666666666666,
+    "steps": 16,
+    "stream_protocol": "binary",
+    "warmup_steps": 1,
+    "weight_source": "registry Hub mapping for waypoint-1.5-1b-720p"
+  },
+  "correctness": {
+    "failures": [],
+    "passed": true
+  },
+  "created_at_utc": "2026-09-14T01:17:40.718788+00:00",
+  "geometry": {
+    "fps": 60.0,
+    "height": 720,
+    "width": 1280
+  },
+  "metric_definitions": {
+    "backpressure": "delta between an unpaused stream and an identical stream paused between SDK reads",
+    "jitter_population_stddev": "population standard deviation of inter-chunk gaps",
+    "memory": "PSS and nvidia-smi GPU process memory summed over the server process group only",
+    "stall": "inter-chunk gap strictly greater than stall_threshold_seconds",
+    "startup_latency_seconds": "time_to_first_frame_seconds over --startup-repeats short streams, each after a full request cleanup, so every sample reuses a world slot",
+    "sustained_media_to_wall_ratio": "media seconds in chunks after the first divided by first-to-last chunk arrival time",
+    "time_to_first_frame_seconds": "request iterator start to first fully decoded SDK VideoFrameChunk"
+  },
+  "model_variant": "waypoint-1.5-1b-720p",
+  "release_threshold": null,
+  "runs": {
+    "baseline": {
+      "chunk_count": 16,
+      "consumer": {
+        "injected_pause_seconds": 0.0,
+        "pause_count": 0,
+        "pause_seconds": 0.0
+      },
+      "frame_count": 64,
+      "generated_media_seconds": 1.0666666666666667,
+      "inter_chunk_gap_seconds": {
+        "jitter_population_stddev": 0.013000318471714206,
+        "maximum": 0.06586903904099017,
+        "mean": 0.039978627332796654,
+        "p50": 0.040775645058602095,
+        "p95": 0.06085885625798254,
+        "sample_count": 15
+      },
+      "memory": {
+        "peak_gpu_mib": 5496.0,
+        "peak_host_pss_mib": 3531.2861328125,
+        "phase": "baseline",
+        "quiet_gpu_mib": 5496.0,
+        "quiet_host_pss_mib": 3541.8330078125,
+        "sample_count": 4
+      },
+      "overall_media_to_wall_ratio": 1.4359184877003128,
+      "payload_bytes": 176947200,
+      "payload_sha256": "bdd8ed5605d329ea704820b0c017c3ea0b0a70122286611a1d999b19e327dde3",
+      "request_id": "waypoint-streaming-benchmark-baseline",
+      "request_wall_seconds": 0.7428462519310415,
+      "stalls": {
+        "count": 0,
+        "longest_seconds": null,
+        "threshold_seconds": 0.26666666666666666,
+        "total_excess_seconds": 0
+      },
+      "sustained_media_to_wall_ratio": 1.6675576705450403,
+      "time_to_first_frame_seconds": 0.13369207200594246
+    },
+    "slow_consumer": {
+      "chunk_count": 16,
+      "consumer": {
+        "injected_pause_seconds": 3.75,
+        "pause_count": 15,
+        "pause_seconds": 0.25
+      },
+      "frame_count": 64,
+      "generated_media_seconds": 1.0666666666666667,
+      "inter_chunk_gap_seconds": {
+        "jitter_population_stddev": 0.03673902102491809,
+        "maximum": 0.4127342230640352,
+        "mean": 0.2770922866727536,
+        "p50": 0.2642167890444398,
+        "p95": 0.3194235348841174,
+        "sample_count": 15
+      },
+      "memory": {
+        "peak_gpu_mib": 5496.0,
+        "peak_host_pss_mib": 3553.48046875,
+        "phase": "slow-consumer",
+        "quiet_gpu_mib": 5496.0,
+        "quiet_host_pss_mib": 3552.4150390625,
+        "sample_count": 23
+      },
+      "overall_media_to_wall_ratio": 0.2478224240670744,
+      "payload_bytes": 176947200,
+      "payload_sha256": "bdd8ed5605d329ea704820b0c017c3ea0b0a70122286611a1d999b19e327dde3",
+      "request_id": "waypoint-streaming-benchmark-slow-consumer",
+      "request_wall_seconds": 4.304157183039933,
+      "stalls": {
+        "count": 5,
+        "longest_seconds": 0.4127342230640352,
+        "threshold_seconds": 0.26666666666666666,
+        "total_excess_seconds": 0.18440834681193036
+      },
+      "sustained_media_to_wall_ratio": 0.24059372950139207,
+      "time_to_first_frame_seconds": 0.13728229294065386
+    }
+  },
+  "schema_version": 1,
+  "server": {
+    "startup_seconds": 76.07913955603726
+  },
+  "startup_latency_seconds": {
+    "maximum": 0.1409923859173432,
+    "mean": 0.1355317895882763,
+    "minimum": 0.13000060396734625,
+    "p50": 0.13549610553309321,
+    "p95": 0.14016392232151703,
+    "sample_count": 20
+  },
+  "status": "completed",
+  "variant": "720p"
+}

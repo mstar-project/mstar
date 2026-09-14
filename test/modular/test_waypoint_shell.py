@@ -846,11 +846,14 @@ def test_binding_without_a_declared_resource_fails_at_bind(submodule):
 # ---------------------------------------------------------------------------
 
 
-def test_only_the_steady_dit_rollout_is_an_optional_capture(submodule):
-    """The one-time prime/cache pass is compiled internally but uncaptured."""
+def test_both_dit_walks_are_optional_captures(submodule, config):
+    """Prime and rollout both capture; the declaration order is capture order."""
     configs = submodule.get_cuda_graph_configs(torch.device("meta"))
-    assert len(configs) == 1
-    assert configs[0].capture_graph_walk == ROLLOUT_WALK
+    # Rollout first: the two share one graph pool and rollout's five forwards
+    # are a superset of prime's one, so rollout sizes the pool. The runner's
+    # largest-first sort is stable and both specs are (1, tokens_per_frame),
+    # so this list order is the order they are captured in.
+    assert [cfg.capture_graph_walk for cfg in configs] == [ROLLOUT_WALK, PRIME_WALK]
     for cfg in configs:
         assert cfg.compile is False
         # One live world again: the bucket cannot be wider than it.
@@ -858,10 +861,30 @@ def test_only_the_steady_dit_rollout_is_an_optional_capture(submodule):
         # The v1 engine always dispatches batched; a submodule captured on bare
         # `forward` is captured on a method that never runs.
         assert cfg.capture_forward_method == "forward_batched"
+        assert cfg.single_request_inputs.input_seq_len == config.tokens_per_frame
 
-    assert "noise" in configs[0].single_request_inputs.tensor_inputs
-    assert "latent" not in configs[0].single_request_inputs.tensor_inputs
+    rollout, prime = (cfg.single_request_inputs.tensor_inputs for cfg in configs)
+    assert "noise" in rollout and "latent" not in rollout
+    assert "latent" in prime and "noise" not in prime
+    # The two templates are one shape with the frame tensor renamed. A
+    # divergence here is a second static-input family for no reason.
+    assert set(rollout) - {"noise"} == set(prime) - {"latent"}
+    assert rollout["noise"].shape == prime["latent"].shape
+    assert rollout["noise"].dtype == prime["latent"].dtype
     assert submodule.disable_torch_compile is True
+
+
+def test_dit_prime_capture_can_be_declined_on_its_own(config):
+    """The A/B control arm: prime off leaves the steady rollout graph alone."""
+    no_prime = dataclasses.replace(config, capture_dit_prime=False)
+    with torch.device("meta"):
+        dit = WaypointDiT(no_prime)
+    dit.cast_serving_dtypes()
+    submodule = WaypointDitSubmodule(dit, no_prime)
+
+    configs = submodule.get_cuda_graph_configs(torch.device("meta"))
+    assert [cfg.capture_graph_walk for cfg in configs] == [ROLLOUT_WALK]
+    assert "noise" in configs[0].single_request_inputs.tensor_inputs
 
 
 def test_dit_declares_no_capture_when_cuda_graph_is_disabled(config):

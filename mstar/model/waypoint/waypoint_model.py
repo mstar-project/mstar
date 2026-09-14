@@ -128,6 +128,7 @@ class WaypointModel(Model):
         reference_compat: bool | None = None,
         compile_dit: bool | None = None,
         cuda_graph: bool | None = None,
+        capture_dit_prime: bool | None = None,
         full_global_ring: bool | None = None,
         checkpoint_revision: str | None = None,
         ae_revision: str | None = None,
@@ -153,6 +154,7 @@ class WaypointModel(Model):
                 "reference_compat": reference_compat,
                 "compile_dit": compile_dit,
                 "cuda_graph": cuda_graph,
+                "capture_dit_prime": capture_dit_prime,
                 "full_global_ring": full_global_ring,
             }.items() if value is not None
         }

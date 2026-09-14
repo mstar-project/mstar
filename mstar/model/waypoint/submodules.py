@@ -391,11 +391,14 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
-        """The optional steady-rollout graph; the one-time prime stays uncaptured.
+        """Both walks, as optional captures.
 
-        The DiT compiles its reference-shaped denoise/cache regions internally.
-        Compiling this wrapper would fuse across their boundary, while capturing
-        prime would spend graph memory on one cache-only forward per request.
+        The DiT compiles its reference-shaped denoise/cache regions internally;
+        compiling this wrapper would fuse across their boundary. Prime is one
+        cache-only forward per request, but it is on the admission-to-first-frame
+        path and its inputs are the rollout template with ``noise`` renamed, so
+        the capture costs one static-input family and reuses the pool the rollout
+        graph already sized.
         """
         del tp_world_size  # no sharded nodes; the ring and the mask do not shard
         if not self.config.cuda_graph:
@@ -417,15 +420,26 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
                 input_seq_len=self.config.tokens_per_frame,
             )
 
-        return [BatchedCudaGraphConfig(
-            capture_graph_walk=ROLLOUT_WALK,
-            single_request_inputs=template("noise"),
-            capture_batch_sizes=[1],
-            capture_forward_method="forward_batched",
-            # The DiT compiles its two reference-shaped fullgraph regions
-            # itself. Compiling this wrapper would fuse across their boundary.
-            compile=False,
-        )]
+        # Rollout first, and the order is load-bearing: both captures share one
+        # graph pool and rollout's five forwards are a superset of prime's one,
+        # so the pool is sized once and prime reuses its freed blocks.
+        # ``prepare_for_capture``'s sort is stable and both specs are
+        # (bs=1, tokens_per_frame), so declaration order is capture order.
+        walks = [(ROLLOUT_WALK, "noise")]
+        if self.config.capture_dit_prime:
+            walks.append((PRIME_WALK, "latent"))
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk=walk,
+                single_request_inputs=template(latent_key),
+                capture_batch_sizes=[1],
+                capture_forward_method="forward_batched",
+                # The DiT compiles its two reference-shaped fullgraph regions
+                # itself. Compiling this wrapper would fuse across their boundary.
+                compile=False,
+            )
+            for walk, latent_key in walks
+        ]
 
     # ------------------------------------------------------------------
     # step tail
