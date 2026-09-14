@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 13, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1877,7 +1877,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">tensor_infos</span><span class="p">:</span>
             <span class="n">uuid</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
             <span class="n">already_registered</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">):</span>
                 <span class="k">if</span> <span class="n">already_registered</span><span class="p">:</span>
                     <span class="k">continue</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Registering </span><span class="si">%s</span><span class="s2"> for send"</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
@@ -1912,7 +1912,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">"Trying to cleanup tensor </span><span class="si">%s</span><span class="s2">, but uuid not found"</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
             <span class="k">return</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span> \
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">)</span> \
                 <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
             <span class="n">ret_value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span><span class="o">.</span><span class="n">unregister_memory</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">()</span>
@@ -1965,7 +1965,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span>
                 <span class="p">)</span>
 
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="ow">in</span> <span class="p">(</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">RDMA</span><span class="p">,</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">):</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span><span class="o">.</span><span class="n">register_memory</span><span class="p">(</span><span class="n">buffer</span><span class="o">.</span><span class="n">data_ptr</span><span class="p">(),</span> <span class="n">info</span><span class="o">.</span><span class="n">nbytes</span><span class="p">)</span>
 
                 <span class="n">read_info</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">TransferReadInfo</span><span class="p">(</span>
@@ -2315,7 +2315,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 13, 2026.
+  Last updated on Sep 14, 2026.
   <br/>
 </p>
   </div>
