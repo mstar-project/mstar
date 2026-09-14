@@ -1,108 +1,116 @@
-# M* model contract — quick reference
+# MStar model contract
 
-Condensed lookup for the interfaces a new model implements. The authoritative source is
-`docs/adding_models.rst` plus `mstar/model/base.py` and `mstar/model/submodule_base.py`.
-Read those when this summary is not enough.
+Use this as a lookup only after reading `docs/adding_models.rst` and the
+checked-out sources. The branch is authoritative.
 
-## `Model` abstract methods (`mstar/model/base.py`)
+## Model surface
 
-Must implement (all `@abstractmethod`):
+Current required hooks in `mstar/model/base.py`:
 
-| Method | Returns | Purpose |
-|---|---|---|
-| `get_kv_cache_config()` | `list[KVCacheConfig]` | per-node paged-KV configs (layers, kv_heads, head_dim, max_seq_len, num_qo_heads). Empty if no AR node. Encoder-decoder: declare `cross_attn={source: CrossAttnKVConfig}`. |
-| `get_node_engine_types()` | `dict[str, EngineType]` | each node → `KV_CACHE` or `STATELESS`. |
-| `get_graph_walk_graphs()` | `dict[str, GraphSection]` | `{walk_name: graph}` built from the four primitives. |
-| `process_prompt(prompt, in_mods, out_mods, tensors=None, **kw)` | `NameToTensorList` | tokenize + initial tensors; reuse the HF tokenizer/processor here; may read raw media tensors to derive `pixel_values` etc. |
-| `get_initial_forward_pass_args(partition, in_mods, out_mods, input_signals, model_kwargs=None)` | `ForwardPassArgs` | seed the first walk. |
-| `get_partition_forward_pass_args(partition, metadata, persist_signals, incoming_connections=None)` | `ForwardPassArgs` | state machine — next walk / inputs / `request_done`. |
-| `postprocess(output, modality, request_kwargs=None)` | `bytes` | encode final tensor (utf-8 / PNG / PCM). |
-| `get_submodule(node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None)` | `NodeSubmodule \| None` | lazily build+load one node; `None` = dummy mode. |
+| method | purpose |
+|---|---|
+| `get_node_resources()` | Declare `NodeResourceSpec` objects and the graph nodes sharing each resource. Return `[]` when no engine resource is needed. |
+| `get_graph_walk_graphs()` | Build each named Walk from graph sections and exact tensor-edge names. |
+| `process_prompt(...)` | Turn request text and loaded media into initial named tensors. |
+| `get_initial_forward_pass_args(...)` | Seed each partition's first Walk and inputs. |
+| `get_partition_forward_pass_args(...)` | Choose the next Walk, persisted inputs, and completion state. |
+| `postprocess(...)` | Encode an emitted tensor as client bytes. |
+| `get_submodule(...)` | Construct and load one node, or return `None` in dummy mode. |
 
-Overridable (not abstract): `get_sampling_config`, `get_aux_sampling_configs`,
-`resolve_sampling_configs`, `get_max_output_tokens`, `get_autocast_dtype` (default bf16),
-`get_default_sharding_config` (declare `tp_enabled_nodes`/`sp_enabled_nodes`),
-`load_image`/`load_audio`/`load_video`, `get_output_sample_rate`/`get_output_audio_channels`,
-and the partition API (`get_partition_topology`, `get_partitions`) for async streaming.
+`get_request_resource_configs()` optionally returns per-request
+`ResourceReqConfig` values keyed by the same resource keys used in
+`get_node_resources()`. This is where request sampling settings and other
+resource-specific request parameters enter the engine.
 
-## Engine types (`mstar/engine/base.py:EngineType`)
+Optional partition hooks, media loaders, output metadata, sharding, and token
+limits are documented on `Model`. Implement only what the port requires.
 
-- **`KV_CACHE`** — persistent paged KV cache across forwards: autoregressive LLMs and
-  LLM-as-denoiser flow loops. Pairs with `ARNodeSubmodule` + an entry in `get_kv_cache_config`.
-- **`STATELESS`** — no cross-step KV state: ViT/VAE/audio encoders & decoders, embedding &
-  projection stages, flow-matching combine, codec (waveform) decoders.
+## Resource declaration
 
-## Graph primitives (`mstar/graph/base.py`)
+Import declaration types from `mstar.engine.resources`. Existing kinds include:
 
-- `GraphNode(name, input_names, outputs)` — one compute unit; `name` matches a
-  `get_node_engine_types` key; `outputs` is a list of `GraphEdge`.
-- `GraphEdge(next_node, name, persist=?, output_modality=?)` — routes an output tensor.
-  `persist=True` carries a tensor across steps/walks (e.g. prefill's token into the decode
-  loop). `output_modality` + `next_node=EMIT_TO_CLIENT` streams to the client.
-- `Sequential([...])` / `Parallel([...])` — compose subgraphs in order / concurrently.
-- `Loop(name, section, max_iters, outputs)` — iterating subgraph; body feeds its outputs back.
-  Give it a `name` so a submodule's `check_stop` can stop it early (EOS). This is the decode loop.
-- Special destinations: `EMIT_TO_CLIENT`, `EMPTY_DESTINATION` (`mstar/graph/special_destinations.py`).
-- `StreamingGraphEdge(next_node, name, target_partition=...)` — cross-partition async edge.
+| declaration | engine-owned behavior |
+|---|---|
+| `KVSpec(KVConfig(...))` | Paged persistent KV storage and request admission. |
+| `AttentionSpec(AttentionConfig(...))` | Self-attention planned against a named KV resource. |
+| `CrossAttentionSpec(CrossAttentionConfig(...))` | Read-once encoder context and decoder cross-attention. |
+| `RaggedAttentionSpec(RaggedAttentionConfig(...))` | Cacheless variable-length attention for packed encoder inputs. |
+| `PositionSpec(PositionConfig(...))` | Position counters and optional RoPE against a named KV resource. |
+| `SamplerSpec(...)` | Sampling buffers and per-request sampling state. |
 
-## `NodeSubmodule` contract (`mstar/model/submodule_base.py`)
+Each spec has a unique `resource_key`, a set of owning `nodes`, and optional
+`depends_on()` keys. YAML deployment overrides live under
+`resources.<resource_key>` and may tune only fields accepted by that spec.
 
-- `prepare_inputs(graph_walk, fwd_info, inputs, **kw) -> NodeInputs` — cheap host-side only.
-- `preprocess(graph_walk, engine_inputs, inputs) -> dict` — collate batch → forward kwargs
-  (base handles bs=1; **abstract for `ARNodeSubmodule`**).
-- `forward(graph_walk, engine_inputs, **kw) -> NameToTensorList` — pure compute; auto-compiled.
-- `postprocess(...)` — metadata-only, **no tensor value reads** (runs on GPU thread).
-- `check_stop(...) -> set[str]` — may read tensor values (off GPU thread); returns loop names to stop.
-- `cleanup_request(request_id)` — free per-request state; call `super()` if overriding.
-- Batching: `can_batch` (default `False`), `forward_batched`, `max_batch_size`.
-- CUDA graphs: `get_cuda_graph_configs` (whole forward), `get_piecewise_cuda_graph_configs`
-  (inner region, e.g. a block loop), `can_use_cuda_graphs`.
-- Stateless flavor: `get_stateless_flavor()` → `"enc_dec"` (default) or `"audio_codec"`.
-- `ARNodeInputs` fields: `input_seq_len` (required), `input_ids` or `input_embeds`, `custom_pos_ids`.
-- Per-request state: `self.request_state(rid)` (a `PerRequestState`); engine injects the
-  batch's states via `ModelInputsFromEngine.per_request_states` and drops them on removal.
+## Graph surface
 
-## Weight loading (`mstar/model/loader/`)
+- `GraphNode(name, input_names, outputs)` defines one compute node. Every input
+  name must arrive before the node becomes ready.
+- `GraphEdge(next_node, name, persist=..., output_modality=...)` routes the
+  tensor returned under exactly `name`.
+- `Sequential` and `Parallel` compose graph sections.
+- `Loop(name, section, max_iters, outputs)` repeats a section; `check_stop()`
+  returns loop names that should stop.
+- `StreamingGraphEdge` crosses async partitions. Use the partition topology and
+  chunk-policy APIs already present on the branch.
 
-Three layers:
-1. In `get_submodule`: build on `meta`, cast to `autocast_dtype`, `to_empty(device)`, then
-   `load_weights(module, source, device=...)` (top-level driver picks single-file vs sharded HF dir).
-2. Module implements `load_weights(self, weights)` → delegates to
-   `load_hf_weights(self, weights, stacked_params=..., name_remapper=...)`.
-3. `stacked_params` (list of `StackedParamRule`) fuse several checkpoint keys into one param
-   (e.g. `LLAMA_STACKED_PARAMS` for `q/k/v_proj` → `qkv_proj`). `name_remapper` rewrites/drops keys.
+Use `EMIT_TO_CLIENT` and `EMPTY_DESTINATION` from
+`mstar.graph.special_destinations` for terminal edges.
 
-Each param's `weight_loader` also shards along its shard dim when the module was built with a
-`comm_group` — one load path serves single-GPU and tensor-parallel.
+## NodeSubmodule surface
 
-## Tensor parallelism / sequence parallelism
+`NodeSubmodule` and `ARNodeSubmodule` are driven by the engine:
 
-- Declare shardable nodes: override `get_default_sharding_config()` →
-  `ShardingConfig(groups=[], tp_enabled_nodes={...}, sp_enabled_nodes={...}, shard_dim={})`.
-- Build components from `mstar/model/components/distributed/` with the `comm_group`; otherwise
-  a node is replicated on every rank.
-- Config: add `tp_size` (and `sp_size`) to a `node_groups` entry with that many ranks. A
-  `tp_size>1` group naming a non-TP-enabled node is rejected at load.
-- Activation sharding across a node boundary: `shard_dim` map (edge/signal name → split dim);
-  absent ⇒ replicated. Overridable per-run under a `sharding_config:` YAML block.
-
-## Config YAML (`configs/<name>.yaml`)
-
-```yaml
-model: "<registry_key>"
-max_seq_len: 2048
-node_groups:
-  - node_names: ["LLM"]
-    ranks: [0]
-    # optional: tp_size, sp_size, graph_walks: [prefill, decode]
+```text
+prepare_inputs -> declare_step -> admit -> plan -> preprocess -> forward -> commit
 ```
-Naming convention encodes layout: `_tp2`, `_sp2`, `_pd_disaggregated`, `_colocated`, etc.
-Disaggregation = pin the same node to different ranks per `graph_walks`.
 
-## Validate
+- `prepare_inputs(...) -> NodeInputs` performs cheap host-side shaping. Set
+  `input_seq_len`; use `resource_step_info` for declaration-only metadata.
+- `declare_step(...) -> SubmoduleStep | None` describes work for each resource
+  key. A declaring submodule does not independently plan or commit the same
+  state.
+- `preprocess(...) -> dict` collates prepared inputs. The AR subclass requires
+  an implementation.
+- `forward(...) -> NameToTensorList` reads resources from
+  `engine_inputs.resources[key]` and returns exact graph-edge keys.
+- `check_stop(...)` may read tensor values off the GPU thread. `postprocess(...)`
+  should normally remain metadata-only.
 
-```bash
-ruff check .          # CI enforces
-pytest test/modular/  # CPU, dummy-mode submodules (get_submodule → None)
-mstar-serve --config configs/<name>.yaml --port 8000
-```
+The engine binds each node's resources once with `bind_node_resources()`, which
+also calls `bind_resources()` on child layers that expose it. Layer constructors
+should retain resource keys, not build or own managers.
+
+`engine_inputs.per_request_states` is valid for request-local tensors or
+metadata whose storage does not need pooling, admission, capacity accounting,
+stable shared addresses, dependency ordering, or an independent cleanup policy.
+Use an engine resource when any of those properties appears.
+
+## Step declarations
+
+A `SubmoduleStep` maps resource keys to `ResourceStep` subclasses and may share
+a default list of `Segment(request_id, label, span)` values. Existing step kinds
+include `KVStep`, `AttentionStep`, `PositionStep`, and `SamplerStep`.
+
+Unit-test declarations on CPU. Confirm that:
+
+- every declared key belongs to that node;
+- every dependency is declared and acyclic;
+- request spans and labels match the forward layout;
+- capacity failure is explicit and releases cleanly; and
+- resident capacity is not confused with `max_batch_size`.
+
+## Weight and deployment wiring
+
+Build modules on `meta`, cast before `to_empty(device=...)`, then use
+`mstar.model.loader.load_weights`. Component `load_weights()` implementations
+should delegate to `load_hf_weights` with explicit stacked-parameter rules and
+name remapping, and must reject incomplete matches.
+
+Register the model in `mstar/model/registry.py`, add its `configs/<name>.yaml`,
+declare only the required pip extra, and add an API adapter only when the target
+endpoint needs one. Start with all nodes on one rank unless correctness requires
+another placement.
+
+Validate graph and resource structure without weights, then compare component,
+node, and live outputs against the independent eager oracle.

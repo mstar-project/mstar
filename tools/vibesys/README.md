@@ -10,9 +10,10 @@ directory.
 It is a **registry of task types** over shared machinery. Adding a task type is a
 new module under `tasks/`; `core/` does not change. The first (and currently
 only) task type is **`add-model`**: implement a new model natively in mstar
-(submodule nodes, walk graph, engine types, weight loading — not a wrapper around
-the upstream pipeline), verified against the reference implementation, at
-reasonable performance.
+(submodule nodes, walk graph, engine-owned resources, and weight loading, not a
+wrapper around the upstream pipeline), verified eagerly against the reference
+implementation. Its benchmark is an observational baseline, not an optimization
+objective.
 
 ## Quickstart
 
@@ -53,6 +54,8 @@ tools/vibesys/
         ├── task.py        # AddModelTask: spec parsing, bundle render, seed files, vibesys wiring
         ├── templates/     # rendered per instance:
         │   ├── OBJECTIVE.md.tmpl    #   implement-it-yourself contract (→ bundle)
+        │   ├── PORTING_REPORT.md.tmpl # engine/resource evidence scaffold (→ seed)
+        │   ├── PORTING_DECISIONS.jsonl.tmpl # structured decision signals (→ seed)
         │   ├── reference.py.tmpl    #   generic oracle stub (→ bundle vibeval/)
         │   ├── config.yaml.tmpl     #   starter mstar config (→ workspace-seed)
         │   ├── run.sh.tmpl          #   launch contract (uv run mstar-serve … SHM)
@@ -79,7 +82,7 @@ and `workspace-seed/`; VibeSys creates `runs/` at run time.
 │   │   ├── reference/meta.json        #   HF id+revision → weight download
 │   │   └── evaluator/vibeval/{checker.py, benchmark.py, reference.py}
 │   ├── workspace-seed/                # standalone mstar clone @ pinned commit (immutable input)
-│   │   └── … + configs/<model>.yaml + run.sh
+│   │   └── … + configs/<model>.yaml + run.sh + progress-artifacts/evidence/{model-port-report.md,model-port-decisions.jsonl}
 │   └── runs/                          # VibeSys runtime store (--runs-dir)
 │       ├── _inputs/<exp>/             #   synthesized bundle (OBJECTIVE, vibesys.input.toml, reference/, vibeval/, _seed/)
 │       └── <timestamp>-…-<exp>/       #   ONE dir per run:
@@ -118,16 +121,25 @@ Three roles run per round (`--rounds N`):
 - **Orchestrator** — reads the objective + memory (`progress.md`, `roadmap.md`,
   `pareto-frontier.md`) + git history + profiler hints → emits **one** hypothesis
   (`workspace/progress-artifacts/plans/round-NNNN.json`).
-- **Implementer** — edits the candidate (the mstar port), runs local checks,
-  writes `progress-artifacts/evidence/…`, and nominates.
+- **Implementer** — maps nodes and engine resources in
+  `progress-artifacts/evidence/model-port-report.md`, records architecture choices
+  and skill signals in `model-port-decisions.jsonl`, edits the candidate, runs
+  local checks, updates evidence, and nominates.
 - **Judge** — fresh, read-only; verdict pass/fail; checks for reward-hacking
   (e.g. weakening `vibeval/checker.py`). **Only after a PASS does the framework
-  itself** run `vibeval/checker.py` (accuracy) and `vibeval/benchmark.py` (perf).
+  itself** run `vibeval/checker.py` (accuracy) and `vibeval/benchmark.py`
+  (observational baseline).
 
 Per-round artifacts, the agent's memory files, and logs accumulate under
 `runs/<run>/` (`workspace/…` and `logs/…`). This is per-run and **ephemeral**:
 each `run` synthesizes a fresh workspace from the seed, so memory/profiling do
 not carry across separate runs (only within a run, or via `--resume`).
+
+### Inspecting model-port decisions
+
+Each run's workspace contains
+`progress-artifacts/evidence/model-port-decisions.jsonl`. Check whether the agent
+matched one pattern, composed several, or derived an unmatched shape.
 
 > **Two known interleaving issues (deferred).** (1) VibeSys copies the evaluator
 > (`vibeval/`) into the workspace via `--input-evaluator-dir`, so it is *visible*
@@ -141,10 +153,11 @@ not carry across separate runs (only within a run, or via `--resume`).
 ## The `add-model` task
 
 The agent must **implement the model natively** in mstar (submodule nodes, walk
-graph, engine types, weight loading) — *not* wrap the upstream pipeline. The task
-is described by client-facing **modalities** (input/output), never by walks
-(those are the agent's internal design). You provide two gitignored files under
-`instances/` (copy the tracked `example.*`):
+graph, engine-owned resources, step declarations, and weight loading) — *not*
+wrap the upstream pipeline. The task is described by client-facing
+**modalities** (input/output), never by walks (those are the agent's internal
+design). You provide two gitignored files under `instances/` (copy the tracked
+`example.*`):
 
 - **`<model>.toml`** — the declarative spec (below). Required.
 - **`<model>.reference.py`** — the oracle + client I/O hooks (`sample_input`,
@@ -177,12 +190,13 @@ compare = "ssim"                    # output-level metric: ssim | audio_mse | co
 tol = 0.2
 
 [headline]
-metric = "latency_p50_ms"           # reasonable-latency target (not an optimization goal)
+metric = "latency_p50_ms"           # observational baseline for future optimization
 result_arg = "--output-json"
 ```
 
-- **Goal = correct implementation at reasonable perf, then stop** — the objective
-  tells the agent this is not a latency-optimization task.
+- **Goal = correct eager implementation** — the benchmark still runs and writes
+  the same result JSON, but `add-model` does not pass an input benchmark metric
+  or register latency as a synthesis objective.
 - **`accuracy_mode`**: `strict` (default) compares the served output to the
   reference oracle via `compare`/`tol`; `smoke` only asserts a valid non-empty
   response (fast bring-up). The strict checker runs in the candidate env
@@ -233,8 +247,11 @@ as the oracle. Only `render_bundle` changes; `core/` is untouched.
   spew "error importing function definition" on every agent command.
 - Passes `--config tools/vibesys/agent.toml` (installed VibeSys resolves a
   default `agent.toml` from the launch dir).
-- `--input-benchmark-result-arg=<opt>` is joined with `=` (argparse reads a bare
-  `--output-json` as a flag otherwise).
+- Passes the checked-out `.claude/skills/add-mstar-model/` through
+  `--extra-skills` and stops before launch if that directory is missing.
+- Keeps `headline.metric`, `headline.result_arg`, and benchmark JSON compatible
+  for a future optimization task without passing
+  `--input-benchmark-metric`/`--input-benchmark-result-arg` in `add-model`.
 - Eval harness is namespaced under a single `vibeval/` dir so it never collides
   with mstar's own top-level `benchmark/`.
 - Seeds via standalone `git clone` (not `git worktree`) so the copied `.git` is

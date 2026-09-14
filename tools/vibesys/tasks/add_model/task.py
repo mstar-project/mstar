@@ -1,10 +1,11 @@
 """The ``add-model`` task type: implement a new model natively in mstar and
 verify it against the reference (HF/official) implementation.
 
-The agent must *implement* the model (submodule nodes, walk graph, engine types,
-weight loading), not wrap the upstream pipeline. The task is described by the
-client-facing input/output *modalities* (walks are an mstar implementation
-detail the agent chooses). The checker/benchmark are modality-specific
+The agent must *implement* the model (submodule nodes, walk graph, engine
+resources, weight loading), not wrap the upstream pipeline. The task is
+described by the client-facing input/output *modalities* (walks are an mstar
+implementation detail the agent chooses). The checker and benchmark are
+modality-specific
 (``templates/modalities/<modality>/``) and compare the client-facing output to
 the reference oracle in ``reference.py`` (weights from ``reference/meta.json``).
 """
@@ -119,6 +120,16 @@ class AddModelTask(TaskType):
         t = self.dir / "templates"
         ctx = self._ctx(spec)
         render.render_to(t / "config.yaml.tmpl", seed_dir / "configs" / f"{spec.model}.yaml", ctx)
+        render.render_to(
+            t / "PORTING_REPORT.md.tmpl",
+            seed_dir / "progress-artifacts" / "evidence" / "model-port-report.md",
+            ctx,
+        )
+        render.render_to(
+            t / "PORTING_DECISIONS.jsonl.tmpl",
+            seed_dir / "progress-artifacts" / "evidence" / "model-port-decisions.jsonl",
+            ctx,
+        )
         run_sh = seed_dir / "run.sh"
         render.render_to(t / "run.sh.tmpl", run_sh, ctx)
         run_sh.chmod(0o755)
@@ -147,20 +158,28 @@ class AddModelTask(TaskType):
             reference_dir=bundle_dir / "reference",
             evaluator_dir=bundle_dir / "evaluator",
             workspace_seed_dir=seed_dir,
-            benchmark_metric=spec.headline_metric,
-            benchmark_result_arg=spec.result_arg,
+            # Keep the benchmark command and its result JSON as an observational
+            # baseline. The add-model MVP does not register latency as a
+            # synthesis objective; a later optimization task can consume the
+            # unchanged artifact format.
+            benchmark_metric=None,
+            benchmark_result_arg=None,
             accuracy_timeout=spec.accuracy_timeout,
             benchmark_timeout=spec.benchmark_timeout,
         )
 
     def run_options(self, spec: Spec, exp_name: str, docker_image: str, **overrides) -> RunOptions:
-        skills = self.dir.parents[2] / "skills" / "add-mstar-model"
+        skills = self.dir.parents[3] / ".claude" / "skills" / "add-mstar-model"
+        if not skills.is_dir():
+            raise FileNotFoundError(
+                f"required add-model skill directory is missing: {skills}"
+            )
         config = self.dir.parents[1] / "agent.toml"  # tools/vibesys/agent.toml
         opts = RunOptions(
             exp_name=exp_name,
             docker_image=docker_image,
             modality=spec.modality,
-            extra_skills=skills if skills.is_dir() else None,
+            extra_skills=skills,
             config=config if config.exists() else None,
         )
         for key, value in overrides.items():

@@ -1,128 +1,131 @@
-# Multi-stage / streaming models, the serving stack, and debugging hangs
+# Multi-stage models, streaming, and serving
 
-Read this once your model has more than one autoregressive stage, streams output as it
-generates, or you're bringing up `mstar-serve`. It layers on top of `model-contract.md`.
-The canonical patterns to copy live in `mstar/model/qwen3_omni/` (encoder → LLM → talker →
-vocoder, streaming) and `mstar/model/orpheus/` (LLM → codec, streaming). Read their
-`get_graph_walk_graphs`, `get_partitions`, `get_partition_topology`, and the conductor
-state machines (`_get_*_forward`) — do not invent these from scratch.
+Read this for async partitions, multi-stage streaming, live serving, or a
+request that hangs. Confirm every interface against the checkout first.
 
-## How the engine drives your submodule (mental model)
+The closest live patterns are `mstar/model/qwen3_omni/` and
+`mstar/model/orpheus/`. Read their Walks, partition definitions, partition
+topology, resource declarations, node step declarations, and conductor state
+machines before implementing a similar topology.
 
-- The **conductor** owns request scheduling and the walk state machine; **workers** own GPUs
-  and run **engines** (one `KV_CACHE` engine, one `STATELESS` engine per flavor). Each engine
-  drives your submodule as `prepare_inputs → preprocess → forward (→ postprocess, check_stop)`.
-- **Prefill vs decode is just the `graph_walk` string** passed to every method — branch on it;
-  it is not a flag the engine interprets.
-- The **cache handle is `engine_inputs.cache_manager`** — there is no separate argument. On a
-  `STATELESS` engine it is `None` (and so is the sampler). `preprocess` plans attention
-  (`cache_manager.plan_attention(seq_lens, ...)`, `plan_rope(...)`); `forward` computes
-  (`cache_manager.run_attention(q, k, v, layer_idx)`).
-- **Sampling**: return `{"logits": [...]}` and let the engine sample, OR sample inside `forward`
-  via `engine_inputs.sampler.sample(...)`. A second token channel (residual codebooks, a function
-  channel) is declared by the model's `get_aux_sampling_configs` and sampled with
-  `sampler.sample_aux("<label>", request_ids, logits)`. The aux label *set* must be static.
-- **Custom per-request state** (recurrent state, a talker's own KV, a diffusion scheduler) lives
-  in `engine_inputs.per_request_states[rid]` (a `PerRequestState`; `.add`/`.get`). The engine
-  injects the batch's states and drops them on request removal. It is `None` during CUDA-graph
-  capture — which is why nodes holding such state set `disable_torch_compile = True` (eager).
-- **Batching**: `can_batch(batch, inputs) -> len(inputs) > 1` + `forward_batched` returning
-  `{request_id: NameToTensorList}`. Read each request's last-token output at its packed offset
-  (`itertools.accumulate(seq_lens)`).
+## How a node runs
 
-## Async partitions (multi-stage streaming)
+The conductor owns request scheduling and the Walk state machine. Workers own
+the node submodules and the resources built for those nodes. One node step runs:
 
-When stage B must start consuming stage A's output *before* A finishes (LLM streaming tokens to
-a talker/vocoder), the stages run as **partitions** scheduled independently:
+```text
+prepare_inputs -> declare_step -> admit -> plan -> preprocess -> forward -> commit
+```
 
-- **`get_partitions()`** → one `PartitionDefinition` per stage: `name`, `graph_walks`,
-  `initial_walk`, and `producer_partitions` (who it consumes from). The producer has
-  `producer_partitions=[]`; consumers name their upstream.
-- **Cross-partition edges are `StreamingGraphEdge(next_node=…, name=…, target_partition=…)`.**
-  The producer emits them unaware; on the consumer they land in a **StreamBuffer** gated by a
-  **chunk policy**.
-- **`get_partition_topology()`** → `PartitionTopology(partitions=[…], connections=[Connection(
-  from_partition, to_partition, edge_name, chunk_policy_factory)])`. `FixedChunkPolicy(chunk_size=1)`
-  delivers one token/frame per consumer step; `LeftContextChunkPolicy(chunk, left_context)` gives a
-  causal decoder its overlap so it can decode a chunk with enough left context and emit only the new tail.
-- **The per-partition state machine** (`get_initial_forward_pass_args` +
-  `get_partition_forward_pass_args`) is called by the conductor per partition step. The producer
-  transitions prefill→decode and finishes on EOS; a **consumer partition gates on its stream** and
-  finishes when the upstream is done. Mirror `qwen3_omni._get_talker_forward` / `_get_code2wav_forward`.
+The resource runner owns admission, dependency-ordered planning, commit, and
+request removal. A declaring submodule must not repeat that lifecycle privately.
 
-**The streamed tensor arrives via the StreamBuffer, NOT via the forward-pass-args `inputs`.** The
-conductor's forward-pass-args supply only the *non-streamed* / self-fed inputs (the fed-back token,
-a trigger). A decode loop that also needs a streamed input lists it in the node's `input_names` and
-gets it from the buffer; **all of `input_names` must be satisfied for the node to run** — which is
-the classic hang: on iteration 0 a fed-back input has no prior value, so seed it.
+`graph_walk` is the model's branch key; the engine does not infer prefill or
+decode behavior from the name. In a forward, retrieve built resources from
+`engine_inputs.resources[resource_key]`. Layers may receive the same resources
+through `bind_resources()` during node binding.
 
-**Loop termination** is the worker-side `Loop`'s `check_stop`/`max_iters`, not the conductor. The
-consumer partition's `get_partition_forward_pass_args` should return `request_done=True` when the
-loop returns control — don't invent a separate stream-exhaustion condition unless the reference does.
+For sampling, declare a `SamplerSpec`, return its `SamplingReqConfig` from
+`get_request_resource_configs()`, include `SamplerStep` in the node's
+`SubmoduleStep`, and call the built sampler resource. Separate token channels
+use separate, statically declared sampler resource keys.
 
-**Multiple output modalities**: give each producing edge an `output_modality` (`"text"`/`"audio"`)
-pointing at `EMIT_TO_CLIENT`, and branch on `modality` in `Model.postprocess`.
+Engine-provided per-request state is suitable for request-local metadata and
+tensors without their own admission or capacity contract. Any pool, allocator,
+stable shared buffer, resident limit, dependency ordering, or cleanup policy is
+an engine-owned resource instead.
 
-## Verify the graph without a GPU
+Start with `can_batch()` false unless the node already has a verified batching
+implementation. Resident resource capacity is independent of the number of
+requests processed in one step.
 
-Before any live run, these resolve every edge route and cross-partition connection on CPU:
-- `model.get_graph_walk_graphs()` / `get_partitions()` / `get_partition_topology()` construct cleanly.
-- `model.get_worker_graphs(config_path)` derives a worker graph for **every** walk — a dangling edge
-  name or unresolved partition raises here.
-- Constructing a `Conductor(model, model_config_file, socket_path_prefix=…)` derives the full
-  per-worker topology (worker ids, per-worker graphs) — one level deeper than `get_worker_graphs`.
-- Wrap the above in a `test/modular/test_<name>_model.py` (build the model with
-  `object.__new__(<Model>)` + a config, no weights) so it's CI-checked.
+## Async partitions
 
-## The live serving stack
+Use partitions when a downstream stage must consume upstream output before the
+producer finishes:
 
-Request flow: HTTP `POST /generate` → **data worker** loads media (`model.load_<modality>`) and
-calls `model.process_prompt(...)` → tensors are registered and handed to the **conductor** →
-partitions execute on **workers** → outputs stream back tagged by modality → `model.postprocess`.
+- `get_partitions()` returns a `PartitionDefinition` for each independently
+  scheduled stage, including its Walks, initial Walk, and producers.
+- `StreamingGraphEdge` identifies the destination node, tensor name, and target
+  partition.
+- `get_partition_topology()` returns the matching `Connection` objects and
+  chunk-policy factories.
+- `get_initial_forward_pass_args()` seeds non-streamed inputs for each
+  partition.
+- `get_partition_forward_pass_args()` advances that partition after a Walk and
+  marks it done when appropriate.
 
-Launch:
+The streamed tensor arrives from the stream buffer, not from the
+forward-pass-argument input list. Every node input name must still be satisfied.
+Seed self-fed or loop-back inputs for the first consumer iteration, or that node
+never becomes ready.
+
+Use `FixedChunkPolicy` for one item per consumer step and
+`LeftContextChunkPolicy` when a causal decoder needs overlap. Copy a matching
+policy from a checked-out reference instead of inventing new scheduling rules.
+
+Loop termination remains worker-side: `Loop.max_iters` is the bound and the
+node's `check_stop()` returns named loops to stop. A consumer partition normally
+sets `request_done=True` after its loop returns control and the upstream stream
+has completed according to the reference state machine.
+
+For multiple output modalities, tag each client edge with its
+`output_modality`, and branch on that value in `Model.postprocess()`.
+
+## CPU structural validation
+
+Before weights or a GPU:
+
+1. Construct every Walk, partition definition, topology connection, resource
+   spec, request config, and node step declaration.
+2. Call `get_worker_graphs(config_path)` for every Walk and confirm every graph
+   node is mapped by the YAML.
+3. Confirm every resource key is unique, each dependency exists, and each node
+   step uses only resources owned by that node.
+4. Build a dummy-mode `Conductor` to resolve worker and partition routing.
+5. Add focused modular tests for first-iteration seeds, exact edge names,
+   completion transitions, capacity refusal, and request cleanup.
+
+## Live serving
+
+Launch from the checkout so the new registry entry wins over an installed copy:
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$PWD PYTHONUNBUFFERED=1 \
   mstar-serve --config configs/<name>.yaml --host 127.0.0.1 --port 8000 \
-  --tensor-comm-protocol SHM --socket-path-prefix /tmp/mstar_<name>/ --upload-dir /tmp/mstar_up_<name>/
+  --tensor-comm-protocol SHM --socket-path-prefix /tmp/mstar_<name>/ \
+  --upload-dir /tmp/mstar_up_<name>/
 ```
-Client: `from mstar.client.client import MStarClient; MStarClient("http://127.0.0.1:8000").generate(
-audio="x.wav", input_modalities=("audio",), output_modalities=("text","audio"), temperature=0.0)`.
 
-### First-run gotchas (each of these cost real debugging time)
-- **`import mstar` must resolve your checkout.** The installed `mstar-serve` console script imports
-  the *main* checkout; a model added in a worktree/branch won't be in its registry → `Unknown model`.
-  Set `PYTHONPATH=$PWD` (your checkout) so your code wins.
-- **`mstar serve <name>`** (the quickstart wrapper) validates against a hardcoded allow-list and will
-  reject a new model. Use the low-level **`mstar-serve --config <yaml>`**.
-- **Tensor transport defaults to RDMA/Mooncake**, which fails to register memory without active
-  InfiniBand (`mlx5 … not active` in the log). On a single node use `--tensor-comm-protocol SHM`.
-- **`buffered `conda run`/`nohup` hide startup logs.** Launch the env binary directly with
-  `PYTHONUNBUFFERED=1` so you can watch weight-loading + warmup and catch errors live.
-- **Media ingestion** calls `model.load_audio/load_image/load_video`; the base `load_audio` uses
-  `torchcodec` (fragile native libs). Override it to decode via `soundfile`/PIL and return the same
-  `TensorAndMetadata` shape.
-- **Media key naming.** The data worker stores loaded media under `f"{modality}_inputs"`
-  (`audio_inputs`, `image_inputs`). Your `process_prompt` receives that dict and must expose it under
-  the *node input name* your encoder consumes (e.g. `out["audio_features"] = tensors["audio_inputs"]`).
-- After teardown, a worker may hold the GPU briefly; free it with
-  `kill -9 $(nvidia-smi --query-compute-apps=pid --format=csv,noheader)` before relaunching.
+Use a deterministic, realistic request already verified against the standalone
+eager oracle. The first run must confirm exact output routing, termination,
+resource release, and a second request reusing released capacity.
 
-## Debugging a hung request (no crash, no error)
+Common startup faults:
 
-A hang means a node never became *ready* (an `input_names` entry never arrived) or a loop never
-terminated. It won't show a traceback, so instrument and localize:
+- `Unknown model`: `PYTHONPATH` points at another checkout or the registry is
+  incomplete.
+- Transport initialization fails without InfiniBand: use SHM for a single-node
+  run.
+- Media never reaches the first node: map the data worker's `image_inputs`,
+  `audio_inputs`, or `video_inputs` key to the exact graph input in
+  `process_prompt()`.
+- Media decoding fails before scheduling: use a model-appropriate loader with
+  declared runtime dependencies.
+- A node is absent from a worker: align YAML `node_names` with graph node names.
 
-1. Add trace logging (`logger.warning`) at the top of each node's `forward`/`prepare_inputs`, and in
-   `get_initial_forward_pass_args` / `get_partition_forward_pass_args`. Restart, send one *short*
-   input (fast iteration), and read the trace order.
-2. Localize:
-   - **First-stage forward never logs** → the producer partition isn't scheduled, or its input didn't
-     route (check `process_prompt` produced the node's input key; check the initial forward-pass-args).
-   - **Producer logs, consumer's `prepare_inputs` never logs** → the stream isn't delivering: the
-     producer's output key ≠ the edge name, or the `Connection`/chunk policy is missing/misnamed, or
-     the consumer's fed-back `input_names` aren't seeded on iteration 0.
-   - **Consumer logs N times then stops** → the loop isn't terminating: fix `check_stop` / the
-     partition's `request_done` transition.
-3. A request that hangs for exactly the client timeout, then "client cancelled" in the server log, is
-   this class of bug — not a slow model.
+## Diagnose a hung request
+
+A hang means a node never became ready or a loop never terminated. Add temporary
+logging at each node's `prepare_inputs()` and `forward()`, plus both
+forward-pass-argument state-machine hooks. Send one short request and identify
+the first missing event.
+
+| last observed event | likely cause | fix |
+|---|---|---|
+| No first-node preparation | Initial input name or partition seed is missing. | Compare `process_prompt()` output with the first graph node's inputs. |
+| Producer runs; consumer never prepares | Stream edge, connection, chunk policy, or first loop-back seed is missing. | Match the producer output key, stream connection, and all consumer inputs. |
+| Consumer runs repeatedly | Stop signal or partition completion transition is wrong. | Test `check_stop()` and the next forward-pass arguments directly. |
+| Capacity fails after completed requests | A resource claim is not released. | Test ingest, admit, failure, cancellation, and remove lifecycle paths. |
+
+Remove temporary trace logging after the structural test captures the failure.
