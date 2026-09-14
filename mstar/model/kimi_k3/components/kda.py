@@ -183,7 +183,12 @@ class ParallelKDAAttention(nn.Module):
         result = super()._apply(fn, recurse=recurse)
         self._attach_loaders()
         restore_kept_dtypes(self)
+        self._params_cache = None
         return result
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._params_cache = None
+        return super()._load_from_state_dict(*args, **kwargs)
 
     def set_kernels(self, kernels) -> None:
         self.kernels = kernels
@@ -193,14 +198,21 @@ class ParallelKDAAttention(nn.Module):
         self.state = resources.get(self._state_key)
 
     def params(self) -> KDAParams:
-        conv_w = torch.cat(
-            [self.q_conv1d.weight[:, 0], self.k_conv1d.weight[:, 0], self.v_conv1d.weight[:, 0]], dim=0,
-        )
-        return KDAParams(
-            conv_weight=conv_w, A_log=self.A_log, dt_bias=self.dt_bias,
-            lower_bound=self.gate_lower_bound, num_heads=self.num_heads, head_dim=self.head_dim,
-            scale=self.head_dim ** -0.5,
-        )
+        """The kernels' parameter bundle; the q/k/v conv weights concatenated into one
+        ``[3P, W]`` tensor. Cached (keyed by the weights' storage and version, cleared on
+        ``_apply``/reload): rebuilding the concatenation was one launch per layer per step."""
+        ws = (self.q_conv1d.weight, self.k_conv1d.weight, self.v_conv1d.weight)
+        key = tuple((w.data_ptr(), w._version) for w in ws)
+        cached = getattr(self, "_params_cache", None)
+        if cached is None or cached[0] != key:
+            conv_w = torch.cat([w[:, 0] for w in ws], dim=0)
+            cached = (key, KDAParams(
+                conv_weight=conv_w, A_log=self.A_log, dt_bias=self.dt_bias,
+                lower_bound=self.gate_lower_bound, num_heads=self.num_heads, head_dim=self.head_dim,
+                scale=self.head_dim ** -0.5,
+            ))
+            self._params_cache = cached
+        return cached[1]
 
     def _project(self, x: torch.Tensor):
         t = x.shape[0]
