@@ -40,18 +40,20 @@ class FLAKDAKernels:
         updated in place. Returns ``o [T, H, D]``."""
         h, d = p.num_heads, p.head_dim
         rows = plan.num_rows
-        slot_ids = plan.slot_ids[:rows].to(torch.long)
-        has_state = plan.has_state[:rows]
         t = qkv.shape[0]
         conv_w = p.conv_weight.to(qkv.dtype)  # [3P, W]
         if plan.is_decode:
             # decode reads the slots as they are: the resource zeroes a slot when it hands it
             # out (and the scratch slot every padded step), so a row's first decode after its
             # prefill finds the written state and a fresh slot holds zeros -- no masking, no
-            # gather/scatter of the recurrent states (tens of MB per layer at 64 rows)
+            # gather/scatter of the recurrent states (tens of MB per layer at 64 rows).
+            # The plan's int32 index buffers are used as they are: index_select, advanced
+            # indexing and the fla kernels all take int32, and every dtype conversion here
+            # would be one more captured launch per layer per step
+            slot_ids = plan.slot_ids[:rows]
             cache = conv_state.index_select(0, slot_ids)
             y, cache = self._conv_update(qkv.view(rows, 1, -1), cache, weight=conv_w, activation="silu")
-            conv_state.index_copy_(0, slot_ids, cache.to(conv_state.dtype))
+            conv_state[slot_ids] = cache.to(conv_state.dtype)
             # the low-level Triton kernel assumes contiguous [B, T, H, K]: a strided split of
             # the fused conv output reads the wrong memory for every row after the first, so
             # re-layout once to [3, rows, P] (one copy) and take contiguous leading slices
@@ -64,13 +66,15 @@ class FLAKDAKernels:
                 g=g_raw.view(1, rows, h, d), beta=beta_raw.view(1, rows, h),
                 A_log=p.A_log, dt_bias=p.dt_bias, initial_state=rec_state, scale=p.scale,
                 output_final_state=True, inplace_final_state=True, state_v_first=True,
-                cu_seqlens=plan.cu_seqlens[: rows + 1].to(torch.long),
-                ssm_state_indices=slot_ids.to(torch.int32),
+                cu_seqlens=plan.cu_seqlens[: rows + 1],
+                ssm_state_indices=slot_ids,
                 use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
                 lower_bound=p.lower_bound,
             )[0]
             return o.view(rows, h, d)
         # prefill: varlen over the packed rows with gathered initial states
+        slot_ids = plan.slot_ids[:rows].to(torch.long)
+        has_state = plan.has_state[:rows]
         cu = plan.cu_seqlens[: rows + 1].to(torch.long)
         conv_init = conv_state.index_select(0, slot_ids) * has_state[:, None, None].to(conv_state.dtype)
         y, conv_final = self._conv(
