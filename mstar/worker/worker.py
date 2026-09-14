@@ -1777,6 +1777,7 @@ class Worker:
         engine = self.engine_manager.get_engine(batch_N.node_name)
         cpu_outputs = self._prematerialize_for_check_stop(
             outputs, batch_N.node_batch.completion_event,
+            request_ids=batch_N.node_batch.request_ids,
         )
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
         if batch_N.node_batch.failed_requests:
@@ -1958,10 +1959,53 @@ class Worker:
             )
         return buffers[index]
 
+
+    def _prematerialize_batched(
+        self,
+        buffers: dict,
+        side: torch.cuda.Stream,
+        request_ids: list[str],
+    ) -> dict[str, NameToTensorList]:
+        """One device-to-host copy per named buffer, sliced per request after.
+
+        The per-rid form costs a copy per tensor per request — 48 of them at a
+        decode batch of 16, each carrying a single token — and every one is a
+        launch plus a completion the host waits on. A submodule that hands over
+        the whole batch tensor instead pays one, and the per-rid views below
+        are slices of pinned memory, so they cost nothing.
+
+        Row i belongs to ``request_ids[i]``, the same convention the engine
+        uses to map a captured graph's rows back to real requests. A padded
+        replay leaves extra rows past the real ones; they are simply not read.
+        """
+        rows = len(request_ids)
+        host: dict[str, torch.Tensor] = {}
+        with torch.cuda.stream(side):
+            for index, (name, tensor) in enumerate(buffers.items()):
+                if not (torch.is_tensor(tensor) and tensor.is_cuda):
+                    host[name] = tensor
+                    continue
+                buf = self._get_pinned_d2h_buffer(
+                    "check_stop_batched", tensor.shape, tensor.dtype, index,
+                )
+                buf.copy_(tensor, non_blocking=True)
+                host[name] = buf
+        side.synchronize()
+
+        out: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(request_ids):
+            per_rid: NameToTensorList = {}
+            for name, buf in host.items():
+                if torch.is_tensor(buf) and buf.shape and i < buf.shape[0]:
+                    per_rid[name] = [buf[i : i + 1]]
+            out[rid] = per_rid
+        return out
+
     def _prematerialize_for_check_stop(
         self,
-        outputs: dict[str, NameToTensorList],
+        outputs: "BatchedModelOutput",
         completion_event: torch.cuda.Event | None,
+        request_ids: list[str] | None = None,
     ) -> dict[str, NameToTensorList]:
         """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
@@ -1978,15 +2022,21 @@ class Worker:
         a code) so the cost is negligible. If a future engine emits large
         tensors here (e.g. activations), revisit.
         """
+        source = outputs.get_check_stop_input()
         if not torch.cuda.is_available() or completion_event is None:
-            return outputs
-        if not outputs:
-            return outputs
+            return source
+        if not source:
+            return source
 
         if self._d2h_stream is None:
             self._d2h_stream = torch.cuda.Stream(device=self.device)
         side = self._d2h_stream
         side.wait_event(completion_event)
+
+        if outputs.check_stop_buffers is not None and request_ids is not None:
+            return self._prematerialize_batched(
+                outputs.check_stop_buffers, side, request_ids,
+            )
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)

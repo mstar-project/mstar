@@ -50,6 +50,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import (
+    BatchedModelOutput,
     ARNodeInputs,
     ARNodeSubmodule,
     ModelInputsFromEngine,
@@ -345,15 +346,21 @@ class LLMSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         new_tokens = self._forward(
             graph_walk, engine_inputs, cos_3d, sin_3d,
             input_ids=input_ids, input_embeds=input_embeds,
         )
-        return {
-            rid: {"new_token": [new_tokens[i : i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        return BatchedModelOutput(
+            per_rid_outputs={
+                rid: {"new_token": [new_tokens[i : i + 1]]}
+                for i, rid in enumerate(engine_inputs.request_ids)
+            },
+            # The stop check only reads the sampled token, and it is already
+            # one tensor here — row i is request i. Handing it over whole is
+            # one device-to-host copy a step instead of one per request.
+            check_stop_buffers={"new_token": new_tokens},
+        )
 
     # ------------------------------------------------------------------
     # Post-step

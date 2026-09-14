@@ -17,7 +17,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCudaGraphConfig,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class CudaGraphSlot:
     # preprocess output as captured; tensor entries are the static buffers
     static_inputs: dict[str, Any]
     static_input_keys: tuple[str, ...]
-    static_outputs: dict
+    static_outputs: BatchedModelOutput
     # padding rows address these; their streams stay resident between steps
     dummy_rids: list[str]
     dummy_metadata: dict[str, CurrentForwardPassInfo]
@@ -486,7 +486,9 @@ class CudaGraphRunner:
             graph = torch.cuda.CUDAGraph()
             with autocast_scope(self._autocast_dtype):
                 with torch.cuda.graph(graph, pool=self._memory_pool):
-                    output = run_forward()
+                    output = BatchedModelOutput.coerce(
+                        run_forward()
+                    )
             torch.cuda.synchronize()
 
             return self._build_slot_from_capture(

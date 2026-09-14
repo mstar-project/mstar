@@ -20,6 +20,96 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class BatchedModelOutput:
+    """A step's outputs, split by how they are addressed.
+
+    ``per_rid_outputs`` is keyed by request id. ``packed_outputs`` holds whole
+    batch tensors a captured graph emitted under a ``__name__`` key, which a
+    submodule's ``unpack_packed_outputs`` cuts per request.
+
+    ``check_stop_buffers`` is what the stop check reads. It defaults to the
+    per-rid outputs, which costs a device-to-host copy per tensor per request;
+    a submodule that can hand over one batch tensor instead — row i belonging
+    to request i, as everywhere else here — turns that into one copy.
+
+    Both dicts are always dicts: a ``None`` here would have every reader guard
+    before touching them, and the readers are on the step's critical path.
+    """
+
+    per_rid_outputs: dict[str, NameToTensorList] = field(default_factory=dict)
+    packed_outputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    # None means "not provided", which is not the same as "provided empty"
+    check_stop_buffers: dict[str, torch.Tensor | NameToTensorList] | None = None
+
+    @classmethod
+    def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
+        if isinstance(output, BatchedModelOutput):
+            return output
+        per_rid_outputs = {}
+        packed_outputs = {}
+        for k, v in output.items():
+            if k.startswith("__") and k.endswith("__"):
+                packed_outputs[k] = v
+            else:
+                per_rid_outputs[k] = v
+        return cls(
+            per_rid_outputs=per_rid_outputs,
+            packed_outputs=packed_outputs,
+        )
+
+    def get(self, key: str, default=None):
+        if key in self.per_rid_outputs:
+            return self.per_rid_outputs[key]
+        return self.packed_outputs.get(key, default)
+
+    def pop(self, request_id: str, default=None):
+        """Drop one request's outputs, e.g. when it stopped or failed.
+
+        Only the per-rid side: a packed or check-stop batch tensor is addressed
+        by row, and the caller takes the request out of the batch instead.
+        """
+        return self.per_rid_outputs.pop(request_id, default)
+
+    def clone_check_stop_buffers(self):
+        """A detached copy, since a captured graph's buffers are overwritten by
+        the next replay and the stop check reads them after that has started.
+        """
+        if self.check_stop_buffers is None:
+            return None
+
+        def _clone(value):
+            if isinstance(value, torch.Tensor):
+                return value.clone()
+            if isinstance(value, list):
+                return [
+                    x.clone() if isinstance(x, torch.Tensor) else x for x in value
+                ]
+            if isinstance(value, dict):
+                return {k: _clone(v) for k, v in value.items()}
+            # anything else is not ours to copy — pass it through rather than
+            # dropping it, which would silently lose a stop signal
+            return value
+
+        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
+
+    def get_check_stop_input(self):
+        if self.check_stop_buffers is not None:
+            return self.check_stop_buffers
+        return self.per_rid_outputs
+
+    def update(self, other: BatchedModelOutput | dict[str, Any]):
+        # coerced, because a caller holding the old dict contract is still a
+        # valid producer — that is what `coerce` is for everywhere else here
+        other = self.coerce(other)
+        self.per_rid_outputs.update(other.per_rid_outputs)
+        self.packed_outputs.update(other.packed_outputs)
+        if other.check_stop_buffers is not None:
+            if self.check_stop_buffers is None:
+                self.check_stop_buffers = {}
+            self.check_stop_buffers.update(other.check_stop_buffers)
+
+
+@dataclass
 class NodeInputs:
     tensor_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     # non-tensor kwargs
@@ -425,7 +515,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs, # coming from preprocess output
-    )  -> dict[str, NameToTensorList]: # request_id to tensors
+    )  -> dict[str, NameToTensorList] | BatchedModelOutput: # request_id to tensors
         """Batched form of ``forward``: maps a multi-request batch to
         per-request outputs. Override when ``can_batch`` returns True."""
         raise NotImplementedError(
@@ -456,7 +546,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         real_seq_lens: list[int],
         inputs: list[NodeInputs],
         per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> dict[str, dict[str, list[torch.Tensor]]]:
+    ) -> dict[str, NameToTensorList]:
         """Per-rid slicing for packed sentinels emitted by the captured graph.
 
         Decode-style submodules emit per-rid entries inside the captured

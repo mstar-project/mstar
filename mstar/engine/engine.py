@@ -37,6 +37,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.model.submodule_base import (
+    BatchedModelOutput,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -116,7 +117,7 @@ class ExecutingBatch:
 
     # This step's per-rid outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
-    outputs: dict[str, NameToTensorList] = field(default_factory=dict)
+    outputs: BatchedModelOutput = field(default_factory=BatchedModelOutput)
 
     # The next step reads N's outputs, and plans against N's committed state.
     # Two separate dependencies, so two events: whoever prepares N+1 can start
@@ -438,7 +439,7 @@ class Engine:
 
     def exec(
         self, batch: ExecutingBatch
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """Run one step: declare → admit → plan → forward → commit.
 
         Captured replay and the eager forward are the same path. Under a lease
@@ -453,7 +454,9 @@ class Engine:
         # failed preparing, so there is no forward to run. Reaching one anyway
         # dies on an empty `inputs`; the walk's next step is scheduled as usual.
         if not batch.request_ids:
-            batch.outputs = {}
+            batch.outputs = BatchedModelOutput(
+                per_rid_outputs={rid: {} for rid in batch.request_ids}
+            )
             batch.outputs_ready.set()
             batch.release_waiters()
             return batch.outputs
@@ -487,7 +490,7 @@ class Engine:
 
     def _exec_single(
         self, batch: ExecutingBatch
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """The one-forward path: batched (a lease replay or ``forward_batched``)
         or a single eager request."""
         submodule_mgmt = self._submodules[batch.node_name]
@@ -524,7 +527,9 @@ class Engine:
                 step=batch.step, set_launch=True,
             )
             if raw is None:
-                return {rid: {} for rid in batch.request_ids}
+                return BatchedModelOutput(
+                    per_rid_outputs={rid: {} for rid in batch.request_ids}
+                )
             # Commit first: releasing `commit_done` here is what lets a pre-plan
             # of N+1 overlap this step's per-request tail.
             batch.commit_done.set()
@@ -569,7 +574,9 @@ class Engine:
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
-        merged: dict[str, NameToTensorList] = {rid: {} for rid in batch.request_ids}
+        merged = BatchedModelOutput(
+            per_rid_outputs={rid: {} for rid in batch.request_ids}
+        )
         launched = False
 
         # Step 1: loop through all of the requests for admit errors
@@ -601,7 +608,6 @@ class Engine:
                     step=steps[rid], set_launch=not launched,
                 )
                 if raw is None:
-                    merged[rid] = {}
                     continue
                 launched = True
                 merged.update(self._collect_outputs(
@@ -810,7 +816,7 @@ class Engine:
         running_batched: bool,
         request_ids: list[str],
         release_event: "threading.Event | None" = None,
-    ) -> dict:
+    ) -> BatchedModelOutput:
         """Replay the leased slot, or run the eager forward.
 
         ``release_event`` is set as late as possible before the call that drops
@@ -824,19 +830,23 @@ class Engine:
         if release_event is not None:
             release_event.set()
         if running_batched:
-            return submodule_mgmt.forward_batched(
-                graph_walk, engine_inputs=engine_inputs, **preprocessed
+            return BatchedModelOutput.coerce(
+                submodule_mgmt.forward_batched(
+                    graph_walk, engine_inputs=engine_inputs, **preprocessed
+                )
             )
         assert len(request_ids) == 1, (
             "the unbatched forward takes one request; batch of "
             f"{len(request_ids)} needs running_batched"
         )
-        return {request_ids[0]: submodule_mgmt.forward(
-            graph_walk, engine_inputs=engine_inputs, **preprocessed
-        )}
+        return BatchedModelOutput.coerce(
+            {request_ids[0]: submodule_mgmt.forward(
+                graph_walk, engine_inputs=engine_inputs, **preprocessed
+            )}
+        )
 
     def postprocess_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: BatchedModelOutput,
     ) -> None:
         """Per-rid ``submodule.postprocess``, e.g. the non-capturable tail of a
         walk whose graph covered only the forward.
@@ -853,7 +863,7 @@ class Engine:
                 range_pop()
 
     def _postprocess_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: BatchedModelOutput,
     ) -> None:
         submodule = self._submodules[batch.node_name].submodule
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
@@ -873,7 +883,7 @@ class Engine:
 
     def exec_and_postprocess(
         self, batch: ExecutingBatch
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """The forward and its per-rid tail, which belong to the same step: a
         walk that captured only its forward finishes in ``postprocess``.
 
@@ -942,12 +952,12 @@ class Engine:
         self,
         submodule_mgmt: SubmoduleManagement,
         lease: SlotLease | None,
-        raw_outputs: dict,
+        raw_outputs: BatchedModelOutput,
         inputs: list[NodeInputs],
         req_info: Mapping[str, CurrentForwardPassInfo],
         request_ids: list[str],
         step_request_ids: tuple[str, ...],
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """Per-rid outputs for the real requests: drop the padding rows and map
         a captured graph's keys back to real ids.
 
@@ -969,12 +979,15 @@ class Engine:
             outputs, raw_outputs, request_ids, submodule,
             inputs[:len(request_ids)], req_info,
         )
-        return outputs
+        return BatchedModelOutput(
+            per_rid_outputs=outputs,
+            check_stop_buffers=raw_outputs.clone_check_stop_buffers()
+        )
 
     def _merge_per_rid(
         self,
         outputs: dict[str, NameToTensorList],
-        raw_outputs: dict,
+        raw_outputs: BatchedModelOutput,
         request_ids: list[str],
         out_ids: list[str],
         submodule: NodeSubmodule,
@@ -1000,7 +1013,7 @@ class Engine:
     def _merge_unpacked(
         self,
         outputs: dict[str, NameToTensorList],
-        raw_outputs: dict,
+        raw_outputs: BatchedModelOutput,
         request_ids: list[str],
         submodule: NodeSubmodule,
         real_inputs: list[NodeInputs],
@@ -1012,7 +1025,7 @@ class Engine:
         depend on the real seq_lens, which only reach it through the plan.
         """
         unpacked = submodule.unpack_packed_outputs(
-            static_output=raw_outputs,
+            static_output=raw_outputs.packed_outputs,
             request_ids=request_ids,
             real_seq_lens=[inp.input_seq_len for inp in real_inputs],
             inputs=real_inputs,
