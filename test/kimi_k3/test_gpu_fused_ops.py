@@ -98,3 +98,49 @@ def test_fused_router_matches_reference(t):
             num_expert_group=router.num_expert_group, topk_group=router.topk_group,
         )
     assert all(set(idx2[i].tolist()) == set(ref_idx2[i].tolist()) for i in range(t))
+
+
+@cuda
+@pytest.mark.parametrize("m,d", [(0, 512), (1, 1024), (3, 7168), (8, 7168)])
+@pytest.mark.parametrize("t", [1, 37])
+def test_attn_res_folded_add_and_norm_are_exact(m, d, t):
+    """The residual add folded into the read's first launch gives the same read as the eager
+    add followed by the plain read, returns the bit-identical sum, and the folded output norm
+    equals the unfused read followed by the KimiRMSNorm module."""
+    from mstar.model.kimi_k3.components.attn_res import AttnResRead
+    from mstar.model.kimi_k3.components.attn_res_kernel import attn_res_add_read_triton, attn_res_read_triton
+    from mstar.model.kimi_k3.components.common import KimiRMSNorm
+
+    torch.manual_seed(0)
+    prefix = torch.randn(t, d, device=DEV, dtype=torch.bfloat16) * 2
+    add = torch.randn(t, d, device=DEV, dtype=torch.bfloat16) * 3
+    blocks = torch.randn(t, m, d, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(d, device=DEV) * 0.05
+    norm = KimiRMSNorm(d).to(DEV, torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.normal_(1.0, 0.2)
+        summed = prefix + add
+        x, p = attn_res_add_read_triton(prefix, add, blocks, w, 1e-5)
+        assert torch.equal(p, summed) and p.data_ptr() != prefix.data_ptr()
+        assert torch.equal(x, attn_res_read_triton(summed, blocks, w, 1e-5))
+        xn, pn = attn_res_add_read_triton(prefix, add, blocks, w, 1e-5, out_norm_weight=norm.weight, out_eps=norm.variance_epsilon)
+        assert torch.equal(pn, summed)
+        assert torch.equal(xn, norm(attn_res_read_triton(summed, blocks, w, 1e-5)))
+        # the module's read: CUDA (folded) and CPU (eager) paths agree with each other
+        mod = AttnResRead(d).to(DEV, torch.bfloat16)
+        mod.norm.weight.normal_(1.0, 0.1)
+        mod.proj.weight.normal_(0.0, 0.05)
+        x_mod, p_mod = mod.read(prefix, blocks, out_norm=norm, add=add)
+        assert torch.equal(p_mod, summed)
+        assert torch.equal(x_mod, attn_res_add_read_triton(
+            prefix, add, blocks, mod.score_weight(), mod.eps, out_norm_weight=norm.weight, out_eps=norm.variance_epsilon)[0])
+        mod_cpu = AttnResRead(d).to(torch.bfloat16)
+        mod_cpu.load_state_dict(mod.state_dict())
+        norm_cpu = KimiRMSNorm(d).to(torch.bfloat16)
+        norm_cpu.load_state_dict(norm.state_dict())
+        x_cpu, p_cpu = mod_cpu.read(prefix.cpu(), blocks.cpu(), out_norm=norm_cpu, add=add.cpu())
+        assert torch.equal(p_cpu, summed.cpu())
+        torch.testing.assert_close(x_mod.float().cpu(), x_cpu.float(), rtol=2e-2, atol=2e-2)
+        # no blocks and no norm: the read is the sum itself
+        x0, p0 = mod.read(prefix, blocks[:, :0], add=add)
+        assert torch.equal(x0, summed) and torch.equal(p0, summed)
