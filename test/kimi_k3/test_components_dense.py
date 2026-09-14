@@ -88,3 +88,25 @@ def test_kda_paged_kernel_matches_dense(mstar_model, tiny_dir):
     torch.testing.assert_close(layer._finish(xa2, o2), out_a2, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(from_v_first(rec[1]), st_a2.recurrent, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(conv[1, : layer.projection_size], st_a2.conv_q, rtol=1e-5, atol=1e-5)
+
+
+def test_kda_params_bundle_is_cached_and_invalidated(mstar_model):
+    """``params()`` (the concatenated conv weights the kernels take) is built once and reused
+    -- rebuilding it was a launch per layer per decode step -- and rebuilt after the weights
+    move (``_apply``), are reloaded, or are written in place."""
+    layer = mstar_model.model.layers[0].self_attn
+    p1 = layer.params()
+    assert layer.params() is p1
+    expected = torch.cat([layer.q_conv1d.weight[:, 0], layer.k_conv1d.weight[:, 0], layer.v_conv1d.weight[:, 0]])
+    assert torch.equal(p1.conv_weight, expected) and p1.A_log is layer.A_log
+    with torch.no_grad():
+        layer.q_conv1d.weight.mul_(2.0)  # in-place write bumps the version counter
+    p2 = layer.params()
+    assert p2 is not p1 and torch.equal(p2.conv_weight[: layer.projection_size], layer.q_conv1d.weight[:, 0])
+    layer._apply(lambda t: t)  # a device/dtype move rebinds the parameters
+    assert layer.params() is not p2
+    p3 = layer.params()
+    layer.load_state_dict(layer.state_dict())
+    assert layer.params() is not p3
+    with torch.no_grad():
+        layer.q_conv1d.weight.div_(2.0)
