@@ -114,20 +114,23 @@ class KimiK3LanguageModel(nn.Module):
                 break
 
     # ---------------------------------------------------------------- paths
-    def _finish(self, prefix: torch.Tensor, blocks: torch.Tensor) -> torch.Tensor:
-        out = self.output_attn_res(prefix, blocks) if self.cfg.use_attn_res else prefix
-        return self.norm(out)
+    def _finish(self, prefix: torch.Tensor, blocks: torch.Tensor, pending: torch.Tensor | None) -> torch.Tensor:
+        """Output read (with the last layer's residual add and the final norm folded in) or,
+        without attention residuals, the final norm of the completed prefix."""
+        if self.cfg.use_attn_res:
+            return self.output_attn_res.read(prefix, blocks, out_norm=self.norm, add=pending)[0]
+        return self.norm(prefix if pending is None else prefix + pending)
 
     def forward(self, hidden: torch.Tensor, *, label: str = "main") -> torch.Tensor:
         """Paged path over packed tokens ``hidden [T, H]``; returns the final-normed
         hidden states ``[T, H]``."""
         self.bind_label(label)
-        prefix = hidden
+        prefix, pending = hidden, None
         blocks = hidden.new_zeros(hidden.shape[0], 0, hidden.shape[1])
         for layer in self.layers:
             self._set_cursors(layer)
-            prefix, blocks = layer(prefix, blocks)
-        return self._finish(prefix, blocks)
+            prefix, blocks, pending = layer(prefix, blocks, pending)
+        return self._finish(prefix, blocks, pending)
 
     def forward_dense(
         self, input_ids: torch.Tensor, state: list | None = None,
@@ -136,11 +139,11 @@ class KimiK3LanguageModel(nn.Module):
         state = state or [None] * len(self.layers)
         new_state: list = [None] * len(self.layers)
         hidden = self.embed_tokens(input_ids)
-        prefix = hidden
+        prefix, pending = hidden, None
         blocks = hidden.new_zeros(hidden.shape[0], 0, hidden.shape[1])
         for i, layer in enumerate(self.layers):
-            prefix, blocks, new_state[i] = layer.forward_dense(prefix, blocks, state[i])
-        return self._finish(prefix, blocks), new_state
+            prefix, blocks, new_state[i], pending = layer.forward_dense(prefix, blocks, state[i], pending)
+        return self._finish(prefix, blocks, pending), new_state
 
 
 def select_kda_kernels(model: nn.Module, device) -> bool:
