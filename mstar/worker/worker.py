@@ -1691,9 +1691,22 @@ class Worker:
         self, batch_N: PendingBatch,
         outputs: dict[str, NameToTensorList],
     ):
+        # Stage stopwatch, same names as the NVTX ranges below. A stamp rather
+        # than a nested `_span` per stage: this function has two early returns,
+        # and a clock read carries no unwind bookkeeping across them.
+        _pp_t = _time.perf_counter() if self._phase_period else 0.0
+        def _pp_stage(name: str) -> None:
+            nonlocal _pp_t
+            if not self._phase_period:
+                return
+            now = _time.perf_counter()
+            self._phase_buf[f"worker.postprocess.{name}"].append(now - _pp_t)
+            _pp_t = now
+
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
         self._cleanup_consumed_inputs(batch_N.batch)
+        _pp_stage("cleanup_inputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.pending_loop_stops", synchronize=False)
@@ -1735,6 +1748,7 @@ class Worker:
             ) for rid in batch_N.node_batch.request_ids
         }
 
+        _pp_stage("pending_loop_stops")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.update_lru", synchronize=False)
@@ -1744,6 +1758,7 @@ class Worker:
         for rid in batch_N.node_batch.request_ids:
             self._last_active[(rid, batch_N.node_name)] = t
 
+        _pp_stage("update_lru")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.synchronize_completion_event", synchronize=False)
@@ -1763,6 +1778,7 @@ class Worker:
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
 
+        _pp_stage("completion_event_sync")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
@@ -1779,6 +1795,7 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
+        _pp_stage("prematerialize")
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
@@ -1795,6 +1812,7 @@ class Worker:
                     range_pop(synchronize=False)
                 return
 
+        _pp_stage("check_stop")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.stop_loops", synchronize=False)
@@ -1844,6 +1862,7 @@ class Worker:
                     )
                 )
 
+        _pp_stage("stop_loops")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.route_outputs", synchronize=False)
@@ -1856,6 +1875,7 @@ class Worker:
             req_output_tensors = outputs.get(rid)
             node = batch_N.batch.node_objects[rid]
             node.reset_outputs() # reset stale outputs
+            _rt = _time.perf_counter() if self._phase_period else 0.0
             if req_output_tensors:
                 graph_node_info = self.tensor_manager.store_and_populate_graph_edges(
                     request_id=rid,
@@ -1869,16 +1889,28 @@ class Worker:
                 per_request_uuids[rid] = {
                     info.uuid for infos in graph_node_info.values() for info in infos
                 }
+            if self._phase_period:
+                _now = _time.perf_counter()
+                self._phase_buf["worker.route.store_tensors"].append(_now - _rt)
+                _rt = _now
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
                 rid, wg_id, batch_N.node_name
             )
             real_outputs = [edge.clone() for edge in completion_output.output_edges]
+            if self._phase_period:
+                _now = _time.perf_counter()
+                self._phase_buf["worker.route.mark_complete"].append(_now - _rt)
+                _rt = _now
 
             routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
                 rid, node_name=batch_N.node_name,
                 outputs=real_outputs, graph_walk=batch_N.graph_walk
             )
+            if self._phase_period:
+                _now = _time.perf_counter()
+                self._phase_buf["worker.route.process_outputs"].append(_now - _rt)
+                _rt = _now
 
             if rid in per_request_uuids:
                 routing = routing_per_request[rid]
@@ -1904,11 +1936,17 @@ class Worker:
                 self.tensor_manager.set_output_ref_counts(
                     rid, per_request_uuids[rid], routed_edges
                 )
+                if self._phase_period:
+                    self._phase_buf["worker.route.ref_counts"].append(
+                        _time.perf_counter() - _rt
+                    )
 
+        _pp_stage("route_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
         self._register_outputs(batch_N.batch, routing_per_request)
+        _pp_stage("register_outputs")
 
         # send outputs
         if self.enable_nvtx:
@@ -1931,6 +1969,7 @@ class Worker:
                 batch_N.node_batch.exec_timings,
             )
         for rid, routing in routing_per_request.items():
+            _so = _time.perf_counter() if self._phase_period else 0.0
             self._send_outputs(
                 rid, routing,
                 nested_loop_indices=per_req_nested_idxs[rid],
@@ -1938,7 +1977,12 @@ class Worker:
                 partition_name=batch_N.partition,
                 node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled
             )
+            if self._phase_period:
+                self._phase_buf["worker.send_outputs.per_rid"].append(
+                    _time.perf_counter() - _so
+                )
 
+        _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -2568,7 +2612,8 @@ class Worker:
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
-                            spec_launch_started.wait(timeout=launch_wait_s)
+                            with self._span("worker.submit_spec.launch_wait"):
+                                spec_launch_started.wait(timeout=launch_wait_s)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:

@@ -351,14 +351,15 @@ class LLMSubmodule(ARNodeSubmodule):
             graph_walk, engine_inputs, cos_3d, sin_3d,
             input_ids=input_ids, input_embeds=input_embeds,
         )
+        # Row i is request i on both sides, so the whole step is described by
+        # the one tensor the forward already produced:
+        #
+        # * ``row_outputs`` — the engine takes ONE clone out of the graph's
+        #   buffer and gives each request a view, instead of a clone per row.
+        # * ``check_stop_buffers`` — one device-to-host copy a step instead of
+        #   one per request.
         return BatchedModelOutput(
-            per_rid_outputs={
-                rid: {"new_token": [new_tokens[i : i + 1]]}
-                for i, rid in enumerate(engine_inputs.request_ids)
-            },
-            # The stop check only reads the sampled token, and it is already
-            # one tensor here — row i is request i. Handing it over whole is
-            # one device-to-host copy a step instead of one per request.
+            row_outputs={"new_token": new_tokens},
             check_stop_buffers={"new_token": new_tokens},
         )
 

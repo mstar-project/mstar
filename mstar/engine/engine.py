@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from time import perf_counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
@@ -44,7 +45,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
-from mstar.utils.profiler import mark, range_pop, range_push
+from mstar.utils.profiler import PHASE_PERIOD, mark, phase_record, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -535,6 +536,7 @@ class Engine:
             batch.commit_done.set()
             if self._enable_nvtx:
                 range_push("engine.collect_outputs")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 out = self._collect_outputs(
                     submodule_mgmt, lease, raw, inputs, req_info,
@@ -542,6 +544,8 @@ class Engine:
                     step_request_ids=batch.step_context.padded_request_ids,
                 )
             finally:
+                if PHASE_PERIOD:
+                    phase_record("engine.collect_outputs", perf_counter() - t0)
                 if self._enable_nvtx:
                     range_pop()
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
@@ -644,6 +648,7 @@ class Engine:
             self._maybe_lease_piecewise_regions(batch.node_name, ctx, inputs)
             if nvtx:
                 range_push("engine.declare_step")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 step = submodule.declare_step(
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
@@ -651,6 +656,8 @@ class Engine:
                     piecewise_leases=ctx.piecewise_leases,
                 )
             finally:
+                if PHASE_PERIOD:
+                    phase_record("engine.declare_step", perf_counter() - t0)
                 if nvtx:
                     range_pop()
         if step is None:
@@ -663,9 +670,12 @@ class Engine:
 
         if nvtx:
             range_push("engine.admit")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             admit_outcome = self._runner.admit(step)
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.admit", perf_counter() - t0)
             if nvtx:
                 range_pop()
 
@@ -749,9 +759,16 @@ class Engine:
                     "engine.plan.promoted" if batch.preplan_event is not None
                     else "engine.plan.fresh"
                 )
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 self._runner.plan(step)
             finally:
+                if PHASE_PERIOD:
+                    phase_record(
+                        "engine.plan.promoted" if batch.preplan_event is not None
+                        else "engine.plan.fresh",
+                        perf_counter() - t0,
+                    )
                 if nvtx:
                     range_pop()
 
@@ -768,11 +785,14 @@ class Engine:
         )
         if nvtx:
             range_push("engine.preprocess")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             preprocessed = submodule.preprocess(
                 ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs,
             )
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.preprocess", perf_counter() - t0)
             if nvtx:
                 range_pop()
 
@@ -786,21 +806,27 @@ class Engine:
             # the launch/enqueue span, not the GPU work: `synchronize=True`
             # here would drain the stream and destroy the overlap
             range_push("engine.forward")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             raw = self._forward(
                 batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                 lease, running_batched, request_ids, release_event,
             )
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.forward", perf_counter() - t0)
             if nvtx:
                 range_pop()
 
         if step is not None:
             if nvtx:
                 range_push("engine.commit")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 self._runner.commit(step)
             finally:
+                if PHASE_PERIOD:
+                    phase_record("engine.commit", perf_counter() - t0)
                 if nvtx:
                     range_pop()
         return raw, step
@@ -856,9 +882,12 @@ class Engine:
         """
         if self._enable_nvtx:
             range_push("engine.postprocess")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             self._postprocess_batch(batch, outputs)
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.postprocess", perf_counter() - t0)
             if self._enable_nvtx:
                 range_pop()
 
@@ -993,17 +1022,47 @@ class Engine:
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
     ) -> None:
-        """Fold the forward's per-rid entries into ``outputs``."""
-        for rid, out_id in zip(request_ids, out_ids, strict=False):
+        """Fold the forward's per-rid entries into ``outputs``.
+
+        Row-addressed outputs (``row_outputs``) are copied out of the graph's
+        buffers once for the whole batch and handed to each request as a view
+        of that one clone. Per-rid entries are still cloned individually —
+        nothing says they are rows of a single tensor. A name present in both
+        is the per-rid one: that is the more specific claim.
+
+        The clone still happens after ``filter_batched_output``, so a key the
+        submodule drops for this request is never copied. Taking a view is
+        free, so the row entries can be offered to the filter up front.
+        """
+        row_clones = raw_outputs.clone_row_outputs(len(request_ids))
+        for i, (rid, out_id) in enumerate(
+            zip(request_ids, out_ids, strict=False)
+        ):
             rid_out = raw_outputs.get(out_id)
-            if not isinstance(rid_out, dict):
+            # names served by a view of the batch clone — already copied out,
+            # so they must not be cloned again below
+            from_rows: set[str] = set()
+            candidates: dict[str, Any] = {}
+            for name, tensor in row_clones.items():
+                if isinstance(tensor, torch.Tensor) and tensor.dim() and (
+                    i < tensor.shape[0]
+                ):
+                    candidates[name] = [tensor[i : i + 1]]
+                    from_rows.add(name)
+            if isinstance(rid_out, dict):
+                for name, value in rid_out.items():
+                    candidates[name] = value
+                    from_rows.discard(name)
+            if not candidates:
                 continue
             # captured output keys are fixed for graph compat; the submodule
             # decides which of them this real request should receive
-            rid_out = submodule.filter_batched_output(req_info.get(rid), rid_out)
+            rid_out = submodule.filter_batched_output(req_info.get(rid), candidates)
             merged = outputs.setdefault(rid, {})
             for key, value in rid_out.items():
-                if isinstance(value, list):
+                if key in from_rows:
+                    merged[key] = value
+                elif isinstance(value, list):
                     merged[key] = [t.clone() for t in value]
                 elif isinstance(value, torch.Tensor):
                     merged[key] = [value.clone()]

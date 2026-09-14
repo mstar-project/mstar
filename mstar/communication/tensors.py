@@ -21,6 +21,8 @@ else:
     MOONCAKE_IMPORT_ERROR = None
 import torch
 
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
+
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
@@ -881,6 +883,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 ret_value = self.transfer_engine.register_memory(
                     tensor.data_ptr(), tensor.nbytes
                 )
+                if PHASE_PERIOD:
+                    phase_record(
+                        "tensors.register_memory", time.perf_counter() - t0,
+                    )
                 if ret_value != 0:
                     raise RuntimeError(
                         f"Mooncake memory registration failed for request id {request_id}, uuid {uuid}."
