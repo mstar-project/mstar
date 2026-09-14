@@ -31,7 +31,7 @@ class Spec:
     model: str
     hf_id: str
     revision: str | None
-    reference_model: str             # mstar model to copy STRUCTURE from (e.g. "wan22")
+    reference_model: str | None      # optional mstar structural example
     served_model_name: str
     endpoint: str                    # client-facing OpenAI route
     port: int
@@ -65,7 +65,7 @@ class AddModelTask(TaskType):
             model=model["name"],
             hf_id=model["hf_id"],
             revision=model.get("revision") or None,
-            reference_model=model.get("reference_model", "wan22"),
+            reference_model=model.get("reference_model") or None,
             served_model_name=model.get("served_model_name", model["name"]),
             endpoint=model["endpoint"],
             port=int(model.get("port", 8000)),
@@ -194,11 +194,26 @@ class AddModelTask(TaskType):
 
     # ---- helpers ------------------------------------------------------------
     def _ctx(self, spec: Spec) -> dict:
+        if spec.reference_model:
+            reference_guidance = (
+                f"Inspect `mstar/model/{spec.reference_model}/` as a structural example and "
+                "borrow only graph and resource patterns whose invariants match. It is not a "
+                "required taxonomy bucket. If it does not fit, derive the model directly from "
+                "its stages, Walks, tensor dependencies, persistent state, and the checked-out "
+                "engine contracts."
+            )
+        else:
+            reference_guidance = (
+                "No reference model is preselected. Derive the target graph and resource "
+                "requirements first, consult the model shape map, and record every considered "
+                "reference in `model-port-decisions.jsonl`. Select references only where their "
+                "graph and resource invariants match."
+            )
         return {
             "model": spec.model,
             "hf_id": spec.hf_id,
             "revision": spec.revision or "",
-            "reference_model": spec.reference_model,
+            "reference_guidance": reference_guidance,
             "served_model_name": spec.served_model_name,
             "endpoint": spec.endpoint,
             "port": spec.port,

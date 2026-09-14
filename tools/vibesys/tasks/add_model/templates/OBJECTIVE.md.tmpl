@@ -45,11 +45,9 @@ or routine command logs.
 
 ## Native port requirements
 
-Inspect `mstar/model/${reference_model}/` as a structural example and borrow
-only graph and resource patterns whose invariants match. It is not a required
-taxonomy bucket. If it does not fit, derive the model directly from its stages,
-Walks, tensor dependencies, persistent state, and the checked-out engine
-contracts. Then:
+${reference_guidance}
+
+Then:
 
 1. Implement the compute under `mstar/model/${model}/` as `NodeSubmodule` or
    `ARNodeSubmodule` nodes and declare the Walks with `get_graph_walk_graphs()`.

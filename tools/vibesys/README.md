@@ -177,7 +177,7 @@ See `example.toml` for the tracked template.
 [model]
 name = "lingbot"
 hf_id = "robbyant/lingbot-video-dense-1.3b"
-reference_model = "wan22"           # mstar model to copy STRUCTURE from
+# reference_model = "wan22"         # optional; omit to let the agent derive and select
 served_model_name = "lingbot"
 endpoint = "/v1/videos/generations"
 modality = "video_generation"       # selects the vibeval templates + vibesys --modality
@@ -197,6 +197,9 @@ result_arg = "--output-json"
 - **Goal = correct eager implementation** — the benchmark still runs and writes
   the same result JSON, but `add-model` does not pass an input benchmark metric
   or register latency as a synthesis objective.
+- **`reference_model`**: when supplied, it is one structural example rather than
+  a required taxonomy bucket. When omitted, the objective tells the agent to
+  derive the graph and resources first and log every reference it considers.
 - **`accuracy_mode`**: `strict` (default) compares the served output to the
   reference oracle via `compare`/`tol`; `smoke` only asserts a valid non-empty
   response (fast bring-up). The strict checker runs in the candidate env

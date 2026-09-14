@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -76,6 +77,7 @@ def test_run_fails_when_skill_directory_is_missing(tmp_path, monkeypatch):
 
 def test_rendered_objective_and_port_report_use_resource_contract(tmp_path):
     task, spec = _task_and_spec()
+    assert spec.reference_model is None
     bundle = tmp_path / "bundle"
     seed = tmp_path / "seed"
     task.render_bundle(spec, bundle)
@@ -106,7 +108,9 @@ def test_rendered_objective_and_port_report_use_resource_contract(tmp_path):
     assert "resident capacity" in report
     assert "Direction Status" in report
     assert "Deferred Performance Opportunities" in report
-    assert "not a required taxonomy bucket" in normalized_objective
+    assert "No reference model is preselected" in normalized_objective
+    assert "consult the model shape map" in normalized_objective
+    assert "mstar/model//" not in objective
     assert "Never use model-owned allocation" in normalized_objective
     assert "No matching reference" in normalized_objective
     assert "attempted engine mapping" in normalized_report
@@ -131,6 +135,17 @@ def test_rendered_objective_and_port_report_use_resource_contract(tmp_path):
             "supersedes": None,
         }
     ]
+
+    referenced_bundle = tmp_path / "referenced-bundle"
+    task.render_bundle(
+        replace(spec, reference_model="vjepa2"),
+        referenced_bundle,
+    )
+    referenced_objective = " ".join(
+        (referenced_bundle / "OBJECTIVE.md").read_text().split()
+    )
+    assert "mstar/model/vjepa2/" in referenced_objective
+    assert "not a required taxonomy bucket" in referenced_objective
 
 
 def test_benchmark_remains_observational_and_emits_compatible_json(tmp_path):

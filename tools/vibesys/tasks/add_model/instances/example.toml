@@ -12,7 +12,7 @@
 name = "mymodel"
 hf_id = "org/my-model"               # HF checkpoint (weights + reference impl)
 revision = ""                        # optional: pin a revision
-reference_model = "wan22"            # mstar model to copy STRUCTURE from (wan22, qwen3_omni, orpheus, ...)
+# reference_model = "wan22"          # optional structural example; omit for agent selection
 served_model_name = "mymodel"        # the "model" field clients send
 endpoint = "/v1/videos/generations"  # client-facing OpenAI route
 port = 8000
