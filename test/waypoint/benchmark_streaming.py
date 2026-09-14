@@ -165,6 +165,20 @@ def _validate_chunk(
     return failures
 
 
+def _startup_latency_metrics(samples: Sequence[float]) -> dict | None:
+    """Time-to-first-frame across repeated world-slot reuse, or None if unmeasured."""
+    if not samples:
+        return None
+    return {
+        "sample_count": len(samples),
+        "p50": _percentile(samples, 0.50),
+        "p95": _percentile(samples, 0.95),
+        "mean": statistics.fmean(samples),
+        "minimum": min(samples),
+        "maximum": max(samples),
+    }
+
+
 def _measure_stream(
     client: MStarClient,
     seed_image: Path,
@@ -357,6 +371,14 @@ def _human_summary(result: dict, artifact: Path) -> str:
             f"{memory['quiet_host_pss_mib']:.1f} MiB, GPU={memory['peak_gpu_mib']:.1f}/"
             f"{memory['quiet_gpu_mib']:.1f} MiB"
         )
+    startup = result["startup_latency_seconds"]
+    if startup is not None:
+        lines.append(
+            f"  startup TTFF over {startup['sample_count']} reused slots: "
+            f"p50/p95={_format_number(startup['p50'])}/"
+            f"{_format_number(startup['p95'])}s "
+            f"mean={_format_number(startup['mean'])}s"
+        )
     backpressure = result["backpressure"]
     lines.extend(
         [
@@ -388,6 +410,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--warmup-steps", type=int, default=1)
+    parser.add_argument(
+        "--startup-repeats",
+        type=int,
+        default=0,
+        help="short streams measured before the baseline, for startup p50/p95",
+    )
+    parser.add_argument("--startup-steps", type=int, default=1)
     parser.add_argument("--slow-consumer-delay", type=float, default=0.25)
     parser.add_argument(
         "--stall-threshold",
@@ -421,6 +450,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--steps must be positive")
     if args.warmup_steps < 0:
         parser.error("--warmup-steps cannot be negative")
+    if args.startup_repeats < 0:
+        parser.error("--startup-repeats cannot be negative")
+    if args.startup_steps <= 0:
+        parser.error("--startup-steps must be positive")
     if args.slow_consumer_delay < 0:
         parser.error("--slow-consumer-delay cannot be negative")
     if args.stall_threshold is not None and args.stall_threshold <= 0:
@@ -500,6 +533,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
     sampler: rollout.MemorySampler | None = None
     failures: list[str] = []
     runs: dict[str, dict] = {}
+    startup_ttffs: list[float] = []
     startup_started = time.perf_counter()
     try:
         client = MStarClient(url, timeout=args.request_timeout)
@@ -535,6 +569,38 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
                 args.log, (warmup_id,), proc, args.request_timeout
             )
             rollout._wait_for_quiescent_memory(sampler, "warmup-quiet")
+
+        # Startup samples: short streams, each followed by a full cleanup, so
+        # every TTFF is measured against a reused world slot rather than a
+        # freshly warmed one. This is the population the prime-capture A/B
+        # compares.
+        for index in range(args.startup_repeats):
+            phase = f"startup-{index:02d}"
+            _wait_for_phase_sample(sampler, proc, phase)
+            request_id = f"{args.request_id}-{phase}"
+            metrics, startup_failures = _measure_stream(
+                client,
+                seed_image,
+                variant,
+                num_steps=args.startup_steps,
+                request_id=request_id,
+                rng_seed=args.seed,
+                consumer_pause_seconds=0.0,
+                stall_threshold_seconds=stall_threshold,
+                enable_nvtx=args.enable_nvtx,
+            )
+            failures.extend(f"{phase}: {failure}" for failure in startup_failures)
+            rollout._wait_for_cleanup(
+                args.log, (request_id,), proc, args.request_timeout
+            )
+            ttff = metrics["time_to_first_frame_seconds"]
+            if ttff is not None:
+                startup_ttffs.append(ttff)
+        if args.startup_repeats:
+            print(
+                f"startup: {len(startup_ttffs)}/{args.startup_repeats} samples, "
+                f"p50={_format_number(_percentile(startup_ttffs, 0.50))}s"
+            )
 
         for name, pause in (
             ("baseline", 0.0),
@@ -603,6 +669,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
             "server_log": str(args.log),
         },
         "server": {"startup_seconds": startup_seconds},
+        "startup_latency_seconds": _startup_latency_metrics(startup_ttffs),
         "runs": runs,
         "backpressure": _backpressure_metrics(
             runs["baseline"],
@@ -614,6 +681,10 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
         "metric_definitions": {
             "time_to_first_frame_seconds": (
                 "request iterator start to first fully decoded SDK VideoFrameChunk"
+            ),
+            "startup_latency_seconds": (
+                "time_to_first_frame_seconds over --startup-repeats short streams, "
+                "each after a full request cleanup, so every sample reuses a world slot"
             ),
             "sustained_media_to_wall_ratio": (
                 "media seconds in chunks after the first divided by first-to-last chunk arrival time"

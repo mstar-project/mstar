@@ -448,6 +448,13 @@ def captured():
     static_noise = torch.zeros(1, 1, *config.latent_shape, dtype=DTYPE, device=DEVICE)
     static_frame = torch.zeros((), dtype=torch.int64, device=DEVICE)
 
+    static_latent = torch.zeros(1, 1, *config.latent_shape, dtype=DTYPE, device=DEVICE)
+
+    # One pool for both graphs, as ``CudaGraphRunner`` does, and rollout first:
+    # its five forwards are a superset of prime's one, so the pool is sized once
+    # and prime reuses the blocks rollout freed.
+    pool = torch.cuda.graphs.graph_pool_handle()
+
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream), torch.no_grad():
@@ -455,12 +462,23 @@ def captured():
             dit.generate_frame(
                 static_noise, static_frame, mouse=mouse, button=button, scroll=scroll
             )
+        for _ in range(3):
+            dit.append_frame(
+                static_latent, static_frame, mouse=mouse, button=button, scroll=scroll
+            )
     torch.cuda.current_stream().wait_stream(stream)
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph), torch.no_grad():
+    with torch.cuda.graph(graph, pool=pool), torch.no_grad():
         static_out = dit.generate_frame(
             static_noise, static_frame, mouse=mouse, button=button, scroll=scroll
+        )
+    torch.cuda.synchronize()
+
+    prime_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(prime_graph, pool=pool), torch.no_grad():
+        prime_out = dit.append_frame(
+            static_latent, static_frame, mouse=mouse, button=button, scroll=scroll
         )
     torch.cuda.synchronize()
 
@@ -474,6 +492,7 @@ def captured():
     return {
         "config": config, "dit": dit, "kv": kv, "attn": attn, "graph": graph,
         "noise": static_noise, "frame": static_frame, "out": static_out,
+        "prime_graph": prime_graph, "latent": static_latent, "prime_out": prime_out,
         "controls": (mouse, button, scroll),
     }
 
@@ -506,6 +525,39 @@ def eager_frame(captured, rid: str, frame: int, stream: str) -> torch.Tensor:
         ).clone()
     torch.cuda.synchronize()
     captured["kv"].commit(_step(rid, frame), _ctx(rid))
+    return latent
+
+
+def replay_prime(captured, rid: str, stream: str) -> torch.Tensor:
+    """Prime one world through the captured graph. Prime always sits at frame 0.
+
+    The latent stands in for the VAE encoder's output; ``noise_for`` only has to
+    be a deterministic function of ``stream`` here, not real pixels.
+    """
+    admit_frame(captured["kv"], rid, 0, captured["attn"])
+    captured["latent"].copy_(noise_for(captured["config"], stream, 0))
+    captured["frame"].fill_(0)
+    captured["prime_graph"].replay()
+    torch.cuda.synchronize()
+    latent = captured["prime_out"].clone()
+    captured["kv"].commit(_step(rid, 0), _ctx(rid))
+    return latent
+
+
+def eager_prime(captured, rid: str, stream: str) -> torch.Tensor:
+    """The same prime through the same compiled ``_cache_pass``, uncaptured --
+    the control replay must be compared against, for the reason ``eager_frame``
+    gives."""
+    admit_frame(captured["kv"], rid, 0, captured["attn"])
+    mouse, button, scroll = captured["controls"]
+    with torch.no_grad():
+        latent = captured["dit"].append_frame(
+            noise_for(captured["config"], stream, 0),
+            torch.tensor(0, dtype=torch.int64, device=DEVICE),
+            mouse=mouse, button=button, scroll=scroll,
+        ).clone()
+    torch.cuda.synchronize()
+    captured["kv"].commit(_step(rid, 0), _ctx(rid))
     return latent
 
 
@@ -665,6 +717,110 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
         "the two rollouts are identical; an isolation leak would be invisible"
     )
     scrub(kv, "both_a", "both_b")
+
+
+# ---------------------------------------------------------------------------
+# A.6 -- the prime graph
+# ---------------------------------------------------------------------------
+
+
+def test_prime_replay_matches_the_uncaptured_prime(captured):
+    """Replaying prime writes the ring the compiled cache pass writes.
+
+    The ring *is* prime's whole product -- ``append_frame`` returns its input
+    untouched -- so a latent comparison alone would pass on a graph that did
+    nothing at all.
+    """
+    kv = captured["kv"]
+    scrub(kv, "capture")
+
+    kv.ingest_request("eager_p")
+    eager_prime(captured, "eager_p", "P")
+    eager_ring = world_snapshot(kv, kv.world_of("eager_p"))
+    scrub(kv, "eager_p")
+
+    kv.ingest_request("graph_p")
+    replay_prime(captured, "graph_p", "P")
+    graph_ring = world_snapshot(kv, kv.world_of("graph_p"))
+
+    assert_worlds_equal(eager_ring, graph_ring, "primed by replay vs uncaptured")
+    assert any(written.any() for _, written in graph_ring), (
+        "priming made nothing visible; the comparison above is between two "
+        "empty rings and would pass on a graph that never ran"
+    )
+    scrub(kv, "graph_p")
+
+    # A second, different latent must land somewhere else, or the replay is
+    # reproducing capture-time state rather than reading its input buffer.
+    kv.ingest_request("other_p")
+    replay_prime(captured, "other_p", "Q")
+    other_ring = world_snapshot(kv, kv.world_of("other_p"))
+    assert not torch.equal(graph_ring[0][0], other_ring[0][0]), (
+        "two different seed latents primed the same ring bytes"
+    )
+    scrub(kv, "other_p")
+
+
+def test_the_prime_graph_returns_its_own_static_input_buffer(captured):
+    """Prime's output aliases its input, and that is the contract downstream.
+
+    ``append_frame`` hands the settled latent straight back, so the captured
+    output is the captured input buffer. The consumer -- the VAE decoder, next
+    in the same ``Sequential`` -- must therefore copy before the following prime
+    stages over it, which it does: the engine stages every captured node's
+    inputs through ``copy_``. Pinned here so adding a ``.clone()`` to
+    ``append_frame`` is a decision and not an accident.
+    """
+    assert captured["prime_out"].data_ptr() == captured["latent"].data_ptr()
+
+    staged = noise_for(captured["config"], "R", 0)
+    captured["latent"].copy_(staged)
+    assert torch.equal(captured["prime_out"], staged), (
+        "the output view did not follow its input buffer, so it is a copy made "
+        "at capture time and every replay would return stale bytes"
+    )
+
+
+def test_prime_then_rollout_through_both_graphs_matches_eager(captured):
+    """The integration claim, and the shared-pool gate.
+
+    Priming through one graph and then rolling out through the other must be
+    bit-identical to the same sequence through the uncaptured compiled regions.
+    If the two captures aliased each other in the shared pool, the rollout would
+    read latents the prime graph had since overwritten.
+    """
+    kv = captured["kv"]
+    frames = 8
+    scrub(kv, "capture")
+
+    kv.ingest_request("eager_pr")
+    eager_prime(captured, "eager_pr", "S")
+    want = [eager_frame(captured, "eager_pr", f, "S") for f in range(1, frames + 1)]
+    want_ring = world_snapshot(kv, kv.world_of("eager_pr"))
+    scrub(kv, "eager_pr")
+
+    kv.ingest_request("graph_pr")
+    replay_prime(captured, "graph_pr", "S")
+    got = [replay_frame(captured, "graph_pr", f, "S") for f in range(1, frames + 1)]
+    got_ring = world_snapshot(kv, kv.world_of("graph_pr"))
+
+    for frame, (a, b) in enumerate(zip(want, got, strict=True), start=1):
+        assert torch.equal(a, b), (
+            f"frame {frame}: priming through the graph changed the rollout by "
+            f"{(a.float() - b.float()).abs().max().item():.3e}"
+        )
+    assert_worlds_equal(want_ring, got_ring, "primed rollout, replay vs uncaptured")
+    scrub(kv, "graph_pr")
+
+    # Without this, a prime graph that replayed nothing would pass: the rollout
+    # would simply start from an empty world in both arms.
+    kv.ingest_request("unprimed")
+    unprimed = [replay_frame(captured, "unprimed", f, "S") for f in range(1, frames + 1)]
+    assert not torch.equal(got[0], unprimed[0]), (
+        "the first rolled-out frame is the same with and without priming; the "
+        "prime graph wrote nothing the rollout could read"
+    )
+    scrub(kv, "unprimed")
 
 
 # ---------------------------------------------------------------------------
