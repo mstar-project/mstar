@@ -205,6 +205,15 @@ class ARNodeInputs(NodeInputs):
     # Tensor for single cache label, dict for multi-label
     custom_pos_ids: torch.Tensor | dict[str, torch.Tensor] | None = None
 
+    # A pure-text span is fully described by where its positions start: they
+    # run contiguously from here and every position grid advances together
+    # over it. Setting this instead of `custom_pos_ids` lets a submodule's
+    # `preprocess` build the whole batch's ids in one pass, rather than a
+    # per-request tensor to concatenate. Positions that do NOT advance
+    # together (an image's grids) cannot be described this way and still need
+    # `custom_pos_ids`, which wins if both are set.
+    text_pos_start: float | None = None
+
     @classmethod
     def collate(cls, inputs_list: list["ARNodeInputs"], stacking_method=StackingMethod.NONE):
         out = defaultdict(list)
