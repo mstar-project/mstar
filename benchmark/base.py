@@ -242,6 +242,18 @@ class Qwen3TTS(Model):
         return {RequestType.T2S}
 
 
+class Qwen3_5_Dense(Model):
+    """Qwen3-TTS CustomVoice benchmark metadata for native M* requests."""
+    def __init__(self, model_size: str = "4B"):
+        self.size = model_size
+
+    def get_hf_url(self):
+        return f"Qwen/Qwen3.5-{self.size}"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T, RequestType.I2T}
+
+
 class Pi05(Model):
     """Physical Intelligence Pi0.5 VLA model.
 
@@ -332,6 +344,7 @@ class ModelType(Enum):
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
+    QWEN3_5 = "qwen3.5"
 
     def inst(self, **kwargs) -> Model:
         if self == ModelType.BAGEL:
@@ -350,4 +363,6 @@ class ModelType(Enum):
             return WhisperLarge(**kwargs)
         if self == ModelType.HIGGS_AUDIO:
             return HiggsAudio(**kwargs)
+        if self == ModelType.QWEN3_5:
+            return Qwen3_5_Dense(**kwargs)
         raise NotImplementedError(f"Unknown model type {self}")

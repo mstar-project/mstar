@@ -12,4 +12,4 @@ node_groups:
 
 resources:
   gdn_state:
-    max_slots: 96
+    max_slots: 97
