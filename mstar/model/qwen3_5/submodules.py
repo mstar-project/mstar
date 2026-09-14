@@ -13,7 +13,6 @@ built here and threaded in as cos/sin.
 import logging
 from typing import Any
 
-import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
@@ -84,8 +83,6 @@ class LLMSubmodule(ARNodeSubmodule):
         self.config = config
         self.vision_config = vision_config
         self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
-        # Pinned staging for a step's position ids; see `_batch_position_ids`.
-        self._pos_ids_host: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -109,13 +106,6 @@ class LLMSubmodule(ARNodeSubmodule):
             return ARNodeInputs(
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
                 input_seq_len=n,
-                # `preprocess` turns these into the cos/sin static buffers, so
-                # capture needs them shaped even though the values are dummy —
-                # replay copies the real positions in. A start rather than a
-                # tensor: the runner clones this row for every padding row, and
-                # a tensor here would drop each padded step onto the slow path
-                # in `_batch_position_ids`.
-                text_pos_start=0.0,
             )
 
         return [
@@ -216,78 +206,44 @@ class LLMSubmodule(ARNodeSubmodule):
         return ARNodeInputs(
             input_seq_len=seq_len,
             input_ids=input_ids,
-            # Read by `preprocess` below rather than by the position resource —
-            # that one derives its own 1D ids from the counters. Handed over as
-            # the span's start, not a [3, seq_len] built on the device: see
-            # `_batch_position_ids`.
-            text_pos_start=start_pos,
         )
 
-    def _position_ids_host(self, total_tokens: int) -> torch.Tensor:
-        """Pinned ``[3, tokens]`` staging, grown as buckets demand.
-
-        Reusing one buffer across steps is safe because the copy out of it
-        blocks: it is free again the moment ``_batch_position_ids`` returns.
-        An asynchronous copy would be ~19us faster at a decode batch and would
-        cost a lifetime rule saying which buffer is still being read — not a
-        trade worth making for that.
-        """
-        buf = self._pos_ids_host
-        if buf is None or buf.shape[1] < total_tokens:
-            buf = torch.empty(
-                (3, max(total_tokens, 64)), dtype=torch.float, pin_memory=True,
-            )
-            self._pos_ids_host = buf
-        return buf
-
-    def _batch_position_ids(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
+    def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """``[3, total_tokens]`` for the step, in packed request order.
 
-        A pure-text span is described by its start alone — positions run
-        contiguously from it and the three MRoPE grids advance together — so
-        the batch can be written into one pinned buffer and sent over in a
-        single copy. The alternative, a ``[3, seq_len]`` built on the device
-        per request and then concatenated, is three launches and two
-        allocations per row: at a decode batch that measured ~500us a step,
-        against ~30us here.
+        The position resource already built this step's 1D positions on the
+        device as part of its own plan — the same counters, the same KV plan
+        order — and `plan` runs before `preprocess`. A pure-text step is that
+        vector broadcast across the three MRoPE grids, which advance together
+        over text: a view, so no host work and no copy of its own.
 
-        An image's grids do not advance together, so a request carrying a real
-        ``custom_pos_ids`` cannot be described by a start; a step holding one
-        falls back to the concatenation, materialising any text spans beside
-        it so a mixed batch still lines up.
+        An image's grids do NOT advance together (T is flat while H and W
+        sweep the patch grid), so a request carrying `custom_pos_ids` supplies
+        its own and the step concatenates instead, taking the resource's slice
+        for any text span beside it.
         """
-        if any(inp.custom_pos_ids is not None for inp in inputs):
-            device = self.get_device()
-            return torch.cat(
-                [
-                    inp.custom_pos_ids if inp.custom_pos_ids is not None
-                    else text_position_ids(
-                        inp.input_seq_len, inp.text_pos_start or 0.0, device,
-                    )
-                    for inp in inputs
-                ],
-                dim=1,
-            )
-
         total_tokens = sum(inp.input_seq_len for inp in inputs)
-        buf = self._position_ids_host(total_tokens)
-        host = buf.numpy()
+        pos_ids = self.node_resources[ROPE].pos_ids("main")
+        assert pos_ids is not None, (
+            "position resource has no plan for this step; `plan` must run "
+            "before `preprocess`"
+        )
+        if not any(inp.custom_pos_ids is not None for inp in inputs):
+            return pos_ids[:total_tokens].unsqueeze(0).expand(3, -1)
+
+        parts: list[torch.Tensor] = []
         offset = 0
         for inp in inputs:
             span = inp.input_seq_len
-            start = inp.text_pos_start or 0.0
-            if span == 1:
-                # the decode case: one position, the same on all three grids
-                host[:, offset] = start
+            if inp.custom_pos_ids is not None:
+                parts.append(inp.custom_pos_ids.float())
             else:
-                host[0, offset:offset + span] = (
-                    np.arange(span, dtype=np.float32) + start
+                parts.append(
+                    pos_ids[offset:offset + span].float()
+                    .unsqueeze(0).expand(3, -1)
                 )
-                host[1, offset:offset + span] = host[0, offset:offset + span]
-                host[2, offset:offset + span] = host[0, offset:offset + span]
             offset += span
-        # Blocking on purpose — see `_position_ids_host`.
-        return buf[:, :total_tokens].to(self.get_device())
+        return torch.cat(parts, dim=1)
 
     def preprocess(
         self,
@@ -303,7 +259,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 [inp.input_embeds for inp in inputs], dim=0,
             )
 
-        position_ids_3d = self._batch_position_ids(inputs)  # (3, total_tokens)
+        position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
         cos, sin = self.model.model.build_cos_sin(
             position_ids_3d, dtype=self.model.model.embed_tokens.weight.dtype,
         )
