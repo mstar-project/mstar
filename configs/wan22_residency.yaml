@@ -1,0 +1,34 @@
+# Wan2.2-TI2V-5B with the text encoder and VAEs paged in on demand.
+#
+# The validation case for `residency: on_demand`, and the one that mirrors how a
+# large composite model actually behaves: UMT5-XXL runs ONCE per request but is
+# comparable in size to the DiT, which runs every denoise step. Holding the
+# encoder resident for the whole request buys nothing; paging it should lower
+# the high-water mark by roughly its own size.
+#
+# wan22 is served eager (no torch.compile, no CUDA-graph capture), so excluding
+# on_demand nodes from capture costs nothing here.
+#
+# Measure with MSTAR_LOG_PEAK_MEM=1 and compare against configs/wan22.yaml.
+model: "wan22"
+max_seq_len: 512
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+    residency: on_demand
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+    residency: on_demand
+
+  - node_names:
+      - dit
+    ranks:
+      - 0
+    residency: resident
