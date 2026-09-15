@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Framework-owned eval wrapper: bring the candidate server up on a fixed port,
+# wait for /health, run the passed eval command, then tear the server down.
+#
+# The official accuracy/benchmark commands are pure HTTP clients; nothing else
+# starts the server for them (the agent's own server, from its turn, is gone by
+# the time the framework runs the official gate). This wrapper makes the gate
+# self-contained. Usage:  bash vibeval/serve_and_eval.sh <eval command...>
+set -uo pipefail
+
+PORT=${port}
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # the vibeval/ dir
+WS="$(cd "$HERE/.." && pwd)"                             # workspace root (has run.sh)
+
+healthy() { curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; }
+
+# Log to /tmp, never the workspace: some framework gates reject any workspace
+# mutation, and it keeps server logs out of the candidate's git history.
+SVLOG="/tmp/vibeval-server-$PORT.log"
+SVPID=""
+if ! healthy; then
+  ( cd "$WS" && exec bash run.sh "$PORT" ) >"$SVLOG" 2>&1 &
+  SVPID=$!
+fi
+cleanup() { [ -n "$SVPID" ] && kill "$SVPID" 2>/dev/null; pkill -P "$SVPID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+# Wait up to ~20 min for /health (weight load + torch.compile on first serve).
+for _ in $(seq 1 600); do
+  healthy && break
+  if [ -n "$SVPID" ] && ! kill -0 "$SVPID" 2>/dev/null; then
+    echo "serve_and_eval: server exited during startup; last server.log lines:" >&2
+    tail -60 "$HERE/server.log" >&2
+    exit 1
+  fi
+  sleep 2
+done
+
+"$@"
+rc=$?
+exit "$rc"
