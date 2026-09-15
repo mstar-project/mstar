@@ -11,7 +11,7 @@ no deepstack, so the tower returns merged embeddings and nothing else.
 
 Images arrive packed: ``pixel_values`` is ``[total_patches, patch_numel]`` and
 ``grid_thw`` gives each image's ``(t, h, w)`` patch grid. Attention is per
-image, which is what ``cu_seqlens`` marks off.
+image, which is what the per-frame segment lengths mark off.
 """
 from __future__ import annotations
 
@@ -26,20 +26,25 @@ from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
 # ----------------------------------------------------------------------------
 
 
-def vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
-    """``[num_segments + 1]`` int32 boundaries; one segment per frame.
+def vision_seq_lengths(grid: list[tuple[int, int, int]]) -> list[int]:
+    """One segment length per frame, on the host.
 
     Each frame attends to itself alone, so a ``t``-frame entry contributes
     ``t`` segments of ``h * w``.
+
+    Host-side on purpose. This used to be a device ``[num_segments + 1]``
+    cumsum that attention read back with ``.tolist()`` — once per block, so
+    24 device syncs per image, which pinned the host to the GPU for the whole
+    tower and left no launch runway at all. The grid is three ints; reading it
+    once up front costs nothing and the lengths follow by arithmetic.
     """
-    seqlens = torch.repeat_interleave(
-        grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0],
-    )
-    return F.pad(seqlens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0)
+    return [h * w for t, h, w in grid for _ in range(t)]
 
 
 def vision_position_ids(
-    grid_thw: torch.Tensor, spatial_merge_size: int,
+    grid: list[tuple[int, int, int]],
+    spatial_merge_size: int,
+    device: torch.device,
 ) -> torch.Tensor:
     """``[total_patches, 2]`` (h, w) indices in spatial-merge-block order.
 
@@ -47,9 +52,8 @@ def vision_position_ids(
     emitted block-major here and the rotary sees the same order the merger
     will consume.
     """
-    device = grid_thw.device
     out = []
-    for t, h, w in grid_thw.tolist():
+    for t, h, w in grid:
         hpos, wpos = torch.meshgrid(
             torch.arange(h, device=device),
             torch.arange(w, device=device),
@@ -83,7 +87,10 @@ def _axis_taps_weights(
 
 
 def vision_interpolation(
-    grid_thw: torch.Tensor, num_grid_per_side: int, spatial_merge_size: int,
+    grid: list[tuple[int, int, int]],
+    num_grid_per_side: int,
+    spatial_merge_size: int,
+    device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather indices and weights that resample the square learned position
     table onto each image's ``(h, w)`` grid.
@@ -92,17 +99,20 @@ def vision_interpolation(
     patch, as the outer product of the two axes' taps.
     """
     side, merge = num_grid_per_side, spatial_merge_size
-    device = grid_thw.device
 
+    grid_thw = torch.tensor(grid, dtype=torch.long, device=device)
     counts = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
     heights = torch.repeat_interleave(grid_thw[:, 1], counts)
     widths = torch.repeat_interleave(grid_thw[:, 2], counts)
     starts = torch.repeat_interleave(
         F.pad(counts.cumsum(0)[:-1], (1, 0)), counts,
     )
-    # position within one frame's flat patch run, repeating across frames
+    # position within one frame's flat patch run, repeating across frames.
+    # The total comes off the host grid rather than `counts.sum()`, which
+    # would be a device read this function has no other reason to make.
+    total_patches = sum(t * h * w for t, h, w in grid)
     within = (
-        torch.arange(int(counts.sum()), device=device) - starts
+        torch.arange(total_patches, device=device) - starts
     ) % (heights * widths)
 
     # undo the spatial-merge-block ordering to recover (row, col)
@@ -221,8 +231,8 @@ class VisionAttention(nn.Module):
 
     Not the engine's attention resource: there is no KV cache and nothing
     persists across steps, so this runs straight through SDPA. Segments are
-    split by ``cu_seqlens`` rather than masked, which keeps the cost linear in
-    patches instead of quadratic across the whole packed batch.
+    split by their per-frame lengths rather than masked, which keeps the cost
+    linear in patches instead of quadratic across the whole packed batch.
     """
 
     def __init__(self, config: Qwen3_5VisionConfig):
@@ -235,7 +245,7 @@ class VisionAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        seq_lengths: list[int],
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
@@ -255,14 +265,20 @@ class VisionAttention(nn.Module):
 
         # [1, heads, tokens, head_dim]
         q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        outs = [
-            F.scaled_dot_product_attention(qs, ks, vs, is_causal=False)
-            for qs, ks, vs in zip(
-                *(torch.split(t, lengths, dim=2) for t in (q, k, v)), strict=True,
-            )
-        ]
-        out = torch.cat(outs, dim=2)
+        if len(seq_lengths) == 1:
+            # One frame, which is every single-image request: the split and
+            # the concat below are both identities on it, and skipping them
+            # drops two kernel launches per block.
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            outs = [
+                F.scaled_dot_product_attention(qs, ks, vs, is_causal=False)
+                for qs, ks, vs in zip(
+                    *(torch.split(t, seq_lengths, dim=2) for t in (q, k, v)),
+                    strict=True,
+                )
+            ]
+            out = torch.cat(outs, dim=2)
         return self.proj(out.transpose(1, 2).reshape(seq_len, -1).contiguous())
 
 
@@ -277,12 +293,12 @@ class VisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        seq_lengths: list[int],
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), cu_seqlens, cos, sin,
+            self.norm1(hidden_states), seq_lengths, cos, sin,
         )
         return hidden_states + self.mlp(self.norm2(hidden_states))
 
@@ -313,11 +329,18 @@ class Qwen3_5VisionModel(nn.Module):
         """``[total_patches, patch_numel]`` in, ``[merged_tokens, out_hidden]``
         out — one token per ``spatial_merge_size ** 2`` block of patches."""
         merge = self.config.spatial_merge_size
+        device = pixel_values.device
+        # The one device read of the whole tower, and free when the caller
+        # hands the grid over on the host. Everything the shape maths needs
+        # is three ints per image; reading them here is what lets the 24
+        # blocks below launch without ever waiting on the GPU.
+        grid = [(int(t), int(h), int(w)) for t, h, w in grid_thw.tolist()]
+
         indices, weights = vision_interpolation(
-            grid_thw, self.config.num_grid_per_side, merge,
+            grid, self.config.num_grid_per_side, merge, device,
         )
-        position_ids = vision_position_ids(grid_thw, merge)
-        cu_seqlens = vision_cu_seqlens(grid_thw)
+        position_ids = vision_position_ids(grid, merge, device)
+        seq_lengths = vision_seq_lengths(grid)
 
         hidden = self.patch_embed(pixel_values)
         # bilinear resample of the learned table, as a weighted gather
@@ -327,5 +350,5 @@ class Qwen3_5VisionModel(nn.Module):
         cos, sin = self.rotary_pos_emb(position_ids)
         cos, sin = cos.to(hidden.dtype), sin.to(hidden.dtype)
         for block in self.blocks:
-            hidden = block(hidden, cu_seqlens, cos, sin)
+            hidden = block(hidden, seq_lengths, cos, sin)
         return self.merger(hidden)

@@ -16,6 +16,7 @@ import os
 import pytest
 import torch
 
+from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
@@ -125,38 +126,48 @@ def test_schedule_matches_the_split(model):
     }
     schedule = model._prefill_schedule(modalities, signals)
 
-    walks = [step.walk for step in schedule]
+    # An image prompt is one walk, whatever its layout: the interleaving
+    # travels as `order` rather than as a walk per span.
+    assert [step.walk for step in schedule] == ["prefill_vision"]
+    step = schedule[0]
+
     planned = [
-        "prefill_text" if s.modality == TEXT else "prefill_vision"
+        TEXT_PART if s.modality == TEXT else IMAGE_PART
         for s in prefill_plan(parts_from_modalities(modalities))
     ]
-    assert walks == planned
+    assert list(step.order) == planned
 
-    # every text step reads its own segment, in order
-    got = [
-        step.input_tensors["text_inputs"]
-        for step in schedule if step.walk == "prefill_text"
-    ]
-    assert len(got) == len(signals["text_inputs"])
-    for a, b in zip(got, signals["text_inputs"], strict=True):
-        assert a is b
-
-    # each vision step carries its own image *and* that image's grid
-    vision = [step for step in schedule if step.walk == "prefill_vision"]
-    for i, step in enumerate(vision):
-        assert step.input_tensors["pixel_values"] is signals["pixel_values"][i]
-        assert step.input_tensors["image_grid_thw"] is signals["image_grid_thw"][i]
+    # the nth tag of a kind takes the nth tensor of that kind, in order
+    for name in ("text_inputs", "pixel_values", "image_grid_thw"):
+        got = step.input_tensors[name]
+        assert len(got) == len(signals[name])
+        for a, b in zip(got, signals[name], strict=True):
+            assert a is b
 
     # the grid has to reach both halves of the walk: the encoder lays out its
-    # patches with it, the LLM places the 3D positions with it
-    for step in vision:
-        nodes = {
-            (edge.next_node, edge.name)
-            for edge in type(model)._walk_inputs(step)
-        }
-        assert ("vision_encoder", "pixel_values") in nodes
-        assert ("vision_encoder", "image_grid_thw") in nodes
-        assert ("LLM", "image_grid_thw") in nodes
+    # patches with it, the LLM places the 3D positions with it. The LLM also
+    # reads the text spans now.
+    edges = type(model)._walk_inputs(step)
+    nodes = {(edge.next_node, edge.name) for edge in edges}
+    assert ("vision_encoder", "pixel_values") in nodes
+    assert ("vision_encoder", "image_grid_thw") in nodes
+    assert ("LLM", "image_grid_thw") in nodes
+    assert ("LLM", "text_inputs") in nodes
+    # and each edge hands over every tensor of its name, not just the first
+    by_name = {edge.name: edge for edge in edges if edge.next_node == "LLM"}
+    assert len(by_name["text_inputs"].tensor_info) == len(signals["text_inputs"])
+
+
+def test_text_only_prompt_still_uses_prefill_text(model):
+    """No images, no merged walk: the plain text path is unchanged."""
+    out = model.process_prompt("just text", ["text"], ["text"], tensors={})
+    signals = {"text_inputs": list(out["text_inputs"])}
+    schedule = model._prefill_schedule(["text"], signals)
+
+    assert [s.walk for s in schedule] == ["prefill_text"] * len(schedule)
+    got = [s.input_tensors["text_inputs"][0] for s in schedule]
+    for a, b in zip(got, signals["text_inputs"], strict=True):
+        assert a is b
 
 
 def test_multi_text_layout_needs_prompt_parts(model):

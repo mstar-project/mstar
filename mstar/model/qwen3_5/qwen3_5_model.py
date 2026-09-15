@@ -108,10 +108,18 @@ class WalkInput:
     inputs: tuple[str, ...]
 
 
+# `prefill_order` tags, in prompt order. The nth tag of a kind addresses the
+# nth tensor of that kind.
+TEXT_PART, IMAGE_PART = 0, 1
+
+
 @dataclass(frozen=True)
 class PrefillStep:
     walk: str
-    input_tensors: dict[str, TensorPointerInfo]
+    # One list per name: a merged `prefill_vision` step carries every text
+    # span and every image of the prompt.
+    input_tensors: dict[str, list[TensorPointerInfo]]
+    order: tuple[int, ...] = ()
 
 
 # TODO: implement MoE variants
@@ -251,11 +259,11 @@ class Qwen3_5DenseModel(Model):
             outputs=[],
         )
 
-        # The encoder turns pixels into LLM-width embeddings, which the LLM
-        # node prefills exactly as it would token embeddings. One walk per
-        # image, scheduled between the text spans it sat between in the
-        # prompt; the KV stream is append-only, so prefilling the spans in
-        # order is what reproduces the interleaving.
+        # One walk for a whole multimodal prompt: the encoder turns every
+        # image into LLM-width embeddings, then the LLM node prefills the text
+        # spans and those embeddings as one row, spliced in prompt order off
+        # `prefill_order`. The KV stream is append-only, so one ordered
+        # concatenation reproduces the interleaving that a walk per span did.
         prefill_vision = Sequential([
             GraphNode(
                 name="vision_encoder",
@@ -268,7 +276,7 @@ class Qwen3_5DenseModel(Model):
             ),
             GraphNode(
                 name="LLM",
-                input_names=["vision_embeds", "image_grid_thw"],
+                input_names=["vision_embeds", "image_grid_thw", "text_inputs"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -424,7 +432,7 @@ class Qwen3_5DenseModel(Model):
         "prefill_text": [WalkInput("LLM", ("text_inputs",))],
         "prefill_vision": [
             WalkInput("vision_encoder", ("pixel_values", "image_grid_thw")),
-            WalkInput("LLM", ("image_grid_thw",)),
+            WalkInput("LLM", ("text_inputs", "image_grid_thw")),
         ]
     }
 
@@ -433,12 +441,14 @@ class Qwen3_5DenseModel(Model):
         input_modalities: list[str],
         signals: dict[str, list[TensorPointerInfo]],
     ) -> list[PrefillStep]:
-        """The prefill walks a request runs, in the order they were written.
+        """The prefill walks a request runs.
 
-        Walks the prefill plan, so text spans and images prefill where the
-        prompt put them and N images get N walks. `process_prompt` split
-        `text_inputs` against the same plan, so the nth span is the nth text
-        step.
+        One walk per prompt: `prefill_vision` carries the whole interleaving
+        when the request has images, `prefill_text` when it does not. The
+        layout travels as `order` rather than as a walk per span, so an image
+        prompt costs one step instead of one per span plus one per image.
+        `process_prompt` split `text_inputs` against the same plan, so the nth
+        span is the nth text tensor.
         """
         pools = {
             TEXT: signals.get("text_inputs", []),
@@ -446,7 +456,10 @@ class Qwen3_5DenseModel(Model):
         }
         grids = signals.get("image_grid_thw", [])
 
-        schedule: list[PrefillStep] = []
+        order: list[int] = []
+        picked: dict[str, list[TensorPointerInfo]] = {
+            "text_inputs": [], "pixel_values": [], "image_grid_thw": [],
+        }
         for step in prefill_plan(parts_from_modalities(input_modalities)):
             pool = pools.get(step.modality, [])
             # An image needs its grid too, and the two are built together in
@@ -466,23 +479,26 @@ class Qwen3_5DenseModel(Model):
                 )
                 continue
             if step.modality == TEXT:
-                schedule.append(
-                    PrefillStep(
-                        "prefill_text", input_tensors={
-                            "text_inputs": pool[step.index]
-                        }
-                    )
-                )
+                order.append(TEXT_PART)
+                picked["text_inputs"].append(pool[step.index])
             else:
-                schedule.append(
-                    PrefillStep(
-                        "prefill_vision", input_tensors={
-                            "pixel_values": pool[step.index],
-                            "image_grid_thw": grids[step.index]
-                        }
-                    )
-                )
-        return schedule
+                order.append(IMAGE_PART)
+                picked["pixel_values"].append(pool[step.index])
+                picked["image_grid_thw"].append(grids[step.index])
+
+        if not order:
+            return []
+        if not picked["pixel_values"]:
+            # No encoder to run, so this is the plain text walk — and it stays
+            # one step per span, exactly as before.
+            return [
+                PrefillStep("prefill_text", {"text_inputs": [t]}, (TEXT_PART,))
+                for t in picked["text_inputs"]
+            ]
+        # TODO: one walk holds every image, so a many-image prompt makes one
+        # very wide step. Cap images per walk here and emit several steps,
+        # each with its share of `order`.
+        return [PrefillStep("prefill_vision", picked, tuple(order))]
 
     def get_initial_forward_pass_args(
         self,
@@ -520,7 +536,8 @@ class Qwen3_5DenseModel(Model):
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
             step_metadata={
                 "is_prefill": True,
-                "last_prefill": len(schedule) == 1
+                "last_prefill": len(schedule) == 1,
+                "prefill_order": step.order,
             },
         )
 
@@ -530,8 +547,12 @@ class Qwen3_5DenseModel(Model):
         edges = []
         for inp in cls._WALK_INPUTS[step.walk]:
             for name in inp.inputs:
+                tensors = step.input_tensors.get(name, [])
+                if not tensors:
+                    # An image-only prompt has no text span to hand over.
+                    continue
                 edge = GraphEdge(next_node=inp.node, name=name)
-                edge.tensor_info = [step.input_tensors[name]]
+                edge.tensor_info = list(tensors)
                 edges.append(edge)
         return edges
 
@@ -549,6 +570,7 @@ class Qwen3_5DenseModel(Model):
         # only one left.
         last_prefill = len(remaining) == 1
 
+        order: tuple[int, ...] = ()
         if metadata.is_prefill and remaining:
             # Every prefill step carries its own tensors, so a text span in the
             # middle of the prompt reads its own segment. Only decode reads
@@ -556,6 +578,7 @@ class Qwen3_5DenseModel(Model):
             step = remaining.pop(0)
             metadata.graph_walk = step.walk
             inputs = self._walk_inputs(step)
+            order = step.order
         elif metadata.is_prefill:
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
@@ -579,7 +602,8 @@ class Qwen3_5DenseModel(Model):
             unpersist_tensors=sum((inp.tensor_info for inp in inputs), start=[]),
             step_metadata={
                 "is_prefill": metadata.is_prefill,
-                "last_prefill": last_prefill
+                "last_prefill": last_prefill,
+                "prefill_order": order,
             },
         )
 

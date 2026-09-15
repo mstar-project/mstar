@@ -49,6 +49,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
+from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ARNodeInputs,
@@ -72,6 +73,12 @@ class LLMSubmodule(ARNodeSubmodule):
     # concurrency the deployment actually wants. See configs/qwen3_5.yaml.
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
+    # A merged walk holds a whole prompt, so these count text as well as image
+    # tokens. They stop at 4096 rather than the processor's 16384 ceiling
+    # because the interned static buffers are sized by the largest bucket in
+    # the config; a longer prompt falls back to the eager path.
+    PREFILL_VISION_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
+
     def __init__(
         self,
         model: Qwen3_5ForCausalLM,
@@ -91,21 +98,37 @@ class LLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[CudaGraphConfig]:
-        """Decode and text prefill both capture.
+        """Decode, text prefill and vision prefill all capture.
 
         Nothing here is model-specific beyond the bucket sizes: the recurrent
         pool and the GDN resource size their plan buffers per (bucket, slot),
         so a captured walk replays without re-planning.
-
-        Vision prefill stays eager. Its token count is `t * h' * w' + 2` off
-        the image grid, which is continuous rather than bucketed, and it runs
-        once per request against a decode loop that runs hundreds of times —
-        so the buckets would mostly miss and the win would be small anyway.
         """
         def dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
                 input_seq_len=n,
+            )
+
+        def vision_dummy(n: int) -> ARNodeInputs:
+            # Embeds, not ids, from the encoder's output
+            return ARNodeInputs(
+                input_seq_len=n,
+                input_embeds=torch.zeros(
+                    (n, self.config.hidden_size),
+                    device=device, dtype=self.model.model.embed_tokens.weight.dtype,
+                ),
+                custom_pos_ids=torch.zeros(
+                    (3, n), dtype=torch.float, device=device,
+                ),
+                # `declare_step` reads these; capture only needs admit and
+                # plan to succeed on them, and replay restages the real values.
+                tensor_inputs={
+                    "mrope_advance": max(n - 2, 0),
+                    "text_token_ids": torch.zeros(
+                        n, dtype=torch.long, device=device,
+                    ),
+                },
             )
 
         return [
@@ -118,6 +141,12 @@ class LLMSubmodule(ARNodeSubmodule):
                 capture_graph_walk="prefill_text",
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 make_node_input=dummy,
+                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            ),
+            PackedCudaGraphConfig(
+                capture_graph_walk="prefill_vision",
+                capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
+                make_node_input=vision_dummy,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
         ]
@@ -144,14 +173,20 @@ class LLMSubmodule(ARNodeSubmodule):
     def _vision_inputs(
         self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
     ) -> ARNodeInputs:
-        """One image, wrapped in its sentinels, with 3D grid positions.
+        """A whole multimodal prompt as one row, spliced in prompt order.
 
-        The three MRoPE grids stop moving together across an image: T is flat
-        while H and W sweep the merged patch grid, so the span covers
-        ``max(h', w')`` positions but ``t * h' * w'`` tokens. The sentinels
-        take text positions either side, and `declare_step` tells the position
-        resource the real advance — left to its own rule it would advance by
-        the token count and put the following text in the wrong place.
+        `prefill_order` tags each part text (0) or image (1); the nth tag of a
+        kind takes the nth tensor of that kind. Text spans embed as usual;
+        each image contributes its sentinels and the encoder's slice of the
+        packed embeds.
+
+        Positions are why the two kinds cannot simply concatenate. The three
+        MRoPE grids stop moving together across an image: T is flat while H
+        and W sweep the merged patch grid, so an image spans ``max(h', w')``
+        positions but ``t * h' * w'`` tokens. The cursor advances by the real
+        amount here, and `declare_step` hands the total to the position
+        resource — left to its own rule it would advance by the token count
+        and put everything after the first image in the wrong place.
         """
         if self.vision_config is None:
             raise ValueError(
@@ -159,30 +194,64 @@ class LLMSubmodule(ARNodeSubmodule):
                 "size; this LLM submodule was built without one"
             )
         device = self.get_device()
-        embeds = inputs["vision_embeds"][0].to(device)
-        grid = inputs["image_grid_thw"][0]
-        grid = grid[0] if grid.dim() == 2 else grid
         merge = self.vision_config.spatial_merge_size
+        texts = inputs.get("text_inputs", [])
+        grids = inputs.get("image_grid_thw", [])
+        packed = inputs["vision_embeds"][0].to(device)
+        start_embed, end_embed = self._sentinel_embeds()
 
-        start_pos = self.node_resources[ROPE].position(
+        pos = self.node_resources[ROPE].position(
             rid=fwd_info.request_id, label="main",
         )
-        start_embed, end_embed = self._sentinel_embeds()
-        advance = vision_position_advance(grid, merge)
-        pos_ids = torch.cat(
-            [
-                text_position_ids(1, start_pos, device),
-                vision_position_ids(grid, merge, start_pos + 1, device),
-                text_position_ids(1, start_pos + 1 + advance, device),
-            ],
-            dim=1,
-        )
-        return ARNodeInputs(
-            input_seq_len=embeds.shape[0] + 2,
-            input_embeds=torch.cat([start_embed, embeds, end_embed], dim=0),
-            custom_pos_ids=pos_ids,
+        start_pos = pos
+        embeds: list[torch.Tensor] = []
+        pos_ids: list[torch.Tensor] = []
+        tracked: list[torch.Tensor] = []
+        text_i = image_i = 0
+        # into `packed`, which holds every image's merged tokens end to end
+        cursor = 0
+
+        for kind in fwd_info.step_metadata.get("prefill_order", ()):
+            if kind == TEXT_PART:
+                ids = texts[text_i].to(device)
+                text_i += 1
+                span = ids.shape[0]
+                embeds.append(self.model.model.embed_tokens(ids))
+                pos_ids.append(text_position_ids(span, pos, device))
+                tracked.append(ids)
+                pos += span
+                continue
+            grid = grids[image_i]
+            image_i += 1
+            grid = grid[0] if grid.dim() == 2 else grid
+            t, h, w = (int(v) for v in grid.tolist())
+            span = t * (h // merge) * (w // merge)
+            advance = vision_position_advance(grid, merge)
+            embeds += [start_embed, packed[cursor:cursor + span], end_embed]
+            pos_ids += [
+                text_position_ids(1, pos, device),
+                vision_position_ids(grid, merge, pos + 1, device),
+                text_position_ids(1, pos + 1 + advance, device),
+            ]
+            cursor += span
             # two sentinels either side, and the image between them
-            tensor_inputs={"mrope_advance": advance + 2},
+            pos += advance + 2
+
+        input_embeds = torch.cat(embeds, dim=0)
+        return ARNodeInputs(
+            input_seq_len=input_embeds.shape[0],
+            input_embeds=input_embeds,
+            custom_pos_ids=torch.cat(pos_ids, dim=1),
+            tensor_inputs={
+                "mrope_advance": pos - start_pos,
+                # Ids cannot ride `input_ids` — that is what `preprocess` keys
+                # the embeds-vs-ids branch on — so the repetition penalty
+                # takes them from here.
+                "text_token_ids": (
+                    torch.cat(tracked) if tracked
+                    else torch.zeros(0, dtype=torch.long, device=device)
+                ),
+            },
         )
 
     def prepare_inputs(
@@ -280,10 +349,17 @@ class LLMSubmodule(ARNodeSubmodule):
                 rid: inp.input_ids
                 for rid, inp in zip(request_ids, inputs, strict=True)
             }
+        elif graph_walk == "prefill_vision":
+            # The merged walk carries the prompt's text too, so its ids still
+            # have to reach the repetition penalty.
+            prefill_tokens = {
+                rid: inp.tensor_inputs["text_token_ids"]
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            }
 
         # `advance=None` means the resource's own rule, which is the span. That
-        # is right for text and wrong for an image, whose 3D grid covers fewer
-        # positions than it does tokens.
+        # is right for a pure-text walk and wrong for one holding an image,
+        # whose 3D grid covers fewer positions than it does tokens.
         advance = None
         if graph_walk == "prefill_vision":
             advance = tuple(
@@ -432,9 +508,17 @@ class LLMSubmodule(ARNodeSubmodule):
 class VisionEncoderSubmodule(NodeSubmodule):
     """Qwen3.5's ViT, which turns pixel patches into LLM-width embeddings.
 
-    Runs once per request and then idles, so it stays eager: its token count
-    is set by the image grid, which is continuous rather than bucketed, and
-    there is no cache to carry anything between calls.
+    A prompt's images go through one at a time, and the LLM node concatenates
+    what comes back. The tower would pack them — attention is per frame, so
+    images never see each other — but a grid with more than one row is a shape
+    inductor cannot codegen ("CantSplit"), and one row per call is the shape
+    that is already compiled. N is small and the tower is launch-bound.
+
+    Stays eager, and one request per step — `can_batch` is the base default.
+    Batching across requests means packing several requests' patches and
+    splitting the embeds back out; the ragged attention resource
+    (`mstar/engine/resources/attn/ragged`) is the natural backend for it, and
+    likely beats the per-segment `F.sdpa` loop even at bs=1.
     """
 
     def __init__(
@@ -451,14 +535,15 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        grid = inputs["image_grid_thw"][0]
+        # (num_images, 3). One image arrives as a bare [t, h, w], which the
+        # per-image loops in `vision.py` would read as three images.
+        grids = [
+            g.reshape(-1, 3) for g in inputs["image_grid_thw"]
+        ]
         return NodeInputs(
             tensor_inputs={
-                "pixel_values": inputs["pixel_values"][0],
-                # (num_images, 3). A single-image request arrives as a bare
-                # [t, h, w], which the per-image loops in `vision.py` would
-                # read as three images.
-                "image_grid_thw": grid.unsqueeze(0) if grid.dim() == 1 else grid,
+                "pixel_values": torch.cat(inputs["pixel_values"], dim=0),
+                "image_grid_thw": torch.cat(grids, dim=0),
             },
         )
 
@@ -482,9 +567,18 @@ class VisionEncoderSubmodule(NodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         device = self.get_device()
-        # The grid drives `.tolist()` loops and index maths inside the tower,
-        # so it has to sit beside the weights, not on the conductor's CPU copy.
-        embeds = self.model(
-            pixel_values.to(device), image_grid_thw.to(device),
-        )
-        return {"vision_embeds": [embeds]}
+        # Pixels move; the grid does not. The tower reads the grid on the host
+        # once and derives every shape from it, so handing it the conductor's
+        # CPU copy makes that read free — uploading it first would turn the
+        # tower's one `.tolist()` back into a device sync.
+        pixels = pixel_values.to(device)
+        grid = image_grid_thw.reshape(-1, 3)
+        if grid.shape[0] == 1:
+            return {"vision_embeds": [self.model(pixels, grid)]}
+        embeds, start = [], 0
+        for row in grid:
+            row = row.reshape(1, 3)
+            patches = int(row[0].prod())
+            embeds.append(self.model(pixels[start:start + patches], row))
+            start += patches
+        return {"vision_embeds": [torch.cat(embeds, dim=0)]}
