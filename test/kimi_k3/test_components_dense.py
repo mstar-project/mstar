@@ -110,3 +110,16 @@ def test_kda_params_bundle_is_cached_and_invalidated(mstar_model):
     assert layer.params() is not p3
     with torch.no_grad():
         layer.q_conv1d.weight.div_(2.0)
+
+
+def test_llm_submodule_caps_prefill_batches_only(mstar_model, tiny_dir):
+    """Prefill steps are bounded in requests (their transient memory grows with the tokens in
+    the step); decode is left to the captured graph buckets."""
+    from mstar.model.kimi_k3.submodules import KimiK3LLMSubmodule
+    cfg = KimiK3Config.from_hf_dir(tiny_dir)
+    sub = KimiK3LLMSubmodule(language_model=mstar_model, config=cfg, cuda_graphs=False)
+    assert sub.max_batch_size("prefill") == 8 and sub.max_batch_size("decode") is None
+    sub = KimiK3LLMSubmodule(language_model=mstar_model, config=cfg, cuda_graphs=False, max_prefill_batch_size=3)
+    assert sub.max_batch_size("prefill") == 3
+    sub = KimiK3LLMSubmodule(language_model=mstar_model, config=cfg, cuda_graphs=False, max_prefill_batch_size=None)
+    assert sub.max_batch_size("prefill") is None
