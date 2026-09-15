@@ -44,8 +44,12 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 
     def __init__(self, language_model: nn.Module, config: KimiK3Config, cuda_graphs: bool = True,
-                 max_capture_batch_size: int | None = None):
+                 max_capture_batch_size: int | None = None, max_prefill_batch_size: int | None = 8):
         super().__init__()
+        # prefill runs eagerly and its transient memory grows with the tokens in the step: the
+        # attention-residual stack alone is [tokens, blocks, hidden] (about 1 GB per 8k tokens at
+        # K3 width), so the scheduler is asked to split prefills beyond this many requests
+        self.max_prefill_batch_size = max_prefill_batch_size
         self.language_model = language_model
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
@@ -117,6 +121,11 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        """Requests per step: prefill is bounded (see ``max_prefill_batch_size``), decode by the
+        captured graph buckets (the engine takes the smaller cap)."""
+        return self.max_prefill_batch_size if graph_walk == "prefill" else None
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor, **kwargs,
