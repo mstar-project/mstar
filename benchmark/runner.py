@@ -522,6 +522,8 @@ def parse_args() -> BenchmarkConfig:
     # "default" uses the BAGEL-codebase transforms.
     parser.add_argument("--bagel-image-preprocess", choices=["default", "vllm"], default="vllm")
 
+    parser.add_argument("--model-id", type=str, default=None)
+
     # VBench args
     vbench = parser.add_argument_group("vbench")
     vbench.add_argument(

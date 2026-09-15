@@ -244,11 +244,15 @@ class Qwen3TTS(Model):
 
 class Qwen3_5_Dense(Model):
     """Qwen3-TTS CustomVoice benchmark metadata for native M* requests."""
-    def __init__(self, model_size: str = "4B"):
-        self.size = model_size
+
+    DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
+    def __init__(self, model_id: str | None = None):
+        if model_id is None:
+            model_id = self.DEFAULT_MODEL_ID
+        self.model_id = model_id
 
     def get_hf_url(self):
-        return f"Qwen/Qwen3.5-{self.size}"
+        return self.model_id
 
     def get_supported_modalities(self):
         return {RequestType.T2T, RequestType.I2T}
