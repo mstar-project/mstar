@@ -456,9 +456,13 @@ class PreprocessWorkerThread:
                             request_id=request_id,
                             uuid=tensor_info.uuid
                         )
+                        request_kwargs = {
+                            **(self.request_model_kwargs.get(request_id) or {}),
+                            "_mstar_request_id": request_id,
+                        }
                         postprocessed = self.model.postprocess(
                             tensor, modality,
-                            request_kwargs=self.request_model_kwargs.get(request_id),
+                            request_kwargs=request_kwargs,
                         )
 
                         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
@@ -553,6 +557,9 @@ class PreprocessWorkerThread:
                     did_work = True
                     req_id = self.cleanup_request_queue.get()
                     self.tensor_manager.cleanup_request(req_id)
+                    cleanup_postprocess = getattr(self.model, "cleanup_postprocess", None)
+                    if cleanup_postprocess is not None:
+                        cleanup_postprocess(req_id)
                     if req_id in self.tensor_uuid_to_metadata_per_request:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
                     self.request_model_kwargs.pop(req_id, None)

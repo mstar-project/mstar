@@ -77,7 +77,7 @@ uv pip install \
   "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
-Other models: `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
+Other models: `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve qwenvl` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
 
 **Python SDK** — works for every model (text, image, audio, video):
 
@@ -115,6 +115,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 |-------|--------|----------------|-----------|
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
+| [Qwen3-VL](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) | Vision-language MoE | image, text → text (single-GPU correctness baseline; TP2 not yet accepted; no video) | `/generate` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
 | [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3 Policy DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | Robot policy | text, image, video → robot actions, video | `/generate`, `/v1/images/generations`, `/v1/videos/generations` |
