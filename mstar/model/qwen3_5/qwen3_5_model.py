@@ -246,7 +246,8 @@ class Qwen3_5DenseModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # A safety bound, not the per-request budget
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 
