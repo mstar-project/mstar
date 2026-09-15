@@ -1338,10 +1338,10 @@ class Worker:
         if self._phase_period > 0:
             self._phase_buf[name].append(dt)
 
-    def _profile_step(self, graph_walk: str):
+    def _profile_step(self, graph_walk: str, batch_size: int):
         """The MSTAR_TORCH_PROFILE window around one engine step, or a no-op."""
         prof = self._step_profiler
-        return prof.step(graph_walk) if prof is not None else nullcontext()
+        return prof.step(graph_walk, batch_size) if prof is not None else nullcontext()
 
     def _execute_on_gpu_thread(
         self,
@@ -1384,7 +1384,7 @@ class Worker:
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
-            with self._span("worker.gpu_thread.exec"), self._profile_step(batch.graph_walk):
+            with self._span("worker.gpu_thread.exec"), self._profile_step(batch.graph_walk, len(batch.node_objects)):
                 outputs = engine.exec_and_postprocess(node_batch)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
