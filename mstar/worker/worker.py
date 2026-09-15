@@ -8,7 +8,7 @@ import time as _time
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
@@ -53,6 +53,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
+from mstar.utils.step_profiler import StepProfiler
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
@@ -175,6 +176,8 @@ class Worker:
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
+        # Optional torch.profiler window over engine steps (MSTAR_TORCH_PROFILE); None when unset.
+        self._step_profiler = StepProfiler.from_env(self.worker_id)
 
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
@@ -1335,6 +1338,11 @@ class Worker:
         if self._phase_period > 0:
             self._phase_buf[name].append(dt)
 
+    def _profile_step(self, graph_walk: str):
+        """The MSTAR_TORCH_PROFILE window around one engine step, or a no-op."""
+        prof = self._step_profiler
+        return prof.step(graph_walk) if prof is not None else nullcontext()
+
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1376,7 +1384,7 @@ class Worker:
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
-            with self._span("worker.gpu_thread.exec"):
+            with self._span("worker.gpu_thread.exec"), self._profile_step(batch.graph_walk):
                 outputs = engine.exec_and_postprocess(node_batch)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
