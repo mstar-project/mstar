@@ -28,7 +28,7 @@ from mstar.engine.resources import (
     StepContext,
 )
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -62,7 +62,7 @@ def _stub_transfer(monkeypatch):
 
 
 def _make_manager(max_num_pages: int = 16, cpu_offload_pages: int = 16):
-    cfg = KVConfig(
+    cfg = PagedKVConfig(
         num_layers=2,
         num_kv_heads=1,
         head_dim=4,

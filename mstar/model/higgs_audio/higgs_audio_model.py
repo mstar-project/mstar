@@ -38,9 +38,9 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -114,7 +114,7 @@ class HiggsAudioModel(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """LLM paged KV + attention/positions/sampler. audio_encoder is
         stateless: it runs once per request and holds nothing."""
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.head_dim,
