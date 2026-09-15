@@ -872,7 +872,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         for info in tensor_infos:
             uuid = info.uuid
             already_registered = self.tensor_store.is_registered(request_id, uuid)
-            if self.protocol == CommProtocol.RDMA:
+            if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
                 if already_registered:
                     continue
                 logger.debug("Registering %s for send", uuid)
@@ -910,7 +910,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if not self.tensor_store.check_uuid_presence(request_id, uuid):
             logger.warning("Trying to cleanup tensor %s, but uuid not found", uuid)
             return
-        if self.protocol == CommProtocol.RDMA \
+        if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) \
                 and self.tensor_store.is_registered(request_id, uuid):
             ret_value = self.transfer_engine.unregister_memory(
                 self.tensor_store.get_tensor(request_id, uuid).data_ptr()
@@ -961,7 +961,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     request_id, info.uuid, 2
                 )
 
-                if self.protocol == CommProtocol.RDMA:
+                if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
                     self.transfer_engine.register_memory(buffer.data_ptr(), info.nbytes)
 
                 read_info.append(TransferReadInfo(

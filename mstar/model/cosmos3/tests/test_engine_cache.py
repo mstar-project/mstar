@@ -245,6 +245,7 @@ def _forward_step(
         lease = cg_runner.lease_slot(
             graph_walk=walk,
             bs=len(real_ids),
+            slot=0,
             num_tokens=sum(inp.input_seq_len for inp in inputs),
             cg_key_info=dit.cg_key_info(walk, step_fwds),
         )
@@ -812,7 +813,7 @@ def _run_cuda_graph_denoise(ctx):
     cg_runner = CudaGraphRunner(
         submodule_name="dit", submodule=dit, resources=resources,
         step_runner=StepRunner(resources), device=dev, autocast_dtype=dtype,
-        joint_comm_group=groups,
+        joint_comm_group=groups, num_slots=1,
     )
     cg_runner.warmup_and_capture()
     assert cg_runner.any_graphs, "no CUDA graph captured for cosmos3 image_gen"
