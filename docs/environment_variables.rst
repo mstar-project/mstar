@@ -24,6 +24,15 @@ Communication
        ``0``: always pyzmq. The two transports are wire-compatible, so
        this can be set per-process while the rest of the mesh stays on
        pyzmq.
+   * - ``MSTAR_TORCH_PROFILE``
+     - unset
+     - ``<skip>:<count>[:<graph_walk>]`` makes a worker profile ``count`` engine steps of
+       ``graph_walk`` (default ``decode``) with ``torch.profiler`` after skipping the first
+       ``skip`` of them, then log one per-kernel table (CUDA time and launches per step; the
+       kernels of CUDA-graph replays are listed individually) and write a Chrome trace to
+       ``MSTAR_TORCH_PROFILE_DIR`` (default ``/tmp``). ``MSTAR_TORCH_PROFILE_RANKS`` (default
+       ``0``; comma-separated worker indices or ``all``) selects the workers. Unset, the hook is
+       a counter increment per step.
    * - ``MSTAR_SYMM_MEM_ALLREDUCE``
      - ``0``
      - ``1`` routes small tensor-parallel all-reduces (``CommGroup.all_reduce``)
