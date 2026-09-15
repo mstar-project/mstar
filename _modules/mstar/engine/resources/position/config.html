@@ -596,6 +596,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -677,7 +678,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -919,6 +919,12 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">PositionSpec</span><span class="p">(</span><span class="n">NodeResourceSpec</span><span class="p">):</span>
     <span class="n">config</span><span class="p">:</span> <span class="n">PositionConfig</span>
+
+<div class="viewcode-block" id="PositionSpec.depends_on">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.PositionSpec.depends_on">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">}</span></div>
+
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>

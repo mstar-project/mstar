@@ -596,6 +596,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -677,7 +678,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -871,6 +871,7 @@ window.runMermaid = runMermaid;</script>
  | <a href="#U"><strong>U</strong></a>
  | <a href="#V"><strong>V</strong></a>
  | <a href="#W"><strong>W</strong></a>
+ | <a href="#X"><strong>X</strong></a>
  | <a href="#Z"><strong>Z</strong></a>
  
 </div>
@@ -1235,6 +1236,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PositionConfig.block_step">(mstar.engine.resources.PositionConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.block_table">block_table (mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.APIServerMessage.body">body (mstar.api_server.request_types.APIServerMessage attribute)</a>
 
       <ul>
@@ -1401,6 +1404,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.AttentionStep.causal">(mstar.engine.resources.attn.config.AttentionStep attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DensePlan.causal">(mstar.engine.resources.attn.dense.DensePlan attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.causal">(mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.GenStepInfo.cfg">cfg (mstar.model.cosmos3.submodules.GenStepInfo attribute)</a>
@@ -1810,7 +1815,11 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DensePlan.cu_k">cu_k (mstar.engine.resources.attn.dense.DensePlan attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DensePlan.cu_q">cu_q (mstar.engine.resources.attn.dense.DensePlan attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.cu_q">(mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.cuda_graph">cuda_graph (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -1948,13 +1957,19 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.depends_on">(mstar.engine.resources.attn.flashinfer.FlashInferManager method)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.depends_on">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.depends_on">(mstar.engine.resources.base.Resource method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.CrossAttentionSpec.depends_on">(mstar.engine.resources.CrossAttentionSpec method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.NodeResourceSpec.depends_on">(mstar.engine.resources.NodeResourceSpec method)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.position.config.PositionSpec.depends_on">(mstar.engine.resources.position.config.PositionSpec method)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.depends_on">(mstar.engine.resources.position.manager.RopeManager method)</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PositionSpec.depends_on">(mstar.engine.resources.PositionSpec method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.depends_on">(mstar.engine.resources.Resource method)</a>
 </li>
@@ -2907,10 +2922,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.head_dim">(mstar.model.whisper.config.WhisperModelConfig property)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.hidden_act">hidden_act (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.hidden_size">hidden_size (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -2937,6 +2952,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PositionConfig.high_freq_factor">(mstar.engine.resources.PositionConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.host_kv_lens">host_kv_lens (mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
+</li>
   </ul></td>
 </tr></table>
 
@@ -3518,7 +3535,11 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.max_iters">max_iters (mstar.graph.base.Loop attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DensePlan.max_k">max_k (mstar.engine.resources.attn.dense.DensePlan attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.max_k">(mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.pi05.config.html#mstar.model.pi05.config.Pi05Config.max_lang_tokens">max_lang_tokens (mstar.model.pi05.config.Pi05Config attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.max_new_tokens">max_new_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
@@ -3542,7 +3563,11 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.attn.dense.html#mstar.engine.resources.attn.dense.DensePlan.max_q">max_q (mstar.engine.resources.attn.dense.DensePlan attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan.max_q">(mstar.engine.resources.attn.xpu.XPUPagedPlan attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.max_rollout_horizon">max_rollout_horizon (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig.max_segments_for">max_segments_for() (mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig method)</a>
@@ -3775,6 +3800,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.attn.wrappers.html#module-mstar.engine.resources.attn.wrappers">mstar.engine.resources.attn.wrappers</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#module-mstar.engine.resources.attn.xpu">mstar.engine.resources.attn.xpu</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#module-mstar.engine.resources.base">mstar.engine.resources.base</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.convenience.html#module-mstar.engine.resources.convenience">mstar.engine.resources.convenience</a>
@@ -3800,6 +3827,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.position.manager.html#module-mstar.engine.resources.position.manager">mstar.engine.resources.position.manager</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.position.rope.html#module-mstar.engine.resources.position.rope">mstar.engine.resources.position.rope</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.rms_norm.html#module-mstar.engine.resources.rms_norm">mstar.engine.resources.rms_norm</a>
+</li>
+        <li><a href="_autosummary/mstar.engine.resources.rms_norm.rms_norm.html#module-mstar.engine.resources.rms_norm.rms_norm">mstar.engine.resources.rms_norm.rms_norm</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.runner.html#module-mstar.engine.resources.runner">mstar.engine.resources.runner</a>
 </li>
@@ -3962,8 +3993,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.utils.adarms_norm.html#module-mstar.utils.adarms_norm">mstar.utils.adarms_norm</a>
 </li>
         <li><a href="_autosummary/mstar.utils.containers.html#module-mstar.utils.containers">mstar.utils.containers</a>
-</li>
-        <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#module-mstar.utils.flashinfer_utils">mstar.utils.flashinfer_utils</a>
 </li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#module-mstar.utils.ipc_format">mstar.utils.ipc_format</a>
 </li>
@@ -4238,6 +4267,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.engine.resources.attn.xpu
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#module-mstar.engine.resources.attn.xpu">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.engine.resources.base
 
       <ul>
@@ -4326,6 +4362,20 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.position.rope.html#module-mstar.engine.resources.position.rope">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.engine.resources.rms_norm
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.rms_norm.html#module-mstar.engine.resources.rms_norm">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.engine.resources.rms_norm.rms_norm
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.rms_norm.rms_norm.html#module-mstar.engine.resources.rms_norm.rms_norm">module</a>
 </li>
       </ul></li>
       <li>
@@ -4893,13 +4943,6 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.utils.containers.html#module-mstar.utils.containers">module</a>
-</li>
-      </ul></li>
-      <li>
-    mstar.utils.flashinfer_utils
-
-      <ul>
-        <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#module-mstar.utils.flashinfer_utils">module</a>
 </li>
       </ul></li>
       <li>
@@ -5583,6 +5626,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper.plan">(mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper method)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.plan">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
+</li>
         <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.plan">(mstar.engine.resources.base.Resource method)</a>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.plan">(mstar.engine.resources.kv.manager.KVManager method)</a>
@@ -5920,14 +5965,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.qkv_bias">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.QKVParallelLinear">QKVParallelLinear (class in mstar.model.components.distributed)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.QKVParallelLinear">(class in mstar.model.components.distributed.linear)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.attn.cross.html#mstar.engine.resources.attn.cross.QueryPacking.qo_indptr">qo_indptr (mstar.engine.resources.attn.cross.QueryPacking attribute)</a>
 
       <ul>
@@ -5935,7 +5980,11 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.qo_indptr_buf">qo_indptr_buf() (mstar.engine.resources.attn.flashinfer.FlashInferManager method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.qo_indptr_buf">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.CrossAttentionConfig.query_kv_cache">query_kv_cache (mstar.engine.resources.attn.config.CrossAttentionConfig attribute)</a>
 
       <ul>
@@ -6545,11 +6594,17 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper.run">(mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper method)</a>
 </li>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.run">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
+</li>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.run_forward">run_forward() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
 </li>
-      <li><a href="_autosummary/mstar.utils.flashinfer_utils.html#mstar.utils.flashinfer_utils.run_rms_norm">run_rms_norm() (in module mstar.utils.flashinfer_utils)</a>
+      <li><a href="_autosummary/mstar.engine.resources.rms_norm.html#mstar.engine.resources.rms_norm.run_rms_norm">run_rms_norm() (in module mstar.engine.resources.rms_norm)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.rms_norm.rms_norm.html#mstar.engine.resources.rms_norm.rms_norm.run_rms_norm">(in module mstar.engine.resources.rms_norm.rms_norm)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch.running_batched">running_batched (mstar.engine.engine.ExecutingBatch attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestComplete.rx_info">rx_info (mstar.api_server.request_types.RequestComplete attribute)</a>
@@ -6677,7 +6732,11 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.select_bucket">select_bucket() (mstar.engine.cuda_graph_runner.CudaGraphRunner method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.select_last_hidden">select_last_hidden() (mstar.engine.resources.attn.flashinfer.FlashInferManager method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.select_last_hidden">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.MessageSource.SELF">SELF (mstar.utils.ipc_format.MessageSource attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator.send">send() (mstar.communication.communicator.BaseCommunicator method)</a>
@@ -6886,10 +6945,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_window_tokens">snac_window_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Snake1d">Snake1d (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Snake1d">Snake1d (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
+</li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3SchedulerConfig.solver_order">solver_order (mstar.model.cosmos3.config.Cosmos3SchedulerConfig attribute)</a>
 
       <ul>
@@ -7821,6 +7880,24 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.write_kv">write_kv() (mstar.engine.resources.kv.manager.KVManager method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.cache.html#mstar.engine.resources.kv.cache.KVCache.write_tokens">write_tokens() (mstar.engine.resources.kv.cache.KVCache method)</a>
+</li>
+  </ul></td>
+</tr></table>
+
+<h2 id="X">X</h2>
+<table style="width: 100%" class="indextable genindextable"><tr>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.AttnBackend.XPU_PAGED">XPU_PAGED (mstar.engine.resources.attn.config.AttnBackend attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.AttnBackend.XPU_PAGED">(mstar.engine.resources.AttnBackend attribute)</a>
+</li>
+      </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager">XPUPagedAttentionManager (class in mstar.engine.resources.attn.xpu)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedPlan">XPUPagedPlan (class in mstar.engine.resources.attn.xpu)</a>
 </li>
   </ul></td>
 </tr></table>

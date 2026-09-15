@@ -32,6 +32,7 @@ mstar.engine.resources
    convenience
    kv
    position
+   rms_norm
    runner
    sampler
    spec

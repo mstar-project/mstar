@@ -596,6 +596,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -677,7 +678,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -848,7 +848,6 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""FlashInfer utility wrappers for batched paged attention.</span>
 
 <span class="sd">Provides:</span>
-<span class="sd">- flashinfer_rmsnorm: RMS norm behind a custom op</span>
 <span class="sd">- FlashInferPrefillWrapper: batched prefill with paged KV cache, optional CUDA graph mode</span>
 <span class="sd">- FlashInferDecodeWrapper: batched decode with paged KV cache, optional CUDA graph mode</span>
 
@@ -867,47 +866,6 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
-
-
-<span class="c1"># ── FlashInfer behind custom ops ────────────────────────────────────────</span>
-<span class="c1">#</span>
-<span class="c1"># Every kernel below reaches FlashInfer through a TVM-FFI call that dynamo</span>
-<span class="c1"># can't trace and that can't run on fake tensors. Called directly, each one</span>
-<span class="c1"># breaks the graph — and a break inside a decoder layer makes the layer body</span>
-<span class="c1"># its own frame, which dynamo then recompiles once per `layer_idx`. Behind an</span>
-<span class="c1"># op with a registered fake, the whole layer loop stays a single graph.</span>
-
-
-<span class="nd">@torch</span><span class="o">.</span><span class="n">library</span><span class="o">.</span><span class="n">custom_op</span><span class="p">(</span><span class="s2">"mstar::flashinfer_rmsnorm"</span><span class="p">,</span> <span class="n">mutates_args</span><span class="o">=</span><span class="p">())</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">flashinfer_rmsnorm</span><span class="p">(</span>
-    <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-    <span class="n">norm_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""RMS norm, returned in ``x``'s dtype whatever the kernel ran in."""</span>
-    <span class="kn">import</span><span class="w"> </span><span class="nn">flashinfer</span>
-
-    <span class="n">orig_dtype</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>
-    <span class="k">if</span> <span class="n">norm_dtype</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">norm_dtype</span><span class="p">)</span>
-    <span class="k">elif</span> <span class="n">torch</span><span class="o">.</span><span class="n">is_autocast_enabled</span><span class="p">():</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">get_autocast_dtype</span><span class="p">(</span><span class="s2">"cuda"</span><span class="p">))</span>
-    <span class="k">elif</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">:</span>
-        <span class="c1"># unsupported dtype; must recast</span>
-        <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">)</span>
-
-    <span class="c1"># flashinfer.norm.rmsnorm requires matching input/weight dtypes</span>
-    <span class="k">if</span> <span class="n">weight</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
-        <span class="n">weight</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">flashinfer</span><span class="o">.</span><span class="n">norm</span><span class="o">.</span><span class="n">rmsnorm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="n">eps</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span>
-
-
-<span class="nd">@flashinfer_rmsnorm</span><span class="o">.</span><span class="n">register_fake</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">_flashinfer_rmsnorm_fake</span><span class="p">(</span>
-    <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">weight</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
-    <span class="n">norm_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
-
 
 
 <div class="viewcode-block" id="FlashInferPrefillWrapper">

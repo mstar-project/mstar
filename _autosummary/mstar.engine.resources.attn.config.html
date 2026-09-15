@@ -243,6 +243,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -324,7 +325,6 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -574,6 +574,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend"><code class="docutils literal notranslate"><span class="pre">AttnBackend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend.DENSE"><code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend.FLASHINFER"><code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend.XPU_PAGED"><code class="docutils literal notranslate"><span class="pre">AttnBackend.XPU_PAGED</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.CrossAttentionConfig"><code class="docutils literal notranslate"><span class="pre">CrossAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -750,6 +751,11 @@ resource stays free of the manager and its kernels.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttnBackend.FLASHINFER">
 <span class="sig-name descname"><span class="pre">FLASHINFER</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'flashinfer'</span></span><a class="headerlink" href="#mstar.engine.resources.attn.config.AttnBackend.FLASHINFER" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttnBackend.XPU_PAGED">
+<span class="sig-name descname"><span class="pre">XPU_PAGED</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'xpu_paged'</span></span><a class="headerlink" href="#mstar.engine.resources.attn.config.AttnBackend.XPU_PAGED" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -931,6 +937,7 @@ resource stays free of the manager and its kernels.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend"><code class="docutils literal notranslate"><span class="pre">AttnBackend</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend.DENSE"><code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend.FLASHINFER"><code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttnBackend.XPU_PAGED"><code class="docutils literal notranslate"><span class="pre">AttnBackend.XPU_PAGED</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.CrossAttentionConfig"><code class="docutils literal notranslate"><span class="pre">CrossAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

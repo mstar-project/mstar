@@ -596,6 +596,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -677,7 +678,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -849,9 +849,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">``RMSNorm`` supports both the standard Llama-style normalization</span>
 <span class="sd">(``normed * weight``) and Gemma's variant (``normed * (1 + weight)``)</span>
-<span class="sd">through the ``gemma_mode`` flag. In standard mode the FlashInfer fused</span>
-<span class="sd">kernel is used; Gemma mode falls back to a fp32 manual computation that</span>
-<span class="sd">matches HF Gemma exactly.</span>
+<span class="sd">through the ``gemma_mode`` flag. Standard mode dispatches to a fused</span>
+<span class="sd">accelerator kernel when available; Gemma mode uses an fp32 computation</span>
+<span class="sd">that matches Hugging Face Gemma exactly.</span>
 
 <span class="sd">``AdaRMSNorm`` adds adaRMS conditioning (scale / shift / gate from a</span>
 <span class="sd">condition vector). Used by pi05's action expert flow-matching path; the</span>
@@ -863,7 +863,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">nn</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.flashinfer_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">run_rms_norm</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.rms_norm</span><span class="w"> </span><span class="kn">import</span> <span class="n">run_rms_norm</span>
 
 
 <div class="viewcode-block" id="RMSNorm">
@@ -877,8 +877,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        gemma_mode: if True, use ``(1 + weight)`` and a fp32 manual</span>
 <span class="sd">            implementation (matches HF Gemma exactly; the loaded</span>
 <span class="sd">            checkpoint weight is centered around zero, not one). If</span>
-<span class="sd">            False, use ``weight`` and dispatch to FlashInfer's fused</span>
-<span class="sd">            kernel.</span>
+<span class="sd">            False, use ``weight`` and dispatch to the device-appropriate</span>
+<span class="sd">            implementation.</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">,</span> <span class="n">gemma_mode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
@@ -901,9 +901,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">normed</span> <span class="o">=</span> <span class="n">x</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">variance_epsilon</span><span class="p">)</span>
             <span class="n">normed</span> <span class="o">=</span> <span class="n">normed</span> <span class="o">*</span> <span class="p">(</span><span class="mf">1.0</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span>
             <span class="k">return</span> <span class="n">normed</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span>
-        <span class="c1"># FlashInfer's rmsnorm wants 2D input — reshape/restore around the</span>
-        <span class="c1"># call so callers can pass arbitrary leading dims (e.g. the talker</span>
-        <span class="c1"># code_predictor's [bs, seq_len, hidden_size] batched path).</span>
+        <span class="c1"># Fused kernels expect 2D input. Reshape/restore so callers can pass</span>
+        <span class="c1"># arbitrary leading dims, such as [batch, sequence, hidden_size].</span>
         <span class="n">orig_shape</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">shape</span>
         <span class="n">flat</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">orig_shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
         <span class="n">out</span> <span class="o">=</span> <span class="n">run_rms_norm</span><span class="p">(</span><span class="n">flat</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">variance_epsilon</span><span class="p">)</span>

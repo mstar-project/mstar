@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>mstar.utils.flashinfer_utils &#8212; M* v0.2.0 Documentation</title>
+    <title>mstar.engine.resources.rms_norm &#8212; M* v0.2.0 Documentation</title>
   
   
   
@@ -46,12 +46,12 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.utils.flashinfer_utils';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.engine.resources.rms_norm';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.utils.ipc_format" href="mstar.utils.ipc_format.html" />
-    <link rel="prev" title="mstar.utils.containers" href="mstar.utils.containers.html" />
+    <link rel="next" title="mstar.engine.resources.rms_norm.rms_norm" href="mstar.engine.resources.rms_norm.rms_norm.html" />
+    <link rel="prev" title="mstar.engine.resources.position.rope" href="mstar.engine.resources.position.rope.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
@@ -233,16 +233,17 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.engine.html">mstar.engine</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_config.html">mstar.engine.cuda_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.cuda_graph_runner.html">mstar.engine.cuda_graph_runner</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.engine.engine.html">mstar.engine.engine</a></li>
-<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.engine.resources.html">mstar.engine.resources</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -321,10 +322,9 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.streaming.topology.html">mstar.streaming.topology</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -414,7 +414,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.utils.flashinfer_utils.rst?plain=1" target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.engine.resources.rms_norm.rst?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -431,7 +431,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.utils.flashinfer_utils.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.engine.resources.rms_norm.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -461,7 +461,7 @@
       
       
       
-      <li><a href="../_sources/_autosummary/mstar.utils.flashinfer_utils.rst" target="_blank"
+      <li><a href="../_sources/_autosummary/mstar.engine.resources.rms_norm.rst" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -544,7 +544,7 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>mstar.utils.flashinfer_utils</h1>
+    <h1>mstar.engine.resources.rms_norm</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
@@ -554,7 +554,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.rms_norm.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -566,39 +566,37 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="module-mstar.utils.flashinfer_utils">
-<span id="mstar-utils-flashinfer-utils"></span><h1>mstar.utils.flashinfer_utils<a class="headerlink" href="#module-mstar.utils.flashinfer_utils" title="Link to this heading">#</a></h1>
-<p>FlashInfer helpers used from model code.</p>
-<p>The batched paged-attention wrappers live in
-<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.attn.wrappers</span></code>.</p>
-<p class="rubric">Functions</p>
-<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
-<tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.flashinfer_utils.run_rms_norm" title="mstar.utils.flashinfer_utils.run_rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">run_rms_norm</span></code></a>(input, weight[, eps, ...])</p></td>
-<td><p>RMS norm through <code class="docutils literal notranslate"><span class="pre">mstar::flashinfer_rmsnorm</span></code>.</p></td>
-</tr>
-</tbody>
-</table>
-</div>
+  <section id="module-mstar.engine.resources.rms_norm">
+<span id="mstar-engine-resources-rms-norm"></span><h1>mstar.engine.resources.rms_norm<a class="headerlink" href="#module-mstar.engine.resources.rms_norm" title="Link to this heading">#</a></h1>
+<p>Backend-neutral RMSNorm operator.</p>
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.utils.flashinfer_utils.run_rms_norm">
-<span class="sig-prename descclassname"><span class="pre">mstar.utils.flashinfer_utils.</span></span><span class="sig-name descname"><span class="pre">run_rms_norm</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/flashinfer_utils.html#run_rms_norm"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.flashinfer_utils.run_rms_norm" title="Link to this definition">#</a></dt>
-<dd><p>RMS norm through <code class="docutils literal notranslate"><span class="pre">mstar::flashinfer_rmsnorm</span></code>.</p>
-<p>Behind an op rather than called directly: FlashInfer’s kernel is a TVM-FFI
-call dynamo can’t trace, and a break here lands inside every decoder
-layer’s <code class="docutils literal notranslate"><span class="pre">input_layernorm</span></code> — which makes the layer body a frame dynamo
-recompiles once per layer.</p>
+<dt class="sig sig-object py" id="mstar.engine.resources.rms_norm.run_rms_norm">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.rms_norm.</span></span><span class="sig-name descname"><span class="pre">run_rms_norm</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-6</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/rms_norm/rms_norm.html#run_rms_norm"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.rms_norm.run_rms_norm" title="Link to this definition">#</a></dt>
+<dd><p>Apply the backend-neutral <code class="docutils literal notranslate"><span class="pre">mstar::rms_norm</span></code> custom operator.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>input</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>rms_norm_dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
 </dd>
 </dl>
 </dd></dl>
 
+<p class="rubric">Modules</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.rms_norm.rms_norm.html#module-mstar.engine.resources.rms_norm.rms_norm" title="mstar.engine.resources.rms_norm.rms_norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm</span></code></a></p></td>
+<td><p>Backend-neutral RMSNorm custom operator.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 </section>
 
 
@@ -613,20 +611,20 @@ recompiles once per layer.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.utils.containers.html"
+       href="mstar.engine.resources.position.rope.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.utils.containers</p>
+        <p class="prev-next-title">mstar.engine.resources.position.rope</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.utils.ipc_format.html"
+       href="mstar.engine.resources.rms_norm.rms_norm.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.utils.ipc_format</p>
+        <p class="prev-next-title">mstar.engine.resources.rms_norm.rms_norm</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -648,7 +646,7 @@ recompiles once per layer.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.flashinfer_utils.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.rms_norm.run_rms_norm"><code class="docutils literal notranslate"><span class="pre">run_rms_norm()</span></code></a></li>
 </ul>
   </nav></div>
 

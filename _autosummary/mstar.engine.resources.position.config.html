@@ -243,6 +243,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4 current active"><a class="reference internal" href="mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -324,7 +325,6 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -581,6 +581,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec"><code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec.config"><code class="docutils literal notranslate"><span class="pre">PositionSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">PositionSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">PositionSpec.resource_class</span></code></a></li>
 </ul>
 </li>
@@ -760,6 +761,18 @@ without pulling FlashInfer in behind it.</p>
 <span class="sig-name descname"><span class="pre">config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.position.config.PositionConfig" title="mstar.engine.resources.position.config.PositionConfig"><span class="pre">PositionConfig</span></a></span><a class="headerlink" href="#mstar.engine.resources.position.config.PositionSpec.config" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.position.config.PositionSpec.depends_on">
+<span class="sig-name descname"><span class="pre">depends_on</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/position/config.html#PositionSpec.depends_on"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.position.config.PositionSpec.depends_on" title="Link to this definition">#</a></dt>
+<dd><p>Keys whose specs this one builds against; the engine resolves them
+into <code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.dependencies</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.position.config.PositionSpec.resource_class">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.position.config.PositionSpec.resource_class" title="Link to this definition">#</a></dt>
@@ -872,6 +885,7 @@ resource stays free of the manager and its kernels.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec"><code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec.config"><code class="docutils literal notranslate"><span class="pre">PositionSpec.config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">PositionSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.position.config.PositionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">PositionSpec.resource_class</span></code></a></li>
 </ul>
 </li>

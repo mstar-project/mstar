@@ -596,6 +596,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -677,7 +678,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -897,7 +897,14 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="n">PositionSpec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="n">PosBackend</span><span class="o">.</span><span class="n">ROPE</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">RopeManager</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+            <span class="n">kv_config</span> <span class="o">=</span> <span class="n">info</span><span class="o">.</span><span class="n">dependency</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">)</span><span class="o">.</span><span class="n">config</span>
+            <span class="k">return</span> <span class="n">RopeManager</span><span class="p">(</span>
+                <span class="n">config</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">,</span>
+                <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+                <span class="n">max_seq_len</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">max_seq_len</span><span class="p">,</span>
+                <span class="n">head_dim</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown position backend </span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 </div>
 
@@ -908,10 +915,44 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">RopeManager</span><span class="p">(</span><span class="n">PositionManager</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""rotary position on top flashinfer in-place kernels"""</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">PositionConfig</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">config</span><span class="p">:</span> <span class="n">PositionConfig</span><span class="p">,</span>
+        <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+        <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32768</span><span class="p">,</span>
+        <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>
+    <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache_key</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"xpu"</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">llama31_params</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                    <span class="s2">"Llama 3.1 RoPE scaling is not implemented for XPU"</span>
+                <span class="p">)</span>
+            <span class="n">rotary_dim</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">rotary_dim</span> <span class="ow">or</span> <span class="n">head_dim</span>
+            <span class="k">if</span> <span class="n">rotary_dim</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">"XPU RoPE needs PositionConfig.rotary_dim or the "</span>
+                    <span class="s2">"dependent KV cache's head_dim"</span>
+                <span class="p">)</span>
+            <span class="n">cache_dtype</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">rope_dtype</span> <span class="ow">or</span> <span class="n">dtype</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache_key</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="n">rotary_dim</span><span class="p">,</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">rope_scale</span><span class="p">,</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">rope_theta</span><span class="p">,</span>
+                <span class="n">cache_dtype</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_rope_cache</span><span class="p">(</span>
+                <span class="n">rotary_dim</span><span class="p">,</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">rope_scale</span><span class="p">,</span>
+                <span class="n">config</span><span class="o">.</span><span class="n">rope_theta</span><span class="p">,</span>
+                <span class="n">cache_dtype</span><span class="p">,</span>
+            <span class="p">)</span>
 
         <span class="c1"># rid -&gt; label -&gt; next pos of stream</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -1179,6 +1220,37 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_pos_ids</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span></div>
 
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_build_rope_cache</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">rotary_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">rope_scale</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+        <span class="n">rope_theta</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+        <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="n">positions</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_max_seq_len</span><span class="p">,</span>
+                <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="o">/</span> <span class="n">rope_scale</span>
+        <span class="p">)</span>
+        <span class="n">inv_freq</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span>
+            <span class="n">rope_theta</span>
+            <span class="o">**</span> <span class="p">(</span>
+                <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span>
+                    <span class="mi">0</span><span class="p">,</span>
+                    <span class="n">rotary_dim</span><span class="p">,</span>
+                    <span class="mi">2</span><span class="p">,</span>
+                    <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="o">/</span> <span class="n">rotary_dim</span>
+            <span class="p">)</span>
+        <span class="p">)</span>
+        <span class="n">freqs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">outer</span><span class="p">(</span><span class="n">positions</span><span class="p">,</span> <span class="n">inv_freq</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">freqs</span><span class="o">.</span><span class="n">cos</span><span class="p">(),</span> <span class="n">freqs</span><span class="o">.</span><span class="n">sin</span><span class="p">()),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+
 <div class="viewcode-block" id="RopeManager.apply_qk">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.apply_qk">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">apply_qk</span><span class="p">(</span>
@@ -1211,12 +1283,46 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"low_freq_factor"</span><span class="p">,</span> <span class="s2">"high_freq_factor"</span><span class="p">,</span> <span class="s2">"old_context_len"</span><span class="p">)</span>
         <span class="p">}</span> <span class="ow">or</span> <span class="n">config</span><span class="o">.</span><span class="n">llama31_params</span>
 
+        <span class="n">rotary_dim</span> <span class="o">=</span> <span class="n">rotary_dim</span> <span class="k">if</span> <span class="n">rotary_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">rotary_dim</span>
+        <span class="n">interleave</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">interleave</span> <span class="k">if</span> <span class="n">interleave</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">interleave</span>
+        <span class="p">)</span>
+        <span class="n">rope_scale</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">rope_scale</span> <span class="k">if</span> <span class="n">rope_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">rope_scale</span>
+        <span class="p">)</span>
+        <span class="n">rope_theta</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">rope_theta</span> <span class="k">if</span> <span class="n">rope_theta</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">rope_theta</span>
+        <span class="p">)</span>
+
+        <span class="n">cos_sin_cache</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">kernel_pos_ids</span> <span class="o">=</span> <span class="n">pos_ids</span><span class="p">[:</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span>
+        <span class="k">if</span> <span class="n">q</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"xpu"</span><span class="p">:</span>
+            <span class="n">rotary_dim</span> <span class="o">=</span> <span class="n">rotary_dim</span> <span class="ow">or</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+            <span class="n">cache_key</span> <span class="o">=</span> <span class="p">(</span><span class="n">rotary_dim</span><span class="p">,</span> <span class="n">rope_scale</span><span class="p">,</span> <span class="n">rope_theta</span><span class="p">,</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">cache_key</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache_key</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="s2">"RoPE runtime arguments do not match the cache built "</span>
+                    <span class="sa">f</span><span class="s2">"from PositionConfig: runtime=</span><span class="si">{</span><span class="n">cache_key</span><span class="si">}</span><span class="s2">, "</span>
+                    <span class="sa">f</span><span class="s2">"configured=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache_key</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="n">cos_sin_cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_rope_cache</span>
+            <span class="k">assert</span> <span class="n">cos_sin_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="c1"># vllm-xpu-kernels requires int64 position IDs. Normalize only at</span>
+            <span class="c1"># this backend boundary so position planning and CUDA stay</span>
+            <span class="c1"># unchanged.</span>
+            <span class="n">kernel_pos_ids</span> <span class="o">=</span> <span class="n">kernel_pos_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+                <span class="n">device</span><span class="o">=</span><span class="n">q</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span>
+            <span class="p">)</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">mstar</span><span class="o">.</span><span class="n">rope_apply_qk_inplace</span><span class="p">(</span>
-            <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">pos_ids</span><span class="p">[:</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]],</span>
-            <span class="n">rotary_dim</span> <span class="k">if</span> <span class="n">rotary_dim</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">rotary_dim</span><span class="p">,</span>
-            <span class="n">interleave</span> <span class="k">if</span> <span class="n">interleave</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">interleave</span><span class="p">,</span>
-            <span class="n">rope_scale</span> <span class="k">if</span> <span class="n">rope_scale</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">rope_scale</span><span class="p">,</span>
-            <span class="n">rope_theta</span> <span class="k">if</span> <span class="n">rope_theta</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">config</span><span class="o">.</span><span class="n">rope_theta</span><span class="p">,</span>
+            <span class="n">q</span><span class="p">,</span>
+            <span class="n">k</span><span class="p">,</span>
+            <span class="n">kernel_pos_ids</span><span class="p">,</span>
+            <span class="n">cos_sin_cache</span><span class="p">,</span>
+            <span class="n">rotary_dim</span><span class="p">,</span>
+            <span class="n">interleave</span><span class="p">,</span>
+            <span class="n">rope_scale</span><span class="p">,</span>
+            <span class="n">rope_theta</span><span class="p">,</span>
             <span class="o">**</span><span class="n">llama31_params</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">return</span> <span class="n">q</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">),</span> <span class="n">k</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span></div>

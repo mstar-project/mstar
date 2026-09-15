@@ -34,4 +34,5 @@ mstar.engine.resources.attn
    flashinfer
    ragged
    wrappers
+   xpu
 

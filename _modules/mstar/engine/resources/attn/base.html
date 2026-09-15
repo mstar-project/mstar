@@ -596,6 +596,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.convenience.html">mstar.engine.resources.convenience</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
@@ -677,7 +678,6 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.flashinfer_utils.html">mstar.utils.flashinfer_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
@@ -920,6 +920,27 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">dtype</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">kv_dtype</span><span class="p">,</span>
                 <span class="n">kv_config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">,</span>
                 <span class="n">backend</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">flashinfer_backend</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="n">AttnBackend</span><span class="o">.</span><span class="n">XPU_PAGED</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.xpu</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+                <span class="n">XPUPagedAttentionManager</span><span class="p">,</span>
+                <span class="n">_xpu_paged_unavailable_reason</span><span class="p">,</span>
+            <span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"xpu"</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="s2">"attention backend 'xpu_paged' requires an XPU device; "</span>
+                    <span class="sa">f</span><span class="s2">"got </span><span class="si">{</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="n">reason</span> <span class="o">=</span> <span class="n">_xpu_paged_unavailable_reason</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">reason</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="s2">"attention backend 'xpu_paged' requires a working "</span>
+                    <span class="sa">f</span><span class="s2">"vllm-xpu-kernels installation (</span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">)"</span>
+                <span class="p">)</span>
+            <span class="k">return</span> <span class="n">XPUPagedAttentionManager</span><span class="p">(</span>
+                <span class="n">kv_cache</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">,</span>
+                <span class="n">device</span><span class="o">=</span><span class="n">info</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown attention backend </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span></div>
 
