@@ -1126,7 +1126,11 @@ class Worker:
                 request_id, outputs.persist
             )
 
-        if outputs.new_token_outputs:
+        # Only the first TP rank counts new tokens: the conductor reads the counts
+        # from the rank-0 WORKER_GRAPHS_DONE alone, and followers never register the
+        # emit-to-client tensors these edges point at (the leader emits them), so
+        # looking them up on a follower raises KeyError.
+        if outputs.new_token_outputs and outputs.is_first_tp_rank:
             name_to_count: dict[str, int] = {}
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_count:
