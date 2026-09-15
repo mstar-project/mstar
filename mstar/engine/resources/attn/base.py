@@ -70,6 +70,27 @@ class AttentionManager(AttentionResource):
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
             )
+        if backend == AttnBackend.XPU_PAGED:
+            from mstar.engine.resources.attn.xpu import (
+                XPUPagedAttentionManager,
+                _xpu_paged_unavailable_reason,
+            )
+
+            if info.device.type != "xpu":
+                raise RuntimeError(
+                    "attention backend 'xpu_paged' requires an XPU device; "
+                    f"got {info.device}"
+                )
+            reason = _xpu_paged_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(
+                    "attention backend 'xpu_paged' requires a working "
+                    f"vllm-xpu-kernels installation ({reason})"
+                )
+            return XPUPagedAttentionManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+            )
         raise ValueError(f"Unknown attention backend {backend!r}")
 
     @property
