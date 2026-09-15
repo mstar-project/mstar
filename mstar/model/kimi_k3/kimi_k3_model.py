@@ -75,6 +75,9 @@ class KimiK3Model(Model):
         self.moe_backend = str(kwargs.get("moe_backend", "auto"))
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
+        # requests per prefill step (the scheduler splits larger groups); None lifts the cap
+        pre = kwargs.get("max_prefill_batch_size", 8)
+        self.max_prefill_batch_size = int(pre) if pre is not None else None
         self.tokenizer = KimiK3Tokenizer(self.local_dir)
         self.config.stop_token_ids = frozenset({self.tokenizer.eos_id, self.tokenizer.eot_id})
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -266,7 +269,8 @@ class KimiK3Model(Model):
             self.config.text.kv_lora_rank, self.config.text.qk_rope_head_dim
         )
         submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config, cuda_graphs=graph_safe,
-                                       max_capture_batch_size=self.max_capture_batch_size)
+                                       max_capture_batch_size=self.max_capture_batch_size,
+                                       max_prefill_batch_size=self.max_prefill_batch_size)
         self._submodule_cache[node_name] = submodule
         logger.info("Loaded Kimi K3 %s on %s", node_name, device)
         return submodule
