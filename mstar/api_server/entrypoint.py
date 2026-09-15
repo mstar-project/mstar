@@ -65,6 +65,12 @@ def _conductor_process_target(
     tcp_transfer_device=""
 ):
     """Runs DummyConductor.run() in a spawned process."""
+    # The api_server escalates from SIGINT to terminate(): make SIGTERM unwind the
+    # interpreter so the conductor's atexit shutdown still terminates its workers, and
+    # do not outlive the api_server either (a killed server used to leave the whole
+    # worker tree resident on the GPUs).
+    graceful_sigterm()
+    die_with_parent(signal.SIGTERM)
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -702,6 +708,7 @@ api_server: APIServer | None = None
 # The router resolves the loaded model's adapter lazily per request, so models
 # without an adapter simply return a 404 there and keep working via /generate.
 from mstar.api_server.openai.router import router as openai_router  # noqa: E402
+from mstar.utils.procs import die_with_parent, graceful_sigterm
 
 app.include_router(openai_router)
 
