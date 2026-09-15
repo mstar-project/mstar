@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1202,7 +1202,11 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelAttention.bind_resources">(mstar.model.components.distributed.attention.ParallelAttention method)</a>
 </li>
+        <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_resources">(mstar.model.components.distributed.attention.ParallelCrossAttention method)</a>
+</li>
         <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelAttention.bind_resources">(mstar.model.components.distributed.ParallelAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelCrossAttention.bind_resources">(mstar.model.components.distributed.ParallelCrossAttention method)</a>
 </li>
         <li><a href="_autosummary/mstar.model.vjepa2.components.ac_predictor.html#mstar.model.vjepa2.components.ac_predictor.ACRoPEAttention.bind_resources">(mstar.model.vjepa2.components.ac_predictor.ACRoPEAttention method)</a>
 </li>
@@ -1213,6 +1217,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.components.attention.html#mstar.model.components.attention.CrossAttention.bind_step">(mstar.model.components.attention.CrossAttention method)</a>
 </li>
         <li><a href="_autosummary/mstar.model.components.html#mstar.model.components.CrossAttention.bind_step">(mstar.model.components.CrossAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_step">(mstar.model.components.distributed.attention.ParallelCrossAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelCrossAttention.bind_step">(mstar.model.components.distributed.ParallelCrossAttention method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.position.config.PosScheme.BLOCK">BLOCK (mstar.engine.resources.position.config.PosScheme attribute)</a>
@@ -1235,6 +1243,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessage.body">(mstar.utils.ipc_format.WorkerMessage attribute)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.PiecewiseCaptureShape.bs">bs (mstar.engine.cuda_graph_config.PiecewiseCaptureShape attribute)</a>
 
       <ul>
@@ -1249,8 +1259,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey.bs">(mstar.engine.resources.step.BucketKey attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseGraphData.bucket">bucket (mstar.engine.cuda_graph_runner.PiecewiseGraphData attribute)</a>
 
       <ul>
@@ -1587,10 +1595,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.complete">complete() (mstar.graph.base.GraphNode method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.complete_iter">complete_iter() (mstar.graph.base.Loop method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.PartitionState.completed_worker_graph_ids">completed_worker_graph_ids (mstar.conductor.request_info.PartitionState attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch.completion_event">completion_event (mstar.engine.engine.ExecutingBatch attribute)</a>
@@ -1599,6 +1607,10 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.model.components.html#mstar.model.components.CrossAttention.compute_kv">(mstar.model.components.CrossAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelCrossAttention.compute_kv">(mstar.model.components.distributed.attention.ParallelCrossAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelCrossAttention.compute_kv">(mstar.model.components.distributed.ParallelCrossAttention method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.MessageSource.CONDUCTOR">CONDUCTOR (mstar.utils.ipc_format.MessageSource attribute)</a>
@@ -2282,6 +2294,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelAttention.forward">(mstar.model.components.distributed.attention.ParallelAttention method)</a>
 </li>
+        <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelCrossAttention.forward">(mstar.model.components.distributed.attention.ParallelCrossAttention method)</a>
+</li>
         <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ColumnParallelLinear.forward">(mstar.model.components.distributed.ColumnParallelLinear method)</a>
 </li>
         <li><a href="_autosummary/mstar.model.components.distributed.embedding.html#mstar.model.components.distributed.embedding.VocabParallelEmbedding.forward">(mstar.model.components.distributed.embedding.VocabParallelEmbedding method)</a>
@@ -2295,6 +2309,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.components.distributed.mlp.html#mstar.model.components.distributed.mlp.ParallelGatedMLPUnfused.forward">(mstar.model.components.distributed.mlp.ParallelGatedMLPUnfused method)</a>
 </li>
         <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelAttention.forward">(mstar.model.components.distributed.ParallelAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelCrossAttention.forward">(mstar.model.components.distributed.ParallelCrossAttention method)</a>
 </li>
         <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelGatedMLP.forward">(mstar.model.components.distributed.ParallelGatedMLP method)</a>
 </li>
@@ -3191,6 +3207,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.cache.html#mstar.engine.resources.kv.cache.KVCache">KVCache (class in mstar.engine.resources.kv.cache)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.KVColumnParallelLinear">KVColumnParallelLinear (class in mstar.model.components.distributed.linear)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.KVConfig">KVConfig (class in mstar.engine.resources)</a>
 
       <ul>
@@ -3203,10 +3221,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVLayout">(class in mstar.engine.resources.kv.config)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager">KVManager (class in mstar.engine.resources.kv.manager)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager">KVManager (class in mstar.engine.resources.kv.manager)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutput">KVPlanOutput (class in mstar.engine.resources.kv.plan)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.KVPlanOutputs">KVPlanOutputs (class in mstar.engine.resources.kv.plan)</a>
@@ -5408,6 +5426,12 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelAttention">(class in mstar.model.components.distributed.attention)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelCrossAttention">ParallelCrossAttention (class in mstar.model.components.distributed)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelCrossAttention">(class in mstar.model.components.distributed.attention)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelGatedMLP">ParallelGatedMLP (class in mstar.model.components.distributed)</a>
 
       <ul>
@@ -5592,14 +5616,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_waiting_edge">pop_waiting_edge() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.position.config.PositionStep.pos_ids">pos_ids (mstar.engine.resources.position.config.PositionStep attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PositionStep.pos_ids">(mstar.engine.resources.PositionStep attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.pos_ids">pos_ids() (mstar.engine.resources.position.manager.RopeManager method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PosBackend">PosBackend (class in mstar.engine.resources)</a>
@@ -6703,6 +6727,10 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.model.components.html#mstar.model.components.CrossAttention.set_layer_idx">(mstar.model.components.CrossAttention method)</a>
 </li>
+        <li><a href="_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.attention.ParallelCrossAttention.set_layer_idx">(mstar.model.components.distributed.attention.ParallelCrossAttention method)</a>
+</li>
+        <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ParallelCrossAttention.set_layer_idx">(mstar.model.components.distributed.ParallelCrossAttention method)</a>
+</li>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorStore.set_metadata">set_metadata() (mstar.communication.tensors.TensorStore method)</a>
 </li>
@@ -6860,14 +6888,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Snake1d">Snake1d (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3SchedulerConfig.solver_order">solver_order (mstar.model.cosmos3.config.Cosmos3SchedulerConfig attribute)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3SchedulerConfig.solver_order">(mstar.model.cosmos3.Cosmos3SchedulerConfig attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3SchedulerConfig.solver_type">solver_type (mstar.model.cosmos3.config.Cosmos3SchedulerConfig attribute)</a>
 
       <ul>
@@ -7721,6 +7749,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.ColumnParallelLinear.weight_loader">(mstar.model.components.distributed.linear.ColumnParallelLinear method)</a>
 </li>
+        <li><a href="_autosummary/mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.KVColumnParallelLinear.weight_loader">(mstar.model.components.distributed.linear.KVColumnParallelLinear method)</a>
+</li>
         <li><a href="_autosummary/mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.MergedColumnParallelLinear.weight_loader">(mstar.model.components.distributed.linear.MergedColumnParallelLinear method)</a>
 </li>
         <li><a href="_autosummary/mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.QKVParallelLinear.weight_loader">(mstar.model.components.distributed.linear.QKVParallelLinear method)</a>
@@ -7860,7 +7890,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 14, 2026.
+  Last updated on Sep 15, 2026.
   <br/>
 </p>
   </div>

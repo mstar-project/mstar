@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -875,7 +875,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">nn</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.attention</span><span class="w"> </span><span class="kn">import</span> <span class="n">Attention</span><span class="p">,</span> <span class="n">CrossAttention</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">CommGroup</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.distributed.attention</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParallelAttention</span><span class="p">,</span> <span class="n">ParallelCrossAttention</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.whisper.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">ATTN</span><span class="p">,</span>
     <span class="n">CONTEXT_LABEL</span><span class="p">,</span>
@@ -889,10 +890,11 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="WhisperDecoderLayer">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.whisper.components.decoder.html#mstar.model.whisper.components.decoder.WhisperDecoderLayer">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">WhisperDecoderLayer</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">WhisperModelConfig</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">WhisperModelConfig</span><span class="p">,</span> <span class="n">comm_group</span><span class="p">:</span> <span class="n">CommGroup</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">self_attn_layer_norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">self_attn</span> <span class="o">=</span> <span class="n">Attention</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">self_attn</span> <span class="o">=</span> <span class="n">ParallelAttention</span><span class="p">(</span>
+            <span class="n">comm_group</span><span class="o">=</span><span class="n">comm_group</span><span class="p">,</span>
             <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">,</span>
             <span class="n">num_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">decoder_attention_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">decoder_attention_heads</span><span class="p">,</span>
@@ -906,12 +908,14 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">encoder_attn_layer_norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">)</span>
         <span class="c1"># Whisper's bias layout is the shared default (q/v/o biased, k not).</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">encoder_attn</span> <span class="o">=</span> <span class="n">CrossAttention</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">encoder_attn</span> <span class="o">=</span> <span class="n">ParallelCrossAttention</span><span class="p">(</span>
+            <span class="n">comm_group</span><span class="o">=</span><span class="n">comm_group</span><span class="p">,</span>
             <span class="n">hidden_size</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">,</span>
             <span class="n">num_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">decoder_attention_heads</span><span class="p">,</span>
             <span class="n">head_dim</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
             <span class="n">cross_key</span><span class="o">=</span><span class="n">CROSS_ATTN</span><span class="p">,</span>
             <span class="n">context_kv_key</span><span class="o">=</span><span class="n">CROSS_KV_CACHE</span><span class="p">,</span>
+            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">decoder_attention_heads</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">final_layer_norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">fc1</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">decoder_ffn_dim</span><span class="p">)</span>
@@ -941,24 +945,26 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">WhisperDecoderModel</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Decoder stack; parameter paths mirror HF's ``model.decoder.*``."""</span>
 
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">WhisperModelConfig</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">WhisperModelConfig</span><span class="p">,</span> <span class="n">comm_group</span><span class="p">:</span> <span class="n">CommGroup</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span> <span class="o">=</span> <span class="n">config</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embed_tokens</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Embedding</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">embed_positions</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Embedding</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">max_target_positions</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layers</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">ModuleList</span><span class="p">(</span>
-            <span class="p">[</span><span class="n">WhisperDecoderLayer</span><span class="p">(</span><span class="n">config</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">decoder_layers</span><span class="p">)]</span>
+            <span class="p">[</span><span class="n">WhisperDecoderLayer</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">comm_group</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">decoder_layers</span><span class="p">)]</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">layer_norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">d_model</span><span class="p">)</span>
 
 <div class="viewcode-block" id="WhisperDecoderModel.zero_missing_biases">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.model.whisper.components.decoder.html#mstar.model.whisper.components.decoder.WhisperDecoderModel.zero_missing_biases">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">zero_missing_biases</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Zero the self-attn ``k_proj`` biases absent from the HF checkpoint</span>
-<span class="sd">        (allocated because the shared ``Attention`` has one qkv_bias flag)."""</span>
+<span class="w">        </span><span class="sd">"""Zero the fused K-bias slice absent from the HF checkpoint."""</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
             <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
-                <span class="n">layer</span><span class="o">.</span><span class="n">self_attn</span><span class="o">.</span><span class="n">k_proj</span><span class="o">.</span><span class="n">bias</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span></div>
+                <span class="n">attn</span> <span class="o">=</span> <span class="n">layer</span><span class="o">.</span><span class="n">self_attn</span>
+                <span class="n">q_size</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">head_dim</span>
+                <span class="n">k_size</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">*</span> <span class="n">attn</span><span class="o">.</span><span class="n">head_dim</span>
+                <span class="n">attn</span><span class="o">.</span><span class="n">qkv_proj</span><span class="o">.</span><span class="n">bias</span><span class="p">[</span><span class="n">q_size</span><span class="p">:</span><span class="n">q_size</span> <span class="o">+</span> <span class="n">k_size</span><span class="p">]</span><span class="o">.</span><span class="n">zero_</span><span class="p">()</span></div>
 
 
 <div class="viewcode-block" id="WhisperDecoderModel.embed">
@@ -1074,7 +1080,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 14, 2026.
+  Last updated on Sep 15, 2026.
   <br/>
 </p>
   </div>

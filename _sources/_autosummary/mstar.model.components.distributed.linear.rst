@@ -18,6 +18,7 @@ mstar.model.components.distributed.linear
    .. autosummary::
    
       ColumnParallelLinear
+      KVColumnParallelLinear
       MergedColumnParallelLinear
       QKVParallelLinear
       RowParallelLinear

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -559,6 +559,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelAttention.forward"><code class="docutils literal notranslate"><span class="pre">ParallelAttention.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_resources"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.bind_resources()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_step"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.bind_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.compute_kv"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.compute_kv()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.forward"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.set_layer_idx()</span></code></a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -572,7 +580,7 @@
                   
   <section id="module-mstar.model.components.distributed.attention">
 <span id="mstar-model-components-distributed-attention"></span><h1>mstar.model.components.distributed.attention<a class="headerlink" href="#module-mstar.model.components.distributed.attention" title="Link to this heading">#</a></h1>
-<p>TP-aware multi-head attention.</p>
+<p>TP-aware self- and cross-attention.</p>
 <p>Mirrors <code class="docutils literal notranslate"><span class="pre">mstar.model.components.Attention</span></code> but with the QKV projection
 sharded across heads via <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code> and the output projection
 all-reduced via <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code>. QK-norm (if enabled) and RoPE
@@ -597,6 +605,9 @@ world size (tp * sp).</p></li>
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.distributed.attention.ParallelAttention" title="mstar.model.components.distributed.attention.ParallelAttention"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ParallelAttention</span></code></a>(*[, comm_group, qkv_bias, ...])</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.distributed.attention.ParallelCrossAttention" title="mstar.model.components.distributed.attention.ParallelCrossAttention"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ParallelCrossAttention</span></code></a>(*[, comm_group, ...])</p></td>
+<td><p>Cross-attention split across tensor-parallel ranks.</p></td>
 </tr>
 </tbody>
 </table>
@@ -661,6 +672,105 @@ world size (tp * sp).</p></li>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.attention.ParallelCrossAttention">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.attention.</span></span><span class="sig-name descname"><span class="pre">ParallelCrossAttention</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">q_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">v_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">o_bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">source</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'default'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cross_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">context_kv_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/attention.html#ParallelCrossAttention"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.attention.ParallelCrossAttention" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
+<p>Cross-attention split across tensor-parallel ranks.</p>
+<p>Each rank handles a subset of attention heads, then the output projection
+combines their contributions with an all-reduce.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>comm_group</strong> (<em>CommGroup</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>q_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>k_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>v_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>o_bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>source</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>cross_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>context_kv_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.attention.ParallelCrossAttention.bind_resources">
+<span class="sig-name descname"><span class="pre">bind_resources</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">resources</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/attention.html#ParallelCrossAttention.bind_resources"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_resources" title="Link to this definition">#</a></dt>
+<dd><p>Resolve this source’s cross-attention resource and the cache
+holding its context. See <code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>resources</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.attention.ParallelCrossAttention.bind_step">
+<span class="sig-name descname"><span class="pre">bind_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/attention.html#ParallelCrossAttention.bind_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_step" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.attention.ParallelCrossAttention.compute_kv">
+<span class="sig-name descname"><span class="pre">compute_kv</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">encoder_states</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/attention.html#ParallelCrossAttention.compute_kv"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.compute_kv" title="Link to this definition">#</a></dt>
+<dd><p>Project the encoder context to K/V for the cross-attention pool.</p>
+<p><code class="docutils literal notranslate"><span class="pre">(enc_len,</span> <span class="pre">hidden)</span> <span class="pre">-&gt;</span> <span class="pre">(k,</span> <span class="pre">v)</span></code>, each <code class="docutils literal notranslate"><span class="pre">(enc_len,</span> <span class="pre">num_kv_heads,</span> <span class="pre">head_dim)</span></code>.
+Override to reshape for a model-specific pool layout.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>encoder_states</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.attention.ParallelCrossAttention.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/attention.html#ParallelCrossAttention.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.forward" title="Link to this definition">#</a></dt>
+<dd><p>Label and layer index come off the resources’ cursors; see
+<code class="docutils literal notranslate"><span class="pre">Attention.forward</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>hidden_states</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.attention.ParallelCrossAttention.set_layer_idx">
+<span class="sig-name descname"><span class="pre">set_layer_idx</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layer_idx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/attention.html#ParallelCrossAttention.set_layer_idx"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.set_layer_idx" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>layer_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -715,6 +825,14 @@ world size (tp * sp).</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelAttention.forward"><code class="docutils literal notranslate"><span class="pre">ParallelAttention.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_resources"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.bind_resources()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.bind_step"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.bind_step()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.compute_kv"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.compute_kv()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.forward"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.attention.ParallelCrossAttention.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention.set_layer_idx()</span></code></a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -748,7 +866,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 14, 2026.
+  Last updated on Sep 15, 2026.
   <br/>
 </p>
   </div>

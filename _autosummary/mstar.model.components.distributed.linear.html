@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -559,6 +559,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.ColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.KVColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.KVColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear.weight_loader()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.MergedColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.MergedColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
@@ -591,13 +595,16 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.ColumnParallelLinear" title="mstar.model.components.distributed.linear.ColumnParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code></a>(comm_group, input_size, ...)</p></td>
 <td><p>Linear layer with column parallelism.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.MergedColumnParallelLinear" title="mstar.model.components.distributed.linear.MergedColumnParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code></a>(comm_group, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.KVColumnParallelLinear" title="mstar.model.components.distributed.linear.KVColumnParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KVColumnParallelLinear</span></code></a>(comm_group, ...[, ...])</p></td>
+<td><p>One K or V projection, sharded by head, replicated when heads run out.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.MergedColumnParallelLinear" title="mstar.model.components.distributed.linear.MergedColumnParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code></a>(comm_group, ...)</p></td>
 <td><p>Packed linear layers with column parallelism.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.QKVParallelLinear" title="mstar.model.components.distributed.linear.QKVParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code></a>(comm_group, hidden_size, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.QKVParallelLinear" title="mstar.model.components.distributed.linear.QKVParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code></a>(comm_group, hidden_size, ...)</p></td>
 <td><p>Linear layers for the attention's QKV transformation.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.RowParallelLinear" title="mstar.model.components.distributed.linear.RowParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RowParallelLinear</span></code></a>(comm_group, input_size, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.distributed.linear.RowParallelLinear" title="mstar.model.components.distributed.linear.RowParallelLinear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RowParallelLinear</span></code></a>(comm_group, input_size, ...)</p></td>
 <td><p>Linear layer with row parallelism.</p></td>
 </tr>
 </tbody>
@@ -645,6 +652,54 @@ registered hooks while the latter silently ignores them.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.components.distributed.linear.ColumnParallelLinear.weight_loader">
 <span class="sig-name descname"><span class="pre">weight_loader</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">param</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_shard_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear.html#ColumnParallelLinear.weight_loader"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.linear.ColumnParallelLinear.weight_loader" title="Link to this definition">#</a></dt>
+<dd><p>Copy this rank’s slice of <code class="docutils literal notranslate"><span class="pre">loaded_weight</span></code> into <code class="docutils literal notranslate"><span class="pre">param</span></code>.</p>
+<p>For plain ColumnParallelLinear there’s a single shard so
+<code class="docutils literal notranslate"><span class="pre">loaded_shard_id</span></code> must be None. Subclasses (<code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code>,
+<code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code>) override to dispatch by shard id.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>param</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.parameter.Parameter.html#torch.nn.parameter.Parameter" title="(in PyTorch v2.14)"><em>Parameter</em></a>) – the destination parameter (<code class="docutils literal notranslate"><span class="pre">self.weight</span></code> or
+<code class="docutils literal notranslate"><span class="pre">self.bias</span></code>).</p></li>
+<li><p><strong>loaded_weight</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – the full-checkpoint tensor — shape
+<code class="docutils literal notranslate"><span class="pre">(output_size,</span> <span class="pre">input_size)</span></code> for weight, <code class="docutils literal notranslate"><span class="pre">(output_size,)</span></code>
+for bias.</p></li>
+<li><p><strong>loaded_shard_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.linear.KVColumnParallelLinear">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.linear.</span></span><span class="sig-name descname"><span class="pre">KVColumnParallelLinear</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">input_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear.html#KVColumnParallelLinear"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.linear.KVColumnParallelLinear" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.model.components.distributed.linear.ColumnParallelLinear" title="mstar.model.components.distributed.linear.ColumnParallelLinear"><code class="xref py py-class docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code></a></p>
+<p>One K or V projection, sharded by head, replicated when heads run out.</p>
+<p>For models whose checkpoint keeps <code class="docutils literal notranslate"><span class="pre">k_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">v_proj</span></code> apart rather than
+fused into a QKV block. <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code> already handles this case,
+but only for the fused layout.</p>
+<p>The replication is not an optimization — it is what keeps the model and the
+KV cache agreeing. <code class="docutils literal notranslate"><span class="pre">KVConfig.shard</span></code> gives every rank one whole head once
+<code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;=</span> <span class="pre">total_num_kv_heads</span></code>, so a plain column shard, which would hand
+each rank a <em>fraction</em> of a head, would silently disagree with the cache it
+writes into.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>comm_group</strong> (<em>CommGroup</em>)</p></li>
+<li><p><strong>input_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>total_num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.linear.KVColumnParallelLinear.weight_loader">
+<span class="sig-name descname"><span class="pre">weight_loader</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">param</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_weight</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loaded_shard_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear.html#KVColumnParallelLinear.weight_loader"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.linear.KVColumnParallelLinear.weight_loader" title="Link to this definition">#</a></dt>
 <dd><p>Copy this rank’s slice of <code class="docutils literal notranslate"><span class="pre">loaded_weight</span></code> into <code class="docutils literal notranslate"><span class="pre">param</span></code>.</p>
 <p>For plain ColumnParallelLinear there’s a single shard so
 <code class="docutils literal notranslate"><span class="pre">loaded_shard_id</span></code> must be None. Subclasses (<code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code>,
@@ -890,6 +945,10 @@ registered hooks while the latter silently ignores them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.ColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.KVColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.KVColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">KVColumnParallelLinear.weight_loader()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.MergedColumnParallelLinear"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.linear.MergedColumnParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear.weight_loader()</span></code></a></li>
 </ul>
@@ -936,7 +995,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 14, 2026.
+  Last updated on Sep 15, 2026.
   <br/>
 </p>
   </div>

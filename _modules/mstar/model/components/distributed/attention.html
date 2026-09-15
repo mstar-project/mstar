@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -845,7 +845,7 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.components.distributed.attention</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""TP-aware multi-head attention.</span>
+<span></span><span class="sd">"""TP-aware self- and cross-attention.</span>
 
 <span class="sd">Mirrors ``mstar.model.components.Attention`` but with the QKV projection</span>
 <span class="sd">sharded across heads via ``QKVParallelLinear`` and the output projection</span>
@@ -871,8 +871,11 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">nn</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.communication</span><span class="w"> </span><span class="kn">import</span> <span class="n">CommGroup</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">divide</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.convenience</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionCallable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.distributed.linear</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">ColumnParallelLinear</span><span class="p">,</span>
+    <span class="n">KVColumnParallelLinear</span><span class="p">,</span>
     <span class="n">QKVParallelLinear</span><span class="p">,</span>
     <span class="n">RowParallelLinear</span><span class="p">,</span>
 <span class="p">)</span>
@@ -1024,6 +1027,159 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">attn_output</span><span class="p">)</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="ParallelCrossAttention">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.ParallelCrossAttention">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ParallelCrossAttention</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cross-attention split across tensor-parallel ranks.</span>
+
+<span class="sd">    Each rank handles a subset of attention heads, then the output projection</span>
+<span class="sd">    combines their contributions with an all-reduce.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="o">*</span><span class="p">,</span>
+        <span class="n">comm_group</span><span class="p">:</span> <span class="n">CommGroup</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">q_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">k_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">v_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">o_bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">source</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"default"</span><span class="p">,</span>
+        <span class="n">cross_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">context_kv_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+
+        <span class="k">if</span> <span class="n">comm_group</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">comm_group</span> <span class="o">=</span> <span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">comm_group</span> <span class="o">=</span> <span class="n">comm_group</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">total_num_heads</span> <span class="o">=</span> <span class="n">num_heads</span>
+        <span class="c1"># If no num_kv_heads is specified, we use num_heads.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">total_num_kv_heads</span> <span class="o">=</span> <span class="n">num_kv_heads</span> <span class="k">if</span> <span class="n">num_kv_heads</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">num_heads</span>
+
+        <span class="n">tp_size</span> <span class="o">=</span> <span class="n">comm_group</span><span class="o">.</span><span class="n">world_size</span>
+
+        <span class="k">assert</span> <span class="n">num_heads</span> <span class="o">&gt;=</span> <span class="n">tp_size</span><span class="p">,</span> <span class="p">(</span>
+            <span class="s2">"Parallel cross attention cannot handle head replication over Q."</span>
+        <span class="p">)</span>
+
+        <span class="n">inner</span> <span class="o">=</span> <span class="n">num_heads</span> <span class="o">*</span> <span class="n">head_dim</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="n">num_heads</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span> <span class="o">=</span> <span class="n">head_dim</span>
+
+        <span class="c1"># If num_kv_heads is not specified, num_heads is the number of heads for q,k and v.</span>
+        <span class="c1"># It is then required to have TP_size &lt;= num_heads; otherwise divide(tp_size, self.total_num_heads)</span>
+        <span class="c1"># will raise.</span>
+        <span class="k">if</span> <span class="n">num_kv_heads</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">tp_size</span> <span class="o">&gt;</span> <span class="n">num_kv_heads</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="mi">1</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_head_replicas</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="n">tp_size</span><span class="p">,</span> <span class="n">num_kv_heads</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">)</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_head_replicas</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="k">else</span> <span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span> <span class="o">=</span> <span class="n">KVColumnParallelLinear</span><span class="p">(</span>
+            <span class="n">comm_group</span><span class="o">=</span><span class="n">comm_group</span><span class="p">,</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">head_size</span><span class="o">=</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">total_num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_kv_heads</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">k_bias</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span> <span class="o">=</span> <span class="n">KVColumnParallelLinear</span><span class="p">(</span>
+            <span class="n">comm_group</span><span class="o">=</span><span class="n">comm_group</span><span class="p">,</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">head_size</span><span class="o">=</span><span class="n">head_dim</span><span class="p">,</span>
+            <span class="n">total_num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">total_num_kv_heads</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">v_bias</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span> <span class="o">=</span> <span class="n">ColumnParallelLinear</span><span class="p">(</span>
+            <span class="n">comm_group</span><span class="o">=</span><span class="n">comm_group</span><span class="p">,</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">output_size</span><span class="o">=</span><span class="n">inner</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">q_bias</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span> <span class="o">=</span> <span class="n">RowParallelLinear</span><span class="p">(</span>
+            <span class="n">comm_group</span><span class="o">=</span><span class="n">comm_group</span><span class="p">,</span>
+            <span class="n">input_size</span><span class="o">=</span><span class="n">inner</span><span class="p">,</span>
+            <span class="n">output_size</span><span class="o">=</span><span class="n">hidden_size</span><span class="p">,</span>
+            <span class="n">bias</span><span class="o">=</span><span class="n">o_bias</span><span class="p">,</span>
+            <span class="n">input_is_parallel</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+            <span class="n">reduce_results</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">source</span> <span class="o">=</span> <span class="n">source</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_cross_key</span> <span class="o">=</span> <span class="n">cross_key</span> <span class="ow">or</span> <span class="n">source</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_context_kv_key</span> <span class="o">=</span> <span class="n">context_kv_key</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cross</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">context_kv</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="ParallelCrossAttention.compute_kv">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.ParallelCrossAttention.compute_kv">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">compute_kv</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">encoder_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Project the encoder context to K/V for the cross-attention pool.</span>
+
+<span class="sd">        ``(enc_len, hidden) -&gt; (k, v)``, each ``(enc_len, num_kv_heads, head_dim)``.</span>
+<span class="sd">        Override to reshape for a model-specific pool layout.</span>
+<span class="sd">        """</span>
+        <span class="n">enc_len</span> <span class="o">=</span> <span class="n">encoder_states</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">encoder_states</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">enc_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
+        <span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">encoder_states</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">enc_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="ParallelCrossAttention.bind_resources">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.ParallelCrossAttention.bind_resources">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bind_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">resources</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Resolve this source's cross-attention resource and the cache</span>
+<span class="sd">        holding its context. See ``NodeSubmodule.bind_node_resources``."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cross</span> <span class="o">=</span> <span class="n">resources</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_cross_key</span><span class="p">]</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context_kv_key</span>
+        <span class="k">if</span> <span class="n">key</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># the resource already names the cache it attends</span>
+            <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross</span><span class="o">.</span><span class="n">context_cache_key</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">context_kv</span> <span class="o">=</span> <span class="n">resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span></div>
+
+
+    <span class="c1"># Same cursor API as AttentionCallable, so a layer loop drives self- and</span>
+    <span class="c1"># cross-attention the same way. Not an AttentionCallable itself: nothing is</span>
+    <span class="c1"># written here, and the context cache is a different resource.</span>
+<div class="viewcode-block" id="ParallelCrossAttention.bind_step">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.ParallelCrossAttention.bind_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bind_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cross</span><span class="o">.</span><span class="n">set_default_label</span><span class="p">(</span><span class="n">label</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ParallelCrossAttention.set_layer_idx">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.ParallelCrossAttention.set_layer_idx">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_layer_idx</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">context_kv</span><span class="o">.</span><span class="n">set_default_layer_idx</span><span class="p">(</span><span class="n">layer_idx</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="ParallelCrossAttention.forward">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.attention.html#mstar.model.components.distributed.ParallelCrossAttention.forward">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Label and layer index come off the resources' cursors; see</span>
+<span class="sd">        ``Attention.forward``."""</span>
+        <span class="n">num_tokens</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
+        <span class="c1"># nothing is written here: the context was written once at encode time</span>
+        <span class="n">attn</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cross</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">context_kv</span><span class="o">.</span><span class="n">layer_view</span><span class="p">())</span>
+        <span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span><span class="p">(</span><span class="n">attn</span><span class="p">)</span></div>
+</div>
+
 </pre></div>
 
                 </article>
@@ -1071,7 +1227,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 14, 2026.
+  Last updated on Sep 15, 2026.
   <br/>
 </p>
   </div>

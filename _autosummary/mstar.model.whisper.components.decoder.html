@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -605,10 +605,10 @@ is allocated and zeroed post-load (<code class="docutils literal notranslate"><s
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.decoder.WhisperDecoderLayer" title="mstar.model.whisper.components.decoder.WhisperDecoderLayer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WhisperDecoderLayer</span></code></a>(config)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.whisper.components.decoder.WhisperDecoderLayer" title="mstar.model.whisper.components.decoder.WhisperDecoderLayer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WhisperDecoderLayer</span></code></a>(config[, comm_group])</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.decoder.WhisperDecoderModel" title="mstar.model.whisper.components.decoder.WhisperDecoderModel"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WhisperDecoderModel</span></code></a>(config)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.whisper.components.decoder.WhisperDecoderModel" title="mstar.model.whisper.components.decoder.WhisperDecoderModel"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WhisperDecoderModel</span></code></a>(config[, comm_group])</p></td>
 <td><p>Decoder stack; parameter paths mirror HF's <code class="docutils literal notranslate"><span class="pre">model.decoder.*</span></code>.</p></td>
 </tr>
 </tbody>
@@ -616,11 +616,14 @@ is allocated and zeroed post-load (<code class="docutils literal notranslate"><s
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.whisper.components.decoder.WhisperDecoderLayer">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.decoder.</span></span><span class="sig-name descname"><span class="pre">WhisperDecoderLayer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/decoder.html#WhisperDecoderLayer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.decoder.WhisperDecoderLayer" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.decoder.</span></span><span class="sig-name descname"><span class="pre">WhisperDecoderLayer</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/decoder.html#WhisperDecoderLayer"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.decoder.WhisperDecoderLayer" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>config</strong> (<a class="reference internal" href="mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig" title="mstar.model.whisper.config.WhisperModelConfig"><em>WhisperModelConfig</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig" title="mstar.model.whisper.config.WhisperModelConfig"><em>WhisperModelConfig</em></a>)</p></li>
+<li><p><strong>comm_group</strong> (<em>CommGroup</em><em> | </em><em>None</em>)</p></li>
+</ul>
 </dd>
 </dl>
 <dl class="py method">
@@ -649,12 +652,15 @@ registered hooks while the latter silently ignores them.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.whisper.components.decoder.WhisperDecoderModel">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.decoder.</span></span><span class="sig-name descname"><span class="pre">WhisperDecoderModel</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/decoder.html#WhisperDecoderModel"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.decoder.WhisperDecoderModel" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.whisper.components.decoder.</span></span><span class="sig-name descname"><span class="pre">WhisperDecoderModel</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/decoder.html#WhisperDecoderModel"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.decoder.WhisperDecoderModel" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
 <p>Decoder stack; parameter paths mirror HF’s <code class="docutils literal notranslate"><span class="pre">model.decoder.*</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>config</strong> (<a class="reference internal" href="mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig" title="mstar.model.whisper.config.WhisperModelConfig"><em>WhisperModelConfig</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>config</strong> (<a class="reference internal" href="mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig" title="mstar.model.whisper.config.WhisperModelConfig"><em>WhisperModelConfig</em></a>)</p></li>
+<li><p><strong>comm_group</strong> (<em>CommGroup</em><em> | </em><em>None</em>)</p></li>
+</ul>
 </dd>
 </dl>
 <dl class="py method">
@@ -737,8 +743,7 @@ the step’s segment order.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.whisper.components.decoder.WhisperDecoderModel.zero_missing_biases">
 <span class="sig-name descname"><span class="pre">zero_missing_biases</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/whisper/components/decoder.html#WhisperDecoderModel.zero_missing_biases"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.whisper.components.decoder.WhisperDecoderModel.zero_missing_biases" title="Link to this definition">#</a></dt>
-<dd><p>Zero the self-attn <code class="docutils literal notranslate"><span class="pre">k_proj</span></code> biases absent from the HF checkpoint
-(allocated because the shared <code class="docutils literal notranslate"><span class="pre">Attention</span></code> has one qkv_bias flag).</p>
+<dd><p>Zero the fused K-bias slice absent from the HF checkpoint.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>None</p>
@@ -842,7 +847,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 14, 2026.
+  Last updated on Sep 15, 2026.
   <br/>
 </p>
   </div>

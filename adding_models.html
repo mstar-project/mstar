@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 14, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1771,7 +1771,7 @@ the resource name.</p>
 <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> ranks. The runtime splits the group’s ranks into TP groups of that size and
 builds one <code class="docutils literal notranslate"><span class="pre">comm_group</span></code> per shard.</p>
 <p>A node is sharded only if its components are built from the tensor-parallel modules in
-<code class="docutils literal notranslate"><span class="pre">mstar/model/components/distributed</span></code>: <code class="docutils literal notranslate"><span class="pre">ParallelAttention</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mstar/model/components/distributed</span></code>: <code class="docutils literal notranslate"><span class="pre">ParallelAttention</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelCrossAttention</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP</span></code>,
 <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> and others.
 The <code class="docutils literal notranslate"><span class="pre">weight_loader</span></code> of each such parameter slices it automatically. See <a class="reference internal" href="#loading-weights">Loading
 weights</a>. A node whose components do not use these modules is replicated on every rank
@@ -2258,7 +2258,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 14, 2026.
+  Last updated on Sep 15, 2026.
   <br/>
 </p>
   </div>

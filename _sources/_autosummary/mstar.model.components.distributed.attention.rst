@@ -18,6 +18,7 @@ mstar.model.components.distributed.attention
    .. autosummary::
    
       ParallelAttention
+      ParallelCrossAttention
    
    
 
