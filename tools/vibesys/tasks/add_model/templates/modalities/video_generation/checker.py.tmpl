@@ -1,0 +1,129 @@
+"""Correctness gate for a text/image->video port (framework-owned, read-only).
+
+Sends one client request to the running mstar server and compares the returned
+video to the reference implementation's video:
+
+- ``--smoke``: validity only (a real, non-empty mp4). No oracle, no weights.
+- ``--strict`` (default): decode both clips and compare frames with SSIM within
+  tolerance ${tol}.
+
+Diffusion/flow video is chaotic in its initial noise: two *correct*
+implementations that start from different noise produce different (each valid)
+clips, so an output-vs-output metric is only meaningful when both denoise the
+**same** starting latent. This gate therefore generates one shared initial
+latent (``reference.initial_latent``) and feeds it to *both* the candidate (via
+``init_latents`` in the request) and the reference oracle. The candidate must be
+mstar-native compute, not the upstream pipeline.
+
+Model specifics (request shape, mp4 decode, the oracle, the latent) live in
+reference.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+import httpx
+import numpy as np
+
+TOL = ${tol}
+
+
+def _load_reference():
+    here = Path(__file__).resolve()
+    for cand in (Path("reference.py").resolve(), here.parent / "reference.py", here.parents[1] / "reference.py"):
+        if cand.exists():
+            spec = importlib.util.spec_from_file_location("mstar_vibesys_reference", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise SystemExit("FAIL: reference.py not found next to the checker")
+
+
+def _frame_ssim(a: np.ndarray, b: np.ndarray) -> float:
+    try:
+        from skimage.metrics import structural_similarity as sk
+        return float(sk(a, b, channel_axis=2))
+    except Exception:
+        a = a.astype(np.float64); b = b.astype(np.float64)
+        mu_a, mu_b, va, vb = a.mean(), b.mean(), a.var(), b.var()
+        cov = ((a - mu_a) * (b - mu_b)).mean()
+        c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+        return float(((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / ((mu_a**2 + mu_b**2 + c1) * (va + vb + c2)))
+
+
+def _mean_ssim(cand: np.ndarray, ref: np.ndarray) -> float:
+    n = min(len(cand), len(ref))
+    if n == 0:
+        return 0.0
+    return float(np.mean([_frame_ssim(cand[i], ref[i]) for i in range(n)]))
+
+
+def wait_for_health(client, base, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if client.get(f"{base}/health").status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(2.0)
+    raise SystemExit(f"FAIL: server never became healthy at {base}/health")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="http://localhost:${port}")
+    ap.add_argument("--timeout", type=float, default=900.0)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--strict", action="store_true", default=True)
+    mode.add_argument("--smoke", dest="strict", action="store_false")
+    args = ap.parse_args()
+
+    base = args.url.rstrip("/")
+    client = httpx.Client(timeout=args.timeout)
+    wait_for_health(client, base, args.timeout)
+    ref = _load_reference()
+
+    sample = ref.sample_input()
+
+    # Strict: build the shared starting latent up front and hand it to both the
+    # candidate (in the request) and the oracle, so any output difference is
+    # attributable to compute, not to a different noise draw. Smoke sends none.
+    latents = None
+    if args.strict:
+        ref.load()
+        latents = ref.initial_latent(sample)
+
+    method, path, body = ref.to_request(sample, latents)
+    try:
+        resp = client.request(method, f"{base}{path}", json=body)
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"FAIL: request to {path} failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    candidate = ref.from_response(resp)  # (T,H,W,C) uint8, or None/empty if invalid
+    if candidate is None or len(candidate) == 0:
+        print("FAIL: candidate returned no decodable video", file=sys.stderr)
+        raise SystemExit(1)
+
+    if not args.strict:
+        print(f"PASS[smoke]: server returned a valid video ({len(candidate)} frames)")
+        return
+
+    reference = ref.oracle(sample, latents)
+    score = _mean_ssim(candidate, reference)
+    distance = 1.0 - score
+    ok = distance <= TOL
+    print(f"{'PASS' if ok else 'FAIL'}: video SSIM mean={score:.4f} (1-SSIM={distance:.4f}, tol={TOL})")
+    if not ok:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
