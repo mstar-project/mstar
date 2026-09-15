@@ -237,9 +237,14 @@ def test_graph_replay_survives_a_poisoned_output_tail():
 
 def test_graph_mode_pads_fewer_segments():
     w = graph_wrapper()
+    # the padded layout is asserted off `_prepare_cu_seqlens`, not the wrapper:
+    # it returns a fresh pinned buffer per plan and retains none (see there)
+    padded = w._prepare_cu_seqlens(cu([10, 20]))
+    assert padded.tolist() == [0, 10, 30, 30, 30]
+    assert w.num_segments == 2
+    # repeating the final offset appends zero-length segments: no extra tokens
     w.plan(cu([10, 20]))
     assert w.num_segments == 2
-    assert w._cu_host.tolist() == [0, 10, 30, 30, 30]
 
 
 def test_graph_mode_rejects_too_many_segments():
