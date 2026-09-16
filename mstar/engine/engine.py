@@ -9,6 +9,8 @@ from typing import Any, Callable, Mapping
 
 import torch
 
+from mstar.utils.coalesce import clone_coalesced
+
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
@@ -1119,7 +1121,13 @@ class Engine:
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
     ) -> None:
-        """Fold the forward's per-rid entries into ``outputs``."""
+        """Fold the forward's per-rid entries into ``outputs``.
+
+        The per-rid tensors are cloned off the forward's (static, graph-owned) buffers. They are
+        typically slices of one batch-wide result, so the clones are coalesced: one kernel per
+        shared storage instead of one per request (``mstar.utils.coalesce``).
+        """
+        pending: list[tuple[dict, str, int, torch.Tensor]] = []  # (merged dict, key, position, tensor)
         for rid, out_id in zip(request_ids, out_ids, strict=False):
             rid_out = raw_outputs.get(out_id)
             if not isinstance(rid_out, dict):
@@ -1130,11 +1138,19 @@ class Engine:
             merged = outputs.setdefault(rid, {})
             for key, value in rid_out.items():
                 if isinstance(value, list):
-                    merged[key] = [t.clone() for t in value]
+                    merged[key] = list(value)
+                    for i, t in enumerate(value):
+                        if isinstance(t, torch.Tensor):
+                            pending.append((merged, key, i, t))
                 elif isinstance(value, torch.Tensor):
-                    merged[key] = [value.clone()]
+                    merged[key] = [value]
+                    pending.append((merged, key, 0, value))
                 else:
                     merged[key] = value
+        if pending:
+            clones = clone_coalesced([t for _, _, _, t in pending])
+            for (merged, key, i, _), c in zip(pending, clones, strict=True):
+                merged[key][i] = c
 
     def _merge_unpacked(
         self,
