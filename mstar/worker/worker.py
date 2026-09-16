@@ -1956,7 +1956,7 @@ class Worker:
                     fresh_batch.request_to_worker_graph[rid]
                 )
 
-        logger.debug(f"Speculating: {spec_node_info.node_name} {list(new_node_objects)}")
+        logger.debug("Speculating: %s %s", spec_node_info.node_name, list(new_node_objects))
         return self._assemble_speculation(
             pending, sample_node, spec_node_info,
             new_node_objects, new_request_to_worker_graph, per_request_inputs,
@@ -2977,7 +2977,7 @@ class Worker:
                         if batch is not None:
                             node_batch = self._build_executing_batch(batch)
                             batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-                            logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
+                            logger.debug("Yield away: %s %s", batch.node_name, node_batch.request_ids)
                             speculation = Speculation(
                                 scheduled_batch=batch,
                                 node_batch=node_batch,
@@ -3227,7 +3227,7 @@ class Worker:
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )
                 self.wakeup_event.register_future(future)
-                logger.debug(f"Scheduling: {batch.node_name} {node_batch.request_ids}")
+                logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
                 _set_pending(PendingBatch(
                     batch=batch,
                     node_batch=node_batch,
@@ -3237,6 +3237,12 @@ class Worker:
                     future=future,
                     tp_seq=fallthrough_tp_seq,
                 ))
+                if phase_period:
+                    # the serial protocol's iterations flush too, so MSTAR_PHASE_TIMING shows its
+                    # phases (and the mixed-step counter) rather than only the speculative path's
+                    _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_iter[0] += 1
+                    _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch)
                 # Follower: a head from a step that raised must not sit at the
