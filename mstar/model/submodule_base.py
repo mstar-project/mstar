@@ -471,6 +471,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def mixed_step_walks(self, graph_walk: str) -> set[str]:
+        """Walks whose ready requests may ride along in a step of ``graph_walk`` as extra rows.
+
+        An autoregressive node that runs its prefill and its decode as separate steps stalls every
+        decoding request for the length of each prefill. Returning ``{"decode"}`` for ``"prefill"``
+        lets the scheduler append the node's ready decode requests (up to the decode walk's own cap)
+        to a prefill step: the step keeps ``graph_walk`` (so it dispatches, leases and preprocesses as
+        that walk) while each request keeps its own walk for input preparation, output routing and
+        loop bookkeeping. The submodule's forward must accept a batch of mixed spans (a packed prefill
+        plus one-token rows); the resources already do. Default: nothing rides along.
+        """
+        del graph_walk
+        return set()
+
     def get_autocast_dtype(self) -> torch.dtype | None:
         """Per-submodule autocast dtype override for the engine's forward
         wrap. The engine consults this on each ``execute_batch`` and uses
