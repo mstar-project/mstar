@@ -17,11 +17,11 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
 )
-from mstar.engine.cuda_graph_runner import DummyRowPool
+from mstar.engine.accelerator_graph_runner import DummyRowPool
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVConfig, KVStep
 from mstar.engine.resources.kv.manager import KVManager
@@ -157,14 +157,14 @@ def test_a_batched_padding_row_still_declares_its_token():
     """The other half: a decode-shaped config ignores the token argument, so
     its padding rows re-take one page each on first replay rather than none."""
     device = torch.device("cpu")
-    batched = BatchedCudaGraphConfig(
+    batched = BatchedAcceleratorGraphConfig(
         capture_graph_walk="decode",
         single_request_inputs=ARNodeInputs(
             input_ids=torch.zeros(1, dtype=torch.long, device=device),
             input_seq_len=1,
         ),
     )
-    packed = PackedCudaGraphConfig(
+    packed = PackedAcceleratorGraphConfig(
         capture_graph_walk="prefill",
         capture_token_lengths=[64],
         make_node_input=lambda n: ARNodeInputs(input_seq_len=n),

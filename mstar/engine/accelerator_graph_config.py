@@ -302,8 +302,3 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
         # zero-length padding rows keep the planned qo_indptr summing to the
         # real token count, so attention skips the padded tail
         return list(seq_lens) + [0] * (shape.bs - real_bs)
-
-
-# Transitional names used before the resource-pool graph config rename.
-BasicBatchedAcceleratorGraphConfig = BatchedAcceleratorGraphConfig
-FlashInferPackedAcceleratorGraphConfig = PackedAcceleratorGraphConfig

@@ -18,12 +18,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.cuda_graph_config import (
+from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewisePackedConfig,
 )
-from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources import (
     AttentionStep,
     BucketKey,
@@ -506,7 +506,7 @@ def piecewise_runner(mgr, capture_fn):
             steps={ATTN: AttentionStep(causal=False)},
         )
 
-    runner = PiecewiseCudaGraphRunner(
+    runner = PiecewiseAcceleratorGraphRunner(
         label="encoder_block_loop",
         config=PiecewisePackedConfig(
             capture_fn=capture_fn,

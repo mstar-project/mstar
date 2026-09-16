@@ -13,12 +13,12 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
@@ -220,10 +220,10 @@ class ViTEncoderSubmodule(NodeSubmodule):
         features = features + self.vit_pos_embed(packed_position_ids)
         return {"img_emb": [features]}
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype,
         tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Capture the ViT block loop, leaving patch-embed and the RoPE gathers
         eager — they are data-dependent indexing with no business in a graph."""
         if not self._cuda_graph_enabled:
@@ -728,9 +728,9 @@ class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TEXT_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048]
     PREFILL_TEXT_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[BatchedCudaGraphConfig | PackedCudaGraphConfig]:
+    ) -> list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig]:
         """Declare CUDA graph captures for ``decode`` (cfg-off + cfg-on) and ``prefill_text`` (cfg-off only).
 
         cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
@@ -744,12 +744,12 @@ class LLMSubmodule(ARNodeSubmodule):
         semantics).
         """
 
-        configs: list[BatchedCudaGraphConfig | PackedCudaGraphConfig] = []
+        configs: list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig] = []
         if device.type == "cuda":
             # `additional_key_info` carries what `requires_cfg` / `labels`
             # used to: cfg-on and cfg-off decode are distinct buckets.
             configs.extend([
-                BatchedCudaGraphConfig(
+                BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=False,
                 single_request_inputs=ARNodeInputs(
@@ -757,7 +757,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     input_seq_len=1
                 ),
                 ),
-                BatchedCudaGraphConfig(
+                BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 additional_key_info=True,
                 single_request_inputs=ARNodeInputs(
@@ -766,7 +766,7 @@ class LLMSubmodule(ARNodeSubmodule):
                     resource_step_info=True, # requires cfg
                 ),
                 ),
-                PackedCudaGraphConfig(
+                PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text"],
                 capture_token_lengths=list(self.PREFILL_TEXT_TOKEN_BUCKETS),
@@ -800,7 +800,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 max_num_patches_per_side=self.config.max_latent_size,
             )
             configs.append(
-                BatchedCudaGraphConfig(
+                BatchedAcceleratorGraphConfig(
                     capture_graph_walk="image_gen_cfg",
                     additional_key_info=True,
                     single_request_inputs=ARNodeInputs(
@@ -1013,7 +1013,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 post_forks = (("main", "cfg_text"),)
 
         # `cg_key_info` picks among the walk's capture buckets; it must match
-        # the `additional_key_info` on the configs in get_cuda_graph_configs.
+        # the `additional_key_info` on the configs in get_accelerator_graph_configs.
         steps: dict = {}
         if graph_walk == "prefill_text":
             # The prompt's tokens enter the repetition-penalty mask here; the

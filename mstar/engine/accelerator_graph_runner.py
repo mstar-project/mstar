@@ -14,10 +14,10 @@ from mstar.engine.accelerator_graph_backend import (
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
-    PiecewiseAcceleratorGraphConfig,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule

@@ -8,10 +8,12 @@ from mstar.engine.resources import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
+    BucketKey,
     KVConfig,
     KVSpec,
     PositionConfig,
     PositionSpec,
+    SlotLease,
     StepContext,
 )
 from mstar.engine.resources.attn import xpu as xpu_attention
@@ -38,15 +40,20 @@ def _manager() -> XPUPagedAttentionManager:
     return XPUPagedAttentionManager(
         kv_cache="kv",
         device=torch.device("cpu"),
+        kv_config=_kv_config(),
     )
 
 
-def _ctx(views: list[SequenceView]) -> StepContext:
+def _ctx(
+    views: list[SequenceView],
+    slot_lease: SlotLease | None = None,
+) -> StepContext:
     return StepContext(
         request_ids=tuple(view.request_id for view in views),
         graph_walk="decode",
         slot=0,
         capture=False,
+        slot_lease=slot_lease,
         plan_results={
             "kv": {
                 "main": KVPlanOutput(
@@ -138,3 +145,47 @@ def test_xpu_plan_uses_kv_view_order_and_pads_block_table():
     assert plan.max_k == 7
     assert plan.causal is False
     assert manager.qo_indptr_buf("main").tolist() == [0, 3, 4]
+
+
+def test_xpu_graph_plan_keeps_addresses_stable_across_replans():
+    manager = _manager()
+    lease = SlotLease(
+        slot=0,
+        bucket=BucketKey(graph_walk="image_gen_cfg", bs=1, num_tokens=1),
+    )
+    manager.plan(
+        AttentionStep(causal=False),
+        _ctx(
+            [SequenceView("r0", "main", [2], length=3, to_compute=1)],
+            slot_lease=lease,
+        ),
+    )
+    plan = manager._current_plans["main"]
+    addresses = (
+        plan.block_table.data_ptr(),
+        plan.cu_q.data_ptr(),
+        plan.host_kv_lens.data_ptr(),
+    )
+
+    manager.plan(
+        AttentionStep(causal=False),
+        _ctx(
+            [
+                SequenceView(
+                    "r0", "main", [5, 6, 7], length=9, to_compute=1
+                )
+            ],
+            slot_lease=lease,
+        ),
+    )
+
+    replanned = manager._current_plans["main"]
+    assert replanned is plan
+    assert (
+        replanned.block_table.data_ptr(),
+        replanned.cu_q.data_ptr(),
+        replanned.host_kv_lens.data_ptr(),
+    ) == addresses
+    assert replanned.block_table[0, :3].tolist() == [5, 6, 7]
+    assert replanned.host_kv_lens.tolist() == [9]
+    assert replanned.max_k == _kv_config().max_seq_len
