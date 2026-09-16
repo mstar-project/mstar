@@ -1,8 +1,12 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import logging
+
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 
 class CommGroup:
@@ -71,9 +75,11 @@ class CommGroup:
     # its peers over NVLink and reduces locally) 12-13 µs up to ~128 KB, and the two-shot
     # kernel (reduce-scatter + all-gather) 14-16 µs at 1 MB. Opt in with
     # MSTAR_SYMM_MEM_ALLREDUCE=1 (single-node groups with peer access): messages up to
+    # (=multimem: the NVLink-multicast kernel instead, in place on a ring of buffers) messages up to
     # MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES (default 256 KiB) go one-shot, up to
     # MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES (default 4 MiB) two-shot, larger ones stay on NCCL.
     _symm_enabled: bool | None = None
+    _symm_multimem: bool = False
     _symm_one_shot_max_bytes: int = 256 * 1024
     _symm_max_bytes: int = 4 * 1024 * 1024
 
@@ -81,7 +87,9 @@ class CommGroup:
         if self._symm_enabled is None:
             import os
 
-            enabled = os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE", "0") == "1"
+            mode = os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE", "0")
+            self._symm_multimem = mode == "multimem"
+            enabled = mode in ("1", "multimem")
             if enabled:
                 try:
                     import torch.distributed._symmetric_memory  # noqa: F401
@@ -96,23 +104,43 @@ class CommGroup:
             self._symm_bufs: dict = {}
         return self._symm_enabled
 
+    # multimem (NVLink multicast, ``MSTAR_SYMM_MEM_ALLREDUCE=multimem``) reduces in place and hands
+    # the symmetric buffer itself back, so each shape owns a ring of buffers: a result stays valid
+    # until this many more all-reduces of the same shape have happened. Kimi K3 keeps at most one
+    # result per shape live (attention output, then the FFN output), so 4 is ample.
+    _SYMM_RING = 4
+
     def _symm_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         import torch.distributed._symmetric_memory as symm_mem
 
         key = (tuple(input_.shape), input_.dtype, input_.device)
-        buf = self._symm_bufs.get(key)
-        if buf is None:
-            # first use of a shape: allocate the symmetric buffer and rendezvous (a
+        ring = self._symm_bufs.get(key)
+        if ring is None:
+            # first use of a shape: allocate the symmetric buffer(s) and rendezvous (a
             # collective; every rank sees the shapes in the same order). The engine's
             # warmup runs each capture shape eagerly first, so this never happens
             # inside a CUDA-graph capture.
-            buf = symm_mem.empty(*input_.shape, dtype=input_.dtype, device=input_.device)
-            symm_mem.rendezvous(buf, self.device_group.group_name)
-            self._symm_bufs[key] = buf
+            bufs = []
+            for _ in range(self._SYMM_RING if self._symm_multimem else 1):
+                buf = symm_mem.empty(*input_.shape, dtype=input_.dtype, device=input_.device)
+                symm_mem.rendezvous(buf, self.device_group.group_name)
+                bufs.append(buf)
+            ring = self._symm_bufs[key] = (bufs, [0])
+        bufs, cursor = ring
+        buf = bufs[cursor[0]]
+        cursor[0] = (cursor[0] + 1) % len(bufs)
         buf.copy_(input_)
+        name = self.device_group.group_name
+        if self._symm_multimem:
+            try:
+                torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", name)
+                return buf  # aliased ring slot, see _SYMM_RING
+            except RuntimeError as ex:  # no NVLS support here: stay on the copying kernels
+                logger.warning("symmetric-memory multimem all-reduce unavailable (%s); using one-shot/two-shot", ex)
+                self._symm_multimem = False
         if input_.numel() * input_.element_size() <= self._symm_one_shot_max_bytes:
-            return torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", self.device_group.group_name)
-        return torch.ops.symm_mem.two_shot_all_reduce_(buf, "sum", self.device_group.group_name)
+            return torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", name)
+        return torch.ops.symm_mem.two_shot_all_reduce_(buf, "sum", name)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """Sum ``input_`` across the group. Use the returned tensor: NCCL reduces in place,
