@@ -1,5 +1,5 @@
 """BAGEL image-to-image must be repeatable per seed. The VAE encoder samples
-its posterior; the draw comes from the request seed, not the global RNG."""
+its posterior, and the draw comes from the request seed, not the global RNG."""
 
 from types import SimpleNamespace
 
@@ -18,7 +18,7 @@ def test_posterior_sample_uses_the_given_noise():
     mean, logvar = torch.chunk(z, 2, dim=1)
     assert torch.equal(reg(z, noise=noise), mean + torch.exp(0.5 * logvar) * noise)
     assert torch.equal(reg(z, noise=noise), reg(z, noise=noise))
-    assert not torch.equal(reg(z), reg(z))  # global RNG: a fresh draw each call
+    assert not torch.equal(reg(z), reg(z))  # global RNG, a fresh draw each call
     assert torch.equal(DiagonalGaussian(sample=False)(z), mean)
 
 

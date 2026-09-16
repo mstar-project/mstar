@@ -682,8 +682,8 @@ class PreprocessWorkerThread:
             if not did_work:
                 time.sleep(0.001)
 
-        # Stopping: nothing will send the RemoveRequest for what is still
-        # tracked (the conductor is gone, or going), so drop it here rather than
+        # Stopping, and nothing will send the RemoveRequest for what is still
+        # tracked (the conductor is gone or going), so drop it here rather than
         # leave the input signals of in-flight requests in /dev/shm.
         for request_id in list(self.tensor_uuid_to_metadata_per_request):
             self._hard_cleanup(request_id)

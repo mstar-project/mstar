@@ -514,7 +514,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
 
         # The VAE samples its posterior. Drawing that noise here from the
         # request's seed makes image-to-image repeatable per seed, like the
-        # diffusion's initial noise; the global RNG would differ per run.
+        # diffusion's initial noise. The global RNG would differ per run.
         generator = torch.Generator(device=device)
         generator.manual_seed(fwd_info.random_seed + _VAE_NOISE_SEED_OFFSET)
         vae_noise = self.vae_model.posterior_noise(

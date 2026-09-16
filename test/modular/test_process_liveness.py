@@ -140,7 +140,7 @@ def test_startup_wait_raises_when_a_worker_dies_before_reporting(monkeypatch):
         c._wait_for_workers_ready()
     assert (exc.value.worker_id, exc.value.pid, exc.value.exitcode) == ("worker_1", 12, 1)
     assert "worker_1 (pid 12) exited with exit code 1" in str(exc.value)
-    # Noticed on the first poll: no waiting on a SETUP_DONE that will never come.
+    # Noticed on the first poll, with no waiting on a SETUP_DONE that will never come.
     assert sleeps == []
 
 
@@ -170,12 +170,12 @@ def test_dead_worker_fails_every_waiting_client_with_503():
         "completed": _request_data(["worker_0"]),
     }
     c.draining = {
-        # Fail path: the client is only told once the barrier completes, and
+        # Fail path. The client is only told once the barrier completes, and
         # the dead participant will never ACK, so tell it now.
         "failing": DrainingRequest(
             expected_acks={"worker_1"}, participants={"worker_1"}, failure_error="boom"
         ),
-        # Happy path: request_complete already went out.
+        # Happy path, request_complete already went out.
         "completed": DrainingRequest(expected_acks={"pp"}, participants={"pp"}),
     }
     c.waiting_queue = [_queued("queued")]
@@ -197,7 +197,7 @@ def test_orphaned_worker_leaves_gracefully_then_hard(monkeypatch):
 
     def _exit(code):
         calls.append(("_exit", code))
-        raise SystemExit(code)  # os._exit never returns; stand in for it
+        raise SystemExit(code)  # os._exit never returns, so stand in for it
 
     monkeypatch.setattr(os, "_exit", _exit)
     alive = [True, True, False]
@@ -213,7 +213,7 @@ def test_orphaned_worker_leaves_gracefully_then_hard(monkeypatch):
 
 
 def test_worker_without_a_multiprocessing_parent_keeps_running():
-    # A test process has no multiprocessing parent: the watchdog is a no-op.
+    # A test process has no multiprocessing parent, so the watchdog is a no-op.
     assert _exit_when_orphaned("worker_0") is None
 
 
@@ -318,7 +318,7 @@ def test_dead_conductor_releases_pending_requests_and_stops_the_server():
     assert waiting.event.is_set()
     assert waiting.error_status == 503
     assert "conductor process exited with signal SIGKILL" in waiting.error
-    # An earlier, more specific error is kept; the client is still released.
+    # An earlier, more specific error is kept, and the client is still released.
     assert (already_failed.error, already_failed.error_status) == ("bad knob", 400)
     assert already_failed.event.is_set()
     assert stopped == [True]

@@ -215,12 +215,13 @@ class APIServer:
         self.request_lock = threading.Lock()
         self.running = True
 
-        # Set by main() once the conductor is spawned, and polled: a conductor
-        # that dies sends nothing (see finalize_setup / _process_messages).
+        # Set by main() once the conductor is spawned. It gets polled because a
+        # conductor that dies sends nothing (see finalize_setup and
+        # _process_messages).
         self.conductor_proc: mp.Process | None = None
         # Non-None once the deployment is going down because the conductor
-        # died: the error every pending (and later) request gets, and main()'s
-        # reason to exit non-zero. on_fatal stops the HTTP server.
+        # died. It is the error every pending (and later) request gets, and the
+        # reason main() exits non-zero. on_fatal stops the HTTP server.
         self.fatal_error: str | None = None
         self.on_fatal: Callable[[], None] | None = None
         self._liveness_interval_s = 0.5
@@ -285,8 +286,8 @@ class APIServer:
         timeout, refuse new requests, and stop the HTTP server so the process
         exits non-zero instead of serving a deployment that can't run anything.
         """
-        message = f"conductor process exited with {exited}; the server is shutting down"
-        logger.error("Conductor process exited with %s; shutting the server down", exited)
+        message = f"conductor process exited with {exited}, so the server is shutting down"
+        logger.error("Conductor process exited with %s, shutting the server down", exited)
         with self.request_lock:
             self.fatal_error = message
             for req in self.pending_requests.values():
@@ -419,7 +420,7 @@ class APIServer:
 
     def _process_messages(self) -> None:
         """Drain the ZMQ pull socket and route results to pending requests.
-        Also watches the conductor process: once it exits, every pending
+        Also watches the conductor process. Once it exits, every pending
         request is failed and the HTTP server is told to stop."""
         next_liveness_check = 0.0
         while self.running:
@@ -1081,7 +1082,7 @@ def main(argv: list[str] | None = None):
             bridge.run()
         else:
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
-            # uvicorn.run() inlined so the server object is reachable: the
+            # uvicorn.run() inlined so the server object is reachable. The
             # message thread stops it when the conductor dies.
             server = uvicorn.Server(
                 uvicorn.Config(app, host=args.host, port=args.port, access_log=False)
@@ -1108,7 +1109,7 @@ def main(argv: list[str] | None = None):
         if api_server is not None:
             api_server.cleanup()
         _shutdown_conductor_process(conductor_proc)
-    # A worker or conductor death is a failed run; SIGINT/SIGTERM stays 0.
+    # A worker or conductor death is a failed run. A SIGINT stop still exits 0.
     if api_server.fatal_error is not None:
         exit_code = 1
     if exit_code:

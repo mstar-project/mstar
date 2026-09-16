@@ -264,8 +264,8 @@ class DiagonalGaussian(nn.Module):
         self.chunk_dim = chunk_dim
 
     def forward(self, z: Tensor, noise: Tensor | None = None) -> Tensor:
-        """``noise`` is the standard-normal draw for the sample; pass one made
-        from a seeded generator for a repeatable encode. Drawn from the global
+        """``noise`` is the standard-normal draw for the sample. Pass one made
+        from a seeded generator for a repeatable encode. It comes from the global
         RNG when omitted."""
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
         if self.sample:
