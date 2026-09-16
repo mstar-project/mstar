@@ -16,13 +16,13 @@ import os
 import pytest
 import torch
 
-from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
     parts_from_modalities,
     prefill_plan,
 )
+from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
 
 CKPT = os.environ.get("QWEN3_5_CKPT")
 

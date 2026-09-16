@@ -8,8 +8,8 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
-from time import perf_counter
 from collections.abc import Collection, Mapping
+from time import perf_counter
 from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource

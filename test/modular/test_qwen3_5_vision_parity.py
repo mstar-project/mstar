@@ -36,14 +36,12 @@ from mstar.model.qwen3_5.components.vision import (
     vision_position_ids,
     vision_seq_lengths,
 )
-from mstar.model.qwen3_5.config import VISION_ATTN
-
-
-from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 from mstar.model.qwen3_5.weight_loader import (
     load_qwen3_5_vision_weights,
     qwen3_5_vision_name_remapper,
 )
+
 
 class SDPARaggedDouble:
     """Stands in for the ragged attention resource, in fp32.

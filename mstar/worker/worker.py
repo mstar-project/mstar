@@ -29,6 +29,7 @@ from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import RecentSet
@@ -50,8 +51,8 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
 from mstar.utils.numa import pin_to_device_numa_node
+from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (

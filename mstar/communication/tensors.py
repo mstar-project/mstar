@@ -21,11 +21,10 @@ else:
     MOONCAKE_IMPORT_ERROR = None
 import torch
 
-from mstar.utils.profiler import PHASE_PERIOD, phase_record
-
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 logger = logging.getLogger(__name__)
 

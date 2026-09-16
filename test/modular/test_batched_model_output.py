@@ -133,6 +133,7 @@ def test_qwen3_5_hands_over_a_batch_tensor():
     """The producer side: without this the worker silently keeps paying the
     per-request copies."""
     import inspect
+
     from mstar.model.qwen3_5 import submodules
 
     src = inspect.getsource(submodules.LLMSubmodule.forward_batched)

@@ -4,8 +4,8 @@ import logging
 import os
 import threading
 import time
-from time import perf_counter
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Callable, Mapping
 
 import torch

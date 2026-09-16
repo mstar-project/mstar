@@ -25,10 +25,6 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.attn.ragged.config import (
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-)
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.position.config import PositionStep
@@ -46,6 +42,8 @@ from mstar.model.qwen3_5.components.vision import (
     Qwen3_5VisionModel,
     vision_interpolation,
     vision_seq_lengths,
+)
+from mstar.model.qwen3_5.components.vision import (
     # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
     vision_position_ids as vision_grid_position_ids,
 )
@@ -62,9 +60,9 @@ from mstar.model.qwen3_5.config import (
 )
 from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART
 from mstar.model.submodule_base import (
-    BatchedModelOutput,
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
