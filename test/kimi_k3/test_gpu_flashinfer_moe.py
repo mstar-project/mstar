@@ -32,11 +32,11 @@ def test_flashinfer_backend_matches_triton(mode, tol):
         moe.experts.gate_up_scale.copy_(s13)
         moe.experts.down_packed.copy_(p2)
         moe.experts.down_scale.copy_(s2)
-        for prm in (moe.gate.weight, moe.routed_expert_down_proj.weight, moe.routed_expert_up_proj.weight):
+        for prm in (moe.gate.weight, moe.in_proj.weight, moe.routed_expert_up_proj.weight):
             prm.normal_(std=0.05)
         moe.gate.e_score_correction_bias.normal_(std=0.01)
         x = torch.randn(37, hidden, device=DEV, dtype=torch.bfloat16)
-        z = moe.routed_expert_down_proj(x)
+        z = moe.routed_down(x)
         idx, w = moe.gate(x)
         ref = moe._routed(z, idx, w).float()  # Triton MXFP4 kernel
         moe.prepare_experts_backend(mode, DEV)
