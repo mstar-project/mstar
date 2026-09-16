@@ -1577,6 +1577,15 @@ class Worker:
     ) -> NameToTensorList:
         inputs = node.ready_next_iter.ready_inputs if check_next_iter \
             else node.ready_signals.ready_inputs
+        if check_next_iter:
+            # Carry over loop-external inputs sitting in ready_signals (see
+            # GraphNode.is_ready_for_speculation): they are re-injected
+            # unchanged every iteration and never land in ready_next_iter.
+            carried = {
+                name: edge for name, edge in node.ready_signals.ready_inputs.items()
+                if edge._persist_for_loop and name not in inputs
+            }
+            inputs = {**carried, **inputs}
         tensors = {}
         for input_name, edge in inputs.items():
             tensors[input_name] = [
