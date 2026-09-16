@@ -38,6 +38,7 @@ _SHARD_OF = {"w1": "gate", "w3": "up", "w2": "down"}
 
 def _build_layer(
     cfg: KimiK3TextConfig, i: int, comm_group: CommGroup | None, quantized_experts: bool = False,
+    moe_ep_size: int = 1,
 ) -> KimiK3DecoderLayer:
     if cfg.is_kda_layer(i):
         attn = ParallelKDAAttention(
@@ -62,7 +63,7 @@ def _build_layer(
             latent_norm=cfg.latent_moe_use_norm and cfg.use_latent_moe, norm_eps=cfg.rms_norm_eps,
             renormalize=cfg.moe_renormalize, routed_scaling_factor=cfg.routed_scaling_factor,
             num_expert_group=cfg.num_expert_group, topk_group=cfg.topk_group, comm_group=comm_group,
-            quantized=quantized_experts,
+            quantized=quantized_experts, ep_size=moe_ep_size,
         )
     else:
         mlp = ParallelSiTUMLP(
@@ -77,15 +78,19 @@ def _build_layer(
 
 
 class KimiK3LanguageModel(nn.Module):
-    def __init__(self, cfg: KimiK3TextConfig, comm_group: CommGroup | None = None, quantized_experts: bool = False):
+    def __init__(self, cfg: KimiK3TextConfig, comm_group: CommGroup | None = None, quantized_experts: bool = False,
+                 moe_ep_size: int = 1):
+        """``moe_ep_size`` expert-parallel groups over the comm group for the routed experts
+        (1 = every rank holds every expert, sharded on the intermediate dim; see ``ExpertSharding``)."""
         super().__init__()
         self.cfg = cfg
         self.quantized_experts = quantized_experts
+        self.moe_ep_size = moe_ep_size
         self.embed_tokens = VocabParallelEmbedding(
             cfg.vocab_size, cfg.hidden_size, comm_group=comm_group, padding_idx=cfg.pad_token_id,
         )
         self.layers = nn.ModuleList(
-            [_build_layer(cfg, i, comm_group, quantized_experts) for i in range(cfg.num_hidden_layers)]
+            [_build_layer(cfg, i, comm_group, quantized_experts, moe_ep_size) for i in range(cfg.num_hidden_layers)]
         )
         self.norm = KimiRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         if cfg.use_attn_res:
@@ -191,7 +196,8 @@ def _all_ranks_agree(ok: bool, comm_group) -> bool:
 
 def marlin_supports(moe) -> bool:
     """Marlin's tiles need the latent width a multiple of 256 and the per-rank expert
-    intermediate width a multiple of 128 (the released K3 shapes at TP1..8 all qualify)."""
+    intermediate width a multiple of 128 (the released K3 shapes at TP1..8 all qualify, and
+    expert parallelism only widens the per-rank intermediate)."""
     return moe.latent_size % 256 == 0 and moe.inter_local % 128 == 0
 
 
@@ -244,11 +250,13 @@ def prepare_moe_kernels(model: nn.Module, device, backend: str = "auto") -> str:
 
 
 class KimiK3ForCausalLM(nn.Module):
-    def __init__(self, cfg: KimiK3TextConfig, comm_group: CommGroup | None = None, quantized_experts: bool = False):
+    def __init__(self, cfg: KimiK3TextConfig, comm_group: CommGroup | None = None, quantized_experts: bool = False,
+                 moe_ep_size: int = 1):
         super().__init__()
         self.cfg = cfg
         self.quantized_experts = quantized_experts
-        self.model = KimiK3LanguageModel(cfg, comm_group=comm_group, quantized_experts=quantized_experts)
+        self.model = KimiK3LanguageModel(
+            cfg, comm_group=comm_group, quantized_experts=quantized_experts, moe_ep_size=moe_ep_size)
         self.lm_head = ColumnParallelLinear(
             comm_group=comm_group or CommGroup.trivial(), input_size=cfg.hidden_size,
             output_size=cfg.vocab_size, bias=False, gather_output=True,
