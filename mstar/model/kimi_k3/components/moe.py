@@ -273,9 +273,13 @@ class KimiLatentMoE(nn.Module):
         w2 = torch.stack([dequant_mxfp4(self.experts.down_packed[i], self.experts.down_scale[i]) for i in range(e)])
         return w13, w2
 
-    def _routed(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+    def _routed(
+        self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Routed experts' partial sums ``[T, latent]``; the fused backends can write them into
+        ``out`` (the caller checks ``result is out``)."""
         if self._backend is not None:
-            return self._backend(z, topk_idx, topk_weight)
+            return self._backend(z, topk_idx, topk_weight, out=out)
         if self.quantized:
             if self._use_triton(z):
                 from mstar.utils.fused_moe.mxfp4 import fused_experts_mxfp4
@@ -304,9 +308,16 @@ class KimiLatentMoE(nn.Module):
         x = x.reshape(-1, self.hidden_size)
         topk_idx, topk_weight = self.gate(x)
         z = self.routed_expert_down_proj(x)
-        y = self._routed(z, topk_idx, topk_weight)
-        if self.comm_group.world_size > 1:
-            y = self.comm_group.all_reduce(y)  # partial sums over the intermediate shards
+        # partial sums over the intermediate shards; the fused backends write them straight into the
+        # symmetric all-reduce buffer when that path applies (no copy launch)
+        buf = self.comm_group.symm_buffer(z.shape, z.dtype, z.device)
+        y = self._routed(z, topk_idx, topk_weight, out=buf)
+        if buf is not None:
+            if y is not buf:
+                buf.copy_(y)
+            y = self.comm_group.all_reduce_symm_buffer(buf)
+        elif self.comm_group.world_size > 1:
+            y = self.comm_group.all_reduce(y)
         if self.routed_expert_norm is not None:
             y = self.routed_expert_norm(y)
         y = self.routed_expert_up_proj(y)  # partial over the latent shards
