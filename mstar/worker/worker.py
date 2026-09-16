@@ -34,6 +34,7 @@ from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.api_server.request_types import INLINE_MAX_BYTES, InlineResults
 from mstar.communication.tensors import _serialize_tensor
+from mstar.utils.coalesce import apply_coalesced
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -95,7 +96,8 @@ def inline_output_bytes(
             continue
         for t, info in zip(tensors, infos, strict=True):
             if torch.is_tensor(t) and not t.is_cuda and info.nbytes <= max_bytes:
-                out[info.uuid] = _serialize_tensor(t)
+                # the same bytes _serialize_tensor produces (host copies are contiguous already)
+                out[info.uuid] = t.reshape(-1).view(torch.uint8).numpy().tobytes()
     return out
 
 
@@ -2535,32 +2537,39 @@ class Worker:
         side = self._d2h_stream
         side.wait_event(completion_event)
 
+        # collect the CUDA tensors, copy them once per shared storage (the per-request
+        # tokens are slices of one sampler result), then rebuild the per-request structure
         cpu_per_rid: dict = {}
-        buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
-        with torch.cuda.stream(side):
-            for rid, name_to_list in outputs.items():
-                if not isinstance(name_to_list, dict):
-                    cpu_per_rid[rid] = name_to_list
+        pending: list[tuple[list, int, torch.Tensor]] = []
+        for rid, name_to_list in outputs.items():
+            if not isinstance(name_to_list, dict):
+                cpu_per_rid[rid] = name_to_list
+                continue
+            cpu_per_rid[rid] = {}
+            for name, tensors in name_to_list.items():
+                if not isinstance(tensors, list):
+                    cpu_per_rid[rid][name] = tensors
                     continue
-                cpu_per_rid[rid] = {}
-                for name, tensors in name_to_list.items():
-                    if not isinstance(tensors, list):
-                        cpu_per_rid[rid][name] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.is_cuda:
-                            key = ("check_stop", t.dtype, tuple(t.shape))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    cpu_per_rid[rid][name] = new_list
+                new_list = list(tensors)
+                for i, t in enumerate(tensors):
+                    if torch.is_tensor(t) and t.is_cuda:
+                        pending.append((new_list, i, t))
+                cpu_per_rid[rid][name] = new_list
+        if pending:
+            buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
+
+            def to_host(span: torch.Tensor) -> torch.Tensor:
+                key = ("check_stop", span.dtype, (span.numel(),))
+                idx = buffer_indices[key]
+                buffer_indices[key] += 1
+                cpu_t = self._get_pinned_d2h_buffer("check_stop", (span.numel(),), span.dtype, idx)
+                cpu_t.copy_(span, non_blocking=True)
+                return cpu_t
+
+            with torch.cuda.stream(side):
+                host = apply_coalesced([t for _, _, t in pending], to_host)
+            for (lst, i, _), h in zip(pending, host, strict=True):
+                lst[i] = h
         side.synchronize()
 
         return cpu_per_rid
