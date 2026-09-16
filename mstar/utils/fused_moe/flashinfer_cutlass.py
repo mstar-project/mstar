@@ -133,11 +133,14 @@ class FlashInferMXFP4Experts:
 
     # ------------------------------------------------------------------ forward
     @torch.compiler.disable
-    def __call__(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         from flashinfer import fused_moe
 
         assert self.converted, "convert() the expert weights first"
-        out = torch.empty(z.shape[0], z.shape[1], dtype=torch.bfloat16, device=z.device)
+        if out is None or out.dtype != torch.bfloat16 or not out.is_contiguous():
+            out = torch.empty(z.shape[0], z.shape[1], dtype=torch.bfloat16, device=z.device)
         fused_moe.cutlass_fused_moe(
             z.to(torch.bfloat16), topk_idx.to(torch.int32), topk_weight.to(torch.float32),
             self.w13, self.w2, torch.bfloat16, quant_scales=self.quant_scales,
