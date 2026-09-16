@@ -382,6 +382,22 @@ class APIServer:
                         logger.warning("Unexpected message type: %s", type(message))
                         continue
 
+                    if message.message_type == "inline_results":
+                        # a worker's whole step of small outputs in one message: no
+                        # transport read, nothing to ack for requests that are gone
+                        with self.request_lock:
+                            for res in message.body.results:
+                                if res.request_id in self.pending_requests:
+                                    self.preprocess_worker.new_inline_result(res, message.body.data)
+                                elif res.request_id in self.recently_completed:
+                                    logger.warning(
+                                        "Inline results for %s arrived after the client finished; "
+                                        "dropping them", res.request_id,
+                                    )
+                                else:
+                                    logger.warning("Inline results for unknown request %s", res.request_id)
+                        continue
+
                     rid = message.body.request_id
 
                     with self.request_lock:
