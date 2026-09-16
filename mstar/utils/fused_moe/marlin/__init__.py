@@ -157,6 +157,7 @@ class MarlinMXFP4Experts:
         self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from mstar.utils.fused_moe.align import moe_align_block_size
+        from mstar.utils.fused_moe.kernels import moe_sum_reduce_triton
         from mstar.utils.fused_moe.mxfp4 import situ_and_mul_triton
 
         m, k = z.shape
@@ -182,7 +183,9 @@ class MarlinMXFP4Experts:
             c2, c3, self.w2, None, self.s2, None, None, None, None, None, self.workspace,
             sorted_ids, expert_ids, num_post_pad, w, bs_m, 1, True, FP4_E2M1F_ID,
             m * top_k, k, inter, True, False, True, False, -1, -1, -1)
+        # the top-k sum: the in-tree Triton reduce is bit-identical to torch.sum and faster from
+        # 8 rows on (3.3 vs 3.7 µs at 8, 3.6 vs 4.7 at 64, 6.4 vs 9.9 at 256; bench/kernels/topk_sum_bench.py)
         if out is None:
-            return c3.view(m, top_k, k).sum(dim=1)
-        torch.sum(c3.view(m, top_k, k), dim=1, out=out)
+            out = torch.empty(m, k, dtype=z.dtype, device=z.device)
+        moe_sum_reduce_triton(c3.view(m, top_k, k), out)
         return out
