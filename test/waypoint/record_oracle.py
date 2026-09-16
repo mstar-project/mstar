@@ -66,10 +66,13 @@ is that LUT evaluated both ways, so Phase 9 has the number instead of an argumen
 
 Noise is an input, not model behaviour, and the reference draws it unseeded
 (``torch.randn(..., device=cuda, dtype=bf16)``), which no oracle can reproduce.
-This draws fp32 from a seeded CPU generator and casts, matching how the port
-draws it (``mstar/model/waypoint/submodules.py::_frame_noise``), saves both
-tensors, and records the substitution. Seeding also makes the run re-recordable,
-which is what lets ``--ring-snapshot-frames`` be narrowed by default.
+The port now draws the same way — bf16 straight onto the device, but from a
+seeded per-frame ``Generator`` (``mstar/model/waypoint/submodules.py::_frame_noise``).
+This recorder instead draws fp32 from a seeded CPU generator, casts, and injects
+that tensor into both sides, so the substitution stays device-independent and
+re-recordable regardless of how the port draws — which is what lets
+``--ring-snapshot-frames`` be narrowed by default. It saves both tensors and
+records the substitution.
 
 Usage:
 

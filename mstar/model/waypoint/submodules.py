@@ -295,19 +295,24 @@ class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodul
     ) -> torch.Tensor:
         """``[1, 1, C, H, W]`` of fresh noise for this frame.
 
-        Drawn fp32 on a CPU generator and cast, rather than bf16 straight onto
-        the device: a CPU draw is reproducible across devices, which is what
-        makes "same seed, same frame, same tensor" a testable claim. The
-        reference draws bf16 on device and unseeded, so there is no
-        bit-exactness here to preserve — only the distribution.
+        Drawn straight onto the device. Determinism is now per-GPU: 
+        a CUDA generator reproduces run-to-run on the same arch + torch build, 
+        not against a CPU draw or another arch. Runs in ``prepare_inputs``, outside any
+        captured region, so this is a normal stream-ordered kernel launch.
         """
-        generator = torch.Generator(device="cpu").manual_seed(
+        shape = (1, 1, *self.config.latent_shape)
+        if device.type == "meta":
+            # Shape-only builds (meta-device shell tests) have no RNG to seed.
+            return torch.empty(shape, device=device, dtype=dtype)
+        generator = torch.Generator(device=device).manual_seed(
             _frame_seed(request_seed, frame_pos)
         )
-        noise = torch.randn(
-            (1, 1, *self.config.latent_shape), generator=generator, dtype=torch.float32
+        return torch.randn(
+            shape,
+            generator=generator,
+            device=device,
+            dtype=dtype,
         )
-        return noise.to(device=device, dtype=dtype)
 
     def _controller_slice(
         self,

@@ -332,6 +332,9 @@ class CondHead(nn.Module):
         self.cond_proj = nn.ModuleList(
             nn.Linear(config.d_model, config.d_model, bias=False) for _ in range(self.n_cond)
         )
+        # ``[S, 6, 1, 1, D]`` after ``build_cache``; None keeps ``forward`` on
+        # the live projection until the runtime tables are materialized.
+        self._cache: torch.Tensor | None = None
 
     def _project(self, cond: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """The live head: ``cond`` ``[B, N, D]`` -> six ``[B, N, D]`` tensors, in
