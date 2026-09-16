@@ -9,6 +9,11 @@
 // not needed.  Registered under the ``_mstar_moe_C`` op namespace so it never
 // collides with a real vLLM ``_moe_C`` in the same process.
 //
+// Local change: expert ids outside ``[0, num_experts)`` are skipped in every
+// kernel (upstream's small-batch kernel did not check), so an expert-parallel
+// rank can hand in the assignments of experts it does not hold under an
+// out-of-range id (``ExpertSharding.invalid_id``) and they get no slot.
+//
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -57,7 +62,7 @@ __global__ void moe_align_block_size_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
+    if (expert_id >= num_experts || expert_id < 0) {
       continue;
     }
     int warp_idx = expert_id / experts_per_warp;
@@ -117,7 +122,7 @@ __global__ void count_and_sort_expert_tokens_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
+    if (expert_id >= num_experts || expert_id < 0) {
       continue;
     }
     int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
@@ -148,7 +153,11 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i]];
+    int32_t expert_id = topk_ids[i];
+    if (expert_id >= num_experts || expert_id < 0) {
+      continue;  // held by another expert-parallel rank (mstar: ExpertSharding.invalid_id)
+    }
+    ++tokens_cnts[(threadIdx.x + 1) * num_experts + expert_id];
   }
 
   __syncthreads();
@@ -192,6 +201,9 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
+    if (expert_id >= num_experts || expert_id < 0) {
+      continue;
+    }
     int32_t rank_post_pad =
         tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
