@@ -2,22 +2,23 @@
 
 ## Install names
 
-The engine is published as **`m-star`** on PyPI (the bare `mstar` name was
-already taken). The import package and console scripts are unchanged:
+The engine is published as **`mstar-ai`** on PyPI. The bare `mstar` name is
+taken by an unrelated project, and PyPI's similarity rule (separators are
+dropped before names are compared) refuses `m-star` while that project
+exists. The import package and console scripts are unchanged:
 
 ```
-pip install m-star
+pip install mstar-ai
 python -c "import mstar"
 mstar --help
 ```
 
-`mstar-ai` and `mstar-project` are alias packages (under
-`packaging/aliases/`) that carry no code and just depend on `m-star`, so
-`pip install mstar-ai` resolves to the same thing. They mirror m-star's
-extras, so `pip install "mstar-ai[all]"` forwards to `m-star[all]`; keep
-their `[project.optional-dependencies]` in sync when m-star's extras change.
-PyPI treats `m-star`, `m_star`, `m.star`, and `M-Star` as one name, but
-`mstar` (no separator) is a separate project.
+`mstar-project` is an alias package (under
+`packaging/aliases/`) that carries no code and just depends on `mstar-ai`, so
+`pip install mstar-project` resolves to the same thing. It mirrors mstar-ai's
+extras, so `pip install "mstar-project[all]"` forwards to `mstar-ai[all]`. Keep
+its `[project.optional-dependencies]` in sync when mstar-ai's extras change.
+PyPI treats `mstar-ai`, `mstar_ai`, `mstar.ai` and `MSTAR-AI` as one name.
 
 ## Default configs
 
@@ -39,7 +40,7 @@ Version lives in `pyproject.toml` (`[project] version`). To release:
 3. The `Publish to PyPI` workflow builds the sdist and wheel and uploads
    them over Trusted Publishing (OIDC — no token stored in the repo).
 
-One-time PyPI setup: add a pending Trusted Publisher for project `m-star`
+One-time PyPI setup: add a pending Trusted Publisher for project `mstar-ai`
 (owner `mstar-project`, repo `mstar`, workflow `release.yml`, environment
 `pypi`).
 
@@ -47,10 +48,10 @@ One-time PyPI setup: add a pending Trusted Publisher for project `m-star`
 
 ```
 pip install build twine
-python -m build                       # -> dist/m_star-<ver>.tar.gz + .whl
+python -m build                       # -> dist/mstar_ai-<ver>.tar.gz + .whl
 twine upload --repository testpypi dist/*     # optional TestPyPI dry run
 ```
 
 The alias packages are built and published from their own directories, e.g.
-`cd packaging/aliases/mstar-ai && python -m build`, and only need
+`cd packaging/aliases/mstar-project && python -m build`, and only need
 re-publishing if their metadata changes.

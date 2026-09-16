@@ -6,8 +6,8 @@ from importlib.metadata import version as _pkg_version
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
-# "m-star" is the distribution name whereas "mstar" is the import name.
-package_version = _pkg_version("m-star")
+# "mstar-ai" is the distribution name whereas "mstar" is the import name.
+package_version = _pkg_version("mstar-ai")
 
 project = "M*"
 author = "M* Team"

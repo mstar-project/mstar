@@ -1,8 +1,8 @@
 name: Publish to PyPI
 
-# Publishes the m-star distribution when a GitHub Release is published.
+# Publishes the mstar-ai distribution when a GitHub Release is published.
 # Uses PyPI Trusted Publishing (OIDC) — no API token or secret needed.
-# Configure a pending publisher on PyPI first: project m-star, owner
+# Configure a pending publisher on PyPI first: project mstar-ai, owner
 # mstar-project, repo mstar, workflow release.yml, environment pypi.
 #
 # The alias packages under packaging/aliases/ change rarely and are
