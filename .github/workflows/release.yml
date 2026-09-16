@@ -7,10 +7,11 @@ name: Publish to PyPI
 # (project mstar-ai, mstar-project or mstar-serve, owner mstar-project, repo
 # mstar, workflow release.yml, environment pypi).
 #
-# Every publish step mints its own token and PyPI activates one pending
-# publisher per token, so on the very first release a later step can fail as
-# not authorized. Uploads skip files that already exist, so re-running the
-# failed job finishes the release.
+# PyPI allows only one pending publisher per configuration at a time and
+# activates it on first use, so the three projects have to be bootstrapped
+# one release run at a time: publish with the engine's pending publisher,
+# add the next alias's pending publisher, re-run the failed job, repeat.
+# Uploads skip files that already exist, so re-runs are safe.
 
 on:
   release:

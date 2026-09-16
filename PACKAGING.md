@@ -44,12 +44,15 @@ release:
    uploads them over Trusted Publishing (OIDC, no token stored in the repo).
    The `pypi` environment asks one of its reviewers to approve the run first.
 
-One-time PyPI setup: add a pending Trusted Publisher for each project
-(`mstar-ai`, `mstar-project` and `mstar-serve`, all with owner `mstar-project`,
-repo `mstar`, workflow `release.yml`, environment `pypi`). PyPI activates one
-pending publisher per upload step, so on the very first release a later upload
-step can fail as not authorized. Re-running the failed job finishes it, the
-uploads skip files that already exist.
+One-time PyPI setup: each project needs a pending Trusted Publisher (owner
+`mstar-project`, repo `mstar`, workflow `release.yml`, environment `pypi`).
+PyPI allows only one pending publisher per configuration at a time and turns
+it into a real one at the first upload, so the three projects are bootstrapped
+in turn: add the publisher for `mstar-ai` and publish the release (the alias
+steps fail as not authorized), add the one for `mstar-project` and re-run the
+failed job, then the same for `mstar-serve`. The uploads skip files that
+already exist, so re-runs are safe. Once all three projects exist, a single run
+publishes all of them.
 
 ## Local build / dry run
 
