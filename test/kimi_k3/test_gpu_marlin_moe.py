@@ -30,7 +30,7 @@ def _small_moe():
         moe.experts.gate_up_scale.copy_(s13)
         moe.experts.down_packed.copy_(p2)
         moe.experts.down_scale.copy_(s2)
-        for prm in (moe.gate.weight, moe.routed_expert_down_proj.weight, moe.routed_expert_up_proj.weight):
+        for prm in (moe.gate.weight, moe.in_proj.weight, moe.routed_expert_up_proj.weight):
             prm.normal_(std=0.05)
         moe.gate.e_score_correction_bias.normal_(std=0.01)
     return moe, hidden
@@ -41,7 +41,7 @@ def test_marlin_backend_matches_triton():
     moe, hidden = _small_moe()
     with torch.no_grad():
         x = torch.randn(37, hidden, device=DEV, dtype=torch.bfloat16)
-        z = moe.routed_expert_down_proj(x)
+        z = moe.routed_down(x)
         idx, w = moe.gate(x)
         ref = moe._routed(z, idx, w).float()  # Triton MXFP4 kernel
         moe.prepare_experts_backend("marlin", DEV)
@@ -78,7 +78,7 @@ def test_marlin_backend_replays_in_cuda_graph():
     moe.prepare_experts_backend("marlin", DEV)
     with torch.no_grad():
         x = torch.randn(3, hidden, device=DEV, dtype=torch.bfloat16)
-        z = moe.routed_expert_down_proj(x)
+        z = moe.routed_down(x)
         idx, w = moe.gate(x)
         eager = moe._routed(z, idx, w).clone()
         static_z, static_idx, static_w = z.clone(), idx.clone(), w.clone()
@@ -92,7 +92,7 @@ def test_marlin_backend_replays_in_cuda_graph():
             out = moe._routed(static_z, static_idx, static_w)
         # new routing through the same graph: the kernels read every address from tensors
         x2 = torch.randn(3, hidden, device=DEV, dtype=torch.bfloat16)
-        z2 = moe.routed_expert_down_proj(x2)
+        z2 = moe.routed_down(x2)
         idx2, w2 = moe.gate(x2)
         static_z.copy_(z2); static_idx.copy_(idx2); static_w.copy_(w2)
         g.replay()
@@ -110,7 +110,7 @@ def test_marlin_backend_writes_into_a_given_output():
     moe.prepare_experts_backend("marlin", DEV)
     with torch.no_grad():
         x = torch.randn(5, hidden, device=DEV, dtype=torch.bfloat16)
-        z = moe.routed_expert_down_proj(x)
+        z = moe.routed_down(x)
         idx, w = moe.gate(x)
         plain = moe._routed(z, idx, w)
         out = torch.empty_like(plain)
@@ -151,7 +151,7 @@ def _sharded_copies(full, world, ep, p13, s13, p2, s2, backend):
             _load_expert_shards(m, p13, s13, p2, s2, full.moe_intermediate_size)
             m.gate.weight.copy_(full.gate.weight)
             m.gate.e_score_correction_bias.copy_(full.gate.e_score_correction_bias)
-            m.routed_expert_down_proj.weight.copy_(full.routed_expert_down_proj.weight)
+            m.in_proj.weight.copy_(full.in_proj.weight)
         if backend is not None:
             m.prepare_experts_backend(backend, DEV)
         ranks.append(m)
@@ -172,7 +172,7 @@ def test_marlin_expert_parallel_partials_sum_to_full(world, ep):
     moe.prepare_experts_backend("marlin", DEV)
     with torch.no_grad():
         x = torch.randn(37, hidden, device=DEV, dtype=torch.bfloat16)
-        z = moe.routed_expert_down_proj(x)
+        z = moe.routed_down(x)
         idx, w = moe.gate(x)
         ref = moe._routed(z, idx, w).float()
         parts = [m._routed(z, idx, w) for m in ranks]
