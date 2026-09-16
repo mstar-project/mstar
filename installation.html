@@ -555,6 +555,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requirements">Requirements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-pypi">Install from PyPI</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-source">Install from source</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
@@ -595,9 +596,28 @@ inference.</p></li>
 BAGEL-7B, Qwen3-Omni-30B) are multi-GPU-class models.</p></li>
 </ul>
 </section>
+<section id="install-from-pypi">
+<h2>Install from PyPI<a class="headerlink" href="#install-from-pypi" title="Link to this heading">#</a></h2>
+<p>Released versions are on PyPI as <code class="docutils literal notranslate"><span class="pre">mstar-ai</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar-project</span></code> and <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> are
+alias packages that install the same thing). The import package and the console scripts
+are still <code class="docutils literal notranslate"><span class="pre">mstar</span></code>. We recommend <a class="reference external" href="https://docs.astral.sh/uv/">uv</a> to create the
+Python 3.12 environment:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Create and activate a Python 3.12 virtualenv (--seed adds pip to it)</span>
+uv<span class="w"> </span>venv<span class="w"> </span>--python<span class="w"> </span><span class="m">3</span>.12<span class="w"> </span>--seed
+<span class="nb">source</span><span class="w"> </span>.venv/bin/activate
+
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span><span class="s2">"mstar-ai[all]"</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>bagel
+</pre></div>
+</div>
+<p>The extras are the same as for a source install (see <a class="reference internal" href="#optional-dependencies">Optional dependencies</a>), so
+<code class="docutils literal notranslate"><span class="pre">mstar-ai[bagel]</span></code> or <code class="docutils literal notranslate"><span class="pre">mstar-ai[qwen3_omni,audio]</span></code> work the same way. The default
+deployment configs ship inside the package, so <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">&lt;model&gt;</span></code> works without a
+checkout. Keep <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> on every install, see the note below.</p>
+</section>
 <section id="install-from-source">
 <h2>Install from source<a class="headerlink" href="#install-from-source" title="Link to this heading">#</a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">mstar</span></code> is installed from source in editable mode. We recommend <a class="reference external" href="https://docs.astral.sh/uv/">uv</a> to create the Python 3.12 environment:</p>
+<p>To work on the code, install from source in editable mode:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/mstar-project/mstar.git
 <span class="nb">cd</span><span class="w"> </span>mstar
 
@@ -933,6 +953,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#requirements">Requirements</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-pypi">Install from PyPI</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-source">Install from source</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
