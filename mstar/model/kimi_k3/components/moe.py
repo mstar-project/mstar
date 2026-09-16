@@ -14,6 +14,11 @@ model's ``load_weights`` (packed MXFP4 bytes and scales stay packed in ``quantiz
 Routed dispatch: the reference per-expert loop (any device), the in-tree Triton grouped
 GEMM, or a converted-weight backend (Marlin, FlashInfer CUTLASS) installed by
 ``prepare_experts_backend``; ``dispatch="reference"`` forces the loop.
+
+The layer input is projected once: ``in_proj`` = ``routed_expert_down_proj`` (replicated latent
+down-projection) | ``shared_experts.gate_proj`` | ``shared_experts.up_proj`` (column-parallel), one
+62 MB GEMM per rank instead of a 51 MB and an 11 MB launch (``MOE_IN_PROJ_PARAMS`` routes the
+checkpoint tensors by segment). The router keeps its own fp32-output GEMM.
 """
 from __future__ import annotations
 
@@ -25,18 +30,27 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import RowParallelLinear
+from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
 from mstar.model.components.expert_sharding import ExpertSharding
 from mstar.model.kimi_k3.components.common import (
     KimiRMSNorm,
-    ReplicatedLinear,
+    SiTUAndMul,
     replicated_loader,
     restore_kept_dtypes,
 )
-from mstar.model.kimi_k3.components.mlp import ParallelSiTUMLP
 from mstar.model.kimi_k3.reference.moe import routed_experts_loop
 from mstar.model.kimi_k3.reference.mxfp4 import MXFP4_GROUP, dequant_mxfp4
 from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_route_supported, gate_logits
 from mstar.model.kimi_k3.reference.router import noaux_tc_route
+
+
+# stacked-shard rules for the merged input projection; the shared-expert rules must precede the
+# generic ``.gate_proj -> .gate_up_proj`` rules of the dense MLPs in the model's rule list
+MOE_IN_PROJ_PARAMS = [
+    (".in_proj", ".routed_expert_down_proj", "routed_down"),
+    ("block_sparse_moe.in_proj", "block_sparse_moe.shared_experts.gate_proj", "shared_gate"),
+    ("block_sparse_moe.in_proj", "block_sparse_moe.shared_experts.up_proj", "shared_up"),
+]
 
 
 def _expert_gate_up_loader(sharding: ExpertSharding, param, loaded, loaded_shard_id=None):
@@ -164,7 +178,17 @@ class KimiLatentMoE(nn.Module):
             hidden_size, num_experts, top_k, renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor, num_expert_group=num_expert_group, topk_group=topk_group,
         )
-        self.routed_expert_down_proj = ReplicatedLinear(hidden_size, latent_size)
+        # one GEMM on the layer input: the replicated latent down-projection and, when present,
+        # the shared experts' column-parallel gate | up (adjacent, so SiTU reads them as one block)
+        shared_inter = moe_intermediate_size * num_shared_experts
+        segments = [("routed_down", latent_size, REPLICATED)]
+        if num_shared_experts:
+            segments += [("shared_gate", shared_inter, COLUMN), ("shared_up", shared_inter, COLUMN)]
+        self.in_proj = MergedParallelLinear(comm_group, hidden_size, segments)
+        if num_shared_experts:
+            # SiTU reads gate | up as one [T, 2 * S_local] block: the two segments must be adjacent
+            gate_off, up_off = self.in_proj.offsets["shared_gate"], self.in_proj.offsets["shared_up"]
+            assert up_off == gate_off + self.in_proj.local_sizes["shared_gate"], (gate_off, up_off)
         # row-parallel over the latent: each rank projects its slice of the (replicated,
         # normalized) latent and the partial rides the same all-reduce as the shared
         # experts' partial -- one collective on hidden, and 1/tp of the up-proj weights
@@ -190,10 +214,15 @@ class KimiLatentMoE(nn.Module):
             self.experts.down_proj = nn.Parameter(torch.empty(e_local, latent_size, self.inter_local))
         self.shared_experts = None
         if num_shared_experts:
-            self.shared_experts = ParallelSiTUMLP(
-                hidden_size, moe_intermediate_size * num_shared_experts, comm_group=comm_group,
-                situ_beta=situ_beta, situ_linear_beta=situ_linear_beta, reduce_results=False,
+            # gate/up live in in_proj; the SiTU-GLU and the row-parallel down-projection (its
+            # partial rides the layer's final all-reduce) stay under the checkpoint's module name
+            self.shared_experts = nn.Module()
+            self.shared_experts.act = SiTUAndMul(situ_beta, situ_linear_beta)
+            self.shared_experts.down_proj = RowParallelLinear(
+                comm_group=comm_group, input_size=shared_inter, output_size=hidden_size,
+                bias=False, input_is_parallel=True, reduce_results=False,
             )
+            self._shared_gate_up = (self.in_proj.offsets["shared_gate"], 2 * self.in_proj.local_sizes["shared_gate"])
         # a converted-weight expert backend (FlashInfer CUTLASS or Marlin) once
         # prepare_experts_backend() ran; it owns the routed forward from then on
         self._backend = None
@@ -216,7 +245,6 @@ class KimiLatentMoE(nn.Module):
         else:
             self.experts.gate_up_proj.weight_loader = partial(_expert_gate_up_loader, sh)
             self.experts.down_proj.weight_loader = partial(_expert_down_loader, sh, 1)
-        self.routed_expert_down_proj.weight.weight_loader = replicated_loader
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
@@ -312,11 +340,25 @@ class KimiLatentMoE(nn.Module):
             self.situ_beta, self.situ_linear_beta,
         )
 
+    def routed_down(self, x: torch.Tensor) -> torch.Tensor:
+        """The latent input of the routed experts ``[T, latent]`` (tests; the forward takes the
+        same view out of the merged projection)."""
+        return self.in_proj.project(x.reshape(-1, self.hidden_size))["routed_down"].contiguous()
+
+    def _shared(self, mixed: torch.Tensor) -> torch.Tensor:
+        """Shared experts' partial ``[T, hidden]`` from the merged projection's gate | up block (a
+        strided view: the SiTU kernel takes the row stride)."""
+        off, width = self._shared_gate_up
+        return self.shared_experts.down_proj(self.shared_experts.act(mixed.narrow(-1, off, width)))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.hidden_size)
         topk_idx, topk_weight = self.gate(x)
-        z = self.routed_expert_down_proj(x)
+        mixed = self.in_proj(x)
+        # the expert kernels read the latent as a plain row-major matrix (a view of the merged
+        # output is one for a single row, a small copy otherwise)
+        z = mixed.narrow(-1, 0, self.latent_size).contiguous()
         # this rank's partial sum (over its intermediate shard and/or its experts); the fused backends
         # write it straight into the symmetric all-reduce buffer when that path applies (no copy launch)
         buf = self.comm_group.symm_buffer(z.shape, z.dtype, z.device)
@@ -331,7 +373,7 @@ class KimiLatentMoE(nn.Module):
             y = self.routed_expert_norm(y)
         y = self.routed_expert_up_proj(y)  # partial over the latent shards
         if self.shared_experts is not None:
-            s_out = self.shared_experts(x)  # partial over the intermediate shards
+            s_out = self._shared(mixed)  # partial over the intermediate shards
             buf = self.comm_group.symm_buffer(y.shape, y.dtype, y.device)
             if buf is not None:  # the add lands in the all-reduce buffer: no copy launch
                 torch.add(y, s_out, out=buf)
@@ -342,4 +384,4 @@ class KimiLatentMoE(nn.Module):
         return y.view(shape)
 
 
-__all__ = ["KimiLatentMoE", "NoAuxTCRouter", "F"]
+__all__ = ["MOE_IN_PROJ_PARAMS", "KimiLatentMoE", "NoAuxTCRouter", "F"]
