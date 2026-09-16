@@ -241,8 +241,11 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - ``0``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+     - unset
+     - Async scheduling for lockstep-parallel (TP / SP) nodes. Unset: a
+       parallel node runs it when its submodule sets
+       ``NodeSubmodule.prefers_tp_async_scheduling`` (Kimi K3 does), else the
+       serial protocol. ``1``: the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative
@@ -254,7 +257,8 @@ Worker scheduling
        rank from replicated state, never signalled. A comma-separated
        list of node names (``thinker,talker``) enables it for those
        parallel nodes only. ``0``: the serial path — leader schedules
-       after N, followers rebuild after the broadcast. Set it identically
+       after N, followers rebuild after the broadcast — whatever the
+       submodule prefers. Set it identically
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
        ``0`` with it: that throttle holds the GPU thread until step N drains,
