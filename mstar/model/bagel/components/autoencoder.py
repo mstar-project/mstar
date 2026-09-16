@@ -263,11 +263,16 @@ class DiagonalGaussian(nn.Module):
         self.sample = sample
         self.chunk_dim = chunk_dim
 
-    def forward(self, z: Tensor) -> Tensor:
+    def forward(self, z: Tensor, noise: Tensor | None = None) -> Tensor:
+        """``noise`` is the standard-normal draw for the sample; pass one made
+        from a seeded generator for a repeatable encode. Drawn from the global
+        RNG when omitted."""
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
         if self.sample:
             std = torch.exp(0.5 * logvar)
-            return mean + std * torch.randn_like(mean)
+            if noise is None:
+                noise = torch.randn_like(mean)
+            return mean + std * noise.to(mean.dtype)
         else:
             return mean
 
@@ -293,12 +298,26 @@ class BagelAutoEncoder(nn.Module):
             z_channels=params.z_channels,
         )
         self.reg = DiagonalGaussian()
+        self.z_channels = params.z_channels
+        self.downsample = params.downsample
 
         self.scale_factor = params.scale_factor
         self.shift_factor = params.shift_factor
 
-    def encode(self, x: Tensor) -> Tensor:
-        z = self.reg(self.encoder(x))
+    def posterior_noise(
+        self, height: int, width: int, generator: torch.Generator | None = None,
+        device: torch.device | str | None = None,
+    ) -> Tensor:
+        """The standard-normal draw ``encode`` samples the posterior with, shaped
+        for a (height, width) image. Make it from a seeded generator to get the
+        same latent for the same image and seed."""
+        return torch.randn(
+            1, self.z_channels, height // self.downsample, width // self.downsample,
+            generator=generator, device=device,
+        )
+
+    def encode(self, x: Tensor, noise: Tensor | None = None) -> Tensor:
+        z = self.reg(self.encoder(x), noise=noise)
         z = self.scale_factor * (z - self.shift_factor)
         return z
 

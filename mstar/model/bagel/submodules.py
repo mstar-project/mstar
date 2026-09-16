@@ -427,6 +427,11 @@ class ViTEncoderSubmodule(NodeSubmodule):
         return out
 
 
+# Added to the request seed for the VAE posterior draw, so it is a different
+# stream from the diffusion's initial noise (seeded with the request seed itself).
+_VAE_NOISE_SEED_OFFSET = 0x9E3779B9
+
+
 class VAEEncoderSubmodule(NodeSubmodule):
     """VAE encode + patchify + vae2llm + time_embedder + latent_pos_embed.
 
@@ -507,10 +512,20 @@ class VAEEncoderSubmodule(NodeSubmodule):
             max_num_patches_per_side=self.max_latent_size
         )
 
+        # The VAE samples its posterior. Drawing that noise here from the
+        # request's seed makes image-to-image repeatable per seed, like the
+        # diffusion's initial noise; the global RNG would differ per run.
+        generator = torch.Generator(device=device)
+        generator.manual_seed(fwd_info.random_seed + _VAE_NOISE_SEED_OFFSET)
+        vae_noise = self.vae_model.posterior_noise(
+            img_h, img_w, generator=generator, device=device,
+        )
+
         tensor_inputs = {
             "padded_images": image_tensor.unsqueeze(0),
             "packed_vae_position_ids": packed_vae_position_ids,
             "packed_timesteps": torch.tensor([0.0], device=device),
+            "vae_noise": vae_noise,
         }
         kwargs = {
             "h": h,
@@ -526,6 +541,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         padded_images: torch.Tensor,
         packed_vae_position_ids: torch.Tensor,
         packed_timesteps: torch.Tensor,
+        vae_noise: torch.Tensor,
         h: int,
         w: int,
         **kwargs,
@@ -538,7 +554,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
             packed_timesteps.shape, h, w
         )
 
-        latent = self.vae_model.encode(padded_images)
+        latent = self.vae_model.encode(padded_images, noise=vae_noise)
 
         p = self.latent_patch_size
         # h, w are already ints from preprocess (CUDA graph compatible)
