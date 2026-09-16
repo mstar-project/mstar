@@ -100,3 +100,24 @@ def test_marlin_backend_replays_in_cuda_graph():
         expect = moe._routed(z2, idx2, w2)
     torch.testing.assert_close(out, expect, rtol=0, atol=0)
     torch.testing.assert_close(moe._routed(z, idx, w), eager, rtol=0, atol=0)
+
+
+@cuda
+def test_marlin_backend_writes_into_a_given_output():
+    """``out=`` receives the summed expert outputs bit for bit (the caller's all-reduce buffer),
+    including through the token-chunked path."""
+    moe, hidden = _small_moe()
+    moe.prepare_experts_backend("marlin", DEV)
+    with torch.no_grad():
+        x = torch.randn(5, hidden, device=DEV, dtype=torch.bfloat16)
+        z = moe.routed_expert_down_proj(x)
+        idx, w = moe.gate(x)
+        plain = moe._routed(z, idx, w)
+        out = torch.empty_like(plain)
+        res = moe._routed(z, idx, w, out=out)
+        assert res is out and torch.equal(out, plain)
+        moe._backend.max_chunk_tokens = 2  # chunked: slices of the output buffer
+        out2 = torch.empty_like(plain)
+        res2 = moe._routed(z, idx, w, out=out2)
+        assert res2 is out2 and torch.equal(out2, plain)
+        assert torch.equal(moe._routed(z, idx, w), plain)
