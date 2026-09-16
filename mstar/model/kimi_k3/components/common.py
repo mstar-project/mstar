@@ -43,7 +43,9 @@ class SiTUAndMul(nn.Module):
             # one Triton kernel (fp32 math, like the reference) instead of six elementwise ones
             from mstar.utils.fused_moe.mxfp4 import situ_and_mul_triton
 
-            x = gate_up.reshape(-1, gate_up.shape[-1]).contiguous()
+            x = gate_up.reshape(-1, gate_up.shape[-1])  # a 2-D view keeps a merged projection's row stride
+            if x.stride(-1) != 1:
+                x = x.contiguous()
             out = torch.empty(x.shape[0], x.shape[1] // 2, dtype=x.dtype, device=x.device)
             situ_and_mul_triton(x, out, self.beta, self.linear_beta)
             return out.view(*gate_up.shape[:-1], x.shape[1] // 2)
@@ -51,8 +53,8 @@ class SiTUAndMul(nn.Module):
 
 
 class ReplicatedLinear(nn.Module):
-    """A full-width linear every rank holds (small projections: latent down/up, the
-    MLA LoRA-A projections, the KDA ``f_a_proj``)."""
+    """A full-width linear every rank holds (small replicated projections; the ones that
+    share an input now live as replicated segments of a ``MergedParallelLinear``)."""
 
     def __init__(self, input_size: int, output_size: int, bias: bool = False, dtype=None):
         super().__init__()
