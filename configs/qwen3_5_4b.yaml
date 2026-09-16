@@ -7,12 +7,5 @@ node_groups:
   - node_names: [LLM, vision_encoder]
     ranks: [0]
 resources:
-  # A delta-net slot is ~50 MiB per request (24 layers x 32 heads x 128 x 128
-  # fp32), so the pool's 256-slot default would reserve ~12.5 GiB before any
-  # KV. The floor is cuda graph capture's: sum over configs of
-  # (num_slots x max capture bs) = 2x32 decode + 2x16 prefill_text
-  # + 2x16 prefill_vision = 128 usable, plus the sink slot. Raising either
-  # PREFILL/DECODE_CAPTURE_BATCH_SIZES raises this, and capture fails
-  # outright if it does not fit.
   gdn_state:
     max_slots: 129
