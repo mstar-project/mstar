@@ -1,7 +1,9 @@
-"""Tensor parallelism without GPUs: the ranks run in threads and share a fake comm group
-whose collectives are barrier-synchronised exchanges (same semantics as ``CommGroup``:
+"""Tensor and expert parallelism without GPUs: the ranks run in threads and share a fake comm
+group whose collectives are barrier-synchronised exchanges (same semantics as ``CommGroup``:
 all_gather concatenates in rank order, all_reduce sums in place). Checks the sharded weight
-loaders and the TP dense forward against the single-rank model on the tiny checkpoint."""
+loaders and the parallel dense forward against the single-rank model on the tiny checkpoint,
+with the routed experts sharded on the intermediate dim (TP), placed whole on each rank (EP)
+or both (``moe_ep_size``)."""
 import threading
 
 import pytest
@@ -60,9 +62,9 @@ class FakeCommGroup(CommGroup):
         self._mb.barrier.wait()
 
 
-def _build(cfg, tiny_dir, group):
+def _build(cfg, tiny_dir, group, ep=1):
     with torch.device("meta"):
-        lm = KimiK3ForCausalLM(cfg, comm_group=group)
+        lm = KimiK3ForCausalLM(cfg, comm_group=group, moe_ep_size=ep)
     lm = lm.to(torch.bfloat16)
     for name, p in lm.named_parameters():
         if name.endswith(("A_log", "dt_bias", "e_score_correction_bias")):
@@ -73,8 +75,9 @@ def _build(cfg, tiny_dir, group):
     return lm
 
 
-@pytest.mark.parametrize("tp", [2, 4])
-def test_tp_dense_forward_matches_single_rank(tiny_dir, tp):
+@pytest.mark.parametrize("tp,ep", [(2, 1), (4, 1), (2, 2), (4, 2), (4, 4)])
+def test_tp_dense_forward_matches_single_rank(tiny_dir, tp, ep):
+    """``tp`` ranks; the routed experts in ``ep`` expert-parallel groups (1: pure TP)."""
     cfg = KimiK3Config.from_hf_dir(tiny_dir).text
     ref = _build(cfg, tiny_dir, CommGroup.trivial())
     torch.manual_seed(0)
@@ -82,9 +85,17 @@ def test_tp_dense_forward_matches_single_rank(tiny_dir, tp):
     with torch.no_grad():
         ref_logits, _ = ref.forward_dense(ids)
     mb = _Mailbox(tp)
-    lms = [_build(cfg, tiny_dir, FakeCommGroup(r, mb)) for r in range(tp)]
+    lms = [_build(cfg, tiny_dir, FakeCommGroup(r, mb), ep) for r in range(tp)]
     # the column-parallel lm_head shards concatenate back to the full weight
     assert torch.equal(torch.cat([lm.lm_head.weight for lm in lms], 0), ref.lm_head.weight)
+    # expert placement: ep groups of whole experts, each sharded over tp / ep ranks
+    moe_ref, moe = ref.model.layers[1].block_sparse_moe, lms[tp - 1].model.layers[1].block_sparse_moe
+    n_exp, inter = cfg.num_experts, cfg.moe_intermediate_size
+    assert moe.experts.gate_up_proj.shape == (n_exp // ep, 2 * inter // (tp // ep), moe_ref.latent_size)
+    sh = moe.sharding
+    for le in range(sh.local_experts):
+        cols = slice(sh.inter_offset, sh.inter_offset + sh.inter_local)
+        assert torch.equal(moe.experts.down_proj[le], moe_ref.experts.down_proj[sh.expert_offset + le][:, cols])
     outs: list[torch.Tensor | None] = [None] * tp
     errs: list[BaseException | None] = [None] * tp
 
