@@ -286,6 +286,33 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         self._executor.shutdown(wait=True)
 
 
+class LocalOnlyKVTransferEngine(KVTransferEngine):
+    """KV cache that never leaves its worker instance."""
+
+    def read_batched_async(
+        self, remote_kv_info, read_info: list[KVReadInfo]
+    ) -> Future | None:
+        del remote_kv_info
+        if read_info:
+            raise RuntimeError(
+                "Cross-worker KV migration was requested for a local-only "
+                "resource"
+            )
+        return None
+
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> None:
+        del request_id, label, page_indices, seq_len
+
+    def shutdown(self):
+        pass
+
+
 @dataclass(frozen=True)
 class ShmKVTransferInfo:
     path: str
@@ -306,6 +333,7 @@ class ShmKVTransferEngine(KVTransferEngine):
         kv_cache: KVCache,
         entity_id: str,
         shm_dir: str | None = None,
+        resource_key: str = "kv",
     ):
         self._kv_cache = kv_cache
         root = shm_dir or os.getenv("MSTAR_KV_SHM_DIR")
@@ -318,13 +346,16 @@ class ShmKVTransferEngine(KVTransferEngine):
         self._shm_dir = root
         os.makedirs(self._shm_dir, exist_ok=True)
         self._entity_id = entity_id
+        self._resource_key = resource_key
         self._published: dict[
             tuple[str, str],
             tuple[tuple[tuple[int, ...], int], ShmKVTransferInfo],
         ] = {}
 
     def _path(self, request_id: str, label: str) -> str:
-        key = f"{self._entity_id}:{request_id}:{label}".encode()
+        key = (
+            f"{self._entity_id}:{self._resource_key}:{request_id}:{label}"
+        ).encode()
         digest = hashlib.sha256(key).hexdigest()
         return os.path.join(self._shm_dir, f"mstar_kv_{digest}.pt")
 
@@ -457,7 +488,9 @@ class TransferEngineInfo:
 class KVTransferManager:
     def __init__(
         self, transfer_engine_info: TransferEngineInfo,
-        kv_cache: KVCache
+        kv_cache: KVCache,
+        resource_key: str = "kv",
+        needs_remote_transfer: bool = True,
     ):
         from mstar.communication.tensors import (
             LocalTransferEngine,
@@ -480,11 +513,14 @@ class KVTransferManager:
         ):
             if kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
-            else:
+            elif needs_remote_transfer:
                 self._kv_transfer_engine = ShmKVTransferEngine(
                     kv_cache=kv_cache,
                     entity_id=transfer_engine_info.my_entity_id,
+                    resource_key=resource_key,
                 )
+            else:
+                self._kv_transfer_engine = LocalOnlyKVTransferEngine()
         else:
             raise ValueError(f"Unsupported transfer engine type: {type(transfer_engine_info.transfer_engine)}")
 

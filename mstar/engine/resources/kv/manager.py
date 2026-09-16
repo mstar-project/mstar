@@ -188,6 +188,7 @@ class KVManager(AttentionResource):
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+        needs_remote_transfer: bool = True,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -206,7 +207,10 @@ class KVManager(AttentionResource):
         sink = self._arena.acquire(1)
         assert sink == [SINK_PAGE], f"expected page {SINK_PAGE} first, got {sink}"
         self._transfer = KVTransferManager(
-            transfer_engine_info, self.kv_cache
+            transfer_engine_info,
+            self.kv_cache,
+            resource_key=name,
+            needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
         if cfg.cpu_offload_pages > 0:
@@ -251,6 +255,7 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
+            needs_remote_transfer=info.needs_remote_transfer,
         )
 
     def build_cuda_graph_buffers(

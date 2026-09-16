@@ -310,6 +310,14 @@ class Engine:
             if len(relevant_nodes) == 0:
                 continue # resource not needed
 
+            if not parallel_groups.all_have_compatible_parallel_shape(
+                spec.nodes
+            ):
+                raise ValueError(
+                    f"Resource spec {spec.resource_key} nodes {spec.nodes} "
+                    "must use the same TP x SP shape across replicas"
+                )
+
             # A spec is a logical resource identity and may span replicas on
             # different workers (for example BAGEL's three CFG branches).
             # This Engine constructs only the local instance, so require only
@@ -330,6 +338,11 @@ class Engine:
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
+                    needs_remote_transfer=(
+                        parallel_groups.resource_needs_remote_transfer(
+                            spec.nodes, relevant_nodes
+                        )
+                    ),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },

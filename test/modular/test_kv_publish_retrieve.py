@@ -33,8 +33,8 @@ class _StubTransfer:
 
     started: list[dict] = []
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
     def get_kv_transfer_info(self, **kwargs):
         del kwargs
