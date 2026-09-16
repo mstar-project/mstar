@@ -6,6 +6,8 @@ gather, sum, div, mul, casts) with one launch; the expert sets and weights match
 
 The per-k argmax loop below was measured against a rank-counting formulation (every candidate
 counts how many beat it; scatter by rank): 7 µs vs 28 µs at one token on H100, so the loop stays.
+One warp per token: the 256-wide reductions of each of the k rounds then stay inside the warp
+(5.7 µs against 7.8 with four warps at 1 to 64 tokens, same outputs; ``bench/kernels/router_warps_bench.py``).
 """
 from __future__ import annotations
 
@@ -63,7 +65,7 @@ def fused_route(
     _route_kernel[(t,)](
         logits, bias, idx, w, e, float(scale),
         SIGMOID=scoring == "sigmoid", RENORM=bool(renormalize and top_k > 1), K=top_k,
-        BLOCK_E=triton.next_power_of_2(e), num_warps=4,
+        BLOCK_E=triton.next_power_of_2(e), num_warps=1,
     )
     return idx, w
 
