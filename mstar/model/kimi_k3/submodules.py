@@ -44,12 +44,17 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 
     def __init__(self, language_model: nn.Module, config: KimiK3Config, cuda_graphs: bool = True,
-                 max_capture_batch_size: int | None = None, max_prefill_batch_size: int | None = 8):
+                 max_capture_batch_size: int | None = None, max_prefill_batch_size: int | None = 8,
+                 mixed_prefill_decode: bool = False):
         super().__init__()
         # prefill runs eagerly and its transient memory grows with the tokens in the step: the
         # attention-residual stack alone is [tokens, blocks, hidden] (about 1 GB per 8k tokens at
         # K3 width), so the scheduler is asked to split prefills beyond this many requests
         self.max_prefill_batch_size = max_prefill_batch_size
+        # let the decoding requests ride along in prefill steps (one-token rows next to the packed
+        # prompts) instead of stalling for the length of every prefill; the varlen kernels and the
+        # paged attention take the mixed spans as they are
+        self.mixed_prefill_decode = mixed_prefill_decode
         self.language_model = language_model
         self.embed_tokens = language_model.model.embed_tokens
         self.lm_head = language_model.lm_head
@@ -126,6 +131,11 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         """Requests per step: prefill is bounded (see ``max_prefill_batch_size``), decode by the
         captured graph buckets (the engine takes the smaller cap)."""
         return self.max_prefill_batch_size if graph_walk == "prefill" else None
+
+    def mixed_step_walks(self, graph_walk: str) -> set[str]:
+        """Decode rows may join a prefill step (``mixed_prefill_decode``); they add one token each
+        to the packed batch and their outputs are routed as decode-loop outputs."""
+        return {"decode"} if self.mixed_prefill_decode and graph_walk == "prefill" else set()
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor, **kwargs,
