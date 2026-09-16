@@ -68,8 +68,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        ``model_kwargs.moe_ep_size`` (a divisor of ``tp_size``) places whole experts on
        each rank instead (expert parallelism, ``configs/kimi_k3_pruned75_ep8.yaml``), or
        mixes the two. ``model_kwargs.mixed_prefill_decode: true`` lets decoding requests
-       ride along in prefill steps instead of pausing for them. Text only for now (no
-       vision tower), no speculative decoding yet.
+       ride along in prefill steps instead of pausing for them. Tensor-parallel
+       deployments run the async scheduling protocol by default (the submodule sets
+       ``prefers_tp_async_scheduling``; ``MSTAR_TP_ASYNC_SCHED=0`` restores the serial
+       one): on pruned75 at TP8 it adds 10-14% decode throughput at every concurrency
+       with identical outputs. Text only for now (no vision tower), no speculative
+       decoding yet.
 
 Notes
 -----
