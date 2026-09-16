@@ -133,10 +133,8 @@ class ZMQCommunicator(BaseCommunicator):
 
     def send(self, entity_id: str, msg):
         # TODO: maybe serialize to JSON instead if more efficient
-        logger.debug(
-            "%s to send a message %s to entity %s",
-            self.my_id, str(msg), entity_id
-        )
+        # lazy %s: the repr of a step's message (64 results, their bytes) is only built at DEBUG
+        logger.debug("%s to send a message %s to entity %s", self.my_id, msg, entity_id)
         if entity_id not in self.push_sockets:
             sock = self.context.socket(zmq.PUSH)
             sock.connect(self._endpoint(entity_id))
@@ -164,10 +162,7 @@ class ZMQCommunicator(BaseCommunicator):
                 messages.append(self.pull_socket.recv_pyobj(
                     flags=zmq.NOBLOCK
                 ))
-                logger.debug(
-                    "%s to received message %s",
-                    self.my_id, str(messages[-1])
-                )
+                logger.debug("%s to received message %s", self.my_id, messages[-1])
             except zmq.Again:
                 # zmq.Again actually means no messages left to read
                 break
