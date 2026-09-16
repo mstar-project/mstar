@@ -19,7 +19,12 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
-from mstar.model.kimi_k3.components.common import KimiRMSNorm, ReplicatedLinear, replicated_loader
+from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
+from mstar.model.kimi_k3.components.common import KimiRMSNorm
+
+# the checkpoint's q_a_proj / kv_a_proj_with_mqa land in the merged in_proj by segment name; its
+# g_proj goes through the same ``(".in_proj", ".g_proj", "g")`` rule as the KDA layers'
+MLA_IN_PROJ_PARAMS = [(".in_proj", ".q_a_proj", "q_a"), (".in_proj", ".kv_a_proj_with_mqa", "kv_a")]
 
 
 class ParallelMLAAttention(nn.Module):
@@ -60,27 +65,25 @@ class ParallelMLAAttention(nn.Module):
         self.attn = None
         self.kv = None
 
-        self.q_a_proj = ReplicatedLinear(hidden_size, q_lora_rank)
+        # the three projections of the layer input (the replicated LoRA-A factors of q and kv,
+        # the column-parallel output gate) run as one GEMM; see MergedParallelLinear
+        segments = [("q_a", q_lora_rank, REPLICATED), ("kv_a", kv_lora_rank + qk_rope_head_dim, REPLICATED)]
+        if use_output_gate:
+            segments.append(("g", num_heads * v_head_dim, COLUMN))
+        self.in_proj = MergedParallelLinear(comm_group, hidden_size, segments)
         self.q_a_layernorm = KimiRMSNorm(q_lora_rank, eps=norm_eps)
         self.q_b_proj = ColumnParallelLinear(comm_group, q_lora_rank, num_heads * self.qk_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = ReplicatedLinear(hidden_size, kv_lora_rank + qk_rope_head_dim)
         self.kv_a_layernorm = KimiRMSNorm(kv_lora_rank, eps=norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             comm_group, kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim), bias=False,
         )
-        if use_output_gate:
-            self.g_proj = ColumnParallelLinear(comm_group, hidden_size, num_heads * v_head_dim, bias=False)
         self.o_proj = RowParallelLinear(
             comm_group, num_heads * v_head_dim, hidden_size, bias=False, input_is_parallel=True, reduce_results=True,
         )
-        self.q_a_proj.weight.weight_loader = replicated_loader
-        self.kv_a_proj_with_mqa.weight.weight_loader = replicated_loader
         self._absorbed: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
-        self.q_a_proj.weight.weight_loader = replicated_loader
-        self.kv_a_proj_with_mqa.weight.weight_loader = replicated_loader
         self._absorbed = None
         return result
 
@@ -98,34 +101,43 @@ class ParallelMLAAttention(nn.Module):
         return self._absorbed
 
     # ---------------------------------------------------------------- pieces
-    def _query(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        t = x.shape[0]
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x))).view(t, self.num_heads, self.qk_head_dim)
+    def _project(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """The input projections in one GEMM: ``q_a``, ``kv_a`` (both replicated) and ``g``
+        (column-parallel, when the output gate is on); views of the merged output."""
+        return self.in_proj.project(x)
+
+    def _query(self, q_a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        t = q_a.shape[0]
+        q = self.q_b_proj(self.q_a_layernorm(q_a)).view(t, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         w_uk, _ = self.absorb()
         q_lat = torch.einsum("thn,hnl->thl", q_nope, w_uk.to(q_nope.dtype))
         return q_lat, q_pe
 
     def latent(self, x: torch.Tensor) -> torch.Tensor:
-        ckv = self.kv_a_proj_with_mqa(x)
+        """The new tokens' compressed latents ``[T, kv_lora_rank + rope]`` from the layer input."""
+        return self._latent(self._project(x)["kv_a"])
+
+    def _latent(self, ckv: torch.Tensor) -> torch.Tensor:
         c, k_pe = ckv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return torch.cat([self.kv_a_layernorm(c), k_pe], dim=-1)
 
-    def _finish(self, x: torch.Tensor, o_lat: torch.Tensor) -> torch.Tensor:
-        t = x.shape[0]
+    def _finish(self, g: torch.Tensor | None, o_lat: torch.Tensor) -> torch.Tensor:
+        t = o_lat.shape[0]
         _, w_uv = self.absorb()
         attn = torch.einsum("thl,hlv->thv", o_lat, w_uv.to(o_lat.dtype)).reshape(t, self.num_heads * self.v_head_dim)
         if self.use_output_gate:
-            attn = attn * torch.sigmoid(self.g_proj(x))
+            attn = attn * torch.sigmoid(g)
         return self.o_proj(attn)
 
     # ---------------------------------------------------------------- paths
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert self.attn is not None and self.kv is not None, "bind_resources first, or use forward_dense"
-        q_lat, q_pe = self._query(x)
-        self.kv.write_kv(self.latent(x))
+        mixed = self._project(x)
+        q_lat, q_pe = self._query(mixed["q_a"])
+        self.kv.write_kv(self._latent(mixed["kv_a"]))
         o_lat = self.attn.run(q_lat, kv_cache_layer=self.kv.layer_view(), q_pe=q_pe)
-        return self._finish(x, o_lat)
+        return self._finish(mixed.get("g"), o_lat)
 
     def forward_dense(
         self, x: torch.Tensor, latent_cache: torch.Tensor | None = None,
@@ -133,8 +145,9 @@ class ParallelMLAAttention(nn.Module):
         """Causal attention of the new tokens ``x [T, hidden]`` over ``latent_cache``
         (``[T_past, latent]``) plus themselves; returns ``(out, new_latents [T, latent])``."""
         t = x.shape[0]
-        q_lat, q_pe = self._query(x)
-        latent_new = self.latent(x)
+        mixed = self._project(x)
+        q_lat, q_pe = self._query(mixed["q_a"])
+        latent_new = self._latent(mixed["kv_a"])
         lat = latent_new if latent_cache is None else torch.cat([latent_cache, latent_new], 0)
         c, k_pe = lat.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         scores = (
@@ -147,7 +160,7 @@ class ParallelMLAAttention(nn.Module):
         scores = scores.masked_fill(~(kj <= qi + offset)[None], float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         o_lat = torch.einsum("hqk,kl->qhl", probs, c.float()).to(x.dtype)
-        return self._finish(x, o_lat), latent_new
+        return self._finish(mixed.get("g"), o_lat), latent_new
 
 
-__all__ = ["ParallelMLAAttention", "F"]
+__all__ = ["MLA_IN_PROJ_PARAMS", "ParallelMLAAttention", "F"]
