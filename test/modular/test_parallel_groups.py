@@ -1,10 +1,10 @@
-"""``WorkerParallelGroups.all_in_same_group``: may these nodes share one resource?
+"""``WorkerParallelGroups.all_in_same_group``: may local nodes share one resource?
 
-A resource spec naming several nodes (BAGEL's LLM + its two CFG branches share
-one KV cache) is only legal when those nodes sit in the same (tp, sp) group.
-The check has to answer per dimension: SP is usually unregistered, and the
-lazy getters mint a fresh single-rank group per node, so comparing those would
-reject every TP-only deployment.
+A logical resource spec may span remote replicas (BAGEL's LLM + its two CFG
+branches), but one worker's physical resource instance can only serve local
+nodes in the same (tp, sp) group. The check has to answer per dimension: SP is
+usually unregistered, and the lazy getters mint a fresh single-rank group per
+node, so comparing those would reject every TP-only deployment.
 """
 
 from __future__ import annotations
@@ -56,6 +56,19 @@ def test_different_tp_groups_are_rejected():
     groups.add("codec", _tp([2, 3]))
 
     assert groups.all_in_same_group(["llm", "codec"]) is False
+
+
+def test_remote_replicas_are_excluded_before_group_validation():
+    groups = _groups()
+    groups.add("llm", _tp([0, 1]))
+    groups.add("llm_cfg_text", _tp([2, 3]))
+    groups.add("llm_cfg_img", _tp([4, 5]))
+
+    spec_nodes = {"llm", "llm_cfg_text", "llm_cfg_img"}
+    local_nodes = spec_nodes & {"llm"}
+
+    assert groups.all_in_same_group(spec_nodes) is False
+    assert groups.all_in_same_group(local_nodes) is True
 
 
 def test_tp_node_and_unparallelized_node_are_rejected():

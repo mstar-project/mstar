@@ -39,7 +39,12 @@ def test_xpu_config_only_changes_cfg_replica_placement():
     with open(root / "configs/bagel_cfg_parallel.yaml") as f:
         h100_groups = yaml.safe_load(f)["node_groups"]
     with open(root / "configs/bagel_xpu_cfg_tp2.yaml") as f:
-        xpu_groups = yaml.safe_load(f)["node_groups"]
+        xpu_config = yaml.safe_load(f)
+    xpu_groups = xpu_config["node_groups"]
+
+    assert "kv_cache" not in xpu_config
+    assert xpu_config["resources"]["kv"]["max_num_pages"] == 1024
+    assert xpu_config["resources"]["attn"]["backend"] == "xpu_paged"
 
     def cfg_walks(groups, node):
         return next(g.get("graph_walks") for g in groups if node in g["node_names"])
