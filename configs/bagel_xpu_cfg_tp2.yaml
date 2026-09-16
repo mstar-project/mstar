@@ -16,27 +16,27 @@ node_groups:
       - vae_encoder
       - vae_decoder
     ranks:
-      - 0
+      - 6
 
   - node_names:
       - LLM
     ranks:
+      - 0
       - 1
-      - 2
     tp_size: 2
 
   - node_names:
       - combine_cfg
     ranks:
-      - 1
+      - 0
     graph_walks:
       - image_gen_cfg
 
   - node_names:
       - LLM_cfg_text
     ranks:
+      - 2
       - 3
-      - 4
     tp_size: 2
     graph_walks:
       - image_gen_cfg
@@ -44,8 +44,8 @@ node_groups:
   - node_names:
       - LLM_cfg_img
     ranks:
+      - 4
       - 5
-      - 6
     tp_size: 2
     graph_walks:
       - image_gen_cfg

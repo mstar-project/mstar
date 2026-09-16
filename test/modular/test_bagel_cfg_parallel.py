@@ -66,6 +66,21 @@ def test_xpu_config_only_changes_cfg_replica_placement():
         if any(n.startswith("LLM_cfg_") for n in g["node_names"])
     ]
     assert all(g["tp_size"] == 2 and len(g["ranks"]) == 2 for g in xpu_cfg_groups)
+    assert next(g for g in xpu_groups if "LLM" in g["node_names"])["ranks"] == [
+        0, 1
+    ]
+    assert next(
+        g for g in xpu_groups if "LLM_cfg_text" in g["node_names"]
+    )["ranks"] == [2, 3]
+    assert next(
+        g for g in xpu_groups if "LLM_cfg_img" in g["node_names"]
+    )["ranks"] == [4, 5]
+    assert next(
+        g for g in xpu_groups if "vae_decoder" in g["node_names"]
+    )["ranks"] == [6]
+    assert next(
+        g for g in xpu_groups if "combine_cfg" in g["node_names"]
+    )["ranks"] == [0]
 
 
 def test_combine_cfg_is_parameterless():
