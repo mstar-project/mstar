@@ -177,6 +177,9 @@ class ExecutingBatch:
     # rids whose consumed streaming input was the final chunk — this step
     # reports the partition done
     final_stream_rids: set[str] = field(default_factory=set)
+    # rid -> walk for rows riding along in this step from another walk (see
+    # ``NodeSubmodule.mixed_step_walks``); every other rid runs the step's walk
+    request_walks: Mapping[str, str] = field(default_factory=dict)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -230,6 +233,10 @@ class ExecutingBatch:
     @property
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
+
+    def walk_of(self, rid: str) -> str:
+        """The walk this request is on: the step's, unless it rides along from another."""
+        return self.request_walks.get(rid, self.step_context.graph_walk)
 
     def register_prepare_batch(self, inputs: list[NodeInputs]):
         self.inputs = inputs
@@ -505,7 +512,7 @@ class Engine:
         for rid in batch.request_ids:
             try:
                 req_inputs = submodule.prepare_inputs(
-                    graph_walk=batch.step_context.graph_walk,
+                    graph_walk=batch.walk_of(rid),
                     fwd_info=batch.per_request_info[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
@@ -680,7 +687,7 @@ class Engine:
         ):
             ctxs[rid] = StepContext(
                 request_ids=(rid,),
-                graph_walk=batch.step_context.graph_walk,
+                graph_walk=batch.walk_of(rid),
                 slot=slot, capture=False,
             )
             if i != len(batch.request_ids) - 1:
@@ -1153,6 +1160,11 @@ class Engine:
         for rid, rid_out in unpacked.items():
             outputs.setdefault(rid, {}).update(rid_out)
 
+
+    def mixed_step_walks(self, node_name: str, graph_walk: str) -> set[str]:
+        """Walks whose ready requests the node lets ride along in a step of ``graph_walk``
+        (``NodeSubmodule.mixed_step_walks``)."""
+        return set(self._submodules[node_name].submodule.mixed_step_walks(graph_walk))
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
