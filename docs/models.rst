@@ -67,7 +67,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        are sharded on their intermediate dim across the tensor-parallel ranks by default;
        ``model_kwargs.moe_ep_size`` (a divisor of ``tp_size``) places whole experts on
        each rank instead (expert parallelism, ``configs/kimi_k3_pruned75_ep8.yaml``), or
-       mixes the two. Text only for now (no vision tower), no speculative decoding yet.
+       mixes the two. ``model_kwargs.mixed_prefill_decode: true`` lets decoding requests
+       ride along in prefill steps instead of pausing for them. Text only for now (no
+       vision tower), no speculative decoding yet.
 
 Notes
 -----
