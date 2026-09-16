@@ -4,9 +4,16 @@ from types import SimpleNamespace
 import torch
 import yaml
 
+from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVConfig
-from mstar.engine.resources.kv.transfer import KVReadInfo, ShmKVTransferEngine
+from mstar.engine.resources.kv.transfer import (
+    KVReadInfo,
+    KVTransferManager,
+    LocalOnlyKVTransferEngine,
+    ShmKVTransferEngine,
+    TransferEngineInfo,
+)
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.bagel.submodules import CombineCFGSubmodule
 
@@ -129,3 +136,58 @@ def test_shm_publication_refreshes_when_seq_len_changes(tmp_path):
     )
     producer.remove_request("request")
     assert not Path(refreshed.path).exists()
+
+
+def test_shm_publications_are_namespaced_by_resource(tmp_path):
+    source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
+    source_cache = _kv_cache(source)
+    first = ShmKVTransferEngine(
+        source_cache,
+        "producer",
+        str(tmp_path),
+        resource_key="thinker_kv",
+    )
+    second = ShmKVTransferEngine(
+        source_cache,
+        "producer",
+        str(tmp_path),
+        resource_key="talker_kv",
+    )
+
+    first_info = first.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[0], seq_len=1,
+    )
+    second_info = second.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[0], seq_len=1,
+    )
+
+    assert first_info.path != second_info.path
+    assert first.owns_transfer_info(first_info, "request", "main")
+    assert not first.owns_transfer_info(second_info, "request", "main")
+
+    first.shutdown()
+    second.shutdown()
+
+
+def test_local_only_cpu_cache_does_not_publish_shm_snapshots():
+    source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
+    manager = KVTransferManager(
+        TransferEngineInfo(
+            my_entity_id="producer",
+            my_session_id="session",
+            transfer_engine=LocalTransferEngine("producer"),
+        ),
+        _kv_cache(source),
+        resource_key="local_kv",
+        needs_remote_transfer=False,
+    )
+
+    assert isinstance(
+        manager._kv_transfer_engine, LocalOnlyKVTransferEngine
+    )
+    assert manager.get_kv_transfer_info(
+        request_id="request",
+        label="main",
+        page_indices=[0],
+        seq_len=1,
+    ) is None
