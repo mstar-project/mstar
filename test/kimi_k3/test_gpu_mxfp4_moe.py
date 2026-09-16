@@ -124,7 +124,7 @@ def test_triton_expert_parallel_partials_sum_to_full(world, ep):
     ranks = _sharded_copies(moe, world, ep, p13, s13, p2, s2, backend=None)
     with torch.no_grad():
         x = torch.randn(37, hidden, device=DEV, dtype=torch.bfloat16)
-        z = moe.routed_expert_down_proj(x)
+        z = moe.routed_down(x)
         idx, w = moe.gate(x)
         ref = moe._routed(z, idx, w).float()  # Triton kernel, every expert local
         parts = [m._routed(z, idx, w) for m in ranks]
