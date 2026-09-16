@@ -72,10 +72,14 @@ def routed_experts_loop(
     linear_beta: float | None,
 ) -> torch.Tensor:
     """Per-expert loop over the latent inputs ``z [T, latent]``; returns ``[T, latent]``
-    in ``z.dtype`` with the routing weights applied in fp32 (like ``moe_infer``)."""
+    in ``z.dtype`` with the routing weights applied in fp32 (like ``moe_infer``). Ids outside
+    ``[0, E)`` (assignments an expert-parallel rank does not hold) contribute nothing, so the
+    result is that rank's partial sum."""
     t, k = topk_idx.shape
     out = torch.zeros(t, k, z.shape[-1], dtype=torch.float32, device=z.device)
     for e in torch.unique(topk_idx).tolist():
+        if not 0 <= e < w13.shape[0]:
+            continue
         rows, slots = torch.where(topk_idx == e)
         h = F.linear(z[rows], w13[e].to(z.dtype))
         h = situ_and_mul(h, beta, linear_beta)
