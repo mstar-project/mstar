@@ -39,7 +39,7 @@ def storage_spans(tensors: list[torch.Tensor]) -> list[StorageSpan]:
         if not t.is_contiguous():
             key = ("alone", i)
         else:
-            key = (t.untyped_storage().data_ptr(), t.dtype, str(t.device))
+            key = (t.untyped_storage().data_ptr(), t.dtype, t.device)
         groups.setdefault(key, []).append(_Member(i, t.storage_offset(), t.numel(), tuple(t.shape)))
     spans = []
     for key, members in groups.items():
@@ -65,9 +65,25 @@ def apply_coalesced(
     out: list[torch.Tensor | None] = [None] * len(tensors)
     for span in storage_spans(tensors):
         res = span_op(span.view)
-        for m in span.members:
+        members = span.members
+        if len(members) > 1 and _tiles(members, res.numel()):
+            # the usual case (one row per request, in order): every view from one split call
+            for m, piece in zip(members, res.split([m.numel for m in members]), strict=True):
+                out[m.index] = piece if len(m.shape) == 1 else piece.view(m.shape)
+            continue
+        for m in members:
             out[m.index] = res[m.offset:m.offset + m.numel].view(m.shape)
     return out  # type: ignore[return-value]
+
+
+def _tiles(members: list[_Member], total: int) -> bool:
+    """The members cover ``[0, total)`` back to back in list order."""
+    end = 0
+    for m in members:
+        if m.offset != end:
+            return False
+        end += m.numel
+    return end == total
 
 
 def clone_coalesced(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
