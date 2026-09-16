@@ -23,10 +23,10 @@ from mstar.model.components.distributed import ColumnParallelLinear, VocabParall
 from mstar.model.kimi_k3.components.attn_res import AttnResRead
 from mstar.model.kimi_k3.components.common import KimiRMSNorm
 from mstar.model.kimi_k3.components.decoder_layer import KimiK3DecoderLayer
-from mstar.model.kimi_k3.components.kda import KDA_STACKED_PARAMS, ParallelKDAAttention
-from mstar.model.kimi_k3.components.mla import ParallelMLAAttention
+from mstar.model.kimi_k3.components.kda import KDA_IN_PROJ_PARAMS, KDA_STACKED_PARAMS, ParallelKDAAttention
+from mstar.model.kimi_k3.components.mla import MLA_IN_PROJ_PARAMS, ParallelMLAAttention
 from mstar.model.kimi_k3.components.mlp import ParallelSiTUMLP
-from mstar.model.kimi_k3.components.moe import KimiLatentMoE
+from mstar.model.kimi_k3.components.moe import MOE_IN_PROJ_PARAMS, KimiLatentMoE
 from mstar.model.kimi_k3.config import KDA_STATE, MLA_ATTN, MLA_KV, KimiK3TextConfig
 from mstar.model.kimi_k3.reference.mxfp4 import dequant_mxfp4
 
@@ -286,7 +286,8 @@ class KimiK3ForCausalLM(nn.Module):
         Handles the ``language_model.`` prefix, drops the vision tower and projector,
         routes per-expert ``w1/w2/w3`` into the fused expert parameters (dequantizing
         MXFP4 ``weight_packed``/``weight_scale`` pairs on the fly), and applies the
-        stacked-shard rules for ``qkv_proj`` (KDA) and ``gate_up_proj`` (MLPs).
+        stacked-shard rules for ``qkv_proj`` (KDA), the merged input projections ``in_proj``
+        (KDA, MLA, MoE) and ``gate_up_proj`` (MLPs).
         """
         from mstar.model.loader.base import load_weights_into
 
@@ -330,8 +331,11 @@ class KimiK3ForCausalLM(nn.Module):
                 route_expert(prefix, expert, w, dequant_mxfp4(packed, scale, dtype=params[
                     f"{prefix}.experts.down_proj"].dtype))
 
+        # first match wins: the merged input projections' rules (whole-name-specific) precede
+        # the dense MLPs' generic gate/up rules
         stacked = [
             *[_Rule(t, s, i) for t, s, i in KDA_STACKED_PARAMS],
+            *[_Rule(t, s, i) for t, s, i in KDA_IN_PROJ_PARAMS + MLA_IN_PROJ_PARAMS + MOE_IN_PROJ_PARAMS],
             _Rule(".gate_up_proj", ".gate_proj", 0),
             _Rule(".gate_up_proj", ".up_proj", 1),
         ]
