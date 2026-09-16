@@ -1,0 +1,22 @@
+# The real-dims tiny checkpoint (MXFP4 experts, MLA 512/64, KDA head 128) on two GPUs with the
+# routed experts placed whole on each rank (moe_ep_size 2 over tp_size 2): Marlin runs on 4 local
+# experts of full intermediate width per rank, and the partials combine through the same latent
+# all-reduce as the TP2 deployment (configs/kimi_k3_tiny_realdims_tp2.yaml).
+model: "kimi_k3"
+max_seq_len: 4096
+model_kwargs:
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ref/tiny_kimi_k3_realdims
+  max_output_tokens: 256
+  moe_backend: auto
+  moe_ep_size: 2
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 512
+    page_size: 64
+  kda_state:
+    max_num_slots: 128
