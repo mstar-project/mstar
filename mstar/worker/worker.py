@@ -340,6 +340,8 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _parse_tp_async_sched(
             os.environ.get("MSTAR_TP_ASYNC_SCHED", "0")
         )
+        # unset: a parallel node's submodule may ask for it (resolved once the models are loaded)
+        self._tp_async_from_model = "MSTAR_TP_ASYNC_SCHED" not in os.environ
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
         # Follower: leader steps that will NOT be followed by a head; the
@@ -1579,6 +1581,28 @@ class Worker:
             self.tp_async_nodes is None or node_name in self.tp_async_nodes
         )
 
+    def _resolve_tp_async_default(self) -> None:
+        """``MSTAR_TP_ASYNC_SCHED`` unset: a parallel node runs the async protocol when its loaded
+        submodule sets ``prefers_tp_async_scheduling`` (the same class on every rank, so the
+        ranks agree). A set variable, ``0`` included, is left alone."""
+        if not self._tp_async_from_model or self.tp_async_sched:
+            return
+        preferring = []
+        for node in sorted(self.parallel_nodes):
+            try:
+                submodule = self.engine_manager.get_engine(node).submodule(node)
+            except (KeyError, AttributeError):
+                continue
+            if getattr(submodule, "prefers_tp_async_scheduling", False):
+                preferring.append(node)
+        if preferring:
+            self.tp_async_sched, self.tp_async_nodes = True, frozenset(preferring)
+            logger.info(
+                "Worker %s: TP async scheduling ON for %s (%s; the submodule's default, "
+                "MSTAR_TP_ASYNC_SCHED unset)",
+                self.worker_id, preferring, "follower" if self.is_tp_follower else "leader",
+            )
+
     def _verify_tp_async_sched_agrees(self) -> None:
         """Refuse a per-rank flag mismatch at startup: a follower would wait for
         a decision the leader never sends, or get a head it cannot build."""
@@ -2742,6 +2766,7 @@ class Worker:
         # reaches warmup at the same wall-clock instant, so subgroup
         # bootstrap completes within the retry budget.
         self.parallel_groups.barrier_all()
+        self._resolve_tp_async_default()
         self._verify_tp_async_sched_agrees()
 
         # CUDA graph capture before entering the main loop
