@@ -493,7 +493,7 @@ class VisionTransformerPredictorAC(nn.Module):
         static_pos_bufs: dict,          # {"d_pos": Tensor, "h_pos": Tensor, ...}
         cond_tokens: int,
     ):
-        """Return a closure capturing the block loop for PiecewiseCudaGraphRunner.
+        """Return a closure capturing the block loop for PiecewiseAcceleratorGraphRunner.
 
         The returned ``fn(x) -> x`` reads position tensors from
         ``static_pos_bufs`` (which the runner updates via ``.copy_()`` before
@@ -560,7 +560,7 @@ class VisionTransformerPredictorAC(nn.Module):
         else:
             attn_mask = None
             # Compute positions once before the block loop so this work stays
-            # outside any CUDA-graph-captured region (see PiecewiseCudaGraphRunner).
+            # outside any CUDA-graph-captured region (see PiecewiseAcceleratorGraphRunner).
             d_pos, h_pos, w_pos, time_pos = self._compute_rope_positions(
                 t_0, self.grid_height, self.grid_width, cond_tokens, x.device, x.dtype
             )

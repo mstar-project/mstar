@@ -22,7 +22,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
@@ -764,12 +768,12 @@ class ThinkerSubmodule(ARNodeSubmodule):
     PREFILL_VISION_TOKEN_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1]
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         num_deepstack = len(self.config.vision.deepstack_visual_indexes)
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="thinker_decode",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=1,
@@ -788,7 +792,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_text",
                 replay_graph_walks=["prefill_text", "prefill_audio"],
                 make_node_input=lambda n: ARNodeInputs(
@@ -814,7 +818,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill_vision",
                 replay_graph_walks=["prefill_vision"],
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
@@ -1583,11 +1587,11 @@ class TalkerSubmodule(ARNodeSubmodule):
     TALKER_LAST_PREFILL_TOKENS_PER_REQ = 6
     TALKER_LAST_PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="talker_decode",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(
@@ -1599,7 +1603,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
                 compile=True
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="talker_prefill",
                 replay_graph_walks=["talker_prefill"],
                 make_node_input=lambda n: ARNodeInputs(
@@ -1613,7 +1617,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.TALKER_PREFILL_CAPTURE_BATCH_SIZES,
                 compile=True
             ),
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="talker_last_prefill",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(
@@ -1678,10 +1682,10 @@ class Code2WavSubmodule(NodeSubmodule):
         self._first_chunk_emitted.discard(request_id)
         self._latest_seq_len.pop(request_id, None)
 
-    def get_cuda_graph_configs(self, device, tp_world_size: int = 1):
+    def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         num_quantizers = self.config.code2wav.num_quantizers
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="code2wav_chunk",
                 single_request_inputs=ARNodeInputs(
                     tensor_inputs={
@@ -1833,8 +1837,8 @@ class Code2WavSubmodule(NodeSubmodule):
                 for inputs in model_inputs
         }) == 1
 
-    def can_use_cuda_graphs(self, batch, model_inputs: list[NodeInputs]):
-        res = super().can_use_cuda_graphs(batch, model_inputs) \
+    def can_use_accelerator_graphs(self, batch, model_inputs: list[NodeInputs]):
+        res = super().can_use_accelerator_graphs(batch, model_inputs) \
             and self.can_batch(batch, model_inputs) \
                 and model_inputs[0].tensor_inputs["codec_tokens"].shape[1] == self.full_seqlen
         return res

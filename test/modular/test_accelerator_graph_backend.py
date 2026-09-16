@@ -2,22 +2,6 @@ import pytest
 import torch
 
 from mstar.engine.accelerator_graph_backend import AcceleratorGraphBackend
-from mstar.engine.accelerator_graph_config import (
-    AcceleratorGraphConfig,
-    BasicBatchedAcceleratorGraphConfig,
-)
-from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-from mstar.engine.cuda_graph_config import (
-    BasicBatchedCudaGraphConfig,
-    CudaGraphConfig,
-)
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
-
-
-def test_cuda_compatibility_aliases_point_to_accelerator_api():
-    assert CudaGraphConfig is AcceleratorGraphConfig
-    assert BasicBatchedCudaGraphConfig is BasicBatchedAcceleratorGraphConfig
-    assert CudaGraphRunner is AcceleratorGraphRunner
 
 
 def test_backend_rejects_non_accelerator_device():

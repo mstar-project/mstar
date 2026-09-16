@@ -15,10 +15,10 @@ from mstar.engine.accelerator_graph_backend import (
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
-    PiecewiseAcceleratorGraphConfig,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
@@ -301,7 +301,11 @@ class AcceleratorGraphRunner:
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
-        self._graph_backend = get_accelerator_graph_backend(device)
+        self._graph_backend = (
+            get_accelerator_graph_backend(device)
+            if device is not None and device.type in {"cuda", "xpu"}
+            else None
+        )
         self._autocast_dtype = autocast_dtype
         self._enable_nvtx = enable_nvtx
 
@@ -417,10 +421,10 @@ class AcceleratorGraphRunner:
 
     def warmup_and_capture(self):
         """Capture graphs for all configs and batch sizes."""
-        if self._device is None or not self._graph_backend.is_available():
+        if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
                 "%s is not available, skipping graph capture for %s",
-                self._device.type.upper(),
+                getattr(self._device, "type", "accelerator").upper(),
                 self._submodule_name,
             )
             return
@@ -995,7 +999,7 @@ class AcceleratorGraphRunner:
         event past pre-plan's own kernels. Its own stream keeps the two
         independent; a plan-done event gates the replay that reads the buffers.
         """
-        if not self._graph_backend.is_available():
+        if self._graph_backend is None or not self._graph_backend.is_available():
             return None
         if self._plan_stream is None:
             self._plan_stream = self._graph_backend.new_stream()
@@ -1104,7 +1108,11 @@ class PiecewiseAcceleratorGraphRunner:
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
-        self._graph_backend = get_accelerator_graph_backend(device)
+        self._graph_backend = (
+            get_accelerator_graph_backend(device)
+            if device is not None and device.type in {"cuda", "xpu"}
+            else None
+        )
         self._autocast_dtype = autocast_dtype
         self._comm_group = joint_comm_group
         # scopes buffer allocation; `label` carries it but mangled with the region
@@ -1194,10 +1202,10 @@ class PiecewiseAcceleratorGraphRunner:
         return self._prepared_shapes
 
     def warmup_and_capture(self) -> None:
-        if self._device is None or not self._graph_backend.is_available():
+        if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
                 "%s is not available, skipping piecewise capture for %s",
-                self._device.type.upper(),
+                getattr(self._device, "type", "accelerator").upper(),
                 self._label,
             )
             return

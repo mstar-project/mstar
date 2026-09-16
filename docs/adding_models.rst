@@ -714,7 +714,7 @@ methods are:
    them.
 
 Two more methods control batching and CUDA graphs: ``can_batch`` with
-``forward_batched``, and ``get_cuda_graph_configs``. They are described in Step 5.
+``forward_batched``, and ``get_accelerator_graph_configs``. They are described in Step 5.
 
 .. _Step 4a — Declare the step:
 
@@ -961,11 +961,11 @@ expected to collate a batch. You can still disable batching for one node, or for
 walks, by returning ``False`` from ``can_batch`` in those cases.
 
 **CUDA graphs.** A submodule declares the shapes it can capture in
-``get_cuda_graph_configs(self, device, tp_world_size=1) -> list[CudaGraphConfig]``. The
+``get_accelerator_graph_configs(self, device, tp_world_size=1) -> list[AcceleratorGraphConfig]``. The
 default is an empty list, which means eager execution. For each config, the engine first
 runs ``torch.compile``, controlled by the config's ``compile`` flag, which defaults to
 ``True``. It then records a CUDA graph and replays it. Two config types are defined in
-``mstar/engine/cuda_graph_config.py``. They differ in which stage of the submodule
+``mstar/engine/accelerator_graph_config.py``. They differ in which stage of the submodule
 pipeline they freeze:
 
 .. list-table::
@@ -974,13 +974,13 @@ pipeline they freeze:
 
    * - Config type
      - Use and captured stage
-   * - ``BatchedCudaGraphConfig``
+   * - ``BatchedAcceleratorGraphConfig``
      - Decode-style forward passes, in which every request in the batch has the same
        length. That length is usually one token. Pass ``single_request_inputs``, which is
        a ``NodeInputs`` for one request. The runner clones it to build each captured
        batch. This config fixes the output of ``prepare_inputs``, and ``preprocess`` runs
        on both capture and replay.
-   * - ``PackedCudaGraphConfig``
+   * - ``PackedAcceleratorGraphConfig``
      - Prefill-style forward passes that operate on packed, variable-length sequences.
        Pass ``capture_token_lengths``, which lists the token-count buckets to record, and
        ``make_node_input(n)``, a factory that builds a ``NodeInputs`` for one request of
@@ -988,7 +988,7 @@ pipeline they freeze:
        planned at capture time from the step declaration, and planned again into the
        captured buffers on each replay.
 
-Both types share the base ``CudaGraphConfig`` fields:
+Both types share the base ``AcceleratorGraphConfig`` fields:
 
 - ``capture_graph_walk`` is the walk to capture.
 - ``replay_graph_walks`` lists the walks that may replay this capture. One capture can
@@ -1011,7 +1011,7 @@ Both types share the base ``CudaGraphConfig`` fields:
   on another participating rank, warmup raises after rank-wide agreement instead of
   dropping the bucket and falling back to eager execution. The default is ``False``.
 
-``BatchedCudaGraphConfig`` also accepts ``total_tokens_multiplier``. Use it when one
+``BatchedAcceleratorGraphConfig`` also accepts ``total_tokens_multiplier``. Use it when one
 request's step commits KV across several labels that are combined into a single plan, as
 in batched guidance that packs the conditional and unconditional sequences together. The
 static buffer must hold all of them, and this field scales the buffer independently of the
@@ -1025,16 +1025,16 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
-   def get_cuda_graph_configs(self, device, tp_world_size=1):
+   def get_accelerator_graph_configs(self, device, tp_world_size=1):
        return [
-           BatchedCudaGraphConfig(
+           BatchedAcceleratorGraphConfig(
                capture_graph_walk="decode",
                single_request_inputs=ARNodeInputs(
                    input_ids=torch.zeros(1, dtype=torch.long, device=device),
                    input_seq_len=1,
                ),
            ),
-           PackedCudaGraphConfig(
+           PackedAcceleratorGraphConfig(
                capture_graph_walk="prefill",
                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                make_node_input=lambda n: ARNodeInputs(
@@ -1063,16 +1063,16 @@ and projection. A piecewise CUDA graph supports this.
 
 A submodule enables piecewise capture by returning one or more configs from::
 
-   get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1)
-       -> dict[str, PiecewiseCudaGraphConfig]
+   get_piecewise_accelerator_graph_configs(self, device, autocast_dtype, tp_world_size=1)
+       -> dict[str, PiecewiseAcceleratorGraphConfig]
 
 The dict key is a region name, which is any string that identifies the captured region.
 Several keys capture several independent graphs. At warmup, the engine builds one
-``PiecewiseCudaGraphRunner`` per key and puts them in
+``PiecewiseAcceleratorGraphRunner`` per key and puts them in
 ``engine_inputs.piecewise_runners``. Your forward looks up the runner by key and calls it.
 Nothing is stored on the submodule.
 
-Two config types are defined in ``mstar/engine/cuda_graph_config.py``. They correspond to
+Two config types are defined in ``mstar/engine/accelerator_graph_config.py``. They correspond to
 the two whole-forward types:
 
 .. list-table::
@@ -1091,7 +1091,7 @@ the two whole-forward types:
        a list of token-count buckets. One graph is captured per pair of batch size and
        bucket.
 
-Both types share the base ``PiecewiseCudaGraphConfig`` fields:
+Both types share the base ``PiecewiseAcceleratorGraphConfig`` fields:
 
 - ``capture_fn`` is the callable to capture. Its interface is described below.
 - ``make_static_inputs`` is a factory with signature
@@ -1169,7 +1169,7 @@ A ``capture_fn`` may also return a single ``Tensor``. The runner wraps it as
 **Calling the runner.** Look up the runner by region name and pass your real inputs to it.
 It returns a ``PiecewiseOutput``, which behaves like a dict. Indexing and ``.get`` return
 a clone that you own and can keep. ``.get_view`` returns a view without copying, which is
-only valid until the next call to ``run``. See ``mstar/engine/cuda_graph_runner.py``. The
+only valid until the next call to ``run``. See ``mstar/engine/accelerator_graph_runner.py``. The
 runner handles input padding, admission and planning of the region's declared step,
 replay, commit, and output slicing.
 
@@ -1180,7 +1180,7 @@ sequence, and an eager section after the region.
 
 .. code-block:: python
 
-   from mstar.engine.cuda_graph_config import (
+   from mstar.engine.accelerator_graph_config import (
        PiecewiseBatchedConfig, PiecewiseCallInputs, PiecewiseCaptureShape,
    )
 
@@ -1192,7 +1192,7 @@ sequence, and an eager section after the region.
        return {"x": fn(inp.static_inputs["x"])}
 
    # --- declare the region ---
-   def get_piecewise_cuda_graph_configs(self, device, autocast_dtype, tp_world_size=1, **kwargs):
+   def get_piecewise_accelerator_graph_configs(self, device, autocast_dtype, tp_world_size=1, **kwargs):
        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
            # hidden state in autocast_dtype so the replay copy_ is a same-dtype memcpy;
            # position buffers stay float32 (RoPE frequency precision matters more)

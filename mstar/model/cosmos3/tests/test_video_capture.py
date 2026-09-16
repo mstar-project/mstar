@@ -35,7 +35,7 @@ def _dit_with_buckets(monkeypatch):
     sub = Cosmos3DiTSubmodule(
         transformer=_fake_transformer(), config=Cosmos3Config(compile_denoise=False), scheduler=None,
     )
-    configs = sub.get_cuda_graph_configs("cpu")
+    configs = sub.get_accelerator_graph_configs("cpu")
     return sub, configs
 
 

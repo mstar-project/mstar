@@ -1064,11 +1064,11 @@ def test_windowed_kv_dense_matches_paged() -> None:
 @torch.no_grad()
 def _run_cuda_graph_denoise(ctx):
     """Capture the image denoise step and run the whole loop through the real
-    CudaGraphRunner (one captured forward per step covering both guidance
+    AcceleratorGraphRunner (one captured forward per step covering both guidance
     branches), returning the final latents."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
     from mstar.distributed.communication import CommGroup, JointGroups
-    from mstar.engine.cuda_graph_runner import CudaGraphRunner
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 
     model, dit = ctx["model"], ctx["dit"]
     device, dtype = ctx["device"], ctx["dtype"]
@@ -1093,7 +1093,7 @@ def _run_cuda_graph_denoise(ctx):
     )
     # The runner's autocast scope is the engine's: none for a node that pins
     # its own precision (the DiT forwards run native bf16), else the model's.
-    cg_runner = CudaGraphRunner(
+    cg_runner = AcceleratorGraphRunner(
         submodule_name="dit", submodule=dit, resources=resources,
         step_runner=StepRunner(resources), device=dev,
         autocast_dtype=None if dit.disable_autocast else model.get_autocast_dtype(),

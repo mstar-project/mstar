@@ -14,9 +14,9 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, Resou
 if TYPE_CHECKING:
     # the config reaches back here through the submodule base, so keep the
     # import out of module exec
-    from mstar.engine.cuda_graph_config import (
-        CudaGraphConfig,
-        PiecewiseCudaGraphConfig,
+    from mstar.engine.accelerator_graph_config import (
+        AcceleratorGraphConfig,
+        PiecewiseAcceleratorGraphConfig,
     )
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
 
@@ -26,7 +26,7 @@ class CGSlotSpec:
     bucket: BucketKey
     slot: int
     # a whole forward's capture, or one piecewise region's
-    config: CudaGraphConfig | PiecewiseCudaGraphConfig
+    config: AcceleratorGraphConfig | PiecewiseAcceleratorGraphConfig
     config_idx: int | None = None
 
     @property

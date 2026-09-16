@@ -49,9 +49,9 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
 )
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.kv.config import RetentionPolicy
@@ -273,7 +273,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         The engine leases the replay slot before the step is declared, so this
         answers from per-request state rather than from prepared inputs. It is
-        the sole gate on capture — the v1 engine has no ``can_use_cuda_graphs``
+        the sole gate on capture — the v1 engine has no ``can_use_accelerator_graphs``
         — so every condition the old gate checked lives here:
 
         * only the two-branch guidance regime is captured (both the prefill's
@@ -2064,7 +2064,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # scheduler step run eagerly afterwards.
     # ------------------------------------------------------------------
 
-    def get_cuda_graph_configs(self, device, tp_world_size: int = 1):
+    def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Declare one fixed-shape capture of the image denoise step per
         resolution. Requests at other resolutions, or without guidance, fall back
         to the eager path. The per-resolution token layout is prompt-independent,
@@ -2147,7 +2147,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _gen_capture_config(
         self, latent_shape, height, width, frames, device, dtype, capture_batch_sizes,
         walk, replay_walks,
-    ) -> BatchedCudaGraphConfig:
+    ) -> BatchedAcceleratorGraphConfig:
         """One denoise-step capture bucket per latent shape. The graph is
         built with every frame declared noisy (its token layout is baked); the
         request's clean/noisy layout rides in as the ``noisy_token_mask``
@@ -2182,7 +2182,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 cfg=True, cfg_active=True, capture_key=tuple(latent_shape),
             ),
         )
-        return BatchedCudaGraphConfig(
+        return BatchedAcceleratorGraphConfig(
             capture_graph_walk=walk,
             replay_graph_walks=replay_walks,
             single_request_inputs=single,
@@ -2227,7 +2227,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
 
-            configs.append(PackedCudaGraphConfig(
+            configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
                 capture_token_lengths=prefill_tokens,
@@ -3026,7 +3026,7 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
         # vision prefills carry per-request packed embeddings and run alone.
         return batch.graph_walk in (REASONER_DECODE_WALK, REASONER_PREFILL_WALK)
 
-    def get_cuda_graph_configs(self, device, tp_world_size: int = 1):
+    def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Capture the decode step (one token per request) per batch-size
         bucket; prefills run eager (they are one-shot and shape-varied)."""
         if self.transformer is None or os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH"):
@@ -3041,7 +3041,7 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
         env = os.environ.get("COSMOS3_REASONER_COMPILE")
         compile_decode = (env == "1") if env is not None else bool(self.config.compile_reasoner_decode)
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk=REASONER_DECODE_WALK,
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
