@@ -234,7 +234,7 @@ def test_fla_kernels_match_torch_reference(tiny_dir):
     lens = [19, 6, 33]
     t = sum(lens)
     x = torch.randn(t, cfg.hidden_size, device=DEV, dtype=torch.bfloat16)
-    qkv, g_raw, beta_raw = layer._project(x)
+    qkv, g_raw, beta_raw, _ = layer._project(x)
     n_slots = 5
     conv_t = torch.zeros(n_slots, 3 * layer.projection_size, cfg.kda_conv_kernel_size, device=DEV, dtype=torch.bfloat16)
     rec_t = torch.zeros(n_slots, layer.num_heads, layer.head_dim, layer.head_dim, device=DEV)
@@ -253,7 +253,7 @@ def test_fla_kernels_match_torch_reference(tiny_dir):
     _assert_rel(conv_f[slots], conv_t[slots], 1e-2, "prefill conv state")
     # decode: one token for rows in slots 4 and 1 (reversed order), states resident
     x2 = torch.randn(2, cfg.hidden_size, device=DEV, dtype=torch.bfloat16)
-    qkv2, g2, b2 = layer._project(x2)
+    qkv2, g2, b2, _ = layer._project(x2)
     slots2, has2, cu2 = [4, 1], [True, True], [0, 1, 2]
     plan2 = RecurrentPlanOutput(
         slot_ids=torch.tensor(slots2, dtype=torch.int32, device=DEV),
@@ -331,7 +331,7 @@ def test_flashkda_prefill_matches_fla_kernels():
     lens = [40, 3, 70]
     t = sum(lens)
     x = torch.randn(t, hidden, device=DEV, dtype=torch.bfloat16)
-    qkv, g_raw, beta_raw = layer._project(x)
+    qkv, g_raw, beta_raw, _ = layer._project(x)
     n_slots = 4
     conv_a = torch.zeros(n_slots, 3 * h * d, 4, device=DEV, dtype=torch.bfloat16)
     rec_a = torch.zeros(n_slots, h, d, d, device=DEV)
