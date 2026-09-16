@@ -7,9 +7,12 @@ kernels and two execution contexts:
 * **dense** (tests / eager reference): ``forward_dense(x, state)`` carries an explicit
   ``KDAState`` for one sequence.
 
-Parameter names mirror the checkpoint (``q_proj``, ``q_conv1d``, ``f_a_proj``, ...) except
-the three input projections, which are packed into ``qkv_proj`` (loaded through stacked
-rules ``q_proj -> 0, k_proj -> 1, v_proj -> 2``).
+Parameter names mirror the checkpoint (``q_proj``, ``q_conv1d``, ``f_b_proj``, ...) except
+the projections of the layer input, which are packed into two GEMMs: ``qkv_proj`` (stacked
+rules ``q_proj -> 0, k_proj -> 1, v_proj -> 2``) and ``in_proj`` = ``g_proj | b_proj | f_a_proj``
+(``KDA_IN_PROJ_PARAMS``; the output gate and beta are column-parallel, the low-rank decay
+factor ``f_a`` is replicated). One 24 MB GEMM instead of three launches of 22, 0.2 and 1.8 MB
+that each paid the same fixed ramp (see ``MergedParallelLinear``).
 
 State layout in the resource (per layer, per slot):
 ``conv``: ``[3 * P_local, W]`` = the last ``W`` pre-activation inputs of q | k | v;
@@ -29,8 +32,8 @@ from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
 from mstar.model.kimi_k3.components.common import (
-    ReplicatedLinear,
     attach_dim0_loader,
     replicated_loader,
     restore_kept_dtypes,
@@ -47,6 +50,8 @@ from mstar.model.kimi_k3.reference.kda import (
 )
 
 KDA_STACKED_PARAMS = [(".qkv_proj", ".q_proj", 0), (".qkv_proj", ".k_proj", 1), (".qkv_proj", ".v_proj", 2)]
+# the checkpoint's g_proj / b_proj / f_a_proj land in the merged in_proj by segment name
+KDA_IN_PROJ_PARAMS = [(".in_proj", ".g_proj", "g"), (".in_proj", ".b_proj", "b"), (".in_proj", ".f_a_proj", "f_a")]
 
 
 @dataclass
@@ -154,10 +159,12 @@ class ParallelKDAAttention(nn.Module):
         self.k_conv1d.weight = nn.Parameter(torch.empty(p_local, 1, conv_kernel_size))
         self.v_conv1d = nn.Module()
         self.v_conv1d.weight = nn.Parameter(torch.empty(p_local, 1, conv_kernel_size))
-        self.f_a_proj = ReplicatedLinear(hidden_size, head_dim)
+        # output gate g, beta and the decay factor f_a all project the layer input: one GEMM
+        self.in_proj = MergedParallelLinear(
+            comm_group, hidden_size,
+            [("g", p_full, COLUMN), ("b", num_heads, COLUMN), ("f_a", head_dim, REPLICATED)],
+        )
         self.f_b_proj = ColumnParallelLinear(comm_group, head_dim, p_full, bias=False)
-        self.b_proj = ColumnParallelLinear(comm_group, hidden_size, num_heads, bias=False)
-        self.g_proj = ColumnParallelLinear(comm_group, hidden_size, p_full, bias=False)
         self.A_log = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(torch.zeros(p_local, dtype=torch.float32))
         self.o_norm = nn.Module()
@@ -177,7 +184,6 @@ class ParallelKDAAttention(nn.Module):
         self.A_log._keep_dtype = torch.float32
         self.dt_bias._keep_dtype = torch.float32
         self.o_norm.weight.weight_loader = replicated_loader
-        self.f_a_proj.weight.weight_loader = replicated_loader
 
     def _apply(self, fn, recurse=True):
         result = super()._apply(fn, recurse=recurse)
@@ -215,15 +221,19 @@ class ParallelKDAAttention(nn.Module):
         return cached[1]
 
     def _project(self, x: torch.Tensor):
+        """``(qkv [T, 3 P_local], g_raw [T, H, D], beta_raw [T, H], g_out [T, H, D])``: two GEMMs on
+        ``x`` plus the tiny ``f_b`` factor. The merged segments are views; the kernels need
+        contiguous ``beta`` and ``g`` (a no-op for one row, a small copy otherwise)."""
         t = x.shape[0]
-        qkv = self.qkv_proj(x)  # [T, 3 P_local]
-        g_raw = self.f_b_proj(self.f_a_proj(x)).view(t, self.num_heads, self.head_dim)
-        beta_raw = self.b_proj(x)  # [T, H_local]
-        return qkv, g_raw, beta_raw
+        qkv = self.qkv_proj(x)
+        mixed = self.in_proj.project(x)
+        g_raw = self.f_b_proj(mixed["f_a"]).view(t, self.num_heads, self.head_dim)
+        beta_raw = mixed["b"].contiguous()
+        g_out = mixed["g"].contiguous().view(t, self.num_heads, self.head_dim)
+        return qkv, g_raw, beta_raw, g_out
 
-    def _finish(self, x: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
-        t = x.shape[0]
-        g_out = self.g_proj(x).view(t, self.num_heads, self.head_dim)
+    def _finish(self, g_out: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+        t = o.shape[0]
         y = self._gated_norm(o, g_out)
         return self.o_proj(y.reshape(t, self.num_heads * self.head_dim))
 
@@ -250,19 +260,19 @@ class ParallelKDAAttention(nn.Module):
         set by the model loop)."""
         assert self.state is not None, "bind_resources first, or use forward_dense"
         plan = self.state.plan_output
-        qkv, g_raw, beta_raw = self._project(x)
+        qkv, g_raw, beta_raw, g_out = self._project(x)
         o = self.kernels.run_paged(
             qkv, g_raw, beta_raw, plan,
             self.state.layer_view("conv"), self.state.layer_view("recurrent"), self.params(),
         )
-        return self._finish(x, o)
+        return self._finish(g_out, o)
 
     def forward_dense(self, x: torch.Tensor, state: KDAState | None = None) -> tuple[torch.Tensor, KDAState]:
         """One sequence with explicit state (K-first recurrent, like the reference)."""
         state = state or KDAState()
         p = self.params()
         t = x.shape[0]
-        qkv, g_raw, beta_raw = self._project(x)
+        qkv, g_raw, beta_raw, g_out = self._project(x)
         conv_prev = None
         if state.conv_q is not None:
             conv_prev = torch.cat([state.conv_q, state.conv_k, state.conv_v], dim=0)
@@ -277,7 +287,7 @@ class ParallelKDAAttention(nn.Module):
             g_log, torch.sigmoid(beta_raw.float()), state.recurrent, p.scale,
         )
         cq, ck, cv = conv_new.split([pl, pl, pl], dim=0)
-        return self._finish(x, o.to(x.dtype)), KDAState(conv_q=cq, conv_k=ck, conv_v=cv, recurrent=rec)
+        return self._finish(g_out, o.to(x.dtype)), KDAState(conv_q=cq, conv_k=ck, conv_v=cv, recurrent=rec)
 
 
-__all__ = ["KDA_STACKED_PARAMS", "KDAParams", "ParallelKDAAttention", "TorchKDAKernels", "F"]
+__all__ = ["KDA_IN_PROJ_PARAMS", "KDA_STACKED_PARAMS", "KDAParams", "ParallelKDAAttention", "TorchKDAKernels", "F"]
