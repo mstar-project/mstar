@@ -33,7 +33,7 @@ from mstar.model.kimi_k3.components.common import (
 from mstar.model.kimi_k3.components.mlp import ParallelSiTUMLP
 from mstar.model.kimi_k3.reference.moe import routed_experts_loop
 from mstar.model.kimi_k3.reference.mxfp4 import MXFP4_GROUP, dequant_mxfp4
-from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_route_supported
+from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_route_supported, gate_logits
 from mstar.model.kimi_k3.reference.router import noaux_tc_route
 
 
@@ -91,8 +91,9 @@ class NoAuxTCRouter(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.is_cuda and fused_route_supported(self.top_k, self.num_expert_group, self.topk_group, self.scoring):
-            # the fp32 gate GEMV, then one Triton launch for scores, bias, top-k and weights
-            logits = F.linear(x.reshape(-1, x.shape[-1]).float(), self._gate_weight_fp32())
+            # the fp32 gate logits (bf16-in / fp32-out GEMM, no cast launch; see gate_logits),
+            # then one launch for scores, bias, top-k and weights
+            logits = gate_logits(x.reshape(-1, x.shape[-1]), self.weight, self._gate_weight_fp32)
             return fused_route(
                 logits, self.e_score_correction_bias, self.top_k, scoring=self.scoring,
                 renormalize=self.renormalize, scale=self.routed_scaling_factor,
