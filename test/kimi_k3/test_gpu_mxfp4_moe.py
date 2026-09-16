@@ -78,3 +78,59 @@ def test_attn_res_kernel_matches_reference(m, d):
     ref2 = attn_res_read_and_norm(prefix, blocks, w, nw, 1e-5, 1e-5)
     out2 = attn_res_read_triton(prefix, blocks, w, 1e-5, out_norm_weight=nw, out_eps=1e-5)
     torch.testing.assert_close(out2.float(), ref2.float(), rtol=3e-2, atol=3e-2)
+
+
+@cuda
+@pytest.mark.parametrize("e,tokens", [(16, 5), (224, 100)])
+def test_align_op_skips_foreign_expert_ids(e, tokens):
+    """The CUDA alignment op ignores ids outside ``[0, num_experts)`` like the torch fallback
+    (both the small-batch kernel, ``e <= 64`` and few assignments, and the general one)."""
+    from mstar.utils.fused_moe.align import _moe_align_block_size_torch, moe_align_block_size
+
+    torch.manual_seed(0)
+    top_k, block = 4, 8
+    ids = torch.randint(0, e + 1, (tokens, top_k), dtype=torch.int32, device=DEV)  # e = foreign
+    ids[0] = e
+    sorted_ids, expert_ids, post = moe_align_block_size(ids, block, e)
+    n = sorted_ids.shape[0]
+    ref_sorted = torch.empty(n, dtype=torch.int32, device=DEV)
+    ref_experts = torch.empty(expert_ids.shape[0], dtype=torch.int32, device=DEV)
+    ref_post = torch.empty(1, dtype=torch.int32, device=DEV)
+    _moe_align_block_size_torch(ids, block, e, ref_sorted, ref_experts, ref_post)
+    assert int(post) == int(ref_post)
+    valid = int(post)
+    # same multiset of placed assignments per block (intra-block order is free)
+    for b in range(valid // block):
+        got = sorted(sorted_ids[b * block:(b + 1) * block].tolist())
+        exp = sorted(ref_sorted[b * block:(b + 1) * block].tolist())
+        assert got == exp, b
+        assert int(expert_ids[b]) == int(ref_experts[b])
+    flat = ids.reshape(-1)
+    placed = sorted_ids[:valid]
+    placed = placed[placed < flat.numel()]
+    assert bool((flat[placed] < e).all()) and placed.numel() == int((flat < e).sum())
+
+
+@cuda
+@pytest.mark.parametrize("world,ep", [(2, 2), (4, 2)])
+def test_triton_expert_parallel_partials_sum_to_full(world, ep):
+    """The in-tree Triton MXFP4 kernel in partial mode (local ids with the skipped id, zero-filled
+    top-k slots): per-rank partials add up to the full routed result."""
+    from test_gpu_marlin_moe import _sharded_copies, _small_moe
+
+    moe, hidden = _small_moe()
+    ex = moe.experts
+    p13, s13, p2, s2 = (t.clone() for t in (ex.gate_up_packed, ex.gate_up_scale, ex.down_packed, ex.down_scale))
+    ranks = _sharded_copies(moe, world, ep, p13, s13, p2, s2, backend=None)
+    with torch.no_grad():
+        x = torch.randn(37, hidden, device=DEV, dtype=torch.bfloat16)
+        z = moe.routed_expert_down_proj(x)
+        idx, w = moe.gate(x)
+        ref = moe._routed(z, idx, w).float()  # Triton kernel, every expert local
+        parts = [m._routed(z, idx, w) for m in ranks]
+    for m, part in zip(ranks, parts, strict=True):
+        none_here = (m.sharding.localize(idx) == m.sharding.invalid_id).all(1)
+        assert torch.equal(part[none_here], torch.zeros_like(part[none_here]))
+    total = sum(p.float() for p in parts)
+    rel = (total - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()
+    assert rel < 2e-2, f"rel rms {rel:.4f}"
