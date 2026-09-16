@@ -288,6 +288,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
 
+    # Set True on a submodule whose lockstep-parallel (TP / SP) instance should run the async
+    # scheduling protocol -- the leader speculates step N+1 during forward N and broadcasts it,
+    # see ``MSTAR_TP_ASYNC_SCHED`` -- when that variable is not set. A set variable wins.
+    prefers_tp_async_scheduling: bool = False
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
