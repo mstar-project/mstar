@@ -26,6 +26,24 @@ class ResultTensors:
 
 
 @dataclass
+class InlineResults:
+    """One step's small client outputs from a worker, carried in the message itself.
+
+    A decode step emits one token per request; sending each as a tensor to be read over the
+    transport costs a store, a registration, a message, a read and an ack per request per step.
+    Below ``INLINE_MAX_BYTES`` the worker puts the bytes in this batch instead: ``results`` are
+    the usual per-request ``ResultTensors`` (their ``graph_edge.tensor_info`` carry dims and
+    dtype), ``data`` maps each tensor info's uuid to its serialized bytes.
+    """
+    results: list[ResultTensors]
+    data: dict[str, bytes]
+
+
+# per-tensor size up to which a client output travels inline in the result message
+INLINE_MAX_BYTES = 4096
+
+
+@dataclass
 class RequestComplete:
     """Signals that a request has finished processing."""
     request_id: str
