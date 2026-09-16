@@ -82,11 +82,13 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
 
 def inline_output_bytes(
     host_outputs: dict | None, graph_node_info: dict, max_bytes: int = INLINE_MAX_BYTES,
+    blobs: dict[int, bytes] | None = None,
 ) -> dict[str, bytes]:
     """The step's small outputs of one request as ``{uuid: bytes}``, taken from the host copies
     the stop check already made (``host_outputs[name][i]`` mirrors the stored tensor
     ``graph_node_info[name][i]``). Tensors without a host copy or above ``max_bytes`` are left to
-    the transport path."""
+    the transport path. ``blobs`` is a per-step cache keyed by storage: the host copies of a
+    step's requests share one buffer, which is then converted to bytes once and sliced."""
     out: dict[str, bytes] = {}
     if not isinstance(host_outputs, dict):
         return out
@@ -96,9 +98,21 @@ def inline_output_bytes(
             continue
         for t, info in zip(tensors, infos, strict=True):
             if torch.is_tensor(t) and not t.is_cuda and info.nbytes <= max_bytes:
-                # the same bytes _serialize_tensor produces (host copies are contiguous already)
-                out[info.uuid] = t.reshape(-1).view(torch.uint8).numpy().tobytes()
+                out[info.uuid] = host_tensor_bytes(t, blobs)
     return out
+
+
+def host_tensor_bytes(t: torch.Tensor, blobs: dict[int, bytes] | None = None) -> bytes:
+    """The bytes ``_serialize_tensor`` would produce for a host tensor."""
+    if blobs is None or not t.is_contiguous():
+        return t.contiguous().view(-1).view(torch.uint8).numpy().tobytes()
+    storage = t.untyped_storage()
+    blob = blobs.get(storage.data_ptr())
+    if blob is None:
+        whole = torch.empty(0, dtype=torch.uint8, device=t.device).set_(storage)
+        blob = blobs[storage.data_ptr()] = whole.numpy().tobytes()
+    start = t.storage_offset() * t.element_size()
+    return blob[start:start + t.numel() * t.element_size()]
 
 
 @dataclass
@@ -2378,6 +2392,7 @@ class Worker:
         # are the host copies the stop check made): rid -> {uuid: bytes}, rid -> the edges
         inline_bytes: dict[str, dict[str, bytes]] = {}
         inline_edges: dict[str, list[GraphEdge]] = {}
+        host_blobs: dict[int, bytes] = {}  # this step's host buffers as bytes, converted once each
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.
@@ -2397,7 +2412,7 @@ class Worker:
                 per_request_uuids[rid] = {
                     info.uuid for infos in graph_node_info.values() for info in infos
                 }
-                inline_bytes[rid] = inline_output_bytes(cpu_outputs.get(rid), graph_node_info)
+                inline_bytes[rid] = inline_output_bytes(cpu_outputs.get(rid), graph_node_info, blobs=host_blobs)
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
                 rid, wg_id, batch_N.node_name
