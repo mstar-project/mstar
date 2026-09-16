@@ -61,3 +61,25 @@ def test_submodule_builds_on_cpu(tiny_dir):
     cg = sub.get_cuda_graph_configs(torch.device("cpu"))
     # decode only: the varlen KDA prefill kernels size work on the host, so no prefill capture
     assert len(cg) == 1 and cg[0].capture_graph_walk == "decode"
+
+
+def test_moe_backend_selection_helpers():
+    """The Marlin load is retried before falling back, and the backend choice is AND-ed across
+    the tensor-parallel group (a trivial group returns the local verdict)."""
+    from mstar.distributed.communication import CommGroup
+    from mstar.model.kimi_k3.components.language_model import _all_ranks_agree, _retry
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise FileNotFoundError("lock")
+        return "loaded"
+
+    assert _retry(flaky, attempts=3, delay_s=0) == "loaded" and calls["n"] == 3
+    import pytest as _pytest
+    with _pytest.raises(FileNotFoundError):
+        _retry(lambda: (_ for _ in ()).throw(FileNotFoundError("x")), attempts=2, delay_s=0)
+    assert _all_ranks_agree(True, None) is True and _all_ranks_agree(False, None) is False
+    assert _all_ranks_agree(True, CommGroup.trivial()) is True
