@@ -13,11 +13,11 @@ python -c "import mstar"
 mstar --help
 ```
 
-`mstar-project` is an alias package (under
-`packaging/aliases/`) that carries no code and just depends on `mstar-ai`, so
-`pip install mstar-project` resolves to the same thing. It mirrors mstar-ai's
+`mstar-project` and `mstar-serve` are alias packages (under
+`packaging/aliases/`) that carry no code and just depend on `mstar-ai`, so
+`pip install mstar-project` resolves to the same thing. They mirror mstar-ai's
 extras, so `pip install "mstar-project[all]"` forwards to `mstar-ai[all]`. Keep
-its `[project.optional-dependencies]` in sync when mstar-ai's extras change.
+their `[project.optional-dependencies]` in sync when mstar-ai's extras change.
 PyPI treats `mstar-ai`, `mstar_ai`, `mstar.ai` and `MSTAR-AI` as one name.
 
 ## Default configs
