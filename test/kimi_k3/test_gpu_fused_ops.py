@@ -43,6 +43,11 @@ def test_situ_kernel_matches_reference():
     # fp32 math in both, rounded once to bf16: at most one ulp apart
     assert (out - ref).abs().max() <= (ref.abs().max() * 2 ** -7)
     assert ((out - ref).abs() > 0).float().mean() < 0.05
+    # a column slice of a wider matrix (a merged projection's gate | up segment): same result
+    wide = torch.randn(37, 4352, device=DEV, dtype=torch.bfloat16) * 6
+    view = wide.narrow(-1, 3584, 2 * 384)
+    assert not view.is_contiguous()
+    torch.testing.assert_close(act(view), act(view.contiguous()), rtol=0, atol=0)
 
 
 @cuda
