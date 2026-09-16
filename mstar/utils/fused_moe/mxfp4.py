@@ -176,11 +176,15 @@ def fused_experts_mxfp4(
     w2_packed: torch.Tensor, w2_scale: torch.Tensor,
     topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     situ_beta: float = 4.0, situ_linear_beta: float | None = 25.0,
-    reduce_results: bool = True,
+    reduce_results: bool = True, partial: bool = False,
 ) -> torch.Tensor:
     """MXFP4-weight MoE dispatch: ``hidden [T, K]`` bf16 -> ``[T, K]`` (or ``[T, top_k, K]``).
 
     ``w13_packed [E, 2*inter, K/2]`` (gate rows then up rows), ``w2_packed [E, K, inter/2]``.
+    ``topk_ids`` are indices into these ``E`` (local) experts; ids ``>= E`` mark assignments held
+    by another expert-parallel rank and are skipped. Pass ``partial=True`` whenever such ids can
+    occur: the skipped top-k slots are then zero-filled so the sum over ``top_k`` is this rank's
+    partial result.
     """
     assert hidden_states.dtype in (torch.bfloat16, torch.float16) and hidden_states.dim() == 2
     hidden_states = hidden_states.contiguous()
@@ -198,7 +202,8 @@ def fused_experts_mxfp4(
     m_topk = num_tokens * top_k
     cache1 = torch.empty((m_topk, two_inter), device=hidden_states.device, dtype=hidden_states.dtype)
     cache2 = torch.empty((m_topk, inter), device=hidden_states.device, dtype=hidden_states.dtype)
-    cache3 = torch.empty((num_tokens, top_k, hidden), device=hidden_states.device, dtype=hidden_states.dtype)
+    alloc = torch.zeros if partial else torch.empty
+    cache3 = alloc((num_tokens, top_k, hidden), device=hidden_states.device, dtype=hidden_states.dtype)
 
     invoke_fused_moe_mxfp4_kernel(
         hidden_states, w13_packed, w13_scale, cache1, topk_weights, topk_ids,
@@ -223,8 +228,10 @@ def fused_experts_bf16_situ(
     hidden_states: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor,
     topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     situ_beta: float = 4.0, situ_linear_beta: float | None = 25.0, reduce_results: bool = True,
+    partial: bool = False,
 ) -> torch.Tensor:
-    """The bf16 Triton grouped GEMM with the SiTU-GLU activation (dense-weight experts)."""
+    """The bf16 Triton grouped GEMM with the SiTU-GLU activation (dense-weight experts); ``partial``
+    as in :func:`fused_experts_mxfp4`."""
     from mstar.utils.fused_moe.kernels import invoke_fused_moe_kernel
 
     hidden_states = hidden_states.contiguous()
@@ -240,7 +247,8 @@ def fused_experts_bf16_situ(
     m_topk = num_tokens * top_k
     cache1 = torch.empty((m_topk, two_inter), device=hidden_states.device, dtype=hidden_states.dtype)
     cache2 = torch.empty((m_topk, inter), device=hidden_states.device, dtype=hidden_states.dtype)
-    cache3 = torch.empty((num_tokens, top_k, hidden), device=hidden_states.device, dtype=hidden_states.dtype)
+    alloc = torch.zeros if partial else torch.empty
+    cache3 = alloc((num_tokens, top_k, hidden), device=hidden_states.device, dtype=hidden_states.dtype)
     invoke_fused_moe_kernel(
         A=hidden_states, B=w13, C=cache1, topk_weights=topk_weights, topk_ids=topk_ids,
         sorted_token_ids=sorted_token_ids, expert_ids=expert_ids, num_tokens_post_padded=num_tokens_post_padded,
