@@ -149,3 +149,38 @@ def test_attn_res_folded_add_and_norm_are_exact(m, d, t):
         # no blocks and no norm: the read is the sum itself
         x0, p0 = mod.read(prefix, blocks[:, :0], add=add)
         assert torch.equal(x0, summed) and torch.equal(p0, summed)
+
+
+@cuda
+@pytest.mark.parametrize("rows,d,dtype", [(1, 4608, torch.bfloat16), (5, 4608, torch.bfloat16), (64, 384, torch.bfloat16), (3, 96, torch.float32)])
+def test_slot_indexed_conv_update_matches_fla(rows, d, dtype):
+    """The in-place slot-indexed conv update equals fla's kernel on the gathered windows, output
+    and updated windows bit for bit (same fp32 taps, same rounding), and leaves the other slots alone."""
+    from fla.modules.conv.triton.ops import causal_conv1d_update
+
+    from mstar.model.kimi_k3.components.conv_kernel import conv_update_slots
+
+    torch.manual_seed(0)
+    w = 4
+    slots = rows + 9
+    state = torch.randn(slots, d, w, device=DEV, dtype=dtype)
+    slot_ids = torch.randperm(slots, device=DEV)[:rows].to(torch.int32)
+    weight = (torch.randn(d, w, device=DEV) * 0.3).to(dtype)
+    x = torch.randn(rows, d, device=DEV, dtype=dtype)
+    ref_state = state.clone()
+    cache = ref_state.index_select(0, slot_ids)
+    y_ref, cache = causal_conv1d_update(x.view(rows, 1, -1), cache, weight=weight, activation="silu")
+    ref_state[slot_ids] = cache.to(ref_state.dtype)
+    y = conv_update_slots(x, state, slot_ids, weight, activation="silu")
+    if dtype == torch.float32:  # fla's autotuned split can order the four taps differently: one ulp
+        torch.testing.assert_close(y.view(rows, -1), y_ref.view(rows, -1), rtol=0, atol=2e-7)
+    else:
+        assert torch.equal(y.view(rows, -1), y_ref.view(rows, -1))
+    assert torch.equal(state, ref_state)
+    # a strided row (a column slice of a wider matrix) reads the same way
+    wide = torch.randn(rows, d + 64, device=DEV, dtype=dtype)
+    view = wide.narrow(1, 32, d)
+    st1, st2 = state.clone(), state.clone()
+    y1 = conv_update_slots(view, st1, slot_ids, weight)
+    y2 = conv_update_slots(view.contiguous(), st2, slot_ids, weight)
+    assert torch.equal(y1, y2) and torch.equal(st1, st2)
