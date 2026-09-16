@@ -333,9 +333,35 @@ class CondHead(nn.Module):
             nn.Linear(config.d_model, config.d_model, bias=False) for _ in range(self.n_cond)
         )
 
-    def forward(self, cond: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """``cond`` ``[B, N, D]`` -> six ``[B, N, D]`` tensors, in block order
-        ``(s0, b0, g0, s1, b1, g1)``."""
+    def _project(self, cond: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """The live head: ``cond`` ``[B, N, D]`` -> six ``[B, N, D]`` tensors, in
+        block order ``(s0, b0, g0, s1, b1, g1)``."""
         cond = cond + self.bias_in if self.bias_in is not None else cond
         h = F.silu(cond)
         return tuple(p(h) for p in self.cond_proj)
+
+    def build_cache(self, conds: torch.Tensor) -> None:
+        """Precompute the six modulation tensors for every scheduled sigma.
+
+        ``conds`` is ``[S, 1, D]`` -- one embedding per ``scheduler_sigmas``
+        entry, each built at M=1 exactly as ``forward`` receives it, so a cached
+        row is bit-identical to the live ``_project`` it replaces. Switches
+        ``forward`` to a gather; idempotent enough to rebuild.
+        """
+        with torch.no_grad():
+            rows = [
+                torch.stack(self._project(conds[i : i + 1]), dim=0)
+                for i in range(conds.size(0))
+            ]
+        self._cache = torch.stack(rows, dim=0)
+
+    def forward(self, cond: torch.Tensor, cond_idx: int) -> tuple[torch.Tensor, ...]:
+        """``cond`` ``[B, N, D]``, ``cond_idx`` the ``scheduler_sigmas`` slot ->
+        six ``[B, N, D]`` tensors ``(s0, b0, g0, s1, b1, g1)``.
+
+        After ``build_cache`` the six come from the cache row ``cond_idx`` and
+        ``cond`` is unused
+        """
+        if self._cache is not None:
+            return tuple(self._cache[cond_idx].unbind(0))
+        return self._project(cond)
