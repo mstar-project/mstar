@@ -311,7 +311,12 @@ class KimiLatentMoE(nn.Module):
             y = self.routed_expert_norm(y)
         y = self.routed_expert_up_proj(y)  # partial over the latent shards
         if self.shared_experts is not None:
-            y = y + self.shared_experts(x)  # partial over the intermediate shards
+            s_out = self.shared_experts(x)  # partial over the intermediate shards
+            buf = self.comm_group.symm_buffer(y.shape, y.dtype, y.device)
+            if buf is not None:  # the add lands in the all-reduce buffer: no copy launch
+                torch.add(y, s_out, out=buf)
+                return self.comm_group.all_reduce_symm_buffer(buf).view(shape)
+            y = y + s_out
         if self.comm_group.world_size > 1:
             y = self.comm_group.all_reduce(y)
         return y.view(shape)
