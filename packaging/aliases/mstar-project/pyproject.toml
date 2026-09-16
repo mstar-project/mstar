@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # Alias for the M* engine. Installs the real `mstar-ai` distribution.
 name = "mstar-project"
-version = "0.2.0"
+version = "0.2.1"
 description = "Alias for the M* multimodal inference engine (installs mstar-ai)."
 readme = "README.md"
 requires-python = ">=3.12"
