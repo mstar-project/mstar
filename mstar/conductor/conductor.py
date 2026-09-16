@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import signal
 import socket
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -49,6 +51,19 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
+
+
+class DeadWorkerError(RuntimeError):
+    """A worker process exited. Raised out of ``Conductor.run`` so the
+    conductor tears the deployment down and exits non-zero."""
+
+    def __init__(self, worker_id: str, pid: int | None, exitcode: int | None):
+        super().__init__(
+            f"worker {worker_id} (pid {pid}) exited with {describe_exitcode(exitcode)}"
+        )
+        self.worker_id = worker_id
+        self.pid = pid
+        self.exitcode = exitcode
 
 
 def _req_id_to_seed(req_id: str):
@@ -78,6 +93,28 @@ def _pick_free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
+    """Worker-side watchdog: leave once the conductor is gone.
+
+    The conductor terminates its workers on every exit path it controls; this
+    covers the one it cannot (killed outright), so no worker outlives it holding
+    GPU memory. That includes a worker still in setup, which would otherwise
+    wedge in a startup collective waiting for a peer that already left. SIGTERM
+    first (the graceful path in ``_worker_process_target``); a main thread stuck
+    in a C call cannot service it, so exit hard after a grace period, as the
+    conductor's own shutdown does.
+    """
+    parent = mp.parent_process() if parent is None else parent
+    if parent is None:
+        return
+    while parent.is_alive():
+        time.sleep(poll_s)
+    logger.error("Worker %s: the conductor process is gone; exiting", worker_id)
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(5.0)
+    os._exit(1)
 
 
 def _worker_process_target(
@@ -119,6 +156,9 @@ def _worker_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    threading.Thread(
+        target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
+    ).start()
 
     from mstar.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
@@ -145,6 +185,8 @@ def _worker_process_target(
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
         )
+    except SystemExit:
+        raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
@@ -264,6 +306,11 @@ class Conductor:
         self.tcp_transfer_device = tcp_transfer_device
 
         self._worker_processes: list[mp.Process] = []
+        # A worker that dies sends nothing, so its process handle is the only
+        # signal; polled on this cadence by the startup wait and the main loop
+        # (see _poll_worker_liveness).
+        self._liveness_interval_s = 0.5
+        self._next_liveness_check = 0.0
         self.waiting_queue: list[NewRequestConductor] = []
 
         with open(model_config_file, "r") as f:
@@ -467,6 +514,8 @@ class Conductor:
 
     def shutdown(self):
         """Terminate and join all worker processes."""
+        if not self._worker_processes:
+            return  # already done (run()'s caller and the atexit hook both call this)
         logger.info("Shutting down conductor...")
         # SIGTERM is handled in _worker_process_target as a graceful exit so
         # the transports' cleanup runs (shm segments unlinked). A worker
@@ -485,6 +534,79 @@ class Conductor:
                 p.kill()
                 p.join(timeout=5)
         self._worker_processes.clear()
+
+    def _dead_workers(self) -> list[tuple[str, mp.Process]]:
+        """(worker_id, handle) for every worker process that has exited.
+        Handles are appended in ``worker_ids`` order by ``_launch_workers``;
+        ``is_alive`` reaps the child, so ``exitcode`` is set afterwards."""
+        return [
+            (worker_id, p)
+            for worker_id, p in zip(self.worker_ids, self._worker_processes, strict=True)
+            if not p.is_alive()
+        ]
+
+    def _worker_nodes(self, worker_id: str) -> set[str]:
+        return {
+            node
+            for wg in self._per_worker_graphs.get(worker_id, [])
+            for node in wg.section.get_nodes()
+        }
+
+    def _poll_worker_liveness(self) -> None:
+        """Raise ``DeadWorkerError`` if a worker process has exited.
+
+        A worker that dies during setup (init exception, OOM kill) or while
+        serving (SIGKILL, segfault) sends nothing, so without this check the
+        startup wait and the main loop would wait for it forever and its
+        requests would sit until the API server's timeout. A dead worker is
+        fatal for the deployment: every waiting client gets a 503 naming it,
+        then the exception propagates out of ``run`` so the conductor
+        terminates the remaining workers and exits non-zero.
+        """
+        now = time.perf_counter()
+        if now < self._next_liveness_check:
+            return
+        self._next_liveness_check = now + self._liveness_interval_s
+        dead = self._dead_workers()
+        if not dead:
+            return
+        for worker_id, p in dead:
+            logger.error(
+                "Worker %s (pid %s) exited with %s; it hosted nodes %s. "
+                "Shutting the deployment down.",
+                worker_id, p.pid, describe_exitcode(p.exitcode),
+                sorted(self._worker_nodes(worker_id)),
+            )
+        worker_id, p = dead[0]
+        self._fail_all_requests(
+            f"worker {worker_id} (pid {p.pid}) exited with "
+            f"{describe_exitcode(p.exitcode)}; the server is shutting down"
+        )
+        raise DeadWorkerError(worker_id, p.pid, p.exitcode)
+
+    def _fail_all_requests(self, error_message: str, status: int = 503) -> None:
+        """Notify the client of every request still awaiting a result, bypassing
+        the drain barrier. Only for a deployment that is going down: the workers
+        are about to be terminated anyway, and waiting for a dead participant's
+        READS_DONE would just hold the client until the request timeout."""
+        pending = [body.request_id for body in self.waiting_queue]
+        for request_id in self.requests:
+            dr = self.draining.get(request_id)
+            if dr is not None and dr.failure_error is None:
+                continue  # completed or aborted: the client has already heard
+            pending.append(request_id)
+        for request_id in pending:
+            self.communicator.send(
+                "api_server",
+                APIServerMessage(
+                    message_type="request_failed",
+                    body=RequestFailed(
+                        request_id=request_id,
+                        error_message=error_message,
+                        status=status,
+                    ),
+                ),
+            )
 
     def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
         """
@@ -1315,7 +1437,8 @@ class Conductor:
         """Block until every worker reports ``SETUP_DONE`` (weight load + warmup
         + CUDA-graph capture), so the main loop opens only once all workers can
         serve. Any non-``SETUP_DONE`` message that races in is stashed and
-        replayed on the first main-loop iteration so it isn't lost.
+        replayed on the first main-loop iteration so it isn't lost. Raises
+        ``DeadWorkerError`` if a worker exits before reporting.
         """
         pending = set(self.worker_ids)
         logger.info(
@@ -1328,6 +1451,7 @@ class Conductor:
                 else:
                     self._startup_message_backlog.append(message)
             if pending:
+                self._poll_worker_liveness()
                 time.sleep(0.01)
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
 
@@ -1405,4 +1529,7 @@ class Conductor:
                 if self.enable_nvtx:
                     range_pop()
 
+            # Outside the try above: DeadWorkerError has to leave the loop, not be
+            # logged as a main-loop error and retried.
+            self._poll_worker_liveness()
             time.sleep(0.001)
