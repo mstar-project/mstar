@@ -3,10 +3,12 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# Distribution name is "m-star" because the bare "mstar" is taken on PyPI.
-# The import package is still `mstar` and the console scripts are unchanged;
-# `pip install m-star` then `import mstar` works as expected.
-name = "m-star"
+# Distribution name is "mstar-ai". The bare "mstar" is taken on PyPI and its
+# similarity rule (separators are dropped before names are compared) also
+# refuses "m-star" while that project exists. The import package is still
+# `mstar` and the console scripts are unchanged, so `pip install mstar-ai`
+# then `import mstar` works as expected.
+name = "mstar-ai"
 version = "0.2.0"
 description = "Multimodal inference engine"
 readme = "README.md"
@@ -78,6 +80,20 @@ bagel = [
     "torchaudio",
     "torchcodec",
     "transformers",
+]
+
+bagel_xpu = [
+    "einops",
+    "huggingface-hub",
+    "mooncake-transfer-engine",
+    "Pillow",
+    "regex",
+    "safetensors",
+    "torchvision",
+    "torchaudio",
+    "torchcodec",
+    "transformers",
+    "vllm-xpu-kernels==0.1.13.2",
 ]
 
 cosmos3 = [

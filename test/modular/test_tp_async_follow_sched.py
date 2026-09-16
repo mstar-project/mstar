@@ -185,3 +185,56 @@ def test_fifo_accessors_touch_only_the_head_and_keep_order():
     assert sched.peek_tp_follow() is None
 
 
+
+
+# -------------------------------------------------- drain refcount accounting
+
+# ``Worker._complete_drain_if_ready`` withholds the teardown barrier's
+# READS_DONE ACK while ``pending_tp_follow_count[rid] > 0``, so every path that
+# retires a queued head must discharge the count — the async follower's direct
+# head pops included, or an abort never completes.
+
+def test_drain_refcount_discharged_by_the_serial_path():
+    sched = _sched()
+    manager = _FakeWorkerGraphsManager(_FakeQueue(["r0"]))
+    sched.register_tp_follow(_head(["r0"]))
+    assert sched.pending_tp_follow_count["r0"] == 1
+
+    assert sched.get_next_batch(manager) is not None
+    assert "r0" not in sched.pending_tp_follow_count
+
+
+def test_drain_refcount_discharged_by_a_direct_head_pop():
+    """The async follower retires heads without ``_try_schedule_tp_follow``:
+    building one into a speculation, dropping one whose parent step closed, or
+    voiding one on its parent's verdict. All three pop the head directly."""
+    sched = _sched()
+    sched.register_tp_follow(_head(["r0", "r1"]))
+    assert sched.pending_tp_follow_count == {"r0": 1, "r1": 1}
+
+    sched.pop_tp_follow_head()
+    assert not sched.pending_tp_follow_count
+
+
+def test_drain_refcount_tracks_each_queued_head_separately():
+    sched = _sched()
+    sched.register_tp_follow(_head(["r0"], seq=1, from_seq=0))
+    sched.register_tp_follow(_head(["r0"], seq=2, from_seq=1))
+    assert sched.pending_tp_follow_count["r0"] == 2
+
+    sched.pop_tp_follow_head()
+    assert sched.pending_tp_follow_count["r0"] == 1  # one head still queued
+    sched.pop_tp_follow_head()
+    assert "r0" not in sched.pending_tp_follow_count
+
+
+def test_drain_refcount_not_resurrected_by_a_pop_after_clear_rid():
+    """REMOVE_REQUEST clears the count; a later pop of a head still naming the
+    rid must not leave a fresh entry behind (the dict is a defaultdict)."""
+    sched = _sched()
+    sched.register_tp_follow(_head(["r0"]))
+    sched.clear_rid("r0")
+    assert "r0" not in sched.pending_tp_follow_count
+
+    sched.pop_tp_follow_head()
+    assert "r0" not in sched.pending_tp_follow_count
