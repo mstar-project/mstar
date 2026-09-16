@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 
 import torch
 import triton
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 _CSRC = os.path.join(os.path.dirname(__file__), "csrc", "moe_align_block_size.cu")
 
 
-def _clear_stale_build_lock(name: str) -> None:
+def _clear_stale_build_lock(name: str, min_age_s: float = 20 * 60) -> None:
     """Remove a ``FileBaton`` lock left behind by a killed build process.
 
     ``torch.utils.cpp_extension.load`` serialises concurrent builds with a lock
@@ -37,7 +38,13 @@ def _clear_stale_build_lock(name: str) -> None:
 
     The baton holds the fd open for the build's duration, so a lock nobody has
     open is by definition abandoned. Scanning /proc for holders distinguishes
-    that from a genuine build in progress, which mtime alone cannot.
+    that from a genuine build in progress, which mtime alone cannot -- on this
+    machine. The extension cache usually lives in the home directory, which is
+    shared across nodes, and /proc only shows local processes: a lock held by a
+    rank on another node looks abandoned from here. Removing it made the holder's
+    release fail (``FileNotFoundError``) and that rank fell back to a slower kernel
+    (2026-09-15). So a lock is only removed when it is also older than
+    ``min_age_s`` (default 20 minutes) -- longer than any load or build takes.
     """
     from torch.utils.cpp_extension import _get_build_directory
 
@@ -47,6 +54,11 @@ def _clear_stale_build_lock(name: str) -> None:
         return
     lock_path = os.path.join(build_dir, "lock")
     if not os.path.exists(lock_path):
+        return
+    try:
+        if time.time() - os.path.getmtime(lock_path) < min_age_s:
+            return  # young: a live build or load, possibly on another node
+    except OSError:
         return
     try:
         target = os.path.realpath(lock_path)
