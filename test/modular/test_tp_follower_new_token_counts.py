@@ -49,3 +49,11 @@ def test_first_rank_counts_new_tokens():
     w, counts, _ = _fake_worker({"r": {"u1": torch.zeros(3, dtype=torch.int64)}})
     Worker._send_outputs(w, "r", _routing(True), nested_loop_indices=None, graph_walk="decode", partition_name="p")
     assert counts == {"new_token": 3}
+
+
+def test_symm_all_reduce_mode_parsing():
+    from mstar.distributed.communication import _symm_mode
+
+    assert _symm_mode("auto") == (True, True) and _symm_mode("multimem") == (True, True)
+    assert _symm_mode("1") == (True, False)
+    assert _symm_mode("0") == (False, False) and _symm_mode("nccl") == (False, False)
