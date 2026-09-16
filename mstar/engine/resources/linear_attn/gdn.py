@@ -1,15 +1,14 @@
 """Gated delta rule through FlashInfer's GDN kernels.
 
-Two kernels, and a plan picks one for the whole batch. Every row of one token
-takes the recurrent decode path, which addresses the state pool directly by
-slot. Anything else takes the chunked path, which handles span-1 rows and
-zero-span padding alongside long ones — so a mixed batch goes through it whole
-rather than being split, and neither kernel needs the tokens re-packed.
+Two kernels, one plan picking one for the whole batch: all-one-token rows take
+the recurrent decode path, anything else the chunked path, which handles span-1
+and zero-span padding alongside long rows. So a mixed batch goes through whole
+and neither kernel re-packs tokens.
 
-The pool is reached two ways, and never as an object: its plan result arrives
-through ``ctx.plan_results`` (this resource names it in ``depends_on``), and
-its per-layer block arrives as a plain tensor argument to ``run``, the way
-``AttentionCallable`` hands ``kv.layer_view()`` to ``attn.run``.
+The pool is never reached as an object: its plan result arrives through
+``ctx.plan_results`` (named in ``depends_on``) and its per-layer block as a
+plain tensor argument to ``run``, as ``AttentionCallable`` hands
+``kv.layer_view()`` to ``attn.run``.
 """
 
 from __future__ import annotations
@@ -271,25 +270,17 @@ class GDNManager(LinearAttnManager):
     ) -> torch.Tensor:
         """One layer's gated delta rule over this step's packed tokens.
 
-        ``q``/``k`` are ``[total_tokens, H, K]`` and ``v`` ``[total_tokens, HV,
-        V]``. ``a`` and ``b`` are the raw ``[total_tokens, HV]`` gate
-        projections, not the decay and the learning rate: the decode kernel
-        forms those itself from ``a_log``/``dt_bias``, while the chunked one
-        wants them made, so the two are marshalled apart below.
+        ``q``/``k`` are ``[total_tokens, H, K]``, ``v`` ``[total_tokens, HV,
+        V]``, and the return ``[total_tokens, HV, V]``. ``state_layer`` is this
+        layer's ``[max_slots, HV, V, K]`` view of the pool, updated in place.
 
-        ``state_layer`` is this layer's ``[max_slots, HV, V, K]`` view of the
-        pool — the caller reads it off the pool, as ``AttentionCallable`` reads
-        ``layer_view()`` — and is updated in place.
+        ``a``/``b`` are the raw gate projections, not the decay and learning
+        rate: the decode kernel forms those itself, the chunked one wants them
+        made, so they are marshalled apart below.
 
-        Returns ``[total_tokens, HV, V]``. Neither path re-packs tokens, so
-        there is no output buffer to stitch: each kernel already writes the
-        batch in order.
-
-        q and k are L2-normalized wherever the kernel will not do it. Both take
-        a flag, but only the decode one honours it: the SM90 chunked kernel
-        silently ignores its own and returns NaN for any sequence long enough
-        to matter. Doing it here costs a norm, a divide and two casts per
-        tensor per layer, so the decode path leaves it to the kernel.
+        q and k are L2-normalized only where the kernel will not do it. Both
+        take a flag but only decode honours it — SM90's chunked kernel ignores
+        its own and returns NaN on any sequence long enough to matter.
         """
         plan = self.current_plan(label)
         if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
@@ -318,14 +309,12 @@ class GDNManager(LinearAttnManager):
     ) -> torch.Tensor:
         """The depthwise conv over ``[q|k|v]``, before the delta rule.
 
-        ``x`` is ``[total_tokens, conv_dim]`` and ``conv_layer`` this layer's
+        ``x`` is ``[total_tokens, conv_dim]``, ``weight``
+        ``[conv_dim, kernel_size]``, and ``conv_layer`` this layer's
         ``[max_slots, conv_dim, width]`` view of the pool's conv block, updated
-        in place. ``weight`` is ``[conv_dim, kernel_size]``.
-
-        Splits the same way ``run`` does, and on the same plan. Padding rows
-        need nothing special either way: pointed at the sink they write there,
-        and with the sink off they carry -1, which is this kernel's own
-        ``PAD_SLOT_ID``.
+        in place. Splits like ``run``, on the same plan. Padding rows need
+        nothing special: at the sink they write there, and with the sink off
+        they carry -1, this kernel's own ``PAD_SLOT_ID``.
         """
         return self.current_plan(label).run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,
