@@ -91,14 +91,16 @@ class WaypointDiTBlock(nn.Module):
         v1: Tensor | None,
         *,
         commit: bool,
+        cond_idx: int,
     ) -> tuple[Tensor, Tensor]:
         """``x`` ``[B, N*T, D]``, ``cond``/``ctrl_emb`` ``[B, N, D]`` (per frame)
         -> ``(x, v1)``. ``v1`` is layer 0's pre-lerp V, threaded down the stack.
+        ``cond_idx`` is the ``scheduler_sigmas`` slot, for the cond_head cache.
 
         Only ``f_pos`` reaches this far -- the RoPE angles are built once at the
         root -- so the scalar ring clock is passed rather than the whole bundle.
         """
-        s0, b0, g0, s1, b1, g1 = self.cond_head(cond)
+        s0, b0, g0, s1, b1, g1 = self.cond_head(cond, cond_idx)
 
         residual = x
         x = ada_rmsnorm(x, s0, b0)
@@ -236,7 +238,26 @@ class WaypointDiT(nn.Module):
         self.rope_angles.materialize(device)
         self.denoise_step_emb.materialize(device)
         self._sigma_schedule(device, self.dtype)
+        self._materialize_cond_cache(device)
         return self
+
+    def _materialize_cond_cache(self, device: torch.device) -> None:
+        """Fold every block's cond_head GEMMs into a per-sigma gather.
+
+        The six modulation tensors depend only on the sigma-indexed cond, and
+        sigma is one of ``scheduler_sigmas``. Each cond is built at M=1, exactly
+        as ``forward`` receives it, so the cached rows are bit-identical to the
+        live projection they replace (bf16 GEMV in, bf16 gather out). Runs after
+        weight load, before ``compile_regions``, on the same footing as the
+        conditioner LUT.
+        """
+        sigmas = self._sigma_schedule(device, self.dtype)
+        with torch.no_grad():
+            conds = torch.cat(
+                [self.denoise_step_emb(s.view(1, 1)) for s in sigmas], dim=0
+            )  # [S, 1, D], one M=1 embedding per scheduled sigma
+        for block in self.blocks:
+            block.cond_head.build_cache(conds)
 
     # ---- Positions ---------------------------------------------------------
 
@@ -266,6 +287,7 @@ class WaypointDiT(nn.Module):
         button: Tensor,
         scroll: Tensor,
         commit: bool,
+        cond_idx: int,
     ) -> Tensor:
         """One pass over one latent frame; returns the rectified-flow velocity.
 
@@ -275,7 +297,9 @@ class WaypointDiT(nn.Module):
 
         ``commit`` says whether this pass keeps its K/V: False for the four
         denoise passes, True for the fifth. An argument rather than resource
-        state -- all five passes sit inside one engine step.
+        state -- all five passes sit inside one engine step. ``cond_idx`` is
+        this pass's ``scheduler_sigmas`` slot; it selects the cached modulation
+        row and must match ``sigma``.
         """
         B, N, C, H, W = x.shape
         ph, pw = self.patch
@@ -308,7 +332,8 @@ class WaypointDiT(nn.Module):
         v1 = None  # layer 0's pre-lerp V, threaded through all 24 blocks
         for block in self.blocks:
             h, v1 = block(
-                h, pos_ids.f_pos, rope_angles, cond, ctrl_emb, v1, commit=commit
+                h, pos_ids.f_pos, rope_angles, cond, ctrl_emb, v1,
+                commit=commit, cond_idx=cond_idx,
             )
 
         # silu sits BETWEEN the adaLN norm and the unpatchify projection
@@ -359,7 +384,9 @@ class WaypointDiT(nn.Module):
         # 5 sigmas, 4 diffs: the trailing 0.0 exists only to produce the last
         # step size. Sliced, not zipped ragged -- dynamo rejects a ragged zip
         # under fullgraph.
-        for step_sigma, step_dsigma in zip(sigmas[:-1], sigmas.diff(), strict=True):
+        for cond_idx, (step_sigma, step_dsigma) in enumerate(
+            zip(sigmas[:-1], sigmas.diff(), strict=True)
+        ):
             v = self(
                 x,
                 sigma.fill_(step_sigma),
@@ -368,6 +395,7 @@ class WaypointDiT(nn.Module):
                 button=button,
                 scroll=scroll,
                 commit=False,
+                cond_idx=cond_idx,
             )
             # fp32 accumulate, back to the latent dtype: the add in bf16 loses
             # the small late steps.
@@ -395,6 +423,8 @@ class WaypointDiT(nn.Module):
             button=button,
             scroll=scroll,
             commit=True,
+            # sigma=0 is the trailing schedule entry, the committing pass's slot.
+            cond_idx=len(self.config.scheduler_sigmas) - 1,
         )
 
     def generate_frame(
