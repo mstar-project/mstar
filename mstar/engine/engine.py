@@ -63,11 +63,85 @@ class SubmoduleManagement:
     resources: dict[str, Resource]
     cuda_graph_runner: CudaGraphRunner | None = None
 
+    # Rotated globally, not per runner: slot-keyed buffers are shared across
+    # buckets and regions, so per-runner counters let consecutive steps collide
+    # on a slot. Leased from the plan thread and the GPU thread both, hence the
+    # lock.
+    _next_slot: int = field(init=False, default=0)
+    _num_slots: int = field(init=False, default=1)
+    _forced_double_buffer: bool = field(init=False, default=False)
+    _slot_lock: threading.Lock = field(
+        init=False, default_factory=threading.Lock, repr=False
+    )
+
     # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
     piecewise_runners: dict[str, PiecewiseCudaGraphRunner] = field(
         default_factory=dict
     )
+
+    def __post_init__(self):
+        # Two hazards want a second slot, both of them the host running ahead of
+        # the GPU: pre-plan needs plan(N+1) to write buffers replay(N) isn't
+        # reading, and ``force_double_buffer`` is the same for a resource
+        # staging into a reused host buffer. The latter is not pre-plan
+        # specific — the main runner has it too (see `Resource`).
+        # TODO: submodule-wide, so a capture touching neither kind still pays
+        # double the buffers. Each runner could size its own count from the
+        # resources its captures touch, as PiecewiseCudaGraphRunner does.
+        preplan_enabled = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
+        self._forced_double_buffer = any(
+            res.force_double_buffer for res in self.resources.values()
+        )
+        double_buffered = self._forced_double_buffer or (
+            preplan_enabled
+            and any(res.supports_preplan for res in self.resources.values())
+        )
+        if not double_buffered:
+            self._num_slots = 1
+            return
+        self._num_slots = int(os.environ.get("MSTAR_NUM_SLOTS", "2"))
+        if self._num_slots < 2:
+            # MSTAR_NUM_SLOTS=1 is the knob for turning double-buffering off,
+            # but neither hazard has a single-buffered form: one slot puts the
+            # next step's staging on top of a DMA that may not have retired.
+            # Turn pre-planning off (MSTAR_PRE_PLAN_SPEC=0) to drop to a slot.
+            logger.warning(
+                "MSTAR_NUM_SLOTS=%d, but a resource on this node needs "
+                "double-buffering; using 2 slots.", self._num_slots,
+            )
+            self._num_slots = 2
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
+
+    @property
+    def needs_slot_fence(self) -> bool:
+        """Whether reusing a slot has to wait out the GPU work that last held
+        it — true exactly when a resource stages into a reused host buffer."""
+        return self._forced_double_buffer
+
+    @property
+    def next_slot(self) -> int:
+        """The slot the next lease hands out. Read unlocked: an int read is
+        atomic under the GIL, and the only other leaser is the plan thread,
+        which is gated on the previous batch's ``commit_done``."""
+        return self._next_slot
+
+    def lease_slot(self) -> int:
+        with self._slot_lock:
+            slot = self._next_slot
+            self._next_slot = (self._next_slot + 1) % self._num_slots
+            return slot
+
+    def set_piecewise_slot(self, slot: int) -> None:
+        """Point the region runners at this batch's slot, on the GPU thread just
+        before its forward. Set here rather than at lease time: leasing runs
+        ahead of the forward (pre-plan reserves N+1's slot while N is in flight),
+        so a lease-time write would race the replay reading ``_current_slot``."""
+        for runner in self.piecewise_runners.values():
+            runner.set_slot(slot)
 
 
 @dataclass
@@ -78,6 +152,9 @@ class ExecutingBatch:
     step_context: StepContext
 
     running_batched: bool = False
+
+    # Enables double-buffering for resources with non-blocking H2D
+    slot: int | None = None
 
     # Selects among a walk's capture buckets; matches SubmoduleStep.cg_key_info
     cg_key_info: Any | None = None
@@ -186,8 +263,15 @@ class ExecutingBatch:
         self.admit_error = reason
         self.failed_resource = failed_resource
 
+    def set_slot(self, slot: int):
+        self.slot = slot
+        if self.step_context is not None:
+            self.step_context.slot = slot
+
     def lease_slot(self, slot_lease: SlotLease):
         self.step_context.slot_lease = slot_lease
+        if self.slot is None:
+            self.set_slot(slot_lease.slot)
 
 
 class Engine:
@@ -328,6 +412,7 @@ class Engine:
                 device=self._device,
                 autocast_dtype=self._autocast_dtype_for(submodule),
                 joint_comm_group=submodule_mgmt.joint_comm_group,
+                num_slots=submodule_mgmt.num_slots,
                 enable_nvtx=self._enable_nvtx
             )
             piecewise[node_name] = self._build_piecewise_runners(
@@ -387,6 +472,7 @@ class Engine:
                 device=self._device,
                 autocast_dtype=node_dtype,
                 joint_comm_group=submodule_mgmt.joint_comm_group,
+                num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
             )
             runners[label] = runner
@@ -491,6 +577,9 @@ class Engine:
         """The one-forward path: batched (a lease replay or ``forward_batched``)
         or a single eager request."""
         submodule_mgmt = self._submodules[batch.node_name]
+        # On the GPU thread, right before the forward: point the region runners
+        # at this batch's slot so the piecewise lease and replay agree with it.
+        submodule_mgmt.set_piecewise_slot(batch.slot or 0)
         cg_runner = submodule_mgmt.cuda_graph_runner
         lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
@@ -572,15 +661,27 @@ class Engine:
         merged: dict[str, NameToTensorList] = {rid: {} for rid in batch.request_ids}
         launched = False
 
-        # Step 1: loop through all of the requests for admit errors
+        # Step 1: loop through all of the requests for admit errors.
+        # Each request is its own cycle, so each takes its own slot off the
+        # shared counter — to the rotation these sub-steps ARE steps. The last
+        # one doesn't advance it, so the batch leaves the counter one past the
+        # slot it last used, exactly as a single-forward step would.
+        slot = batch.slot or 0
         steps: dict[str, SubmoduleStep] = {}
         ctxs: dict[str, StepContext] = {}
-        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
+        for i, (rid, inp) in enumerate(
+            zip(batch.request_ids, batch.inputs, strict=True)
+        ):
             ctxs[rid] = StepContext(
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
-                slot=0, capture=False,
+                slot=slot, capture=False,
             )
+            if i != len(batch.request_ids) - 1:
+                slot = submodule_mgmt.lease_slot()
+            # declare (here) and drive (below) are separate loops, so the
+            # region runners are pointed at the slot in both
+            submodule_mgmt.set_piecewise_slot(ctxs[rid].slot)
             admit_outcome, steps[rid] = self._declare_and_admit(
                 batch, rids=[rid], inputs=[inp],
                 submodule=submodule_mgmt.submodule,
@@ -589,9 +690,21 @@ class Engine:
             if not admit_outcome.ok:
                 return merged
 
-        # Step 2: drive step, plan -> forward -> commit loop
+        # Step 2: drive step, plan -> forward -> commit loop.
+        # Nothing stages before here, so only this loop fences, in two places:
+        # on reuse inside the loop (the rotation wraps after `num_slots`
+        # requests), and on the way out — see below.
+        fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
+        slot_events: dict[int, torch.cuda.Event] = {}
+
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
             req_info = {rid: batch.per_request_info[rid]}
+            slot = ctxs[rid].slot
+            submodule_mgmt.set_piecewise_slot(slot)
+            in_flight = slot_events.get(slot)
+            if in_flight is not None:
+                in_flight.synchronize()
+
             if nvtx:
                 range_push(f"engine.per_request.{rid}")
             try:
@@ -604,6 +717,10 @@ class Engine:
                     merged[rid] = {}
                     continue
                 launched = True
+                if fence:
+                    slot_events[slot] = torch.cuda.Event()
+                    slot_events[slot].record()
+
                 merged.update(self._collect_outputs(
                     submodule_mgmt, None, raw, [inp], req_info,
                     request_ids=[rid], step_request_ids=(rid,),
@@ -611,6 +728,15 @@ class Engine:
             finally:
                 if nvtx:
                     range_pop()
+
+        # Releasing `commit_done` lets the plan thread pre-plan the next batch,
+        # which stages `next_slot` while this batch's work may still be queued.
+        # Only that slot needs draining: every other one the loop touched is
+        # re-consumed a batch or more later, by which point the worker has
+        # synced on this step.
+        event = slot_events.get(submodule_mgmt.next_slot)
+        if event is not None:
+            event.synchronize()
         batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
@@ -1078,6 +1204,10 @@ class Engine:
         ``CudaGraphRunner.select_batched_bucket``.
         """
         submodule_mgmt = self._submodules[batch.node_name]
+
+        if batch.slot is None:
+            batch.set_slot(submodule_mgmt.lease_slot())
+
         cg_runner = submodule_mgmt.cuda_graph_runner
         if cg_runner is None:
             return None
@@ -1092,6 +1222,7 @@ class Engine:
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,
             bs=len(batch.request_ids),
+            slot=batch.slot,
             num_tokens=(
                 None if batch.inputs is None
                 else sum(inp.input_seq_len for inp in batch.inputs)

@@ -6,6 +6,7 @@ import torch
 
 from mstar.engine.resources.attn.base import (
     AttentionWrapper,
+    EagerSlotKey,
     PlanCacheKey,
     WorkspacePool,
 )
@@ -93,7 +94,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         # decoder plan label -> wrapper
         self._current_plan_states: dict[str, AttentionWrapper] = {}
         # persistent wrappers [we can keep eager ones]
-        self._eager_plan_states: dict[str, AttentionWrapper] = {}
+        self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
         self._preplan_states: dict[str, AttentionWrapper] = {}
@@ -133,12 +134,18 @@ class FlashInferCrossManager(CrossAttentionManager):
     def supports_preplan(self):
         return True
 
+    @property
+    def force_double_buffer(self):
+        # same pinned staging inside FlashInfer's plan as the self-attention
+        # manager; see `FlashInferManager.force_double_buffer`
+        return True
+
     def plan(self, step: AttentionStep, ctx: StepContext):
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: the eager wrapper for a label "
-            "persists and would be replanned under the in-flight forward"
+            "preplan requires a cuda graph step: an eager wrapper shares its "
+            "workspace with the captured one on the same slot"
         )
         assert not (self._preplanned and ctx.is_preplan), (
             "cross attention preplan is already pending; clear_preplan before "
@@ -160,6 +167,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             indptrs = self._build_indptrs(packing, context_views, plan_label)
             state_key, wrapper = self._wrapper_for(
                 plan_label, lease, num_rows=indptrs.qo_indptr.shape[0] - 1,
+                slot=ctx.slot,
             )
 
             # The context pages are immutable once written, so between steps
@@ -312,7 +320,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
 
     def _wrapper_for(
-        self, plan_label: str, lease: SlotLease | None, num_rows: int,
+        self, plan_label: str, lease: SlotLease | None, num_rows: int, slot: int,
     ) -> tuple[Any, AttentionWrapper]:
         """``num_rows`` is this label's qo_indptr row count — bucket.bs for an
         ordinary label, more when the query plan combines labels. See
@@ -335,14 +343,17 @@ class FlashInferCrossManager(CrossAttentionManager):
                 )
             return key, wrapper
 
-        wrapper = self._eager_plan_states.get(plan_label)
+        # slotted like the captured one, and on the same workspace; see
+        # `FlashInferManager._eager_wrapper`
+        key = EagerSlotKey(label=plan_label, slot=slot)
+        wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
             wrapper = FlashInferPrefillWrapper(
-                workspace_buffer=self._workspaces.get(plan_label),
+                workspace_buffer=self._workspaces.get(plan_label, slot),
                 **self._wrapper_kv_kwargs,
             )
-            self._eager_plan_states[plan_label] = wrapper
-        return plan_label, wrapper
+            self._eager_plan_states[key] = wrapper
+        return key, wrapper
 
 
     def run(

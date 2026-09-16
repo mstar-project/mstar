@@ -28,7 +28,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components.attention import Attention, CrossAttention
+from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed.attention import ParallelAttention, ParallelCrossAttention
 from mstar.model.whisper.config import (
     ATTN,
     CONTEXT_LABEL,
@@ -40,10 +41,11 @@ from mstar.model.whisper.config import (
 
 
 class WhisperDecoderLayer(nn.Module):
-    def __init__(self, config: WhisperModelConfig):
+    def __init__(self, config: WhisperModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         self.self_attn_layer_norm = nn.LayerNorm(config.d_model)
-        self.self_attn = Attention(
+        self.self_attn = ParallelAttention(
+            comm_group=comm_group,
             hidden_size=config.d_model,
             num_heads=config.decoder_attention_heads,
             num_kv_heads=config.decoder_attention_heads,
@@ -57,12 +59,14 @@ class WhisperDecoderLayer(nn.Module):
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(config.d_model)
         # Whisper's bias layout is the shared default (q/v/o biased, k not).
-        self.encoder_attn = CrossAttention(
+        self.encoder_attn = ParallelCrossAttention(
+            comm_group=comm_group,
             hidden_size=config.d_model,
             num_heads=config.decoder_attention_heads,
             head_dim=config.head_dim,
             cross_key=CROSS_ATTN,
             context_kv_key=CROSS_KV_CACHE,
+            num_kv_heads=config.decoder_attention_heads,
         )
         self.final_layer_norm = nn.LayerNorm(config.d_model)
         self.fc1 = nn.Linear(config.d_model, config.decoder_ffn_dim)
@@ -86,22 +90,24 @@ class WhisperDecoderLayer(nn.Module):
 class WhisperDecoderModel(nn.Module):
     """Decoder stack; parameter paths mirror HF's ``model.decoder.*``."""
 
-    def __init__(self, config: WhisperModelConfig):
+    def __init__(self, config: WhisperModelConfig, comm_group: CommGroup | None = None):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
         self.embed_positions = nn.Embedding(config.max_target_positions, config.d_model)
         self.layers = nn.ModuleList(
-            [WhisperDecoderLayer(config) for _ in range(config.decoder_layers)]
+            [WhisperDecoderLayer(config, comm_group=comm_group) for _ in range(config.decoder_layers)]
         )
         self.layer_norm = nn.LayerNorm(config.d_model)
 
     def zero_missing_biases(self) -> None:
-        """Zero the self-attn ``k_proj`` biases absent from the HF checkpoint
-        (allocated because the shared ``Attention`` has one qkv_bias flag)."""
+        """Zero the fused K-bias slice absent from the HF checkpoint."""
         with torch.no_grad():
             for layer in self.layers:
-                layer.self_attn.k_proj.bias.zero_()
+                attn = layer.self_attn
+                q_size = attn.num_heads * attn.head_dim
+                k_size = attn.num_kv_heads * attn.head_dim
+                attn.qkv_proj.bias[q_size:q_size + k_size].zero_()
 
     def embed(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor,

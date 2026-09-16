@@ -48,6 +48,7 @@ sys.path.insert(0, ".")
 
 from mstar.model.components import AdaRMSNorm as Pi05AdaRMSNorm
 from mstar.model.components.decoder_layer import _gated_residual
+from mstar.model.components.distributed.attention import ParallelAttention
 from mstar.model.pi05.components.action_expert import (
     Pi05ActionExpert,
     Pi05ActionExpertLayer,
@@ -253,45 +254,76 @@ class RefActionExpertLayer(nn.Module):
 # ----------------------------------------------------------------------
 
 
-class MockCacheHandle:
-    """A drop-in replacement for ``BatchedCacheManager`` that uses vanilla
-    SDPA. Stores per-layer K/V, supports a single request, no paged cache.
+class MockKVAttention:
+    """Stands in for the KV + attention resources a layer attends through.
 
-    Supports exactly the subset of the interface that the Pi0.5 transformer
-    touches: ``set_layer_idx``, ``apply_rope``, ``run_attention``, and
-    ``advance_seq_lens``.
+    One object serves as both, mirroring how the engine binds them: the
+    ``AttentionCallable`` writes K/V through the KV resource then calls the
+    attention one, and the accumulated per-layer history is the same state
+    either way. Vanilla SDPA, single request, no paged cache.
+
+    RoPE stays out of it — the ``rope`` key is left unbound so
+    ``ParallelAttention._apply_rope`` short-circuits, matching the reference
+    attention above, which also skips RoPE.
     """
+
+    requires_kv_write = True
 
     def __init__(self, scale: float):
         self.scale = scale
-        self.layer_idx = 0
+        self._layer_idx = 0
+        self._label = "main"
         self._store: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
         self.write_cache = True
 
-    def set_layer_idx(self, layer_idx: int):
-        self.layer_idx = layer_idx
+    # --- resource cursors
 
-    def apply_rope(self, q: torch.Tensor, k: torch.Tensor, rope_theta=None, **kwargs):
-        # No RoPE in the test — pass-through to keep the test independent
-        # of rope_theta and matching the RefAttention above.
-        return q, k
+    @property
+    def default_label(self) -> str:
+        return self._label
 
-    def run_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        past = self._store.get(self.layer_idx)
+    def set_default_label(self, label: str) -> None:
+        self._label = label
+
+    def set_default_layer_idx(self, layer_idx: int) -> None:
+        self._layer_idx = layer_idx
+
+    def layer_view(self):
+        return self._layer_idx
+
+    def seed_prefix(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Pre-populate a layer's cache, standing in for a prefill pass."""
+        self._store[layer_idx] = (k, v)
+
+    # --- the two calls a layer makes
+
+    def write_kv(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        self._pending = (k, v)
+
+    def run(self, q: torch.Tensor, kv_cache_layer, k=None, v=None) -> torch.Tensor:
+        del k, v  # taken from the write above, as the paged backends do
+        assert self._pending is not None, "run without a preceding write_kv"
+        k_new, v_new = self._pending
+        self._pending = None
+
+        past = self._store.get(kv_cache_layer)
         if past is not None:
-            k_full = torch.cat([past[0], k], dim=0)
-            v_full = torch.cat([past[1], v], dim=0)
+            k_full = torch.cat([past[0], k_new], dim=0)
+            v_full = torch.cat([past[1], v_new], dim=0)
         else:
-            k_full, v_full = k, v
+            k_full, v_full = k_new, v_new
         if self.write_cache:
-            self._store[self.layer_idx] = (k_full, v_full)
+            self._store[kv_cache_layer] = (k_full, v_full)
         return _sdpa(q, k_full, v_full, scale=self.scale)
 
-    def advance_seq_lens(self, *args, **kwargs):
-        pass
 
-    def set_active_label(self, label: str):
-        pass
+def _bind_mock_resources(module: nn.Module, handle: MockKVAttention) -> None:
+    """Bind the fake as both KV and attention on every ParallelAttention in
+    ``module``, as the engine does with the real resources."""
+    for submodule in module.modules():
+        if isinstance(submodule, ParallelAttention):
+            submodule.bind_resources({"attn": handle, "kv": handle})
 
 
 # ----------------------------------------------------------------------
@@ -330,13 +362,27 @@ def _copy_adarms(dst: Pi05AdaRMSNorm, src: RefAdaRMSNorm) -> None:
         dst.dense.bias.copy_(src.dense.bias)
 
 
+def _copy_qkv(dst: ParallelAttention, src: RefAttention) -> None:
+    """The reference keeps q/k/v separate; ours fuses them into one
+    ``QKVParallelLinear`` whose output rows are ``[q | k | v]`` in the order
+    given by ``output_sizes``."""
+    q_out, k_out, _ = dst.qkv_proj.output_sizes
+    with torch.no_grad():
+        weight = dst.qkv_proj.weight
+        weight[:q_out].copy_(src.q_proj.weight)
+        weight[q_out:q_out + k_out].copy_(src.k_proj.weight)
+        weight[q_out + k_out:].copy_(src.v_proj.weight)
+
+
 def _copy_layer(dst: Pi05ActionExpertLayer, src: RefActionExpertLayer) -> None:
-    _copy_linear(dst.self_attn.q_proj, src.self_attn.q_proj)
-    _copy_linear(dst.self_attn.k_proj, src.self_attn.k_proj)
-    _copy_linear(dst.self_attn.v_proj, src.self_attn.v_proj)
+    _copy_qkv(dst.self_attn, src.self_attn)
     _copy_linear(dst.self_attn.o_proj, src.self_attn.o_proj)
-    _copy_linear(dst.mlp.gate_proj, src.mlp.gate_proj)
-    _copy_linear(dst.mlp.up_proj, src.mlp.up_proj)
+    # Same fusion story as qkv: gate and up share one MergedColumnParallelLinear,
+    # gate first (``output_sizes=[intermediate, intermediate]``).
+    gate_out, _ = dst.mlp.gate_up_proj.output_sizes
+    with torch.no_grad():
+        dst.mlp.gate_up_proj.weight[:gate_out].copy_(src.mlp.gate_proj.weight)
+        dst.mlp.gate_up_proj.weight[gate_out:].copy_(src.mlp.up_proj.weight)
     _copy_linear(dst.mlp.down_proj, src.mlp.down_proj)
     _copy_adarms(dst.input_layernorm, src.input_layernorm)
     _copy_adarms(dst.post_attention_layernorm, src.post_attention_layernorm)
@@ -362,8 +408,15 @@ def _randomize_adarms(mod: RefAdaRMSNorm) -> None:
 def test_sincos_matches_reference_formula():
     torch.manual_seed(0)
     t = torch.rand(3)
-    ours = sincos_timestep_embedding(t, dim=32, min_period=4e-3, max_period=4.0)
-    ref = ref_create_sinusoidal_pos_embedding(t, 32, 4e-3, 4.0).to(ours.dtype)
+    dim = 32
+    # Frequency ladder and output buffer are the caller's now; float64 for the
+    # ladder matches the submodule (and the reference's period computation).
+    fraction = torch.linspace(0.0, 1.0, dim // 2, dtype=torch.float64)
+    ours = sincos_timestep_embedding(
+        t, dim=dim, fraction=fraction, output_buffer=torch.empty(t.numel(), dim),
+        min_period=4e-3, max_period=4.0,
+    )
+    ref = ref_create_sinusoidal_pos_embedding(t, dim, 4e-3, 4.0).to(ours.dtype)
     assert ours.shape == ref.shape
     # Our implementation runs in float32; the reference uses float64 for the
     # period computation, so a tolerance at the float32 machine eps is
@@ -398,7 +451,11 @@ def test_adarms_norm_matches_reference_with_shared_weights():
     x = torch.randn(4, 32, device=DEVICE, dtype=torch.float32)
     cond = torch.randn(32, device=DEVICE, dtype=torch.float32)
 
-    ours_out, ours_gate = ours(x.to(MSTAR_DTYPE), cond.to(MSTAR_DTYPE))
+    # mstar's AdaRMSNorm takes cond batched as [BS, cond_dim] (it slices
+    # modulation as [:, :H]); the reference keeps its single-request 1-D form.
+    ours_out, ours_gate = ours(
+        x.to(MSTAR_DTYPE), cond.unsqueeze(0).to(MSTAR_DTYPE)
+    )
     ref_out, ref_gate = ref_norm(x, cond)
 
     ours_out_f32 = ours_out.to(torch.float32)
@@ -444,11 +501,11 @@ def test_action_expert_layer_matches_reference_single_request():
     x = torch.randn(config.action_horizon, config.hidden_size, device=DEVICE, dtype=torch.float32)
     cond = torch.randn(config.hidden_size, device=DEVICE, dtype=torch.float32)
 
-    handle = MockCacheHandle(scale=config.head_dim ** -0.5)
+    handle = MockKVAttention(scale=config.head_dim ** -0.5)
+    _bind_mock_resources(ours, handle)
     ours_out = ours(
         hidden_states=x.to(MSTAR_DTYPE),
-        cache_handle=handle,
-        adarms_cond=cond.to(MSTAR_DTYPE),
+        adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
     ).to(torch.float32)
 
     ref_out, _, _ = ref_layer(x, cond=cond)
@@ -501,17 +558,22 @@ def test_action_expert_full_stack_matches_reference_against_prefix_kv_cache():
         v = torch.randn(prefix_len, config.num_kv_heads, config.head_dim, device=DEVICE, dtype=torch.float32)
         past_kvs.append((k, v))
 
-    handle = MockCacheHandle(scale=config.head_dim ** -0.5)
+    handle = MockKVAttention(scale=config.head_dim ** -0.5)
     for layer_idx, (k, v) in enumerate(past_kvs):
-        handle._store[layer_idx] = (k.clone().to(MSTAR_DTYPE), v.clone().to(MSTAR_DTYPE))
+        handle.seed_prefix(
+            layer_idx, k.clone().to(MSTAR_DTYPE), v.clone().to(MSTAR_DTYPE)
+        )
+    # Read-only prefix: action_gen attends to the frozen prefill KV without
+    # committing its own writes (the KVStep(commit=False) contract).
     handle.write_cache = False
+    _bind_mock_resources(ours, handle)
 
     suffix = torch.randn(config.action_horizon, config.hidden_size, device=DEVICE, dtype=torch.float32)
     cond = torch.randn(config.hidden_size, device=DEVICE, dtype=torch.float32)
     ours_out = ours(
         query_sequence=suffix.to(MSTAR_DTYPE),
-        cache_handle=handle,
-        adarms_cond=cond.to(MSTAR_DTYPE),
+        adarms_cond=cond.unsqueeze(0).to(MSTAR_DTYPE),
+        label="main",
     ).to(torch.float32)
 
     # Reference stack on the same suffix using the same prefix KV cache.
@@ -808,7 +870,7 @@ def test_pi05_siglip_encoder_matches_hf_reference():
 
 def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
     """Reference port of ``image_tools.resize_with_pad_torch`` (channels-first
-    float32 path). Used to verify ``Pi05ViTEncoderSubmodule._preprocess_one``.
+    float32 path). Used to verify ``Pi05ViTEncoderSubmodule._prepare_one``.
     """
     assert images.dim() == 4 and images.dtype == torch.float32
     _, _, cur_h, cur_w = images.shape
@@ -828,7 +890,7 @@ def _ref_resize_with_pad(images: torch.Tensor, target_h: int, target_w: int) -> 
 
 
 def test_pi05_image_preprocessing_matches_resize_with_pad_letterbox():
-    """``Pi05ViTEncoderSubmodule._preprocess_one`` vs openpi's resize_with_pad_torch.
+    """``Pi05ViTEncoderSubmodule._prepare_one`` vs openpi's resize_with_pad_torch.
 
     Tests three cases that exercise the letterbox path:
       * already-target square (no resize / no pad — identity-ish)
@@ -861,7 +923,7 @@ def test_pi05_image_preprocessing_matches_resize_with_pad_letterbox():
     for name, shape in cases:
         torch.manual_seed(hash(name) & 0xFFFF)
         images = torch.rand(*shape) * 2.0 - 1.0  # [-1, 1] float32
-        ours = submodule._preprocess_one(images)
+        ours = submodule._prepare_one(images)
         ref = _ref_resize_with_pad(images, cfg.vit_image_size, cfg.vit_image_size)
         assert ours.shape == ref.shape == (1, 3, 224, 224), f"{name}: shape mismatch"
         # Padding regions are exactly -1, content region matches the resized
@@ -882,7 +944,7 @@ def test_pi05_image_preprocessing_uint8_to_float():
     submodule = Pi05ViTEncoderSubmodule(Pi05SiglipEncoder(cfg), cfg)
     images_u8 = torch.zeros(1, 3, 224, 224, dtype=torch.uint8)
     images_u8[..., 100:200, 100:200] = 255
-    out = submodule._preprocess_one(images_u8)
+    out = submodule._prepare_one(images_u8)
     assert out.dtype == torch.float32
     # Background pixels (0) -> -1, foreground pixels (255) -> +1.
     assert out[0, 0, 0, 0].item() == pytest.approx(-1.0, abs=1e-6)
