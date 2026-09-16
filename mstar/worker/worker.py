@@ -1,5 +1,6 @@
 import gc
 import logging
+import math
 import os
 import sys
 import threading
@@ -31,6 +32,8 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.api_server.request_types import INLINE_MAX_BYTES, InlineResults
+from mstar.communication.tensors import _serialize_tensor
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -74,6 +77,26 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     if raw == "1":
         return True, None
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def inline_output_bytes(
+    host_outputs: dict | None, graph_node_info: dict, max_bytes: int = INLINE_MAX_BYTES,
+) -> dict[str, bytes]:
+    """The step's small outputs of one request as ``{uuid: bytes}``, taken from the host copies
+    the stop check already made (``host_outputs[name][i]`` mirrors the stored tensor
+    ``graph_node_info[name][i]``). Tensors without a host copy or above ``max_bytes`` are left to
+    the transport path."""
+    out: dict[str, bytes] = {}
+    if not isinstance(host_outputs, dict):
+        return out
+    for name, infos in graph_node_info.items():
+        tensors = host_outputs.get(name)
+        if not isinstance(tensors, list) or len(tensors) != len(infos):
+            continue
+        for t, info in zip(tensors, infos, strict=True):
+            if torch.is_tensor(t) and not t.is_cuda and info.nbytes <= max_bytes:
+                out[info.uuid] = _serialize_tensor(t)
+    return out
 
 
 @dataclass
@@ -1078,6 +1101,7 @@ class Worker:
         self,
         batch: ScheduledBatch,
         routing_per_request: dict[str, NodeOutputRouting],
+        inline_edges: dict[str, list[GraphEdge]] | None = None,
     ):
         """
         For outputs going to other workers: register tensors for RDMA send
@@ -1088,10 +1112,12 @@ class Worker:
         for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
             infos_by_uuid = {}
+            # client-emit edges whose bytes ride in the result message are read by nobody
+            skip = {id(e) for e in (inline_edges or {}).get(request_id, [])}
             for edge in (
                 routing.persist +
                 sum(routing.to_workers.values(), start=[]) +
-                routing.emit_to_client +
+                [e for e in routing.emit_to_client if id(e) not in skip] +
                 sum(routing.streaming_to_workers.values(), start=[])
             ):
                 for info in edge.tensor_info:
@@ -1107,15 +1133,21 @@ class Worker:
         nested_loop_indices: NestedLoopIndices,
         graph_walk: str | None = None,
         partition_name: str | None = None,
-        node_speculatively_scheduled: bool=False
+        node_speculatively_scheduled: bool=False,
+        inline_edges: list[GraphEdge] | None = None,
+        inline_batch: list[ResultTensors] | None = None,
     ) -> None:
         """
-        Send outputs to other workers and to the conductor.
+        Send outputs to other workers and to the conductor. ``inline_edges`` are
+        client-emit edges whose bytes travel in the step's ``InlineResults``
+        message: their ``ResultTensors`` go to ``inline_batch`` instead of one
+        message each.
         Persist signals and new-token counts are buffered and sent together
         with the WORKER_GRAPHS_DONE message to avoid race conditions.
         """
         if graph_walk is None:
             graph_walk = self.worker_graphs_manager.get_graph_walk(request_id, partition_name)
+        inline_ids = {id(e) for e in (inline_edges or [])}
         for worker_id, edges in outputs.to_workers.items():
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
@@ -1143,13 +1175,17 @@ class Worker:
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_count:
                     continue  # don't double-count new tokens
+                # the element count is in the tensor info (no store lookup per request);
+                # infos without dims fall back to the stored tensor
                 count = 0
                 for tensor_info in signal.tensor_info:
-                    tensor = self.tensor_manager.get_tensor(
-                        request_id=request_id,
-                        uuid=tensor_info.uuid,
-                    )
-                    count += tensor.numel()
+                    dims = getattr(tensor_info, "dims", None)
+                    if dims is None:
+                        count += self.tensor_manager.get_tensor(
+                            request_id=request_id, uuid=tensor_info.uuid,
+                        ).numel()
+                    else:
+                        count += math.prod(dims)
                 name_to_count[signal.name] = count
             self.worker_graphs_manager.buffer_new_token_counts(
                 request_id, name_to_count
@@ -1164,17 +1200,19 @@ class Worker:
                     request_id=request_id, loop_indices=nested_loop_indices,
                     output_name=graph_edge.name
                 )
-                message = APIServerMessage(
-                    message_type="result_tensors",
-                    body=ResultTensors(
-                        request_id=request_id,
-                        modality=graph_edge.output_modality,
-                        graph_edge=graph_edge,
-                        loop_indices=nested_loop_indices,
-                        metadata={}
-                    )
+                result = ResultTensors(
+                    request_id=request_id,
+                    modality=graph_edge.output_modality,
+                    graph_edge=graph_edge,
+                    loop_indices=nested_loop_indices,
+                    metadata={}
                 )
-                self.communicator.send("api_server", message)
+                if id(graph_edge) in inline_ids and inline_batch is not None:
+                    inline_batch.append(result)
+                    continue
+                self.communicator.send("api_server", APIServerMessage(
+                    message_type="result_tensors", body=result,
+                ))
 
         # Handle streaming edges
         # Local streaming: route to StreamBuffer
@@ -2334,6 +2372,10 @@ class Worker:
         # Mark nodes complete and route
         routing_per_request: dict[str, NodeOutputRouting] = {}
         per_request_uuids: dict[str, set[str]] = {}
+        # small client outputs travel inline in one message for the whole step (their bytes
+        # are the host copies the stop check made): rid -> {uuid: bytes}, rid -> the edges
+        inline_bytes: dict[str, dict[str, bytes]] = {}
+        inline_edges: dict[str, list[GraphEdge]] = {}
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.
@@ -2353,6 +2395,7 @@ class Worker:
                 per_request_uuids[rid] = {
                     info.uuid for infos in graph_node_info.values() for info in infos
                 }
+                inline_bytes[rid] = inline_output_bytes(cpu_outputs.get(rid), graph_node_info)
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
                 rid, wg_id, batch_N.node_name
@@ -2378,9 +2421,17 @@ class Worker:
                 #  double-counted (e.g., we should not be incrementing the refcount of
                 # a persist signal that has EMPTY_DESTINATION; that's the conductor's
                 # job to properly compute the reference when unpersisting the signal)
+                # a client-emit edge goes inline when every one of its tensors has small host
+                # bytes; such an edge holds no transport reference (nothing reads it remotely)
+                have = inline_bytes.get(rid, {})
+                inline_edges[rid] = [
+                    e for e in routing.emit_to_client
+                    if e.tensor_info and all(info.uuid in have for info in e.tensor_info)
+                ]
+                inline_ids = {id(e) for e in inline_edges[rid]}
                 routed_edges = (
                     routing.routed_to_this_worker_graph
-                    + routing.emit_to_client
+                    + [e for e in routing.emit_to_client if id(e) not in inline_ids]
                     + routing.streaming_local
                     + sum(routing.to_workers.values(), start=[])
                     + sum(routing.streaming_to_workers.values(), start=[])
@@ -2392,7 +2443,7 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
-        self._register_outputs(batch_N.batch, routing_per_request)
+        self._register_outputs(batch_N.batch, routing_per_request, inline_edges)
 
         # send outputs
         if self.enable_nvtx:
@@ -2414,14 +2465,25 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
+        inline_batch: list[ResultTensors] = []
         for rid, routing in routing_per_request.items():
             self._send_outputs(
                 rid, routing,
                 nested_loop_indices=per_req_nested_idxs[rid],
                 graph_walk=batch_N.batch.walk_of(rid),
                 partition_name=batch_N.partition,
-                node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled
+                node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled,
+                inline_edges=inline_edges.get(rid),
+                inline_batch=inline_batch,
             )
+        if inline_batch:
+            data: dict[str, bytes] = {}
+            for res in inline_batch:
+                for info in res.graph_edge.tensor_info:
+                    data[info.uuid] = inline_bytes[res.request_id][info.uuid]
+            self.communicator.send("api_server", APIServerMessage(
+                message_type="inline_results", body=InlineResults(results=inline_batch, data=data),
+            ))
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
