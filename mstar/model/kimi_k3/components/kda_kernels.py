@@ -5,7 +5,8 @@
 * prefill (packed varlen): ``causal_conv1d`` with per-sequence initial conv states and
   ``chunk_kda`` with per-sequence initial recurrent states, both gathered from the resource
   slots by a *device* index tensor and scattered back with ``index_copy_``;
-* decode (one token per row): ``causal_conv1d_update`` on the gathered conv windows and
+* decode (one token per row): the slot-indexed conv update (``conv_kernel.py``, in place in the
+  resource; fla's ``causal_conv1d_update`` on gathered windows as the fallback) and
   ``fused_recurrent_kda_fwd`` with ``ssm_state_indices`` writing the recurrent slots in place.
 
 Every address the kernels touch comes from tensors (``slot_ids``, ``cu_seqlens``; ``has_state``
@@ -17,6 +18,7 @@ from __future__ import annotations
 import torch
 
 from mstar.engine.resources.recurrent.config import RecurrentPlanOutput
+from mstar.model.kimi_k3.components.conv_kernel import conv_update_slots, conv_update_slots_supported
 
 
 class FLAKDAKernels:
@@ -51,9 +53,14 @@ class FLAKDAKernels:
             # indexing and the fla kernels all take int32, and every dtype conversion here
             # would be one more captured launch per layer per step
             slot_ids = plan.slot_ids[:rows]
-            cache = conv_state.index_select(0, slot_ids)
-            y, cache = self._conv_update(qkv.view(rows, 1, -1), cache, weight=conv_w, activation="silu")
-            conv_state[slot_ids] = cache.to(conv_state.dtype)
+            if conv_update_slots_supported(qkv, conv_state):
+                # one launch: the slot-indexed conv update reads and rewrites each row's window in
+                # the resource itself (fla's kernel needs a gathered [rows, 3P, W] copy and a scatter back)
+                y = conv_update_slots(qkv, conv_state, slot_ids, conv_w, activation="silu")
+            else:
+                cache = conv_state.index_select(0, slot_ids)
+                y, cache = self._conv_update(qkv.view(rows, 1, -1), cache, weight=conv_w, activation="silu")
+                conv_state[slot_ids] = cache.to(conv_state.dtype)
             # the low-level Triton kernel assumes contiguous [B, T, H, K]: a strided split of
             # the fused conv output reads the wrong memory for every row after the first, so
             # re-layout once to [3, rows, P] (one copy) and take contiguous leading slices
