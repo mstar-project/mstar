@@ -24,11 +24,15 @@ class FlashInferMXFP4Experts:
     uint8 parameters (rows ``[gate | up]``); they are rewritten in place by ``convert``.
     """
 
-    def __init__(self, *, mode: str, situ_beta: float, situ_linear_beta: float | None, device: torch.device):
+    def __init__(self, *, mode: str, situ_beta: float, situ_linear_beta: float | None, device: torch.device,
+                 sharding=None):
         from flashinfer.tllm_enums import ActivationType
 
         assert mode in ("w4a16", "humming"), mode
         self.mode = mode
+        # ExpertSharding of the owning module: the kernel takes global expert ids and this rank's
+        # (ep_size, ep_rank) and skips the other ranks' assignments itself
+        self.sharding = sharding
         self.activation = ActivationType.Situ
         self.situ_beta = float(situ_beta)
         self.situ_linear_beta = float(situ_linear_beta) if situ_linear_beta is not None else 0.0
@@ -121,11 +125,12 @@ class FlashInferMXFP4Experts:
         assert self.converted
         e, _, half_latent = self.w13.shape
         latent = half_latent * 2
-        k = min(top_k, e)
+        e_global = e if self.sharding is None else self.sharding.num_experts
+        k = min(top_k, e_global)
         with autotune(True):
             for t in token_counts:
                 x = torch.randn(t, latent, device=self.device, dtype=torch.bfloat16)
-                idx = torch.stack([torch.randperm(e, device=self.device)[:k] for _ in range(t)]).to(torch.int32)
+                idx = torch.stack([torch.randperm(e_global, device=self.device)[:k] for _ in range(t)]).to(torch.int32)
                 w = torch.softmax(torch.randn(t, k, device=self.device), -1)
                 for _ in range(2):
                     self(x, idx, w)
@@ -141,10 +146,11 @@ class FlashInferMXFP4Experts:
         assert self.converted, "convert() the expert weights first"
         if out is None or out.dtype != torch.bfloat16 or not out.is_contiguous():
             out = torch.empty(z.shape[0], z.shape[1], dtype=torch.bfloat16, device=z.device)
+        ep = {} if self.sharding is None else dict(ep_size=self.sharding.ep_size, ep_rank=self.sharding.ep_rank)
         fused_moe.cutlass_fused_moe(
             z.to(torch.bfloat16), topk_idx.to(torch.int32), topk_weight.to(torch.float32),
             self.w13, self.w2, torch.bfloat16, quant_scales=self.quant_scales,
             use_w4_group_scaling=True, use_wfp4afp8_humming=(self.mode == "humming"), output=out,
-            activation_type=self.activation, swiglu_alpha=self.alpha, swiglu_beta=self.beta,
+            activation_type=self.activation, swiglu_alpha=self.alpha, swiglu_beta=self.beta, **ep,
         )
         return out.to(z.dtype) if out.dtype != z.dtype else out
