@@ -10,6 +10,11 @@ call: token/expert alignment (M*'s ``moe_align_block_size``), the gate/up GEMM, 
 Same duck-typed interface as ``FlashInferMXFP4Experts`` (``convert(...)`` then
 ``__call__(z, idx, w)``), except that ``convert`` returns the converted tensors: Marlin's layouts
 have other shapes and dtypes, so the owning module rebinds its parameters to them.
+
+Expert parallelism: the backend takes the module's ``ExpertSharding``; ``__call__`` receives
+global expert ids, maps them to this rank's local experts (assignments of other ranks get the
+sharding's invalid id, which the alignment step drops) and zero-fills their top-k slots so the
+summed result is this rank's partial.
 """
 from __future__ import annotations
 
@@ -90,10 +95,12 @@ def prepare_scales(scale: torch.Tensor, size_n: int, size_k: int) -> torch.Tenso
 class MarlinMXFP4Experts:
     """Routed-expert forward on the Marlin MXFP4 MoE kernel (bf16 activations)."""
 
-    def __init__(self, situ_beta: float, situ_linear_beta: float | None, device: torch.device):
+    def __init__(self, situ_beta: float, situ_linear_beta: float | None, device: torch.device, sharding=None):
         self.ops = _load_ops()
         self.situ_beta, self.situ_linear_beta = float(situ_beta), situ_linear_beta
         self.device = torch.device(device)
+        # ExpertSharding of the owning module (None: every expert is local)
+        self.sharding = sharding
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.workspace = torch.zeros(sms * 4, dtype=torch.int, device=self.device)
         self.w13 = self.s13 = self.w2 = self.s2 = None
@@ -155,13 +162,17 @@ class MarlinMXFP4Experts:
         m, k = z.shape
         top_k = topk_idx.shape[1]
         e, inter = self.num_experts, self.inter
+        partial = self.sharding is not None and self.sharding.is_partial
+        if partial:  # global -> local expert ids, other ranks' assignments -> the skipped id
+            topk_idx = self.sharding.localize(topk_idx)
         idx = topk_idx.to(torch.int32).contiguous()
         w = topk_weight.to(torch.float32).contiguous()
         bs_m = self.block_size_m(m, top_k, e)
         sorted_ids, expert_ids, num_post_pad = moe_align_block_size(idx, bs_m, e)
         c1 = torch.empty(m * top_k, 2 * inter, dtype=z.dtype, device=z.device)
         c2 = torch.empty(m * top_k, inter, dtype=z.dtype, device=z.device)
-        c3 = torch.empty(m * top_k, k, dtype=z.dtype, device=z.device)
+        # slots of skipped assignments are never written: zero them so the top-k sum is the partial
+        c3 = (torch.zeros if partial else torch.empty)(m * top_k, k, dtype=z.dtype, device=z.device)
         self.ops.moe_wna16_marlin_gemm(
             z, c1, self.w13, None, self.s13, None, None, None, None, None, self.workspace,
             sorted_ids, expert_ids, num_post_pad, w, bs_m, top_k, False, FP4_E2M1F_ID,
