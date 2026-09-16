@@ -61,6 +61,8 @@ def test_submodule_builds_on_cpu(tiny_dir):
     cg = sub.get_cuda_graph_configs(torch.device("cpu"))
     # decode only: the varlen KDA prefill kernels size work on the host, so no prefill capture
     assert len(cg) == 1 and cg[0].capture_graph_walk == "decode"
+    # tensor-parallel deployments take the async scheduling protocol unless the env var says otherwise
+    assert sub.prefers_tp_async_scheduling is True and sub.disable_torch_compile is True
     # decode rows ride along in prefill steps only when the deployment asks for it
     assert sub.mixed_step_walks("prefill") == set() and sub.mixed_step_walks("decode") == set()
     sub.mixed_prefill_decode = True
