@@ -121,7 +121,10 @@ def moe_align_block_size(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort ``topk_ids`` into expert-aligned blocks.
 
-    ``topk_ids`` must be int32 and contiguous (the CUDA op reads it directly).
+    ``topk_ids`` must be int32 and contiguous (the CUDA op reads it directly). Entries outside
+    ``[0, num_experts)`` are ignored: they get no slot and no block, so an expert-parallel rank
+    passes the assignments of experts it does not hold under such an id
+    (``ExpertSharding.invalid_id``) and the GEMMs never touch them.
 
     Returns
     -------
@@ -174,10 +177,8 @@ def _moe_align_block_size_torch(
     num_tokens_post_pad: torch.Tensor,
 ) -> None:
     """Vectorized PyTorch equivalent of the CUDA op, filling the buffers
-    in place with the same semantics.
-
-    Assumes every entry of ``topk_ids`` is a valid expert in
-    ``[0, num_experts)`` (always true for mstar's routed dispatch).
+    in place with the same semantics (entries outside ``[0, num_experts)``
+    are ignored, like the CUDA kernels do).
     """
     device = topk_ids.device
     flat = topk_ids.reshape(-1)
@@ -186,6 +187,14 @@ def _moe_align_block_size_torch(
     # Padding slots hold ``numel``; unused expert-id blocks hold 0.
     sorted_ids.fill_(numel)
     expert_ids.zero_()
+
+    # assignments of experts this rank does not hold get no slot at all
+    valid = (flat >= 0) & (flat < num_experts)
+    if not bool(valid.all()):
+        keep = valid.nonzero().reshape(-1)
+        flat = flat[keep]
+    else:
+        keep = None
 
     # Per-expert token counts, each rounded up to a multiple of block_size.
     counts = torch.bincount(flat, minlength=num_experts)[:num_experts]
@@ -209,6 +218,8 @@ def _moe_align_block_size_torch(
     sorted_experts = flat[order].to(torch.int64)
     ucounts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     ucounts[1:] = torch.cumsum(counts, dim=0)  # unpadded prefix over sorted tokens
-    local_rank = torch.arange(numel, device=device, dtype=torch.int64) - ucounts[sorted_experts]
+    local_rank = torch.arange(flat.numel(), device=device, dtype=torch.int64) - ucounts[sorted_experts]
     dest = cumsum[sorted_experts] + local_rank
+    if keep is not None:
+        order = keep[order]  # back to positions in the original topk_ids
     sorted_ids[dest] = order.to(torch.int32)
