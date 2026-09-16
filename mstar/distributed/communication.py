@@ -9,6 +9,21 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+def _symm_mode(mode: str) -> tuple[bool, bool]:
+    """``MSTAR_SYMM_MEM_ALLREDUCE`` -> (use symmetric memory, prefer the multicast kernel).
+
+    ``auto`` (the default) and ``multimem`` take the NVLink-multicast path, falling back to the
+    one-shot/two-shot kernels where NVLS is missing and to NCCL where the group spans nodes;
+    ``1`` is the one-shot/two-shot path; ``0`` is NCCL only.
+    """
+    mode = mode.strip().lower()
+    if mode in ("0", "off", "false", "nccl"):
+        return False, False
+    if mode == "1":
+        return True, False
+    return True, True  # auto / multimem
+
+
 class CommGroup:
     """A communication group over one axis of the worker device mesh.
 
@@ -74,8 +89,8 @@ class CommGroup:
     # 24-29 µs whatever the size; torch's symmetric-memory one-shot kernel (every rank reads
     # its peers over NVLink and reduces locally) 12-13 µs up to ~128 KB, and the two-shot
     # kernel (reduce-scatter + all-gather) 14-16 µs at 1 MB. Opt in with
-    # MSTAR_SYMM_MEM_ALLREDUCE=1 (single-node groups with peer access): messages up to
-    # (=multimem: the NVLink-multicast kernel instead, in place on a ring of buffers) messages up to
+    # On by default (MSTAR_SYMM_MEM_ALLREDUCE=auto: the NVLink-multicast kernel, in place on a ring of
+    # buffers; =1 one-shot/two-shot; =0 NCCL). Messages up to
     # MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES (default 256 KiB) go one-shot, up to
     # MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES (default 4 MiB) two-shot, larger ones stay on NCCL.
     _symm_enabled: bool | None = None
@@ -87,9 +102,8 @@ class CommGroup:
         if self._symm_enabled is None:
             import os
 
-            mode = os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE", "0")
-            self._symm_multimem = mode == "multimem"
-            enabled = mode in ("1", "multimem")
+            mode = os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE", "auto")
+            enabled, self._symm_multimem = _symm_mode(mode)
             if enabled:
                 try:
                     import torch.distributed._symmetric_memory  # noqa: F401
@@ -126,7 +140,12 @@ class CommGroup:
         all-reduce (279 per Kimi K3 decode step). Ring slots are reused, see ``_SYMM_RING``."""
         if not self.symm_applies(shape, dtype, device):
             return None
-        return self._next_symm_buffer(tuple(int(d) for d in shape), dtype, device)
+        try:
+            return self._next_symm_buffer(tuple(int(d) for d in shape), dtype, device)
+        except RuntimeError as ex:
+            logger.warning("symmetric-memory all-reduce unavailable for this group (%s); using NCCL", ex)
+            self._symm_enabled = False
+            return None
 
     def _next_symm_buffer(self, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         import torch.distributed._symmetric_memory as symm_mem
@@ -150,7 +169,13 @@ class CommGroup:
         return buf
 
     def _symm_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        buf = self._next_symm_buffer(tuple(input_.shape), input_.dtype, input_.device)
+        try:
+            buf = self._next_symm_buffer(tuple(input_.shape), input_.dtype, input_.device)
+        except RuntimeError as ex:  # e.g. ranks on several nodes: no symmetric memory, stay on NCCL
+            logger.warning("symmetric-memory all-reduce unavailable for this group (%s); using NCCL", ex)
+            self._symm_enabled = False
+            dist.all_reduce(input_, group=self.device_group)
+            return input_
         buf.copy_(input_)
         return self.all_reduce_symm_buffer(buf)
 
