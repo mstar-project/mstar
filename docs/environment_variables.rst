@@ -37,6 +37,11 @@ Communication
    * - ``MSTAR_SYMM_MEM_ALLREDUCE``
      - ``0``
      - ``1`` routes small tensor-parallel all-reduces (``CommGroup.all_reduce``)
+       (``multimem``: the same, but through torch's NVLink-multicast
+       ``multimem_all_reduce_`` kernel, which reduces in place on a ring of four
+       symmetric buffers per shape -- a result stays valid until three more
+       all-reduces of that shape; 6.7 µs vs 8.3 µs one-shot at 2 ranks, falls back to
+       one-shot when the node lacks NVLS)
        through torch's symmetric-memory kernels instead of NCCL: one-shot (every
        rank reads its peers' buffers over NVLink and reduces locally) for small
        messages, two-shot above ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``.
