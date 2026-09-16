@@ -1,0 +1,25 @@
+# Kimi-K3-pruned75 on one 8xH100 node with expert parallelism for the routed experts: the eight
+# ranks stay one tensor-parallel group for attention, the dense layer and the latent projections,
+# but each rank holds 28 whole experts (moe_ep_size 8) rather than a 1/8 slice of all 224. Weight
+# bytes per rank are the same as at TP8 (configs/kimi_k3_pruned75_tp8.yaml); what changes is the
+# expert GEMM shape (28 experts x 3072 wide instead of 224 x 384) and, at small batch, the load
+# balance (a rank reads whole experts its tokens picked). Memory budget as in the TP8 config.
+model: "kimi_k3"
+max_seq_len: 16384
+model_kwargs:
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ckpt/Kimi-K3-pruned75
+  max_output_tokens: 2048
+  max_capture_batch_size: 64   # = kda_state.max_num_slots
+  max_prefill_batch_size: 8    # prompts per prefill step (see the TP8 config)
+  moe_ep_size: 8
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 1792      # 64 requests x 24 pages (1024+512 tokens) + 128 capture rows; 3.2 GB per rank
+    page_size: 64
+  kda_state:
+    max_num_slots: 64        # 64 x 54 MiB = 3.5 GB per rank (captures/padding use the scratch slot)
