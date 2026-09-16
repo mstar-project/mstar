@@ -47,3 +47,21 @@ def test_span_op_result_is_sliced_per_member():
 
     out = apply_coalesced(parts, op)
     assert calls == [8] and [o.tolist() for o in out] == [[20, 30], [60, 70], [0]]
+
+
+def test_tiled_members_are_split_once_and_gapped_ones_are_sliced():
+    # rows of one batch result, in order: the fast path (one split call), 1-D and 2-D shapes
+    rows = torch.arange(64 * 4, dtype=torch.long).view(64, 4)
+    parts = [rows[i:i + 1] for i in range(64)]
+    clones = clone_coalesced(parts)
+    assert all(c.shape == (1, 4) and torch.equal(c, p) for c, p in zip(clones, parts, strict=True))
+    flat = [rows.view(-1)[i:i + 1] for i in range(256)]
+    clones = clone_coalesced(flat)
+    assert all(c.shape == (1,) and torch.equal(c, p) for c, p in zip(clones, flat, strict=True))
+    # out of order or with gaps: the span is still one op, members are sliced individually
+    gapped = [rows[5:6], rows[2:3], rows[9:11]]
+    spans = storage_spans(gapped)
+    assert len(spans) == 1 and spans[0].view.numel() == 9 * 4
+    clones = clone_coalesced(gapped)
+    assert all(c.shape == p.shape and torch.equal(c, p) for c, p in zip(clones, gapped, strict=True))
+    assert len({c.untyped_storage().data_ptr() for c in clones}) == 1
