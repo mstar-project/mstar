@@ -110,10 +110,28 @@ class CommGroup:
     # result per shape live (attention output, then the FFN output), so 4 is ample.
     _SYMM_RING = 4
 
-    def _symm_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def symm_applies(self, shape, dtype: torch.dtype, device: torch.device) -> bool:
+        """Whether an all-reduce of this shape would take the symmetric-memory path."""
+        if self.world_size == 1 or device.type != "cuda" or not self._symm_available():
+            return False
+        numel = 1
+        for d in shape:
+            numel *= int(d)
+        return numel * torch.empty((), dtype=dtype).element_size() <= self._symm_max_bytes
+
+    def symm_buffer(self, shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
+        """The next symmetric buffer for this shape, or None when the path does not apply. A
+        producer writes its result straight into it (``torch.mm(..., out=buf)``, ``torch.add(...,
+        out=buf)``) and hands it to :meth:`all_reduce_symm_buffer`: one copy launch less per
+        all-reduce (279 per Kimi K3 decode step). Ring slots are reused, see ``_SYMM_RING``."""
+        if not self.symm_applies(shape, dtype, device):
+            return None
+        return self._next_symm_buffer(tuple(int(d) for d in shape), dtype, device)
+
+    def _next_symm_buffer(self, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
         import torch.distributed._symmetric_memory as symm_mem
 
-        key = (tuple(input_.shape), input_.dtype, input_.device)
+        key = (shape, dtype, device)
         ring = self._symm_bufs.get(key)
         if ring is None:
             # first use of a shape: allocate the symmetric buffer(s) and rendezvous (a
@@ -122,14 +140,22 @@ class CommGroup:
             # inside a CUDA-graph capture.
             bufs = []
             for _ in range(self._SYMM_RING if self._symm_multimem else 1):
-                buf = symm_mem.empty(*input_.shape, dtype=input_.dtype, device=input_.device)
+                buf = symm_mem.empty(*shape, dtype=dtype, device=device)
                 symm_mem.rendezvous(buf, self.device_group.group_name)
                 bufs.append(buf)
             ring = self._symm_bufs[key] = (bufs, [0])
         bufs, cursor = ring
         buf = bufs[cursor[0]]
         cursor[0] = (cursor[0] + 1) % len(bufs)
+        return buf
+
+    def _symm_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        buf = self._next_symm_buffer(tuple(input_.shape), input_.dtype, input_.device)
         buf.copy_(input_)
+        return self.all_reduce_symm_buffer(buf)
+
+    def all_reduce_symm_buffer(self, buf: torch.Tensor) -> torch.Tensor:
+        """Sum a buffer obtained from :meth:`symm_buffer` across the group; use the returned tensor."""
         name = self.device_group.group_name
         if self._symm_multimem:
             try:
@@ -138,7 +164,7 @@ class CommGroup:
             except RuntimeError as ex:  # no NVLS support here: stay on the copying kernels
                 logger.warning("symmetric-memory multimem all-reduce unavailable (%s); using one-shot/two-shot", ex)
                 self._symm_multimem = False
-        if input_.numel() * input_.element_size() <= self._symm_one_shot_max_bytes:
+        if buf.numel() * buf.element_size() <= self._symm_one_shot_max_bytes:
             return torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", name)
         return torch.ops.symm_mem.two_shot_all_reduce_(buf, "sum", name)
 
