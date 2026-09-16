@@ -264,6 +264,15 @@ refers to the 3264-token greedy stream of the TP8 bench against plain
        draft phase, tail) of every ``N``-th decode step from CUDA events. The
        GPU column is stream-elapsed time between events and includes idle
        the GPU spends waiting on the host; read it next to the host column.
+   * - ``MSTAR_GLM52_MTP_PHASE_PREPARE``
+     - ``0``
+     - ``1`` stages the e-independent half of the decode draft phase (slot
+       indices, the contiguous positions, sub-plan 0's attention plan)
+       through ``PiecewiseCudaGraphRunner.stage()`` while the host waits on
+       the verify readback; only the accepted-count-dependent rows and the
+       ``k-1`` chain sub-plans wait for ``e``. Bit-exact by construction
+       (TP8 arm: 110.74 -> 111.71 tok/s, draft-phase host 1.34 -> 0.97 ms).
+       Off until a clean flag-off control on the same tree confirms the gap.
 
 Serving (Rust frontend)
 -----------------------
