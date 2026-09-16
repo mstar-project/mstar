@@ -39,6 +39,9 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     disable_autocast = True
     # the kernels are hand-fused and CUDA-graphed; inductor autotuning breaks on their shapes
     disable_torch_compile = True
+    # the per-step CPU work (scheduling, per-request outputs) hides behind the GPU step: +10-14%
+    # decode throughput at every concurrency on pruned75 TP8, bit-identical outputs (2026-09-16)
+    prefers_tp_async_scheduling = True
     PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
