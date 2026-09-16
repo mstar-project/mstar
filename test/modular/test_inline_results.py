@@ -103,3 +103,27 @@ def test_main_thread_accounting_counts_inline_outputs_like_read_ones():
     pw.new_inline_result(ResultTensors(request_id="gone", modality="text", loop_indices=_loop_idx(),
                                        graph_edge=res.graph_edge), batch.data)
     assert pw.result_tensor_input_queue.empty()
+
+
+def test_host_bytes_from_a_shared_buffer_match_the_direct_path():
+    from mstar.worker.worker import host_tensor_bytes
+
+    buf = torch.arange(40, dtype=torch.int32)
+    views = [buf[3:4], buf[7:9], buf[20:40].view(4, 5)]
+    blobs: dict[int, bytes] = {}
+    for v in views:
+        assert host_tensor_bytes(v, blobs) == host_tensor_bytes(v) == v.reshape(-1).view(torch.uint8).numpy().tobytes()
+    assert len(blobs) == 1  # one conversion for the shared storage
+    strided = torch.arange(12, dtype=torch.int32).view(3, 4)[:, 1]
+    assert host_tensor_bytes(strided, blobs) == strided.contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def test_tensor_ids_are_unique_plain_strings(monkeypatch):
+    from mstar.communication import tensors
+
+    ids = [tensors.new_tensor_id() for _ in range(1000)]
+    assert len(set(ids)) == 1000 and all(isinstance(i, str) and "/" not in i and " " not in i for i in ids)
+    # a forked child (new pid) starts its own prefix instead of continuing the parent's sequence
+    monkeypatch.setattr(tensors.os, "getpid", lambda: 1 << 30)
+    child = tensors.new_tensor_id()
+    assert child.startswith(f"{1 << 30:x}-") and child not in ids
