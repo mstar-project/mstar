@@ -170,6 +170,13 @@ class SamplerResource(Resource):
     def supports_preplan(self):
         return True
 
+    @property
+    def force_double_buffer(self):
+        # Per-step gather indices are staged into a reused pinned buffer
+        # (``_slot_idx_cpu``) behind an async H2D, so a single-buffered region
+        # (a piecewise runner with no pre-plan) races when the host runs ahead.
+        return True
+
     def clear_preplan(self):
         self._preplanned = False
         self._preplan_cg_sampler = None

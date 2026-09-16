@@ -34,9 +34,9 @@ needs_droid = pytest.mark.skipif(
 def test_droid_registry_and_config_wiring() -> None:
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.cli.main import DEFAULT_CONFIGS
-    from mstar.model.registry import HF_MODELS, MODEL_REGISTRY
+    from mstar.model.registry import HF_MODELS, get_model_class
 
-    assert MODEL_REGISTRY["cosmos3_droid"] is Cosmos3Model
+    assert get_model_class("cosmos3_droid") is Cosmos3Model
     assert HF_MODELS["cosmos3_droid"]["model_path_hf"] == "nvidia/Cosmos3-Nano-Policy-DROID"
 
     adapter = get_adapter("cosmos3_droid")

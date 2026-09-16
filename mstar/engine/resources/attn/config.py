@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 class AttnBackend(Enum):
     FLASHINFER = "flashinfer"
     DENSE = "dense"
+    XPU_PAGED = "xpu_paged"
     # DeepSeek-style absorbed multi-head latent attention over a
     # `KVLayout.MLA` cache (one ckv||kpe latent row per token): FlashInfer's
     # MLA kernel on sm90 at the Kimi dims (ckv 512, kpe 64), an fp32 SDPA

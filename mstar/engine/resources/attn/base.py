@@ -83,6 +83,27 @@ class AttentionManager(AttentionResource):
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
             )
+        if backend == AttnBackend.XPU_PAGED:
+            from mstar.engine.resources.attn.xpu import (
+                XPUPagedAttentionManager,
+                _xpu_paged_unavailable_reason,
+            )
+
+            if info.device.type != "xpu":
+                raise RuntimeError(
+                    "attention backend 'xpu_paged' requires an XPU device; "
+                    f"got {info.device}"
+                )
+            reason = _xpu_paged_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(
+                    "attention backend 'xpu_paged' requires a working "
+                    f"vllm-xpu-kernels installation ({reason})"
+                )
+            return XPUPagedAttentionManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+            )
         raise ValueError(f"Unknown attention backend {backend!r}")
 
     @property
@@ -108,6 +129,16 @@ class PlanCacheKey(NamedTuple):
     q_seq_lens: tuple
     page_indices: tuple
     last_page_lens: tuple
+
+
+class EagerSlotKey(NamedTuple):
+    """One eager wrapper — the counterpart of ``CGSlotKey``, slotted for the
+    same reason (FlashInfer's plan stages into a pinned buffer per wrapper)."""
+    label: str
+    slot: int
+    # decode and prefill take different wrapper classes; cross-attention plans
+    # one wrapper per label either way and leaves this False
+    is_decode: bool = False
 
 
 AttentionWrapper = FlashInferPrefillWrapper | FlashInferDecodeWrapper

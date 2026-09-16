@@ -98,6 +98,45 @@ Communication
      - Under ``--log-stats``: how often the arena logs its occupancy /
        fragmentation snapshot (segments, free bytes, largest contiguous
        free block, pinned bytes).
+
+Models
+------
+
+Per-model knobs, read when the submodule is built. They are scoped to one
+model, so they are named for it.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_VIT_BATCHING``
+     - ``0``
+     - BAGEL: batch several requests through the ViT encoder in one forward.
+       Off by default because flash-attn's varlen reductions across packed
+       images produce small bf16 drift, which at greedy ``temperature=0`` can
+       flip a downstream LLM argmax. When off, ``prefill_vit`` runs one
+       request at a time.
+   * - ``MSTAR_VIT_CUDA_GRAPH``
+     - ``0``
+     - BAGEL: CUDA-graph capture of the ViT block loop, over the node's ragged
+       attention resource (see :doc:`adding_models`). Off by default: capture
+       costs one graph per (batch size, token bucket) and the eager
+       flash-attn path is already fast. The win is removing per-layer launch
+       overhead on small images.
+   * - ``MSTAR_VIT_CG_TOKEN_BUCKETS``
+     - ``512,1024,2048,4096,4900``
+     - Comma-separated token-count buckets to capture, when
+       ``MSTAR_VIT_CUDA_GRAPH=1``. A batch longer than the largest bucket runs
+       eagerly. ``4900`` is ``70*70``, the exact length the ``vllm``
+       preprocess option emits.
+   * - ``MSTAR_VIT_CG_BATCH_SIZES``
+     - ``1,2,4``
+     - Comma-separated batch sizes to capture. Read only when
+       ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+
 Serving (Rust frontend)
 -----------------------
 
@@ -158,3 +197,50 @@ uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
   the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
   the Rust frontend (it spends compute on a track the client won't receive), or
   run the Python frontend for sound video.
+
+Worker scheduling
+-----------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_TP_ASYNC_SCHED``
+     - ``0``
+     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+       instance leader speculates step N+1 of the parallel node during
+       forward N (the existing single-worker speculation machinery, gate
+       opened) and broadcasts it at once as a speculative
+       ``ScheduleTPNode``; followers rebuild the identical batch during
+       their own forward N and every rank submits N+1 the moment N
+       completes. Removes the per-step serial build/plan from the group's
+       critical path. Voids (allocation failure, per-rid failure, a
+       continuing request without loop-back output) are derived by each
+       rank from replicated state, never signalled. A comma-separated
+       list of node names (``thinker,talker``) enables it for those
+       parallel nodes only. ``0``: the serial path — leader schedules
+       after N, followers rebuild after the broadcast. Set it identically
+       on every rank of an instance: the workers compare it at startup and
+       refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
+       ``0`` with it: that throttle holds the GPU thread until step N drains,
+       which serialises the very overlap this flag buys.
+   * - ``MSTAR_PRE_PLAN_SPEC``
+     - ``1``
+     - Pre-plan the speculative batch's attention on a dedicated thread
+       while the previous replay runs. ``0`` plans inline on the GPU
+       thread.
+   * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
+     - ``1024``
+     - Cap on back-to-back speculative steps before the leader yields to
+       other ready work.
+   * - ``MSTAR_SPEC_PEEK_FOR_FAIRNESS``
+     - ``1``
+     - Yield the speculation chain only when another (node, walk) is
+       actually ready right now; ``0`` uses the consecutive-step cap alone.
+   * - ``MSTAR_PHASE_TIMING``
+     - ``0``
+     - ``N > 0``: every N iterations log per-phase p50/p95/mean of the
+       worker main loop (speculate, await_gpu, submit_spec, ...).

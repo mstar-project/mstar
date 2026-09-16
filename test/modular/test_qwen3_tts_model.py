@@ -34,7 +34,7 @@ from mstar.model.qwen3_tts.config import (
 )
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule
-from mstar.model.registry import HF_MODELS, MODEL_REGISTRY
+from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -148,7 +148,7 @@ def test_qwen3_tts_declares_talker_and_codec_graphs():
 def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     model = _make_model()
 
-    assert MODEL_REGISTRY["qwen3_tts"] is Qwen3TTSModel
+    assert get_model_class("qwen3_tts") is Qwen3TTSModel
     assert HF_MODELS["qwen3_tts"] == {
         "model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     }
