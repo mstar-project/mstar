@@ -140,13 +140,14 @@ def _tanh_f32(x):
 
 @triton.jit
 def situ_and_mul_kernel(
-    gateup_ptr, out_ptr, hidden_size, beta, linear_beta,
+    gateup_ptr, out_ptr, hidden_size, stride_in, beta, linear_beta,
     BLOCK_SIZE: tl.constexpr, HAS_LINEAR_BETA: tl.constexpr,
 ):
-    """Row-wise SiTU-GLU over ``[rows, 2 * inter]`` -> ``[rows, inter]`` (fp32 math)."""
+    """Row-wise SiTU-GLU over ``[rows, 2 * inter]`` (row stride ``stride_in``) -> ``[rows, inter]``
+    (fp32 math)."""
     half = hidden_size // 2
-    pid = tl.program_id(0)
-    gate_row = gateup_ptr + pid * hidden_size
+    pid = tl.program_id(0).to(tl.int64)
+    gate_row = gateup_ptr + pid * stride_in
     up_row = gate_row + half
     out_row = out_ptr + pid * half
     for start in tl.range(0, half, BLOCK_SIZE):
@@ -161,10 +162,12 @@ def situ_and_mul_kernel(
 
 
 def situ_and_mul_triton(gateup: torch.Tensor, out: torch.Tensor, beta: float, linear_beta: float | None) -> None:
-    assert gateup.is_contiguous() and out.is_contiguous()
+    """``gateup [rows, 2 * inter]`` may be a column slice of a wider matrix (unit stride along the
+    row, any row stride); ``out`` is contiguous."""
+    assert gateup.dim() == 2 and gateup.stride(1) == 1 and out.is_contiguous()
     assert gateup.shape[0] == out.shape[0] and gateup.shape[1] == 2 * out.shape[1]
     situ_and_mul_kernel[(out.shape[0],)](
-        gateup, out, gateup.shape[1], float(beta), float(linear_beta or 1.0),
+        gateup, out, gateup.shape[1], gateup.stride(0), float(beta), float(linear_beta or 1.0),
         BLOCK_SIZE=512, HAS_LINEAR_BETA=linear_beta is not None,
     )
 
