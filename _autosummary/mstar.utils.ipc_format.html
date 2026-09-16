@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 16, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -567,8 +567,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ABORT_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.FAIL_REQUESTS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.FAIL_REQUESTS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.NEW_REQUEST</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.SETUP_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_GRAPHS_DONE</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest"><code class="docutils literal notranslate"><span class="pre">DrainRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest.request_id"><code class="docutils literal notranslate"><span class="pre">DrainRequest.request_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest.source"><code class="docutils literal notranslate"><span class="pre">DrainRequest.source</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.FailRequests"><code class="docutils literal notranslate"><span class="pre">FailRequests</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -609,6 +615,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.input_metadata"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.input_metadata</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.model_kwargs"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.model_kwargs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.request_id"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.request_id</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone"><code class="docutils literal notranslate"><span class="pre">ReadsDone</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.entity_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.entity_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.request_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.request_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest"><code class="docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -683,6 +694,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.DRAIN_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.DRAIN_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.INPUT_SIGNALS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.REMOVE_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.REMOVE_REQUEST</span></code></a></li>
@@ -718,23 +730,29 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ConductorMessageType" title="mstar.utils.ipc_format.ConductorMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ConductorMessageType</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.FailRequests" title="mstar.utils.ipc_format.FailRequests"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FailRequests</span></code></a>(errors)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.DrainRequest" title="mstar.utils.ipc_format.DrainRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DrainRequest</span></code></a>(request_id, source)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.FailRequests" title="mstar.utils.ipc_format.FailRequests"><code class="xref py py-obj docutils literal notranslate"><span class="pre">FailRequests</span></code></a>(errors)</p></td>
 <td><p>A worker reporting requests it can no longer serve.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.InputSignals" title="mstar.utils.ipc_format.InputSignals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSignals</span></code></a>(request_id, inputs, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.InputSignals" title="mstar.utils.ipc_format.InputSignals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSignals</span></code></a>(request_id, inputs, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageBody</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageBody</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageSource" title="mstar.utils.ipc_format.MessageSource"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageSource</span></code></a>(*values)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageSource" title="mstar.utils.ipc_format.MessageSource"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageSource</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequest" title="mstar.utils.ipc_format.NewRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequest</span></code></a>(request_id, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequest" title="mstar.utils.ipc_format.NewRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequest</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequestConductor" title="mstar.utils.ipc_format.NewRequestConductor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequestConductor</span></code></a>(request_id, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.NewRequestConductor" title="mstar.utils.ipc_format.NewRequestConductor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">NewRequestConductor</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.ReadsDone" title="mstar.utils.ipc_format.ReadsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ReadsDone</span></code></a>(request_id, entity_id)</p></td>
+<td><p>An entity confirming it has no in-flight reads for a request and will start none — the conductor's gate before sending the hard RemoveRequest.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.RemoveRequest" title="mstar.utils.ipc_format.RemoveRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a>(request_id, source)</p></td>
 <td><p></p></td>
@@ -832,6 +850,11 @@
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.READS_DONE">
+<span class="sig-name descname"><span class="pre">READS_DONE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'reads_done'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE">
 <span class="sig-name descname"><span class="pre">SETUP_DONE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'setup_done'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -839,6 +862,30 @@
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE">
 <span class="sig-name descname"><span class="pre">WORKER_GRAPHS_DONE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'worker_graphs_done'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.DrainRequest">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">DrainRequest</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">source</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">&lt;MessageSource.CONDUCTOR:</span> <span class="pre">0&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#DrainRequest"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.DrainRequest" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>source</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.DrainRequest.request_id">
+<span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.DrainRequest.request_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.DrainRequest.source">
+<span class="sig-name descname"><span class="pre">source</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.utils.ipc_format.DrainRequest.source" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1036,6 +1083,32 @@ step can fail several of them for different reasons.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.NewRequestConductor.request_id">
 <span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.NewRequestConductor.request_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ReadsDone">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">ReadsDone</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">entity_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#ReadsDone"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.ReadsDone" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<p>An entity confirming it has no in-flight reads for a request and will
+start none — the conductor’s gate before sending the hard RemoveRequest.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ReadsDone.entity_id">
+<span class="sig-name descname"><span class="pre">entity_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.ReadsDone.entity_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ReadsDone.request_id">
+<span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.ReadsDone.request_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1399,6 +1472,11 @@ step can fail several of them for different reasons.</p>
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">WorkerMessageType</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#WorkerMessageType"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.Enum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.DRAIN_REQUEST">
+<span class="sig-name descname"><span class="pre">DRAIN_REQUEST</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'drain_request'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.DRAIN_REQUEST" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS">
 <span class="sig-name descname"><span class="pre">INPUT_SIGNALS</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'input_signals'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -1502,8 +1580,14 @@ step can fail several of them for different reasons.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ABORT_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.FAIL_REQUESTS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.FAIL_REQUESTS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.NEW_REQUEST</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.SETUP_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_GRAPHS_DONE</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest"><code class="docutils literal notranslate"><span class="pre">DrainRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest.request_id"><code class="docutils literal notranslate"><span class="pre">DrainRequest.request_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.DrainRequest.source"><code class="docutils literal notranslate"><span class="pre">DrainRequest.source</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.FailRequests"><code class="docutils literal notranslate"><span class="pre">FailRequests</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1544,6 +1628,11 @@ step can fail several of them for different reasons.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.input_metadata"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.input_metadata</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.model_kwargs"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.model_kwargs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.NewRequestConductor.request_id"><code class="docutils literal notranslate"><span class="pre">NewRequestConductor.request_id</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone"><code class="docutils literal notranslate"><span class="pre">ReadsDone</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.entity_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.entity_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ReadsDone.request_id"><code class="docutils literal notranslate"><span class="pre">ReadsDone.request_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.RemoveRequest"><code class="docutils literal notranslate"><span class="pre">RemoveRequest</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1618,6 +1707,7 @@ step can fail several of them for different reasons.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.DRAIN_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.DRAIN_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.INPUT_SIGNALS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.REMOVE_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.REMOVE_REQUEST</span></code></a></li>
@@ -1661,7 +1751,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 15, 2026.
+  Last updated on Sep 16, 2026.
   <br/>
 </p>
   </div>

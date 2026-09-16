@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 16, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -860,7 +860,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="create_videos">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html#mstar.api_server.openai.serving_videos.create_videos">[docs]</a>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">raw_request</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>  <span class="c1"># noqa: ARG001</span>
     <span class="n">args</span> <span class="o">=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">video_to_request</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"vid"</span><span class="p">)</span>
 
@@ -874,7 +874,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
     <span class="p">)</span>
 
-    <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span>
+    <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="c1"># Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the</span>
     <span class="c1"># image endpoint's b64_json shape. A sound request additionally emits a raw</span>
     <span class="c1"># 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one</span>
@@ -949,7 +949,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 15, 2026.
+  Last updated on Sep 16, 2026.
   <br/>
 </p>
   </div>

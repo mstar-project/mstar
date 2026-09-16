@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 16, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1803,9 +1803,31 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">n</span><span class="o">=</span><span class="n">n</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="TensorCommunicationManager.has_inflight_reads">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">has_inflight_reads</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether any async read for this request is still touching a remote</span>
+<span class="sd">        segment. Synchronous (SHM) reads complete inside ``start_read_tensors``</span>
+<span class="sd">        with ``future=None``, so they never count here; only outstanding</span>
+<span class="sd">        async (RDMA) futures do. Gates the READS_DONE ACK during a drain.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="nb">any</span><span class="p">(</span>
+            <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">==</span> <span class="n">request_id</span>
+            <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="TensorCommunicationManager.cleanup_request">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.cleanup_request">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">cleanup_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cleanup_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">force</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Teardown for a request's tensor state.</span>
+
+<span class="sd">        Default (soft): drop tensors that are safe to GC, defer any still</span>
+<span class="sd">        referenced or persisted. Does NOT force-drop persisted signals — that</span>
+<span class="sd">        is the conductor-coordinated hard cleanup, see</span>
+<span class="sd">        :meth:`force_cleanup_request`.</span>
+<span class="sd">        """</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">read_finished</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">buffered_shards</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">sharding_configs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
@@ -1813,11 +1835,10 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">req_tx_info</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_all_uuids</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">uuid_to_shard_dim</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">persist</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">can_gc</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">can_gc</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">force</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                     <span class="s2">"Deferring cleanup of tensor uuid </span><span class="si">%s</span><span class="s2"> "</span>
-                    <span class="s2">"(awaiting TENSOR_RECEIVED ACK)"</span><span class="p">,</span> <span class="n">uuid</span>
+                    <span class="s2">"(awaiting TENSOR_RECEIVED ACK or unpersist)"</span><span class="p">,</span> <span class="n">uuid</span>
                 <span class="p">)</span>
                 <span class="k">continue</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
@@ -1827,6 +1848,18 @@ window.runMermaid = runMermaid;</script>
             <span class="nb">sum</span><span class="p">([</span><span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span> <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">==</span> <span class="n">request_id</span><span class="p">],</span> <span class="n">start</span><span class="o">=</span><span class="p">[]),</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">ep</span> <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="o">!=</span> <span class="n">request_id</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="TensorCommunicationManager.force_cleanup_request">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">force_cleanup_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Unconditional teardown: drop every tensor for the request and unlink</span>
+<span class="sd">        its SHM, ignoring ref counts and persist markers. Safe only after every</span>
+<span class="sd">        reader has confirmed (READS_DONE) it has no in-flight reads for the</span>
+<span class="sd">        request. Also reclaims non-persisted buffers whose readers drained</span>
+<span class="sd">        before ACKing (which the soft path would otherwise defer forever).</span>
+<span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cleanup_request</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">force</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span></div>
 </div>
 
 
@@ -2315,7 +2348,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 15, 2026.
+  Last updated on Sep 16, 2026.
   <br/>
 </p>
   </div>

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 16, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -611,10 +611,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.buffered_shards"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.buffered_shards</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.cleanup_request"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.force_cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_ready_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_rx_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_rx_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_tensor"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_tensor()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_tx_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_tx_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.has_inflight_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.pending"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.pending</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.read_finished"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.read_finished</span></code></a></li>
@@ -1171,10 +1173,18 @@ TENSOR_RECEIVED ack; emit it here so it can reclaim them.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.cleanup_request">
-<span class="sig-name descname"><span class="pre">cleanup_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.cleanup_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.cleanup_request" title="Link to this definition">#</a></dt>
-<dd><dl class="field-list simple">
+<span class="sig-name descname"><span class="pre">cleanup_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">force</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.cleanup_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.cleanup_request" title="Link to this definition">#</a></dt>
+<dd><p>Teardown for a request’s tensor state.</p>
+<p>Default (soft): drop tensors that are safe to GC, defer any still
+referenced or persisted. Does NOT force-drop persisted signals — that
+is the conductor-coordinated hard cleanup, see
+<a class="reference internal" href="#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request" title="mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request"><code class="xref py py-meth docutils literal notranslate"><span class="pre">force_cleanup_request()</span></code></a>.</p>
+<dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>force</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
 </dd>
 </dl>
 </dd></dl>
@@ -1189,6 +1199,21 @@ TENSOR_RECEIVED ack; emit it here so it can reclaim them.</p>
 <li><p><strong>uuid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>n</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request">
+<span class="sig-name descname"><span class="pre">force_cleanup_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.force_cleanup_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request" title="Link to this definition">#</a></dt>
+<dd><p>Unconditional teardown: drop every tensor for the request and unlink
+its SHM, ignoring ref counts and persist markers. Safe only after every
+reader has confirmed (READS_DONE) it has no in-flight reads for the
+request. Also reclaims non-persisted buffers whose readers drained
+before ACKing (which the soft path would otherwise defer forever).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1244,6 +1269,23 @@ TENSOR_RECEIVED ack; emit it here so it can reclaim them.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<em>TxInfo</em>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads">
+<span class="sig-name descname"><span class="pre">has_inflight_reads</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.has_inflight_reads"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads" title="Link to this definition">#</a></dt>
+<dd><p>Whether any async read for this request is still touching a remote
+segment. Synchronous (SHM) reads complete inside <code class="docutils literal notranslate"><span class="pre">start_read_tensors</span></code>
+with <code class="docutils literal notranslate"><span class="pre">future=None</span></code>, so they never count here; only outstanding
+async (RDMA) futures do. Gates the READS_DONE ACK during a drain.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1815,10 +1857,12 @@ file-transport consumer cannot read an arena producer.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.buffered_shards"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.buffered_shards</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.cleanup_request"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.dereference"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.dereference()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.force_cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_ready_tensors"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_ready_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_rx_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_rx_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_tensor"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_tensor()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.get_tx_info"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.get_tx_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.has_inflight_reads()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.increment_ref"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.increment_ref()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.pending"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.pending</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.tensors.TensorCommunicationManager.read_finished"><code class="docutils literal notranslate"><span class="pre">TensorCommunicationManager.read_finished</span></code></a></li>
@@ -1899,7 +1943,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 15, 2026.
+  Last updated on Sep 16, 2026.
   <br/>
 </p>
   </div>

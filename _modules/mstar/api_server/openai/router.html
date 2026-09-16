@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 16, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -982,12 +982,12 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="videos_generations">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.videos_generations">[docs]</a>
 <span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/videos/generations"</span><span class="p">)</span>
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">videos_generations</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">):</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">videos_generations</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">VideoGenerationRequest</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
     <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_videos"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">err</span>
     <span class="k">try</span><span class="p">:</span>
-        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_videos</span><span class="o">.</span><span class="n">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">)</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="n">serving_videos</span><span class="o">.</span><span class="n">create_videos</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
         <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
         <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
@@ -1081,7 +1081,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 15, 2026.
+  Last updated on Sep 16, 2026.
   <br/>
 </p>
   </div>

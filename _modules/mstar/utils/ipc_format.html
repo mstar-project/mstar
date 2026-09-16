@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 16, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -892,6 +892,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessageType">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">WorkerMessageType</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
     <span class="n">NEW_REQUEST</span> <span class="o">=</span> <span class="s2">"new_request"</span>
+    <span class="n">DRAIN_REQUEST</span> <span class="o">=</span> <span class="s2">"drain_request"</span>
     <span class="n">REMOVE_REQUEST</span> <span class="o">=</span> <span class="s2">"remove_request"</span>
     <span class="n">INPUT_SIGNALS</span> <span class="o">=</span> <span class="s2">"input_signals"</span>
     <span class="n">UNPERSIST_TENSORS</span> <span class="o">=</span> <span class="s2">"unpersist"</span>
@@ -926,6 +927,17 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.RemoveRequest">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoveRequest</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">source</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">MessageSource</span><span class="o">.</span><span class="n">CONDUCTOR</span></div>
+
+
+
+<div class="viewcode-block" id="DrainRequest">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.DrainRequest">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DrainRequest</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+    <span class="c1"># Phase-1 teardown: stop reading this request and confirm no reads remain.</span>
+    <span class="c1"># Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">source</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">MessageSource</span><span class="o">.</span><span class="n">CONDUCTOR</span></div>
 
@@ -1014,7 +1026,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">WORKER_GRAPHS_DONE</span> <span class="o">=</span> <span class="s2">"worker_graphs_done"</span>
     <span class="n">SETUP_DONE</span> <span class="o">=</span> <span class="s2">"setup_done"</span>
     <span class="n">ABORT_REQUEST</span> <span class="o">=</span> <span class="s2">"abort_request"</span>
-    <span class="n">FAIL_REQUESTS</span> <span class="o">=</span> <span class="s2">"fail_requests"</span></div>
+    <span class="n">FAIL_REQUESTS</span> <span class="o">=</span> <span class="s2">"fail_requests"</span>
+    <span class="n">READS_DONE</span> <span class="o">=</span> <span class="s2">"reads_done"</span></div>
 
 
 
@@ -1065,6 +1078,17 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">AbortRequest</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
     <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span></div>
+
+
+
+<div class="viewcode-block" id="ReadsDone">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ReadsDone">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ReadsDone</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""An entity confirming it has no in-flight reads for a request and will</span>
+<span class="sd">    start none — the conductor's gate before sending the hard RemoveRequest."""</span>
+    <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span></div>
 
 
 
@@ -1137,7 +1161,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 15, 2026.
+  Last updated on Sep 16, 2026.
   <br/>
 </p>
   </div>

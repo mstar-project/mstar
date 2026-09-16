@@ -20,12 +20,14 @@ mstar.utils.ipc\_format
       AbortRequest
       ConductorMessage
       ConductorMessageType
+      DrainRequest
       FailRequests
       InputSignals
       MessageBody
       MessageSource
       NewRequest
       NewRequestConductor
+      ReadsDone
       RemoveRequest
       ScheduleTPNode
       SetupDone

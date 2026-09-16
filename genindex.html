@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.0" />
-    <meta name="docbuild:last-update" content="Sep 15, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 16, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -2034,6 +2034,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.communication.event.html#mstar.communication.event.EventWakeup.drain">drain() (mstar.communication.event.EventWakeup method)</a>
 </li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessageType.DRAIN_REQUEST">DRAIN_REQUEST (mstar.utils.ipc_format.WorkerMessageType attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.DrainRequest">DrainRequest (class in mstar.utils.ipc_format)</a>
+</li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2ACPredictorConfig.drop_path_rate">drop_path_rate (mstar.model.vjepa2.config.VJepa2ACPredictorConfig attribute)</a>
 
       <ul>
@@ -2124,12 +2128,16 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.EngineResourceInfo">EngineResourceInfo (class in mstar.engine.resources.base)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.ensure">ensure() (mstar.engine.cuda_graph_runner.DummyRowPool method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.transfer.html#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.entity_id">entity_id (mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ReadsDone.entity_id">(mstar.utils.ipc_format.ReadsDone attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.higgs_audio.config.html#mstar.model.higgs_audio.config.HiggsAudioModelConfig.eos_token_id">eos_token_id (mstar.model.higgs_audio.config.HiggsAudioModelConfig attribute)</a>
 
       <ul>
@@ -2274,6 +2282,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3Config.flow_shift_action">(mstar.model.cosmos3.Cosmos3Config attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.force_cleanup_request">force_cleanup_request() (mstar.communication.tensors.TensorCommunicationManager method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.attn.cross.html#mstar.engine.resources.attn.cross.FlashInferCrossManager.force_double_buffer">force_double_buffer (mstar.engine.resources.attn.cross.FlashInferCrossManager property)</a>
 
       <ul>
@@ -2900,6 +2910,8 @@ window.runMermaid = runMermaid;</script>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.has_chunk_ready">has_chunk_ready() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
 </li>
+      <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.has_inflight_reads">has_inflight_reads() (mstar.communication.tensors.TensorCommunicationManager method)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.attn.ragged.config.html#mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig.head_dim">head_dim (mstar.engine.resources.attn.ragged.config.RaggedAttentionConfig attribute)</a>
 
       <ul>
@@ -2922,10 +2934,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.head_dim">(mstar.model.whisper.config.WhisperModelConfig property)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.hidden_act">hidden_act (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.hidden_act">hidden_act (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3Config.hidden_size">hidden_size (mstar.model.cosmos3.config.Cosmos3Config attribute)</a>
 
       <ul>
@@ -6057,6 +6069,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.read_transformer_weight_shapes">read_transformer_weight_shapes() (in module mstar.model.cosmos3.loader)</a>
 </li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.READS_DONE">READS_DONE (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ReadsDone">ReadsDone (class in mstar.utils.ipc_format)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.AdmitOutcome.ready">ready (mstar.engine.resources.AdmitOutcome attribute)</a>
 
       <ul>
@@ -6282,11 +6298,15 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.AbortRequest.request_id">(mstar.utils.ipc_format.AbortRequest attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.DrainRequest.request_id">(mstar.utils.ipc_format.DrainRequest attribute)</a>
+</li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.InputSignals.request_id">(mstar.utils.ipc_format.InputSignals attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.NewRequest.request_id">(mstar.utils.ipc_format.NewRequest attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.NewRequestConductor.request_id">(mstar.utils.ipc_format.NewRequestConductor attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ReadsDone.request_id">(mstar.utils.ipc_format.ReadsDone attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.RemoveRequest.request_id">(mstar.utils.ipc_format.RemoveRequest attribute)</a>
 </li>
@@ -6945,10 +6965,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_window_tokens">snac_window_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Snake1d">Snake1d (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3SchedulerConfig.solver_order">solver_order (mstar.model.cosmos3.config.Cosmos3SchedulerConfig attribute)</a>
 
       <ul>
@@ -6985,8 +7005,12 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.cosmos3.html#mstar.model.cosmos3.Cosmos3Config.sound_sample_rate">(mstar.model.cosmos3.Cosmos3Config attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.RemoveRequest.source">source (mstar.utils.ipc_format.RemoveRequest attribute)</a>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.DrainRequest.source">source (mstar.utils.ipc_format.DrainRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.RemoveRequest.source">(mstar.utils.ipc_format.RemoveRequest attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.TensorPointerInfo.source_entity">source_entity (mstar.graph.base.TensorPointerInfo attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TransferReadInfo.source_session_id">source_session_id (mstar.communication.tensors.TransferReadInfo attribute)</a>
@@ -7967,7 +7991,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 15, 2026.
+  Last updated on Sep 16, 2026.
   <br/>
 </p>
   </div>
