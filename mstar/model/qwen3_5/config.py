@@ -19,6 +19,8 @@ GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
 ROPE = "rope"
 SAMPLER = "sampler"
+# the ViT tower's cacheless attention, on the `vision_encoder` node
+VISION_ATTN = "vision_attn"
 
 
 @dataclass

@@ -19,26 +19,22 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 
 # ----------------------------------------------------------------------------
 # Grid helpers
 # ----------------------------------------------------------------------------
 
 
-def vision_seq_lengths(grid: list[tuple[int, int, int]]) -> list[int]:
-    """One segment length per frame, on the host.
+def vision_seq_lengths(grid: list[tuple[int, int, int]]) -> tuple[int, ...]:
+    """One attending segment per frame, on the host.
 
     Each frame attends to itself alone, so a ``t``-frame entry contributes
-    ``t`` segments of ``h * w``.
-
-    Host-side on purpose. This used to be a device ``[num_segments + 1]``
-    cumsum that attention read back with ``.tolist()`` — once per block, so
-    24 device syncs per image, which pinned the host to the GPU for the whole
-    tower and left no launch runway at all. The grid is three ints; reading it
-    once up front costs nothing and the lengths follow by arithmetic.
+    ``t`` segments of ``h * w``. The submodule turns these into the step's
+    ``Segment`` list and the ragged attention resource plans them; nothing in
+    the tower reads them.
     """
-    return [h * w for t, h, w in grid for _ in range(t)]
+    return tuple(h * w for t, h, w in grid for _ in range(t))
 
 
 def vision_position_ids(
@@ -229,10 +225,17 @@ class VisionMLP(nn.Module):
 class VisionAttention(nn.Module):
     """Full attention within each frame, over packed patches.
 
-    Not the engine's attention resource: there is no KV cache and nothing
-    persists across steps, so this runs straight through SDPA. Segments are
-    split by their per-frame lengths rather than masked, which keeps the cost
-    linear in patches instead of quadratic across the whole packed batch.
+    The engine's ragged attention resource does the isolating: the submodule
+    declares one segment per frame and the manager plans a varlen layout, so
+    this hands it the whole packed run and never sees the boundaries.
+
+    The layout being in the plan rather than in this forward is what lets the
+    tower compile. Splitting the packed run per frame here put each frame's
+    patch count into the graph as its own symint, which made the token
+    dimension a sum like ``s45 + s63 + 1792``; inductor then would not prove
+    ``hidden_size * n`` divisible by ``n`` when it fused a block's residual add
+    into the next block's norm, and refused to codegen any packed run of three
+    or more images (``CantSplit``).
     """
 
     def __init__(self, config: Qwen3_5VisionConfig):
@@ -241,15 +244,28 @@ class VisionAttention(nn.Module):
         self.head_dim = config.head_dim
         self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=True)
         self.proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.ragged_attn = None
+
+    def bind_resources(self, resources: dict) -> None:
+        """See ``NodeSubmodule.bind_node_resources``. ``.get``: a deployment
+        that never builds the vision node binds nothing here."""
+        self.ragged_attn = resources.get(VISION_ATTN)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        seq_lengths: list[int],
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        if self.ragged_attn is None:
+            raise RuntimeError(
+                "Qwen3.5's vision tower has no ragged attention resource; "
+                f"declare a RaggedAttentionSpec under {VISION_ATTN!r} for the "
+                "vision_encoder node"
+            )
         seq_len = hidden_states.shape[0]
+        # [tokens, heads, head_dim] throughout — the layout the ragged kernel
+        # takes, so nothing transposes on the way in or out
         q, k, v = (
             self.qkv(hidden_states)
             .reshape(seq_len, 3, self.num_heads, -1)
@@ -263,23 +279,8 @@ class VisionAttention(nn.Module):
         q = ((qf * c) + (_rotate_half(qf) * s)).to(dtype)
         k = ((kf * c) + (_rotate_half(kf) * s)).to(dtype)
 
-        # [1, heads, tokens, head_dim]
-        q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))
-        if len(seq_lengths) == 1:
-            # One frame, which is every single-image request: the split and
-            # the concat below are both identities on it, and skipping them
-            # drops two kernel launches per block.
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        else:
-            outs = [
-                F.scaled_dot_product_attention(qs, ks, vs, is_causal=False)
-                for qs, ks, vs in zip(
-                    *(torch.split(t, seq_lengths, dim=2) for t in (q, k, v)),
-                    strict=True,
-                )
-            ]
-            out = torch.cat(outs, dim=2)
-        return self.proj(out.transpose(1, 2).reshape(seq_len, -1).contiguous())
+        out = self.ragged_attn.run(q, k, v)
+        return self.proj(out.reshape(seq_len, -1).contiguous())
 
 
 class VisionBlock(nn.Module):
@@ -293,12 +294,11 @@ class VisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        seq_lengths: list[int],
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states), seq_lengths, cos, sin,
+            self.norm1(hidden_states), cos, sin,
         )
         return hidden_states + self.mlp(self.norm2(hidden_states))
 
@@ -324,23 +324,33 @@ class Qwen3_5VisionModel(nn.Module):
         self.merger = VisionPatchMerger(config)
 
     def forward(
-        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
+        self,
+        pixel_values: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         """``[total_patches, patch_numel]`` in, ``[merged_tokens, out_hidden]``
-        out — one token per ``spatial_merge_size ** 2`` block of patches."""
-        merge = self.config.spatial_merge_size
-        device = pixel_values.device
-        # The one device read of the whole tower, and free when the caller
-        # hands the grid over on the host. Everything the shape maths needs
-        # is three ints per image; reading them here is what lets the 24
-        # blocks below launch without ever waiting on the GPU.
-        grid = [(int(t), int(h), int(w)) for t, h, w in grid_thw.tolist()]
+        out — one token per ``spatial_merge_size ** 2`` block of patches.
 
-        indices, weights = vision_interpolation(
-            grid, self.config.num_grid_per_side, merge, device,
-        )
-        position_ids = vision_position_ids(grid, merge, device)
-        seq_lengths = vision_seq_lengths(grid)
+        Everything the grid decides is built by the caller (see
+        ``vision_grid_inputs``) and handed over ready-made. The grid must not
+        be read here: ``grid_thw.tolist()`` breaks the graph, and the h and w
+        it yields come back as unbacked symints, which makes the token
+        dimension a polynomial like ``s11*s50 + 768``. Inductor then cannot
+        prove ``hidden_size * n`` divisible by ``n`` and refuses to codegen
+        (``CantSplit``) for any packed multi-image run.
+
+        Which patches attend together is not an argument here either: the
+        submodule declares one segment per frame and the ragged attention
+        resource plans the layout, outside the graph.
+        """
+        n = pixel_values.shape[0]
+        # Same grid, separate inputs: without this each leading dim gets its
+        # own symbol and nothing downstream lines up.
+        torch._check(indices.shape[0] == n)
+        torch._check(weights.shape[0] == n)
+        torch._check(position_ids.shape[0] == n)
 
         hidden = self.patch_embed(pixel_values)
         # bilinear resample of the learned table, as a weighted gather
@@ -350,5 +360,5 @@ class Qwen3_5VisionModel(nn.Module):
         cos, sin = self.rotary_pos_emb(position_ids)
         cos, sin = cos.to(hidden.dtype), sin.to(hidden.dtype)
         for block in self.blocks:
-            hidden = block(hidden, seq_lengths, cos, sin)
+            hidden = block(hidden, cos, sin)
         return self.merger(hidden)

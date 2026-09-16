@@ -34,6 +34,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+   * - ``qwen3_5_{0.8,2,4,9,27}b``
+     - ``Qwen/Qwen3.5-4B``
+     - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
+       attention interleaved with full attention, plus a ViT tower.
    * - ``qwen3_omni``
      - ``Qwen/Qwen3-Omni-30B-A3B-Instruct``
      - Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.
@@ -65,6 +69,29 @@ Notes
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
+
+Qwen3.5 (``qwen3_5_*``)
+-----------------------
+
+Text-and-image chat on the Qwen3.5 dense family; five sizes, one architecture.
+MoE variants are not supported yet. Served on both ``POST /generate`` and
+``/v1/chat/completions`` (image parts included). Images may be interleaved with
+text anywhere in the prompt, and prefill follows the order they were written::
+
+    mstar serve qwen3_5_4b --gpus 0
+
+Most layers are gated DeltaNet rather than full attention, so a request holds a
+recurrent-state slot as well as a KV allocation. The slot pool is sized
+explicitly in ``configs/qwen3_5_*.yaml``: at ~25 MiB a slot the 256-slot default
+would reserve far too much, and the floor is set by CUDA-graph capture (every
+captured row holds a slot for the whole pass), not by the concurrency you want.
+Raising any ``*_CAPTURE_BATCH_SIZES`` raises it, and capture fails outright if
+the pool cannot fit — the config comment carries the arithmetic.
+
+``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
+``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
+a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
+via ``extra_body``.
 
 Qwen3-TTS notes
 ---------------

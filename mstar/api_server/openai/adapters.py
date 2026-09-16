@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
+from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -306,6 +307,39 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         )
 
 
+class Qwen3_5Adapter(OpenAIAdapter):
+    """Qwen3.5: text-and-image chat, text out.
+
+    Chat only — the model has no image, speech or video output, so the other
+    ``/v1/*`` surfaces stay 404.
+
+    Sampling keys are the plain ones: ``temperature``, ``top_p`` and
+    ``max_output_tokens`` (see ``Qwen3_5DenseModel.get_request_resource_configs``),
+    plus ``seed``, which the conductor honors. Two more the model reads are not
+    OpenAI fields, so they go through ``extra_body``:
+
+    * ``repetition_penalty`` — the sampler applies it over the prompt's tokens
+      as well as the generated ones.
+    * ``enable_thinking`` (default true) — the chat template opens a
+      ``<think>`` block. Set it false for short answers.
+    """
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        mk = _passthrough(req)
+        _apply_sampling(req, mk)
+        return SubmitArgs(
+            text=text,
+            file_paths=file_paths or None,
+            input_modalities=in_mods,
+            output_modalities=["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
+        )
+
+
 class OrpheusAdapter(OpenAIAdapter):
     """Orpheus: text-to-speech (audio out only). Honors temperature/top_p/seed
     (its ``get_sampling_config`` reads model_kwargs)."""
@@ -460,6 +494,12 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
 }
+
+# One registry key per size, as the model registry declares them; every size is
+# the same dense architecture and takes the same adapter.
+ADAPTER_REGISTRY.update({
+    f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
+})
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:

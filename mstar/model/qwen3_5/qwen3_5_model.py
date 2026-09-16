@@ -13,6 +13,10 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.attn.ragged.config import (
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
+)
 from mstar.engine.resources.kv.config import KVConfig, KVSpec
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -51,6 +55,7 @@ from mstar.model.qwen3_5.config import (
     LINEAR_ATTN,
     ROPE,
     SAMPLER,
+    VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
@@ -111,6 +116,10 @@ class WalkInput:
 # `prefill_order` tags, in prompt order. The nth tag of a kind addresses the
 # nth tensor of that kind.
 TEXT_PART, IMAGE_PART = 0, 1
+
+# Ragged attention sizes a CUDA-graph bucket off this, and the ViT is not
+# captured, so it only has to be generous enough for a plausible prompt.
+MAX_VISION_SEGMENTS = 16
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,30 @@ class Qwen3_5DenseModel(Model):
                 resource_key=SAMPLER, nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
+            ),
+            *self._vision_resources(),
+        ]
+
+    def _vision_resources(self) -> list[NodeResourceSpec]:
+        """The ViT tower's attention. Nothing else: the tower caches nothing
+        and carries nothing between steps.
+
+        Absent on a text-only checkpoint, where the node is never built.
+        """
+        if self.vision_config is None:
+            return []
+        vision = self.vision_config
+        return [
+            RaggedAttentionSpec(
+                resource_key=VISION_ATTN, nodes={"vision_encoder"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=vision.num_heads,
+                    num_kv_heads=vision.num_heads,
+                    head_dim=vision.head_dim,
+                    # a frame, not a request: a prompt's images each add one,
+                    # and a multi-frame entry adds one per frame
+                    max_segments_per_request=MAX_VISION_SEGMENTS,
+                ),
             ),
         ]
 

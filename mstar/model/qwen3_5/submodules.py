@@ -25,6 +25,10 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.ragged.config import (
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
+)
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.position.config import PositionStep
@@ -38,7 +42,13 @@ from mstar.model.qwen3_5.components.rope import (
     vision_position_advance,
     vision_position_ids,
 )
-from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel
+from mstar.model.qwen3_5.components.vision import (
+    Qwen3_5VisionModel,
+    vision_interpolation,
+    vision_seq_lengths,
+    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    vision_position_ids as vision_grid_position_ids,
+)
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -46,6 +56,7 @@ from mstar.model.qwen3_5.config import (
     LINEAR_ATTN,
     ROPE,
     SAMPLER,
+    VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
@@ -508,17 +519,15 @@ class LLMSubmodule(ARNodeSubmodule):
 class VisionEncoderSubmodule(NodeSubmodule):
     """Qwen3.5's ViT, which turns pixel patches into LLM-width embeddings.
 
-    A prompt's images go through one at a time, and the LLM node concatenates
-    what comes back. The tower would pack them — attention is per frame, so
-    images never see each other — but a grid with more than one row is a shape
-    inductor cannot codegen ("CantSplit"), and one row per call is the shape
-    that is already compiled. N is small and the tower is launch-bound.
+    A prompt's images go through packed, in one call. The grid maths runs in
+    `prepare_inputs` rather than the compiled forward, and which patches attend
+    together is declared as this step's segments rather than split for inside
+    it — both so that the tower's only symbolic shape is its token count.
 
-    Stays eager, and one request per step — `can_batch` is the base default.
-    Batching across requests means packing several requests' patches and
-    splitting the embeds back out; the ragged attention resource
-    (`mstar/engine/resources/attn/ragged`) is the natural backend for it, and
-    likely beats the per-segment `F.sdpa` loop even at bs=1.
+    Several requests go through together too: `preprocess` concatenates their
+    patch runs and `forward_batched` cuts the embeddings back apart. The tower
+    is fixed-cost per call (24 blocks of dispatch) and its work is per patch,
+    so one wide call beats several narrow ones.
     """
 
     def __init__(
@@ -537,13 +546,32 @@ class VisionEncoderSubmodule(NodeSubmodule):
     ) -> NodeInputs:
         # (num_images, 3). One image arrives as a bare [t, h, w], which the
         # per-image loops in `vision.py` would read as three images.
-        grids = [
-            g.reshape(-1, 3) for g in inputs["image_grid_thw"]
+        device = self.get_device()
+        merge = self.config.spatial_merge_size
+        grid = [
+            (int(t), int(h), int(w))
+            for g in inputs["image_grid_thw"]
+            for t, h, w in g.reshape(-1, 3).tolist()
         ]
+        # Everything the grid decides is built here, not in the forward: the
+        # tower is compiled, and a `.tolist()` inside it breaks the graph and
+        # turns h and w into symints that inductor cannot codegen a packed run
+        # from. See `Qwen3_5VisionModel.forward`.
+        indices, weights = vision_interpolation(
+            grid, self.config.num_grid_per_side, merge, device,
+        )
         return NodeInputs(
             tensor_inputs={
                 "pixel_values": torch.cat(inputs["pixel_values"], dim=0),
-                "image_grid_thw": torch.cat(grids, dim=0),
+                "indices": indices,
+                "weights": weights,
+                "position_ids": vision_grid_position_ids(grid, merge, device),
+                # neither of these is a forward arg. `declare_step` turns the
+                # segment lengths into the step's segments for the ragged
+                # resource to plan, and `forward_batched` cuts the output at
+                # the patch count.
+                "seq_lengths": vision_seq_lengths(grid),
+                "num_patches": sum(t * h * w for t, h, w in grid),
             },
         )
 
@@ -554,31 +582,83 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: list[NodeInputs],
         **kwargs,
     ) -> SubmoduleStep:
-        # The encoder holds no engine resources: it is a pure function of its
-        # pixels. The LLM node declares the step that prefill_vision plans.
-        return SubmoduleStep(steps={})
+        # One segment per frame: a frame attends to itself alone, so a request
+        # carrying several images contributes several. This is the whole
+        # layout — there is no cache to read it off next step.
+        segments = [
+            Segment(request_id=rid, label="main", span=span)
+            for rid, inp in zip(request_ids, inputs, strict=True)
+            for span in inp.tensor_inputs["seq_lengths"]
+        ]
+        return SubmoduleStep(
+            segments=segments,
+            steps={VISION_ATTN: AttentionStep(causal=False)},
+        )
+
+    def can_batch(
+        self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
+    ) -> bool:
+        return True
+
+    def preprocess(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        inputs: list[NodeInputs],
+    ) -> dict[str, Any]:
+        """One packed run for the whole batch.
+
+        Every per-token input concatenates the same way, in the order
+        `declare_step` laid the segments out, so the plan and the tensors agree
+        without either knowing about the other.
+        """
+        device = self.get_device()
+        cat = lambda name: torch.cat(  # noqa: E731
+            [inp.tensor_inputs[name].to(device) for inp in inputs], dim=0,
+        )
+        return {
+            "pixel_values": cat("pixel_values"),
+            "indices": cat("indices"),
+            "weights": cat("weights"),
+            "position_ids": cat("position_ids"),
+            "num_patches": tuple(
+                inp.tensor_inputs["num_patches"] for inp in inputs
+            ),
+        }
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        pixel_values: torch.Tensor,
-        image_grid_thw: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        device = self.get_device()
-        # Pixels move; the grid does not. The tower reads the grid on the host
-        # once and derives every shape from it, so handing it the conductor's
-        # CPU copy makes that read free — uploading it first would turn the
-        # tower's one `.tolist()` back into a device sync.
-        pixels = pixel_values.to(device)
-        grid = image_grid_thw.reshape(-1, 3)
-        if grid.shape[0] == 1:
-            return {"vision_embeds": [self.model(pixels, grid)]}
-        embeds, start = [], 0
-        for row in grid:
-            row = row.reshape(1, 3)
-            patches = int(row[0].prod())
-            embeds.append(self.model(pixels[start:start + patches], row))
-            start += patches
-        return {"vision_embeds": [torch.cat(embeds, dim=0)]}
+        rid = engine_inputs.request_ids[0]
+        return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        pixel_values: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        position_ids: torch.Tensor,
+        num_patches: tuple[int, ...],
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        # One call for every image of every request in the batch.
+        # `declare_step` planned a segment per frame, so the ragged kernel is
+        # what keeps them from seeing each other; the tower never learns where
+        # any of the boundaries are.
+        embeds = self.model(pixel_values, indices, weights, position_ids)
+        if len(num_patches) == 1:
+            return {engine_inputs.request_ids[0]: {"vision_embeds": [embeds]}}
+        # the merger already folded each `merge_unit` block of patches into one
+        # token, so a request's share of the output is its share scaled down
+        merge_unit = self.config.merge_unit
+        out, start = {}, 0
+        for rid, patches in zip(engine_inputs.request_ids, num_patches, strict=True):
+            end = start + patches // merge_unit
+            out[rid] = {"vision_embeds": [embeds[start:end]]}
+            start = end
+        return out
