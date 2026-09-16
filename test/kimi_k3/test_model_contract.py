@@ -61,6 +61,10 @@ def test_submodule_builds_on_cpu(tiny_dir):
     cg = sub.get_cuda_graph_configs(torch.device("cpu"))
     # decode only: the varlen KDA prefill kernels size work on the host, so no prefill capture
     assert len(cg) == 1 and cg[0].capture_graph_walk == "decode"
+    # decode rows ride along in prefill steps only when the deployment asks for it
+    assert sub.mixed_step_walks("prefill") == set() and sub.mixed_step_walks("decode") == set()
+    sub.mixed_prefill_decode = True
+    assert sub.mixed_step_walks("prefill") == {"decode"} and sub.mixed_step_walks("decode") == set()
 
 
 def test_moe_backend_selection_helpers():
