@@ -455,6 +455,35 @@ def test_generate_frame_is_four_frozen_denoise_passes_then_one_commit():
     assert (kv.resets, kv.states) == (0, [])
 
 
+def test_cond_head_cache_is_bit_exact_and_replaces_the_live_projection():
+    """``materialize_runtime_tables`` folds every block's six cond_proj GEMMs
+    into a per-sigma gather. The cache is a pure precompute of the same M=1
+    projection ``forward`` runs, so a cached frame must match a live one
+    bit-for-bit -- two seed-identical DiTs over fresh (empty) rings, one
+    materialized and one not, must return the same latent."""
+    config = reduced_config()
+    noise, mouse, button, scroll = frame_inputs(config)
+    fp = torch.tensor(0, dtype=torch.int64)
+
+    live, _ = bound_dit(config, seed=0)
+    cached, _ = bound_dit(config, seed=0)
+    cached.materialize_runtime_tables("cpu")
+
+    assert all(b.cond_head._cache is None for b in live.blocks), "live path must not cache"
+    n_cond = cached.blocks[0].cond_head.n_cond
+    for block in cached.blocks:
+        assert block.cond_head._cache is not None, "materialize must build every block's cache"
+        assert tuple(block.cond_head._cache.shape) == (
+            len(config.scheduler_sigmas), n_cond, 1, 1, config.d_model,
+        )
+
+    with torch.no_grad():
+        x_live = live.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+        x_cached = cached.generate_frame(noise, fp, mouse=mouse, button=button, scroll=scroll)
+
+    assert torch.equal(x_live, x_cached), "cond_head cache changed the frame; it must be bit-exact"
+
+
 def test_the_ring_only_moves_on_the_committing_pass():
     """The behavioural half of the same invariant, measured on the ring itself."""
     config = reduced_config()
