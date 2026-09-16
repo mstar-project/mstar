@@ -980,6 +980,7 @@ class Worker:
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_stream_rids=final_stream_rids,
+            request_walks=batch.request_walks,
         )
 
     def _make_executing_batch(
@@ -990,17 +991,20 @@ class Worker:
         per_request_input_tensors: dict[str, NameToTensorList],
         per_request_info: dict[str, CurrentForwardPassInfo],
         final_stream_rids: set[str] | None = None,
+        request_walks: dict[str, str] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
         The context starts unleased and eager; a slot is reserved later, once
-        the real token count is known.
+        the real token count is known. ``request_walks`` names the rows riding
+        along from another walk (``NodeSubmodule.mixed_step_walks``).
         """
         return ExecutingBatch(
             node_name=node_name,
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids or set(),
+            request_walks=dict(request_walks or {}),
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1039,6 +1043,7 @@ class Worker:
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
+                        request_walks=dict(node_batch.request_walks) or None,
                     )
                 )
             )
@@ -1756,6 +1761,11 @@ class Worker:
         """
         batch_N = pending.batch
         graph_walk = pending.graph_walk
+        if batch_N.request_walks:
+            # a step with rows riding along from another walk speculates nothing: its rows
+            # do not share one walk, and it is a prefill-sized step whose successor gains
+            # little from being prepared early
+            return None
 
         # sample node and RID to see which node we will be speculating
         # (TODO: refine this to be, e.g., a majority vote)
@@ -2290,7 +2300,7 @@ class Worker:
             self._pending_loop_stops.update([
                 PendingLoopStop(
                     rid=rid,
-                    graph_walk=batch_N.graph_walk,
+                    graph_walk=batch_N.batch.walk_of(rid),
                     loop_name=name
                 ) for name in loop_names
             ])
@@ -2336,7 +2346,7 @@ class Worker:
                     tensors=req_output_tensors,
                     graph_edges=node.outputs,
                     node_name=node.name,
-                    graph_walk=batch_N.graph_walk,
+                    graph_walk=batch_N.batch.walk_of(rid),
                     skip_cuda_sync=True,
                     skip_ref_count=True,
                 )
@@ -2351,7 +2361,7 @@ class Worker:
 
             routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
                 rid, node_name=batch_N.node_name,
-                outputs=real_outputs, graph_walk=batch_N.graph_walk
+                outputs=real_outputs, graph_walk=batch_N.batch.walk_of(rid),
             )
 
             if rid in per_request_uuids:
@@ -2408,7 +2418,7 @@ class Worker:
             self._send_outputs(
                 rid, routing,
                 nested_loop_indices=per_req_nested_idxs[rid],
-                graph_walk=batch_N.graph_walk,
+                graph_walk=batch_N.batch.walk_of(rid),
                 partition_name=batch_N.partition,
                 node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled
             )
@@ -2771,6 +2781,10 @@ class Worker:
                 p95 = vs[min(n - 1, int(n * 0.95))] * 1000
                 mean = (sum(vs) / n) * 1000
                 parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+            if self.scheduler.mixed_steps:
+                parts.append(
+                    f"mixed steps: {self.scheduler.mixed_steps} carrying {self.scheduler.mixed_rows} rows of another walk"
+                )
             logger.info(
                 "Worker %s phase-timing iter=%d: %s",
                 self.worker_id, phase_iter[0], " | ".join(parts),
