@@ -30,10 +30,9 @@ resources:
     # max_concurrent_requests; the two are checked against each other.
     num_worlds: 1
 
-# 1.28B DiT plus a ~7M-parameter TAEHV, all on rank 0. One group, not wan22's
-# split: the rollout Loop body is dit -> vae_decoder, and the decoder is a
-# streaming model whose frames must be decoded exactly once in emission order,
-# so there is nothing to gain from putting a worker boundary inside the loop.
+# 1.28B DiT plus a ~7M-parameter TAEHV, all on rank 0. One group: the rollout
+# Loop body is a single dit node (the TAEHV decode is fused into its forward),
+# so there is no separate decoder to put a worker boundary in front of.
 node_groups:
-  - node_names: [vae_encoder, dit, vae_decoder]
+  - node_names: [vae_encoder, dit]
     ranks: [0]

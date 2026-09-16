@@ -108,8 +108,39 @@ class _SingleRequestMixin:
         }
 
 
-class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
-    """The world DiT: one latent frame per engine step."""
+class _FunctionalAeMixin:
+    """Shared fixed-shape facts for the captured functional AE paths."""
+
+    @property
+    def ae_dtype(self) -> torch.dtype:
+        """The dtype the weights are in, read live: an input scaled into a dtype
+        the convs are not in faults on the first layer."""
+        return next(self.taehv.parameters()).dtype
+
+    @property
+    def encoded_size(self) -> tuple[int, int]:
+        return encoded_size_for_latent(
+            self.config.latent_height, self.config.latent_width
+        )
+
+    @property
+    def pixel_size(self) -> tuple[int, int]:
+        return pixel_size_for_latent(
+            self.config.latent_height, self.config.latent_width
+        )
+
+
+class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodule):
+    """The world DiT: one latent frame per engine step, TAEHV-decoded in the
+    same forward.
+
+    The decode is fused in rather than left on its own node so that a
+    same-worker speculative N+1 (``GraphNode.enable_async_scheduling``) can
+    start while N's frame is still going out: a separate decoder node
+    would decode frame N only after N+1 was already queued, adding a frame of
+    latency to every step it was meant to hide. See ``WaypointModel``'s
+    module docstring for the resulting two-node graph.
+    """
 
     # ``WaypointConfig.compile_dit`` exclusively controls the two deliberate
     # full-graph regions. Do not let the engine independently compile this
@@ -122,10 +153,27 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     # those fp32 islands to bf16.
     disable_autocast = True
 
-    def __init__(self, dit: WaypointDiT, config: WaypointConfig):
+    def __init__(self, dit: WaypointDiT, taehv: torch.nn.Module, config: WaypointConfig):
         super().__init__()
+        validate_taehv_architecture(taehv)
         self.dit = dit
+        self.taehv = taehv
         self.config = config
+        # The decoder node this replaces was captured with the engine's
+        # ``compile=True``, i.e. ``torch.compile(mode="max-autotune-no-cudagraphs",
+        # fullgraph=False, dynamic=False)`` (``CudaGraphRunner``), and only when
+        # graphs were on. Same options, same gate: Inductor's mode decides which
+        # GEMM/conv kernels the decode runs, and a different mode changes the low
+        # bits of every pixel (the 720p payload SHA in VALIDATION.md is the gate).
+        # Wrapping just the decode call keeps the engine from compiling across
+        # the denoise/decode boundary (this wrapper stays ``disable_torch_compile``).
+        self._decode_latent = (
+            torch.compile(
+                decode_latent, mode="max-autotune-no-cudagraphs",
+                fullgraph=False, dynamic=False,
+            )
+            if config.cuda_graph else decode_latent
+        )
 
     def bind_node_resources(self, resources: dict) -> None:
         """Require both resources before letting the bind reach the layers."""
@@ -148,21 +196,46 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
         **kwargs,
-    ) -> NodeInputs:
+    ) -> NodeInputs | None:
         """This frame's row: the ring clock, its controller slice, and either
-        the noise to denoise from (rollout) or the latent to prime with.
+        the noise to denoise from (rollout) or the latent to prime with. Also
+        the nine decoder histories the fused decode reads and writes.
 
         Runs on the host, outside any captured region — which is the whole
         reason the noise is drawn here. A captured region
         cannot call the RNG, and ``cuda_graph_runner``'s dummy metadata
         hardcodes ``random_seed=0``, so a forward that seeded itself would draw
         the capture-time dummy's noise forever.
+
+        ``inputs.get("clock")`` — the rollout node's loop-back to itself — is
+        never read. Its only job is to sit in ``input_names`` so
+        ``GraphNode.is_ready_for_speculation`` can propose "dit, next iter" as
+        a same-node speculation target; the value carries nothing, since
+        ``frame_pos``/``rollout_step`` already live in host state.
         """
         device = self.get_device()
         dtype = self.dit.dtype
         # The clock is per request and lives on the host; frame 0 is the first
         # frame of the session, priming included.
         state = self.request_state(fwd_info.request_id)
+
+        if graph_walk == ROLLOUT_WALK:
+            requested = int(fwd_info.step_metadata.get("num_steps", 0) or 0)
+            rollout_step = int(state.get("rollout_step", 0))
+            if requested and rollout_step >= requested:
+                # Async scheduling (enable_async_scheduling=True) can dispatch
+                # iteration N+1 before this request's check_stop(N) has
+                # registered the loop's finish signal. Veto it here, before any
+                # tensor work: None makes the engine skip the forward, and the
+                # overshoot never commits a frame into the ring, which has no
+                # undo. Mirrors Wan22DitSubmodule.prepare_inputs.
+                logger.info(
+                    "Waypoint dit: skipping async-overshoot rollout step %d "
+                    "(request %s runs %d steps)",
+                    rollout_step, fwd_info.request_id, requested,
+                )
+                return None
+
         frame_pos = int(state.get("frame_pos", 0))
 
         if graph_walk == PRIME_WALK:
@@ -190,6 +263,11 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             )
         else:
             raise ValueError(f"Unknown Waypoint graph walk: {graph_walk!r}")
+
+        tensor_inputs.update({
+            f"{DECODER_HISTORY_PREFIX}{idx}": value
+            for idx, value in enumerate(self._history_state(fwd_info.request_id))
+        })
 
         return NodeInputs(
             tensor_inputs=tensor_inputs,
@@ -283,6 +361,37 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             torch.zeros((1, 1, 1), dtype=dtype, device=device),
         )
 
+    def _zero_histories(self, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """Fresh zero-valued histories, shaped for this config's latent grid.
+
+        Takes a device rather than a real latent: nothing here needs a value,
+        only the shape ``initial_decoder_histories`` derives from one, and this
+        method runs both from a request's first ``prepare_inputs`` (before the
+        dit has produced anything this session) and from the capture template.
+        """
+        seed_latent = torch.zeros(
+            (1, *self.config.latent_shape), dtype=self.ae_dtype, device=device,
+        )
+        return initial_decoder_histories(self.taehv, seed_latent)
+
+    def _history_state(self, request_id: str) -> tuple[torch.Tensor, ...]:
+        """The request's nine decoder histories, seeded to zero on first use.
+
+        Seeding happens on the first call any request makes — prime, since
+        prime always runs first — because the real values only exist inside
+        this fixed-shape state, not off any graph edge: there is no decoder
+        node's ``prepare_inputs`` to seed them anymore.
+        """
+        state = self.request_state(request_id)
+        histories = tuple(
+            state.get(f"{DECODER_HISTORY_PREFIX}{idx}") for idx in range(9)
+        )
+        if any(value is None for value in histories):
+            histories = self._zero_histories(self.get_device())
+            for idx, value in enumerate(histories):
+                state.add(f"{DECODER_HISTORY_PREFIX}{idx}", value)
+        return histories
+
     # ------------------------------------------------------------------
     # declare_step
     # ------------------------------------------------------------------
@@ -360,14 +469,19 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         """One frame. ``rollout`` denoises it from noise, ``prime`` appends a
-        real one; both commit to the ring and both return ``latent``.
+        real one; both commit to the ring, decode it with TAEHV in the same
+        call, and return the decoded frame, the updated histories, and the
+        clock passthrough.
 
         ``engine_inputs`` is read for nothing at all here, on purpose: under
         capture it is the dummy request's forever. The ring and the
         attention backend come off ``self.node_resources``, which the DiT and
         its 24 attention layers resolved once at ``bind_node_resources`` time.
         """
-        del engine_inputs, kwargs
+        del engine_inputs
+        histories = tuple(kwargs.pop(f"{DECODER_HISTORY_PREFIX}{idx}") for idx in range(9))
+        if kwargs:
+            raise TypeError(f"unexpected dit inputs: {sorted(kwargs)}")
         # The graph boundary owns [1]; the model owns [] — ``_pos_ids``
         # asserts rank 0 and int64. This reshape is the entire seam.
         pos = frame_pos.reshape(())
@@ -382,7 +496,27 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             )
         else:
             raise ValueError(f"Unknown Waypoint graph walk: {graph_walk!r}")
-        return {"latent": [out]}
+
+        frames, updated = self._decode_latent(
+            self.taehv,
+            out.squeeze(1),
+            histories,
+            output_size=self.pixel_size,
+            initialize=graph_walk == PRIME_WALK,
+        )
+        result: NameToTensorList = {
+            "video_output": [frames],
+            # [1], not []: the loop-back edge to next iteration's "clock"
+            # input, whose only job is to be a name in ready_signals (see
+            # prepare_inputs). Harmless on prime too, whose node declares no
+            # outputs at all.
+            "clock": [frame_pos],
+        }
+        result.update({
+            f"{DECODER_HISTORY_PREFIX}{idx}": [value]
+            for idx, value in enumerate(updated)
+        })
+        return result
 
     # ------------------------------------------------------------------
     # capture
@@ -407,16 +541,26 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         frame = (1, 1, *self.config.latent_shape)
 
         def template(latent_key: str) -> NodeInputs:
+            tensor_inputs = {
+                latent_key: torch.zeros(frame, dtype=dtype, device=device),
+                "frame_pos": torch.zeros(1, dtype=torch.int64, device=device),
+                "mouse": torch.zeros((1, 1, 2), dtype=dtype, device=device),
+                "button": torch.zeros(
+                    (1, 1, self.config.n_buttons), dtype=dtype, device=device
+                ),
+                "scroll": torch.zeros((1, 1, 1), dtype=dtype, device=device),
+            }
+            # The fused decode's histories, exactly as prepare_inputs builds
+            # them — this is what makes
+            # test_prepared_shapes_and_dtypes_are_the_capture_template_exactly
+            # hold. "clock" is deliberately absent from both: it is never read
+            # as an input (see prepare_inputs), only produced as an output.
+            tensor_inputs.update({
+                f"{DECODER_HISTORY_PREFIX}{idx}": value
+                for idx, value in enumerate(self._zero_histories(device))
+            })
             return NodeInputs(
-                tensor_inputs={
-                    latent_key: torch.zeros(frame, dtype=dtype, device=device),
-                    "frame_pos": torch.zeros(1, dtype=torch.int64, device=device),
-                    "mouse": torch.zeros((1, 1, 2), dtype=dtype, device=device),
-                    "button": torch.zeros(
-                        (1, 1, self.config.n_buttons), dtype=dtype, device=device
-                    ),
-                    "scroll": torch.zeros((1, 1, 1), dtype=dtype, device=device),
-                },
+                tensor_inputs=tensor_inputs,
                 input_seq_len=self.config.tokens_per_frame,
             )
 
@@ -453,20 +597,33 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         inputs: NodeInputs | None = None,
         **kwargs,
     ):
-        """Advance the ring clock by exactly one committed frame.
+        """Advance the ring clock by exactly one committed frame, and copy the
+        fused decode's updated histories into the request's stable tensors.
 
         Both walks commit — ``append_frame`` runs the cache pass alone and
         ``generate_frame`` runs it after the four denoise passes — so both
-        advance. Metadata only: no ``.item()``, nothing read off ``outputs``.
+        advance. The clock advance is metadata only: no ``.item()``. The
+        history copy is a device ``copy_`` into the same fixed-address tensors
+        ``prepare_inputs`` reads back next call — no ``.item()``, no sync.
         The clock lives on the host because it has to be readable *before* the
         forward that uses it; the device tensor is derived from it in
         ``prepare_inputs``, never the other way round.
         """
-        del outputs, inputs, kwargs
+        del inputs, kwargs
         state = self.request_state(request_id)
         state.add("frame_pos", int(state.get("frame_pos", 0)) + 1)
         if request_info.graph_walk == ROLLOUT_WALK:
             state.add("rollout_step", int(state.get("rollout_step", 0)) + 1)
+        for idx in range(9):
+            key = f"{DECODER_HISTORY_PREFIX}{idx}"
+            values = outputs.get(key)
+            if not values:
+                raise RuntimeError(f"fused dit+decode returned no {key}")
+            target = state.get(key)
+            if target is None:
+                state.add(key, values[0].clone())
+            else:
+                target.copy_(values[0])
 
     def check_stop(
         self,
@@ -481,9 +638,10 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         that iteration — so N frames means firing at ``k == N - 1``, i.e.
         ``k + 1 >= N``. Mirrors ``Wan22DitSubmodule.check_stop``; the ``>=``
         rather than ``==`` keeps it firing if the deferred count ever reads past
-        N. The rollout node runs with async scheduling OFF (see
-        ``WaypointModel``), because an overshoot frame here is not a wasted
-        forward — it commits garbage into the ring, and there is no undo.
+        N. The rollout node runs with async scheduling ON (see
+        ``WaypointModel``): an overshoot iteration this signal is too late to
+        stop is not a wasted forward, it is vetoed instead in
+        ``prepare_inputs`` before it ever commits garbage into the ring.
         """
         del request_id, outputs
         if request_info.graph_walk != ROLLOUT_WALK:
@@ -505,28 +663,6 @@ class WaypointDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         forgotten.
         """
         super().cleanup_request(request_id)
-
-
-class _FunctionalAeMixin:
-    """Shared fixed-shape facts for the captured functional AE paths."""
-
-    @property
-    def ae_dtype(self) -> torch.dtype:
-        """The dtype the weights are in, read live: an input scaled into a dtype
-        the convs are not in faults on the first layer."""
-        return next(self.taehv.parameters()).dtype
-
-    @property
-    def encoded_size(self) -> tuple[int, int]:
-        return encoded_size_for_latent(
-            self.config.latent_height, self.config.latent_width
-        )
-
-    @property
-    def pixel_size(self) -> tuple[int, int]:
-        return pixel_size_for_latent(
-            self.config.latent_height, self.config.latent_width
-        )
 
 
 class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodule):
@@ -603,137 +739,3 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
             capture_forward_method="forward_batched",
             compile=True,
         )]
-
-
-class WaypointVaeDecoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodule):
-    """TAEHV decoder: one latent frame -> ``temporal_compression`` RGB frames.
-
-    ``latent`` ``[1, 1, 32, 32, 64]`` from the dit -> ``video_output``
-    ``[4, 720, 1280, 3]`` uint8, one message per engine step.
-
-    Every latent the world commits must reach this node exactly once and in
-    order, the priming frame included: the temporal memory advances per call, so
-    a duplicate, gap or reorder shifts the whole stream with nothing raised.
-    ``enable_async_scheduling=False`` on both rollout nodes is half of what
-    holds that; the other half is the loop's own iteration boundary.
-    """
-
-    disable_torch_compile = True
-    disable_autocast = True
-
-    def __init__(self, taehv: torch.nn.Module, config: WaypointConfig):
-        super().__init__()
-        validate_taehv_architecture(taehv)
-        self.taehv = taehv
-        self.config = config
-
-    def _history_state(self, request_id: str, latent: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        state = self.request_state(request_id)
-        histories = tuple(
-            state.get(f"{DECODER_HISTORY_PREFIX}{idx}") for idx in range(9)
-        )
-        if any(value is None for value in histories):
-            histories = initial_decoder_histories(self.taehv, latent)
-            for idx, value in enumerate(histories):
-                state.add(f"{DECODER_HISTORY_PREFIX}{idx}", value)
-        return histories
-
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        **kwargs,
-    ) -> NodeInputs:
-        del graph_walk, kwargs
-        latent = inputs["latent"][0]
-        histories = self._history_state(fwd_info.request_id, latent.squeeze(1))
-        tensor_inputs = {"latent": latent}
-        tensor_inputs.update({
-            f"{DECODER_HISTORY_PREFIX}{idx}": value
-            for idx, value in enumerate(histories)
-        })
-        return NodeInputs(tensor_inputs=tensor_inputs, input_seq_len=1)
-
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        latent: torch.Tensor,
-        **kwargs,
-    ) -> NameToTensorList:
-        """Decode this step and return its updated fixed-shape histories."""
-        del engine_inputs
-        # [B, 1, C, h, w] -> [B, C, h, w]: the frame axis is the dit's, and the
-        # AE takes one latent per call.
-        histories = tuple(
-            kwargs.pop(f"{DECODER_HISTORY_PREFIX}{idx}") for idx in range(9)
-        )
-        if kwargs:
-            raise TypeError(f"unexpected decoder inputs: {sorted(kwargs)}")
-        frames, updated = decode_latent(
-            self.taehv,
-            latent.squeeze(1),
-            histories,
-            output_size=self.pixel_size,
-            initialize=graph_walk == PRIME_WALK,
-        )
-        out: NameToTensorList = {"video_output": [frames]}
-        out.update({
-            f"{DECODER_HISTORY_PREFIX}{idx}": [value]
-            for idx, value in enumerate(updated)
-        })
-        return out
-
-    def _capture_template(self, device: torch.device) -> NodeInputs:
-        latent = torch.zeros(
-            (1, 1, *self.config.latent_shape),
-            dtype=self.ae_dtype,
-            device=device,
-        )
-        histories = initial_decoder_histories(self.taehv, latent.squeeze(1))
-        tensors = {"latent": latent}
-        tensors.update({
-            f"{DECODER_HISTORY_PREFIX}{idx}": value
-            for idx, value in enumerate(histories)
-        })
-        return NodeInputs(tensor_inputs=tensors, input_seq_len=1)
-
-    def get_cuda_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
-        del tp_world_size
-        if not self.config.cuda_graph:
-            return []
-        return [
-            BatchedCudaGraphConfig(
-                capture_graph_walk=walk,
-                single_request_inputs=self._capture_template(device),
-                capture_batch_sizes=[1],
-                capture_forward_method="forward_batched",
-                compile=True,
-            )
-            for walk in (PRIME_WALK, ROLLOUT_WALK)
-        ]
-
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        inputs: NodeInputs | None = None,
-        **kwargs,
-    ) -> None:
-        """Copy graph outputs into the request's stable history tensors."""
-        del request_info, inputs, kwargs
-        state = self.request_state(request_id)
-        for idx in range(9):
-            key = f"{DECODER_HISTORY_PREFIX}{idx}"
-            values = outputs.get(key)
-            if not values:
-                raise RuntimeError(f"captured decoder returned no {key}")
-            target = state.get(key)
-            if target is None:
-                state.add(key, values[0].clone())
-            else:
-                target.copy_(values[0])
