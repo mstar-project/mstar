@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 # `mstar` and the console scripts are unchanged, so `pip install mstar-ai`
 # then `import mstar` works as expected.
 name = "mstar-ai"
-version = "0.2.0"
+version = "0.2.1"
 description = "Multimodal inference engine"
 readme = "README.md"
 license = {file = "LICENSE"}

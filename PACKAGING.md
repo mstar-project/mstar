@@ -33,25 +33,37 @@ for a pip install and falls back to the repo `configs/` for checkouts.
 
 ## Cutting a release
 
-Version lives in `pyproject.toml` (`[project] version`). To release:
+Version lives in `pyproject.toml` (`[project] version`), and the alias
+packages carry the same version in `packaging/aliases/*/pyproject.toml`. To
+release:
 
-1. Bump the version and land it on `main`.
-2. Publish a GitHub Release with a matching tag (e.g. `v0.2.0`).
-3. The `Publish to PyPI` workflow builds the sdist and wheel and uploads
-   them over Trusted Publishing (OIDC — no token stored in the repo).
+1. Bump the version in all three pyproject files and land it on `main`.
+2. Publish a GitHub Release with a matching tag (e.g. `v0.2.1`). The workflow
+   refuses a tag that does not match the version.
+3. The `Publish to PyPI` workflow builds the engine and the alias packages and
+   uploads them over Trusted Publishing (OIDC, no token stored in the repo).
+   The `pypi` environment asks one of its reviewers to approve the run first.
 
-One-time PyPI setup: add a pending Trusted Publisher for project `mstar-ai`
-(owner `mstar-project`, repo `mstar`, workflow `release.yml`, environment
-`pypi`).
+One-time PyPI setup: each project needs a pending Trusted Publisher (owner
+`mstar-project`, repo `mstar`, workflow `release.yml`, environment `pypi`).
+PyPI allows only one pending publisher per configuration at a time and turns
+it into a real one at the first upload, so the three projects are bootstrapped
+in turn: add the publisher for `mstar-ai` and publish the release (the alias
+steps fail as not authorized), add the one for `mstar-project` and re-run the
+failed job, then the same for `mstar-serve`. The uploads skip files that
+already exist, so re-runs are safe. Once all three projects exist, a single run
+publishes all of them.
 
 ## Local build / dry run
 
 ```
 pip install build twine
-python -m build                       # -> dist/mstar_ai-<ver>.tar.gz + .whl
-twine upload --repository testpypi dist/*     # optional TestPyPI dry run
+python -m build                                        # -> dist/mstar_ai-<ver>.tar.gz + .whl
+python -m build --outdir dist packaging/aliases/mstar-project
+python -m build --outdir dist packaging/aliases/mstar-serve
+twine check dist/*
+twine upload --repository testpypi dist/*              # optional TestPyPI dry run
 ```
 
-The alias packages are built and published from their own directories, e.g.
-`cd packaging/aliases/mstar-project && python -m build`, and only need
-re-publishing if their metadata changes.
+The alias packages are published by the release workflow together with the
+engine, so they need no separate upload.
