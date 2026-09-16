@@ -2,15 +2,18 @@
 routed experts in the latent space with fused per-rank expert parameters, and the fused
 shared-expert MLP.
 
-Expert storage (per rank, tensor-parallel on the intermediate dim, like
-``ParallelSparseMoeBlock``): ``experts.gate_up_proj [E, 2 * inter_local, latent]`` (gate
-rows then up rows) and ``experts.down_proj [E, latent, inter_local]``. The checkpoint's
-per-expert ``w1`` (gate), ``w3`` (up), ``w2`` (down) tensors are routed into them by the
-model's ``load_weights``; MXFP4-packed experts are dequantized by the loader for now
-(the quantized-parameter path lands with the kernels).
+Expert storage follows an ``ExpertSharding`` over the comm group: ``experts.gate_up_proj
+[E_local, 2 * inter_local, latent]`` (gate rows then up rows) and ``experts.down_proj [E_local,
+latent, inter_local]``, where tensor parallelism shards the intermediate dim (``inter_local``,
+the ``ParallelSparseMoeBlock`` layout) and expert parallelism (``ep_size > 1``) gives each
+rank a subset of whole experts (``E_local``); a rank's routed output is a partial sum in both
+cases and the same all-reduce over the latent combines them. The checkpoint's per-expert
+``w1`` (gate), ``w3`` (up), ``w2`` (down) tensors are routed into the fused parameters by the
+model's ``load_weights`` (packed MXFP4 bytes and scales stay packed in ``quantized`` mode).
 
-Dispatch: the reference per-expert loop (any device) or, on CUDA, the Triton grouped GEMM
-(``mstar.utils.fused_moe``) once it grows a SiTU epilogue; selected by ``dispatch``.
+Routed dispatch: the reference per-expert loop (any device), the in-tree Triton grouped
+GEMM, or a converted-weight backend (Marlin, FlashInfer CUTLASS) installed by
+``prepare_experts_backend``; ``dispatch="reference"`` forces the loop.
 """
 from __future__ import annotations
 
@@ -21,9 +24,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.distributed.utils import divide
 from mstar.model.components.distributed.linear import RowParallelLinear
-from mstar.model.components.moe import _down_proj_weight_loader, _gate_up_weight_loader
+from mstar.model.components.expert_sharding import ExpertSharding
 from mstar.model.kimi_k3.components.common import (
     KimiRMSNorm,
     ReplicatedLinear,
@@ -37,28 +39,18 @@ from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_rout
 from mstar.model.kimi_k3.reference.router import noaux_tc_route
 
 
-def _mxfp4_gate_up_loader(tp_rank, tp_size, full_inter, param, loaded, loaded_shard_id=None):
-    """Route one expert's packed ``w1``/``w3`` (``[inter, K/2]`` bytes or ``[inter, K/32]``
-    scales) into the fused ``[E, 2*inter_local, ...]`` parameter."""
+def _expert_gate_up_loader(sharding: ExpertSharding, param, loaded, loaded_shard_id=None):
+    """Route one expert's ``w1``/``w3`` (bf16 ``[inter, K]``, packed ``[inter, K/2]`` bytes or
+    ``[inter, K/32]`` scales) into the fused ``[E_local, 2*inter_local, ...]`` parameter;
+    ``loaded_shard_id`` is ``"gate:<expert>"`` / ``"up:<expert>"`` with the global expert id."""
     kind, expert = loaded_shard_id.split(":")
-    expert = int(expert)
-    inter_local = full_inter // tp_size
-    src = loaded.narrow(0, tp_rank * inter_local, inter_local)
-    row0 = 0 if kind == "gate" else inter_local
-    dst = param.data[expert].narrow(0, row0, inter_local)
-    assert dst.shape == src.shape, (tuple(dst.shape), tuple(src.shape))
-    dst.copy_(src)
+    sharding.load_gate_up(param, loaded, kind, int(expert))
 
 
-def _mxfp4_down_loader(tp_rank, tp_size, full_inter, per_col, param, loaded, loaded_shard_id=None):
-    """Route one expert's packed ``w2`` (``[K, inter/2]`` bytes or ``[K, inter/32]`` scales):
-    the rank's slice is along the packed input dim (``per_col`` = 2 or 32 elements per column)."""
-    expert = int(loaded_shard_id.split(":")[1])
-    cols_local = (full_inter // tp_size) // per_col
-    src = loaded.narrow(1, tp_rank * cols_local, cols_local)
-    dst = param.data[expert]
-    assert dst.shape == src.shape, (tuple(dst.shape), tuple(src.shape))
-    dst.copy_(src)
+def _expert_down_loader(sharding: ExpertSharding, per_col: int, param, loaded, loaded_shard_id=None):
+    """Route one expert's ``w2`` (``[K, inter]`` weights, ``[K, inter/2]`` bytes or ``[K, inter/32]``
+    scales, ``per_col`` intermediate channels per stored column) into ``[E_local, K, ...]``."""
+    sharding.load_down(param, loaded, int(loaded_shard_id.split(":")[1]), per_col)
 
 
 class NoAuxTCRouter(nn.Module):
@@ -137,18 +129,31 @@ class KimiLatentMoE(nn.Module):
         comm_group: CommGroup | None = None,
         dispatch: str = "auto",
         quantized: bool = False,
+        ep_size: int = 1,
+        expert_sharding: ExpertSharding | None = None,
     ):
+        """``ep_size`` expert-parallel groups over the comm group (1: every rank holds every
+        expert, sharded on the intermediate dim; ``comm_group.world_size``: each rank holds
+        ``num_experts / world_size`` whole experts; in between: the hybrid). ``expert_sharding``
+        overrides it with an explicit placement, for single-rank tests of one shard's partial."""
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
         self.comm_group = comm_group
-        tp_rank, tp_size = comm_group.rank, comm_group.world_size
+        if expert_sharding is None:
+            expert_sharding = ExpertSharding.from_group(comm_group, num_experts, moe_intermediate_size, ep_size)
+        elif comm_group.world_size > 1 and (expert_sharding.world_size, expert_sharding.rank) != (
+                comm_group.world_size, comm_group.rank):
+            raise ValueError(f"expert sharding {expert_sharding} does not describe rank {comm_group.rank} "
+                             f"of a group of {comm_group.world_size}")
+        self.sharding = expert_sharding
         self.hidden_size = hidden_size
         self.latent_size = latent_size
-        self.num_experts = num_experts
+        self.num_experts = num_experts  # global: the router scores all of them
         self.top_k = top_k
         self.moe_intermediate_size = moe_intermediate_size
-        self.inter_local = divide(moe_intermediate_size, tp_size)
+        self.local_experts = self.sharding.local_experts
+        self.inter_local = self.sharding.inter_local
         self.situ_beta, self.situ_linear_beta = situ_beta, situ_linear_beta
         self.dispatch = dispatch
         self.quantized = quantized
@@ -168,35 +173,34 @@ class KimiLatentMoE(nn.Module):
         )
         self.routed_expert_norm = KimiRMSNorm(latent_size, eps=norm_eps) if latent_norm else None
         self.experts = nn.Module()
+        e_local = self.local_experts
         if quantized:
             u8 = torch.uint8
             il = self.inter_local
             self.experts.gate_up_packed = nn.Parameter(
-                torch.empty(num_experts, 2 * il, latent_size // 2, dtype=u8), requires_grad=False)
+                torch.empty(e_local, 2 * il, latent_size // 2, dtype=u8), requires_grad=False)
             self.experts.gate_up_scale = nn.Parameter(
-                torch.empty(num_experts, 2 * il, latent_size // MXFP4_GROUP, dtype=u8), requires_grad=False)
+                torch.empty(e_local, 2 * il, latent_size // MXFP4_GROUP, dtype=u8), requires_grad=False)
             self.experts.down_packed = nn.Parameter(
-                torch.empty(num_experts, latent_size, il // 2, dtype=u8), requires_grad=False)
+                torch.empty(e_local, latent_size, il // 2, dtype=u8), requires_grad=False)
             self.experts.down_scale = nn.Parameter(
-                torch.empty(num_experts, latent_size, il // MXFP4_GROUP, dtype=u8), requires_grad=False)
+                torch.empty(e_local, latent_size, il // MXFP4_GROUP, dtype=u8), requires_grad=False)
         else:
-            self.experts.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * self.inter_local, latent_size))
-            self.experts.down_proj = nn.Parameter(torch.empty(num_experts, latent_size, self.inter_local))
+            self.experts.gate_up_proj = nn.Parameter(torch.empty(e_local, 2 * self.inter_local, latent_size))
+            self.experts.down_proj = nn.Parameter(torch.empty(e_local, latent_size, self.inter_local))
         self.shared_experts = None
         if num_shared_experts:
             self.shared_experts = ParallelSiTUMLP(
                 hidden_size, moe_intermediate_size * num_shared_experts, comm_group=comm_group,
                 situ_beta=situ_beta, situ_linear_beta=situ_linear_beta, reduce_results=False,
             )
-        self._tp = (tp_rank, tp_size)
         # a converted-weight expert backend (FlashInfer CUTLASS or Marlin) once
         # prepare_experts_backend() ran; it owns the routed forward from then on
         self._backend = None
         self._attach_loaders()
 
     def _attach_loaders(self) -> None:
-        tp_rank, tp_size = self._tp
-        full = self.moe_intermediate_size
+        sh = self.sharding
         if self.quantized:
             for prm in (self.experts.gate_up_packed, self.experts.gate_up_scale,
                         self.experts.down_packed, self.experts.down_scale):
@@ -205,14 +209,13 @@ class KimiLatentMoE(nn.Module):
                 # E8M0 scales) and must keep *that* dtype through any later ``_apply``
                 if self._backend is None:
                     prm._keep_dtype = torch.uint8
-            self.experts.gate_up_packed.weight_loader = partial(_mxfp4_gate_up_loader, tp_rank, tp_size, full)
-            self.experts.gate_up_scale.weight_loader = partial(_mxfp4_gate_up_loader, tp_rank, tp_size, full)
-            self.experts.down_packed.weight_loader = partial(_mxfp4_down_loader, tp_rank, tp_size, full, 2)
-            self.experts.down_scale.weight_loader = partial(
-                _mxfp4_down_loader, tp_rank, tp_size, full, MXFP4_GROUP)
+            self.experts.gate_up_packed.weight_loader = partial(_expert_gate_up_loader, sh)
+            self.experts.gate_up_scale.weight_loader = partial(_expert_gate_up_loader, sh)
+            self.experts.down_packed.weight_loader = partial(_expert_down_loader, sh, 2)
+            self.experts.down_scale.weight_loader = partial(_expert_down_loader, sh, MXFP4_GROUP)
         else:
-            self.experts.gate_up_proj.weight_loader = partial(_gate_up_weight_loader, tp_rank, tp_size, full)
-            self.experts.down_proj.weight_loader = partial(_down_proj_weight_loader, tp_rank, tp_size, full)
+            self.experts.gate_up_proj.weight_loader = partial(_expert_gate_up_loader, sh)
+            self.experts.down_proj.weight_loader = partial(_expert_down_loader, sh, 1)
         self.routed_expert_down_proj.weight.weight_loader = replicated_loader
 
     def _apply(self, fn, recurse=True):
@@ -248,7 +251,8 @@ class KimiLatentMoE(nn.Module):
             from mstar.utils.fused_moe.marlin import MarlinMXFP4Experts
 
             be = MarlinMXFP4Experts(
-                situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device)
+                situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device,
+                sharding=self.sharding)
             converted = be.convert(*(prm.data for prm in packed))
             # the Marlin layouts have other shapes and dtypes: rebind the parameters so the
             # weights stay registered (device moves, state_dict) and the old ones are freed
@@ -259,15 +263,16 @@ class KimiLatentMoE(nn.Module):
             from mstar.utils.fused_moe.flashinfer_cutlass import FlashInferMXFP4Experts
 
             be = FlashInferMXFP4Experts(
-                mode=backend, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device)
+                mode=backend, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta, device=device,
+                sharding=self.sharding)
             be.convert(*(prm.data for prm in packed))
         self._backend = be
 
     def dequantized_experts(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """bf16 ``(w13 [E, 2*inter_local, latent], w2 [E, latent, inter_local])`` from the packed
-        parameters (reference/CPU path; materializes the experts, so tests only)."""
+        """bf16 ``(w13 [E_local, 2*inter_local, latent], w2 [E_local, latent, inter_local])`` from the
+        packed parameters (reference/CPU path; materializes the experts, so tests only)."""
         assert self._backend is None, "experts were converted to a fused kernel layout"
-        e = self.num_experts
+        e = self.local_experts
         w13 = torch.stack(
             [dequant_mxfp4(self.experts.gate_up_packed[i], self.experts.gate_up_scale[i]) for i in range(e)])
         w2 = torch.stack([dequant_mxfp4(self.experts.down_packed[i], self.experts.down_scale[i]) for i in range(e)])
@@ -276,10 +281,14 @@ class KimiLatentMoE(nn.Module):
     def _routed(
         self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Routed experts' partial sums ``[T, latent]``; the fused backends can write them into
-        ``out`` (the caller checks ``result is out``)."""
+        """This rank's partial sum of the routed experts, ``[T, latent]`` (the full sum when it
+        holds every expert); ``topk_idx`` are global expert ids. The fused backends can write
+        the result into ``out`` (the caller checks ``result is out``)."""
         if self._backend is not None:
             return self._backend(z, topk_idx, topk_weight, out=out)
+        # local expert ids; assignments of other expert-parallel ranks carry the skipped id
+        topk_idx = self.sharding.localize(topk_idx)
+        partial_sum = self.sharding.is_partial
         if self.quantized:
             if self._use_triton(z):
                 from mstar.utils.fused_moe.mxfp4 import fused_experts_mxfp4
@@ -287,7 +296,7 @@ class KimiLatentMoE(nn.Module):
                 return fused_experts_mxfp4(
                     z, self.experts.gate_up_packed, self.experts.gate_up_scale,
                     self.experts.down_packed, self.experts.down_scale, topk_weight, topk_idx,
-                    self.situ_beta, self.situ_linear_beta,
+                    self.situ_beta, self.situ_linear_beta, partial=partial_sum,
                 )
             w13, w2 = self.dequantized_experts()
             return routed_experts_loop(z, topk_idx, topk_weight, w13, w2, self.situ_beta, self.situ_linear_beta)
@@ -296,7 +305,7 @@ class KimiLatentMoE(nn.Module):
 
             return fused_experts_bf16_situ(
                 z, self.experts.gate_up_proj, self.experts.down_proj, topk_weight, topk_idx,
-                self.situ_beta, self.situ_linear_beta,
+                self.situ_beta, self.situ_linear_beta, partial=partial_sum,
             )
         return routed_experts_loop(
             z, topk_idx, topk_weight, self.experts.gate_up_proj, self.experts.down_proj,
@@ -308,8 +317,8 @@ class KimiLatentMoE(nn.Module):
         x = x.reshape(-1, self.hidden_size)
         topk_idx, topk_weight = self.gate(x)
         z = self.routed_expert_down_proj(x)
-        # partial sums over the intermediate shards; the fused backends write them straight into the
-        # symmetric all-reduce buffer when that path applies (no copy launch)
+        # this rank's partial sum (over its intermediate shard and/or its experts); the fused backends
+        # write it straight into the symmetric all-reduce buffer when that path applies (no copy launch)
         buf = self.comm_group.symm_buffer(z.shape, z.dtype, z.device)
         y = self._routed(z, topk_idx, topk_weight, out=buf)
         if buf is not None:
