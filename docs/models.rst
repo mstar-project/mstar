@@ -63,8 +63,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        fits one 8xH100 node at TP8 (``configs/kimi_k3_pruned75_tp8.yaml``); the full
        1.56 TB checkpoint needs a multi-node deployment. Routed experts run on the Marlin
        MXFP4 MoE kernel (vendored from vLLM, built on first use); FlashInfer's CUTLASS
-       MoE and an in-tree Triton kernel are the alternatives (``moe_backend``). Text only
-       for now (no vision tower), no speculative decoding yet.
+       MoE and an in-tree Triton kernel are the alternatives (``moe_backend``). The experts
+       are sharded on their intermediate dim across the tensor-parallel ranks by default;
+       ``model_kwargs.moe_ep_size`` (a divisor of ``tp_size``) places whole experts on
+       each rank instead (expert parallelism, ``configs/kimi_k3_pruned75_ep8.yaml``), or
+       mixes the two. Text only for now (no vision tower), no speculative decoding yet.
 
 Notes
 -----
