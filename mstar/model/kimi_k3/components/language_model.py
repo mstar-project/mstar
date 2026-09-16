@@ -165,6 +165,30 @@ def select_kda_kernels(model: nn.Module, device) -> bool:
 MOE_BACKENDS = ("auto", "triton", "w4a16", "humming", "marlin")
 
 
+def _retry(fn, attempts: int = 3, delay_s: float = 3.0):
+    """Call ``fn()`` up to ``attempts`` times, sleeping ``delay_s`` between failures."""
+    import time
+
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay_s)
+
+
+def _all_ranks_agree(ok: bool, comm_group) -> bool:
+    """``ok`` AND-ed across the tensor-parallel group (a single rank or no group: ``ok`` itself)."""
+    if comm_group is None or comm_group.world_size == 1 or not torch.cuda.is_available():
+        return ok
+    import torch.distributed as dist
+
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=comm_group.device_group)
+    return bool(flag.item())
+
+
 def marlin_supports(moe) -> bool:
     """Marlin's tiles need the latent width a multiple of 256 and the per-rank expert
     intermediate width a multiple of 128 (the released K3 shapes at TP1..8 all qualify)."""
@@ -192,13 +216,23 @@ def prepare_moe_kernels(model: nn.Module, device, backend: str = "auto") -> str:
                     raise RuntimeError("Marlin needs latent % 256 == 0 and inter/TP % 128 == 0")
                 from mstar.utils.fused_moe.marlin import _load_ops
 
-                _load_ops()  # JIT-builds the extension once per machine; raises if it cannot
+                # JIT-builds the extension once per machine; raises if it cannot. Retried because
+                # concurrent loads (other ranks, other nodes sharing the cache dir) can trip on the
+                # build lock for a moment.
+                _retry(_load_ops, attempts=3, delay_s=3.0)
             else:
                 import flashinfer.fused_moe  # noqa: F401
+            ok = True
         except Exception as ex:
             if backend != "auto":
                 raise
             logger.warning("Kimi K3 MoE backend %s unavailable (%s); trying the next", mode, ex)
+            ok = False
+        # every tensor-parallel rank must run the same kernels: one rank on a slower backend
+        # paces the whole group and has a different memory footprint (an OOM on one GPU, 2026-09-15)
+        if not _all_ranks_agree(ok, moes[0].comm_group if moes else None):
+            if ok:
+                logger.warning("Kimi K3 MoE backend %s unavailable on another rank; trying the next", mode)
             continue
         for m in moes:
             m.prepare_experts_backend(mode, dev)
