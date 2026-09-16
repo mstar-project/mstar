@@ -32,7 +32,6 @@ from mstar.model.waypoint.config import (
 )
 from mstar.model.waypoint.waypoint_model import (
     DIT_NODE,
-    VAE_DECODER_NODE,
     VAE_ENCODER_NODE,
     WaypointModel,
 )
@@ -308,6 +307,22 @@ def test_model_resolves_variant_artifacts_before_first_module_allocation(
         calls.append(("allocate", checkpoint_dir, device))
         return torch.nn.Linear(1, 1)
 
+    class MemBlock(torch.nn.Module):
+        """The class name, not the weights, is what
+        ``validate_taehv_architecture`` reads off ``encoder``/``decoder``."""
+
+    def load_taehv(ae_uri, cache_dir=None):
+        calls.append(("load_taehv", ae_uri, {"cache_dir": cache_dir}))
+        stub = torch.nn.Module()
+        stub.patch_size = 2
+        stub.latent_channels = 32
+        stub.t_downscale = 4
+        stub.t_upscale = 4
+        stub.frames_to_trim = 3
+        stub.encoder = torch.nn.ModuleList([MemBlock() for _ in range(9)])
+        stub.decoder = torch.nn.ModuleList([MemBlock() for _ in range(9)])
+        return stub
+
     monkeypatch.setattr(
         "mstar.model.waypoint.checkpoint.require_taehv_runtime",
         lambda: calls.append(("runtime",)),
@@ -322,6 +337,9 @@ def test_model_resolves_variant_artifacts_before_first_module_allocation(
     monkeypatch.setattr(
         "mstar.model.waypoint.weight_loader.build_waypoint_dit", build_dit,
     )
+    monkeypatch.setattr(
+        "mstar.model.waypoint.components.taehv.load_taehv", load_taehv,
+    )
     model = WaypointModel(
         **HF_MODELS["waypoint"],
         variant=variant,
@@ -333,7 +351,13 @@ def test_model_resolves_variant_artifacts_before_first_module_allocation(
 
     model.get_submodule(DIT_NODE)
 
-    assert [entry[0] for entry in calls] == ["runtime", "waypoint", "taehv", "allocate"]
+    # The dit's fused decode needs TAEHV weights too now (Step 2): allocation
+    # still runs first, and the AE load trails it rather than gating it, since
+    # ``_taehv_weights`` is evaluated as part of the same return statement,
+    # after ``build_waypoint_dit`` already ran.
+    assert [entry[0] for entry in calls] == [
+        "runtime", "waypoint", "taehv", "allocate", "load_taehv",
+    ]
     assert calls[1][1:] == (
         expected_source,
         {"cache_dir": "/cache", "revision": "dit-rev"},
@@ -401,7 +425,7 @@ def test_shipped_config_builds_through_registry_and_engine_manager_without_netwo
 
     model.get_worker_graphs(str(config_path))
     manager = EngineManager.build(
-        node_names={DIT_NODE, VAE_ENCODER_NODE, VAE_DECODER_NODE},
+        node_names={DIT_NODE, VAE_ENCODER_NODE},
         device=torch.device("cpu"),
         model_config=model_config,
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
@@ -413,7 +437,7 @@ def test_shipped_config_builds_through_registry_and_engine_manager_without_netwo
         model=model,
     )
     try:
-        assert manager.node_names == {DIT_NODE, VAE_ENCODER_NODE, VAE_DECODER_NODE}
+        assert manager.node_names == {DIT_NODE, VAE_ENCODER_NODE}
         assert manager.engine._autocast_dtype is torch.bfloat16
         assert model.config.reference_compat is True
         assert model.config.compile_dit is True

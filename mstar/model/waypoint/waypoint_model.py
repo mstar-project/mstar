@@ -1,19 +1,26 @@
 """WaypointModel: Waypoint-1.5-1B interactive video world model.
 
-Architecture (three nodes):
+Architecture (two nodes):
     vae_encoder - TAEHV encode. The seed clip (``temporal_compression`` raw
                   frames) into the one latent frame it stands for.
     dit         - the 1.28B world DiT. One engine step is one latent frame:
                   four frozen Euler denoise passes plus one committing cache
-                  pass, all inside a single ``forward``.
-    vae_decoder - TAEHV decode. One latent frame back into its raw frames.
+                  pass, then a TAEHV decode of that frame, all inside a single
+                  ``forward``. The decode is fused in (rather than left on its
+                  own node) so a same-worker speculative N+1 can start while
+                  N's frame is still going out to the client — a separate
+                  decoder node would decode frame N only after N+1 was
+                  already queued.
 
 Graph walks (2):
-    prime   - vae_encoder -> dit.append_frame -> vae_decoder. Seeds the world
-              and decoder state from a real frame, advances the ring clock by
-              one, and emits nothing.
-    rollout - Loop("rollout_loop") over dit.generate_frame -> vae_decoder ->
-              client; one latent frame per iteration, emitted as it lands.
+    prime   - vae_encoder -> dit.append_frame(+decode). Seeds the world and
+              decoder state from a real frame, advances the ring clock by one,
+              and emits nothing (the dit's rollout instance is a separate
+              ``GraphNode`` with ``outputs=[]``).
+    rollout - Loop("rollout_loop") over a single dit.generate_frame(+decode)
+              node with a self loop-back ("clock") and
+              ``enable_async_scheduling=True``; one latent frame decoded and
+              emitted per iteration.
 
 **Prime decodes as well as encodes**, and not for symmetry: the functional
 decoder's first call spends ``frames_to_trim`` of temporal memory priming
@@ -85,7 +92,6 @@ from mstar.model.waypoint.submodules import (
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
     WaypointDitSubmodule,
-    WaypointVaeDecoderSubmodule,
     WaypointVaeEncoderSubmodule,
 )
 
@@ -93,7 +99,6 @@ logger = logging.getLogger(__name__)
 
 DIT_NODE = "dit"
 VAE_ENCODER_NODE = "vae_encoder"
-VAE_DECODER_NODE = "vae_decoder"
 
 # The scripted action stream, one row per frame. Named once because the walk
 # declarations, the initial-args validation and the per-walk edge builder all
@@ -259,12 +264,9 @@ class WaypointModel(Model):
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # -- prime: encode the seed clip, commit it to the world, initialize the
-        # -- decoder state, and discard the reconstructed seed frames.
-        # --
-        # -- Both `latent` edges carry that name because both endpoints call it
-        # -- that; a section keys edges on (name, next_node), so they are two
-        # -- edges and not one.
+        # -- prime: encode the seed clip, commit it to the world, decode it to
+        # -- initialize the fused decoder's state, and discard the
+        # -- reconstructed seed frames (outputs=[] below).
         prime = Sequential([
             GraphNode(
                 name=VAE_ENCODER_NODE,
@@ -274,58 +276,43 @@ class WaypointModel(Model):
             GraphNode(
                 name=DIT_NODE,
                 input_names={"latent", *_CONTROLLER_STREAMS},
-                outputs=[GraphEdge(next_node=VAE_DECODER_NODE, name="latent")],
-            ),
-            # Advance the decoder's nine temporal histories, but do not expose
-            # reconstructed seed frames. Client frame zero is generated.
-            GraphNode(
-                name=VAE_DECODER_NODE,
-                input_names={"latent"},
                 outputs=[],
             ),
         ])
 
-        # -- rollout: one frame per iteration, emitted as it lands.
+        # -- rollout: one frame decoded and emitted per iteration, from a
+        # -- single node.
         # --
-        # -- No loop-back edges, and that is not an omission: everything that
-        # -- crosses a frame boundary is the ring (an engine resource at a fixed
-        # -- address), the host-side frame_pos, or the decoder's streaming
-        # -- state. The controller streams are loop-external, re-injected every
-        # -- iteration, and the submodule slices the current frame's row out.
+        # -- The "clock" self loop-back is what makes the dit a same-node
+        # -- speculation target (GraphNode.is_ready_for_speculation /
+        # -- WorkerGraphIO.ingest_for_speculation): it carries no information
+        # -- of its own (the submodule ignores its value; frame_pos and
+        # -- rollout_step live in host state), it only has to be a name the
+        # -- loop re-injects every iteration. enable_async_scheduling=True lets
+        # -- the worker build iteration N+1 while N is still on the GPU; the
+        # -- overshoot that can result — N+1 dispatched before check_stop(N)
+        # -- registers the loop's finish signal — is vetoed host-side in
+        # -- WaypointDitSubmodule.prepare_inputs before it can commit a frame
+        # -- into the ring, which has no undo.
         # --
-        # -- EMIT_TO_CLIENT sits on the decoder node, one message per iteration,
-        # -- rather than on Loop.accumulated_outputs: a client that only sees
-        # -- frames after the rollout ends has no world to interact with.
-        # --
-        # -- check_stop ends the loop, but the loop's registry calls
-        # -- complete_iter only once *every* entity in the section is done, so
-        # -- the final frame is decoded before the loop closes.
+        # -- There is no separate decoder node left to order against: the
+        # -- decode happens inside the same forward as the denoise passes, so
+        # -- a frame is decoded and emitted exactly once, when its dit
+        # -- iteration runs.
         rollout = Loop(
             name=ROLLOUT_LOOP_NAME,
-            section=Sequential([
-                GraphNode(
-                    name=DIT_NODE,
-                    input_names=set(_CONTROLLER_STREAMS),
-                    outputs=[GraphEdge(next_node=VAE_DECODER_NODE, name="latent")],
-                    # Speculation would dispatch iteration N+1 before
-                    # check_stop's decision on N landed. The overshoot forward
-                    # *commits a frame into the ring* and there is no undo; the
-                    # next real rollout would inherit it.
-                    enable_async_scheduling=False,
-                ),
-                GraphNode(
-                    name=VAE_DECODER_NODE,
-                    input_names={"latent"},
-                    outputs=[self._emit_frames()],
-                    # And here for the decoder's own reason: it is streaming, so
-                    # frames must be decoded exactly once in emission order, and
-                    # a speculative decode of a frame that may not stand is a
-                    # reorder of a stream that cannot be reordered.
-                    enable_async_scheduling=False,
-                ),
-            ]),
+            section=GraphNode(
+                name=DIT_NODE,
+                input_names=set(_CONTROLLER_STREAMS) | {"clock"},
+                outputs=[
+                    GraphEdge(next_node=DIT_NODE, name="clock"),
+                    self._emit_frames(),
+                ],
+                enable_async_scheduling=True,
+            ),
             # Ceiling only; the request's num_steps stops the loop early via
-            # WaypointDitSubmodule.check_stop.
+            # WaypointDitSubmodule.check_stop (and the overshoot veto above
+            # catches what check_stop is too late for under async scheduling).
             max_iters=self.config.max_frames,
             outputs=[],
             accumulated_outputs=[],
@@ -576,7 +563,7 @@ class WaypointModel(Model):
             raise ValueError(f"Unsupported modality for Waypoint: {modality!r}")
         if output.dtype != torch.uint8:
             raise ValueError(
-                f"the vae_decoder emits uint8 RGB frames; got {output.dtype}."
+                f"the dit's fused decode emits uint8 RGB frames; got {output.dtype}."
             )
         return output.detach().cpu().contiguous().numpy().tobytes()
 
@@ -677,7 +664,7 @@ class WaypointModel(Model):
     ) -> list[GraphEdge]:
         """The external edges seeding one walk. Both walks read the controller
         streams at the dit; only ``prime`` reads the seed clip, and it reads it
-        at the vae_encoder."""
+        at the vae_encoder; only ``rollout`` seeds the dit's self loop-back."""
         inputs = [
             GraphEdge(next_node=DIT_NODE, name=name, persist=True)
             for name in _CONTROLLER_STREAMS
@@ -689,6 +676,10 @@ class WaypointModel(Model):
                     next_node=VAE_ENCODER_NODE, name="image_inputs", persist=True
                 ),
             )
+        else:
+            # Sent empty, like wan22's denoise loop-back edges: the dit
+            # submodule never reads its value, only its name (F4 pattern).
+            inputs.append(GraphEdge(next_node=DIT_NODE, name="clock"))
         for edge in inputs:
             edge.tensor_info = signals.get(edge.name, [])
         return inputs
@@ -765,7 +756,7 @@ class WaypointModel(Model):
         nodes, which makes the engine run that node without real computation."""
         if self.skip_weight_loading:
             return None
-        if node_name in {DIT_NODE, VAE_ENCODER_NODE, VAE_DECODER_NODE}:
+        if node_name in {DIT_NODE, VAE_ENCODER_NODE}:
             self._resolve_checkpoints()
         if node_name == DIT_NODE:
             from mstar.model.waypoint.weight_loader import build_waypoint_dit
@@ -773,11 +764,9 @@ class WaypointModel(Model):
             dit = build_waypoint_dit(
                 self.config, self.checkpoint_dir, device=device,
             )
-            return WaypointDitSubmodule(dit, self.config)
+            return WaypointDitSubmodule(dit, self._taehv_weights(device), self.config)
         if node_name == VAE_ENCODER_NODE:
             return WaypointVaeEncoderSubmodule(self._taehv_weights(device), self.config)
-        if node_name == VAE_DECODER_NODE:
-            return WaypointVaeDecoderSubmodule(self._taehv_weights(device), self.config)
         logger.warning("Waypoint has no submodule for node %r; running it dummy.", node_name)
         return None
 
