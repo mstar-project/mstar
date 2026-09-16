@@ -394,10 +394,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
             # Next MRoPE position for all 3 components: read from the
             # stream's position counter (advanced by the runner's commit
             # of each declared step).
-            pos_ids = torch.tensor(
-                [[start_pos], [start_pos], [start_pos]],
-                dtype=torch.float,
-                device=device,
+            # Fill kernel, not ``torch.tensor(..., device=cuda)``: a pageable H2D
+            # syncs the stream, stalling prepare(N+1) until step N drains.
+            pos_ids = torch.full(
+                (3, 1), float(start_pos), dtype=torch.float, device=device,
             )  # (3, 1)
 
             return ARNodeInputs(

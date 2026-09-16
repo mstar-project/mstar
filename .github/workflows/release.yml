@@ -1,12 +1,17 @@
 name: Publish to PyPI
 
-# Publishes the m-star distribution when a GitHub Release is published.
-# Uses PyPI Trusted Publishing (OIDC) — no API token or secret needed.
-# Configure a pending publisher on PyPI first: project m-star, owner
-# mstar-project, repo mstar, workflow release.yml, environment pypi.
+# Publishes the mstar-ai distribution and the alias packages under
+# packaging/aliases/ when a GitHub Release is published. Uses PyPI Trusted
+# Publishing (OIDC), so no API token or secret is needed. Each of the three
+# projects needs its own pending publisher on PyPI before its first upload
+# (project mstar-ai, mstar-project or mstar-serve, owner mstar-project, repo
+# mstar, workflow release.yml, environment pypi).
 #
-# The alias packages under packaging/aliases/ change rarely and are
-# published by hand; they are not built here.
+# PyPI allows only one pending publisher per configuration at a time and
+# activates it on first use, so the three projects have to be bootstrapped
+# one release run at a time: publish with the engine's pending publisher,
+# add the next alias's pending publisher, re-run the failed job, repeat.
+# Uploads skip files that already exist, so re-runs are safe.
 
 on:
   release:
@@ -23,6 +28,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check that the tag and the alias packages match the version
+        run: |
+          v=$(grep -m1 '^version = ' pyproject.toml)
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$v" = "version = \"$tag\"" ] || { echo "tag $GITHUB_REF_NAME does not match pyproject.toml ($v)"; exit 1; }
+          for f in packaging/aliases/*/pyproject.toml; do
+            grep -q -x -F "$v" "$f" || { echo "$f does not carry $v"; exit 1; }
+          done
       - run: pip install build
-      - run: python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Build mstar-ai
+        run: python -m build
+      - name: Build the alias packages
+        run: |
+          for alias in packaging/aliases/*/; do
+            python -m build --outdir "dist-$(basename "$alias")" "$alias"
+          done
+      - name: Publish mstar-ai
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+      - name: Publish mstar-project
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-mstar-project
+          skip-existing: true
+      - name: Publish mstar-serve
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-mstar-serve
+          skip-existing: true

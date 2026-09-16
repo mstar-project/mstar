@@ -31,12 +31,14 @@ class MessageBody:
 
 class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
+    DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
     INPUT_SIGNALS = "input_signals"
     UNPERSIST_TENSORS = "unpersist"
     TENSOR_RECEIVED = "tensor_received"
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
+    TP_NO_SPEC = "tp_no_spec"
 
 
 @dataclass
@@ -55,6 +57,14 @@ class MessageSource(IntEnum):
 
 @dataclass
 class RemoveRequest(MessageBody):
+    request_id: str
+    source: int = MessageSource.CONDUCTOR
+
+
+@dataclass
+class DrainRequest(MessageBody):
+    # Phase-1 teardown: stop reading this request and confirm no reads remain.
+    # Hard cleanup (RemoveRequest) follows once every reader has ACKed via READS_DONE.
     request_id: str
     source: int = MessageSource.CONDUCTOR
 
@@ -93,6 +103,16 @@ class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
     request_ids: list[str]
+    speculative: bool = False
+    spec_seq: int = -1
+    spec_from_seq: int = -1
+
+
+@dataclass
+class TPNoSpeculation(MessageBody):
+    node_name: str
+    graph_walk: str
+    spec_from_seq: int
 
 @dataclass
 class WorkerMessage:
@@ -110,6 +130,7 @@ class ConductorMessageType(Enum):
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
     FAIL_REQUESTS = "fail_requests"
+    READS_DONE = "reads_done"
 
 
 @dataclass
@@ -148,6 +169,14 @@ class SetupDone(MessageBody):
 @dataclass
 class AbortRequest(MessageBody):
     request_id: str
+
+
+@dataclass
+class ReadsDone(MessageBody):
+    """An entity confirming it has no in-flight reads for a request and will
+    start none — the conductor's gate before sending the hard RemoveRequest."""
+    request_id: str
+    entity_id: str
 
 
 @dataclass

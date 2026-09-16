@@ -17,10 +17,15 @@ def sincos_timestep_embedding(
     Args:
         t: scalar or 1D tensor of timesteps in [0, 1].
         dim: embedding dimension. Must be even.
+        fraction: ``(dim // 2,)`` frequency ladder, caller-owned so it is
+            allocated once rather than per step (see
+            ``Pi05LLMSubmodule._get_timestep_emb_fraction``).
+        output_buffer: ``(len(t), dim)`` destination, written in place and
+            returned; preallocated so the action-gen step stays capturable.
         min_period / max_period: frequency range for the sinusoidal basis.
 
     Returns:
-        Tensor of shape ``(*t.shape, dim)`` with the sin/cos embedding.
+        ``output_buffer``, filled with the sin/cos embedding.
     """
     if dim % 2 != 0:
         raise ValueError(f"sincos embedding requires even dim, got {dim}")

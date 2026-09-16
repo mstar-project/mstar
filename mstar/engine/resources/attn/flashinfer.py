@@ -5,6 +5,7 @@ import torch
 from mstar.engine.resources.attn.base import (
     AttentionManager,
     AttentionWrapper,
+    EagerSlotKey,
     WorkspacePool,
 )
 from mstar.engine.resources.attn.config import AttentionStep
@@ -34,9 +35,9 @@ class FlashInferManager(AttentionManager):
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
 
-        # (label, is_decode) -> wrapper; persistent, because constructing one
-        # allocates FlashInfer's own workspaces and is far from free per step
-        self._eager_plan_states: dict[tuple[str, bool], AttentionWrapper] = {}
+        # persistent, because constructing one allocates FlashInfer's own
+        # workspaces and is far from free per step
+        self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
         self._preplan_states: dict[str, AttentionWrapper] = {}
@@ -100,14 +101,21 @@ class FlashInferManager(AttentionManager):
         self._cg_plan_states[key] = wrapper
         return wrapper
 
-    def _eager_wrapper(self, label: str, is_decode: bool) -> AttentionWrapper:
-        """The persistent eager wrapper for one (label, kind)."""
-        key = (label, is_decode)
+    def _eager_wrapper(
+        self, label: str, is_decode: bool, slot: int
+    ) -> AttentionWrapper:
+        """The persistent eager wrapper for one (label, kind, slot).
+
+        Takes the workspace this slot's captured wrappers already hold: the
+        two never run at once, since the pipeline retires step N before the
+        host stages N+2 and a slot repeats no sooner than that.
+        """
+        key = EagerSlotKey(label=label, slot=slot, is_decode=is_decode)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
             cls = FlashInferDecodeWrapper if is_decode else FlashInferPrefillWrapper
             wrapper = self._eager_plan_states[key] = cls(
-                workspace_buffer=self._workspaces.get(label),
+                workspace_buffer=self._workspaces.get(label, slot),
                 **self._wrapper_kv_kwargs,
             )
         return wrapper
@@ -116,12 +124,20 @@ class FlashInferManager(AttentionManager):
     def supports_preplan(self):
         return True
 
+    @property
+    def force_double_buffer(self):
+        # FlashInfer's plan stages the schedule into a pinned buffer it holds
+        # per wrapper and H2Ds it on the stream (scheduler.cuh's
+        # cudaMemcpyAsync out of page_locked_int_workspace_buffer), so one
+        # wrapper per slot is what keeps plan(N+1) off step N's queued copy.
+        return True
+
     def plan(self, step: AttentionStep, ctx: StepContext):
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
-            "preplan requires a cuda graph step: eager wrappers share one "
-            "workspace per label with the forward still in flight"
+            "preplan requires a cuda graph step: an eager wrapper shares its "
+            "workspace with the captured one on the same slot"
         )
         assert not (self._preplanned and ctx.is_preplan), (
             "attention preplan is already pending; clear_preplan before "
@@ -152,7 +168,7 @@ class FlashInferManager(AttentionManager):
                 is_decode = bool(
                     indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
                 )
-                wrapper = self._eager_wrapper(label, is_decode)
+                wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
             # TODO: cache the latest plan state
             wrapper.plan(
