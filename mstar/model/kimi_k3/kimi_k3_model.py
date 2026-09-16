@@ -73,6 +73,10 @@ class KimiK3Model(Model):
         self.default_thinking = bool(kwargs.get("thinking", True))
         # auto | marlin | w4a16 | humming | triton, see prepare_moe_kernels
         self.moe_backend = str(kwargs.get("moe_backend", "auto"))
+        # expert-parallel groups for the routed experts over the node's tensor-parallel ranks:
+        # 1 (default) shards every expert on its intermediate dim, tp_size gives each rank whole
+        # experts, in between is the hybrid (ExpertSharding); must divide tp_size and num_experts
+        self.moe_ep_size = int(kwargs.get("moe_ep_size", 1))
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
         # requests per prefill step (the scheduler splits larger groups); None lifts the cap
@@ -225,7 +229,12 @@ class KimiK3Model(Model):
 
         quantized = self.config.quant is not None and self.config.quant.is_mxfp4
         with torch.device("meta"):
-            language_model = KimiK3ForCausalLM(self.config.text, comm_group=tp_group, quantized_experts=quantized)
+            language_model = KimiK3ForCausalLM(
+                self.config.text, comm_group=tp_group, quantized_experts=quantized, moe_ep_size=self.moe_ep_size)
+        if self.moe_ep_size > 1:
+            moes = [m for m in language_model.modules() if hasattr(m, "sharding") and hasattr(m, "routed_expert_norm")]
+            if moes:
+                logger.info("Kimi K3 routed experts: %s", moes[0].sharding.describe())
         dtype = autocast_dtype or torch.bfloat16
         language_model = language_model.to(dtype)
         # fp32 parameters (A_log, dt_bias, router bias) and the uint8 packed experts must
