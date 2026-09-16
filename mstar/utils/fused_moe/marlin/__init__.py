@@ -130,15 +130,25 @@ class MarlinMXFP4Experts:
     max_chunk_tokens = 2048
 
     @torch.compiler.disable
-    def __call__(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``out [m, latent]`` (optional, ``z``'s dtype) receives the result -- the summed expert
+        outputs land there directly, e.g. in the all-reduce buffer."""
         n = self.max_chunk_tokens
         if z.shape[0] <= n:
-            return self._forward(z, topk_idx, topk_weight)
+            return self._forward(z, topk_idx, topk_weight, out)
         # routing is per token, so slices along the token axis are independent
-        return torch.cat([self._forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n])
-                          for i in range(0, z.shape[0], n)])
+        if out is None:
+            return torch.cat([self._forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n])
+                              for i in range(0, z.shape[0], n)])
+        for i in range(0, z.shape[0], n):
+            self._forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n], out[i:i + n])
+        return out
 
-    def _forward(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+    def _forward(
+        self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         from mstar.utils.fused_moe.align import moe_align_block_size
         from mstar.utils.fused_moe.mxfp4 import situ_and_mul_triton
 
@@ -161,4 +171,7 @@ class MarlinMXFP4Experts:
             c2, c3, self.w2, None, self.s2, None, None, None, None, None, self.workspace,
             sorted_ids, expert_ids, num_post_pad, w, bs_m, 1, True, FP4_E2M1F_ID,
             m * top_k, k, inter, True, False, True, False, -1, -1, -1)
-        return c3.view(m, top_k, k).sum(dim=1)
+        if out is None:
+            return c3.view(m, top_k, k).sum(dim=1)
+        torch.sum(c3.view(m, top_k, k), dim=1, out=out)
+        return out
