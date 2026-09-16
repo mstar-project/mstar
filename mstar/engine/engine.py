@@ -375,6 +375,10 @@ class Engine:
             )
             submodule.bind_node_resources(resources)
 
+    def submodule(self, node_name: str) -> NodeSubmodule:
+        """The loaded submodule of ``node_name`` (``KeyError`` before it is loaded)."""
+        return self._submodules[node_name].submodule
+
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
 
