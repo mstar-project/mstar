@@ -121,3 +121,71 @@ def test_marlin_backend_writes_into_a_given_output():
         res2 = moe._routed(z, idx, w, out=out2)
         assert res2 is out2 and torch.equal(out2, plain)
         assert torch.equal(moe._routed(z, idx, w), plain)
+
+
+def _load_expert_shards(moe, p13, s13, p2, s2, inter):
+    """Route the checkpoint-style per-expert tensors through the module's loaders (global ids)."""
+    ex = moe.experts
+    for e in range(p13.shape[0]):
+        ex.gate_up_packed.weight_loader(ex.gate_up_packed, p13[e, :inter], f"gate:{e}")
+        ex.gate_up_packed.weight_loader(ex.gate_up_packed, p13[e, inter:], f"up:{e}")
+        ex.gate_up_scale.weight_loader(ex.gate_up_scale, s13[e, :inter], f"gate:{e}")
+        ex.gate_up_scale.weight_loader(ex.gate_up_scale, s13[e, inter:], f"up:{e}")
+        ex.down_packed.weight_loader(ex.down_packed, p2[e], f"down:{e}")
+        ex.down_scale.weight_loader(ex.down_scale, s2[e], f"down:{e}")
+
+
+def _sharded_copies(full, world, ep, p13, s13, p2, s2, backend):
+    """One module per rank of a ``world``-rank group with ``ep`` expert-parallel groups, holding
+    the same experts as ``full`` (trivial comm group: ``_routed`` returns the rank's partial)."""
+    from mstar.model.components.expert_sharding import ExpertSharding
+    from mstar.model.kimi_k3.components.moe import KimiLatentMoE
+
+    ranks = []
+    for r in range(world):
+        sh = ExpertSharding(full.num_experts, full.moe_intermediate_size, world, r, ep_size=ep)
+        m = KimiLatentMoE(hidden_size=full.hidden_size, latent_size=full.latent_size, num_experts=full.num_experts,
+                          top_k=full.top_k, moe_intermediate_size=full.moe_intermediate_size, num_shared_experts=0,
+                          quantized=True, expert_sharding=sh).to(DEV, torch.bfloat16)
+        with torch.no_grad():
+            _load_expert_shards(m, p13, s13, p2, s2, full.moe_intermediate_size)
+            m.gate.weight.copy_(full.gate.weight)
+            m.gate.e_score_correction_bias.copy_(full.gate.e_score_correction_bias)
+            m.routed_expert_down_proj.weight.copy_(full.routed_expert_down_proj.weight)
+        if backend is not None:
+            m.prepare_experts_backend(backend, DEV)
+        ranks.append(m)
+    return ranks
+
+
+@cuda
+@pytest.mark.parametrize("world,ep", [(2, 2), (4, 2), (4, 4)])
+def test_marlin_expert_parallel_partials_sum_to_full(world, ep):
+    """Expert parallelism on the Marlin backend: each rank computes only its experts (global ids
+    mapped to local ones, the other ranks' assignments skipped at alignment, their top-k slots
+    zero) and the per-rank partials add up to the single-rank result."""
+    moe, hidden = _small_moe()
+    ex = moe.experts
+    inter = moe.moe_intermediate_size
+    p13, s13, p2, s2 = (t.clone() for t in (ex.gate_up_packed, ex.gate_up_scale, ex.down_packed, ex.down_scale))
+    ranks = _sharded_copies(moe, world, ep, p13, s13, p2, s2, "marlin")
+    moe.prepare_experts_backend("marlin", DEV)
+    with torch.no_grad():
+        x = torch.randn(37, hidden, device=DEV, dtype=torch.bfloat16)
+        z = moe.routed_expert_down_proj(x)
+        idx, w = moe.gate(x)
+        ref = moe._routed(z, idx, w).float()
+        parts = [m._routed(z, idx, w) for m in ranks]
+    for m, part in zip(ranks, parts, strict=True):
+        sh = m.sharding
+        assert m.experts.gate_up_packed.shape[0] == sh.local_experts
+        if sh.is_partial:
+            none_here = (sh.localize(idx) == sh.invalid_id).all(1)
+            assert torch.equal(part[none_here], torch.zeros_like(part[none_here]))
+    total = sum(p.float() for p in parts)
+    rel = (total - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()
+    assert rel < 2e-2, f"ep{ep}/tp{world // ep}: rel rms {rel:.4f}"  # bf16 rounding of each partial
+    # the partial is also correct when written into a caller's buffer (the all-reduce buffer path)
+    with torch.no_grad():
+        out = torch.empty_like(parts[0])
+        assert ranks[0]._routed(z, idx, w, out=out) is out and torch.equal(out, parts[0])
