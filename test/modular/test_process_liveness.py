@@ -9,6 +9,7 @@ request timeout, new requests are refused, and the processes exit non-zero.
 
 import collections
 import os
+import queue
 import signal
 import threading
 import time
@@ -217,6 +218,36 @@ def test_worker_without_a_multiprocessing_parent_keeps_running():
 
 
 # ---------------------------------------------------------------- API server
+
+
+def test_stopping_data_worker_drops_tracked_requests():
+    """No RemoveRequest is coming for an in-flight request once the server
+    stops, so the thread hard-cleans what it still tracks on its way out."""
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+
+    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    for name in ("in_queue", "out_queue", "result_tensor_queue", "cleanup_request_queue",
+                 "abort_request_queue", "reads_done_queue", "discard_tensor_queue"):
+        setattr(wt, name, queue.Queue())
+    wt.stop_event = threading.Event()
+    wt.stop_event.set()
+    wt.communicator = SimpleNamespace(get_all_new_messages=lambda: [])
+    cleaned = []
+    wt.tensor_manager = SimpleNamespace(
+        force_cleanup_request=cleaned.append,
+        has_inflight_reads=lambda rid: False,
+        get_ready_tensors=lambda: {},
+    )
+    wt.tensor_uuid_to_metadata_per_request = {"r1": {}, "r2": {}}
+    wt.request_model_kwargs = {"r1": {}}
+    wt._draining_rids = {"r1"}
+    wt._reads_done_sent = set()
+
+    wt.run()
+
+    assert sorted(cleaned) == ["r1", "r2"]
+    assert wt.tensor_uuid_to_metadata_per_request == {}
+    assert wt.request_model_kwargs == {}
 
 
 def _pending_request():
