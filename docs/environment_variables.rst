@@ -35,19 +35,19 @@ Communication
        ``0``; comma-separated worker indices or ``all``) selects the workers. Unset, the hook
        is a counter increment per step.
    * - ``MSTAR_SYMM_MEM_ALLREDUCE``
-     - ``0``
-     - ``1`` routes small tensor-parallel all-reduces (``CommGroup.all_reduce``)
-       (``multimem``: the same, but through torch's NVLink-multicast
-       ``multimem_all_reduce_`` kernel, which reduces in place on a ring of four
-       symmetric buffers per shape -- a result stays valid until three more
-       all-reduces of that shape; 6.7 µs vs 8.3 µs one-shot at 2 ranks, falls back to
-       one-shot when the node lacks NVLS)
-       through torch's symmetric-memory kernels instead of NCCL: one-shot (every
-       rank reads its peers' buffers over NVLink and reduces locally) for small
-       messages, two-shot above ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``.
-       On an 8xH100 node a decode-sized all-reduce drops from ~24 µs to ~13 µs
-       (a decode step pays two per layer). Single-node groups with peer access
-       only; falls back to NCCL when the ``symm_mem`` ops are unavailable.
+     - ``auto``
+     - How small tensor-parallel all-reduces (``CommGroup.all_reduce``) run. ``auto`` (or
+       ``multimem``) uses torch's symmetric-memory NVLink-multicast ``multimem_all_reduce_``
+       kernel, in place on a ring of four symmetric buffers per shape (a result stays valid
+       until three more all-reduces of that shape); it falls back to the one-shot/two-shot
+       kernels where the node lacks NVLS and to NCCL where the group spans nodes. ``1`` uses
+       the one-shot kernel (every rank reads its peers' buffers over NVLink and reduces
+       locally) up to ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES`` and the two-shot kernel
+       (reduce-scatter + all-gather) above it; ``0`` keeps NCCL. On an 8xH100 node a
+       decode-sized all-reduce costs ~24 µs on NCCL, ~13 µs one-shot and less with multicast;
+       a Kimi K3 decode step pays three per MoE layer, and the multicast default took it from
+       28 to 23 ms at one request (together with the other 2026-09-15 changes). Producers can
+       write straight into the buffer (``CommGroup.symm_buffer`` / ``all_reduce_symm_buffer``).
    * - ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``
      - ``262144``
      - Largest message (bytes) the one-shot kernel takes; up to
