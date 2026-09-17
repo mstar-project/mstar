@@ -266,6 +266,12 @@ def test_preset_voice_lookup(tmp_path):
     with pytest.raises(ValueError, match=r"presets: \['amy'\]"):
         model._preset_voice_path("bob")
     assert model._preset_voice_path("amy") == tmp_path / "amy.wav"
+    # the file name other servers use for the same preset resolves too
+    assert model._preset_voice_path("amy.wav") == tmp_path / "amy.wav"
+    # but nothing outside the presets directory does
+    (tmp_path.parent / "leak.wav").write_bytes(b"")
+    with pytest.raises(ValueError, match="Unknown voice"):
+        model._preset_voice_path("../leak")
 
 
 # ---------------------------------------------------------------------------
