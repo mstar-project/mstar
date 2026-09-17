@@ -14,7 +14,7 @@ from typing import Optional
 import aiohttp
 import numpy as np
 
-from benchmark.base import Bagel, Kokoro, Model, Orpheus, RequestType, Status
+from benchmark.base import Bagel, Chatterbox, Kokoro, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
 
 
@@ -1494,7 +1494,7 @@ class OursOpenAI(VLLMOmni):
                 metrics=metrics,
                 additional_model_kwargs=additional_model_kwargs,
             )
-        if req_type.get_output_modalities() == "audio" and isinstance(model, (Orpheus, Kokoro)):
+        if req_type.get_output_modalities() == "audio" and isinstance(model, (Orpheus, Kokoro, Chatterbox)):
             metrics = RequestMetrics(
                 request_id=request_id,
                 type=req_type,
