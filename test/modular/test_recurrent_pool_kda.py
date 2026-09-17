@@ -192,3 +192,28 @@ def test_reference_kernels_run_the_paged_forward_against_the_pool():
         runner.commit(s2)
         torch.testing.assert_close(out2[0:1], d_b, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(out2[1:2], d_a, rtol=1e-4, atol=1e-4)
+
+
+def test_capture_rows_take_no_slots():
+    """The CUDA-graph capture's dummy rows (``ctx.capture``) reserve nothing and address the sink:
+    two capture slots of the widest bucket would otherwise exhaust a pool sized for the deployment."""
+    pool, attn, runner = build(max_slots=4)
+    rids = [f"__cg_LLM_0_slot1_{i}__" for i in range(8)]  # more rows than the pool has slots
+    for rid in rids:
+        runner.ingest_request(rid)
+    s = SubmoduleStep(segments=[Segment(rid, "main", 1) for rid in rids], steps={POOL: RecurrentStep(), ATTN: LinearAttnStep()})
+    ctx = StepContext(request_ids=rids, graph_walk="decode", slot=1, capture=True,
+                      slot_lease=SlotLease(bucket=BucketKey(bs=8, num_tokens=8, graph_walk="decode"), slot=1))
+    s.set_ctx(ctx)
+    assert runner.admit(s).ok and pool.num_free_slots == 3
+    runner.plan(s)
+    plan = attn.current_plan()
+    assert plan.is_decode and plan.slot_ids_cpu == [SINK_SLOT] * 8 and plan.has_state_cpu == [False] * 8
+    runner.commit(s)
+    assert pool.num_free_slots == 3
+    # a real request afterwards still gets a slot of its own
+    runner.ingest_request("a")
+    s2, _ = step([Segment("a", "main", 3)])
+    assert runner.admit(s2).ok
+    runner.plan(s2)
+    assert attn.current_plan().slot_ids_cpu[0] != SINK_SLOT
