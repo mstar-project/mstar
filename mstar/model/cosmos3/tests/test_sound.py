@@ -249,7 +249,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
           "guidance_scale": GS, "num_inference_steps": STEPS, "generate_sound": True}
     fwd = CurrentForwardPassInfo(
         request_id=rid, graph_walk="prefill",
-        fwd_index=0, random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+        fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
     )
     text_inputs = [
         torch.tensor(cond_ids, dtype=torch.long, device=device),
