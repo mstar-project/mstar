@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from typing import NamedTuple
+
 import torch
 
 from mstar.engine.resources.linear_attn.conv_update import conv_update_slots, conv_update_slots_supported
@@ -38,6 +40,17 @@ class KDAParams:
     num_heads: int
     head_dim: int
     scale: float
+
+
+class SpecBlocks(NamedTuple):
+    """A layer's per-slot speculative blocks (``DeltaNetGeometry.to_blocks(speculative_tokens=k)``):
+    the pending prefix a verify step left behind. ``prefix [slots, k+1, 3P]`` pre-conv inputs,
+    ``g [slots, k+1, H, D]`` raw gates, ``beta [slots, k+1, H]`` raw betas, ``length [slots, 1]``
+    int32 (accepted + 1 of them are real; 0 after a prefill), shared by every layer (layer 0's)."""
+    prefix: torch.Tensor
+    g: torch.Tensor
+    beta: torch.Tensor
+    length: torch.Tensor
 
 
 def _fla_conv_state(
@@ -130,6 +143,12 @@ class FLAKDAKernels:
         )
         rec_state.index_copy_(0, slot_ids, rec_final.to(rec_state.dtype))
         return o.view(t, h, d)
+
+
+    def run_verify(self, qkv, g_raw, beta_raw, plan, conv_state, rec_state, spec: SpecBlocks, p: KDAParams):
+        """The checkpoint recurrence of a verify step (plan section 8.3 item 6); the fla path lands
+        with the kernel copy. Until then the torch reference (``TorchKDAKernels``) defines it."""
+        raise NotImplementedError("KDA verify path on fla: pending (use TorchKDAKernels for now)")
 
 
 class FlashKDAKernels(FLAKDAKernels):
