@@ -36,6 +36,7 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.model.chatterbox.components.s3gen import FlowRow
 from mstar.model.chatterbox.config import (
     CFG_LABEL,
     COND_LABEL,
@@ -453,6 +454,19 @@ class T3Submodule(ARNodeSubmodule):
 
 
 @dataclass
+class _ChunkPlan:
+    """What one request needs from the current step: a flow row to solve (and
+    how many tokens it settles), or audio that is ready without one."""
+
+    state: "StreamState"
+    generator: torch.Generator
+    is_final: bool
+    usable: int = 0
+    row: FlowRow | None = None
+    ready: torch.Tensor | None = None
+
+
+@dataclass
 class StreamState:
     """One request's progress through chunked synthesis.
 
@@ -578,6 +592,8 @@ class S3GenSubmodule(NodeSubmodule):
 
     # -- synthesis ----------------------------------------------------------------
 
+    MAX_BATCH_SIZE = 8  # requests whose flow solves share one padded batch
+
     def _generator(self, seed: int, device) -> torch.Generator:
         return torch.Generator(device=device).manual_seed(seed)
 
@@ -587,20 +603,6 @@ class S3GenSubmodule(NodeSubmodule):
             return tokens
         silence = torch.full((n,), S3GEN_SILENCE_TOKEN, dtype=torch.long, device=tokens.device)
         return torch.cat([tokens, silence])
-
-    @torch.no_grad()
-    def synthesize(
-        self, tokens: torch.Tensor, ref, n_timesteps: int, seed: int, watermark: bool,
-    ) -> torch.Tensor:
-        """Whole-utterance synthesis, PCM16: the reference path, one call."""
-        tokens = self._with_trailing_silence(tokens)
-        if tokens.numel() == 0:
-            return torch.zeros(0, dtype=torch.int16, device=tokens.device)
-        generator = self._generator(seed, tokens.device)
-        lens = torch.tensor([tokens.numel()], dtype=torch.long, device=tokens.device)
-        mel = self.s3gen.tokens_to_mel(tokens[None], lens, ref, n_timesteps=n_timesteps, generator=generator)
-        wav = self.s3gen.mel_to_wav(mel, generator=generator)[0]
-        return self._finish(wav, watermark)
 
     def _finish(self, wav: torch.Tensor, watermark: bool) -> torch.Tensor:
         if watermark and self.watermarker is not None and wav.numel() > 0:
@@ -618,16 +620,18 @@ class S3GenSubmodule(NodeSubmodule):
             )
         return state.noise
 
-    @torch.no_grad()
-    def synthesize_chunk(
+    def _plan_chunk(
         self, state: StreamState, new_tokens: torch.Tensor, is_final: bool, ref,
-        n_timesteps: int, generator: torch.Generator,
-    ) -> torch.Tensor:
-        """Advance one request by a chunk of tokens; returns the waveform to
-        emit now (float, possibly empty)."""
+        generator: torch.Generator,
+    ) -> _ChunkPlan:
+        """Take a request's new tokens and decide what this step owes it: a flow
+        row to solve, or audio that can go out right away (nothing new to
+        decode yet, or the held-back tail once the stream has ended)."""
         device = self.get_device()
+        plan = _ChunkPlan(state=state, generator=generator, is_final=is_final)
         if state.done:
-            return torch.zeros(0, device=device)
+            plan.ready = torch.zeros(0, device=device)
+            return plan
         state.tokens = torch.cat([state.tokens, new_tokens.to(device)])
         if is_final:
             state.tokens = self._with_trailing_silence(state.tokens)
@@ -635,24 +639,36 @@ class S3GenSubmodule(NodeSubmodule):
         usable = n if is_final else max(n - self.lookahead_tokens, 0)
         if usable <= state.token_offset:
             if not is_final:
-                return torch.zeros(0, device=device)  # not enough new tokens yet
+                plan.ready = torch.zeros(0, device=device)  # not enough new tokens yet
+                return plan
             state.done = True
             # nothing new to decode: release the held-back tail as it is
             tail = state.hift_speech
-            return tail[0] if tail is not None else torch.zeros(0, device=device)
-
-        lens = torch.tensor([n], dtype=torch.long, device=device)
-        noise = self._noise_field(state, ref, generator)
-        mel = self.s3gen.tokens_to_mel(
-            state.tokens[None], lens, ref, n_timesteps=n_timesteps, noise=noise, finalize=is_final,
+            plan.ready = tail[0] if tail is not None else torch.zeros(0, device=device)
+            return plan
+        plan.usable = usable
+        # A whole utterance arriving at once is the reference's offline path:
+        # noise drawn on the spot from the request's generator (bit-exact with
+        # the package). A stream instead denoises one fixed field every chunk.
+        whole = is_final and state.token_offset == 0 and state.noise is None
+        plan.row = FlowRow(
+            tokens=state.tokens, ref=ref, finalize=is_final,
+            noise=None if whole else self._noise_field(state, ref, generator),
+            generator=generator,
         )
+        return plan
+
+    def _emit_chunk(self, plan: _ChunkPlan, mel: torch.Tensor) -> torch.Tensor:
+        """Vocode the frames the flow solve added, continuing the vocoder's
+        held-back tail, and return the waveform to emit now."""
+        state = plan.state
         new_mel = mel[:, :, state.token_offset * self.frames_per_token:]
-        state.token_offset = usable
+        state.token_offset = plan.usable
 
         first = state.hift_mel is None
         mel_in = new_mel if first else torch.cat([state.hift_mel, new_mel], dim=2)
         wav, source = self.s3gen.vocode(
-            mel_in, generator=generator, cache_source=state.hift_source, fade_in=first,
+            mel_in, generator=plan.generator, cache_source=state.hift_source, fade_in=first,
         )
         if not first:
             n_fade = self.cache_samples
@@ -660,7 +676,7 @@ class S3GenSubmodule(NodeSubmodule):
                 wav[:, :n_fade] * self.fade_window[:n_fade]
                 + state.hift_speech[:, -n_fade:] * self.fade_window[n_fade:]
             )
-        if is_final:
+        if plan.is_final:
             state.done = True
             state.hift_mel = state.hift_source = state.hift_speech = None
             emitted = wav
@@ -672,26 +688,92 @@ class S3GenSubmodule(NodeSubmodule):
         state.chunks_emitted += 1
         return emitted[0]
 
+    @torch.no_grad()
+    def _solve(self, plans: list[_ChunkPlan], n_timesteps: list[int]) -> list[torch.Tensor]:
+        """Run every plan that needs the flow decoder, batched by step count,
+        and return each plan's waveform (float)."""
+        outputs: list[torch.Tensor | None] = [plan.ready for plan in plans]
+        pending = [i for i, plan in enumerate(plans) if plan.row is not None]
+        for steps in sorted({n_timesteps[i] for i in pending}):
+            group = [i for i in pending if n_timesteps[i] == steps]
+            mels = self.s3gen.tokens_to_mel_rows([plans[i].row for i in group], n_timesteps=steps)
+            for i, mel in zip(group, mels, strict=True):
+                outputs[i] = self._emit_chunk(plans[i], mel)
+        return outputs
+
+    @torch.no_grad()
+    def synthesize_chunk(
+        self, state: StreamState, new_tokens: torch.Tensor, is_final: bool, ref,
+        n_timesteps: int, generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Advance one request by a chunk of tokens; returns the waveform to
+        emit now (float, possibly empty)."""
+        plan = self._plan_chunk(state, new_tokens, is_final, ref, generator)
+        return self._solve([plan], [n_timesteps])[0]
+
+    @torch.no_grad()
+    def synthesize(
+        self, tokens: torch.Tensor, ref, n_timesteps: int, seed: int, watermark: bool,
+    ) -> torch.Tensor:
+        """Whole-utterance synthesis, PCM16: the reference path, one call."""
+        device = self.get_device()
+        state = StreamState(tokens=torch.empty(0, dtype=torch.long, device=device))
+        wav = self.synthesize_chunk(state, tokens, True, ref, n_timesteps, self._generator(seed, device))
+        return self._finish(wav, watermark)
+
+    def _stream(self, request_id: str, seed: int) -> tuple[StreamState, torch.Generator]:
+        state = self.request_state(request_id)
+        if state.get("stream") is None:
+            device = self.get_device()
+            state.add_all(
+                stream=StreamState(tokens=torch.empty(0, dtype=torch.long, device=device)),
+                generator=self._generator(seed, device),
+            )
+        return state["stream"], state["generator"]
+
+    # -- engine entry points ---------------------------------------------------
+
+    def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
+        del batch
+        return 1 < len(model_inputs) <= self.MAX_BATCH_SIZE
+
+    def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs]):
+        del graph_walk, engine_inputs
+        if len(inputs) == 1:
+            return {**inputs[0].tensor_inputs, **inputs[0].kwargs}
+        packed: dict[str, Any] = {SPEECH_TOKENS: [inp.tensor_inputs[SPEECH_TOKENS] for inp in inputs]}
+        packed.update({key: [inp.kwargs[key] for inp in inputs] for key in inputs[0].kwargs})
+        return packed
+
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, speech_tokens: torch.Tensor,
         request_id: str = "", ref=None, n_timesteps: int = 10, watermark: bool = True,
         seed: int = 0, is_final: bool = True, **kwargs,
     ) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
-        state = self.request_state(request_id)
-        stream: StreamState | None = state.get("stream")
-        if stream is None and is_final:
-            # the whole utterance in one chunk: the offline reference path
-            state.add("stream", StreamState(tokens=speech_tokens, done=True))
-            return {AUDIO_CHUNK: [self.synthesize(speech_tokens, ref, n_timesteps, seed, watermark)]}
-        if stream is None:
-            device = self.get_device()
-            stream = StreamState(tokens=torch.empty(0, dtype=torch.long, device=device))
-            state.add_all(stream=stream, generator=self._generator(seed, device))
-        wav = self.synthesize_chunk(
-            stream, speech_tokens, is_final, ref, n_timesteps, state["generator"],
-        )
+        stream, generator = self._stream(request_id, seed)
+        plan = self._plan_chunk(stream, speech_tokens, is_final, ref, generator)
+        wav = self._solve([plan], [n_timesteps])[0]
         return {AUDIO_CHUNK: [self._finish(wav, watermark)]}
+
+    def forward_batched(
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, speech_tokens: list[torch.Tensor],
+        request_id: list[str], ref: list, n_timesteps: list[int], watermark: list[bool],
+        seed: list[int], is_final: list[bool], **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        """Several requests' chunks in one step: their flow solves share a
+        padded batch, the vocoder runs per request behind its own cache."""
+        del graph_walk, engine_inputs, kwargs
+        plans = []
+        for rid, tokens, r, s, final in zip(request_id, speech_tokens, ref, seed, is_final, strict=True):
+            stream, generator = self._stream(rid, s)
+            plans.append(self._plan_chunk(stream, tokens, final, r, generator))
+        wavs = self._solve(plans, list(n_timesteps))
+        return {
+            rid: {AUDIO_CHUNK: [self._finish(wav, wm)]}
+            for rid, wav, wm in zip(request_id, wavs, watermark, strict=True)
+        }
+
 
 def audio_seconds(num_samples: int, sample_rate: int) -> float:
     return num_samples / float(sample_rate) if sample_rate else math.nan
