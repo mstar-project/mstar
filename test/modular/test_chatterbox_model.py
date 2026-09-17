@@ -62,6 +62,7 @@ class _TokenizerStub:
 def _make_model(variant: str = "chatterbox", voices_dir=None) -> ChatterboxModel:
     model = object.__new__(ChatterboxModel)
     model.config = ChatterboxConfig.from_variant(variant)
+    model._t3_dtype = torch.bfloat16
     model.tokenizer = _TokenizerStub()
     model.voices_dir = voices_dir
     model.local_dir = "/nonexistent"
@@ -375,6 +376,16 @@ def test_s3gen_partition_reinjects_reference_each_chunk():
 
     metadata.graph_walk = "s3gen_chunk"
     assert model.get_partition_forward_pass_args("S3Gen", metadata, persist).inputs == []
+
+
+def test_t3_dtype_switch():
+    from mstar.model.chatterbox.chatterbox_model import _parse_dtype
+
+    model = _make_model()
+    assert model.get_autocast_dtype() == torch.bfloat16
+    assert _parse_dtype("float32") == torch.float32 and _parse_dtype("bf16") == torch.bfloat16
+    with pytest.raises(ValueError, match="t3_dtype"):
+        _parse_dtype("int8")
 
 
 def test_postprocess_encodes_pcm16():
