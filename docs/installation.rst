@@ -77,7 +77,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
        and ``tensordict`` for reference validation. The pinned TAEHV implementation
        must be installed separately as shown below; keeping its direct URL out of
-       package metadata allows ``m-star`` to be published on PyPI.
+       package metadata allows ``m-star`` to be published on PyPI. **Also needs**
+       ``flash-attn-4``, which is installed separately —
+       see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_.
    * - ``.[audio]``
      - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
@@ -143,13 +145,15 @@ The GPU model families depend on:
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
 - **flash-attn** — used by Qwen3-Omni. **Not installed by any extra**; install it separately
   (see `flash-attn (Qwen3-Omni)`_).
+- **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
+  extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
 - **mooncake-transfer-engine** — RDMA tensor transport for multi-GPU, disaggregated
   deployments. Single-node deployments can use shared-memory (``SHM``) or ``TCP`` transport
   instead (see :doc:`serving`).
 
-Apart from ``flash-attn``, these are installed by the extras above. Your installed ``torch``
-must match your system CUDA toolkit — ``--torch-backend=auto`` handles that for you (next
-section).
+Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
+installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
+that for you (next section).
 
 flash-attn (Qwen3-Omni)
 -----------------------
@@ -231,6 +235,30 @@ Three things to get right:
    uv pip install psutil
    FLASH_ATTN_CUDA_ARCHS="90" uv pip install flash-attn==2.8.3.post1 --no-build-isolation
    python -c "import flash_attn; print(flash_attn.__version__)"
+
+flash-attn-4 (Waypoint, FA3 sm90 kernel)
+----------------------------------------
+
+Waypoint's DiT attention runs torch flex-attention with the ``FLASH`` backend by
+default. That backend needs the **flash-attn-4** package, which provides
+``flash_attn.cute`` — the CuTe DSL rewrite of flash-attn; on H100 it runs the
+FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on
+PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
+
+Install it from the upstream repo's ``flash_attn/cute`` subdirectory:
+
+.. code-block:: bash
+
+   git clone https://github.com/Dao-AILab/flash-attention
+   uv pip install --torch-backend=auto ./flash-attention/flash_attn/cute
+
+This is pure Python plus ``nvidia-cutlass-dsl`` — there is no CUDA extension to
+build. Its kernels are JIT-compiled on first use, which adds roughly a minute to
+the first server startup.
+
+If ``flash-attn-4`` isn't installed, set ``MSTAR_FLEX_BACKEND=TRITON`` to fall
+back to the previous Triton flex kernel. It is correct but slower — about 1.8x
+per attention call at 720p.
 
 Matching your CUDA toolkit
 --------------------------

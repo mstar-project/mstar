@@ -180,6 +180,8 @@ waypoint = [
     # so the parity tests import it. Serving does not — components/dit.py uses a
     # NamedTuple to keep tensordict out of the serving path.
     "tensordict==0.10.0",
+    # flash-attn-4 (flash_attn.cute, the default flex attention backend) is not
+    # on PyPI; install it separately, see docs/installation.rst.
 ]
 
 vjepa2_ac = [
@@ -233,6 +235,8 @@ all = [
     # direct-URL dependencies in project metadata; see docs/installation.rst.
     "tensordict==0.10.0",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
+    # separately, see docs/installation.rst.
+    # flash-attn-4 (waypoint's default flex attention backend) is also installed
     # separately, see docs/installation.rst.
     "jiwer",
 ]

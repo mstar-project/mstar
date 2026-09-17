@@ -11,6 +11,8 @@ are whole frames of tokens. That is what makes "capacity must be a multiple of
 128" a real constraint here rather than a convenience.
 """
 
+import os
+
 import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import (
@@ -27,6 +29,20 @@ from mstar.engine.resources.kv.ring.manager import RingPlan
 from mstar.engine.resources.step import StepContext
 
 __all__ = ["FlexAttentionManager", "flex_attention_masked", "make_block_mask"]
+
+# Backend switch, read once at import. "FLASH" is the default. Setting
+# MSTAR_FLEX_BACKEND=TRITON is the rollback switch: it restores the previous
+# Triton flex kernel bit-for-bit; see the comment block below for why FLASH
+# needs a non-trivial mask_mod. FLASH requires the flash-attn-4 package
+# (flash_attn.cute) -- see docs/installation.rst. Torch itself raises "CUTE
+# flash attention library is not available" if it's missing, so there's no
+# extra check here.
+_ALLOWED_FLEX_BACKENDS = ("TRITON", "FLASH")
+_FLEX_BACKEND = os.environ.get("MSTAR_FLEX_BACKEND", "FLASH")
+if _FLEX_BACKEND not in _ALLOWED_FLEX_BACKENDS:
+    raise ValueError(
+        f"MSTAR_FLEX_BACKEND must be one of {_ALLOWED_FLEX_BACKENDS}, got {_FLEX_BACKEND!r}"
+    )
 
 
 # CORRECTNESS, not speed. Our BlockMask carries a NO-OP `mask_mod`: we pass
@@ -45,9 +61,37 @@ __all__ = ["FlexAttentionManager", "flex_attention_masked", "make_block_mask"]
 # @torch.compile(fullgraph=True) -- compilation is load-bearing for the *result*
 # there too, not just the throughput.
 #
-# So the compile is pinned here rather than left to the caller: correctness must
-# not depend on whether someone set `WaypointConfig.compile_dit`.
-flex_attention_masked = torch.compile(flex_attention, dynamic=False)
+# So the compile is pinned here (below, after the backend selection) rather than
+# left to the caller: correctness must not depend on whether someone set
+# `WaypointConfig.compile_dit`.
+
+
+# FLASH needs a non-trivial `mask_mod`, unlike the TRITON rollback path above.
+# `from_kv_blocks(..., mask_mod=None)` substitutes `noop_mask`,
+# whose traced graph is a shapeless `aten.full` -- `is_trivial_mask_graph`
+# (torch/_inductor/kernel/flex/flex_flash_attention.py:205-216) treats exactly
+# that graph as "no block mask" and sets `needs_block_mask=False` (line 394),
+# so the FLASH template attends densely over the whole KV instead of the
+# visible blocks -> wrong output.
+def _flash_mask_mod(b, h, q_idx, kv_idx):
+    return kv_idx >= 0
+
+
+_MASK_MOD = _flash_mask_mod if _FLEX_BACKEND == "FLASH" else None
+_FLASH_KERNEL_OPTIONS = {"BACKEND": "FLASH"}
+
+
+def _flash_flex_attention(q, k, v, *, block_mask, enable_gqa):
+    return flex_attention(
+        q, k, v, block_mask=block_mask, enable_gqa=enable_gqa,
+        kernel_options=_FLASH_KERNEL_OPTIONS,
+    )
+
+
+flex_attention_masked = torch.compile(
+    _flash_flex_attention if _FLEX_BACKEND == "FLASH" else flex_attention,
+    dynamic=False,
+)
 
 
 def make_block_mask(q_len: int, kv_len: int, written: Tensor) -> BlockMask:
@@ -109,7 +153,7 @@ def make_block_mask(q_len: int, kv_len: int, written: Tensor) -> BlockMask:
         full_kv_num_blocks,
         full_kv_indices,
         BLOCK_SIZE=block_size,
-        mask_mod=None,
+        mask_mod=_MASK_MOD,
         seq_lengths=(q_len, kv_len),
         compute_q_blocks=False,
     )
@@ -133,7 +177,7 @@ def _empty_block_mask(q_len: int, kv_len: int, device: torch.device) -> BlockMas
         full_kv_num_blocks,
         full_kv_indices,
         BLOCK_SIZE=block_size,
-        mask_mod=None,
+        mask_mod=_MASK_MOD,
         seq_lengths=(q_len, kv_len),
         compute_q_blocks=False,
     )
