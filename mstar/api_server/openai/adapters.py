@@ -567,6 +567,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "flux2_klein": DiffusionImageAdapter(),
     "flux2_klein_9b": DiffusionImageAdapter(),
+    "z_image_turbo": DiffusionImageAdapter(),
 }
 
 
