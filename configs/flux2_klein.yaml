@@ -15,6 +15,10 @@ model_kwargs:
   capture_sizes: [[1024, 1024]]
   capture_batch_sizes: [1, 2, 4, 8]
   max_batch_size: 8
+  # LoRA adapters folded into the transformer at load (diffusers / PEFT or BFL-layout
+  # safetensors; ``scale`` multiplies the adapter). Example:
+  # lora:
+  #   - {path: /path/to/klein-style.safetensors, scale: 0.8}
 
 node_groups:
   - node_names: [text_encoder]
