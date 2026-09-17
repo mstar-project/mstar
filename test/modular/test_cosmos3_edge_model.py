@@ -102,7 +102,10 @@ def test_edge_recipe_defaults_from_the_checkpoint(tmp_path) -> None:
     assert cfg.video_size_default == (832, 480) and cfg.image_size_default == (640, 640)
     assert cfg.num_frames_video == 121 and cfg.num_inference_steps_video == 20
     assert cfg.flow_shift_action == 10.0
-    over = _model(tmp_path, conditioning_resize="stretch", flow_shift_video=9.0).config
+    over = Cosmos3Model(
+        model_path_hf=str(tmp_path / "edge"), skip_weight_loading=True,
+        conditioning_resize="stretch", flow_shift_video=9.0,
+    ).config
     assert over.conditioning_resize == "stretch" and over.flow_shift_video == 9.0
     # Nano keeps its defaults.
     nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
