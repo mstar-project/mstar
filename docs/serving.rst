@@ -181,6 +181,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        below).
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``dist_timeout_s``
+     - *(optional)* Timeout in seconds for the NCCL world group and its parallel
+       subgroups. Unset keeps PyTorch's default; ``MSTAR_DIST_TIMEOUT_S`` overrides.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /

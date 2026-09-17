@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, NamedTuple
@@ -22,6 +23,65 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
+
+# torch.compile mode for a captured forward. "max-autotune-no-cudagraphs"
+# autotunes every GEMM between cuBLAS and Inductor's Triton templates; at
+# decode shapes (M = a few rows) the autotuner's warm-L2 benchmark can pick a
+# Triton template that loses to cuBLAS split-K once the weights stream from
+# HBM (GLM-5.2 per-rank bench, 2026-08-29: 14.6 vs 7.5 us per dense GEMM;
+# "default" = cuBLAS GEMMs + Inductor fusion, and capture drops from minutes
+# to seconds). A config names its mode (``compile_mode``); the env var
+# overrides every config, for an A/B without a code change.
+_COMPILE_MODE_ENV = "MSTAR_GRAPH_COMPILE_MODE"
+_DEFAULT_COMPILE_MODE = "max-autotune-no-cudagraphs"
+
+
+def _validate_compile_mode(mode: str, source: str) -> str:
+    """Fail loudly, not at capture: an invalid mode raises inside every
+    warmup_and_capture, and the per-capture fallback then serves the whole
+    model eager behind a healthy /health (13x slower on qwen3omni TP2)."""
+    if mode == "default":
+        return mode
+    try:
+        from torch._inductor import list_mode_options
+
+        list_mode_options(mode)
+    except Exception as exc:
+        raise ValueError(
+            f"{source}={mode!r} is not a mode this torch.compile accepts: {exc}"
+        ) from exc
+    return mode
+
+
+_COMPILE_MODE_OVERRIDE = os.environ.get(_COMPILE_MODE_ENV)
+if _COMPILE_MODE_OVERRIDE is not None:
+    _validate_compile_mode(_COMPILE_MODE_OVERRIDE, _COMPILE_MODE_ENV)
+# Restrict what max-autotune considers (e.g. "ATEN" = cuBLAS only), for
+# attributing an autotune pick without leaving autotune.
+_GEMM_BACKENDS = os.environ.get("MSTAR_INDUCTOR_GEMM_BACKENDS", "")
+if _GEMM_BACKENDS:
+    import torch._inductor.config as _inductor_config
+
+    _inductor_config.max_autotune_gemm_backends = _GEMM_BACKENDS
+
+
+def resolve_compile_mode(config_mode: str | None) -> str:
+    """The mode a capture compiles with: the env override, else the config's,
+    else the historical default."""
+    if _COMPILE_MODE_OVERRIDE is not None:
+        return _COMPILE_MODE_OVERRIDE
+    if config_mode is not None:
+        return _validate_compile_mode(config_mode, "compile_mode")
+    return _DEFAULT_COMPILE_MODE
+
+
+def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": False}
+    mode = resolve_compile_mode(config_mode)
+    if mode != "default":
+        kwargs["mode"] = mode
+    return kwargs
 
 
 def autocast_scope(dtype: torch.dtype | None, device_type: str = "cuda"):
@@ -504,10 +564,7 @@ class CudaGraphRunner:
             return forward
         if spec.config_idx not in self._compiled_forwards:
             self._compiled_forwards[spec.config_idx] = torch.compile(
-                forward,
-                mode="max-autotune-no-cudagraphs",
-                fullgraph=False,
-                dynamic=False,
+                forward, **compile_kwargs(spec.config.compile_mode),
             )
         return self._compiled_forwards[spec.config_idx]
 
@@ -1091,9 +1148,7 @@ class PiecewiseCudaGraphRunner:
 
         fn = self._config.capture_fn
         if self._config.compile:
-            fn = torch.compile(
-                fn, mode="max-autotune-no-cudagraphs", fullgraph=False, dynamic=False,
-            )
+            fn = torch.compile(fn, **compile_kwargs(self._config.compile_mode))
 
         def run_fn():
             return fn(call)
@@ -1156,6 +1211,7 @@ class PiecewiseCudaGraphRunner:
         self, request_ids: list[str], seq_lens: list[int],
         bucket: BucketKey, capture: bool, slot: int,
         real_bs: int | None = None,
+        step_kwargs: Mapping[str, Any] | None = None,
     ):
         """The region's step over the padded batch, addressed at its slot.
 
@@ -1167,7 +1223,9 @@ class PiecewiseCudaGraphRunner:
         """
         if self._config.declare_step is None:
             return None
-        step = self._config.declare_step(list(request_ids), list(seq_lens))
+        step = self._config.declare_step(
+            list(request_ids), list(seq_lens), **(step_kwargs or {}),
+        )
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -1265,23 +1323,10 @@ class PiecewiseCudaGraphRunner:
             slot=self._current_slot, bucket=data.bucket
         )
 
-    def run(
-        self,
-        static_inputs: dict[str, torch.Tensor],
-        request_ids: list[str] | None = None,
-        seq_lens: list[int] | None = None,
-        real_bs: int | None = None,
-    ) -> PiecewiseOutput:
-        """Replay the captured region for these real inputs.
-
-        Copies each real input into the runner-owned buffer of the same name,
-        declares and plans the region's step over the padded batch, replays,
-        then commits and returns the padded buffers behind a real-length view.
-
-        Only the static buffers carry data into a replay: the region's Python
-        ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
-        is baked into the graph.
-        """
+    def _resolve_call(
+        self, request_ids: list[str] | None, seq_lens: list[int] | None,
+        real_bs: int | None,
+    ) -> tuple[PiecewiseGraphData, int, int | None, bool]:
         if real_bs is None:
             if request_ids is not None:
                 real_bs = len(request_ids)
@@ -1292,7 +1337,6 @@ class PiecewiseCudaGraphRunner:
                     "piecewise run: pass real_bs, request_ids, or seq_lens to "
                     "determine the batch size"
                 )
-
         is_packed = self._config.get_config_type() == PiecewiseConfigType.PACKED
         real_total_tokens = sum(seq_lens) if seq_lens is not None else None
         data = self._resolve(real_bs, real_total_tokens if is_packed else None)
@@ -1301,18 +1345,32 @@ class PiecewiseCudaGraphRunner:
                 f"piecewise {self._label!r}: no captured graph for bs={real_bs}, "
                 f"total_tokens={real_total_tokens}"
             )
+        return data, real_bs, real_total_tokens, is_packed
 
+    @staticmethod
+    def _copy_inputs(
+        data: PiecewiseGraphData, static_inputs: dict[str, torch.Tensor],
+    ) -> None:
         for name, value in static_inputs.items():
             buffer = data.static_inputs.get(name)
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
             n = value.shape[0]
-            buffer[:n].copy_(value)
+            # non_blocking: a host-resident input (positions staged through
+            # pinned memory) must not drain the stream, or the host cannot
+            # queue this replay behind the one in flight; the copy is
+            # stream-ordered ahead of the replay either way
+            buffer[:n].copy_(value, non_blocking=True)
             if n < buffer.shape[0]:
                 # the padded tail is real compute for a BATCHED capture, so it
                 # reads whatever is here; zero rather than last step's values
                 buffer[n:].zero_()
 
+    def _declare_and_plan(
+        self, data: PiecewiseGraphData, request_ids: list[str] | None,
+        seq_lens: list[int] | None, real_bs: int,
+        step_kwargs: Mapping[str, Any] | None,
+    ):
         step = None
         if request_ids is not None:
             step_ids = [
@@ -1325,9 +1383,63 @@ class PiecewiseCudaGraphRunner:
                 capture=False,
                 slot=self._current_slot,
                 real_bs=real_bs,
+                step_kwargs=step_kwargs,
             )
+        self._plan(step, data.shape)
+        return step
+
+    def stage(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[str] | None = None,
+        seq_lens: list[int] | None = None,
+        real_bs: int | None = None,
+        step_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        """The first half of a replay, ahead of a host readback the rest
+        depends on: copy the inputs known now and declare + plan a first
+        step (``step_kwargs`` name it to ``config.declare_step``). The paired
+        ``run`` then copies the remaining inputs, declares + plans the second
+        step beside the first, and replays. A resource that plans a region's
+        passes in two steps must land the second next to the first, not over
+        it (``MlaAttentionStep.first_sub_plan``).
+
+        Host work only; nothing is replayed and nothing commits here, and a
+        ``run`` that never follows leaves no state behind but the plans.
+        """
+        data, real_bs, _, _ = self._resolve_call(request_ids, seq_lens, real_bs)
+        self._copy_inputs(data, static_inputs)
         try:
-            self._plan(step, data.shape)
+            self._declare_and_plan(data, request_ids, seq_lens, real_bs, step_kwargs)
+        finally:
+            self._dummy_rows.reset(data.dummy_rids[real_bs:data.shape.bs])
+
+    def run(
+        self,
+        static_inputs: dict[str, torch.Tensor],
+        request_ids: list[str] | None = None,
+        seq_lens: list[int] | None = None,
+        real_bs: int | None = None,
+        step_kwargs: Mapping[str, Any] | None = None,
+    ) -> PiecewiseOutput:
+        """Replay the captured region for these real inputs.
+
+        Copies each real input into the runner-owned buffer of the same name,
+        declares and plans the region's step over the padded batch, replays,
+        then commits and returns the padded buffers behind a real-length view.
+
+        Only the static buffers carry data into a replay: the region's Python
+        ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
+        is baked into the graph. ``step_kwargs`` reach ``config.declare_step``
+        for a declaration that depends on this replay's data (a speculative
+        step's accepted counts); the capture declares without them.
+        """
+        data, real_bs, real_total_tokens, is_packed = self._resolve_call(
+            request_ids, seq_lens, real_bs,
+        )
+        self._copy_inputs(data, static_inputs)
+        try:
+            step = self._declare_and_plan(data, request_ids, seq_lens, real_bs, step_kwargs)
             data.graph.replay()
             if step is not None:
                 self._step_runner.commit(step)

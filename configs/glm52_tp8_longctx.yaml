@@ -1,0 +1,34 @@
+model: "glm52"
+# GLM-5.2 TP8 with the DSA long-context path. Same box shape as
+# glm52_tp8.yaml; the difference is the model_kwargs below.
+#
+# dsa_long_context lifts the context <= index_topk (2048) guard to
+# max_seq_len. Indexer layers then keep a per-request bf16 k-store (~5.4
+# KB/token/rank across the 21 full-attention layers) and decode beyond 2048
+# runs sparse absorbed attention over each token's top-2048 latents. A
+# request that stays within 2048 runs the dense paged path bit-identically
+# to glm52_tp8.yaml; batched with a longer one it takes the fp32 sparse
+# gather instead, same selection and math but not bitwise stable against
+# batch composition.
+#
+# Limits, both follow-ups in components/attention.py: prefill prompts must
+# still fit index_topk, and serving is eager only, since the indexer's
+# per-request host work would not replay in a captured graph.
+max_seq_len: 8192
+dist_timeout_s: 7200
+model_kwargs:
+  dsa_long_context: true
+  # Becomes config.max_seq_len: the guard bound and the KV sizing input.
+  # Must stay <= max_num_pages * page_size per rank.
+  max_seq_len: 8192
+resources:
+  kv:
+    # At 1.15 KB/token/layer, 512 x 128-token pages = 64k tokens/rank, i.e.
+    # 8 concurrent full-window requests.
+    max_num_pages: 512
+    page_size: 128
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
