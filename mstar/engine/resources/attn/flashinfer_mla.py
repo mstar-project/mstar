@@ -70,6 +70,7 @@ class FlashInferMLAWrapper:
         self.dtype = None
         self.kv_dtype = None
         self._qo_indptr_buf: torch.Tensor | None = None
+        self._kv_len_buf: torch.Tensor | None = None  # the rows' planned kv lengths, on device
         on_gpu = torch.device(device).type == "cuda"
         self.fallback = not on_gpu or not flashinfer_mla_supports(kv_lora_rank, qk_rope_head_dim)
         if self.fallback:
@@ -115,6 +116,9 @@ class FlashInferMLAWrapper:
         if not self.use_cuda_graph or self.fallback:
             # eager: keep the qo_indptr on device for select_last_hidden
             self._qo_indptr_buf = qo_indptr.to(self.device, dtype=torch.int32, non_blocking=True)
+            self._kv_len_buf = kv_len_arr.to(self.device, dtype=torch.int32, non_blocking=True)
+        elif not self.fallback:
+            self._kv_len_buf[: kv_len_arr.numel()].copy_(kv_len_arr.to(torch.int32), non_blocking=True)
         self.dtype = dtype
         self.kv_dtype = kv_dtype or dtype
         if self.fallback:
@@ -287,6 +291,13 @@ class FlashInferMLAManager(AttentionManager):
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
         wrapper = self._current_plan_states.get(label)
         return None if wrapper is None else wrapper._qo_indptr_buf
+
+    @torch.compiler.disable
+    def kv_len_buf(self, label: str = "main") -> torch.Tensor:
+        """The rows' planned kv lengths, int32 on device (static under a lease): for a
+        ``context_only`` plan the length of each row's stored context, which is where the row's
+        queries (and the entries the step appends) start."""
+        return self._current_plan_states[label]._kv_len_buf
 
     def select_last_hidden(self, hidden: torch.Tensor, label: str = "main") -> torch.Tensor:
         last = (self.qo_indptr_buf(label)[1:] - 1).long()
