@@ -74,6 +74,7 @@ def test_edge_generation_matches_diffusers(ref_path, mpipe) -> None:
         prompt=rec["prompt"], negative_prompt=rec["negative_prompt"], image=image, num_frames=num_frames,
         height=int(rec["height"]), width=int(rec["width"]), num_inference_steps=int(rec["steps"]),
         guidance_scale=float(rec["guidance"]), fps=float(rec["fps"]), latents=init, decode=False,
+        flow_shift=float(rec["flow_shift"]),
     )
     ref_lat = rec["final_latents"].to(lat.device, lat.dtype).reshape(lat.shape)
     px_m = mpipe._decode(lat).squeeze(0).float().cpu()          # [3, T, H, W] in [0, 1]
