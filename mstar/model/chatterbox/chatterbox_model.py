@@ -192,6 +192,8 @@ class ChatterboxModel(Model):
                 resource_key=T3_SAMPLER, nodes={T3_NODE},
                 vocab_size=t3.speech_vocab_size,
                 enable_repetion_penalty=True,
+                # the reference samples with min_p 0.05 (Turbo does not)
+                enable_min_p=not self.config.is_turbo,
             ),
         ]
 
@@ -209,6 +211,7 @@ class ChatterboxModel(Model):
                 top_k=knobs["top_k"],
                 top_p=knobs["top_p"],
                 repetition_penalty=knobs["repetition_penalty"],
+                min_p=knobs["min_p"],
                 ignore_eos=knobs["ignore_eos"],
             ),
             T3_KV: KVReqConfig(needed_labels=labels),
