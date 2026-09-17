@@ -184,6 +184,11 @@ def test_tiny_model_paged_forward_matches_dense(tiny_dir, device):
     for mod in lm.modules():
         if hasattr(mod, "bind_resources"):
             mod.bind_resources(res)
+    # this test covers the addressing (pool slots, packed rows, state carried into the decode) with the
+    # torch reference kernels on both devices; the fla kernels have their own tests below
+    from mstar.model.kimi_k3.components.kda import TorchKDAKernels
+
+    res[KDA_ATTN].set_kernels(TorchKDAKernels())
     steps = _fresh_steps
     torch.manual_seed(0)
     ids_a = torch.randint(0, 1000, (23,), device=device)
