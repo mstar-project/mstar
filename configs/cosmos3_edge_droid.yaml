@@ -1,0 +1,29 @@
+model: "cosmos3_edge_droid"
+# Sequence-length hint for the scheduler (see cosmos3_edge.yaml).
+max_seq_len: 8192
+# The policy checkpoint serves action requests (and the Edge video paths);
+# the pool matches cosmos3_edge.yaml.
+resources:
+  kv:
+    max_num_pages: 1024
+model_kwargs:
+  cuda_graph: true
+  graph_max_latent_area: 2000
+  image_size_default: [640, 640]
+  video_size_default: [832, 480]
+  num_frames_video: 121
+  num_inference_steps_video: 20
+  guidance_scale: 6.0
+  flow_shift_video: 12.0
+  # The released Edge DROID policy serves a 4-step denoise at guidance 3.0;
+  # its scheduler config carries the 480p training flow shift (5.0).
+  num_inference_steps_action: 4
+  guidance_scale_action: 3.0
+  flow_shift_action: 5.0
+node_groups:
+  # No reasoner: the policy checkpoint ships no vision encoder, so the chat
+  # walks are not built and the DiT runs alone.
+  - node_names: ["dit"]
+    ranks: [0]
+  - node_names: ["vae_encoder", "vae_decoder"]
+    ranks: [0]
