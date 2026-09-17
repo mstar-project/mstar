@@ -81,59 +81,44 @@ class TestWindowSchedule:
 
 
 class _StubHandle:
-    """Cache-handle stub that page-floors releases like the real allocator."""
+    """Records the retention the session installs, like the pool would."""
 
-    def __init__(self, page_size: int):
-        self.page_size = page_size
-        self.protected = {}
-        self.freed_total = 0
+    def __init__(self):
+        self.policies = {}
 
-    def protect_prefix(self, request_id, num_tokens, label=None):
-        self.protected[(request_id, label)] = num_tokens
-
-    def release_oldest(self, request_id, num_tokens, label=None):
-        freed = (num_tokens // self.page_size) * self.page_size
-        self.freed_total += freed
-        return freed
+    def set_retention(self, request_id, policy, label=None):
+        self.policies[(request_id, label)] = policy
 
 
 class TestWindowedKVSession:
-    def test_release_targets_with_page_floor_shortfall(self):
-        # 60 tokens/unit against 128-token pages: per-window release asks are
-        # never page-aligned, so the session must re-offer the shortfall.
+    def test_bind_installs_the_schedule_budget(self):
+        # 60 tokens/unit, 16 units of context behind a 300-token prefix.
         s = WindowSchedule(48, 8, context_units=16)
-        h = _StubHandle(page_size=128)
+        h = _StubHandle()
         sess = WindowedKVSession(h, "r", "main", s, tokens_per_unit=60)
+        assert sess.context_tokens == 16 * 60
+        policy = sess.bind(300)
+        assert h.policies[("r", "main")] is policy
+        assert policy.context_budget == 960 and policy.protected_prefix == 300
 
-        sess.protect_prefix(300)
-        assert h.protected[("r", "main")] == 300
-
-        for k in range(s.num_windows):
-            sess.after_commit(k)
-            target = s.released_end(k) * 60
-            # Realized release tracks the nominal target within one page.
-            assert 0 <= target - sess.released_tokens < 128
-
-        assert sess.released_tokens == h.freed_total
-
-    def test_no_release_before_context_fills(self):
-        s = WindowSchedule(48, 8, context_units=16)
-        h = _StubHandle(page_size=8)
+    def test_unbounded_context_installs_nothing(self):
+        s = WindowSchedule(48, 8)
+        h = _StubHandle()
         sess = WindowedKVSession(h, "r", "main", s, tokens_per_unit=8)
-        assert sess.after_commit(0) == 0
-        assert sess.after_commit(1) == 0
-        assert sess.after_commit(2) > 0
+        assert sess.context_tokens is None
+        assert sess.bind(16) is None
+        assert h.policies == {}
 
-    def test_protect_once(self):
-        s = WindowSchedule(8, 8)
-        sess = WindowedKVSession(_StubHandle(8), "r", "main", s, 8)
-        sess.protect_prefix(16)
-        with pytest.raises(RuntimeError, match="already protected"):
-            sess.protect_prefix(16)
+    def test_bind_once(self):
+        s = WindowSchedule(8, 8, context_units=4)
+        sess = WindowedKVSession(_StubHandle(), "r", "main", s, 8)
+        sess.bind(16)
+        with pytest.raises(RuntimeError, match="already bound"):
+            sess.bind(16)
 
     def test_tokens_per_unit_validation(self):
         with pytest.raises(ValueError):
-            WindowedKVSession(_StubHandle(8), "r", "main", WindowSchedule(8, 8), 0)
+            WindowedKVSession(_StubHandle(), "r", "main", WindowSchedule(8, 8), 0)
 
 
 if __name__ == "__main__":
