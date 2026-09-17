@@ -44,6 +44,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -228,6 +229,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         self._scheduler_template = scheduler
         # Per-request denoise state lives in the engine-managed
         # ``request_states`` store from the NodeSubmodule base.
+        # Windowed sessions: the last window's clean latents per session id,
+        # most recent last; a follow-up request with ``resume_session``
+        # re-pins its head from here (see ``_prepare_windowed_prefill``).
+        self._session_tails: OrderedDict[str, torch.Tensor] = OrderedDict()
         # Compile the pure denoise compute (~1.2-1.3x/step; the kernels bake
         # into the CUDA graphs at capture). fullgraph=False breaks at the
         # attention; ``config.compile_denoise=False`` keeps the eager step for
@@ -577,16 +582,31 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
         w0 = schedule.window(0)
         has_image_condition = bool(md.get("has_image_condition", False))
+        # A resumed session re-pins the stored tail as window 0's clean head:
+        # the same clean-frame layout a chained window uses for its overlap.
+        resume_units = int(md.get("resume_latent_units", 0) or 0)
+        resume_tail = None
+        if resume_units:
+            resume_tail = self._session_tail(str(md.get("session_id")), resume_units, height, width)
         cond, uncond = self._build_window_statics(
             cond_ids, uncond_ids, height, width, w0.units, fps,
-            has_image_condition=has_image_condition, cond_units=0, device=device,
+            has_image_condition=has_image_condition, cond_units=resume_units, device=device,
         )
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         tokens_per_unit = cond["num_vision_tokens"] // w0.units
         self._slim_statics(cond, uncond)
         iters_per_window = steps + 1 if is_kv else steps
         st = self.request_state(fwd_info.request_id)
+        if resume_tail is not None:
+            shape = self._window_latent_shape(height, width, w0.units)
+            dtype = self.transformer.proj_in.weight.dtype
+            vmask = torch.zeros((1, 1, w0.units, 1, 1), device=device, dtype=dtype)
+            vmask[:, :, :resume_units] = 1.0
+            cond_video = torch.zeros(shape, device=device, dtype=dtype)
+            cond_video[:, :, :resume_units] = resume_tail.to(device=device, dtype=dtype)
+            st.add_all(vmask=vmask, cond_video_latents=cond_video)
         st.add_all(
+            ar_session_id=md.get("session_id"),
             cond=cond,
             uncond=uncond,
             gs=gs,
@@ -617,6 +637,37 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ar_statics={},
         )
         return node_inputs
+
+    def _session_tail(self, session_id: str, units: int, height: int, width: int) -> torch.Tensor:
+        """The stored last-window latents a resumed request pins its head
+        with: the newest ``units`` latent frames, at the request's latent
+        size. Unknown (or evicted) sessions and size mismatches are request
+        errors — silently starting from scratch would break the client's
+        frame accounting."""
+        tail = self._session_tails.get(session_id)
+        if tail is None:
+            raise ValueError(
+                f"Cosmos3 resume_session: unknown or expired session {session_id!r}."
+            )
+        shape = self._window_latent_shape(height, width, units)
+        if tail.shape[2] < units or tuple(tail.shape[3:]) != tuple(shape[3:]):
+            raise ValueError(
+                f"Cosmos3 resume_session: session {session_id!r} holds latents of shape "
+                f"{tuple(tail.shape)}, which cannot seed a {height}x{width} window."
+            )
+        self._session_tails.move_to_end(session_id)
+        return tail[:, :, -units:]
+
+    def _store_session_tail(self, st, window_latents: torch.Tensor) -> None:
+        """The rollout's final window, kept for a ``resume_session`` follow-up
+        (most recent ``session_store_size`` sessions)."""
+        session_id = st.get("ar_session_id")
+        if not session_id:
+            return
+        self._session_tails[str(session_id)] = window_latents.detach().clone()
+        self._session_tails.move_to_end(str(session_id))
+        while len(self._session_tails) > max(1, int(self.config.session_store_size)):
+            self._session_tails.popitem(last=False)
 
     def _window_statics_for(self, st, plan, device):
         start_unit = plan.start if st.get("ar_kv_mode") else 0
@@ -757,6 +808,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "window_latents": [window_latents],
         }
         if window_index + 1 >= schedule.num_windows:
+            self._store_session_tail(st, window_latents)
             return outputs
         plan = schedule.window(window_index + 1)
         device = window_latents.device
@@ -831,6 +883,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if st.get("vmask") is not None:
             if latents is not None:
                 st.add("cond_video_latents", latents)
+            elif st.get("cond_video_latents") is not None:
+                # A resumed windowed session pinned its head from the stored
+                # tail at prefill; nothing arrives on the edge.
+                pass
             elif "action_chunk" in st:
                 st.add("cond_video_latents", torch.zeros(
                     st["latent_shape"], device=device,
@@ -2491,6 +2547,12 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     report done, so it is not vetoed.
     """
 
+    def __init__(self, vae, config):
+        super().__init__(vae, config)
+        # Per-session decode context (the latents behind a session's last
+        # frames), so a resumed rollout's first window decodes seamlessly.
+        self._session_tails: OrderedDict[str, torch.Tensor] = OrderedDict()
+
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         chunks = (inputs or {}).get("window_latents") or []
         if not chunks:
@@ -2504,6 +2566,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         st = self.request_state(rid)
         if "ar_chunks" not in st:
             md = engine_inputs.per_request_info[rid].step_metadata
+            session_id = md.get("session_id")
+            resume = int(md.get("resume_latent_units", 0) or 0)
             st.add_all(
                 ar_chunks=0,
                 ar_windows=int(md["num_windows"]),
@@ -2515,9 +2579,17 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
                 ar_stream=bool(md.get("stream_video")),
                 ar_emitted=0,
                 ar_pixels=[],
+                ar_session_id=str(session_id) if session_id else None,
+                # A resumed session: window 0's pinned head duplicates frames
+                # the client already has, so it is trimmed like an overlap,
+                # and the session's decode context (when this node still
+                # holds it) warms the conv stack behind the first new frame.
+                ar_resume=resume,
             )
+            if resume and session_id and str(session_id) in self._session_tails:
+                st.add("ar_tail", self._session_tails[str(session_id)])
         index = st["ar_chunks"]
-        overlap = st["ar_overlap"] if index > 0 else 0
+        overlap = st["ar_overlap"] if index > 0 else st["ar_resume"]
         new = latents[:, :, overlap:] if overlap else latents
         tail = st.get("ar_tail")
         # The retained tail is already capped at ar_ctx latents, so appending
@@ -2533,6 +2605,11 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             pixels = pixels[:, :, -keep:]
         st.add("ar_tail", stream_tail[:, :, -st["ar_ctx"]:])
         st.add("ar_chunks", index + 1)
+        if index + 1 >= st["ar_windows"] and st["ar_session_id"]:
+            self._session_tails[st["ar_session_id"]] = st["ar_tail"]
+            self._session_tails.move_to_end(st["ar_session_id"])
+            while len(self._session_tails) > max(1, int(self.config.session_store_size)):
+                self._session_tails.popitem(last=False)
         if st["ar_stream"]:
             # Deliver each window as its own chunk, capped at the frames still
             # owed (the padded final window can outrun the requested count);
