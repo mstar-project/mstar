@@ -158,6 +158,9 @@ class Cosmos3Model(Model):
         self._yaml_config_overrides: dict = dict(kwargs)
 
         self._repo_dir: Path | None = None
+        # Byte-faithful streaming detokenizer for the reasoner (built lazily
+        # against whichever tokenizer is bound; see ``postprocess``).
+        self._detokenizer = None
         self.config: Cosmos3Config = self._load_config()
         self.tokenizer = self._load_tokenizer()
 
@@ -958,9 +961,16 @@ class Cosmos3Model(Model):
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "text":
-            # One sampled token per chunk; the client concatenates the pieces.
-            ids = output.reshape(-1).tolist()
-            return self.tokenizer.decode(ids, skip_special_tokens=True).encode("utf-8")
+            # One sampled token per chunk, emitted as the token's raw bytes
+            # (the Edge tokenizer is byte-level BPE): a multi-byte character
+            # split across tokens reassembles client-side, where per-token
+            # ``decode`` would emit U+FFFD for each fragment. Special tokens
+            # (EOS, chat markup) are dropped, like ``skip_special_tokens``.
+            from mstar.model.utils import ByteLevelDetokenizer
+
+            if self._detokenizer is None or self._detokenizer.tokenizer is not self.tokenizer:
+                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
+            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
         if modality == "image":
             import io
             import os
