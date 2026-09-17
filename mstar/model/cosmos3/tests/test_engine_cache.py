@@ -350,7 +350,8 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
     finally:
         model.config.attention_backend = prev_backend
     for spec in specs:
-        spec.apply_yaml_overrides(max_num_pages=max_num_pages)
+        if spec.resource_key == KV_CACHE:
+            spec.apply_yaml_overrides(max_num_pages=max_num_pages)
 
     groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
     transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
@@ -382,7 +383,7 @@ def _run_cache_once(model, dit, resources, init, cond_ids, uncond_ids, device, n
           "guidance_scale": GS, "num_inference_steps": STEPS}
     fwd = CurrentForwardPassInfo(
         request_id=rid, graph_walk="prefill",
-        fwd_index=0, random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+        fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
     )
     text_inputs = [
         torch.tensor(cond_ids, dtype=torch.long, device=device),
@@ -419,7 +420,7 @@ def _run_batched(model, dit, resources, init, conds, unconds, device, rids):
     for i, rid in enumerate(rids):
         fwd = CurrentForwardPassInfo(
             request_id=rid, graph_walk="prefill", fwd_index=0,
-            random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+            random_seed=SEED, max_tokens=0, step_metadata=md,
         )
         fwds[rid] = fwd
         ti = [torch.tensor(conds[i], dtype=torch.long, device=device),
@@ -615,7 +616,7 @@ def _encode_cond(model, md, media, walk):
     enc = model.get_submodule("vae_encoder", device="cuda:0")
     fwd = CurrentForwardPassInfo(
         request_id="enc", graph_walk=walk, fwd_index=0,
-        random_seed=0, max_tokens=0, sampling_config={}, step_metadata=md,
+        random_seed=0, max_tokens=0, step_metadata=md,
     )
     ei = ModelInputsFromEngine(request_ids=["enc"], per_request_info={"enc": fwd})
     ni = enc.prepare_inputs(walk, fwd, media)
@@ -880,7 +881,7 @@ def _run_windowed_kv_served(dit, resources, md, cond_ids, uncond_ids, device):
     rid = "r0"
     fwd = CurrentForwardPassInfo(
         request_id=rid, graph_walk="prefill",
-        fwd_index=0, random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+        fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
     )
     text_inputs = [
         torch.tensor(cond_ids, dtype=torch.long, device=device),
@@ -1047,7 +1048,7 @@ def _run_cuda_graph_denoise(ctx):
           "guidance_scale": GS, "num_inference_steps": STEPS}
     fwd = CurrentForwardPassInfo(
         request_id=rid, graph_walk="prefill", fwd_index=0,
-        random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
+        random_seed=SEED, max_tokens=0, step_metadata=md,
     )
     ti = [torch.tensor(ctx["cond"], dtype=torch.long, device=device),
           torch.tensor(ctx["uncond"], dtype=torch.long, device=device)]
