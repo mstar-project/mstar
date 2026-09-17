@@ -115,7 +115,7 @@ class KimiK3LanguageModel(nn.Module):
                 break  # one shared resource: setting it once is enough
         for layer in self.layers:
             if layer.is_kda:
-                layer.self_attn.state.set_default_label(label)
+                layer.self_attn.attn.set_default_label(label)
                 break
 
     # ---------------------------------------------------------------- paths
