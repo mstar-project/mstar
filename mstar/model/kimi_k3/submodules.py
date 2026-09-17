@@ -215,10 +215,11 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             return self._forward_verify(engine_inputs, text_inputs)
         new_token = self._forward(graph_walk, engine_inputs, text_inputs)
         if self.speculative_tokens > 0:
-            # a prefill under speculation hands the next row its bonus (and, for the stand-in, its drafts)
+            # a prefill under speculation hands the next row its bonus (and, for the stand-in, its
+            # drafts) as the loop-back edge itself: on this path the keys are the edge names
             bonus = new_token.view(-1, 1)
             nxt = bonus if self.draft is not None else torch.cat([bonus, self._draft(bonus)], dim=1)
-            return {"new_token": new_token, "next_inputs": nxt}
+            return {"new_token": new_token, "text_inputs": nxt.reshape(-1)}
         return {"new_token": new_token}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
