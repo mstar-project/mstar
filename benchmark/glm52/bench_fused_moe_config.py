@@ -1,59 +1,6 @@
 #!/usr/bin/env python3
 """ONE GPU, minutes: sweep Triton tile configs for M*'s fused fp8 MoE kernel
 at GLM-5.2's decode shape and report the fastest per launch.
-
-Companion to ``env/bench_fused_moe_grid.py`` (which measures the grid-size
-clamp at a FIXED default config, now baked into ``invoke_fused_moe_kernel_fp8_w8a8``
-via ``_grid_rows``). This script instead fixes the grid-size question and
-sweeps the compile-time tile knobs Triton exposes for
-``fused_moe_kernel_fp8_w8a8``: ``BLOCK_SIZE_N``, ``GROUP_SIZE_M``,
-``num_warps``, ``num_stages``. Same decode-shape inputs as that script
-(tokens=4, top_k=8, E=256, hidden=6144, inter/rank=256, fp8 block (128,128)).
-
-``BLOCK_SIZE_M`` is NOT swept -- it is fixed at 16, matching today's
-``get_default_config`` for the ``M <= E`` branch (decode is always M <= E
-here: 4 <= 256). Why it can't be swept independently: ``moe_align_block_size``
-(``align.py``) pads and sorts ``topk_ids`` into blocks of whatever size YOU
-pass it (``max_num_tokens_padded = topk_ids.numel() + num_experts *
-(block_size - 1)``; ``expert_ids`` has one entry per that-size block), and
-the kernel's grid / pid-swizzle math (``_grid_rows``,
-``fused_moe_kernel_fp8_w8a8``'s ``num_pid_m = cdiv(EM, BLOCK_SIZE_M)``) reads
-``sorted_token_ids``/``expert_ids`` assuming its OWN ``BLOCK_SIZE_M`` is the
-one they were built with. Trying a different ``BLOCK_SIZE_M`` means a fresh
-``moe_align_block_size`` call, not just relabelling the tile size -- out of
-scope here since the ask is specifically 16 (which is also today's default).
-
-``BLOCK_SIZE_K`` is likewise fixed at 128, not because of alignment but
-because the kernel itself requires it: ``tl.static_assert(BLOCK_SIZE_K ==
-group_k, ...)`` in ``fused_moe_kernel_fp8_w8a8``, and ``fused_experts_fp8``
-forces ``config["BLOCK_SIZE_K"] = block_k`` (the fp8 weight's quant-block K)
-right after calling ``get_default_config``. It is not a free tile parameter
-for this kernel at all.
-
-Also notable while reading the runner: ``fused_experts_fp8`` calls
-``get_default_config`` ONCE, with the gate/up GEMM's shape, and reuses that
-SAME dict for the down GEMM too (``runner.py`` lines ~329-397). The ``M <=
-E`` branch of ``get_default_config`` ignores N/K/top_k entirely, so this is
-shape-consistent today (both branches give the same dict regardless of which
-GEMM's shape you feed it) -- but it does mean the down GEMM (N=6144, K=256)
-has never had a config tuned for ITS shape; it just inherits gate/up's
-(N=512, K=6144) pick. This sweep tunes both independently and reports
-whether that matters.
-
-Correctness: every swept config is checked with ``torch.equal`` against the
-current default's output before it is allowed to compete on speed (bit
-identity is expected -- BLOCK_SIZE_N/GROUP_SIZE_M/num_warps/num_stages only
-change *how* the tile is scheduled and pipelined, not the K-loop's
-summation order -- but this is measured, not assumed).
-
-Run on the box, GPU verified idle first:
-
-    CUDA_VISIBLE_DEVICES=<idle> $VENV/bin/python env/bench_fused_moe_config.py
-
-Smoke-test the plumbing fast (few configs, few iters) before the full grid:
-
-    ... env/bench_fused_moe_config.py --block-n 32 64 --group-m 1 \\
-        --num-warps 4 --num-stages 3 --iters 20
 """
 from __future__ import annotations
 
@@ -68,13 +15,7 @@ from mstar.utils.fused_moe import runner as R
 
 
 def bench_graph(fn, capture_n: int, iters: int, warmup: int = 10) -> float:
-    """Time `fn` (a zero-arg closure) inside a CUDA graph.
-
-    `capture_n` calls of `fn` are captured into one graph; the graph is then
-    replayed `iters` times and timed with CUDA events. Returns microseconds
-    per single call of `fn` (i.e. per launch, not per replay) -- this is how
-    the kernel actually runs in production (captured decode step).
-    """
+    """Time `fn` (a zero-arg closure) inside a CUDA graph."""
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -99,14 +40,7 @@ def bench_graph(fn, capture_n: int, iters: int, warmup: int = 10) -> float:
 
 
 def _context_alive(dev: torch.device) -> bool:
-    """Canary run after any exception.
-
-    A config that Triton rejects at compile time (e.g. out-of-shared-memory)
-    fails cleanly before any kernel executes. A config that instead triggers
-    a genuine device-side error (illegal memory access) can poison the whole
-    CUDA context, silently turning every later config into a spurious skip.
-    This tells the two apart so a poisoned run is reported as such.
-    """
+    """Canary run after any exception."""
     try:
         (torch.zeros(1, device=dev) + 1).item()
         return True

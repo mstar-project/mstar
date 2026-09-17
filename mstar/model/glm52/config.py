@@ -1,10 +1,4 @@
-"""GLM-5.2 architecture + generation config.
-
-Architecture values transcribed from the official checkpoint's config.json
-(zai-org/GLM-5.2, architectures=["GlmMoeDsaForCausalLM"], model_type
-"glm_moe_dsa", transformers 5.12.0). Fields the scaffold does not use yet
-(DSA indexer, MTP) are kept here so the later steps read from one place.
-"""
+"""GLM-5.2 architecture + generation config."""
 
 from dataclasses import dataclass, field
 
@@ -145,11 +139,7 @@ class Glm52ModelConfig:
 
     @property
     def padded_head_dim(self) -> int:
-        """Naive-MLA q/k/v pad target; FlashInfer paged kernels require 64/128/256.
-
-        For the full model qk_head_dim is exactly 256, so padding is a no-op;
-        the reduced configs (24 -> 64) exercise the pad path.
-        """
+        """Naive-MLA q/k/v pad target; FlashInfer paged kernels require 64/128/256."""
         for supported in (64, 128, 256):
             if supported >= self.qk_head_dim:
                 return supported
@@ -178,10 +168,6 @@ class Glm52ModelConfig:
             v_head_dim=16,
             # Indexer at test scale. offset=1 anchors the every-freq series
             # at layer 0, so the 2-layer model is layer 0 FULL / 1 SHARED.
-            # index_topk stays serve-safe: the submodule's preprocess guard
-            # refuses ctx > index_topk, and the GPU e2e serve tests run
-            # ~16-token contexts. Truncation-regime unit tests override
-            # cfg.index_topk locally.
             index_n_heads=4,
             index_head_dim=16,
             index_topk=64,

@@ -1,20 +1,4 @@
-"""CPU tests for the sync-free planning pieces (2026-08-19).
-
-Host-side rewrites of work that used to run on the device with
-stream-draining syncs. Each is pinned against the tensor arithmetic it
-replaces — bit-identical results, no CUDA needed:
-
-1. ``pinned()`` — staging tensor semantics (shape, dtype, values, and the
-   pageable fallback when there is no CUDA).
-2. ``paged_scatter_map_host`` (the MLA attention resource's per-token
-   scatter map) vs the device-side scatter arithmetic it replaced,
-   evaluated on CPU tensors, over random paged batches (variable lengths,
-   zero-length padding rows, page boundaries); and ``build_host_plan``
-   feeding it from the KV plan's ``SequenceView``s.
-3. ``mtp_greedy_verify_host`` vs ``mtp_greedy_verify`` on random draft /
-   target pairs, including the "emitted == target[:n_acc+1]" identity the
-   decode step relies on.
-"""
+"""CPU tests for the sync-free planning pieces (2026-08-19)."""
 import random
 import sys
 import types
@@ -177,7 +161,8 @@ def test_build_host_plan_then_scatter_lands_every_new_token_in_its_stream():
     """The plan the attention resource builds from the KV views, fed to the
     scatter map: token j of request i lands on that request's page
     ``(length - new + j) // page_size`` at offset ``% page_size`` — never
-    another request's page, never a slot below the stored prefix."""
+    another request's page, never a slot below the stored prefix.
+    """
     rng = random.Random(99)
     for page_size in (1, 8, 64):
         for _ in range(40):

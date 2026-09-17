@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
 """ONE GPU, seconds: the fp8 fused-MoE Triton GEMMs at GLM-5.2's decode shape,
 grid sized from the worst-case padded slot count (today) vs clamped.
-
-Today ``invoke_fused_moe_kernel_fp8_w8a8`` sizes its grid from
-``sorted_token_ids.shape[0]`` = ``tokens*top_k + E*(BLOCK_M-1)`` = 32 + 256*15 =
-3872 slots at k=3 decode, i.e. 242 M-tiles: 3,872 CTAs for the gate/up GEMM
-and 46,464 for the down GEMM (N=6144, BLOCK_N=32), of which at most 32 M-tiles
-carry a token. Every other CTA loads ``num_tokens_post_padded`` and exits —
-but it still has to be scheduled, 75 layers per step. vLLM clamps ``EM`` for
-small batches; the bound that is always valid is ``topk_ids.numel() * BLOCK_M``
-(each (token, expert) slot opens at most one partial tile), here 512.
-
-This emulates the clamp by slicing ``sorted_token_ids``/``expert_ids`` — the
-kernel, the valid slots and the outputs are identical — and times both
-launches eagerly and inside a CUDA graph (where they actually run). Run it on
-any idle GPU:
-
-    CUDA_VISIBLE_DEVICES=<idle> .venv/bin/python env/bench_fused_moe_grid.py
 """
 import argparse
 

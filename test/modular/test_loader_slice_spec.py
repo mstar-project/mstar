@@ -1,11 +1,4 @@
-"""The loader iterators' ``slice_spec`` path: sliced safetensors reads.
-
-The generic loader has every rank read the full checkpoint and keep its
-slice (8x the bytes at TP8). ``slice_spec`` lets a TP-aware caller ask the
-iterator for ``get_slice(key)[start:stop]`` / ``[:, start:stop]`` instead of
-the full tensor. These tests pin the iterator half of the fast read path
-(the model-side read plan lives with the model that builds it).
-"""
+"""The loader iterators' ``slice_spec`` path: sliced safetensors reads."""
 import json
 
 import pytest

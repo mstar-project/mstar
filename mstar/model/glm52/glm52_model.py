@@ -1,30 +1,4 @@
-"""Glm52Model: Model implementation for GLM-5.2 (text generation).
-
-GLM-5.2 (zai-org/GLM-5.2) is a 753B-total / ~40B-active MoE causal LM with
-MLA + DSA sparse attention and 1M context. Unlike the composite models in
-the zoo it is a single autoregressive loop, so the graph is the minimal
-prefill -> decode shape and all of the integration substance lives in the
-engine/submodule layer.
-
-Architecture (1 node, default single partition):
-    LLM (ar) - embed + 78 decoder layers (3 dense + 75 MoE, MLA/DSA
-               attention) + lm_head, kept as one fat node: everything
-               colocates on the same TP group, and splitting it would only
-               add IPC overhead.
-
-Scaffold status (bring-up order, per docs/adding_models.rst):
-    [x] registry / config / graph walks / conductor state machine (this file)
-    [x] components/ + weight loading (fp8-block dequant; experts fp8-resident)
-    [x] MLA attention (absorbed default + naive fallback) on the paged latent
-        cache path from users/garv/kimik27-integration
-    [x] DSA indexer + IndexShare (Phase C components + engine v1: opt-in
-        dsa_long_context flag, per-request bf16 indexer k-store, sparse
-        gather-and-dense decode beyond index_topk; prefill prompts must
-        still fit topk, sparse prefill + fp8 paged k-pool are follow-ups)
-    [x] MTP speculation (M3: draft-then-verify decode + KV rewind; trunk
-        verify forward CUDA-graph captured piecewise, drafts eager)
-    [ ] fused fp8 expert kernel (M4 perf debt; reference dispatch until then)
-"""
+"""Glm52Model: Model implementation for GLM-5.2 (text generation)."""
 
 import logging
 import os
@@ -63,31 +37,12 @@ logger = logging.getLogger(__name__)
 
 
 def _mtp_prefill_drafts_enabled() -> bool:
-    """Carry the MTP prefill's [emitted, k drafts] bundle into decode step 1.
-
-    DEFAULT ON [2026-08-19]: arm L on coriander (TP8, k=3, uncontended) ran
-    with it on — 78.53 tok/s, 3264 tokens bit-exact, 0 eager, and the
-    acceptance histogram's forced n_acc=0 bin fell 143 -> 129 (the first
-    decode step is now a speculated (k+1)-row step like every other). Set
-    MSTAR_GLM52_MTP_PREFILL_DRAFTS=0 to drop the bundle (one wasted
-    unspeculated step per request). Read through one helper so the edge that
-    WRITES the bundle and the transition that READS it can never disagree:
-    gating only the write path left the read live and regressed the "off"
-    arm on 2026-08-10.
-    """
+    """Carry the MTP prefill's [emitted, k drafts] bundle into decode step 1."""
     return os.environ.get("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1") == "1"
 
 
 def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
-    """Tick a small CUDA kernel until the first real forward pass.
-
-    The box reaps processes that hold GPU memory with ~30 min of no GPU
-    activity ATTRIBUTED TO THEM (per-process: an external tickler on the
-    same GPU did not prevent kill #4). The idle window spans the host-bound
-    weight load AND the first-request flashinfer JIT storm, so the tick
-    must live from load start until the submodule's first forward — the
-    caller owns the returned stop event and sets it there.
-    """
+    """Tick a small CUDA kernel until the first real forward pass."""
     if not str(device).startswith("cuda"):
         return None
     stop = threading.Event()
@@ -120,9 +75,6 @@ def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
             except torch.AcceleratorError:
                 # A CUDA graph capture is in flight somewhere in the process
                 # (global capture mode rejects unsafe calls from any thread).
-                # The capture path stops this thread before capturing —
-                # get_cuda_graph_configs / get_piecewise_cuda_graph_configs —
-                # so this is a race backstop: skip the tick, stay alive.
                 continue
 
     t = threading.Thread(target=_tick, daemon=True, name="glm52-load-heartbeat")
@@ -175,8 +127,6 @@ class Glm52Model(Model):
                 )
             self.config.dsa_long_context = True
             # Guard + KV sizing move from index_topk to the serving window.
-            # 8192 restores the checkpoint's generation default; real 1M
-            # context is gated on sparse prefill + the fp8 paged k-pool.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
         if "moe_quant_kernel" in kwargs:
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
@@ -355,27 +305,6 @@ class Glm52Model(Model):
             ),
             # Runaway guard. The per-request budget lives in check_stop,
             # which sees the request's real max_tokens.
-            #
-            # KNOWN LIMIT: a requested budget above this cap is truncated,
-            # because the decode edge carries no conductor_new_token so the
-            # conductor's own max-token stop never fires for this model. Do
-            # NOT "fix" that by raising the cap to max_seq_len — tried
-            # 2026-08-10 and reverted. The context-window check in preprocess
-            # is BATCH-level and raises; kv_cache_engine only catches
-            # AllocationFailedError, so the escape reaches
-            # _handle_main_loop_error and fails every co-batched request, not
-            # just the long one. Raising the cap makes that FAR more likely,
-            # though it does not make it impossible today: the guard is
-            # start + sl > limit and start includes the prompt, so a prompt
-            # over ~(limit - max_iters) tokens still trips it mid-decode and
-            # still takes its neighbours down.
-            #
-            # Under MTP the truncation is also acceptance-dependent: a step
-            # emits 1..k+1 tokens, so this cap yields 1024-3072 tokens at
-            # k=2 and a given request's length varies with draft quality.
-            #
-            # The real fix is a per-request budget signal on the decode edge,
-            # plus making the context guard per-request rather than batch-fatal.
             max_iters=self.get_max_output_tokens(),
             outputs=[],
         )
@@ -384,7 +313,6 @@ class Glm52Model(Model):
 
     # -------------------------------------------------------------------
     # Model ABC: conductor state machine (prefill -> decode -> done)
-    # -------------------------------------------------------------------
 
     def get_initial_forward_pass_args(
         self,
@@ -630,15 +558,7 @@ class Glm52Model(Model):
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
-        """Load weights, taking the sliced fast read path when possible.
-
-        The generic driver has every rank read the full checkpoint and keep
-        its TP slice — 8x the bytes at TP8, and the reads dominate load
-        time. With a sharded index present, build a read plan instead:
-        skip keys the model never loads (the MTP layer unless drafting is
-        on, non-FULL indexer keys) and read only this rank's shard of
-        every routed-expert tensor.
-        """
+        """Load weights, taking the sliced fast read path when possible."""
         from mstar.model.glm52.weight_loader import build_glm52_read_plan
         from mstar.model.loader import load_weights
         from mstar.model.loader.iterators import iter_safetensors_shards

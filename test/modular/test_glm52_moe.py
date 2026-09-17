@@ -48,7 +48,8 @@ def _noaux_tc_reference(h, weight, bias, top_k, scale):
     """DeepSeek-V3 noaux_tc with n_group=1, transcribed from the rule:
     sigmoid affinities; the correction bias moves only the SELECTION; the
     combine weights are the raw affinities of the picked experts,
-    normalized over the picked set, times the routed scale."""
+    normalized over the picked set, times the routed scale.
+    """
     scores = torch.sigmoid(h.float() @ weight.float().T)
     ids = torch.topk(scores + bias.float(), k=top_k, dim=-1, sorted=False).indices
     weights = torch.gather(scores, 1, ids)
@@ -246,12 +247,7 @@ def _fp8_entry(state, refs, base, shape):
 
 
 def _fabricate_checkpoint(cfg, include_mtp=False):
-    """HF-style stream for the reduced config + poison keys that must skip.
-
-    ``include_mtp=True`` (M3): emit layer ``num_hidden_layers`` as a full,
-    properly-paired MTP layer (decoder inventory via the same loop body —
-    the position is FULL by the IndexShare formula — plus the glue keys)
-    instead of the poison keys."""
+    """HF-style stream for the reduced config + poison keys that must skip."""
     state: list[tuple[str, torch.Tensor]] = []
     refs: dict[str, tuple] = {}
     hid, q_lora, kv_lora = cfg.hidden_size, cfg.q_lora_rank, cfg.kv_lora_rank
@@ -333,9 +329,6 @@ def _fabricate_checkpoint(cfg, include_mtp=False):
 
     # Poison: MTP layer keys (Phase D) — including the MTP block's own
     # indexer, which must skip by layer index even with load_indexer=True.
-    # The fp8 weights deliberately have NO scale sibling — if the skip ever
-    # ran after the dequant stream instead of before, the stream would raise
-    # "unpaired" and this test would fail.
     state.append((f"{mtp}.enorm.weight", torch.randn(cfg.hidden_size).bfloat16()))
     state.append((f"{mtp}.mlp.experts.0.gate_proj.weight",
                   torch.randn(cfg.moe_intermediate_size, cfg.hidden_size)
@@ -405,7 +398,8 @@ def test_per_token_group_quant_is_compiler_disabled():
     recompile of its Triton kernel crashes (PassManager::run failed,
     08-07 — in-process and subprocess alike) and killed all 296 graph
     captures. The graph break keeps compile+graphs coexisting; this pins
-    the wrap so a refactor can't silently drop it."""
+    the wrap so a refactor can't silently drop it.
+    """
     from mstar.utils.fused_moe.kernels import per_token_group_quant_fp8
 
     assert hasattr(per_token_group_quant_fp8, "_torchdynamo_disable") or hasattr(
@@ -441,7 +435,8 @@ def test_fused_allreduce_reduces_once_and_keeps_local_math(monkeypatch):
     """MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1: the block issues ONE all-reduce
     (of routed_partial + shared_partial) instead of two, and what it reduces
     equals the sum of what the unfused block reduced — the local arithmetic
-    is unchanged; only the reduction order moves."""
+    is unchanged; only the reduction order moves.
+    """
     torch.manual_seed(3)
     cfg = Glm52ModelConfig.reduced()
 

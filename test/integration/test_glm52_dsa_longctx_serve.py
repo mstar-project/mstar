@@ -1,32 +1,5 @@
 """GLM-5.2 DSA long-context serve e2e: decode PAST index_topk on the real
 absorbed paged-latent path (1 GPU, reduced dims, tiny topk=8).
-
-Ports the test_glm52_serve_e2e.py serve harness to the ``mla_absorb`` backend
-— the ``KVLayout.MLA`` KV resource and the MLA attention resource, on its SDPA
-fallback at reduced latent dims — with ``dsa_long_context=True``. One greedy
-generation run drives prefill -> decode through check_stop to prove the
-sparse path serves and stops cleanly; then three TEACHER-FORCED replays of
-that token sequence pin the two properties that cannot both hold unless the
-engine half works:
-
-  prefix property — while every context fits topk the flag-on run takes
-  the UNTOUCHED dense paged path, so its per-step logits must be BITWISE
-  identical both to a dense comparator (topk lifted out of reach) and to
-  the flag-off serve;
-
-  engagement — once context exceeds topk the logits must DIFFER from the
-  dense comparator: top-8 of >8 positions provably drops keys, so equal
-  logits would mean the sparse path never ran.
-
-Teacher forcing (same token fed to every variant) keeps the comparison
-per-step: divergence cannot silently propagate through sampled tokens.
-The k-store lifecycle is asserted on the real path too: it grows one row
-per token per FULL layer and must be EMPTY after ``cleanup_request`` —
-the hook ``Engine.remove_request`` fires (a leak per request is a
-rejection-level bug).
-
-``mstar.model.base`` pulls the sampler's Triton kernels in, so ``Glm52Model``
-is imported inside the test to keep collection clean on CUDA-less machines.
 """
 import pytest
 import torch
@@ -160,7 +133,8 @@ class _Serve:
     """One request's serve loop over the node's real resources — the
     test_glm52_serve_e2e.py harness on the absorbed declaration: the model
     declares a ``KVLayout.MLA`` cache and the MLA attention resource, the
-    YAML block sizes the pages, ``build_resource`` builds them."""
+    YAML block sizes the pages, ``build_resource`` builds them.
+    """
 
     def __init__(self, model, submodule: Glm52LLMSubmodule, rid: str = "r0"):
         self.submodule = submodule

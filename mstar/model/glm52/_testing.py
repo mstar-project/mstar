@@ -1,11 +1,4 @@
-"""Test-support helpers for the GLM-5.2 fp8-block path.
-
-NOT part of the serving path (the real checkpoint arrives pre-quantized).
-These fabricate a synthetic fp8-block checkpoint and its exact bf16
-reference so goldens can assert the load path (``quantization.py`` +
-``weight_loader.py``) reproduces the reference bit-for-bit — the same role
-``kimi_k2_7/_testing.py`` plays for compressed-tensors.
-"""
+"""Test-support helpers for the GLM-5.2 fp8-block path."""
 from __future__ import annotations
 
 import torch
@@ -19,11 +12,7 @@ def fake_quantize_fp8_block(
     weight: torch.Tensor,
     block_size: tuple[int, int] = (128, 128),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (fp8 weight, fp32 scale_inv, exact bf16 dequantized reference).
-
-    Per block: scale = amax / 448 (e4m3 max normal), quantize w / scale to
-    e4m3, store scale as ``weight_scale_inv`` (the multiply-back convention).
-    """
+    """Return (fp8 weight, fp32 scale_inv, exact bf16 dequantized reference)."""
     out_f, in_f = weight.shape
     bo, bi = block_size
     n_bo, n_bi = -(-out_f // bo), -(-in_f // bi)
@@ -45,11 +34,10 @@ def fake_quantize_fp8_block(
 
 
 class ReferenceAttentionResource(AttentionResource):
-    """CPU stand-in for the naive-path attention resource (the FlashInfer
-    K/V backend): dense causal attention over the rows a real NHD
-    ``KVManager`` holds, planned from that manager's plan output. Same call
-    surface a layer uses — ``run(q, kv_cache_layer=...)`` after
-    ``kv.write_kv`` — so the model code runs unchanged without a GPU."""
+    """CPU stand-in for the naive-path attention resource (the FlashInfer K/V backend):
+    dense causal attention over the rows a real NHD ``KVManager`` holds, planned from
+    that manager's plan output.
+    """
 
     def __init__(self, kv_cache: str = "kv"):
         self._kv_name = kv_cache
@@ -124,7 +112,8 @@ def build_cpu_resources(
     NHD, per ``config.mla_absorb``), the matching attention resource (the
     real MLA one on its SDPA fallback, or the reference K/V one) and a
     greedy sampler, plus a ``StepRunner`` over them. Requests in
-    ``request_ids`` are ingested."""
+    ``request_ids`` are ingested.
+    """
     from mstar.engine.resources.attn.mla import MlaAttentionManager
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import KVConfig, KVLayout
@@ -179,7 +168,8 @@ class EagerPiecewiseRunner:
     region → commit cycle over the real resources, same static-buffer
     contract (inputs copied into runner-owned buffers padded to the
     bucket), so the captured regions and their step declarations are
-    exercised on CPU."""
+    exercised on CPU.
+    """
 
     def __init__(self, label, config, resources, runner, batch_sizes=(1, 2, 4)):
         from mstar.engine.cuda_graph_config import (

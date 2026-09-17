@@ -1,9 +1,4 @@
-"""``resolve_dist_timeout`` / ``MSTAR_DIST_TIMEOUT_S``: the process-group timeout knob.
-
-Torch's default (10 min) is shorter than a large checkpoint load at TP8, so a
-deployment opts in via ``dist_timeout_s`` in its config; the env var overrides
-it per process. Unset means ``{}`` — torch's default, untouched.
-"""
+"""``resolve_dist_timeout`` / ``MSTAR_DIST_TIMEOUT_S``: the process-group timeout knob."""
 
 from __future__ import annotations
 

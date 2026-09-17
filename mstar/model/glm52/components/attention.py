@@ -1,35 +1,4 @@
-"""GLM-5.2 MLA attention with absorbed and naive fallback paths.
-
-Same structure as ``kimi_k2_7/components/attention.py`` (both are
-DeepSeek-family MLA) with GLM geometry — q_lora 2048, nope 192, rope 64,
-v_head 256, 64 heads — and plain (non-Yarn) RoPE, so every mscale term is 1.
-qk_head_dim is exactly 256, so the FlashInfer pad on the naive path is a
-no-op for the full model (reduced test configs still exercise it: 24 -> 64).
-
-Phase C: FULL indexer layers (``is_full_indexer_layer``) instantiate a
-``Glm52Indexer`` whose checkpoint weights now load; the naive path accepts
-a precomputed ``dsa_selection`` and restricts softmax to the selected set
-(reference semantics: masked dense attention, -1 entries excluded). At
-ctx <= index_topk, top-k selection of <= topk tokens is the identity, so
-the dense path IS the exact DSA computation in that regime.
-
-Engine half (``dsa_ctx``, absorbed path only): FULL layers append this
-chunk's index keys to the per-request k-store and — once any request's
-context exceeds ``index_topk`` — compute the selection SHARED layers then
-reuse (``_dsa_update``). Beyond topk, decode queries run
-``_run_sparse_absorbed``: gather the selected <= topk latent vectors from
-the paged MLA cache through the request's page table and run dense MQA
-over the gathered set — the same math as ``MlaAbsorbCacheManager._sdpa_mla``
-restricted to the selected rows (-1 padding excluded; the spec marks
-gather + dense semantically identical to the FlashMLA sparse kernel,
-dsa-indexer-spec.md section 4). While every context fits topk the paged
-kernel path runs UNTOUCHED — bit-identical to flag-off.
-
-Engine resources: the layer binds the node's KV resource (the paged latent
-cache, ``layer_view``) and its attention resource (``write_latent`` + ``run``
-on the absorbed path; ``write_kv`` + ``run`` on the naive one) once at load,
-by the labels in ``config.py``; nothing engine-side is threaded per call.
-"""
+"""GLM-5.2 MLA attention with absorbed and naive fallback paths."""
 from __future__ import annotations
 
 import math
@@ -64,11 +33,7 @@ def dsa_selection_to_mask(
 def masked_reference_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
-    """Dense ``(T, H, D)`` attention with an additive ``(T, T)`` mask.
-
-    Matches ``run_attention`` semantics: scale is 1/sqrt(padded head dim)
-    (any intended softmax-scale correction is pre-folded into ``q``).
-    """
+    """Dense ``(T, H, D)`` attention with an additive ``(T, T)`` mask."""
     scale = q.shape[-1] ** -0.5
     scores = torch.einsum("qhd,khd->hqk", q, k) * scale + mask
     return torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), v)
@@ -162,12 +127,8 @@ class Glm52MLAAttention(nn.Module):
         rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """``dsa_selection``: optional ``(T, index_topk)`` int rows from
-        ``Glm52Indexer.compute_selection`` (-1 = padding). When given, the
-        naive path restricts softmax to the selected keys of the current
-        batch; when None, dense behavior is unchanged.
-
-        ``dsa_ctx``: the engine-threaded per-forward DSA context (absorbed
-        path only) — see the module docstring and ``_dsa_update``."""
+        ``Glm52Indexer.compute_selection`` (-1 = padding).
+        """
         if dsa_ctx is not None and not self.mla_absorb:
             # The sparse gather path reads the paged 576-dim latent cache;
             # the naive backend stores padded per-head K/V instead. The
@@ -303,17 +264,7 @@ class Glm52MLAAttention(nn.Module):
         q_c: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor | None:
-        """Maintain the indexer k-store and return the selection to apply.
-
-        FULL layers (``self.indexer`` set) always append this chunk's
-        roped+normed keys — history must be complete from token 0 for the
-        step that first crosses topk — and, when any request is beyond topk,
-        score their per-request history (current chunk included: the causal
-        window is self-inclusive) and publish the selection on ``dsa_ctx``.
-        SHARED layers publish nothing and reuse the most recent FULL layer's
-        rows (IndexShare, spec section 3). Returns None in the identity
-        regime so the caller keeps the untouched dense path.
-        """
+        """Maintain the indexer k-store and return the selection to apply."""
         if self.indexer is None:
             if not dsa_ctx.needs_selection:
                 return None
@@ -362,24 +313,7 @@ class Glm52MLAAttention(nn.Module):
         kv_c: torch.Tensor,
         k_pe: torch.Tensor,
     ) -> torch.Tensor:
-        """Sparse absorbed MLA: gather the selected latents, dense MQA over them.
-
-        Replaces the paged kernel call beyond topk, so it also does that
-        call's cache write: scatter this chunk's 576-dim latents to their
-        page slots (same ``page_indices[pos // page_size]`` mapping the
-        attention resource's plan uses) BEFORE gathering — the causal
-        window includes self, so the current token's latent must be
-        readable. Then, per query, gather the selected <= topk latents
-        (request-local indices -> page slots; -1 padding excluded by the
-        gather itself) and run ``_sdpa_mla``'s math over the gathered set:
-        fp32 MQA, softmax over exactly the selected rows, value = the
-        ckv slice. Gathered-row order is irrelevant up to fp addition order.
-
-        v1 is decode-shaped (q_len == 1 per request; the submodule guard
-        keeps prefill within topk) and loops requests on the host — fine at
-        decode batch sizes, and the batched-gather kernel belongs to the
-        fp8 paged-pool follow-up.
-        """
+        """Sparse absorbed MLA: gather the selected latents, dense MQA over them."""
         latent_cache = self._kv.layer_view(self.cache_layer_idx)
         page_size = self._kv.config.page_size
         latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)  # (T, L + Drope)

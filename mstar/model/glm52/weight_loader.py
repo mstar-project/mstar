@@ -1,18 +1,4 @@
-"""HF GLM-5.2 checkpoint loading for the glm52 module tree.
-
-The checkpoint documents its own map: ``modules_to_not_convert`` names every
-bf16 module, ``self_attn.indexer.*`` appears on every 4th layer (DSA), and
-layer index 78 (== num_hidden_layers) is the MTP module in DeepSeek-V3
-naming (enorm/hnorm/eh_proj/shared_head + a full decoder layer).
-
-Phase C: indexer keys load on FULL layers (``load_indexer=True`` default) —
-``wq_b``/``wk`` arrive as plain fp8 ``.weight`` + ``weight_scale_inv``
-pairs the dequant stream handles like any other, ``weights_proj``/``k_norm``
-(weight AND bias) pass through bf16. MTP layer-78 keys are still skipped up
-front — with a count logged, not silently — until Phase D. Everything else
-dequantizes to bf16 except routed experts, which load FP8-resident (see
-``quantization.py`` for why).
-"""
+"""HF GLM-5.2 checkpoint loading for the glm52 module tree."""
 from __future__ import annotations
 
 import logging
@@ -64,14 +50,6 @@ def skip_phase_b_keys(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Drop MTP-layer keys — and, with ``load_indexer=False``, indexer keys —
     before any dequant buffering.
-
-    Runs upstream of the fp8 stream so skipped fp8 pairs are never buffered
-    or dequantized (the MTP layer alone carries ~9.7B expert params, and its
-    indexer weights would otherwise sit unpaired in the stream).
-
-    ``load_mtp=True`` (M3) passes layer-78 keys through instead; the
-    indexer rule still runs first, so ``load_indexer=False`` drops the MTP
-    block's own indexer along with the trunk's.
     """
     skipped_indexer = 0
     skipped_mtp = 0
@@ -144,12 +122,7 @@ def build_glm52_stacked_params(
 
 
 def restore_fp32_params(module: nn.Module) -> None:
-    """Re-widen params the checkpoint stores fp32 before loading into them.
-
-    ``model.to(autocast_dtype)`` narrows every floating param to bf16;
-    the router selection bias and the fp8 block scales must stay fp32.
-    (The fp8 expert bytes live in uint8 containers and are immune.)
-    """
+    """Re-widen params the checkpoint stores fp32 before loading into them."""
     for name, param in module.named_parameters():
         if name.endswith("e_score_correction_bias") or name.endswith("_scale_inv"):
             if param.dtype != torch.float32:
@@ -164,28 +137,7 @@ def build_glm52_read_plan(
     load_indexer: bool = True,
     load_mtp: bool = False,
 ) -> tuple[set[str], "dict[str, tuple[int, int, int]]"]:
-    """Keys-to-read + per-key slice specs for the TP fast read path.
-
-    Cuts per-rank checkpoint IO two ways: (1) keys the model never loads
-    (the MTP layer unless ``load_mtp``, non-FULL-layer indexer keys) are
-    excluded up front so the iterator never reads them; (2) routed-expert
-    tensors — ~96% of the checkpoint's bytes — get ``(dim, start, stop)``
-    specs so each rank reads only its TP shard (GLM-5.2 at TP8: ~704 GB ->
-    ~120 GB per rank). The expert loaders accept these pre-sliced shards
-    shape-driven.
-
-    ``load_mtp`` MUST mirror the model's drafting flag: this plan runs
-    UPSTREAM of ``skip_phase_b_keys``, so a plan built without it starves
-    the loader of every layer-78 key with nothing left to log — the draft
-    module then serves ``to_empty`` memory, which is silent 0.00
-    acceptance (measured, 2026-08-09 bench). With it, the MTP layer's
-    keys flow like trunk keys: its FULL indexer is read and its routed
-    experts hit the same slice specs (the expert regex is layer-agnostic).
-
-    Scale slicing relies on the shard/block divisibility the MoE block
-    already asserts (per-rank intermediate is a whole number of scale
-    blocks), so sliced fp8 bytes and sliced scales stay aligned.
-    """
+    """Keys-to-read + per-key slice specs for the TP fast read path."""
     from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
     fp8_experts = config.quantization_config is not None and config.moe_fp8_resident
@@ -240,7 +192,8 @@ def _make_glm52_name_remapper(num_hidden_layers: int, load_mtp: bool):
     submodule: strip the layer prefix, apply ``remap_mtp_key`` (glue keys
     direct, the rest under ``transformer_layer.``), then the trunk naming
     conventions — the expert/shared-expert regexes are prefix-agnostic, so
-    the fused stacked-param rules apply to the MTP MoE unchanged."""
+    the fused stacked-param rules apply to the MTP MoE unchanged.
+    """
     if not load_mtp:
         return glm52_name_remapper
 

@@ -1,11 +1,4 @@
-"""CPU tests for the GLM-5.2 MTP components (M3, Phase D).
-
-No engine, no GPU: pins the module's construction against the checkpoint's
-layer-78 key inventory, the fusion math, the module forward over the bound
-KV/attention resources (its KV lands on the plane layer), and the greedy
-verify rule the draft loop builds on. The draft loop itself runs in
-test_glm52_engine_cycle.py.
-"""
+"""CPU tests for the GLM-5.2 MTP components (M3, Phase D)."""
 
 import sys
 import types
@@ -41,19 +34,7 @@ if "flashinfer" not in sys.modules:
 
 @pytest.fixture(autouse=True)
 def _force_cpu_flashinfer(monkeypatch):
-    """Force the CPU stub for the duration of every test in this module.
-
-    The import-time guard above is NOT sufficient: on a GPU box flashinfer
-    is legitimately installed, and any test module imported earlier in the
-    same session (test_fused_rmsnorm imports it directly; qwen3_tts and the
-    api-result tests pull it in transitively) populates sys.modules with the
-    REAL library — after which the guard skips the stub and these CPU tests
-    silently run GPU kernels against CPU tensors. That is how this file's
-    bit-identity assertions started failing in full-suite runs while passing
-    in isolation. monkeypatch.setitem restores the previous entry at
-    teardown, so modules that WANT the real library are unaffected (the
-    test_glm52_indexer.py pattern). ``run_rms_norm`` imports flashinfer
-    inside the call, so a per-test swap reaches it."""
+    """Force the CPU stub for the duration of every test in this module."""
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
 
 from mstar.engine.resources import (  # noqa: E402
@@ -125,7 +106,8 @@ def _expected_module_key(sub_key: str) -> str:
     + fused expert stacking): shared_experts -> shared_expert, per-expert
     gate/up/down projections -> the fused stacked parameters. This mirrors,
     not reimplements, the loader — if the loader's conventions change, the
-    trunk goldens break first and this map is updated with them."""
+    trunk goldens break first and this map is updated with them.
+    """
     routed = remap_mtp_key(sub_key)
     routed = routed.replace(".shared_experts.", ".shared_expert.")
     import re
@@ -162,12 +144,10 @@ def test_mtp_module_refuses_shared_position():
 
 
 def test_mtp_module_covers_checkpoint_keys():
-    """Every layer-78 checkpoint key must land on a real module parameter
-    under subtree routing + the trunk loader's naming conventions — the
-    loader contract, pinned before the MTP loader exists. The reduced
-    config has fewer experts (bf16, non-fp8-resident: fused params carry
-    no _fp8 suffix); expert index 0 exists in both, which is all the
-    mapping needs."""
+    """Every layer-78 checkpoint key must land on a real module parameter under subtree
+    routing + the trunk loader's naming conventions — the loader contract, pinned before
+    the MTP loader exists.
+    """
     cfg = _reduced_mtp_config()
     module = Glm52MTPModule(cfg)
     sd_keys = set(module.state_dict().keys())
@@ -239,7 +219,8 @@ def test_mtp_forward_writes_the_plane_layer():
     like any trunk layer, and its KV goes to the plane: layer index
     ``num_hidden_layers`` (4 here, the one extra plane the resource
     declaration adds under MTP), never a trunk layer. The forward returns
-    ``(head_input, raw_hidden)`` of the token shape."""
+    ``(head_input, raw_hidden)`` of the token shape.
+    """
     cfg = _reduced_mtp_config()
     cfg.mla_absorb = True
     cfg.mtp_num_draft_tokens = 2
@@ -327,7 +308,6 @@ def test_verify_emission_invariant():
 
 # ---------------------------------------------------------------------------
 # M3 weight loader path: layer-78 keys -> the ``mtp.`` submodule.
-# ---------------------------------------------------------------------------
 
 def test_mtp_flag_default_off_no_module():
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM

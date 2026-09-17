@@ -1,10 +1,4 @@
-"""``KVManager.rewind``: take committed tokens back off a stream.
-
-Speculative decoding commits the k+1 verify rows of a step and keeps only the
-accepted prefix. The pages stay (``page_indices`` is a high-water mark), the
-next step overwrites the freed slots in place, and its plan sees the shorter
-stream.
-"""
+"""``KVManager.rewind``: take committed tokens back off a stream."""
 
 from __future__ import annotations
 

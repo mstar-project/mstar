@@ -1,15 +1,4 @@
-"""GLM-5.2 on the resource-pools engine, CPU, reduced config.
-
-The property: at temperature 0, MTP-on emits the bit-identical token stream
-to MTP-off — greedy verify guarantees it by construction. These tests run
-the guarantee through the real per-step contract (``declare_step`` → admit →
-plan → ``preprocess`` → ``forward_batched`` → commit → ``postprocess`` →
-``check_stop``) over the real ``KVManager`` (MLA latent layout on the
-absorbed path, NHD on the naive one), the real MLA attention resource on its
-SDPA fallback, and the greedy sampler. No engine object, no GPU, no
-captured graphs (every region runs its eager fallback through the same
-resources a replay would plan).
-"""
+"""GLM-5.2 on the resource-pools engine, CPU, reduced config."""
 from __future__ import annotations
 
 import sys
@@ -85,12 +74,7 @@ def _fwd_info(rid: str, max_tokens: int, ignore_eos: bool) -> SimpleNamespace:
 
 
 class _Driver:
-    """The engine's per-step cycle for one node, over real resources.
-
-    ``regions=True`` also builds the submodule's piecewise regions as eager
-    stand-ins (``EagerPiecewiseRunner``), so the captured-region code and
-    its step declarations run — sub-plans, ``select_plan_slot``,
-    ``step_kwargs`` — without a graph."""
+    """The engine's per-step cycle for one node, over real resources."""
 
     def __init__(self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rids: list[str],
                  regions: bool = False, batch_sizes=(1, 2, 4)):
@@ -159,7 +143,8 @@ def _model(cfg: Glm52ModelConfig, seed: int = 0) -> Glm52ForCausalLM:
     """Every parameter randomized: the MoE expert containers are raw
     ``torch.empty`` at construction (the loader fills them), and garbage
     there NaNs the logits — a NaN model emits an all-zero argmax stream on
-    every path, which makes a stream comparison vacuous."""
+    every path, which makes a stream comparison vacuous.
+    """
     torch.manual_seed(seed)
     model = Glm52ForCausalLM(cfg)
     for name, p in model.named_parameters():
@@ -326,10 +311,10 @@ def test_declare_step_shapes():
 
 @pytest.mark.parametrize("k", [1, 2, 3])
 def test_mtp_regions_match_baseline_bitwise(k):
-    """The captured regions' code (trunk verify, one-graph draft phase with
-    its k sub-plans, prefill trunk) run eagerly through the region contract
-    emit the same stream as plain decode. The draft chain rides the
-    draft-phase region, so mtp_draft never runs at k>=2."""
+    """The captured regions' code (trunk verify, one-graph draft phase with its k
+    sub-plans, prefill trunk) run eagerly through the region contract emit the same
+    stream as plain decode.
+    """
     (base, spec), drivers = _run_pair(
         k=k, max_tokens=18, ignore_eos=True, mla_absorb=True, regions=True,
     )

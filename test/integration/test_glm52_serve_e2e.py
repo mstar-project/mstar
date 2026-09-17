@@ -1,22 +1,4 @@
-"""In-process 1-GPU serve smoke for GLM-5.2 (fp8-resident experts).
-
-Fabricates an on-disk fp8-block checkpoint (routed experts as genuine e4m3
-weight + weight_scale_inv pairs, plus two fp8 dense projections for load-path
-coverage), then drives the real serve path on CUDA: ``Glm52Model.get_submodule``
-(meta init -> to_empty -> load_weights -> process_weights_after_loading), the
-node's resources built from the model's own declaration the way
-``Engine.load_model`` builds them (``get_node_resources`` -> the deployment's
-``resources: kv:`` overrides -> ``build_resource``), the submodule bound to
-them, and the engine's per-step cycle (declare -> admit -> plan -> preprocess
--> forward -> commit -> postprocess -> check_stop) through prefill and the
-decode loop. This is the cheap gate before the 750 GB TP8 load: it exercises
-every fp8 code path the CPU tests can't put on a device, over the real paged
-FlashInfer cache.
-
-``mstar.model.base`` pulls the sampler's Triton kernels in, so ``Glm52Model``
-is imported inside the tests to keep collection clean on CUDA-less machines
-(``test_fused_moe_fp8.py`` precedent).
-"""
+"""In-process 1-GPU serve smoke for GLM-5.2 (fp8-resident experts)."""
 import pytest
 import torch
 
@@ -171,13 +153,6 @@ def _load_model(tmp_path):
 class _Serve:
     """One request's serve loop over the node's real resources: what the
     engine does around the submodule, minus the worker around the engine.
-
-    Resources come from the model's declaration through the YAML overrides
-    and ``build_resource`` (``Engine.load_model``), the request opens on the
-    per-resource configs the model resolves for it
-    (``get_request_resource_configs``), and every step runs the runner's
-    declare -> admit -> plan -> forward -> commit cycle under the engine's
-    no_grad + autocast scope.
     """
 
     def __init__(self, model, submodule: Glm52LLMSubmodule, rid: str = "r0",

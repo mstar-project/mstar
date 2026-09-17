@@ -1,7 +1,6 @@
-"""Glm52Model contract on the resource-pools engine: registry, graph walks,
-the prefill -> decode transition, the node's resource declaration, the
-per-request sampling config, and the submodule's stop / preprocess guards.
-No weights, no GPU.
+"""Glm52Model contract on the resource-pools engine: registry, graph walks, the prefill ->
+decode transition, the node's resource declaration, the per-request sampling config, and
+the submodule's stop / preprocess guards.
 """
 import sys
 import types
@@ -182,14 +181,9 @@ def test_glm52_prefill_transitions_to_decode():
 
 
 def test_glm52_prefill_drafts_default_on_and_escape_hatch(monkeypatch):
-    """The prefill-draft edge ships ON as of 2026-08-19 (arm L: 78.53 tok/s,
-    3264 bit-exact, forced n_acc=0 bin 143 -> 129). The 2026-08-10 regression
-    that kept it off (33.02 / p1 0.18) was the `text_inputs` name collision,
-    fixed since. MSTAR_GLM52_MTP_PREFILL_DRAFTS=0 must still drop the edge.
-
-    delenv, not ambient env: reading whatever the process happens to have
-    set is the exact dependence that let 8 tests rot silently in this
-    suite."""
+    """The prefill-draft edge ships ON as of 2026-08-19 (arm L: 78.53 tok/s, 3264
+    bit-exact, forced n_acc=0 bin 143 -> 129).
+    """
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
     monkeypatch.delenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", raising=False)
@@ -201,12 +195,7 @@ def test_glm52_prefill_drafts_default_on_and_escape_hatch(monkeypatch):
 
 
 def test_glm52_prefill_persists_drafts_only_under_mtp(monkeypatch):
-    """The MTP prefill computes [emitted, k drafts]. An output with no
-    declared edge is UNROUTED — the worker drops it — so without this edge
-    the prefill's whole sync+draft pass was wasted TTFT work and the first
-    decode step ran unspeculated, injecting one artificial n_acc=0 per
-    request into the acceptance histogram. k=0 must keep the byte-identical
-    old walk."""
+    """The MTP prefill computes [emitted, k drafts]."""
     from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
@@ -226,15 +215,7 @@ def test_glm52_prefill_persists_drafts_only_under_mtp(monkeypatch):
 
 
 def test_glm52_decode_never_reseeds_from_the_prompt_signal(monkeypatch):
-    """REGRESSION (2026-08-10, cost a 27-min box run to find).
-
-    The conductor seeds persist_signals from initial_signals, and this
-    model's initial signal is named "text_inputs" — the PROMPT. A transition
-    that reads that key hands decode the entire prompt back as its first
-    step (measured: a 17-row decode step with no capture bucket, and with
-    the prefill-draft edge on, p1 acceptance 0.76 -> 0.18). The draft bundle
-    travels under a dedicated name that cannot collide; feed the prompt in
-    under BOTH names to prove the transition ignores the prompt one."""
+    """REGRESSION (2026-08-10, cost a 27-min box run to find)."""
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
     assert MTP_DRAFT_BUNDLE != "text_inputs"
@@ -263,11 +244,7 @@ def test_glm52_decode_never_reseeds_from_the_prompt_signal(monkeypatch):
 
 
 def test_glm52_decode_ignores_a_persisted_bundle_when_the_flag_is_off(monkeypatch):
-    """The READ gate. get_graph_walk_graphs is evaluated independently in
-    the conductor and in every worker, so a split-flag deployment can have
-    a worker persisting a bundle that a conductor with the flag OFF would
-    consume. Gating only the write path is what regressed the "off" arm on
-    2026-08-10."""
+    """The READ gate."""
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
     monkeypatch.setenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "0")
@@ -318,13 +295,7 @@ def test_glm52_decode_seeds_from_drafts_when_mtp_persisted_them(monkeypatch):
 
 
 def test_glm52_decode_loop_cap_stays_below_the_context_guard():
-    """The decode loop cap must NOT be raised to max_seq_len.
-
-    The context-window check lives in preprocess, which is BATCH-level and
-    raises, so a request that iterates into it fails every CO-BATCHED
-    request. A cap at max_seq_len lets a long request reach that guard,
-    converting a silent per-request truncation into a batch kill. Tried
-    2026-08-10 and reverted; this pins the revert."""
+    """The decode loop cap must NOT be raised to max_seq_len."""
     model = _make_model_k(0)
     cfg = model.config
     decode = model.get_graph_walk_graphs()["decode"]
@@ -380,10 +351,7 @@ def test_glm52_request_config_is_the_sampler_config():
 
 
 def test_glm52_mtp_declares_greedy_default_but_honors_explicit_asks():
-    """MTP v1 decode is raw argmax. A bare request must serve coherently
-    (greedy declared) rather than inherit config temperature=1.0 and be
-    refused by prepare_inputs; an EXPLICIT non-greedy ask must survive to
-    that refusal, because silently ignoring an ask is the failure mode."""
+    """MTP v1 decode is raw argmax."""
     k2 = _make_model_k(2)
     assert k2.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == 0.0
     assert k2.get_request_resource_configs(

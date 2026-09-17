@@ -1,16 +1,4 @@
-"""Row arithmetic for the PADDED MTP sync pass (glm52-gaps #1).
-
-The sync pass is the last eager phase of the MTP step (~10 of 36.5 ms) and it
-stayed eager because its row count is data-dependent. Padding each request to
-k+1 rows gives it one fixed shape per batch size, but moves all the risk into
-bookkeeping: which row draft 1 comes from, what RoPE position each row gets,
-and how far to rewind the counter afterwards.
-
-That bookkeeping is pure arithmetic, so it is pinned here on CPU rather than
-discovered on 8 GPUs — where the failure mode would be *silent*: a mis-indexed
-last row yields a wrong draft, greedy verify rejects it, and the symptom is
-merely lower acceptance, indistinguishable from a modelling problem.
-"""
+"""Row arithmetic for the PADDED MTP sync pass (glm52-gaps #1)."""
 from __future__ import annotations
 
 import sys
