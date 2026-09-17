@@ -105,7 +105,7 @@ Convenience wrappers:
    * - ``chat(prompt, *, images=None, audio=None, output_modalities=("text",), stream=False, **kw)``
      - Text generation (and, with ``output_modalities=("text", "audio")``, speech).
    * - ``generate_image(prompt, **kw)``
-     - PNG ``bytes`` (e.g. BAGEL text-to-image).
+     - PNG ``bytes`` (e.g. BAGEL, FLUX.2 klein text-to-image).
    * - ``edit_image(prompt, image, **kw)``
      - PNG ``bytes`` for an edit of ``image`` (a path, bytes, or a list of them for
        multi-reference models).
@@ -192,6 +192,9 @@ Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
   ``/v1/images/edits`` for image output.
+- **FLUX.2 klein** — ``/v1/images/generations`` and ``/v1/images/edits`` only
+  (``size`` as ``WxH``, multiples of 16; ``seed``; ``num_inference_steps`` via
+  ``extra_body``).
 - **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
   residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
