@@ -125,7 +125,11 @@ def test_registry_graph_and_yaml_are_consistent(key, repo, yaml_name):
     topo = model.get_partition_topology()
     assert topo.connections[0].edge_name == SPEECH_TOKENS
     policy = topo.connections[0].chunk_policy_factory()
-    assert not policy.is_ready(model.config.t3.max_speech_tokens)  # flushes at producer done
+    assert policy.is_ready(model.config.stream_first_chunk_tokens)
+    assert not policy.is_ready(model.config.stream_first_chunk_tokens - 1)
+    model.config.stream_chunk_tokens = 0
+    offline = topo.connections[0].chunk_policy_factory()
+    assert not offline.is_ready(model.config.t3.max_speech_tokens)  # flushes at producer done
 
     specs = model.get_node_resources()
     kv = next(s for s in specs if isinstance(s, KVSpec))
@@ -554,52 +558,142 @@ def test_t3_stop_on_eos_and_token_budget():
 
 
 class _FakeS3Gen(torch.nn.Module):
+    """Frame bookkeeping of the real S3Gen without its network: one token is
+    two mel frames, one frame 480 samples; the mel carries the token id so the
+    tests can see which frames a chunk re-synthesised."""
+
+    dtype = torch.float32
+
     def __init__(self):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
         self.calls = []
 
-    def tokens_to_mel(self, tokens, lens, ref, *, n_timesteps, generator=None, noise=None):
-        self.calls.append(("mel", tokens.shape, int(lens[0]), n_timesteps, ref))
-        return torch.zeros(1, 80, 2 * tokens.shape[1])
+    def tokens_to_mel(self, tokens, lens, ref, *, n_timesteps, generator=None, noise=None, finalize=True):
+        self.calls.append(("mel", tokens.shape, int(lens[0]), n_timesteps, ref, finalize, noise is not None))
+        frames = tokens.repeat_interleave(2, dim=1).float()[:, None]  # [1, 1, 2L]
+        if not finalize:
+            frames = frames[:, :, :-6]
+        return frames.expand(-1, 80, -1).clone()
 
-    def mel_to_wav(self, mel, *, generator=None):
-        return torch.full((1, mel.shape[-1] * 480), 0.5)
+    def vocode(self, mel, *, generator=None, cache_source=None, fade_in=True):
+        self.calls.append(("vocode", mel.shape[-1], cache_source is not None, fade_in))
+        wav = mel[:, 0].repeat_interleave(480, dim=1) / 10000.0
+        return wav, torch.ones(1, 1, wav.shape[-1])
+
+    def mel_to_wav(self, mel, *, generator=None, fade_in=True):
+        return self.vocode(mel, generator=generator, fade_in=fade_in)[0]
 
 
-def _s3_info(seed=7, watermark=False):
+def _s3_info(seed=7, watermark=False, rid="r"):
     return SimpleNamespace(
-        request_id="r", random_seed=seed,
+        request_id=rid, random_seed=seed,
         step_metadata={"n_cfm_timesteps": 4, "watermark": watermark},
     )
 
 
-def test_s3gen_filters_control_tokens_and_uses_builtin_voice():
-    config = ChatterboxConfig.chatterbox()
+def _s3_submodule(variant="chatterbox"):
+    config = ChatterboxConfig.from_variant(variant)
     fake = _FakeS3Gen()
-    sub = S3GenSubmodule(fake, s3_tokenizer=None, config=config, builtin_voice="builtin")
-    tokens = torch.tensor([[6561], [10], [20], [6562]])  # BOS, speech, speech, EOS
-    prepared = sub.prepare_inputs("s3gen_chunk", _s3_info(), {SPEECH_TOKENS: [tokens]})
-    assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [10, 20]
-    assert prepared.kwargs["ref"] == "builtin" and prepared.kwargs["seed"] == 7
-    assert prepared.kwargs["n_timesteps"] == 4 and prepared.kwargs["watermark"] is False
+    builtin = SimpleNamespace(num_prompt_tokens=4)
+    return S3GenSubmodule(fake, s3_tokenizer=None, config=config, builtin_voice=builtin), fake
 
+
+def _run(sub, tokens, is_final=None, rid="r"):
+    inputs = {SPEECH_TOKENS: [tokens]} if tokens is not None else {SPEECH_TOKENS: []}
+    kwargs = {} if is_final is None else {"is_final_stream_chunk": is_final}
+    prepared = sub.prepare_inputs("s3gen_chunk", _s3_info(rid=rid), inputs, **kwargs)
     out = sub.forward("s3gen_chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
-    pcm = out["audio_chunk"][0]
+    return prepared, out["audio_chunk"][0]
+
+
+def test_s3gen_offline_chunk_filters_control_tokens_and_uses_builtin_voice():
+    sub, fake = _s3_submodule()
+    tokens = torch.tensor([[6561], [10], [20], [6562]])  # BOS, speech, speech, EOS
+    prepared, pcm = _run(sub, tokens)  # no engine flag: EOS marks the end
+    assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [10, 20]
+    assert prepared.kwargs["ref"] is sub.builtin_voice and prepared.kwargs["seed"] == 7
+    assert prepared.kwargs["n_timesteps"] == 4 and prepared.kwargs["watermark"] is False
+    assert prepared.kwargs["is_final"] is True
     assert pcm.dtype == torch.int16 and pcm.numel() == 2 * 2 * 480
-    assert pcm[0].item() == int(0.5 * 32767)
-    assert fake.calls[0][1:4] == ((1, 2), 2, 4)
+    assert fake.calls[0][1:4] == ((1, 2), 2, 4) and fake.calls[0][5] is True
 
 
 def test_s3gen_turbo_appends_silence_and_empty_input_yields_no_audio():
-    config = ChatterboxConfig.turbo()
-    sub = S3GenSubmodule(_FakeS3Gen(), s3_tokenizer=None, config=config, builtin_voice="builtin")
-    prepared = sub.prepare_inputs("s3gen_chunk", _s3_info(), {SPEECH_TOKENS: [torch.tensor([[5], [6562]])]})
-    assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [5, 4299, 4299, 4299]
-    empty = sub.prepare_inputs("s3gen_chunk", _s3_info(), {SPEECH_TOKENS: [torch.tensor([[6562]])]})
-    assert empty.tensor_inputs[SPEECH_TOKENS].numel() == 0
-    out = sub.forward("s3gen_chunk", None, **empty.tensor_inputs, **empty.kwargs)
-    assert out["audio_chunk"][0].numel() == 0
+    sub, fake = _s3_submodule("turbo")
+    prepared, pcm = _run(sub, torch.tensor([[5], [6562]]))
+    assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [5]
+    assert fake.calls[0][1] == (1, 4)  # 5 + three silence tokens
+    assert pcm.numel() == 4 * 2 * 480
+
+    sub, fake = _s3_submodule("turbo")
+    _, pcm = _run(sub, torch.tensor([[6562]]))
+    assert pcm.numel() == 0 and fake.calls == []
+    sub, fake = _s3_submodule("turbo")
+    _, pcm = _run(sub, None)  # empty final flush
+    assert pcm.numel() == 0
+
+
+def test_s3gen_streaming_holds_back_lookahead_and_vocoder_tail():
+    sub, fake = _s3_submodule()
+    spf = 2 * 480  # samples per token
+    tail = sub.cache_samples  # 8 frames x 480
+
+    # chunk 1: 15 tokens, not final -> 12 tokens decoded, 8 frames held back
+    _, pcm1 = _run(sub, torch.arange(1, 16)[:, None], is_final=False)
+    assert pcm1.numel() == 12 * spf - tail
+    mel_call, voc_call = fake.calls[-2], fake.calls[-1]
+    assert mel_call[1] == (1, 15) and mel_call[5] is False and mel_call[6] is True  # noise field passed
+    assert voc_call == ("vocode", 24, False, True)  # 24 new frames, no source cache, utterance fade-in
+    stream = sub.request_state("r")["stream"]
+    assert stream.token_offset == 12 and stream.noise is not None
+    # prompt frames + every token the request may still produce
+    assert stream.noise.shape[-1] == 2 * (4 + ChatterboxConfig.chatterbox().t3.max_speech_tokens)
+
+    # chunk 2: 25 more tokens (40 total), still not final -> tokens 12..37 new
+    _, pcm2 = _run(sub, torch.arange(16, 41)[:, None], is_final=False)
+    assert pcm2.numel() == (37 - 12) * spf  # tail re-emitted, new tail withheld
+    mel_call, voc_call = fake.calls[-2], fake.calls[-1]
+    assert mel_call[1] == (1, 40) and mel_call[5] is False
+    assert voc_call == ("vocode", 8 + 25 * 2, True, False)  # cache frames + new, source continued, no fade-in
+    assert sub.request_state("r")["stream"].token_offset == 37
+
+    # a small chunk still moves the look-ahead window: 2 more tokens decoded
+    _, pcm3 = _run(sub, torch.tensor([[41], [42]]), is_final=False)
+    assert pcm3.numel() == (39 - 37) * spf
+    assert sub.request_state("r")["stream"].token_offset == 39
+
+    # final flush with EOS: everything left (43 tokens total) is decoded
+    _, pcm4 = _run(sub, torch.tensor([[43], [6562]]), is_final=True)
+    assert pcm4.numel() == (43 - 39) * spf + tail
+    assert fake.calls[-2][1] == (1, 43) and fake.calls[-2][5] is True
+    assert sub.request_state("r")["stream"].done
+    total = pcm1.numel() + pcm2.numel() + pcm3.numel() + pcm4.numel()
+    assert total == 43 * spf
+
+    # after the end, further chunks are ignored
+    _, pcm5 = _run(sub, torch.tensor([[1]]), is_final=True)
+    assert pcm5.numel() == 0
+
+
+def test_s3gen_streaming_final_flush_without_new_tokens_releases_the_tail():
+    sub, fake = _s3_submodule()
+    _, pcm1 = _run(sub, torch.arange(1, 21)[:, None], is_final=False)  # 17 decoded
+    _, pcm2 = _run(sub, torch.tensor([[6562]]), is_final=True)  # EOS only: 20 total, 3 new
+    assert pcm1.numel() + pcm2.numel() == 20 * 2 * 480
+    sub, fake = _s3_submodule()
+    _run(sub, torch.arange(1, 21)[:, None], is_final=False)
+    # engine says final but no new tokens arrive: the look-ahead tokens still finish
+    _, pcm = _run(sub, None, is_final=True)
+    assert pcm.numel() == 3 * 2 * 480 + sub.cache_samples
+
+
+def test_s3gen_streaming_turbo_adds_silence_only_at_the_end():
+    sub, fake = _s3_submodule("turbo")
+    _run(sub, torch.arange(1, 21)[:, None], is_final=False)
+    assert fake.calls[0][1] == (1, 20)
+    _run(sub, torch.tensor([[21]]), is_final=True)
+    assert fake.calls[-2][1] == (1, 24)  # 21 tokens + 3 silence, finalised once
 
 
 def test_s3gen_reference_is_cached_per_voice_key():
@@ -614,6 +708,7 @@ def test_s3gen_reference_is_cached_per_voice_key():
     second = sub.prepare_inputs("s3gen_chunk_voice", _s3_info(), inputs)
     assert first.kwargs["ref"] == ("ref", 2400) and second.kwargs["ref"] == first.kwargs["ref"]
     assert calls == [2400]
+    assert first.kwargs["is_final"] is False  # no flag, no EOS, tokens present
 
 
 def test_voice_cache_is_lru():
