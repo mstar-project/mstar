@@ -1,0 +1,20 @@
+model: "cosmos3_super_t2i_4step"
+# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
+max_seq_len: 8192
+# Per-rank KV pool, as for Super at TP=2 (see cosmos3_super_tp2.yaml).
+resources:
+  kv:
+    max_num_pages: 384
+model_kwargs:
+  cuda_graph: true
+  graph_max_latent_area: 2000
+  # Distilled: 4 fixed sigmas, guidance baked into the weights. The distilled
+  # sampler reads its sigma list from the checkpoint scheduler config.
+  num_inference_steps: 4
+  guidance_scale: 1.0
+node_groups:
+  - node_names: ["dit"]
+    ranks: [0, 1]
+    tp_size: 2
+  - node_names: ["vae_encoder", "vae_decoder", "audio_decoder"]
+    ranks: [0]
