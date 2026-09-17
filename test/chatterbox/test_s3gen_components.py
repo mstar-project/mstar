@@ -174,6 +174,44 @@ def test_batched_tokens_to_mel_matches_single(pair):
     assert diff_a < 1e-3 and diff_b < 1e-3
 
 
+def test_tokens_to_mel_rows_matches_single_per_row(pair):
+    """Rows with their own reference (different prompt lengths), look-ahead
+    state and noise, solved as one batch, reproduce each row's single-request
+    mel: a final row, a streaming row with the look-ahead cut, and a row with
+    a shorter prompt."""
+    from mstar.model.chatterbox.components.s3gen import FlowRow, ReferenceConditioning
+
+    variant, (ref, mine, ref_dict, mine_ref, n_steps) = pair
+    tokens = _tokens(mine_ref)[0]
+    short_ref = ReferenceConditioning(
+        prompt_tokens=mine_ref.prompt_tokens[:, :-11],
+        prompt_feat=mine_ref.prompt_feat[:, :-22],
+        embedding=mine_ref.embedding,
+    )
+    gen = torch.Generator().manual_seed(9)
+    rows = [
+        (tokens, mine_ref, True),
+        (tokens[: NUM_TOKENS - 5], mine_ref, False),
+        (tokens[: NUM_TOKENS - 9], short_ref, True),
+    ]
+    flow_rows, singles = [], []
+    for toks, r, final in rows:
+        noise = torch.randn(1, 80, 2 * (r.num_prompt_tokens + toks.numel()), generator=gen)
+        flow_rows.append(FlowRow(tokens=toks, ref=r, finalize=final, noise=noise))
+        singles.append(mine.tokens_to_mel(
+            toks[None], torch.tensor([toks.numel()]), r, n_timesteps=n_steps, noise=noise, finalize=final,
+        ))
+
+    mels = mine.tokens_to_mel_rows(flow_rows, n_timesteps=n_steps)
+
+    for (toks, r, final), mel, single in zip(rows, mels, singles, strict=True):
+        usable = toks.numel() - (0 if final else 3)
+        assert mel.shape == (1, 80, 2 * usable) == single.shape
+        diff = (mel - single).abs().max().item()
+        print(f"[{variant}] rows vs single (final={final}, prompt={r.num_prompt_tokens}): {diff:.3e}")
+        assert diff < 1e-3
+
+
 def test_embed_reference_matches(pair):
     variant, (ref, mine, _, _, _) = pair
     sr = 24000
