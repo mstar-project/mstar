@@ -2,8 +2,8 @@
 forward-pass sequencing, submodule construction (dummy device)."""
 import torch
 
-from mstar.engine.resources import AttnBackend, KVLayout, resolve_spec_dependencies
-from mstar.model.kimi_k3.config import KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER
+from mstar.engine.resources import AttnBackend, KVLayout, LinearAttnVariant, resolve_spec_dependencies
+from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER
 from mstar.model.registry import HF_MODELS, MODEL_REGISTRY, get_model_class
 
 
@@ -12,15 +12,21 @@ def test_registry_and_resources(tiny_dir):
     cls = get_model_class("kimi_k3")
     model = cls(model_path_hf=str(tiny_dir), max_output_tokens=16)
     specs = resolve_spec_dependencies(model.get_node_resources())
-    assert set(specs) == {MLA_KV, MLA_ATTN, KDA_STATE, SAMPLER}
+    assert set(specs) == {MLA_KV, MLA_ATTN, KDA_STATE, KDA_ATTN, SAMPLER}
     kv = specs[MLA_KV].config
     assert kv.layout is KVLayout.MLA and kv.num_layers == 2 and kv.latent_dim == 128 + 32
     assert specs[MLA_ATTN].config.backend is AttnBackend.FLASHINFER_MLA
     assert abs(specs[MLA_ATTN].config.sm_scale - (64 + 32) ** -0.5) < 1e-9
     st = specs[KDA_STATE].config
-    assert st.num_layers == 6 and st.parts["conv"].shape == (3 * 256, 4) and st.parts["recurrent"].shape == (8, 32, 32)
+    # the pool's blocks (DeltaNetGeometry): fp32 V-first state, bf16 conv window of the W - 1 earlier inputs
+    assert st.num_layers == 6 and st.blocks["conv"].shape == (3 * 256, 3) and st.blocks["state"].shape == (8, 32, 32)
+    assert st.blocks["state"].dtype is torch.float32 and st.blocks["conv"].dtype is torch.bfloat16
     st.shard(2)
-    assert st.parts["conv"].shape == (384, 4) and st.parts["recurrent"].shape == (4, 32, 32)
+    assert st.blocks["conv"].shape == (384, 3) and st.blocks["state"].shape == (4, 32, 32)
+    la = specs[KDA_ATTN].config
+    assert la.recurrent_state == KDA_STATE and la.variant is LinearAttnVariant.KDA
+    assert la.gate_lower_bound == model.config.text.kda_gate_lower_bound
+    assert specs[KDA_ATTN].depends_on() == {KDA_STATE}
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {"prefill", "decode"} and model.nodes == ["LLM"]
     assert model.get_default_sharding_config().tp_enabled_nodes == {"LLM"}
