@@ -214,6 +214,15 @@ own ``window_decoder`` partition; a request opts in per call:
        assembled clip. ``/generate`` streams the chunks as NDJSON lines,
        ``/generate/ws`` as frames, ``/v1/videos/generations`` switches to an
        NDJSON body (``video`` lines with a running ``index``, closed by ``done``).
+   * - ``session_id``
+     - —
+     - Names a world-state session: the DiT node keeps the rollout's last window
+       and the decoder its context (the most recent ``session_store_size`` sessions).
+   * - ``resume_session``
+     - ``false``
+     - Continue the named session: window 0 is conditioned on the stored last
+       frames (pinned clean, like a chained overlap) and only the ``num_frames``
+       new frames are delivered — a new prompt steers the same world.
 
 .. code-block:: bash
 
