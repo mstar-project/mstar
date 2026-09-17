@@ -93,6 +93,30 @@ def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
     assert {e.name for e in body.outputs} == {"new_token", "text_inputs"}
 
 
+def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
+    """With windowed serving on, a text (reasoner) request still gets the
+    decode walk on the window_decoder partition — never a reasoner walk that
+    partition cannot run — and the default partition gets the reasoner
+    prefill; the decoder partition's transition keeps its walk pinned."""
+    from mstar.conductor.request_info import CurrentForwardConductorMetadata
+    from mstar.model.cosmos3 import constants as C
+
+    model = _model(tmp_path, enable_windowed_video=True)
+    signals = {"text_inputs": [], "position_ids": []}
+    mk = {"max_output_tokens": 8}
+    dec = model.get_initial_forward_pass_args(C.WINDOW_DECODER_PARTITION, ["text"], ["text"], signals, mk)
+    assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK and dec.inputs == []
+    main = model.get_initial_forward_pass_args("default", ["text"], ["text"], signals, mk)
+    assert main.full_metadata.graph_walk == C.REASONER_PREFILL_WALK
+    pinned = model.get_partition_forward_pass_args(
+        C.WINDOW_DECODER_PARTITION,
+        CurrentForwardConductorMetadata(input_modalities=["text"], output_modalities=["text"],
+                                        graph_walk=C.VIDEO_DECODE_AR_WALK, is_prefill=False, kwargs={}),
+        {},
+    )
+    assert pinned.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK and not pinned.request_done
+
+
 def test_edge_recipe_defaults_from_the_checkpoint(tmp_path) -> None:
     """An Edge checkpoint loads the model card's serving recipe without a
     yaml (480p video at flow shift 12, 640x640 images, the diffusers-0.40
