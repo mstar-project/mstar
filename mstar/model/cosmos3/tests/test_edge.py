@@ -299,6 +299,34 @@ def test_text_forward_keeps_raw_k() -> None:
     assert torch.allclose(res.committed[0][0], k_raw, atol=1e-6)
 
 
+def test_conditioning_frame_recipes() -> None:
+    from mstar.model.cosmos3.components.conditioning import prepare_conditioning_frames
+
+    torch.manual_seed(0)
+    img = torch.rand(3, 90, 160)  # 16:9 source
+    # Stretch: plain resize to a square target, aspect not preserved.
+    out = prepare_conditioning_frames(img, 64, 64, "stretch")
+    assert out.shape == (1, 3, 1, 64, 64) and out.min() >= -1 and out.max() <= 1
+    ref = torch.nn.functional.interpolate(img.unsqueeze(0), size=(64, 64), mode="bilinear", align_corners=False)
+    assert torch.allclose(out[:, :, 0], ref * 2 - 1, atol=1e-6)
+    # Aspect crop: cover-scale (90x160 -> 64x114), center crop to 64x64,
+    # values quantized to 8-bit steps.
+    out = prepare_conditioning_frames(img, 64, 64, "aspect_crop")
+    assert out.shape == (1, 3, 1, 64, 64)
+    steps = (out + 1.0) * 127.5
+    assert torch.allclose(steps, steps.round(), atol=1e-4)
+    full = torch.nn.functional.interpolate(img.unsqueeze(0) * 255, size=(64, 114), mode="bilinear",
+                                           align_corners=False, antialias=True)
+    crop = full[:, :, :, 25:89].round().clamp(0, 255) / 127.5 - 1
+    assert torch.allclose(out[:, :, 0], crop, atol=1e-6)
+    # Same-aspect targets crop nothing; 8-bit inputs and video stacks work too.
+    vid = (torch.rand(4, 3, 45, 80) * 255).to(torch.uint8)
+    out = prepare_conditioning_frames(vid, 90, 160, "aspect_crop")
+    assert out.shape == (1, 3, 4, 90, 160)
+    with pytest.raises(ValueError, match="conditioning_resize"):
+        prepare_conditioning_frames(img, 64, 64, "pad")
+
+
 def test_native_flow_sigmas() -> None:
     from mstar.model.cosmos3.submodules import native_flow_sigmas
 
