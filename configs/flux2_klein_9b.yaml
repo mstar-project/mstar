@@ -1,0 +1,22 @@
+model: "flux2_klein_9b"
+
+# FLUX.2 [klein] 9B (Qwen3-8B text encoder + 4096-wide DiT): same graph and knobs as the
+# 4B config. The 9B weights are released under the FLUX Non-Commercial License v2.1,
+# not Apache-2.0; check the license before deploying.
+max_seq_len: 512
+
+model_kwargs:
+  attention_backend: flashinfer
+  compile: true
+  cuda_graph: true
+  capture_sizes: [[1024, 1024]]
+  capture_batch_sizes: [1, 2, 4]
+  max_batch_size: 4
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]
