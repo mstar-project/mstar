@@ -75,8 +75,17 @@ def test_fla_verify_matches_the_torch_reference():
         runner.plan(s)
         attn.run(*pre, pool.block("conv", 0), pool.block("state", 0), params)
         runner.commit(s)
+    def sync_fla_to_torch():
+        # the prefills ran on different conv kernels (bf16 roundings differ by an ulp here and
+        # there), so seed the fla tree with the torch tree's blocks before each verify step:
+        # what is compared is the verify path alone
+        src, dst = trees["torch"][0], trees["fla"][0]
+        for name in ("conv", "state", "spec_prefix", "spec_g", "spec_beta", "spec_len"):
+            dst.block(name, 0).copy_(src.block(name, 0))
+
     # verify blocks with different acceptance per request and per step
     for accepted in ((3, 0), (7, 2), (0, 5)):
+        sync_fla_to_torch()
         blk = inputs(2 * K1)
         outs, states, wins = {}, {}, {}
         for name, (pool, attn, runner) in trees.items():
