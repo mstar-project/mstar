@@ -33,11 +33,17 @@ model_kwargs:
   num_inference_steps_action: 30
   guidance_scale_action: 1.0
   flow_shift_action: 10.0
+  # Streaming rollout: windowed autoregressive video (the video_gen_ar walk,
+  # the vae_decoder_ar node and its streaming decoder partition). Requests opt
+  # in per call with window_mode ("chained" | "kv") and stream each finished
+  # window with stream_video; the kv-mode context horizon (context_frames)
+  # bounds the committed K/V a long rollout keeps.
+  enable_windowed_video: true
 node_groups:
   # The DiT and the reasoner share one transformer instance and one KV pool;
   # they must sit in the same group. The vision encoder feeds the reasoner's
   # prefill, the VAE nodes the generator walks.
   - node_names: ["dit", "reasoner"]
     ranks: [0]
-  - node_names: ["vision_encoder", "vae_encoder", "vae_decoder"]
+  - node_names: ["vision_encoder", "vae_encoder", "vae_decoder", "vae_decoder_ar"]
     ranks: [0]
