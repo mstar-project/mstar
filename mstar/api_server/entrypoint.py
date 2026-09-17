@@ -17,8 +17,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import msgpack
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -803,6 +804,160 @@ api_server: APIServer | None = None
 from mstar.api_server.openai.router import router as openai_router  # noqa: E402
 
 app.include_router(openai_router)
+
+
+def _decode_ws_files(
+    files: list | None, upload_dir: Path,
+) -> tuple[dict[str, list[str]], list[PromptPart]]:
+    """Persist a websocket message's media (``{"name", "data"}`` entries;
+    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame) under
+    the upload dir, grouped by the modality of each file name, the way the
+    multipart ``/generate`` route does."""
+    file_paths: dict[str, list[str]] = {}
+    parts: list[PromptPart] = []
+    for entry in files or []:
+        name = str(entry.get("name") or "")
+        modality = _detect_modality(name)
+        if modality == "unknown":
+            raise ValueError(f"Cannot determine modality for file: {name}")
+        data = entry.get("data")
+        if isinstance(data, str):
+            data = base64.b64decode(data)
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError(f"file {name!r} carries no data")
+        base = os.path.basename(name) or "upload"
+        save_path = upload_dir / f"{uuid.uuid4()}_{base}"
+        save_path.write_bytes(bytes(data))
+        paths = file_paths.setdefault(modality, [])
+        parts.append(PromptPart(modality=modality, index=len(paths)))
+        paths.append(str(save_path))
+    return file_paths, parts
+
+
+def _ws_input_layout(
+    text: str | None, input_modalities, parts: list[PromptPart],
+) -> tuple[list[str], list[PromptPart]]:
+    """Resolve a websocket message's input layout the way ``/generate`` does:
+    an explicit list is the layout (a text prompt keeps its slot), else the
+    order the files and text arrived in."""
+    if text:
+        parts = [*parts, PromptPart(modality="text", text=text)]
+    if input_modalities is not None:
+        if isinstance(input_modalities, str):
+            in_mods = [m.strip() for m in input_modalities.split(",") if m.strip()]
+        else:
+            in_mods = [str(m) for m in input_modalities]
+        if text and "text" not in in_mods:
+            in_mods.append("text")
+        if not text:
+            in_mods = [m for m in in_mods if m != "text"]
+        return in_mods, []
+    return [p.modality for p in parts], parts
+
+
+@app.websocket("/generate/ws")
+async def generate_ws(websocket: WebSocket):
+    """``/generate`` over one persistent WebSocket, for control loops.
+
+    Each incoming message is one request with the ``/generate`` fields —
+    ``text``, ``files`` (``[{"name", "data"}]``), ``input_modalities``,
+    ``output_modalities``, ``model_kwargs``, ``request_id`` — either a JSON
+    text frame (``data`` base64) or a msgpack binary frame (``data`` raw
+    bytes). Every result chunk comes back as a frame of the same encoding,
+    ``{"request_id", "modality", "data", "metadata"}``, followed by
+    ``{"request_id", "finish": true}``; a rejected message answers
+    ``{"request_id", "error": ...}``. Messages may be pipelined: a client can
+    send the next observation before the previous action chunk has returned,
+    and the ``request_id`` tells the replies apart. Closing the socket aborts
+    whatever is still in flight.
+    """
+    if api_server is None:
+        await websocket.close(code=1013, reason="Server not ready")
+        return
+    await websocket.accept()
+    tasks: set[asyncio.Task] = set()
+    # Pipelined requests reply from separate tasks; one frame at a time.
+    send_lock = asyncio.Lock()
+
+    async def send(payload: dict, binary: bool) -> None:
+        async with send_lock:
+            if binary:
+                await websocket.send_bytes(msgpack.packb(payload, use_bin_type=True))
+            else:
+                if isinstance(payload.get("data"), (bytes, bytearray)):
+                    payload = {**payload, "data": base64.b64encode(payload["data"]).decode("ascii")}
+                await websocket.send_text(json.dumps(payload))
+
+    async def serve_one(message: dict, binary: bool) -> None:
+        request_id = message.get("request_id")
+        try:
+            out_mods = message.get("output_modalities", "text")
+            if isinstance(out_mods, str):
+                out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
+            text = message.get("text")
+            if not text and not message.get("files"):
+                raise ValueError("message carries neither text nor files")
+            file_paths, parts = await run_in_threadpool(
+                _decode_ws_files, message.get("files"), api_server.upload_dir,
+            )
+            in_mods, parts = _ws_input_layout(text, message.get("input_modalities"), parts)
+            model_kwargs = message.get("model_kwargs")
+            if isinstance(model_kwargs, str):
+                model_kwargs = json.loads(model_kwargs)
+            if model_kwargs is not None and not isinstance(model_kwargs, dict):
+                raise ValueError("model_kwargs must be a JSON object")
+            request_id = api_server.submit_request(
+                text=text,
+                file_paths=file_paths or None,
+                input_modalities=in_mods,
+                output_modalities=out_mods,
+                model_kwargs=model_kwargs,
+                prompt_parts=parts or None,
+                streaming=True,
+                request_id=request_id,
+            )
+            # Cancelling this task (socket closed mid-stream) tears the
+            # iterator down, and its ``finally`` aborts the engine request.
+            async for chunk in api_server.iter_result_chunks(request_id):
+                await send({
+                    "request_id": request_id, "modality": chunk.modality,
+                    "data": bytes(chunk.data), "metadata": chunk.metadata,
+                }, binary)
+            await send({"request_id": request_id, "finish": True}, binary)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            raise
+        except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
+            logger.exception("generate/ws request failed")
+            try:
+                await send({"request_id": request_id, "error": str(exc)}, binary)
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        while True:
+            frame = await websocket.receive()
+            if frame.get("type") == "websocket.disconnect":
+                break
+            binary = frame.get("bytes") is not None
+            try:
+                if binary:
+                    message = msgpack.unpackb(frame["bytes"], raw=False)
+                else:
+                    message = json.loads(frame.get("text") or "")
+            except Exception as exc:  # noqa: BLE001 — a bad frame is reported, not fatal
+                await send({"request_id": None, "error": f"undecodable frame: {exc}"}, binary)
+                continue
+            if not isinstance(message, dict):
+                await send({"request_id": None, "error": "message must be an object"}, binary)
+                continue
+            task = asyncio.create_task(serve_one(message, binary))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        for task in list(tasks):
+            task.cancel()
 
 
 @app.post("/generate")
