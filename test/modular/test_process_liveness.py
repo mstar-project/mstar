@@ -14,6 +14,7 @@ import signal
 import threading
 import time
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from fastapi import HTTPException
@@ -212,6 +213,48 @@ def test_orphaned_worker_leaves_gracefully_then_hard(monkeypatch):
     assert ("sleep", 5.0) in calls[kill_at:]
 
 
+def test_orphaned_conductor_leaves_gracefully_then_hard(monkeypatch):
+    """Symmetric with the worker watchdog: an API server killed outright runs
+    no cleanup, so the conductor must notice and take its workers down with it
+    rather than leave them holding GPU memory."""
+    from mstar.utils.orphan import exit_when_orphaned
+
+    calls = []
+    monkeypatch.setattr(time, "sleep", lambda s: calls.append(("sleep", s)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: calls.append(("kill", pid, sig)))
+
+    def _exit(code):
+        calls.append(("_exit", code))
+        raise SystemExit(code)
+
+    monkeypatch.setattr(os, "_exit", _exit)
+    alive = [True, False]
+    parent = SimpleNamespace(is_alive=lambda: alive.pop(0))
+
+    with pytest.raises(SystemExit):
+        exit_when_orphaned(
+            "Conductor", "API server", signal.SIGINT, parent=parent, poll_s=0.0,
+        )
+
+    # SIGINT, not SIGTERM: run() unwinds into shutdown(), which stops the workers.
+    kill_at = calls.index(("kill", os.getpid(), signal.SIGINT))
+    assert calls[-1] == ("_exit", 1)
+    assert ("sleep", 5.0) in calls[kill_at:]
+
+
+def test_conductor_process_target_watches_the_api_server():
+    """The watchdog has to start before the model load, so an API server that
+    dies during weight loading is still caught."""
+    import inspect
+
+    from mstar.api_server import entrypoint
+
+    source = inspect.getsource(entrypoint._conductor_process_target)
+    watch_at = source.index("watch_parent(")
+    assert "signal.SIGINT" in source[watch_at:source.index("\n", watch_at)]
+    assert watch_at < source.index("get_model_class")
+
+
 def test_worker_without_a_multiprocessing_parent_keeps_running():
     # A test process has no multiprocessing parent, so the watchdog is a no-op.
     assert _exit_when_orphaned("worker_0") is None
@@ -222,7 +265,13 @@ def test_worker_without_a_multiprocessing_parent_keeps_running():
 
 def test_stopping_data_worker_drops_tracked_requests():
     """No RemoveRequest is coming for an in-flight request once the server
-    stops, so the thread hard-cleans what it still tracks on its way out."""
+    stops, so the thread hard-cleans what it still tracks on its way out.
+
+    ``r1`` is the case that matters: a request whose input signals were
+    written but which never produced an output tensor, so it appears only in
+    ``in_flight_requests``. Tracking teardown off the output-metadata dict
+    misses exactly that request and leaks its signals into /dev/shm.
+    """
     from mstar.api_server.data_worker import PreprocessWorkerThread
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
@@ -238,7 +287,8 @@ def test_stopping_data_worker_drops_tracked_requests():
         has_inflight_reads=lambda rid: False,
         get_ready_tensors=lambda: {},
     )
-    wt.tensor_uuid_to_metadata_per_request = {"r1": {}, "r2": {}}
+    wt.in_flight_requests = {"r1", "r2"}
+    wt.tensor_uuid_to_metadata_per_request = {"r2": {}}
     wt.request_model_kwargs = {"r1": {}}
     wt._draining_rids = {"r1"}
     wt._reads_done_sent = set()
@@ -246,6 +296,7 @@ def test_stopping_data_worker_drops_tracked_requests():
     wt.run()
 
     assert sorted(cleaned) == ["r1", "r2"]
+    assert wt.in_flight_requests == set()
     assert wt.tensor_uuid_to_metadata_per_request == {}
     assert wt.request_model_kwargs == {}
 
@@ -326,3 +377,53 @@ def test_dead_conductor_releases_pending_requests_and_stops_the_server():
     with pytest.raises(HTTPException) as exc:
         server.submit_request(input_modalities=["text"], output_modalities=["text"])
     assert exc.value.status_code == 503
+
+
+def test_health_reports_unhealthy_once_fatal():
+    """A load balancer must stop routing here: /health has to fail as soon as
+    the deployment is going down, not stay 200 until the process exits."""
+    from fastapi.testclient import TestClient
+
+    import mstar.api_server.entrypoint as ep
+
+    client = TestClient(ep.app)
+    previous = ep.api_server
+    try:
+        ep.api_server = SimpleNamespace(fatal_error=None)
+        assert client.get("/health").status_code == 200
+
+        ep.api_server = SimpleNamespace(
+            fatal_error="worker worker_0 (pid 7) exited with signal SIGKILL"
+        )
+        response = client.get("/health")
+        assert response.status_code == 503
+        assert "worker_0" in response.json()["detail"]
+    finally:
+        ep.api_server = previous
+
+
+def test_dynamo_worker_exits_nonzero_when_conductor_dies():
+    """The Dynamo entrypoint runs the same APIServer, so a dead conductor has
+    to fail that process too rather than leave it registered and serving."""
+    from mstar.api_server.entrypoint import DeadConductorError
+    from mstar.integrations.dynamo import worker as dynamo_worker
+
+    conductor = _Proc(11, alive=False, exitcode=1)
+    server = SimpleNamespace(
+        conductor_proc=None,
+        fatal_error=None,
+        cleanup=lambda: None,
+        finalize_setup=lambda: (_ for _ in ()).throw(
+            DeadConductorError("conductor process exited with exit code 1")
+        ),
+    )
+    argv = ["--config", "c.yaml", "--model-path", "/tmp/m"]
+    with (
+        mock.patch.object(dynamo_worker, "build_server",
+                          return_value=(server, conductor, "whisper_large")),
+        mock.patch.object(dynamo_worker, "serve"),
+        mock.patch("mstar.api_server.entrypoint._shutdown_conductor_process"),
+        pytest.raises(SystemExit) as exc,
+    ):
+        dynamo_worker.main(argv)
+    assert exc.value.code == 1

@@ -281,6 +281,7 @@ class PreprocessWorkerThread:
         self.model = model
         self.enable_prof = enable_prof
 
+        self.in_flight_requests = set()
         self.tensor_uuid_to_metadata_per_request = {}
         # The request's model_kwargs, kept so output postprocessing can
         # honor per-request parameters (e.g. the video container fps).
@@ -295,6 +296,7 @@ class PreprocessWorkerThread:
     ):
         tensors: NameToTensorList = {}
         input_metadata = {}
+        self.in_flight_requests.add(input.request_id)
 
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
@@ -597,6 +599,7 @@ class PreprocessWorkerThread:
         self.tensor_manager.force_cleanup_request(request_id)
         self.tensor_uuid_to_metadata_per_request.pop(request_id, None)
         self.request_model_kwargs.pop(request_id, None)
+        self.in_flight_requests.discard(request_id)
 
     def run(self):
         while not self.stop_event.is_set():
@@ -653,6 +656,7 @@ class PreprocessWorkerThread:
                     if req_id in self.tensor_uuid_to_metadata_per_request:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
                     self.request_model_kwargs.pop(req_id, None)
+                    self.in_flight_requests.discard(req_id)
                 did_work = self._process_read_tensors() or did_work
                 # Reads may have just resolved; ACK any drains now free of them.
                 for rid in list(self._draining_rids):
@@ -676,6 +680,7 @@ class PreprocessWorkerThread:
                         # input signals directly.
                         self.tensor_manager.force_cleanup_request(pre_input.request_id)
                         self.request_model_kwargs.pop(pre_input.request_id, None)
+                        self.in_flight_requests.discard(pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 
@@ -685,6 +690,6 @@ class PreprocessWorkerThread:
         # Stopping, and nothing will send the RemoveRequest for what is still
         # tracked (the conductor is gone or going), so drop it here rather than
         # leave the input signals of in-flight requests in /dev/shm.
-        for request_id in list(self.tensor_uuid_to_metadata_per_request):
+        for request_id in list(self.in_flight_requests):
             self._hard_cleanup(request_id)
 

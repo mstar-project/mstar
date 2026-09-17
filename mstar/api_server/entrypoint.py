@@ -32,6 +32,7 @@ from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.orphan import watch_parent
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,10 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    # Started before the model load so an API server that dies during it is
+    # still caught. SIGINT is the conductor's graceful stop (run() unwinds into
+    # shutdown(), terminating the workers), matching _shutdown_conductor_process.
+    watch_parent("Conductor", "API server", signal.SIGINT)
     # Read yaml early to extract optional `model_kwargs:` section for the model
     # constructor. Lets a yaml override init-time model parameters (e.g.
     # Pi05's action_horizon for the DROID benchmark variant) without code
@@ -913,6 +918,9 @@ async def generate(
 
 @app.get("/health")
 async def health_check():
+    # Report unhealthy while shutting down, so a load balancer stops sending here.
+    if api_server is not None and api_server.fatal_error is not None:
+        raise HTTPException(status_code=503, detail=api_server.fatal_error)
     return {"status": "healthy"}
 
 

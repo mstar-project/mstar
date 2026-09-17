@@ -48,6 +48,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -98,23 +99,16 @@ def _pick_free_tcp_port() -> int:
 def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
     """Worker-side watchdog that leaves once the conductor is gone.
 
-    The conductor terminates its workers on every exit path it controls. This
-    covers the one it cannot (killed outright), so no worker outlives it holding
-    GPU memory. That includes a worker still in setup, which would otherwise
-    wedge in a startup collective waiting for a peer that already left. SIGTERM
-    first, which is the graceful path in ``_worker_process_target``. A main
-    thread stuck in a C call cannot service it, so exit hard after a grace
-    period, as the conductor's own shutdown does.
+    So no worker outlives it holding GPU memory. That includes a worker still
+    in setup, which would otherwise wedge in a startup collective waiting for a
+    peer that already left. SIGTERM is the graceful path in
+    ``_worker_process_target``. The conductor watches the API server the same
+    way (``_conductor_process_target``).
     """
-    parent = mp.parent_process() if parent is None else parent
-    if parent is None:
-        return
-    while parent.is_alive():
-        time.sleep(poll_s)
-    logger.error("Worker %s: the conductor process is gone, exiting", worker_id)
-    os.kill(os.getpid(), signal.SIGTERM)
-    time.sleep(5.0)
-    os._exit(1)
+    exit_when_orphaned(
+        f"Worker {worker_id}", "conductor", signal.SIGTERM,
+        parent=parent, poll_s=poll_s,
+    )
 
 
 def _worker_process_target(
