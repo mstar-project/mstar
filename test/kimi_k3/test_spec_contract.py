@@ -40,12 +40,14 @@ def test_speculative_submodule_rows_carry_k_plus_one_ids(tiny_dir):
     model = get_model_class("kimi_k3")(model_path_hf=str(tiny_dir), speculative_tokens=3)
     sub = model.get_submodule("LLM", device="cpu")
     assert sub.speculative_tokens == 3 and sub.k1 == 4
-    inp = ARNodeInputs(input_ids=torch.zeros(4, dtype=torch.long), input_seq_len=4)
+    # a decode row carries its bonus token (one id) and spans k + 1 tokens, with or without a draft
+    inp = sub.prepare_inputs("decode", None, {"text_inputs": [torch.tensor([42])]})
+    assert inp.input_ids.tolist() == [42] and inp.input_seq_len == 4
     step = sub.declare_step("decode", ["a"], [inp])
     assert SPEC in step.steps and step.segments[0].span == 4
     sub.cuda_graphs = True
     cfg = sub.get_cuda_graph_configs(torch.device("cpu"))[0]
-    assert cfg.single_request_inputs.input_seq_len == 4 and cfg.single_request_inputs.input_ids.numel() == 4
+    assert cfg.single_request_inputs.input_seq_len == 4 and cfg.single_request_inputs.input_ids.numel() == 1
     assert cfg.get_total_tokens(8) == [32]
     # the stub draft repeats the bonus token
     bonus = torch.tensor([[5], [9]])
