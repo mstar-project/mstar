@@ -200,6 +200,7 @@ class Cosmos3Pipeline:
         sound_duration: float | None = None,
         condition_video: torch.Tensor | None = None,
         condition_frame_indexes: tuple[int, ...] = (0, 1),
+        flow_shift: float | None = None,
     ):
         """With ``generate_sound`` a jointly denoised AVAE-latent sound band
         rides after the vision tokens (video-mode only); returns
@@ -288,7 +289,10 @@ class Cosmos3Pipeline:
             preds_vision, preds_sound = self.transformer(**kwargs)
             return preds_vision[0], (preds_sound[0] if generate_sound else None)
 
-        self._set_timesteps(self.scheduler, num_inference_steps, device)
+        # A fresh per-call scheduler built like the served node's (karras off
+        # on the native flow schedule, the request's flow shift); the template
+        # keeps the checkpoint config.
+        self.scheduler = self._make_scheduler(num_inference_steps, flow_shift, device)
         for t in self.scheduler.timesteps:
             vision_tokens = [latents.to(dtype)]
             vision_timesteps = torch.full((num_noisy,), t.item(), device=device)
@@ -356,7 +360,6 @@ class Cosmos3Pipeline:
         predicted. Returns the predicted action ``[1, action_chunk_size,
         raw_action_dim]`` (and the decoded video when ``return_video``).
         """
-        from diffusers import UniPCMultistepScheduler
         from diffusers.utils.torch_utils import randn_tensor
 
         device, dtype = self.device, self.dtype
@@ -367,11 +370,7 @@ class Cosmos3Pipeline:
             action_fps = fps
         action_offset = action_start_frame_offset(action_chunk_size, num_frames)
 
-        if flow_shift is not None:
-            scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config, flow_shift=flow_shift)
-        else:
-            scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
-        self._set_timesteps(scheduler, num_inference_steps, device)
+        scheduler = self._make_scheduler(num_inference_steps, flow_shift, device)
 
         if cond_ids is None or uncond_ids is None:
             cond_ids, uncond_ids = tokenize_prompt(
@@ -551,10 +550,10 @@ class Cosmos3Pipeline:
             gen_seq = residual + layer.mlp_moe_gen(layer.post_attention_layernorm_moe_gen(residual))
         return gen_seq, collected
 
-    def _window_scheduler(self, num_inference_steps: int, flow_shift: float | None, device):
-        """A fresh per-window scheduler built like the served node's
-        ``_new_scheduler``: the checkpoint config, karras off on the native
-        flow schedule, the request flow shift, the node's timestep spacing."""
+    def _make_scheduler(self, num_inference_steps: int, flow_shift: float | None, device):
+        """A fresh scheduler built like the served node's ``_new_scheduler``:
+        the checkpoint config, karras off on the native flow schedule, the
+        request flow shift, the node's timestep spacing."""
         from diffusers import UniPCMultistepScheduler
 
         overrides = {}
@@ -678,7 +677,7 @@ class Cosmos3Pipeline:
         latents = torch.randn(gen_latent_shape, generator=generator, device=device, dtype=dtype)
         windows_out: list[torch.Tensor] = []
         for w in range(num_windows):
-            scheduler = self._window_scheduler(num_inference_steps, flow_shift, device)
+            scheduler = self._make_scheduler(num_inference_steps, flow_shift, device)
             s0 = state["cond"]["statics"][w]
             num_noisy = s0["num_noisy_vision_tokens"]
             for t in scheduler.timesteps:
