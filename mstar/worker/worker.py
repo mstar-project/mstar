@@ -18,13 +18,20 @@ import torch
 from mstar.api_server.request_types import APIServerMessage, ResultTensors
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
-from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
+from mstar.communication.tensors import (
+    LocalTransferEngine,
+    NameToTensorList,
+    create_tensor_communication_manager,
+)
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
-from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.kv.transfer import (
+    TransferEngineInfo,
+    make_deployment_kv_shm_dir,
+)
 from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -222,6 +229,17 @@ class Worker:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof
         )
+        kv_shm_dir = None
+        if (
+            isinstance(
+                self.tensor_manager.transfer_engine, LocalTransferEngine,
+            )
+            and self.device.type != "cuda"
+        ):
+            kv_shm_dir = make_deployment_kv_shm_dir(
+                socket_path_prefix=socket_path_prefix,
+                dist_init_method=dist_init_method,
+            )
 
         node_names = set()
         for wg in my_worker_graphs:
@@ -235,7 +253,8 @@ class Worker:
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
-                transfer_engine=self.tensor_manager.transfer_engine
+                transfer_engine=self.tensor_manager.transfer_engine,
+                shm_dir=kv_shm_dir,
             ),
             model=model,
             enable_nvtx=self.enable_nvtx,

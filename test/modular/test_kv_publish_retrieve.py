@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 
@@ -32,6 +32,8 @@ class _StubTransfer:
     """Records retrieves instead of touching CUDA."""
 
     started: list[dict] = []
+    remove_started: threading.Event | None = None
+    allow_remove: threading.Event | None = None
 
     def __init__(self, transfer_engine_info, kv_cache, **kwargs):
         del transfer_engine_info, kv_cache, kwargs
@@ -52,11 +54,17 @@ class _StubTransfer:
 
     def remove_request(self, request_id):
         del request_id
+        if self.remove_started is not None:
+            self.remove_started.set()
+        if self.allow_remove is not None:
+            assert self.allow_remove.wait(timeout=5)
 
 
 @pytest.fixture(autouse=True)
 def _stub(monkeypatch):
     _StubTransfer.started = []
+    _StubTransfer.remove_started = None
+    _StubTransfer.allow_remove = None
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
@@ -175,6 +183,25 @@ def test_publish_copies_the_page_list():
     assert published.get(0)["main"].page_indices == pages
 
 
+def test_publish_exports_only_labels_declared_for_remote_consumers():
+    kv = _manager()
+    kv.ingest_request(
+        "r0",
+        KVReqConfig(
+            publish_labels_per_node_walk={
+                ("producer", "prefill"): ["branch"],
+            }
+        ),
+    )
+    _grow(kv, "r0", 16)
+    _grow(kv, "r0", 16, label="branch")
+
+    assert kv.publish("r0", "producer", "decode") is None
+    published = kv.publish("r0", "producer", "prefill")
+
+    assert set(published.get(0)) == {"branch"}
+
+
 def test_publish_is_consistent_against_a_concurrent_commit():
     """publish runs on the GPU thread while the scheduler thread commits; a
     published length must never name pages the snapshot doesn't include."""
@@ -207,3 +234,32 @@ def test_publish_is_consistent_against_a_concurrent_commit():
         t.join(timeout=5)
 
     assert not torn, f"published a length past its own pages: {torn[:5]}"
+
+
+def test_remove_keeps_transfer_cleanup_atomic_with_publish():
+    kv = _manager()
+    kv.ingest_request("r0")
+    _grow(kv, "r0", 16)
+    _StubTransfer.remove_started = threading.Event()
+    _StubTransfer.allow_remove = threading.Event()
+
+    remover = threading.Thread(target=kv.remove_request, args=("r0",))
+    remover.start()
+    assert _StubTransfer.remove_started.wait(timeout=5)
+
+    result = []
+    publish_done = threading.Event()
+
+    def _publish():
+        result.append(kv.publish("r0"))
+        publish_done.set()
+
+    publisher = threading.Thread(target=_publish)
+    publisher.start()
+    assert not publish_done.wait(timeout=0.05)
+
+    _StubTransfer.allow_remove.set()
+    remover.join(timeout=5)
+    publisher.join(timeout=5)
+
+    assert result == [None]

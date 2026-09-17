@@ -63,6 +63,12 @@ class KVReqConfig(ResourceReqConfig):
     needed_labels: list[str] | None = None
     needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
     needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # None preserves the generic behavior of publishing every stream. A
+    # mapping lets a model export only labels that another instance may read;
+    # an absent key in an explicit mapping means this step publishes no KV.
+    publish_labels_per_node_walk: (
+        dict[tuple[str, str], list[str]] | None
+    ) = None
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -72,6 +78,18 @@ class KVReqConfig(ResourceReqConfig):
         if self.needed_labels is not None:
             return self.needed_labels
         return ["main"]
+
+    def get_publish_labels(
+        self,
+        node: str | None,
+        walk: str | None,
+        available: list[str],
+    ) -> list[str]:
+        if self.publish_labels_per_node_walk is None:
+            return available
+        if node is None or walk is None:
+            return []
+        return self.publish_labels_per_node_walk.get((node, walk), [])
 
 
 @dataclass

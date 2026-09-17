@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -344,7 +345,8 @@ class ShmKVTransferEngine(KVTransferEngine):
                 else "/tmp/mstar_kv"
             )
         self._shm_dir = root
-        os.makedirs(self._shm_dir, exist_ok=True)
+        os.makedirs(self._shm_dir, mode=0o700, exist_ok=True)
+        os.chmod(self._shm_dir, 0o700)
         self._entity_id = entity_id
         self._resource_key = resource_key
         self._published: dict[
@@ -406,6 +408,22 @@ class ShmKVTransferEngine(KVTransferEngine):
         remote_kv_info: ShmKVTransferInfo | None,
         read_info: list[KVReadInfo],
     ) -> Future | None:
+        try:
+            return self._read_batched(remote_kv_info, read_info)
+        except Exception as error:
+            # SHM reads are synchronous, but the resource readiness contract
+            # expects transfer failures on a Future so they are latched and
+            # reported against this request rather than escaping the worker
+            # scheduler loop and failing every in-flight request.
+            failed = Future()
+            failed.set_exception(error)
+            return failed
+
+    def _read_batched(
+        self,
+        remote_kv_info: ShmKVTransferInfo | None,
+        read_info: list[KVReadInfo],
+    ) -> None:
         if not read_info:
             return None
         if remote_kv_info is None:
@@ -478,11 +496,64 @@ class ShmKVTransferEngine(KVTransferEngine):
             self.remove_request(request_id)
 
 
+def make_deployment_kv_shm_dir(
+    socket_path_prefix: str,
+    dist_init_method: str,
+    owner_pid: int | None = None,
+) -> str:
+    """Create a private SHM directory for one local deployment.
+
+    The conductor PID plus its unique distributed-init endpoint separates
+    concurrent servers, even when both use the default worker ids and request
+    ids. On startup, directories owned by this uid whose conductor no longer
+    exists are swept so killed deployments do not leak tmpfs indefinitely.
+    """
+    base = os.getenv("MSTAR_KV_SHM_DIR")
+    if base is None:
+        base = (
+            "/dev/shm"
+            if os.path.isdir("/dev/shm")
+            else "/tmp"
+        )
+    os.makedirs(base, exist_ok=True)
+
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    owner_pid = os.getppid() if owner_pid is None else owner_pid
+    digest = hashlib.sha256(
+        f"{socket_path_prefix}\0{dist_init_method}".encode()
+    ).hexdigest()[:16]
+    prefix = f"mstar_kv_{uid}_"
+    path = os.path.join(base, f"{prefix}{owner_pid}_{digest}")
+
+    for entry in os.scandir(base):
+        if (
+            not entry.name.startswith(prefix)
+            or not entry.is_dir(follow_symlinks=False)
+            or entry.path == path
+        ):
+            continue
+        suffix = entry.name[len(prefix):]
+        pid_text, separator, _ = suffix.partition("_")
+        if not separator or not pid_text.isdigit():
+            continue
+        try:
+            os.kill(int(pid_text), 0)
+        except ProcessLookupError:
+            shutil.rmtree(entry.path, ignore_errors=True)
+        except PermissionError:
+            continue
+
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
 @dataclass
 class TransferEngineInfo:
     my_entity_id: str
     my_session_id: str
     transfer_engine: TensorTransferEngine
+    shm_dir: str | None = None
 
 
 class KVTransferManager:
@@ -517,6 +588,7 @@ class KVTransferManager:
                 self._kv_transfer_engine = ShmKVTransferEngine(
                     kv_cache=kv_cache,
                     entity_id=transfer_engine_info.my_entity_id,
+                    shm_dir=transfer_engine_info.shm_dir,
                     resource_key=resource_key,
                 )
             else:

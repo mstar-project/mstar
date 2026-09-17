@@ -131,6 +131,20 @@ class Resource(ABC):
     def publish(self, request_id: str) -> "PublishedInfo | None":
         return None
 
+    def publish_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Publish after one node step, with context for selective exporters.
+
+        Existing resources remain compatible through ``publish``; resources
+        that need node/walk context can override this method.
+        """
+        del node_name, graph_walk
+        return self.publish(request_id)
+
     def reset_request(self, rid: str, free: bool=False):
         """For clearing dummy RIDs during cuda graph capture"""
         return

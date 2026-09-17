@@ -795,11 +795,23 @@ class BagelModel(Model):
             # published request's streams to pull in. Guidance-off requests
             # name only "main", so a transfer never drags branches that this
             # request will not attend.
-            "kv": KVReqConfig(needed_labels_per_node_walk={
-                (node, walk): active_labels(walk, cfg, node)
-                for node in self._LLM_NODES
-                for walk in LLM_GRAPH_WALKS
-            }),
+            "kv": KVReqConfig(
+                needed_labels_per_node_walk={
+                    (node, walk): active_labels(walk, cfg, node)
+                    for node in self._LLM_NODES
+                    for walk in LLM_GRAPH_WALKS
+                },
+                # Only the main LLM instance creates cache branches consumed
+                # by the remote CFG replicas. Text-only requests export
+                # nothing. Think-then-image keeps cfg_img current during
+                # decode because image_gen_cfg consumes it after EOS.
+                publish_labels_per_node_walk={
+                    ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
+                    ("LLM", "prefill_vit"): ["cfg_text"],
+                    ("LLM", "prefill_vae"): ["cfg_text"],
+                    ("LLM", "decode"): ["cfg_img"],
+                } if cfg else {},
+            ),
             "sampler": SamplingReqConfig(
                 temperature=sampling.temperature,
                 top_k=sampling.top_k,
