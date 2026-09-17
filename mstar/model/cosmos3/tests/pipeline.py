@@ -212,8 +212,12 @@ class Cosmos3Pipeline:
         the video's VAE-encoded causal prefix and re-injected after every
         scheduler step; the complement is denoised."""
         device, dtype = self.device, self.dtype
+        # The served prompt layout (Cosmos3Model.process_prompt): no system
+        # prompt, no resolution / duration sentences — the reference serving
+        # pipeline's defaults too.
         cond_ids, uncond_ids = tokenize_prompt(
-            self.tokenizer, prompt, negative_prompt, num_frames=num_frames, height=height, width=width, fps=fps
+            self.tokenizer, prompt, negative_prompt, num_frames=num_frames, height=height, width=width, fps=fps,
+            use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
         )
 
         latents, has_image_condition = self._prepare_latents(
@@ -376,6 +380,7 @@ class Cosmos3Pipeline:
             cond_ids, uncond_ids = tokenize_prompt(
                 self.tokenizer, prompt, negative_prompt, num_frames=num_frames,
                 height=height, width=width, fps=fps,
+                use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
             )
 
         # --- action latents (noise drawn before the video noise, matching the
