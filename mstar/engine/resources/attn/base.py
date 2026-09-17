@@ -90,6 +90,7 @@ class AttentionManager(AttentionResource):
             return XPUPagedAttentionManager(
                 kv_cache=spec.config.kv_cache,
                 device=info.device,
+                kv_config=kv_config,
             )
         raise ValueError(f"Unknown attention backend {backend!r}")
 

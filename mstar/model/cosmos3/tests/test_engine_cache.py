@@ -783,11 +783,11 @@ def test_cross_request_batch_matches_individual() -> None:
 @torch.no_grad()
 def _run_cuda_graph_denoise(ctx):
     """Capture the image denoise step and run the whole loop through the real
-    CudaGraphRunner (one captured forward per step covering both guidance
+    AcceleratorGraphRunner (one captured forward per step covering both guidance
     branches), returning the final latents."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
     from mstar.distributed.communication import CommGroup, JointGroups
-    from mstar.engine.cuda_graph_runner import CudaGraphRunner
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 
     model, dit = ctx["model"], ctx["dit"]
     device, dtype = ctx["device"], ctx["dtype"]
@@ -810,7 +810,7 @@ def _run_cuda_graph_denoise(ctx):
     groups = JointGroups(
         tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(),
     )
-    cg_runner = CudaGraphRunner(
+    cg_runner = AcceleratorGraphRunner(
         submodule_name="dit", submodule=dit, resources=resources,
         step_runner=StepRunner(resources), device=dev, autocast_dtype=dtype,
         joint_comm_group=groups, num_slots=1,

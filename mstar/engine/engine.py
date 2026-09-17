@@ -12,9 +12,9 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
-from mstar.engine.cuda_graph_runner import (
-    CudaGraphRunner,
-    PiecewiseCudaGraphRunner,
+from mstar.engine.accelerator_graph_runner import (
+    AcceleratorGraphRunner,
+    PiecewiseAcceleratorGraphRunner,
     autocast_scope,
 )
 from mstar.engine.resources import (
@@ -61,7 +61,7 @@ class SubmoduleManagement:
     forward_batched: Callable
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
-    cuda_graph_runner: CudaGraphRunner | None = None
+    accelerator_graph_runner: AcceleratorGraphRunner | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -74,9 +74,9 @@ class SubmoduleManagement:
         init=False, default_factory=threading.Lock, repr=False
     )
 
-    # label -> PiecewiseCudaGraphRunner for inner-loop capture; spread into
+    # label -> PiecewiseAcceleratorGraphRunner for inner-loop capture; spread into
     # ModelInputsFromEngine so the submodule's forward can look them up
-    piecewise_runners: dict[str, PiecewiseCudaGraphRunner] = field(
+    piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
 
@@ -88,7 +88,7 @@ class SubmoduleManagement:
         # specific — the main runner has it too (see `Resource`).
         # TODO: submodule-wide, so a capture touching neither kind still pays
         # double the buffers. Each runner could size its own count from the
-        # resources its captures touch, as PiecewiseCudaGraphRunner does.
+        # resources its captures touch, as PiecewiseAcceleratorGraphRunner does.
         preplan_enabled = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
         self._forced_double_buffer = any(
             res.force_double_buffer for res in self.resources.values()
@@ -160,7 +160,7 @@ class ExecutingBatch:
     cg_key_info: Any | None = None
 
     # Populated on preplan
-    preplan_event: torch.cuda.Event | None = None
+    preplan_event: Any | None = None
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
@@ -203,7 +203,7 @@ class ExecutingBatch:
 
     # Recorded on the default stream once this step's GPU work is submitted;
     # what a reader of the output values has to wait on.
-    completion_event: torch.cuda.Event | None = None
+    completion_event: Any | None = None
 
     # Set by exec right before the forward's CUDA launch (where torch drops the
     # GIL). A worker that submitted this batch to the GPU thread and then wants
@@ -299,6 +299,7 @@ class Engine:
         kv_cache_type=None,
     ):
         self._device = device
+        self._device_module = getattr(torch, device.type)
         if kv_cache_type is None:
             kv_cache_type = self._autocast_dtype
 
@@ -310,9 +311,22 @@ class Engine:
             if len(relevant_nodes) == 0:
                 continue # resource not needed
 
-            if not parallel_groups.all_in_same_group(spec.nodes):
+            if not parallel_groups.all_have_compatible_parallel_shape(
+                spec.nodes
+            ):
                 raise ValueError(
                     f"Resource spec {spec.resource_key} nodes {spec.nodes} "
+                    "must use the same TP x SP shape across replicas"
+                )
+
+            # A spec is a logical resource identity and may span replicas on
+            # different workers (for example BAGEL's three CFG branches).
+            # This Engine constructs only the local instance, so require only
+            # the locally hosted consumers to share one parallel group.
+            if not parallel_groups.all_in_same_group(relevant_nodes):
+                raise ValueError(
+                    f"Resource spec {spec.resource_key} local nodes "
+                    f"{relevant_nodes} "
                     f"must all be in the same parallel (tp x sp) group"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(
@@ -325,6 +339,11 @@ class Engine:
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
+                    needs_remote_transfer=(
+                        parallel_groups.resource_needs_remote_transfer(
+                            spec.nodes, relevant_nodes
+                        )
+                    ),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
@@ -367,7 +386,7 @@ class Engine:
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
         """
-        if not torch.cuda.is_available():
+        if not torch.accelerator.is_available():
             return
 
         for node_name, submodule_mgmt in self._submodules.items():
@@ -400,11 +419,11 @@ class Engine:
         return None if submodule.disable_autocast else self._autocast_dtype
 
     def warmup(self) -> None:
-        cg_runners: dict[str, CudaGraphRunner] = {}
-        piecewise: dict[str, dict[str, PiecewiseCudaGraphRunner]] = {}
+        ag_runners: dict[str, AcceleratorGraphRunner] = {}
+        piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]] = {}
         for node_name, submodule_mgmt in self._submodules.items():
             submodule = submodule_mgmt.submodule
-            cg_runners[node_name] = CudaGraphRunner(
+            ag_runners[node_name] = AcceleratorGraphRunner(
                 submodule_name=node_name,
                 submodule=submodule,
                 resources=submodule_mgmt.resources,
@@ -423,17 +442,17 @@ class Engine:
         # nodes share resources, so a build driven by a later node would move
         # buffers an earlier node's graphs already recorded the address of.
         for node_name in self._submodules:
-            cg_runners[node_name].prepare_for_capture()
+            ag_runners[node_name].prepare_for_capture()
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
 
         for node_name, submodule_mgmt in self._submodules.items():
-            runner = cg_runners[node_name]
+            runner = ag_runners[node_name]
             runner.warmup_and_capture()
             if runner.any_graphs:
-                submodule_mgmt.cuda_graph_runner = runner
+                submodule_mgmt.accelerator_graph_runner = runner
 
-            captured: dict[str, PiecewiseCudaGraphRunner] = {}
+            captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
             for label, pw_runner in piecewise[node_name].items():
                 pw_runner.warmup_and_capture()
                 if pw_runner.any_graphs:
@@ -449,22 +468,22 @@ class Engine:
 
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement,
-    ) -> dict[str, PiecewiseCudaGraphRunner]:
+    ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
         """One runner per region the submodule declares, not yet captured.
 
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
         """
         node_dtype = self._autocast_dtype_for(submodule_mgmt.submodule)
-        configs = submodule_mgmt.submodule.get_piecewise_cuda_graph_configs(
+        configs = submodule_mgmt.submodule.get_piecewise_accelerator_graph_configs(
             self._device,
             # the dtype the region runs in; an opted-out node keeps its params'
             node_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
         )
-        runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         for label, config in configs.items():
-            runner = PiecewiseCudaGraphRunner(
+            runner = PiecewiseAcceleratorGraphRunner(
                 label=f"{node_name}_{label}",
                 config=config,
                 resources=submodule_mgmt.resources,
@@ -580,7 +599,7 @@ class Engine:
         # On the GPU thread, right before the forward: point the region runners
         # at this batch's slot so the piecewise lease and replay agree with it.
         submodule_mgmt.set_piecewise_slot(batch.slot or 0)
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
 
@@ -634,11 +653,14 @@ class Engine:
             # holds the GPU thread until the step drains, tightening the 2-step
             # launch bound to 1. Must stay after `commit_done`, which the plan
             # thread gates on. Skipped during capture: you can't sync mid-capture.
-            if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
+            if (
+                _ENGINE_STEP_SYNC
+                and not self._device_module.is_current_stream_capturing()
+            ):
                 if self._enable_nvtx:
                     range_push("engine.await_outputs")
                 try:
-                    torch.cuda.current_stream().synchronize()
+                    self._device_module.current_stream().synchronize()
                 finally:
                     if self._enable_nvtx:
                         range_pop()
@@ -695,7 +717,7 @@ class Engine:
         # on reuse inside the loop (the rotation wraps after `num_slots`
         # requests), and on the way out — see below.
         fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
-        slot_events: dict[int, torch.cuda.Event] = {}
+        slot_events: dict[int, Any] = {}
 
         for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
             req_info = {rid: batch.per_request_info[rid]}
@@ -718,7 +740,7 @@ class Engine:
                     continue
                 launched = True
                 if fence:
-                    slot_events[slot] = torch.cuda.Event()
+                    slot_events[slot] = self._device_module.Event()
                     slot_events[slot].record()
 
                 merged.update(self._collect_outputs(
@@ -740,11 +762,14 @@ class Engine:
         batch.commit_done.set()
         # Same optional 1-step launch throttle as _exec_single. This path is
         # always eager (never capturing), but the guard is kept for parity.
-        if _ENGINE_STEP_SYNC and not torch.cuda.is_current_stream_capturing():
+        if (
+            _ENGINE_STEP_SYNC
+            and not self._device_module.is_current_stream_capturing()
+        ):
             if nvtx:
                 range_push("engine.await_outputs")
             try:
-                torch.cuda.current_stream().synchronize()
+                self._device_module.current_stream().synchronize()
             finally:
                 if nvtx:
                     range_pop()
@@ -845,7 +870,7 @@ class Engine:
         ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
         """
         nvtx = self._enable_nvtx
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         submodule = submodule_mgmt.submodule
         rids = list(ctx.padded_request_ids)
 
@@ -1084,7 +1109,7 @@ class Engine:
         submodule = submodule_mgmt.submodule
         out_ids = (
             step_request_ids if lease is None
-            else submodule_mgmt.cuda_graph_runner.slot_for(lease).dummy_rids
+            else submodule_mgmt.accelerator_graph_runner.slot_for(lease).dummy_rids
         )
         outputs: dict[str, NameToTensorList] = {}
 
@@ -1159,9 +1184,9 @@ class Engine:
         """
         submodule_mgmt = self._submodules[node_name]
         caps = [submodule_mgmt.submodule.max_batch_size(graph_walk)]
-        if submodule_mgmt.cuda_graph_runner is not None:
+        if submodule_mgmt.accelerator_graph_runner is not None:
             caps.append(
-                submodule_mgmt.cuda_graph_runner.max_batch_size_for(graph_walk)
+                submodule_mgmt.accelerator_graph_runner.max_batch_size_for(graph_walk)
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
@@ -1201,14 +1226,14 @@ class Engine:
 
         A batch that hasn't been through ``prepare_inputs`` has no token count
         yet, so only a batched capture can serve it — see
-        ``CudaGraphRunner.select_batched_bucket``.
+        ``AcceleratorGraphRunner.select_batched_bucket``.
         """
         submodule_mgmt = self._submodules[batch.node_name]
 
         if batch.slot is None:
             batch.set_slot(submodule_mgmt.lease_slot())
 
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         if cg_runner is None:
             return None
         # Which of the walk's captures this batch belongs to. The engine can't
@@ -1242,7 +1267,7 @@ class Engine:
         a stateless node does not pay that wait to reach a foregone conclusion.
         """
         mgmt = self._submodules.get(node_name)
-        if mgmt is None or mgmt.cuda_graph_runner is None:
+        if mgmt is None or mgmt.accelerator_graph_runner is None:
             return False
         return any(r.supports_preplan for r in mgmt.resources.values())
 
@@ -1271,7 +1296,7 @@ class Engine:
         plans inline.
         """
         submodule_mgmt = self._submodules[batch.node_name]
-        cg_runner = submodule_mgmt.cuda_graph_runner
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         lease = batch.step_context.slot_lease
         if cg_runner is None or lease is None:
             return False
@@ -1318,9 +1343,9 @@ class Engine:
                 self.reset_pre_plan_for_batch(batch)
                 return False
             stream = cg_runner.plan_stream()
-            with torch.cuda.stream(stream):
+            with self._device_module.stream(stream):
                 self._runner.pre_plan(step)
-            batch.preplan_event = torch.cuda.Event()
+            batch.preplan_event = self._device_module.Event()
             batch.preplan_event.record(stream)
             batch.preplanned_rids = tuple(batch.request_ids)
         finally:
@@ -1350,7 +1375,7 @@ class Engine:
             batch.preplan_event = None
             batch.preplanned_rids = None
             lease = batch.step_context.slot_lease
-            cg_runner = self._submodules[batch.node_name].cuda_graph_runner
+            cg_runner = self._submodules[batch.node_name].accelerator_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
         for resource in self._resources.values():

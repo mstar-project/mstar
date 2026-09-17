@@ -20,7 +20,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import BucketKey, CGSlotSpec
 
 requires_cuda = pytest.mark.skipif(
@@ -49,9 +49,9 @@ class _Group:
 class _FakeRunner:
     """`warmup_and_capture` and `_register_slot` bound onto stubs."""
 
-    warmup_and_capture = CudaGraphRunner.warmup_and_capture
-    _register_slot = CudaGraphRunner._register_slot
-    _buckets_captured_everywhere = CudaGraphRunner._buckets_captured_everywhere
+    warmup_and_capture = AcceleratorGraphRunner.warmup_and_capture
+    _register_slot = AcceleratorGraphRunner._register_slot
+    _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
 
     def __init__(
         self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
@@ -80,7 +80,7 @@ class _FakeRunner:
     def _capture_one(self, spec):
         if (spec.bucket.graph_walk, spec.slot) in self._fail:
             raise RuntimeError("capture failed")
-        # stands in for the CudaGraphSlot; identity is what the test checks
+        # stands in for the AcceleratorGraphSlot; identity is what the test checks
         return f"{spec.bucket.graph_walk}:slot{spec.slot}"
 
     def _get_addtl_slot_specs(self, spec):

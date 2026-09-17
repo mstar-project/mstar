@@ -1,19 +1,24 @@
-"""``WorkerParallelGroups.all_in_same_group``: may these nodes share one resource?
+"""``WorkerParallelGroups.all_in_same_group``: may local nodes share one resource?
 
-A resource spec naming several nodes (BAGEL's LLM + its two CFG branches share
-one KV cache) is only legal when those nodes sit in the same (tp, sp) group.
-The check has to answer per dimension: SP is usually unregistered, and the
-lazy getters mint a fresh single-rank group per node, so comparing those would
-reject every TP-only deployment.
+A logical resource spec may span remote replicas (BAGEL's LLM + its two CFG
+branches), but one worker's physical resource instance can only serve local
+nodes in the same (tp, sp) group. The check has to answer per dimension: SP is
+usually unregistered, and the lazy getters mint a fresh single-rank group per
+node, so comparing those would reject every TP-only deployment.
 """
 
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
-from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+from mstar.distributed.communication import (
+    CommGroup,
+    GlobalParallelConfig,
+    WorkerParallelGroups,
+)
 
 
 def _groups() -> WorkerParallelGroups:
@@ -58,6 +63,19 @@ def test_different_tp_groups_are_rejected():
     assert groups.all_in_same_group(["llm", "codec"]) is False
 
 
+def test_remote_replicas_are_excluded_before_group_validation():
+    groups = _groups()
+    groups.add("llm", _tp([0, 1]))
+    groups.add("llm_cfg_text", _tp([2, 3]))
+    groups.add("llm_cfg_img", _tp([4, 5]))
+
+    spec_nodes = {"llm", "llm_cfg_text", "llm_cfg_img"}
+    local_nodes = spec_nodes & {"llm"}
+
+    assert groups.all_in_same_group(spec_nodes) is False
+    assert groups.all_in_same_group(local_nodes) is True
+
+
 def test_tp_node_and_unparallelized_node_are_rejected():
     groups = _groups()
     groups.add("llm", _tp([0, 1]))
@@ -86,3 +104,67 @@ def test_the_check_does_not_cache_groups_for_remote_nodes():
 
     assert "elsewhere" not in groups.node_to_tp_group
     assert "elsewhere" not in groups.node_to_sp_group
+
+
+def test_remote_replicas_with_matching_parallel_shapes_are_compatible():
+    groups = _groups()
+    groups.node_to_parallel_shapes = {
+        "llm": frozenset({(2, 1)}),
+        "llm_cfg": frozenset({(2, 1)}),
+    }
+
+    assert groups.all_have_compatible_parallel_shape({"llm", "llm_cfg"})
+
+
+def test_remote_replicas_with_different_parallel_shapes_are_rejected():
+    groups = _groups()
+    groups.node_to_parallel_shapes = {
+        "llm": frozenset({(2, 1)}),
+        "llm_cfg": frozenset({(4, 1)}),
+    }
+
+    assert not groups.all_have_compatible_parallel_shape({"llm", "llm_cfg"})
+
+
+def test_global_instance_groups_determine_remote_transfer_need():
+    groups = _groups()
+    groups.node_to_instance_groups = {
+        "llm": frozenset({(0, 1)}),
+        "llm_cfg": frozenset({(2, 3)}),
+    }
+
+    assert groups.resource_needs_remote_transfer(
+        {"llm", "llm_cfg"}, {"llm"}
+    )
+
+    groups.node_to_instance_groups["llm_cfg"] = frozenset({(0, 1)})
+    assert not groups.resource_needs_remote_transfer(
+        {"llm", "llm_cfg"}, {"llm", "llm_cfg"}
+    )
+
+
+def test_global_config_exposes_remote_replica_shapes_to_every_worker():
+    def worker_graph(node, ranks, tp_size):
+        return SimpleNamespace(
+            section=SimpleNamespace(get_nodes=lambda: {node: None}),
+            ranks=ranks,
+            tp_size=tp_size,
+            sp_size=1,
+            _tp_comm_size=tp_size,
+            _tp_ranks=[ranks] if tp_size > 1 else [],
+            _sp_ranks=[],
+            _instance_ranks=[ranks] if tp_size > 1 else [],
+        )
+
+    config = GlobalParallelConfig(
+        worker_graphs={
+            "main": worker_graph("llm", [0, 1], 2),
+            "cfg": worker_graph("llm_cfg", [2], 1),
+        },
+        worker_ids=["worker-0", "worker-1", "worker-2"],
+    )
+
+    worker_view = config.per_worker_config["worker-0"]
+    assert not worker_view.all_have_compatible_parallel_shape(
+        {"llm", "llm_cfg"}
+    )
