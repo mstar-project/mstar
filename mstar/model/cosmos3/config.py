@@ -19,8 +19,10 @@ Values load from a local HF checkpoint directory laid out the diffusers way::
 
     <ckpt>/transformer/config.json   -> the DiT (dual-pathway MoT) dimensions
     <ckpt>/vae/config.json           -> AutoencoderKLWan factors + latent stats
-    <ckpt>/scheduler/scheduler_config.json -> UniPC flow scheduler settings
+    <ckpt>/scheduler/scheduler_config.json -> UniPC flow scheduler settings (or the
+                                        distilled checkpoints' FlowMatchEuler SDE sampler)
     <ckpt>/model_index.json          -> pipeline flags (native flow schedule)
+    <ckpt>/modular_model_index.json  -> distilled sampler (is_distilled, distilled_sigmas)
     <ckpt>/config.json               -> reasoner (vision tower + projector), Edge only
     <ckpt>/preprocessor_config.json, video_preprocessor_config.json -> reasoner media processors
 
@@ -66,12 +68,16 @@ class Cosmos3VAEConfig:
 
 @dataclass
 class Cosmos3SchedulerConfig:
-    """UniPC multistep flow scheduler settings (``scheduler/scheduler_config``).
+    """Flow scheduler settings (``scheduler/scheduler_config``).
 
-    The denoise loop drives a diffusers ``UniPCMultistepScheduler`` configured
-    from these fields; we do not re-implement the bh2 corrector.
+    The denoise loop drives a diffusers scheduler configured from these fields
+    — ``UniPCMultistepScheduler`` for the base checkpoints (we do not
+    re-implement the bh2 corrector), ``FlowMatchEulerDiscreteScheduler`` with
+    stochastic (SDE) steps over the fixed ``distilled_sigmas`` for the 4-step
+    distilled ones; ``scheduler_class`` records which.
     """
 
+    scheduler_class: str = "UniPCMultistepScheduler"
     scheduler_type: str = "unipc"
     prediction_type: str = "flow_prediction"
     predict_x0: bool = True
@@ -84,11 +90,16 @@ class Cosmos3SchedulerConfig:
     flow_shift: float = 1.0
     sigma_min: float = 0.147
     sigma_max: float = 200.0
+    # FlowMatchEuler (distilled): re-noise every position each step.
+    stochastic_sampling: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Cosmos3SchedulerConfig":
         # diffusers stores the flow shift under "flow_shift"; keep the rest by name.
-        return cls(**_filtered(cls, d))
+        cfg = cls(**_filtered(cls, d))
+        if d.get("_class_name"):
+            cfg.scheduler_class = str(d["_class_name"])
+        return cfg
 
 
 @dataclass
@@ -367,6 +378,14 @@ class Cosmos3Config:
     # transform is off on that path (the reference recipes pass
     # ``use_karras_sigmas=False``) unless a request re-enables it.
     use_native_flow_schedule: bool = False
+    # ``modular_model_index.json`` of the 4-step distilled task checkpoints
+    # (Super-Text2Image-4Step / Image2Video-4Step): the sampler is a fixed
+    # sigma list [1.0, 0.9375, 0.8333, 0.625] driven by a FlowMatchEuler SDE
+    # step (``x0 = x - sigma * v``, ``x' = (1 - sigma') x0 + sigma' noise``),
+    # classifier-free guidance is baked into the weights (scale forced to 1),
+    # and the step count is the list's length.
+    is_distilled: bool = False
+    distilled_sigmas: tuple[float, ...] | None = None
 
     # ----- denoise CUDA-graph capture (serving knobs) -----
     # Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier
@@ -463,6 +482,15 @@ class Cosmos3Config:
             with open(index_path) as f:
                 index = json.load(f)
             cfg.use_native_flow_schedule = bool(index.get("use_native_flow_schedule", False))
+
+        modular_path = root / "modular_model_index.json"
+        if modular_path.exists():
+            with open(modular_path) as f:
+                modular = json.load(f)
+            sigmas = modular.get("distilled_sigmas")
+            if modular.get("is_distilled") and sigmas:
+                cfg.is_distilled = True
+                cfg.distilled_sigmas = tuple(float(s) for s in sigmas)
 
         top_path = root / "config.json"
         if top_path.exists():
