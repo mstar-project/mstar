@@ -65,3 +65,50 @@ def test_edge_dit_step_matches_diffusers() -> None:
     err = (velocity - ref).abs().max().item()
     scale = ref.abs().max().item()
     assert err <= 1e-3 * max(scale, 1.0), f"velocity max abs diff {err:.3e} (ref scale {scale:.2f})"
+
+
+@needs_ref
+def test_edge_dit_cached_path_matches_diffusers() -> None:
+    """The served cache-once path on real weights: ``prefill_und`` (raw K for
+    the text tower's causal attention, the GEN-facing normed K re-written into
+    the cache) then one ``denoise_step`` reading it, against the same
+    diffusers dump as the fused check."""
+    from mstar.model.cosmos3.components.packing import build_static_inputs
+    from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
+    from mstar.model.cosmos3.config import Cosmos3Config
+    from mstar.model.cosmos3.loader import load_transformer_weights
+    from mstar.model.cosmos3.tests.test_edge import _OverwriteKV
+
+    rec = torch.load(REF)
+    cfg = Cosmos3Config.from_pretrained(EDGE_DIR)
+    ids = rec["input_ids"].tolist()
+    latents = rec["latents"].float()
+    static = build_static_inputs(
+        ids, tuple(latents.shape), cfg, cfg.vae.scale_factor_temporal, float(rec["fps"]), "cpu",
+        has_image_condition=False,
+    )
+    with torch.device("meta"):
+        model = Cosmos3OmniTransformer(cfg)
+    model = model.to_empty(device="cpu").float()
+    load_transformer_weights(model, EDGE_DIR, device="cpu")
+    model.eval()
+    res = _OverwriteKV()
+    for child in model.modules():
+        bind = getattr(child, "bind_resources", None)
+        if bind is not None:
+            bind({"kv": res, "attn": res})
+    ts = torch.full((static["num_noisy_vision_tokens"],), float(rec["timestep"]))
+    with torch.no_grad():
+        res.causal = True
+        model.prefill_und(static["input_ids"], static["text_mrope_ids"], "main")
+        res.commit()
+        res.causal = False
+        velocity = model.denoise_step(
+            latents, ts, static["vision_mrope_ids"], static["vision_token_shapes"],
+            static["vision_noisy_frame_indexes"], static["vision_mse_loss_indexes"] - static["und_len"],
+            "main", res,
+        )
+    ref = rec["velocity"]
+    err = (velocity - ref).abs().max().item()
+    scale = ref.abs().max().item()
+    assert err <= 1e-3 * max(scale, 1.0), f"cached-path velocity max abs diff {err:.3e} (ref scale {scale:.2f})"
