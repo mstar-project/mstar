@@ -14,6 +14,26 @@ BLOCK = (128, 128)  # the kernel requires K tiles == quant groups == 128
 HIDDEN, INTER, NUM_EXPERTS, TOP_K = 256, 128, 4, 2
 
 
+def test_swiglu_clamp_opt_in():
+    from mstar.utils.fused_moe.kernels import act_and_mul_triton
+
+    torch.manual_seed(4)
+    gateup = (torch.randn(16, 512, device=DEVICE) * 40).to(torch.bfloat16)
+    gate, up = gateup.chunk(2, dim=-1)
+    plain = torch.empty(16, 256, device=DEVICE, dtype=torch.bfloat16)
+    clamped = torch.empty_like(plain)
+    act_and_mul_triton(gateup, plain)
+    act_and_mul_triton(gateup, clamped, swiglu_limit=10.0)
+
+    plain_ref = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
+    clamp_ref = (
+        F.silu(gate.float().clamp(max=10.0)) * up.float().clamp(-10.0, 10.0)
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(plain, plain_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(clamped, clamp_ref, rtol=2e-2, atol=2e-2)
+    assert not torch.allclose(plain, clamped, rtol=2e-2, atol=2e-2)
+
+
 def _block_quant(weight: torch.Tensor, block: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
     """(out, in) fp32 -> (e4m3 weight, fp32 scale_inv) per block; dequant = w * scale."""
     out_f, in_f = weight.shape
