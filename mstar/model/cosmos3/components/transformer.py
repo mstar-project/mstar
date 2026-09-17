@@ -1183,6 +1183,7 @@ class Cosmos3OmniTransformer(nn.Module):
         sound_mse_gen_indexes: torch.Tensor | None = None,
         sound_timesteps: torch.Tensor | None = None,
         prefer_all_gather: bool = False,
+        noisy_token_mask: torch.Tensor | None = None,
     ):
         """Conditional and unconditional generation in one batched pass.
 
@@ -1196,7 +1197,15 @@ class Cosmos3OmniTransformer(nn.Module):
         positions, and let the handle's batched plan route each branch to its
         own label's pages. Returns the conditional and unconditional results in
         the same form as ``denoise_step`` (a velocity, or a (video, action) /
-        (video, sound) pair when the extra band is present)."""
+        (video, sound) pair when the extra band is present).
+
+        ``noisy_token_mask`` (one entry per token in ``vision_timesteps``
+        order) is the captured video graphs' way of carrying the clean/noisy
+        layout as data: the graph is built with every frame declared noisy,
+        and the mask zeroes the timestep embedding on the frames that are
+        actually clean — the same tokens the scatter-add would have skipped,
+        so the noisy frames' velocities are unchanged; the clean frames'
+        (meaningless) velocities are re-pinned away by the caller."""
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
@@ -1204,6 +1213,8 @@ class Cosmos3OmniTransformer(nn.Module):
         target_dtype = packed.dtype
         timesteps = vision_timesteps * self.config.timestep_scale
         ts_embeds = self.time_embedder(self.time_proj(timesteps)).to(target_dtype)
+        if noisy_token_mask is not None:
+            ts_embeds = ts_embeds * noisy_token_mask.to(target_dtype)[:, None]
         gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
             packed_tokens=packed,
             packed_timestep_embeds=ts_embeds,
@@ -1284,6 +1295,10 @@ class Cosmos3OmniTransformer(nn.Module):
             ts_embeds = self.time_embedder(
                 self.time_proj(req["vision_timesteps"] * self.config.timestep_scale)
             ).to(packed.dtype)
+            if req.get("noisy_token_mask") is not None:
+                # Captured video graphs: the clean/noisy layout as data (see
+                # denoise_step_batched_cfg).
+                ts_embeds = ts_embeds * req["noisy_token_mask"].to(packed.dtype)[:, None]
             gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
                 packed_tokens=packed,
                 packed_timestep_embeds=ts_embeds,
