@@ -288,4 +288,6 @@ one trace per shape), ``cuda_graph`` with ``capture_sizes`` / ``capture_batch_si
 (the denoise step, Euler update included, is captured per listed ``[height, width]``
 and batch size; other shapes run the eager batched path), ``max_batch_size``.
 Requests at the same output size batch across users in every node, including the
-text encoder, whose input is always 512 tokens.
+text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
+transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
+BFL-layout safetensors), so a styled deployment runs at the base model's speed.
