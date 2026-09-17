@@ -72,7 +72,13 @@ class CacheStream:
     page_indices: list[int] = field(default_factory=list)
     stored_len: int = 0
     position: int = 0
+    # tokens compacted out of the front by `release_oldest` so far; the
+    # stream's committed content is then `[0, protected_prefix) + the newest
+    # (stored_len - protected_prefix)` tokens of what was written
     released: int = 0
+    # the first `protected_prefix` committed tokens (a text prefix, say) are
+    # never released; set once, after they commit (`protect_prefix`)
+    protected_prefix: int = 0
     retention: RetentionPolicy | None = None
     read_pending: bool = False
     read_future: Future | None = None
@@ -91,6 +97,7 @@ class CacheStream:
         self.stored_len = 0
         self.position = 0
         self.released = 0
+        self.protected_prefix = 0
         self.generation += 1
         self.step_in_flight = False
 
@@ -666,6 +673,89 @@ class KVManager(AttentionResource):
                 for rid in ctx.padded_request_ids:
                     self._apply_fork(rid, from_label, to_label)
         # TODO: handle retention policy, free pages if not commit
+
+    # Partial release behind a protected prefix (windowed generation): a
+    # request that generates in windows commits each window's K/V and, once
+    # its context horizon fills, drops the oldest generated pages while the
+    # prompt prefix stays. Ported from #198's PagedAllocationManager (merceod)
+    # onto the pool's streams.
+
+    @torch.compiler.disable
+    def protect_prefix(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> None:
+        """Mark the first ``num_tokens`` committed tokens of the stream as never
+        releasable. Set once, after the prefix commits and before any release;
+        idempotent at the same value."""
+        if label is None:
+            label = self._default_label
+        with self._lock:
+            stream = self._streams[request_id][label]
+            if num_tokens < 0 or num_tokens > stream.stored_len:
+                raise ValueError(
+                    f"protect_prefix({num_tokens}) outside the committed {stream.stored_len} "
+                    f"tokens of request {request_id!r} label {label!r}"
+                )
+            if stream.released:
+                raise ValueError(
+                    f"protect_prefix must precede any release_oldest for request "
+                    f"{request_id!r} label {label!r}"
+                )
+            if stream.protected_prefix not in (0, num_tokens):
+                raise ValueError(
+                    f"protected prefix already {stream.protected_prefix} tokens for "
+                    f"request {request_id!r} label {label!r}, got {num_tokens}"
+                )
+            stream.protected_prefix = num_tokens
+
+    @torch.compiler.disable
+    def release_oldest(
+        self, request_id: str, num_tokens: int, label: str | None = None,
+    ) -> int:
+        """Free the oldest unprotected committed tokens of a live stream, whole
+        pages only, compacting the page list so the remaining stream stays
+        contiguous in page-list order. Returns the tokens actually freed.
+
+        The freed span starts at the first page fully past the protected
+        prefix; a page straddling the protection boundary and a partially
+        filled tail page are never freed, so the realized release can fall
+        short of ``num_tokens`` by up to a page — callers re-offer the
+        shortfall next time (see ``WindowedKVSession``). ``stored_len`` drops
+        by exactly the freed count and ``generation`` moves, so a prefix a
+        backend gathered out of these pages is re-read (the dense backend keys
+        its gathered prefix on it). Positions are not touched: the tokens that
+        remain keep the absolute positions their K/V was written with.
+
+        Refused under an admitted step (its plan addresses these pages) and
+        while the stream is offloaded or being retrieved.
+        """
+        if label is None:
+            label = self._default_label
+        with self._lock:
+            stream = self._streams[request_id][label]
+            if stream.step_in_flight:
+                raise RuntimeError(
+                    f"release_oldest on request {request_id!r} label {label!r} under an "
+                    "admitted step; release between steps"
+                )
+            if stream.offloaded or stream.read_pending:
+                raise RuntimeError(
+                    f"release_oldest on request {request_id!r} label {label!r} while its "
+                    "pages are offloaded or in transfer"
+                )
+            page_size = self.config.page_size
+            first = (stream.protected_prefix + page_size - 1) // page_size
+            releasable = stream.stored_len // page_size - first
+            k = min(num_tokens // page_size, releasable)
+            if k <= 0:
+                return 0
+            freed = stream.page_indices[first:first + k]
+            del stream.page_indices[first:first + k]
+            stream.stored_len -= k * page_size
+            stream.released += k * page_size
+            stream.generation += 1
+            self._arena.release(freed)
+            return k * page_size
 
     # Eviction
 
