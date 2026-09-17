@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash attention modules: NoPE MLA (fork of glm52) + loader-aware KDA."""
+"""GLM-5.3-Flash attention modules: NoPE MLA + TP-sharded, loader-aware KDA."""
 from __future__ import annotations
 
 import torch
@@ -15,7 +15,7 @@ from mstar.model.glm5_next.config import ATTN, KV_CACHE, LABEL, Glm5NextModelCon
 from mstar.model.glm5_next.kda import Glm5NextKdaConfig, Glm5NextLinearAttention
 
 # k_norm eps is hardcoded in the reference indexer (LayerNorm(head_dim,
-# eps=1e-6), weight AND bias) — NOT rms_norm_eps. Same value as glm52's.
+# eps=1e-6), weight AND bias) — NOT rms_norm_eps.
 _INDEXER_K_NORM_EPS = 1e-6
 
 
@@ -34,10 +34,9 @@ class Glm5NextIndexer(nn.Module):
         self.wk = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=_INDEXER_K_NORM_EPS)
-        # Pool compression (new vs glm52): additive per-slot prior over the
-        # kpool members + the member-gate applied via F.linear (no bias) —
-        # both selection-determining, kept exactly (assembly spec, open
-        # question 3). ape's softmax runs fp32 in the M1 scoring.
+        # Pool compression: an additive per-slot prior over the kpool members
+        # plus the member gate applied via F.linear (no bias). Both decide
+        # which slots get selected, so they are carried exactly.
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.kpool, self.head_dim))
         self.index_kpool_compress_gate = nn.Parameter(
@@ -105,7 +104,7 @@ class Glm5NextMLAAttention(nn.Module):
             bias=False, input_is_parallel=True, reduce_results=True)
 
         # Every full-attention layer (the MTP layer included) ships its own
-        # FULL indexer — read indexer_types, no IndexShare formula.
+        # full indexer; config.indexer_types is the source of truth.
         self.layer_idx = layer_idx
         # This layer's plane in the MLA KV pool (compact full-attention
         # index: 3 -> 0, 7 -> 1, ..., 43 -> 10; the MTP draft plane comes
@@ -155,12 +154,12 @@ class Glm5NextMLAAttention(nn.Module):
         q_c, kv_a = fused.split(
             [self.q_a_proj.out_features, self.kv_lora_rank], dim=-1)
         # FlashInfer RMSNorm needs 64-byte input alignment; decode split views
-        # can be contiguous yet start at an unaligned offset (glm52 lesson).
+        # can be contiguous yet still start at an unaligned offset.
         q_c = q_c.contiguous()
         kv_a = kv_a.clone(memory_format=torch.contiguous_format)
 
-        # The post-q_a_layernorm latent is ALSO the M1 indexer's query input
-        # (wq_b reads the same 1536-dim bottleneck) — keep it in a name.
+        # The post-q_a_layernorm latent is also the indexer's query input
+        # (wq_b reads the same q_lora_rank bottleneck), so keep it in a name.
         q_c = self.q_a_layernorm(q_c)
         q = self.q_b_proj(q_c).view(num_tokens, h, self.qk_head_dim)
         kv_c = self.kv_a_layernorm(kv_a).view(num_tokens, 1, self.kv_lora_rank)

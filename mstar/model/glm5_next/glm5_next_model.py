@@ -1,7 +1,6 @@
 """Glm5NextModel: Model implementation for GLM-5.3-Flash (text generation)."""
 
 import logging
-import threading
 from pathlib import Path
 
 import torch
@@ -60,32 +59,6 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
-def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
-    """Tick a small CUDA kernel until the first real forward pass."""
-    if not str(device).startswith("cuda"):
-        return None
-    stop = threading.Event()
-
-    def _tick():
-        # Sized to REGISTER in sampled utilization (~15-25%), not just to
-        # execute: ~2.7 ms of matmul every 50 ms, 14 matmuls per 0.25 s wake
-        # (glm52's measured-the-hard-way sizing; see glm52_model.py).
-        a = torch.ones(8192, 8192, device=device, dtype=torch.bfloat16)
-        while not stop.wait(0.25):
-            try:
-                for _ in range(14):
-                    torch.mm(a, a)
-            except torch.AcceleratorError:
-                # A CUDA graph capture is in flight in the process (global
-                # capture mode rejects unsafe calls from any thread). The
-                # capture path stops this thread first; this is a race backstop.
-                continue
-
-    t = threading.Thread(target=_tick, daemon=True, name="glm5next-load-heartbeat")
-    t.start()
-    return stop
-
-
 class Glm5NextModel(Model):
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
 
@@ -106,10 +79,10 @@ class Glm5NextModel(Model):
         else:
             self.config = Glm5NextModelConfig()
         if kwargs.get("dsa_long_context", False):
-            # glm52's opt-in long-context flag exists on the config for
-            # shape parity, but the glm5_next k-pool engine path (pooled
-            # scoring + sparse gather) is not built yet — refuse loudly
-            # instead of serving a silently-dense long context.
+            # The config carries the opt-in long-context flag for shape
+            # parity, but the k-pool engine path (pooled scoring + sparse
+            # gather) is not built yet — refuse loudly instead of serving a
+            # silently-dense long context.
             raise NotImplementedError(
                 "glm5_next dsa_long_context is a post-M1 follow-up: the "
                 "k-pool indexer engine path is not implemented; serve "
@@ -136,9 +109,7 @@ class Glm5NextModel(Model):
     def tokenizer(self):
         # Lazy: weights AND tokenizer load on demand so the conductor
         # process never touches the 306 GB checkpoint or HF IO in
-        # dummy/byte mode. Token ids, chat template family, and the
-        # transformers-4.x fallback are identical to GLM-5.2 (same eos/pad
-        # ids — config-verified).
+        # dummy/byte mode.
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
@@ -152,7 +123,7 @@ class Glm5NextModel(Model):
             except ValueError:
                 # transformers-5 tokenizer_config declares a backend class
                 # transformers 4.x cannot construct; tokenizer.json is
-                # version-independent (glm52 lesson, verified on 4.57).
+                # version-independent, so build the fast tokenizer from it.
                 self._tokenizer = self._fast_tokenizer_fallback(tokenizer_source)
         return self._tokenizer
 
@@ -230,9 +201,9 @@ class Glm5NextModel(Model):
         if "top_k" in model_kwargs:
             params["top_k"] = int(model_kwargs["top_k"])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
-            # MTP v1 is greedy-only: greedy is the DECLARED default on MTP
-            # configs so a bare request serves coherently; an EXPLICIT
-            # temperature > 0 still reaches the refusal (glm52 policy).
+            # MTP drafting is greedy-only: greedy is the DECLARED default
+            # on MTP configs so a bare request serves coherently; an EXPLICIT
+            # temperature > 0 still reaches the refusal.
             params["temperature"] = 0.0
         return {SAMPLER: SamplingReqConfig(**params)}
 
@@ -241,12 +212,12 @@ class Glm5NextModel(Model):
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # M2 note: glm52's MTP prefill adds a persisted MTP_DRAFT_BUNDLE
-        # edge here (and its read half in the transition below). Port BOTH
-        # halves together behind one flag helper — the write-gated/
-        # read-live split and the "text_inputs" name collision are
-        # documented glm52 regressions (2026-08-10); until the M2 loop
-        # exists, the walk stays the plain shape even at k > 0.
+        # MTP prefill needs a persisted draft-bundle edge here and its read
+        # half in the transition below. Add both halves together behind one
+        # flag helper: a write gated by the flag against an unconditional
+        # read, or a bundle reusing the name "text_inputs", both break the
+        # decode seed. Until the draft loop exists the walk stays this plain
+        # shape even at k > 0.
         prefill = GraphNode(
             name="LLM",
             input_names=["text_inputs"],
@@ -278,11 +249,10 @@ class Glm5NextModel(Model):
                     ),
                 ],
             ),
-            # Runaway guard; the per-request budget lives in check_stop
-            # (M1). Keep this cap strictly below the preprocess context
-            # guard — raising it toward max_seq_len converts a per-request
-            # truncation into a batch-fatal context escape (glm52
-            # 2026-08-10, tried and reverted).
+            # Runaway guard; the per-request budget lives in check_stop.
+            # Keep this cap strictly below the preprocess context guard:
+            # raising it toward max_seq_len converts a per-request
+            # truncation into a batch-fatal context escape.
             max_iters=self.get_max_output_tokens(),
             outputs=[],
         )
@@ -346,10 +316,10 @@ class Glm5NextModel(Model):
                 request_done=True,
             )
 
-        # Seed decode from the persisted emitted token. M2: the draft
-        # bundle seed goes here under a DEDICATED name — never
-        # "text_inputs", which the conductor pre-seeds with the PROMPT
-        # (glm52's measured 17-row decode step + acceptance collapse).
+        # Seed decode from the persisted emitted token. A draft-bundle seed
+        # belongs here too, under a DEDICATED name — never "text_inputs",
+        # which the conductor pre-seeds with the PROMPT, so reusing the name
+        # feeds the whole prompt back into every decode step.
         graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
         graph_edge.tensor_info = persist_signals.get("new_token", [])
         unpersist_tensors = list(graph_edge.tensor_info)
@@ -383,7 +353,7 @@ class Glm5NextModel(Model):
             byte_ids = [min(b, vocab - 1) for b in prompt.encode("utf-8")] or [0]
             return {"text_inputs": [torch.tensor(byte_ids, dtype=torch.long)]}
 
-        # Same chat-template family as GLM-5.2 ([gMASK]<sop> + assistant turn).
+        # The checkpoint's chat template: [gMASK]<sop> + assistant turn.
         if getattr(self.tokenizer, "chat_template", None):
             input_ids = self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
@@ -472,16 +442,15 @@ class Glm5NextModel(Model):
 
         # Build on meta -> optional autocast narrow -> to_empty(device) ->
         # fast read-plan load (restore_fp32_params runs inside load_weights) ->
-        # process_weights_after_loading -> eval -> wrap. Mirrors glm52_model's
-        # sequence. Building on meta first keeps the 306 GB allocation lazy
-        # until to_empty. The KDA state pool is the engine's slot-state
-        # resource (get_node_resources), built by the engine after this.
+        # process_weights_after_loading -> eval -> wrap. Building on meta
+        # first keeps the 306 GB allocation lazy until to_empty. The KDA
+        # state pool is the engine's slot-state resource
+        # (get_node_resources), built by the engine after this.
         with torch.device("meta"):
             language_model = Glm5NextForCausalLM(self.config, comm_group=tp_group)
         if autocast_dtype is not None:
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
-        heartbeat_stop = _start_gpu_liveness_heartbeat(device)
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
@@ -489,14 +458,8 @@ class Glm5NextModel(Model):
         self.kda_conv_dtype = language_model.kda_conv_dtype()
 
         logger.info("Successfully loaded GLM-5.3-Flash submodule for %s", node_name)
-        submodule = Glm5NextLLMSubmodule(
+        return Glm5NextLLMSubmodule(
             language_model=language_model, config=self.config)
-        # The heartbeat outlives the load until CUDA-graph capture starts
-        # (the submodule stops it in get_cuda_graph_configs, or on its first
-        # forward): the reaper's per-process idle clock doesn't care that the
-        # box is busy reading a checkpoint.
-        submodule.set_load_heartbeat_stop(heartbeat_stop)
-        return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
         """Load weights, taking the sliced TP fast read path when possible."""

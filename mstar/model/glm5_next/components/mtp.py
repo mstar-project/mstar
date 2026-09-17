@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash MTP module — the layer-45 draft model (M2 wiring target)."""
+"""GLM-5.3-Flash MTP module: the layer-45 draft model."""
 from __future__ import annotations
 
 import torch
@@ -76,7 +76,9 @@ class Glm5NextMTPModule(nn.Module):
         prev_hidden: torch.Tensor,
         dsa_ctx=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns ``(head_input, raw_hidden)`` — see the module docstring."""
+        """Returns the shared-head norm output (the LM head's input) and the
+        layer's unnormed hidden state, which seeds the next draft step.
+        """
         if dsa_ctx is not None:
             raise NotImplementedError(
                 "glm5_next MTP has no DSA engine path yet (identity regime "

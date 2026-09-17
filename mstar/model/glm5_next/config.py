@@ -2,8 +2,8 @@
 
 from dataclasses import dataclass, field
 
-# Reused as-is per the assembly spec: same fp8 e4m3 [128, 128]
-# weight_scale_inv scheme, same dynamic activation scheme as GLM-5.2.
+# fp8 e4m3 with [128, 128] `weight_scale_inv` block scales and dynamic
+# activation scaling: the checkpoint's quantization scheme.
 from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig
 
 LINEAR_ATTENTION = "linear_attention"
@@ -48,7 +48,7 @@ def build_mlp_layer_types(
 
 
 def build_indexer_types(num_hidden_layers: int) -> tuple[str, ...]:
-    """Every MLA layer runs its own FULL indexer — no GLM-5.2 IndexShare."""
+    """Every MLA layer runs its own full indexer; none are shared."""
     return tuple("full" for _ in range(num_hidden_layers))
 
 
@@ -111,10 +111,9 @@ class Glm5NextModelConfig:
     mla_use_nope: bool = True
 
     # Absorbed MLA stores one compressed latent KV head per token in the
-    # engine's MLA cache layout. The port serves this path only (the
-    # engine's MLA backend has an fp32 SDPA fallback, so reduced CPU
-    # configs run the same path); the flag is kept for config parity and
-    # must stay True.
+    # engine's MLA cache layout. This is the only path served (the engine's
+    # MLA backend has an fp32 SDPA fallback, so reduced CPU configs run the
+    # same path); the flag is kept for config parity and must stay True.
     mla_absorb: bool = True
 
     # --- DSA sparse-attention indexer (k-pool compression) ---
@@ -128,14 +127,13 @@ class Glm5NextModelConfig:
     index_kpool_always_select_tail: bool = True
     index_share_for_mtp_iteration: bool = True
     indexer_rope_interleave: bool = True  # vestigial: rope_dim is 0 here
-    # M3 ablation switch (0 = MTP off; k > 0 = draft k tokens per step with
-    # the layer-45 MTP module). Gates both MTP construction and the
-    # layer-45 weight load.
+    # 0 = MTP off; k > 0 = draft k tokens per step with the layer-45 MTP
+    # module. Gates both MTP construction and the layer-45 weight load.
     mtp_num_draft_tokens: int = 0
-    # Engine half of DSA (glm52 pattern). Off: serving holds every context
-    # to index_topk, where dense MLA is bit-exactly the DSA computation
-    # (selecting <= topk/kpool pools of <= topk/kpool is the identity, tail
-    # included) — the M0 regime.
+    # Engine half of DSA. Off: serving holds every context to index_topk,
+    # where dense MLA computes exactly what DSA would (selecting
+    # <= topk/kpool pools out of <= topk/kpool is the identity, tail
+    # included).
     dsa_long_context: bool = False
 
     # --- MLP / MoE ---
@@ -159,7 +157,7 @@ class Glm5NextModelConfig:
     # Serving cap, consumed by get_node_resources. Held to index_topk
     # while dsa_long_context is off: dense MLA is exactly the DSA
     # computation only within the top-2048 window, and the submodule's
-    # preprocess guard enforces the same bound (glm52 M1 regime).
+    # preprocess guard enforces the same bound.
     max_seq_len: int = 2048
 
     # --- MTP (speculative decoding) ---
@@ -169,7 +167,7 @@ class Glm5NextModelConfig:
     # stream.
     num_nextn_predict_layers: int = 1
 
-    # --- tokens / generation defaults (identical ids to GLM-5.2) ---
+    # --- tokens / generation defaults ---
     eos_token_ids: tuple[int, ...] = (154820, 154827, 154829)
     pad_token_id: int = 154820
     max_output_tokens: int = 1024
@@ -178,13 +176,13 @@ class Glm5NextModelConfig:
     repetition_penalty: float = 1.0
     ignore_eos: bool = False
 
-    # --- quantization / serving knobs (glm52 semantics) ---
+    # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales
     # (`weight_scale_inv`). Populated from config.json by from_hf_config.
     quantization_config: Fp8BlockQuantConfig | None = None
     # Keep routed experts FP8-resident (uint8 container + block scales);
     # everything else dequantizes to bf16 on load. 288 experts x 43 layers
-    # dominate the 306 GB checkpoint the same way GLM-5.2's did.
+    # dominate the 306 GB checkpoint.
     moe_fp8_resident: bool = True
     moe_quant_kernel: str = "reference"
 
@@ -415,8 +413,8 @@ class Glm5NextModelConfig:
             raise ValueError(
                 "linear_attn_config.full_attn_layers disagrees with layer_types"
             )
-        # Group routing must be the identity (same as glm52 — the group
-        # machinery is not ported).
+        # Group routing must be the identity; the expert-group machinery
+        # is not implemented.
         if int(text.get("n_group", 1)) != 1 or int(text.get("topk_group", 1)) != 1:
             raise ValueError(
                 "n_group/topk_group != 1: expert-group routing is not ported"

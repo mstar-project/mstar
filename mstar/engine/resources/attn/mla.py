@@ -66,9 +66,13 @@ class MLAAttentionManager(AttentionManager):
 
         self.use_kernel = mla_kernel_available(self.ckv_dim, self.kpe_dim, device)
         if not self.use_kernel:
-            logger.info(
+            # On CUDA this is a per-request python loop over gathered pages:
+            # correct, but far off serving speed, and it cannot be captured.
+            log = logger.warning if torch.device(device).type == "cuda" else logger.info
+            log(
                 "MLA attention %r: FlashInfer MLA kernel unavailable for "
-                "ckv=%d kpe=%d on %s; using the fp32 SDPA fallback",
+                "ckv=%d kpe=%d on %s; using the fp32 SDPA fallback, which "
+                "runs eager",
                 kv_cache, self.ckv_dim, self.kpe_dim, device,
             )
 
@@ -146,6 +150,14 @@ class MLAAttentionManager(AttentionManager):
     def plan(self, step: AttentionStep, ctx: StepContext):
         self.reset_default_cursors()
         lease = ctx.slot_lease
+        if lease is not None and not self.use_kernel:
+            # The fallback bakes page indices into its plan, so a replay would
+            # attend the capture's pages. Refuse rather than serve garbage.
+            raise RuntimeError(
+                f"MLA attention {self._kv_cache_name!r}: the SDPA fallback "
+                "cannot be captured; the node must not register cuda graphs "
+                "when the FlashInfer MLA kernel is unavailable"
+            )
         assert not ctx.is_preplan or lease is not None, (
             "preplan requires a cuda graph step: eager wrappers share one "
             "workspace per label with the forward still in flight"

@@ -48,7 +48,7 @@ def kda_slot_state_config(
 
 @dataclass
 class Glm5NextKdaSnapshot:
-    """Deep copy of one request's KDA state — the M2 rewind primitive."""
+    """Deep copy of one request's KDA state, for speculative rewind."""
 
     recurrent: torch.Tensor  # (L_kda, H, D, D) fp32
     conv: torch.Tensor  # (L_kda, 3*H*D, kernel-1)
@@ -127,7 +127,7 @@ class Glm5NextKdaStateAccess:
         self._recurrent[kda_pos].index_copy_(0, slot_index, recurrent)
         self._conv[kda_pos].index_copy_(0, slot_index, conv)
 
-    # -- snapshot / restore (M2 verify-rewind; test seam today) -----------
+    # -- snapshot / restore (speculative rewind) --------------------------
 
     def snapshot(self, request_id: str) -> Glm5NextKdaSnapshot:
         slot = self._slot(request_id)
@@ -141,7 +141,7 @@ class Glm5NextKdaStateAccess:
         slot = self._slot(request_id)
         self._recurrent[:, slot].copy_(snap.recurrent)
         self._conv[:, slot].copy_(snap.conv)
-        self.resource._committed[request_id] = snap.committed
+        self.resource.set_committed(request_id, snap.committed)
 
     def _slot(self, request_id: str) -> int:
         slot = self.resource.slot_of(request_id)

@@ -105,7 +105,7 @@ def test_dispatch_fused_matches_clamped_reference(num_tokens):
     x = (torch.randn(num_tokens, block.hidden_size, device=DEVICE) * 0.6).to(torch.bfloat16)
 
     # fp32 topk_weights straight from the gate: BOTH dispatch paths keep the
-    # router weight fp32 (no glm52-style downcast).
+    # router weight fp32, with no downcast on the way in.
     topk_weights, topk_ids = block.gate(x)
     assert topk_weights.dtype == torch.float32
 
@@ -116,12 +116,10 @@ def test_dispatch_fused_matches_clamped_reference(num_tokens):
     assert got.dtype == torch.bfloat16
     # Cosine similarity: scale- and clamp-boundary-robust, so it isolates
     # STRUCTURAL correctness (routing / weights / reduce) from fp8 magnitude
-    # noise. Measured on the lane (coriander, 2026-08-31): 0.996 at
-    # swiglu_limit=0.5 (this tight-clamp stress) and 0.999 at the real 10.0;
-    # a wrong-routing or swapped-weight bug collapses this toward 0.
-    # Element-wise rel-L2 is 4.5% (real limit) / 9% (this stress) -- fp8-on-
-    # hidden=256 noise, not a defect; the true correctness gate is the
-    # on-checkpoint greedy parity (fused serve == reference serve).
+    # noise -- a wrong-routing or swapped-weight bug collapses it toward 0.
+    # Element-wise error stays dominated by fp8 rounding at this hidden size,
+    # so it is no gate here; on-checkpoint greedy parity (fused serve ==
+    # reference serve) is what catches magnitude drift.
     cos = torch.nn.functional.cosine_similarity(got.float().flatten(), ref.float().flatten(), dim=0)
     assert cos > 0.99, f"fused vs reference cosine = {cos:.4f} -- structural break?"
 
@@ -183,9 +181,8 @@ def test_clamp_on_bounds_activation_and_diverges():
 
 
 def test_get_cuda_graph_configs_nonempty_when_fused_resolved():
-    # The capture flip is _use_fused-driven (submodules.py needs no logic
-    # edit); this half is CPU-testable but rides the GPU gate with the rest
-    # of the file.
+    # The capture flip is driven entirely by ``_use_fused``. This half is
+    # CPU-testable but rides the GPU gate with the rest of the file.
     from mstar.model.glm5_next.components.moe import Glm5NextSparseMoeBlock
     from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 
@@ -209,7 +206,7 @@ def test_get_cuda_graph_configs_nonempty_when_fused_resolved():
     assert sub._moe_resolved_fused() is True
     assert sub._moe_capture_blocked(tp_world_size=8) is False
     configs = sub.get_cuda_graph_configs(torch.device(DEVICE), tp_world_size=8)
-    # v1 captures decode only: KDA prefill is a host span loop.
+    # Only decode is captured: KDA prefill is a host span loop.
     assert len(configs) == 1
     assert configs[0].capture_graph_walk == "decode"
     assert configs[0].capture_batch_sizes

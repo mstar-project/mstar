@@ -56,21 +56,15 @@ from mstar.model.glm5_next.kda_state import (  # noqa: E402
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine  # noqa: E402
 
-# The chunked-prefill and recurrent-decode paths are mathematically equal but
-# numerically distinct (different reduction structure). In float64 their max
-# logits delta on this reduced geometry is ~4e-7 on EVERY platform — that is
-# the algorithmic-equivalence signal the cross-path parity test asserts, so it
-# runs in float64 (LOGITS_ATOL_F64). In fp32 the delta is platform-dependent
-# and much larger through the reduced config's ~3x/layer noise gain: ~4e-7 on
-# Apple-Accelerate (dev laptop) but ~5e-3 on x86-MKL (Laude CI box, 2026-08-31)
-# — an fp32 tolerance that held on the laptop failed box-side, and papering it
-# with a ~1e-2 fp32 atol would erode the bug margin (real bugs — gate wiring,
-# state desync, op order — land at O(0.1-1)). LOGITS_ATOL (fp32) stays for the
-# same-path bitwise/greedy checks that are platform-stable.
+# Chunked prefill and recurrent decode are mathematically equal but numerically
+# distinct (different reduction structure). In fp32 the gap between them is
+# BLAS-backend-dependent, and a tolerance wide enough to cover any backend
+# would swallow real bugs — gate wiring, state desync or op order move the
+# logits far more — so cross-path parity runs in float64 (LOGITS_ATOL_F64).
+# LOGITS_ATOL is for the same-path bitwise/greedy checks, which are stable.
 #
-# The MLA backend's SDPA fallback computes in fp32 whatever the model dtype
-# (as the lane's ReferenceCacheHandle did), so the float64 run isolates the
-# KDA chunk-vs-recurrent structure exactly as before.
+# The MLA backend's SDPA fallback computes in fp32 whatever the model dtype, so
+# the float64 run still isolates the KDA chunk-vs-recurrent structure.
 LOGITS_ATOL = 1e-3
 LOGITS_ATOL_F64 = 1e-5
 _WEIGHT_STD = 0.03
@@ -90,7 +84,7 @@ def _cpu_rmsnorm(x, weight, eps=1e-6):
 
 
 class _StubTransfer:
-    """No transfer engine on a laptop: the KV resource's transfer manager is
+    """No transfer engine in a unit test: the KV resource's transfer manager is
     replaced per test (``KVManager.__init__`` builds one unconditionally)."""
 
     def __init__(self, *args, **kwargs):
@@ -138,15 +132,15 @@ def _build_model(
 
 
 class _GreedySampler:
-    """Argmax in place of the Triton sampler for the folded engine-path
-    smoke (``forward_batched`` samples inside the forward)."""
+    """Argmax in place of the Triton sampler for the engine-path smoke test
+    (``forward_batched`` samples inside the forward)."""
 
     def sample(self, request_ids, logits, **kwargs):
         return logits.argmax(-1)
 
 
 class _Harness:
-    """A reduced ``Glm5NextForCausalLM`` behind the REAL v1 resources."""
+    """A reduced ``Glm5NextForCausalLM`` behind the REAL engine resources."""
 
     def __init__(
         self,
@@ -199,10 +193,10 @@ class _Harness:
         return self.kv._streams[rid][LABEL].stored_len
 
     def rewind_kv(self, rid: str, n: int) -> None:
-        """The lane's ``handle.rewind_seq_lens``: v1 has no rewind on the KV
-        resource yet (the M2 verify loop will add one), and a paged rewind is
-        the stream's ``stored_len`` — its pages stay leased as a high-water
-        mark and heal by overwrite.
+        """Rewind a request's KV stream by ``n`` tokens. The KV resource has
+        no rewind entry point of its own, and on a paged cache a rewind is
+        only the stream's ``stored_len`` — its pages stay leased as a
+        high-water mark and heal by overwrite.
         """
         self.kv._streams[rid][LABEL].stored_len -= n
 
@@ -218,7 +212,7 @@ class _Harness:
         step.set_ctx(StepContext(
             request_ids=tuple(request_ids), graph_walk=walk, slot=0, capture=False,
         ))
-        step.steps.pop(SAMPLER)  # see the class docstring
+        step.steps.pop(SAMPLER)  # these tests read logits, never sampled tokens
         outcome = self.runner.admit(step)
         assert outcome.ok, outcome.reason
         self.runner.plan(step)
@@ -262,7 +256,7 @@ class _Harness:
 def test_prefill_matches_stepwise_decode_batched():
     """Chunked prefill and recurrent decode agree over the same tokens."""
     # float64: isolates the chunk-vs-recurrent algorithmic equivalence from
-    # platform fp32 rounding (which the reduced config amplifies ~3x/layer).
+    # platform fp32 rounding, which the reduced config amplifies layer by layer.
     h = _Harness(seed=10, dtype=torch.float64)
     cfg = h.cfg
     prefill_lens = {"r0": 11, "r1": 7}
@@ -308,7 +302,7 @@ def test_prefill_matches_stepwise_decode_batched():
                 f"{rid} decode step {step}: max|d|="
                 f"{(logits[i] - want).abs().max().item():.3e}"
             )
-            # Same greedy trajectory — the M1 parity bar in miniature.
+            # Same greedy trajectory, not merely close logits.
             assert int(logits[i].argmax()) == int(want.argmax())
 
     for rid in request_ids:
@@ -321,10 +315,10 @@ def test_prefill_matches_stepwise_decode_batched():
 @torch.no_grad()
 def test_decode_replays_bitwise_across_kda_snapshot_restore():
     """snapshot -> decode k -> restore + KV rewind -> decode k again: the
-    replay is BIT-exact (same states, same ops) — the M2 verify-rewind
-    primitive (KV-plane rewind is free; recurrent state is not, hence the
-    snapshot), and the strongest possible save/restore check. The snapshot
-    now reads the engine's slot pool through ``Glm5NextKdaStateAccess``.
+    replay is BIT-exact (same states, same ops), the strongest save/restore
+    check there is. The KV plane rewinds for free, the recurrent state does
+    not — hence the snapshot, taken from the engine's slot pool through
+    ``Glm5NextKdaStateAccess``.
     """
     h = _Harness(seed=12)
     cfg = h.cfg
@@ -386,8 +380,8 @@ def test_kda_state_lifecycle_is_explicit_and_loud():
     h.close_step(step)
     assert kda.committed("r0") == 6 and kda.slot_of("r0") == slot
 
-    # A planned-but-dropped step (its forward never ran) commits nothing:
-    # both phases. (The lane rolled these back with abort_context.)
+    # A planned-but-dropped step (its forward never ran) commits nothing, in
+    # either phase.
     h.open_step("decode", ["r0"], [ids[:1]])
     assert kda.committed("r0") == 6
     h.open_step("prefill", ["r0"], [ids[:3]])
@@ -431,8 +425,8 @@ def test_kda_state_lifecycle_is_explicit_and_loud():
 
 
 class _KVSpy:
-    """Records which latent plane the MLA layers write and read through
-    the KV resource — the v1 form of the lane's ``set_layer_idx`` spy."""
+    """Records which latent plane the MLA layers write and read through the
+    KV resource."""
 
     def __init__(self, kv):
         self.writes: list[int] = []
@@ -566,14 +560,14 @@ def test_glm5next_model_constructs_from_config():
     assert set(walks) == {"prefill", "decode"}
     assert isinstance(walks["decode"], Loop)
 
-    # Real constructor path (no tokenizer IO at init — lazy like glm52).
+    # Real constructor path: no tokenizer IO at init, the tokenizer is lazy.
     constructed = Glm5NextModel(
         "zai-org/GLM-5.3-Flash", config_variant="reduced", kda_max_requests=4)
     assert constructed.config.num_hidden_layers == 8
     reduced = _specs_by_key(constructed)
     kv_reduced = reduced[KV_CACHE].config
-    # Same absorbed path as full-size (the lane's mla_absorb=False naive
-    # fallback is gone): 2 planes, one latent head of 32 + 64.
+    # Same absorbed path as full-size — there is no non-absorbed fallback:
+    # 2 planes, one latent head of 32 + 64.
     assert kv_reduced.layout == KVLayout.MLA
     assert kv_reduced.num_layers == 2
     assert kv_reduced.num_kv_heads == 1
@@ -605,7 +599,7 @@ def test_glm5next_model_constructs_from_config():
 def test_glm5next_registered():
     from mstar.model import registry
 
-    # The registry is lazy now: a (module, class) pair resolved on demand.
+    # The registry is lazy: a (module, class) pair resolved on demand.
     assert registry.MODEL_REGISTRY["glm5_next"] == (
         "mstar.model.glm5_next.glm5_next_model", "Glm5NextModel")
     assert registry.get_model_class("glm5_next") is Glm5NextModel
@@ -634,9 +628,9 @@ def test_mtp_off_and_on_both_construct():
     assert mtp.transformer_layer.self_attn.indexer is not None  # own FULL indexer
     assert mtp.transformer_layer.self_attn.kv is h.kv  # bound like the trunk
 
-    # glm52 draft-loop call contract: (embeds, prev_hidden) -> (head_input
-    # for the caller-owned lm_head, raw hidden to chain), run inside a
-    # planned engine step like any layer.
+    # Draft-loop call contract: (embeds, prev_hidden) -> (head_input for the
+    # caller-owned lm_head, raw hidden to chain), run inside a planned engine
+    # step like any other layer.
     spy = _KVSpy(h.kv)
     h.ingest("r0")
     step, _ = h.open_step("prefill", ["r0"], [torch.tensor([5])])
@@ -743,8 +737,8 @@ def test_loader_roundtrip_through_real_pipeline():
 
 def test_full_geometry_names_resolve_through_pipeline():
     """Representative full-config (45-layer) raw names resolve to targets
-    the loader expects — pins the forget_gate remap fix at the geometry
-    the real index has (the reduced roundtrip can't see layer 44)."""
+    the loader expects — pins the forget_gate remap at the geometry the
+    real index has (the reduced roundtrip can't see layer 44)."""
     from mstar.model.glm5_next.weight_loader import (
         expected_parameter_paths,
         resolve_index_names,
@@ -837,7 +831,7 @@ def test_swiglu_clamp_engages_on_every_mlp_path():
 
 
 def test_moe_quant_kernel_resolution_and_clamp_guard():
-    """glm52 kimi quant_kernel semantics + the new SwiGLU-clamp-capability guard."""
+    """'reference' and 'auto' resolve off the device; 'triton' refuses without one."""
     cfg = Glm5NextModelConfig.reduced_fp8()
     assert cfg.moe_quant_kernel == "reference"
     blk = Glm5NextSparseMoeBlock(cfg)
@@ -853,7 +847,7 @@ def test_moe_quant_kernel_resolution_and_clamp_guard():
     cfg_triton = Glm5NextModelConfig.reduced_fp8()
     cfg_triton.moe_quant_kernel = "triton"
     blk_triton = Glm5NextSparseMoeBlock(cfg_triton)
-    with pytest.raises(RuntimeError, match="swiglu_limit"):
+    with pytest.raises(RuntimeError, match="needs CUDA"):
         blk_triton.process_weights_after_loading("cpu")
 
     cfg_bf16 = Glm5NextModelConfig.reduced()  # no quantization_config
@@ -885,9 +879,8 @@ def test_module_tree_matches_loader_expectations():
 
 @torch.no_grad()
 def test_submodule_engine_path_prefill_then_decode():
-    """``test_glm5next_engine_path.py`` folded in: the submodule's own seam (prepare_inputs
-    -> declare_step -> preprocess -> forward_batched) with a greedy stand-in for the
-    Triton sampler.
+    """The submodule's own seam (prepare_inputs -> declare_step -> preprocess
+    -> forward_batched), with a greedy stand-in for the Triton sampler.
     """
     from types import SimpleNamespace
 

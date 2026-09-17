@@ -1,7 +1,5 @@
-"""GLM-5.3-Flash MLP/MoE: the glm52 blocks parameterized + the SwiGLU clamp."""
+"""GLM-5.3-Flash MLP/MoE: sigmoid-router sparse MoE + the SwiGLU clamp."""
 from __future__ import annotations
-
-import inspect
 
 import torch
 import torch.nn.functional as F
@@ -16,13 +14,6 @@ from mstar.model.glm5_next.quantization import FP8_DTYPE, dequantize_fp8_block_w
 
 # HF Glm5NextTextTopkRouter: denominator = topk_weights.sum(...) + 1e-20.
 _TOPK_NORM_EPS = 1e-20
-
-
-def _fused_supports_swiglu_clamp(fused_fn) -> bool:
-    """True iff the loaded fused fp8 kernel accepts ``swiglu_limit`` -- the SwiGLU clamp
-    GLM-5.3 needs.
-    """
-    return "swiglu_limit" in inspect.signature(fused_fn).parameters
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -277,11 +268,10 @@ class Glm5NextSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden_size).contiguous()
 
-        # Combine weights stay fp32 into the dispatch (module docstring
-        # delta 3): the reference's per-expert multiply promotes and
-        # index_add_ downcasts once; the fused kernel folds the same fp32
-        # weights into GEMM-2's fp32 accumulator, so NEITHER path downcasts
-        # topk_weights (glm52's fused branch does).
+        # Combine weights stay fp32 all the way into the dispatch: the
+        # reference path's per-expert multiply promotes and index_add_
+        # downcasts once, and the fused kernel folds the same fp32 weights
+        # into its GEMM-2 accumulator. Neither path downcasts topk_weights.
         topk_weights, topk_ids = self.gate(flat)
         if self._use_fused:
             routed = self._dispatch_fused(flat, topk_weights, topk_ids)
@@ -372,16 +362,13 @@ class Glm5NextSparseMoeBlock(nn.Module):
         fused_ok = dev.type == "cuda"
         if fused_ok:
             try:
-                from mstar.utils.fused_moe import fused_experts_fp8
+                from mstar.utils.fused_moe import fused_experts_fp8  # noqa: F401
             except Exception:
                 fused_ok = False
-            else:
-                fused_ok = _fused_supports_swiglu_clamp(fused_experts_fp8)
         if kernel == "triton" and not fused_ok:
             raise RuntimeError(
-                "moe_quant_kernel='triton' requested but a SwiGLU-clamp-capable "
-                "fused fp8 kernel is unavailable (needs CUDA + a fused_experts_fp8 "
-                "that accepts swiglu_limit). Use 'reference' (default) for the "
+                "moe_quant_kernel='triton' requested but the fused fp8 kernel "
+                "is unavailable (it needs CUDA). Use 'reference' for the "
                 "clamped reference dispatch."
             )
         self._use_fused = kernel == "triton" or (kernel == "auto" and fused_ok)

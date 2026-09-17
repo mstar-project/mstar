@@ -34,8 +34,8 @@ class Glm5NextLanguageModel(nn.Module):
             ]
         )
         self.norm = build_rmsnorm(config)
-        # Unweighted stream mean (explicitly unlike DeepSeek-V4's weighted
-        # head; the checkpoint ships no head weights). Parameter-free.
+        # Unweighted stream mean: the checkpoint ships no head weights, so
+        # the collapse is parameter-free.
         self.hc_head = Glm5NextHyperHead()
 
     def forward(
@@ -80,9 +80,9 @@ class Glm5NextForCausalLM(nn.Module):
         return self.lm_head(hidden_states)
 
     def kda_conv_dtype(self) -> torch.dtype:
-        """The KDA projection dtype: the slot-state conv tail must match it
-        (the continue path ``cat``s the tail onto the projected activations
-        bit-exactly). Read off the first KDA layer's q_proj."""
+        """The KDA projection dtype: the slot-state conv tail must match it,
+        because the continue path ``cat``s the tail onto the projected
+        activations. Read off the first KDA layer's q_proj."""
         for layer in self.model.layers:
             if layer.is_linear_attention:
                 return layer.self_attn.q_proj.weight.dtype

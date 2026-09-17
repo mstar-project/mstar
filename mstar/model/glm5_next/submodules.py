@@ -54,21 +54,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         self.language_model = language_model  # Glm5NextForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
-        self._load_heartbeat_stop = None
-
-    # -- load-time GPU liveness heartbeat (reaper boxes) ------------------
-
-    def set_load_heartbeat_stop(self, stop) -> None:
-        """Adopt the load-time GPU liveness tick."""
-        self._load_heartbeat_stop = stop
-
-    def _stop_load_heartbeat(self) -> None:
-        # getattr: the CPU tests construct partially-initialized submodules
-        # that never ran __init__ (nn.Module.__getattr__ would raise).
-        stop = getattr(self, "_load_heartbeat_stop", None)
-        if stop is not None:
-            stop.set()
-            self._load_heartbeat_stop = None
 
     # -- CUDA-graph configs ----------------------------------------------
 
@@ -109,12 +94,19 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[CudaGraphConfig]:
-        # Capture is about to run: no other thread may issue CUDA work.
-        self._stop_load_heartbeat()
         if self._moe_capture_blocked(tp_world_size):
-            logger.info(
+            logger.warning(
                 "glm5_next: reference MoE dispatch active; decode runs eager "
                 "(set moe_quant_kernel=auto for the capturable fused kernel)"
+            )
+            return []
+        # The MLA fallback bakes page indices into its plan, so a captured
+        # replay would attend the capture's pages (the resource refuses).
+        attn = self.node_resources.get(ATTN)
+        if device.type == "cuda" and attn is not None and not attn.use_kernel:
+            logger.warning(
+                "glm5_next: MLA is on the SDPA fallback, which cannot be "
+                "captured; decode runs eager"
             )
             return []
         # DECODE-ONLY: KDA prefill is a host span loop over python-int slot
@@ -125,9 +117,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             if max_slots is None or b <= max_slots
         ]
         # MSTAR_GLM53_GRAPH_COMPILE=1 captures the torch.compile'd forward;
-        # the default captures the eager one (the lane served that way: the
-        # Inductor-subprocess Triton crash under the compile pool failed
-        # every capture and silently degraded to eager).
+        # the default captures the eager one, because a Triton crash in the
+        # Inductor compile subprocess fails every capture and degrades back
+        # to eager without saying so.
         graph_compile = os.environ.get("MSTAR_GLM53_GRAPH_COMPILE", "0") == "1"
         return [
             BatchedCudaGraphConfig(
@@ -168,10 +160,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         text_inputs = inputs["text_inputs"][0]
         seq_len = text_inputs.shape[0]
         # dsa_long_context is refused at model __init__, so the serving
-        # regime is ALWAYS ctx <= index_topk, where dense MLA is bit-exactly
-        # GLM-5.3-Flash's DSA computation — refuse beyond it rather than serve
-        # off-spec logits. Raising here fails only this request (the engine
-        # registers the failure and drops the rid from the batch).
+        # regime is ALWAYS ctx <= index_topk, where dense MLA computes
+        # exactly what GLM-5.3-Flash's DSA would — refuse beyond it rather
+        # than serve off-spec logits. Raising here fails only this request
+        # (the engine registers the failure and drops the rid from the batch).
         limit = self.config.index_topk
         kda = self.node_resources.get(KDA_STATE) if self.node_resources else None
         committed = kda.committed(fwd_info.request_id) if kda is not None else 0
@@ -234,7 +226,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor,
     ) -> torch.Tensor:
-        self._stop_load_heartbeat()
         attn = engine_inputs.resources[ATTN]
         sampler = engine_inputs.resources[SAMPLER]
         hidden = self.language_model.model(input_ids)
@@ -296,9 +287,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         token = outputs["new_token"][0].item()
         is_eos = token in self.config.eos_token_ids
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        # Total generated = 1 prefill-emitted token + (decode iters + 1). The
-        # +2 counts the prefill-emitted token against max_tokens (vLLM
-        # semantics; the glm52 M1 off-by-one lesson, lane ground rule 5).
+        # Total generated = 1 prefill-emitted token + (decode iters + 1):
+        # max_tokens counts the token the prefill emits, so the decode loop
+        # runs one fewer.
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
             return {"decode_loop"}

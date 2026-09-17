@@ -67,11 +67,11 @@ class Glm5NextDecoderLayer(nn.Module):
         if not self.is_linear_attention:
             return
         self._kda = Glm5NextKdaStateAccess(resources[KDA_STATE])
-        # The conv tail is cat'd onto the projected activations bit-exactly
-        # (kda.prefill), so the pool the model declared must match the dtype
-        # the layer was loaded in — a YAML autocast override without a
-        # matching model_kwargs.kda_conv_dtype would otherwise promote the
-        # conv math silently.
+        # The conv tail is cat'd onto the projected activations (kda.prefill),
+        # so the pool the model declared must match the dtype the layer was
+        # loaded in — a YAML autocast override without a matching
+        # model_kwargs.kda_conv_dtype would otherwise promote the conv math
+        # silently.
         proj_dtype = self.self_attn.q_proj.weight.dtype
         pool_dtype = self._kda.conv_dtype
         if pool_dtype != proj_dtype:

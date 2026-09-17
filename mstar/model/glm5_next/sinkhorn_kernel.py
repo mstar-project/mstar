@@ -1,4 +1,4 @@
-"""Fused Sinkhorn-Knopp kernel for the mHC comb matrix (M3 Phase 2)."""
+"""Fused Sinkhorn-Knopp kernel for the mHC comb matrix."""
 from __future__ import annotations
 
 import torch
@@ -8,7 +8,7 @@ try:
     import triton.language as tl
 
     _HAS_TRITON = True
-except ModuleNotFoundError:  # pure-math files import on CPU-only boxes (ground rule 4)
+except ModuleNotFoundError:  # no triton: the pure-torch reference covers this install
     _HAS_TRITON = False
 
 
@@ -30,8 +30,8 @@ if _HAS_TRITON:
         # Keep every intermediate fp32. ``eps`` is a python float (fp64 in
         # triton), so ``+ eps`` promotes the divide to fp64; ``.to(tl.float32)``
         # after each step both matches the reference's fp32 arithmetic and keeps
-        # the loop-carried reduction fp32 (triton rejects an fp32->fp64 loop var
-        # — the bug the serve surfaced that the isolated launch did not).
+        # the loop-carried value fp32 — triton rejects a loop variable whose
+        # dtype changes between iterations.
         csum = tl.sum(m, axis=0)               # [H], per-column sum over rows
         m = (m / (csum[None, :] + eps)).to(tl.float32)
         for _ in range(num_iters - 1):
@@ -45,7 +45,7 @@ if _HAS_TRITON:
     def sinkhorn_normalize_fused(
         matrix: torch.Tensor, num_iters: int, eps: float,
     ) -> torch.Tensor:
-        """CUDA fused Sinkhorn: one kernel launch replaces the ~78 of the reference loop.
+        """CUDA fused Sinkhorn: one kernel launch for the whole iteration loop.
         ``matrix`` is ``[..., H, H]`` fp32 on CUDA; returns a new tensor (functional,
         like the reference).
         """

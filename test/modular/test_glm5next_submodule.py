@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import sys
-import threading
 import types
 
 sys.path.insert(0, ".")
@@ -263,20 +262,21 @@ class TestSurface:
         for k in (0, 2):
             _model, lm, cfg = _build_model(seed=30, mtp_num_draft_tokens=k)
             sub = Glm5NextLLMSubmodule(language_model=lm, config=cfg)
-            # M1 keeps the walk plain single-token regardless of k; the
-            # submodule carries no MTP machinery. Both builds are valid.
+            # The walk stays plain single-token regardless of k: the
+            # submodule carries no MTP machinery, so both builds are valid.
             assert (lm.mtp is None) == (k == 0)
             assert sub.can_batch(None, []) is True
 
     def test_torch_compile_disabled_by_default(self):
-        # The eager prefill forward hosts the KDA span loop; the post-capture
-        # compile is opt-in (D6).
+        # The eager prefill forward hosts the KDA span loop; compiling the
+        # captured decode is opt-in.
         assert Glm5NextLLMSubmodule.disable_torch_compile is True
 
     def test_create_submodule_builds_on_reduced_config(self, tmp_path, monkeypatch):
         """The real meta-build -> to_empty(cpu) -> load -> process_weights_
-        after_loading -> wrap sequence runs end to end on CPU, with the 306 GB
-        read stubbed out (random-init the meta-materialized module instead)."""
+        after_loading -> wrap sequence runs end to end on CPU, with the
+        checkpoint read stubbed out (random-init the meta-materialized module
+        instead)."""
         model = Glm5NextModel("zai-org/GLM-5.3-Flash", config_variant="reduced")
         # A bare dir: no index.json (generic driver branch), no config.json
         # (_maybe_apply_checkpoint_quant_config is a no-op, bf16 stands).
@@ -300,8 +300,6 @@ class TestSurface:
         assert model.kda_conv_dtype == torch.float32
         kda_spec = next(s for s in model.get_node_resources() if s.resource_key == KDA_STATE)
         assert kda_spec.config.tensors["conv"].dtype == torch.float32
-        # CPU: no reaper heartbeat; resources are the engine's to bind.
-        assert sub._load_heartbeat_stop is None
         assert sub.node_resources == {}
 
         # Non-LLM nodes have no submodule; a dummy build (no checkpoint) is None.
@@ -511,23 +509,6 @@ class TestCudaGraphs:
         monkeypatch.setenv("MSTAR_GLM53_GRAPH_COMPILE", "0")
         assert sub.get_cuda_graph_configs(DEVICE)[0].compile is False
 
-    def test_capture_stops_the_load_heartbeat_even_when_blocked(self):
-        # The runner captures in global error mode: no other thread may touch
-        # CUDA meanwhile, so the tick stops here regardless of what comes back.
-        for blocked in (False, True):
-            _model, lm, cfg = _build_model(seed=35)
-            if blocked:
-                cfg.quantization_config = Glm5NextModelConfig.reduced_fp8().quantization_config
-            sub = Glm5NextLLMSubmodule(lm, cfg)
-            stop = threading.Event()
-            sub.set_load_heartbeat_stop(stop)
-            configs = sub.get_cuda_graph_configs(DEVICE, tp_world_size=1)
-            assert (configs == []) is blocked
-            assert stop.is_set()
-            assert sub._load_heartbeat_stop is None
-        # and a second stop is a no-op
-        sub._stop_load_heartbeat()
-
     def test_max_batch_size_is_the_slot_pool(self):
         h = _Harness(seed=36, max_slots=3)
         assert h.kda.max_slots == 3
@@ -633,14 +614,10 @@ class TestDtypeAndCleanup:
 class TestEngineSeam:
     def test_prefill_decode_lifecycle_and_chunk_step_parity(self):
         h = _Harness(seed=7)
-        stop = threading.Event()
-        h.sub.set_load_heartbeat_stop(stop)
         h.ingest("r0")
         prompt = torch.tensor([5, 9, 13, 7, 21], dtype=torch.long)
 
         t1 = h.step("prefill", {"r0": prompt})["r0"]
-        # the first forward stops the load heartbeat (no capture ran)
-        assert stop.is_set() and h.sub._load_heartbeat_stop is None
         assert t1.shape == (1,) and t1.dtype == torch.long
         assert h.kda.committed("r0") == 5
         assert h.kda.slot_of("r0") not in (None, SINK_SLOT)

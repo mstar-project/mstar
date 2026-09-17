@@ -13,7 +13,7 @@ from mstar.model.glm5_next.kda import (
     Glm5NextLinearAttention,
 )
 
-OUT_ATOL = 1e-3  # bf16 outputs; measured headroom >= 40x
+OUT_ATOL = 1e-3  # bf16 outputs
 STATE_ATOL = 1e-5  # fp32 recurrent states
 
 
@@ -42,7 +42,7 @@ def _input(cfg: Glm5NextKdaConfig, batch_size: int, seq_len: int) -> torch.Tenso
 
 @pytest.mark.parametrize("seq_len", [1, 4, 63, 64, 65, 130])
 def test_prefill_matches_decode_loop(seq_len):
-    """P1: chunked prefill == running the decode step token by token."""
+    """Chunked prefill == running the decode step token by token."""
     layer, cfg = _build(seed=1)
     batch_size = 2
     x = _input(cfg, batch_size, seq_len)
@@ -87,7 +87,7 @@ def test_conv_state_stores_raw_projection_tail():
 
 
 def test_chunked_prefill_resume_matches_full_prefill():
-    """P2: prefill(70) + prefill(60, carried state) == prefill(130)."""
+    """prefill(70) + prefill(60, carried state) == prefill(130)."""
     layer, cfg = _build(seed=3)
     batch_size, seq_len, split = 2, 130, 70
     x = _input(cfg, batch_size, seq_len)
@@ -108,11 +108,10 @@ def test_chunked_prefill_resume_matches_full_prefill():
 
 @pytest.mark.parametrize("tail_len", [1, 3, 5])
 def test_small_continue_chunk_matches_decode_loop(tail_len):
-    """M2 verify shape: a small continue window (L << 64) runs the chunk
-    kernel at an effective chunk covering L (no 64-pad, no 63-iteration
-    substitution loop) and must agree with decoding the same tokens one
-    by one from the same carried state — conv bit-exact, delta rule
-    within the measured tolerance.
+    """A small continue window (L << 64) runs the chunk kernel at an
+    effective chunk covering L (no 64-pad, no 63-iteration substitution
+    loop), and must agree with decoding the same tokens one by one from
+    the same carried state.
     """
     layer, cfg = _build(seed=7)
     batch_size, prefill_len = 2, 10
@@ -192,7 +191,7 @@ def test_shapes_and_dtypes_at_real_config_dims():
     batch_size, seq_len = 1, 5
     x = torch.randn(batch_size, seq_len, cfg.hidden_size, dtype=torch.bfloat16) * 0.05
 
-    # Checkpoint-facing parameter geometry (spec section 1).
+    # Checkpoint-facing parameter geometry.
     assert layer.conv1d.weight.shape == (24576, 1, 4)
     assert layer.conv1d.weight.dtype == torch.float32
     assert layer.forget_gate.A_log.shape == (64,)

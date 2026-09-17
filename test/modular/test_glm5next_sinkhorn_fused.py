@@ -1,4 +1,4 @@
-"""Fused Sinkhorn (Triton) vs the pure-torch reference — parity (M3 Phase 2)."""
+"""Fused Sinkhorn (Triton) vs the pure-torch reference — parity."""
 import pytest
 import torch
 

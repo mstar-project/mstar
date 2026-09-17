@@ -194,8 +194,9 @@ class TestLifecycle:
         assert not outcome.ok
         assert outcome.ready
         assert "exhausted" in outcome.reason.message
-        # not an AllocationFailed / AdmitRuntimeError: the worker re-queues
-        assert type(outcome.reason).__name__ == "AdmitFailedReason"
+        # AllocationFailed is what the worker's hold/backoff path keys on
+        assert type(outcome.reason).__name__ == "AllocationFailed"
+        assert outcome.reason.request_id == "b"
         m.remove_request("a")
         assert m.admit(step, _ctx(["b"])).ok
 

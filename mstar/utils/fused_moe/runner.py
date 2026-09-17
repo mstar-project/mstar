@@ -258,7 +258,7 @@ def fused_experts_fp8(
     # get_default_config's M <= E branch ignores N, so the down GEMM (N=hidden,
     # 12x the gate/up N) used to inherit the gate/up tiles. At decode shapes
     # the two launches want different tiles: a 64-config sweep at GLM-5.2's
-    # per-rank shape (T=4, K=8, E=256, H=6144, I=256; env/bench_fused_moe_config.py,
+    # per-rank shape (T=4, K=8, E=256, H=6144, I=256; benchmark/glm52/bench_fused_moe_config.py,
     # 2026-08-29, all candidates bit-identical to the default) measured
     # gate/up 31.4 -> 28.2 us and down 22.0 -> 15.8 us in-graph.
     config_down = dict(config)

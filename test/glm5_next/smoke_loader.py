@@ -42,7 +42,7 @@ def collect_real_headers(ckpt: Path) -> dict[str, tuple[str, list[int]]]:
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print("usage: python env/smoke_glm53_loader.py <checkpoint_dir>")
+        print("usage: python test/glm5_next/smoke_loader.py <checkpoint_dir>")
         return 2
     ckpt = Path(sys.argv[1])
     cfg = Glm5NextModelConfig.from_hf_config(

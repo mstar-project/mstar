@@ -19,9 +19,9 @@ GLM5_NEXT_HC_EPS = 1e-6
 GLM5_NEXT_HC_SINKHORN_ITERS = 20
 GLM5_NEXT_RMS_NORM_EPS = 1e-5
 
-# M3 Phase 2: fuse the mHC Sinkhorn (~78 launches/site -> 1) on CUDA. Set =0 to
-# force the pure-torch reference (also the CPU path). sinkhorn_kernel guards its
-# own triton import, so this file still imports on a CPU-only box (ground rule 4).
+# Collapse the mHC Sinkhorn iterations into one CUDA launch. Set =0 to force the
+# pure-torch reference (also the CPU path). sinkhorn_kernel guards its own triton
+# import, so this module still imports where triton is absent.
 _FUSED_SINKHORN = os.environ.get("MSTAR_GLM53_FUSED_SINKHORN", "1") == "1"
 
 
@@ -78,11 +78,10 @@ class Glm5NextHyperConnection(nn.Module):
         self.base = nn.Parameter(torch.empty(mix))
         # One learned scale per mapping output: pre, post, comb.
         self.scale = nn.Parameter(torch.empty(3))
-        # fp32 copy of ``fn`` built once by ``process_weights_after_loading``
-        # (the Glm52MoEGate idiom). Plain attribute, not a buffer, so
-        # ``model.to(bf16)`` cannot downcast it; ``forward`` falls back to a
-        # per-call ``.float()`` (bit-identical) until it exists or after a
-        # device move.
+        # fp32 copy of ``fn`` built once by ``process_weights_after_loading``.
+        # A plain attribute, not a buffer, so ``model.to(bf16)`` cannot
+        # downcast it; ``forward`` falls back to an equivalent per-call
+        # ``.float()`` until it exists or after a device move.
         self._fn_fp32: torch.Tensor | None = None
         self.reset_parameters()
 

@@ -31,9 +31,7 @@ class Glm5NextKdaConfig:
 
     @classmethod
     def reduced(cls) -> "Glm5NextKdaConfig":
-        """Tiny-dim variant for CPU tests — the spec's parity-measurement
-        geometry (H=4, D=32; measured chunk-vs-recurrent max diff 6.1e-5
-        on bf16 outputs, ~1e-6 on fp32 states at L=130)."""
+        """Tiny-dim variant (H=4, D=32) for the CPU parity tests."""
         return cls(hidden_size=64, linear_num_heads=4, linear_head_dim=32)
 
 
@@ -105,8 +103,8 @@ def chunk_kda(
     v_head_dim = value.shape[-1]
     scale = 1 / (query.shape[-1] ** 0.5)
     if initial_state is not None:
-        # Small-L continue path (docstring): never pad a verify/resume tail
-        # past its own length. L >= chunk_size continues are unchanged.
+        # Clamp the chunk to a continue's own length: a short resume/verify
+        # tail is never padded out. L >= chunk_size continues are unchanged.
         chunk_size = min(chunk_size, sequence_length)
     pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
     total_sequence_length = sequence_length + pad_size
@@ -132,12 +130,9 @@ def chunk_kda(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
         diagonal=0,
     )
-    # decay[i, j] = exp(g_i - g_j), (B, H, N, C, C, D). Materialized for
-    # ALL chunks at once (1:1 with the reference): at the L=2048 serving
-    # cap this transient is ~4.3 GB/layer unsharded (~0.5 GB at TP8) —
-    # the known first-OOM candidate as prefill batching grows. The M3
-    # lever is a per-chunk recompute (bit-exact: elementwise ops + last-
-    # dim reductions on identical slices), cutting it by N.
+    # decay[i, j] = exp(g_i - g_j), (B, H, N, C, C, D), materialized for ALL
+    # chunks at once as the reference does. It is the largest transient in
+    # prefill, and recomputing it per chunk is how to shrink it.
     decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp().float()
     attn = (
         -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask)
@@ -295,8 +290,8 @@ class Glm5NextLinearAttention(nn.Module):
         self.qkv_dim = self.num_heads * self.head_dim
         self.conv_dim = 3 * self.qkv_dim
         self.conv_kernel_size = config.linear_conv_kernel_size
-        # Kernel-internal chunking, not a config field; 64 matches the
-        # reference default and the parity measurements.
+        # Kernel-internal chunking, not a config field; 64 is the reference
+        # default, which the parity tests are written against.
         self.chunk_size = 64
 
         self.q_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False, dtype=dtype)

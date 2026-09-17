@@ -22,8 +22,8 @@ from mstar.engine.resources.slot_state.config import (
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
-    AdmitFailedReason,
     AdmitOutcome,
+    AllocationFailed,
     StepContext,
 )
 from mstar.utils.pinned_staging import pinned
@@ -105,6 +105,13 @@ class SlotStateManager(Resource):
     def committed(self, rid: str) -> int:
         return self._committed.get(rid, 0)
 
+    def set_committed(self, rid: str, tokens: int) -> None:
+        """Rewind or restore a request's committed length (speculative undo)."""
+        with self._lock:
+            if self.slot_of(rid) is None:
+                raise KeyError(f"request {rid!r} holds no slot")
+            self._committed[rid] = int(tokens)
+
     def tracked_requests(self) -> set[str]:
         return set(self._slot_of)
 
@@ -175,12 +182,18 @@ class SlotStateManager(Resource):
             if segment.span <= 0 or segment.request_id not in real:
                 continue
             if not self._alloc(segment.request_id):
+                # AllocationFailed, like the KV cache: it is what the worker's
+                # hold/backoff path keys on. Nothing here is evictable, so the
+                # batch is held until a resident request releases a slot.
                 return AdmitOutcome(
                     ok=False,
                     ready=True,
-                    reason=AdmitFailedReason(
+                    reason=AllocationFailed(
                         f"slot state {self.name!r}: pool of {self.max_slots} "
-                        f"slots exhausted admitting {segment.request_id!r}"
+                        f"slots exhausted admitting {segment.request_id!r}",
+                        pages_short=1,
+                        label=segment.label,
+                        request_id=segment.request_id,
                     ),
                 )
         return ADMIT_OK

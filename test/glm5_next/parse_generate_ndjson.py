@@ -44,7 +44,7 @@ def extract(path: str) -> tuple[str, int]:
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print("usage: python env/parse_generate_ndjson.py <out_dir> [elapsed_s ...]")
+        print("usage: python test/glm5_next/parse_generate_ndjson.py <out_dir> [elapsed_s ...]")
         return 2
     out = argv[1]
     elapsed = [float(x) for x in argv[2:]]
