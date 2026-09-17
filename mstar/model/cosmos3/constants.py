@@ -28,3 +28,11 @@ ACTION_GEN_WALK = "action_gen"
 # Forward-dynamics runs the same joint video+action denoise but emits the
 # predicted video (VAE-decoded) instead of the action, so it has its own walk.
 ACTION_VIDEO_GEN_WALK = "action_video_gen"
+
+# The Edge reasoner: the understanding tower served as a VLM. A text-only
+# prompt prefills the reasoner alone; a prompt with images/videos runs the
+# vision_encoder node first and hands the projected tokens over; decoding is
+# one token per loop iteration until EOS / max tokens.
+REASONER_PREFILL_WALK = "reasoner_prefill"
+REASONER_PREFILL_VISION_WALK = "reasoner_prefill_vision"
+REASONER_DECODE_WALK = "reasoner_decode"
