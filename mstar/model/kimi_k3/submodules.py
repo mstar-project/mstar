@@ -23,10 +23,12 @@ from mstar.engine.resources import (
     SamplerStep,
     Segment,
     SlotLease,
+    SpecStep,
     SubmoduleStep,
 )
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
+from mstar.engine.resources.speculative import SpecAcceptance
+from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, SPEC, KimiK3Config
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs
 
 logger = logging.getLogger(__name__)
@@ -49,8 +51,16 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
 
     def __init__(self, language_model: nn.Module, config: KimiK3Config, cuda_graphs: bool = True,
                  max_capture_batch_size: int | None = None, max_prefill_batch_size: int | None = 8,
-                 mixed_prefill_decode: bool = False):
+                 mixed_prefill_decode: bool = False, speculative_tokens: int = 0):
         super().__init__()
+        # speculative decoding (plan section 8.5): a decode row carries k + 1 ids (the bonus token
+        # and k drafts), the target verifies them in one pass, `sample_verify` keeps the accepted
+        # prefix plus a new bonus, and the next row is drafted. 0 = one token per step. Until the
+        # DSpark draft lands the drafts are the bonus token repeated (`_draft`), which exercises the
+        # whole verify path with near-zero acceptance.
+        self.speculative_tokens = int(speculative_tokens)
+        self.k1 = self.speculative_tokens + 1
+        self._acceptance = None  # the SpecAcceptance resource, bound with the node's resources
         # prefill runs eagerly and its transient memory grows with the tokens in the step: the
         # attention-residual stack alone is [tokens, blocks, hidden] (about 1 GB per 8k tokens at
         # K3 width), so the scheduler is asked to split prefills beyond this many requests
@@ -78,7 +88,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=1,
+                    input_ids=torch.zeros(self.k1, dtype=torch.long, device=device), input_seq_len=self.k1,
                 ),
                 capture_batch_sizes=self.capture_batch_sizes, compile=False),
             # no prefill capture: the KDA varlen conv/chunk kernels size work on the host
@@ -107,6 +117,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
                 KDA_STATE: RecurrentStep(),
                 KDA_ATTN: LinearAttnStep(),
                 SAMPLER: SamplerStep(apply_penalty=False),
+                **({SPEC: SpecStep()} if self.speculative_tokens > 0 else {}),
             },
         )
 
@@ -126,8 +137,40 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         logits = self.lm_head(hidden)
         return sampler.sample(engine_inputs.request_ids, logits=logits)
 
+    # ------------------------------------------------------------ speculation
+    def _draft(self, bonus: torch.Tensor) -> torch.Tensor:
+        """``bonus [bs, 1]`` -> ``drafts [bs, k]``. The stand-in until the DSpark draft: the bonus
+        token repeated, accepted only where the target repeats itself."""
+        return bonus.expand(-1, self.speculative_tokens)
+
+    def _forward_verify(self, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        """One verify step over decode rows of ``k1`` ids each (``[bonus, d1..dk]``): the target's
+        logits at every position, greedy verification, the acceptance counts staged for the next
+        plan and the KDA prefix lengths, the next rows drafted from the new bonus tokens. Batch-wide
+        sentinels of static shape; ``unpack_packed_outputs`` cuts them per request post-replay."""
+        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        acceptance: SpecAcceptance = engine_inputs.resources[SPEC]
+        kda = engine_inputs.resources[KDA_ATTN]
+        pool = engine_inputs.resources[KDA_STATE]
+        ids = text_inputs.view(-1, self.k1)
+        hidden = self.language_model.model(self.embed_tokens(text_inputs), label="main")
+        logits = self.lm_head(hidden)
+        tokens, accepted = sampler.sample_verify(engine_inputs.request_ids, logits, ids[:, 1:])
+        acceptance.stage(accepted)
+        kda.set_prefix_len(pool.block("spec_len", 0), accepted)
+        bonus = tokens.gather(1, accepted.to(torch.long).unsqueeze(1))
+        next_inputs = torch.cat([bonus, self._draft(bonus)], dim=1)
+        return {"spec_tokens": tokens, "spec_accepted": accepted, "next_inputs": next_inputs}
+
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor, **kwargs):
-        return {"new_token": self._forward(graph_walk, engine_inputs, text_inputs)}
+        if self.speculative_tokens > 0 and graph_walk == "decode":
+            return self._forward_verify(engine_inputs, text_inputs)
+        new_token = self._forward(graph_walk, engine_inputs, text_inputs)
+        if self.speculative_tokens > 0:
+            # a prefill under speculation also drafts the first decode row
+            bonus = new_token.view(-1, 1)
+            return {"new_token": new_token, "next_inputs": torch.cat([bonus, self._draft(bonus)], dim=1)}
+        return {"new_token": new_token}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -145,18 +188,58 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor, **kwargs,
     ) -> dict[str, NameToTensorList]:
+        if self.speculative_tokens > 0 and graph_walk == "decode":
+            # batch-wide sentinels only: the per-request cut needs the accepted counts on the
+            # host, which `unpack_packed_outputs` reads after the replay
+            return self._forward_verify(engine_inputs, text_inputs)
         new_tokens = self._forward(graph_walk, engine_inputs, text_inputs)
-        return {rid: {"new_token": [new_tokens[i : i + 1]]} for i, rid in enumerate(engine_inputs.request_ids)}
+        out = {rid: {"new_token": [new_tokens[i : i + 1]]} for i, rid in enumerate(engine_inputs.request_ids)}
+        if self.speculative_tokens > 0:
+            bonus = new_tokens.view(-1, 1)
+            next_inputs = torch.cat([bonus, self._draft(bonus)], dim=1)
+            for i, rid in enumerate(engine_inputs.request_ids):
+                out[rid]["text_inputs"] = [next_inputs[i]]
+        return out
+
+    def unpack_packed_outputs(self, static_output: dict, request_ids: list[str], real_seq_lens: list[int],
+                              inputs: list, per_request_info: dict) -> dict[str, dict[str, list[torch.Tensor]]]:
+        """A verify step's per-request outputs: ``new_token`` = the accepted tokens and the new
+        bonus (``accepted + 1`` of the row's ``k1`` verified tokens), ``text_inputs`` = the next row.
+        Waits for the step's acceptance counts (recorded mid-step, so the wait overlaps the draft);
+        the slices are cloned off the static buffers."""
+        if "spec_tokens" not in static_output:
+            return {}
+        acceptance: SpecAcceptance = self._acceptance
+        acceptance.note_step(request_ids)
+        counts = acceptance.accepted_for(request_ids)
+        tokens, nxt = static_output["spec_tokens"], static_output["next_inputs"]
+        return {
+            rid: {"new_token": [tokens[i, : counts[i] + 1].clone()], "text_inputs": [nxt[i].clone()]}
+            for i, rid in enumerate(request_ids)
+        }
+
+    def bind_node_resources(self, resources: dict) -> None:
+        super().bind_node_resources(resources)
+        self._acceptance = resources.get(SPEC)
 
     def postprocess(self, request_id: str, request_info: CurrentForwardPassInfo, outputs: dict, **kwargs):
-        if "new_token" in outputs:
+        if "new_token" in outputs and "text_inputs" not in outputs:
             outputs["text_inputs"] = outputs["new_token"]
 
     def check_stop(self, request_id: str, request_info: CurrentForwardPassInfo, outputs: dict) -> set[str]:
         if "new_token" not in outputs:
             return set()
-        token = int(outputs["new_token"][0].item())
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
+        if self.speculative_tokens > 0:
+            # several tokens per step: tally what was emitted; a stop token anywhere in them stops
+            # (the few tokens after it in the same step still reach the client: 4a limitation)
+            emitted = outputs["new_token"][0].reshape(-1).tolist()
+            state = self.request_state(request_id)
+            n_done = state.get("emitted", 0) + len(emitted)
+            state.add("emitted", n_done)
+            hit = not ignore_eos and any(t in self.config.stop_token_ids for t in emitted)
+            return {"decode_loop"} if hit or n_done >= request_info.max_tokens else set()
+        token = int(outputs["new_token"][0].item())
         # tokens emitted so far: one from the prefill node plus one per finished decode
         # iteration (the loop index is 0-based), so max_tokens means max_tokens tokens
         n_done = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
