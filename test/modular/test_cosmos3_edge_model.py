@@ -93,6 +93,22 @@ def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
     assert {e.name for e in body.outputs} == {"new_token", "text_inputs"}
 
 
+def test_edge_recipe_defaults_from_the_checkpoint(tmp_path) -> None:
+    """An Edge checkpoint loads the model card's serving recipe without a
+    yaml (480p video at flow shift 12, 640x640 images, the diffusers-0.40
+    conditioning crop); yaml model_kwargs still override it."""
+    cfg = _model(tmp_path).config
+    assert cfg.conditioning_resize == "aspect_crop" and cfg.flow_shift_video == 12.0
+    assert cfg.video_size_default == (832, 480) and cfg.image_size_default == (640, 640)
+    assert cfg.num_frames_video == 121 and cfg.num_inference_steps_video == 20
+    assert cfg.flow_shift_action == 10.0
+    over = _model(tmp_path, conditioning_resize="stretch", flow_shift_video=9.0).config
+    assert over.conditioning_resize == "stretch" and over.flow_shift_video == 9.0
+    # Nano keeps its defaults.
+    nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
+    assert nano.conditioning_resize == "stretch" and nano.flow_shift_video is None
+
+
 def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     model = _model(tmp_path)
     specs = {s.resource_key: s for s in model.get_node_resources()}
