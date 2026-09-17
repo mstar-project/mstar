@@ -1,43 +1,4 @@
-"""HF GLM-5.3-Flash checkpoint loading for the glm5_next module tree.
-
-The checkpoint is multimodal; this package is the text-only port, so the
-name space splits three ways (counts from model.safetensors.index.json,
-76,108 tensors / ~306 GB):
-
-- ``model.language_model.*`` + top-level ``lm_head.weight`` — the text
-  trunk. Remapped ``model.language_model.`` -> ``model.`` (GLM-5.2 was
-  ``model.layers.*`` already; the prefix strip is the first delta).
-- ``model.language_model.layers.45.*`` (1,760 tensors) — the MTP module in
-  DeepSeek-V3 naming (enorm/hnorm/eh_proj/shared_head + one full decoder
-  layer). Skipped, with a logged count, unless drafting is on.
-- ``model.visual.*`` (347 tensors) — the vision tower. Out of scope for
-  ``glm5_next_text``: always skipped, always counted, never silent.
-
-Loader deltas vs glm52 the remapper/rules encode:
-
-- mHC params are stored flat at layer level (``layers.N.hc_attn_fn``) and
-  are renamed onto the per-site modules (``layers.N.attn_hc.fn``); only
-  layers 0..44 have them — the MTP layer is plain-residual.
-- KDA layers store three depthwise convs (``q/k/v_conv1d.weight``,
-  [qkv_dim, 1, kernel] each) that row-concat into the module's single
-  fused ``conv1d.weight`` ([3*qkv_dim, 1, kernel], (q, k, v) order) via
-  StackedParamRules — exact for a depthwise conv.
-- fp8 e4m3 weights carry a ``weight_scale_inv`` sibling and dequantize to
-  bf16 on load, except routed experts which stay FP8-resident — the glm52
-  scheme verbatim (``glm52/quantization.py`` is reused as-is). bf16
-  tensors (embeddings, norms, router gates, every KDA projection, the DSA
-  indexer, ``kv_b_proj``, lm_head) have no scale sibling.
-- ``self_attn.o_proj.weight`` exists on all 46 layers with two different
-  shapes/dtypes (KDA [4096, 8192] bf16 vs MLA [4096, 16384] fp8): loading
-  is target-module-driven so shapes disambiguate, but any name-only
-  accounting (read plans, the cross-check below) must key on layer type.
-
-``python -m mstar.model.glm5_next.weight_loader <checkpoint_dir>`` dry-runs
-the exact pipeline (skip -> fp8 pairing -> remap -> stacked rules) against
-the real index and cross-checks it against the module tree the config
-implies — unmapped keys, unexpected/missing targets, and shard-count
-mismatches all fail it.
-"""
+"""HF GLM-5.3-Flash checkpoint loading for the glm5_next module tree."""
 from __future__ import annotations
 
 import logging
@@ -128,7 +89,8 @@ def _make_glm5_next_name_remapper(num_hidden_layers: int, load_mtp: bool):
     strip the layer prefix, place glue keys direct and the rest under
     ``transformer_layer.``, then the trunk naming conventions — the
     expert/shared-expert rewrites are prefix-agnostic, so the fused
-    stacked-param rules apply to the MTP MoE unchanged."""
+    stacked-param rules apply to the MTP MoE unchanged.
+    """
     if not load_mtp:
         return glm5_next_name_remapper
 
@@ -150,15 +112,6 @@ def skip_vision_and_mtp_keys(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Drop vision-tower keys — and, unless ``load_mtp``, MTP-layer keys —
     before any dequant buffering, counting every drop.
-
-    Runs upstream of the fp8 stream so skipped fp8 pairs are never buffered
-    or dequantized (the MTP layer alone carries a 288-expert MoE, and the
-    vision tower's keys would otherwise sit unmatched in the stream).
-    Nothing is dropped silently: the vision skip is the point of the
-    text-only milestone and its count is always logged. There is
-    deliberately NO indexer skip flag: ``Glm5NextMLAAttention`` builds its
-    indexer unconditionally, so a load that dropped indexer keys would
-    leave 84 real parameters silently uninitialized.
     """
     skipped_vision = 0
     skipped_mtp = 0
@@ -228,8 +181,6 @@ def build_glm5_next_stacked_params(
             ))
     # KDA fused depthwise conv: three [qkv_dim, 1, kernel] checkpoint convs
     # row-concat into one [3*qkv_dim, 1, kernel] parameter in (q, k, v)
-    # order — the order the module's cat(q, k, v) input assumes; the
-    # parameter's weight_loader places each shard at its row offset.
     rules.append(StackedParamRule(".conv1d.weight", ".q_conv1d.weight", "q"))
     rules.append(StackedParamRule(".conv1d.weight", ".k_conv1d.weight", "k"))
     rules.append(StackedParamRule(".conv1d.weight", ".v_conv1d.weight", "v"))
@@ -242,10 +193,6 @@ def build_glm5_next_stacked_params(
 
 # Parameter-name suffixes the checkpoint stores in fp32 and that must stay
 # fp32 after ``model.to(autocast_dtype)`` narrows every float param to bf16.
-# Single source of truth: ``env/smoke_glm53_loader.py`` imports this and
-# asserts every fp32 tensor in a real checkpoint maps to a target ending in
-# one of these, so a newly-fp32 family cannot slip through as a silent
-# bf16 downcast.
 FP32_PARAM_SUFFIXES = (
     "e_score_correction_bias",  # DeepSeek-V3 router selection bias (glm52 set)
     "_scale_inv",               # fp8 block scales (glm52 set)
@@ -259,17 +206,7 @@ FP32_PARAM_SUFFIXES = (
 
 
 def restore_fp32_params(module: nn.Module) -> None:
-    """Re-widen params the checkpoint stores fp32 before loading into them.
-
-    ``model.to(autocast_dtype)`` narrows every floating param to bf16; the
-    router selection bias and the fp8 block scales must stay fp32 (glm52
-    set), the HF reference additionally pins the KDA ``conv1d``, ``dt_bias``
-    and ``A_log`` via ``_keep_in_fp32_modules_strict`` (recurrent-state math
-    compounds rounding), and the mHC ``base``/``scale`` ship fp32 in the
-    checkpoint and feed the fp32 Sinkhorn — mirror ``fn``'s fp32 cache so a
-    ``.to(bf16)`` cannot round the hyper-connection bias/scale. (The fp8
-    expert bytes live in uint8 containers and are immune.)
-    """
+    """Re-widen params the checkpoint stores fp32 before loading into them."""
     for name, param in module.named_parameters():
         if name.endswith(FP32_PARAM_SUFFIXES) and param.dtype != torch.float32:
             param.data = param.data.float()
@@ -282,28 +219,7 @@ def build_glm5_next_read_plan(
     tp_size: int,
     load_mtp: bool = False,
 ) -> tuple[set[str], dict[str, tuple[int, int, int]]]:
-    """Keys-to-read + per-key slice specs for the TP fast read path.
-
-    Cuts per-rank checkpoint IO two ways: (1) keys the model never loads
-    (the vision tower, the MTP layer unless ``load_mtp``) are excluded up
-    front so the iterator never reads them; (2) routed-expert tensors —
-    ~95% of the checkpoint's 306 GB — and the head-sharded KDA tensors get
-    ``(dim, start, stop)`` specs so each rank reads only its TP shard. The
-    expert and KDA loaders accept these pre-sliced shards shape-driven.
-
-    ``load_mtp`` MUST mirror the model's drafting flag: this plan runs
-    UPSTREAM of ``skip_vision_and_mtp_keys``, so a plan built without it
-    starves the loader of every layer-45 key with nothing left to log —
-    the draft module then serves ``to_empty`` memory, which is silent 0.00
-    acceptance (the glm52 2026-08-09 lesson). Unlike glm52 there is no
-    FULL/SHARED indexer formula to filter by — every full-attention layer
-    (and the MTP layer) ships its own full indexer, always read (see
-    ``skip_vision_and_mtp_keys`` on why there is no indexer knob).
-
-    Scale slicing relies on the shard/block divisibility the MoE block
-    already asserts (per-rank intermediate is a whole number of scale
-    blocks), so sliced fp8 bytes and sliced scales stay aligned.
-    """
+    """Keys-to-read + per-key slice specs for the TP fast read path."""
     fp8_experts = config.quantization_config is not None and config.moe_fp8_resident
     shard_inter = config.moe_intermediate_size // tp_size
     keys: set[str] = set()
@@ -401,7 +317,6 @@ def load_weights(
 
 # ---------------------------------------------------------------------------
 # Index cross-check: a name-level dry run of the exact load pipeline.
-# ---------------------------------------------------------------------------
 
 _SCALE_SUFFIX = ".weight_scale_inv"
 
@@ -411,17 +326,7 @@ def resolve_index_names(
     config: Glm5NextModelConfig,
     load_mtp: bool = True,
 ) -> dict[str, tuple[str, ...]]:
-    """Classify every checkpoint name through the real pipeline stages.
-
-    Returns ``{kind: (names...)}`` for kinds ``skip_vision`` /
-    ``skip_mtp`` / ``unmapped``, plus per-name results
-    under ``loaded`` (as ``"<raw> -> <target>"``) and ``absorbed``
-    (non-resident fp8 scales that dequant folds into their ``.weight``).
-    The stages run in load order — skip, fp8 pairing, remap, stacked-rule
-    dispatch — using the same regexes, remapper and first-win rule
-    matcher the loader itself uses, so this cannot drift from the load
-    path without failing.
-    """
+    """Classify every checkpoint name through the real pipeline stages."""
     # The real dispatcher's rule matcher — not a reimplementation.
     from mstar.model.loader.base import _apply_stacked
 

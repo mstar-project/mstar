@@ -1,23 +1,5 @@
 """CPU import contract for the glm5_next package — the ``registry`` tier of
 ``env/ci_glm53.sh``.
-
-Two tiers. Both run under pytest because main's sampler does an unguarded
-``import triton`` (``mstar/engine/resources/sampler/utils.py``) that only the
-``test/modular/conftest.py`` stub satisfies on a CUDA-less venv; the lane's
-bare-python tier cannot survive that on a laptop.
-
-HARD (fresh interpreter, no conftest, no stubs): the model-math modules
-  ``kda`` / ``mhc`` / ``config`` / ``kda_state`` / ``weight_loader`` import
-  with neither ``flashinfer`` nor ``triton`` in ``sys.modules`` — torch +
-  stdlib only, so the parity tests run on any machine. A subprocess is the
-  only honest way to assert that: in this process the stub is already
-  installed.
-
-TOLERANT (this process, stubs in place): the full model module and the
-  registry's lazy ``(module, class)`` entry resolve. A missing NON-mstar
-  module (a laptop venv without something a box venv has) is a skip; a
-  missing ``mstar.*`` module is always a failure — our own tree broken must
-  never read as skip.
 """
 import os
 import subprocess

@@ -1,17 +1,4 @@
-"""GLM-5.3-Flash KDA parity tests — CPU-only, pure torch (no flashinfer/triton).
-
-The parity contract (drafts/2026-08-31-glm53-kda-spec.md section 4): conv
-paths and per-token pure functions are BIT-exact across paths
-(``torch.equal``); only the delta-rule accumulation is
-tolerance-equivalent — measured chunk-vs-recurrent max diff 6.1e-5 on bf16
-outputs (~1-2 ulp) and ~1e-6 on fp32 states at this exact reduced geometry
-(H=4, D=32, L=130), so atol 1e-3 (outputs) / 1e-5 (states) has >= 40x
-headroom while real bugs (op order, gate wiring, dtype) show up O(1).
-
-Seeds are fixed per test; the L sweep {1, 4, 63, 64, 65, 130} covers the
-chunk-pad boundary cases (4 is the MTP-verify shape) and batch > 1
-covers the generality rule.
-"""
+"""GLM-5.3-Flash KDA parity tests — CPU-only, pure torch (no flashinfer/triton)."""
 import sys
 from pathlib import Path
 
@@ -55,11 +42,7 @@ def _input(cfg: Glm5NextKdaConfig, batch_size: int, seq_len: int) -> torch.Tenso
 
 @pytest.mark.parametrize("seq_len", [1, 4, 63, 64, 65, 130])
 def test_prefill_matches_decode_loop(seq_len):
-    """P1: chunked prefill == running the decode step token by token.
-
-    Outputs and final S within the measured delta-rule tolerance; the conv
-    state is bit-exact across the two paths (same raw bf16 columns).
-    """
+    """P1: chunked prefill == running the decode step token by token."""
     layer, cfg = _build(seed=1)
     batch_size = 2
     x = _input(cfg, batch_size, seq_len)
@@ -77,11 +60,7 @@ def test_prefill_matches_decode_loop(seq_len):
 
 
 def test_conv_state_stores_raw_projection_tail():
-    """Conv state == last kernel-1 RAW pre-SiLU columns of the padded conv input.
-
-    Pins the storage convention: caching conv OUTPUTS (or post-SiLU values)
-    would pass shape checks and silently break every continue path.
-    """
+    """Conv state == last kernel-1 RAW pre-SiLU columns of the padded conv input."""
     layer, cfg = _build(seed=2)
     batch_size, seq_len = 2, 9
     x = _input(cfg, batch_size, seq_len)
@@ -108,12 +87,7 @@ def test_conv_state_stores_raw_projection_tail():
 
 
 def test_chunked_prefill_resume_matches_full_prefill():
-    """P2: prefill(70) + prefill(60, carried state) == prefill(130).
-
-    The resumed conv prepends the cached 3 raw columns and keeps the last
-    L outputs — the conv tail must be bit-exact with the one-shot run; the
-    delta rule re-chunks from the carried S within tolerance.
-    """
+    """P2: prefill(70) + prefill(60, carried state) == prefill(130)."""
     layer, cfg = _build(seed=3)
     batch_size, seq_len, split = 2, 130, 70
     x = _input(cfg, batch_size, seq_len)
@@ -138,7 +112,8 @@ def test_small_continue_chunk_matches_decode_loop(tail_len):
     kernel at an effective chunk covering L (no 64-pad, no 63-iteration
     substitution loop) and must agree with decoding the same tokens one
     by one from the same carried state — conv bit-exact, delta rule
-    within the measured tolerance."""
+    within the measured tolerance.
+    """
     layer, cfg = _build(seed=7)
     batch_size, prefill_len = 2, 10
     x = _input(cfg, batch_size, prefill_len + tail_len)

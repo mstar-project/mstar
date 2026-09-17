@@ -1,9 +1,5 @@
 """Best-effort text + chunk-count extraction from mstar-serve ``/generate``
 NDJSON replies saved by the glm53 serve smokes (``gen-*.ndjson`` in a dir).
-
-Usage: ``python env/parse_generate_ndjson.py <out_dir> [elapsed_s ...]``
-Prints each reply's text (first 500 chars) and, when one elapsed time per
-file is given, a chunks/s figure per prompt plus the aggregate.
 """
 
 from __future__ import annotations

@@ -1,31 +1,4 @@
-"""Glm5NextModel: Model implementation for GLM-5.3-Flash (text generation).
-
-GLM-5.3-Flash (zai-org/GLM-5.3-Flash) is a 320B-total / ~18B-active MoE
-causal LM with a hybrid layer schedule — 34 KDA (gated-delta-rule linear
-attention) layers with per-request fixed-size state + 11 NoPE MLA/DSA
-full-attention layers — mHC 4-stream residuals, and 1M context. Like
-GLM-5.2 it is a single autoregressive loop: minimal prefill -> decode
-graph, one fat TP node, the integration substance in the engine/submodule
-layer.
-
-Architecture (1 node, default single partition):
-    LLM (ar) - embed + 45 decoder layers (3 dense + 42 MoE; KDA/MLA per
-               ``layer_types``) + lm_head, one node: everything colocates
-               on the same TP group, splitting only adds IPC.
-
-Scaffold status (lane milestones, ``mstar-glm53-wt/CLAUDE.md``):
-    [x] M0: registry / config / graph walks / conductor state machine
-        (this file), components/ + weight mapping, KDA + mHC math,
-        CPU-verified assembly (test/modular/test_glm5next_*.py)
-    [ ] M1: serving submodule (preprocess/forward_batched/check_stop,
-        KDA slot plumbing, load path + Laude TP8 bring-up, greedy parity)
-    [ ] M2: MTP spec decode (draft loop reuse + KDA snapshot/rewind)
-    [ ] M3: perf campaign; rebase KDA state onto rp2/#228 Resource
-
-Serving regime pinned for M0/M1 (assembly spec section 6.4): indexer
-selection off, every request held to ctx <= ``index_topk`` = 2048 where
-dense MLA is bit-exactly the DSA computation — the glm52 M1 playbook.
-"""
+"""Glm5NextModel: Model implementation for GLM-5.3-Flash (text generation)."""
 
 import logging
 import threading
@@ -65,13 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def process_weights_after_loading(root: torch.nn.Module, device: torch.device) -> None:
-    """Finalize kernel layouts across a freshly-loaded module tree.
-
-    Call once after ``load_weights`` and before ``eval()``/CUDA-graph capture.
-    Any submodule exposing a ``process_weights_after_loading(device)`` method
-    gets it invoked (the MoE blocks resolve their dispatch kernel and cache
-    the fp32 router; the MLA layers build their absorbed projections).
-    """
+    """Finalize kernel layouts across a freshly-loaded module tree."""
     for module in root.modules():
         hook = getattr(module, "process_weights_after_loading", None)
         if callable(hook) and module is not root:
@@ -94,17 +61,7 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 
 
 def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
-    """Tick a small CUDA kernel until the first real forward pass.
-
-    Ported verbatim from ``glm52_model._start_gpu_liveness_heartbeat``. The
-    coriander GPU-management daemon reaps processes whose per-process NVML SM
-    utilization stays under 10% for ~30 min, and the idle window spans the
-    host-bound weight load AND the first-request flashinfer JIT storm — so the
-    tick must live from load start until the submodule's first forward (the
-    caller owns the returned stop event and sets it there via
-    ``set_load_heartbeat_stop``). Laude, the glm5_next dev box, has NO reaper,
-    so on it ``device`` is cuda but the tick is simply harmless overhead until
-    the first forward stops it; on CPU it is a no-op (returns None)."""
+    """Tick a small CUDA kernel until the first real forward pass."""
     if not str(device).startswith("cuda"):
         return None
     stop = threading.Event()
@@ -216,18 +173,7 @@ class Glm5NextModel(Model):
     # -------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The LLM node's four resources.
-
-        KV: only the 11 full-attention layers have KV, so the pool holds 11
-        compact planes (MLA layer idx -> (idx - 3) // 4) — NOT 45 — plus one
-        draft plane when MTP is on. One latent head per token of width
-        kv_lora_rank + mla_cache_kpe (512 + 64 = 576): GLM-5.3 is NoPE (real
-        kpe 0), but the capturable FlashInfer MLA kernel is locked to kpe=64,
-        so the zero-padded slot is what lets decode capture (see
-        config.mla_cache_kpe + wiki/glm53-decode-capture). 1.15 KB/token/layer
-        x 11 vs glm52's 87.8 KB — the per-request budget lives in the KDA
-        state slots instead.
-        """
+        """The LLM node's four resources."""
         num_kv_layers = len(self.config.full_attn_layer_indices) + (
             1 if self.config.mtp_num_draft_tokens > 0 else 0
         )
@@ -345,7 +291,6 @@ class Glm5NextModel(Model):
 
     # -------------------------------------------------------------------
     # Model ABC: conductor state machine (prefill -> decode -> done)
-    # -------------------------------------------------------------------
 
     def get_initial_forward_pass_args(
         self,
@@ -554,16 +499,7 @@ class Glm5NextModel(Model):
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
-        """Load weights, taking the sliced TP fast read path when possible.
-
-        With a sharded index present, build a read plan (skip vision + the MTP
-        layer unless drafting, read only this rank's shard of every routed
-        expert) and stream it into ``language_model.load_weights`` — which runs
-        ``restore_fp32_params`` and refuses to serve if drafting is on but the
-        layer-45 keys are absent. ``load_mtp`` MUST mirror the model's drafting
-        flag: a plan built without it starves the MTP layer of weights -> silent
-        0.00 acceptance (the glm52 2026-08-09 lesson). No index -> the generic
-        driver reads the full checkpoint per rank."""
+        """Load weights, taking the sliced TP fast read path when possible."""
         from mstar.model.glm5_next.weight_loader import build_glm5_next_read_plan
         from mstar.model.loader import load_weights
         from mstar.model.loader.iterators import iter_safetensors_shards
@@ -593,15 +529,7 @@ class Glm5NextModel(Model):
         language_model.load_weights(weights)
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
-        """Adopt the checkpoint's fp8-block quant config from its config.json.
-
-        glm5_next reuses glm52's ``Fp8BlockQuantConfig``; the official
-        checkpoint ships fp8 e4m3 with [128,128] block scales. No-op if the
-        config already carries a quant config, or config.json is missing /
-        unreadable — stay bf16 rather than guess. Ported from glm52_model:658
-        (top-level ``quantization_config`` read); the nested text-config layout
-        is already covered by the primary ``Glm5NextModelConfig.from_hf_config``
-        construction path."""
+        """Adopt the checkpoint's fp8-block quant config from its config.json."""
         import json
 
         from mstar.model.glm5_next.quantization import Fp8BlockQuantConfig

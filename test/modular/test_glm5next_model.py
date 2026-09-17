@@ -1,56 +1,5 @@
 """GLM-5.3-Flash assembled-model tests on the resource-pool engine — CPU,
 reduced config, no GPU deps.
-
-Port of the lane's ``test_glm5next_model.py`` (deleted-engine era: flat
-token batches over ``glm52._testing.ReferenceCacheHandle`` + model-owned KDA
-state). Every numerical parity assertion is kept; what changed is the
-harness: the model is driven the way the v1 engine drives it — its
-``get_node_resources()`` specs are built into the REAL resources (MLA-layout
-KV cache, MLA attention backend on its fp32 SDPA fallback, slot-state
-resource, sampler), bound into the layers, and every step goes
-declare -> admit -> plan -> forward -> commit through a ``StepRunner``.
-
-What this file pins:
-
-1. Prefill vs stepwise decode emit the same logits through the full
-   hybrid stack (KDA chunk kernel vs recurrent step, MLA over the paged
-   latent cache, mHC threading, clamped MoE) at batch > 1 — including
-   across a KDA-state snapshot/restore + KV rewind, which replays
-   bit-exactly (the M2 verify-rewind primitive), now through
-   ``Glm5NextKdaStateAccess`` over the engine's slot pool.
-2. The slot-state lifecycle in its v1 form: lease at first admit, a
-   single-token step before any chunk refused, commit after the forward
-   (a planned-but-never-run step commits nothing — what replaces
-   ``abort_context``), reset, and idempotent removal.
-3. The ``layer_types`` schedule is honored structurally AND behaviorally
-   (KDA layers never touch the KV resource; the two full-attention layers
-   write and read compact planes 0 and 1, once each, in order).
-4. The registry entry resolves and ``Glm5NextModel`` declares the four
-   node resources (KV planes = full-attention count, MLA layout, latent =
-   kv_lora_rank + the 64-wide zero kpe pad; KDA pool shapes).
-5. MTP-off and MTP-on both construct; the layer-45 module's call contract
-   holds against the real resources (it addresses its own draft plane);
-   the loader's expected parameter tree matches the assembled module tree
-   name-for-name and a raw checkpoint stream round-trips bit-for-bit.
-6. The engine-path smoke (prepare_inputs -> declare -> preprocess ->
-   forward_batched with a greedy stand-in for the Triton sampler): the
-   same token trajectory generated stepwise and prefilled whole
-   (``test_glm5next_engine_path.py`` folded in; that file stays).
-
-Dropped, with no v1 analogue (each noted again at the site):
-``alloc_kda_state`` double-alloc refusal (a slot lease is idempotent by
-design), ``prefill_context(ctx_starts=)`` desync refusal (the resource owns
-the committed counter — a caller cannot name a gap), ``abort_context``
-(nothing to roll back: commit runs after the forward),
-``get_node_engine_types``/``EngineType`` (one engine now), and the
-``mla_absorb=False`` naive fallback (the MLA backend's SDPA fallback serves
-reduced configs on the absorbed path).
-
-Per lane ground rule 4, the flashinfer CPU stub is a fixture
-(``run_rms_norm`` imports flashinfer per call, so a monkeypatched
-``sys.modules`` entry scopes it to each test) — never a module-level
-``sys.modules`` write. The KV transfer manager is stubbed the same way (no
-transfer engine on a laptop).
 """
 import sys
 import types
@@ -156,11 +105,7 @@ class _StubTransfer:
 
 @pytest.fixture(autouse=True)
 def _cpu_flashinfer(monkeypatch):
-    """CPU ``flashinfer.norm.rmsnorm`` so RMSNorm-backed forwards run here.
-
-    Forced per test (not deferred to an import-time guard) — the glm52
-    suite's lesson: on a box with real flashinfer an earlier import wins
-    and these CPU tensors hit GPU kernels."""
+    """CPU ``flashinfer.norm.rmsnorm`` so RMSNorm-backed forwards run here."""
     fi = types.ModuleType("flashinfer")
     fi.norm = types.SimpleNamespace(rmsnorm=_cpu_rmsnorm)
     monkeypatch.setitem(sys.modules, "flashinfer", fi)
@@ -175,8 +120,6 @@ def _randomize(model: Glm5NextForCausalLM, dtype: torch.dtype) -> None:
     if dtype != torch.float32:
         model.to(dtype)
     # The real load sequence: load -> process_weights_after_loading -> eval.
-    # The MLA layers build their absorbed w_kc/w_vc (+ fused q/kv_a) here;
-    # after the dtype cast so they carry the model dtype.
     process_weights_after_loading(model, torch.device("cpu"))
     model.eval()
     model.requires_grad_(False)
@@ -185,11 +128,7 @@ def _randomize(model: Glm5NextForCausalLM, dtype: torch.dtype) -> None:
 def _build_model(
     seed: int, mtp_num_draft_tokens: int = 0, dtype: torch.dtype = torch.float32
 ) -> tuple[Glm5NextForCausalLM, Glm5NextModelConfig]:
-    """Reduced-config model with small random weights, no engine attached.
-
-    ``dtype`` widens the whole model — float64 for the cross-path parity test
-    (see LOGITS_ATOL_F64), float32 elsewhere.
-    """
+    """Reduced-config model with small random weights, no engine attached."""
     torch.manual_seed(seed)
     cfg = Glm5NextModelConfig.reduced()
     cfg.mtp_num_draft_tokens = mtp_num_draft_tokens
@@ -207,17 +146,7 @@ class _GreedySampler:
 
 
 class _Harness:
-    """A reduced ``Glm5NextForCausalLM`` behind the REAL v1 resources.
-
-    Built exactly as the engine builds them: ``Glm5NextModel.get_node_resources``
-    -> ``resolve_spec_dependencies`` -> ``build_resource`` per spec ->
-    ``StepRunner`` -> ``bind_node_resources`` into the layers. Each step is
-    the engine's protocol (``declare_step`` -> admit -> plan -> forward ->
-    commit); the sampler step is dropped from the declaration — the Triton
-    sampler cannot run on CPU and these tests want raw logits — so the
-    forward is the trunk + lm_head, the same tensors
-    ``Glm5NextLLMSubmodule._forward`` hands the sampler.
-    """
+    """A reduced ``Glm5NextForCausalLM`` behind the REAL v1 resources."""
 
     def __init__(
         self,
@@ -273,7 +202,8 @@ class _Harness:
         """The lane's ``handle.rewind_seq_lens``: v1 has no rewind on the KV
         resource yet (the M2 verify loop will add one), and a paged rewind is
         the stream's ``stored_len`` — its pages stay leased as a high-water
-        mark and heal by overwrite."""
+        mark and heal by overwrite.
+        """
         self.kv._streams[rid][LABEL].stored_len -= n
 
     # -- one engine step --------------------------------------------------
@@ -330,15 +260,7 @@ class _Harness:
 
 @torch.no_grad()
 def test_prefill_matches_stepwise_decode_batched():
-    """Chunked prefill and recurrent decode agree over the same tokens.
-
-    Reference: each request's FULL sequence prefilled alone in one chunk.
-    Subject: both requests prefilled together (flat varlen batch), then
-    teacher-forced joint decode steps — exercising per-request KDA slot
-    isolation, the batched gather/scatter decode path by the planned slot
-    index, and the paged MLA latent cache, at batch > 1 (lane generality
-    rule).
-    """
+    """Chunked prefill and recurrent decode agree over the same tokens."""
     # float64: isolates the chunk-vs-recurrent algorithmic equivalence from
     # platform fp32 rounding (which the reduced config amplifies ~3x/layer).
     h = _Harness(seed=10, dtype=torch.float64)
@@ -402,7 +324,8 @@ def test_decode_replays_bitwise_across_kda_snapshot_restore():
     replay is BIT-exact (same states, same ops) — the M2 verify-rewind
     primitive (KV-plane rewind is free; recurrent state is not, hence the
     snapshot), and the strongest possible save/restore check. The snapshot
-    now reads the engine's slot pool through ``Glm5NextKdaStateAccess``."""
+    now reads the engine's slot pool through ``Glm5NextKdaStateAccess``.
+    """
     h = _Harness(seed=12)
     cfg = h.cfg
     prefill_len, num_decode = 9, 3
@@ -437,18 +360,7 @@ def test_decode_replays_bitwise_across_kda_snapshot_restore():
 
 
 def test_kda_state_lifecycle_is_explicit_and_loud():
-    """The slot-state lifecycle, driven on the model's own declared pool.
-
-    v1 deltas vs the lane's model-owned store, each asserted in its new
-    form: the lease is idempotent (no "already allocated" — a re-admitted
-    rid keeps its slot), a single-token step before any chunk is refused
-    by ``plan``, counts advance at COMMIT (a planned step whose forward
-    never ran leaves them untouched — what ``abort_context`` did), a
-    ``commit=False`` step reads without advancing, ``reset_request``
-    rewinds to 0 and zeroes the slot, removal is idempotent. No analogue:
-    ``prefill_context(ctx_starts=)`` desync — the resource owns the
-    committed counter, so a caller cannot name a gap.
-    """
+    """The slot-state lifecycle, driven on the model's own declared pool."""
     h = _Harness(seed=14, max_slots=2)
     kda = h.kda
     ids = torch.zeros(4, dtype=torch.long)
@@ -541,14 +453,7 @@ class _KVSpy:
 
 @torch.no_grad()
 def test_layer_schedule_honored():
-    """idx % 4 == 3 -> MLA (compact planes), else KDA; dense iff idx < 3.
-
-    Behavioral half: over one forward, the KV resource sees exactly the
-    two full-attention planes, once each, in order — written then attended
-    — and KDA layers never touch it (assembly spec section 6.1). The KDA
-    layers' state lands in the slot pool instead: every KDA layer's plane
-    of the request's slot is nonzero after the prefill.
-    """
+    """idx % 4 == 3 -> MLA (compact planes), else KDA; dense iff idx < 3."""
     h = _Harness(seed=15)
     cfg, model = h.cfg, h.lm
 
@@ -616,14 +521,7 @@ def _specs_by_key(model: Glm5NextModel) -> dict:
 
 
 def test_glm5next_model_constructs_from_config():
-    """The four node resources, full-size and reduced.
-
-    Replaces the lane's ``get_kv_cache_config`` / ``get_node_engine_types``
-    assertions: the KV cache is a ``KVSpec`` in the MLA layout, the backend
-    an ``AttentionSpec`` (MLA, ckv = kv_lora_rank, scale = qk_head_dim
-    ** -0.5), plus the sampler and the KDA slot pool — there is one engine
-    now, so ``EngineType`` has no analogue.
-    """
+    """The four node resources, full-size and reduced."""
     model = object.__new__(Glm5NextModel)
     model.config = Glm5NextModelConfig()
     model.kda_max_requests = 32
@@ -632,10 +530,6 @@ def test_glm5next_model_constructs_from_config():
 
     kv = specs[KV_CACHE].config
     # 11 compact latent planes (full-attention layers only), one latent head.
-    # head_dim = ckv(512) + kpe(64): NoPE's real rope is 0, but the cache pads
-    # the kpe slot to 64 zeros so the capturable FlashInfer MLA kernel accepts
-    # it (mla_ckv_dim stays the true 512). See config.mla_cache_kpe /
-    # wiki/glm53-decode-capture.
     assert kv.layout == KVLayout.MLA
     assert kv.num_layers == 11
     assert kv.num_kv_heads == 1
@@ -761,16 +655,7 @@ def test_mtp_off_and_on_both_construct():
 
 
 def _raw_checkpoint_stream(model, cfg):
-    """Invert the glm5_next weight map: (raw HF checkpoint name, tensor).
-
-    The inverse of ``weight_loader``'s remap + stacked rules, applied to
-    the assembled model's parameters — layer-flat mHC names, flat
-    ForgetGate names, three per-branch conv tensors, per-expert
-    gate/up/down, ``shared_experts``, the MTP module back under
-    ``layers.<num_hidden_layers>``, and the ``model.language_model.``
-    prefix. Feeding this stream back through the REAL pipeline must
-    reproduce every parameter bit-for-bit.
-    """
+    """Invert the glm5_next weight map: (raw HF checkpoint name, tensor)."""
     import re
 
     n = cfg.num_hidden_layers
@@ -819,14 +704,7 @@ def _raw_checkpoint_stream(model, cfg):
 
 @torch.no_grad()
 def test_loader_roundtrip_through_real_pipeline():
-    """Raw HF-named stream -> load_weights -> every parameter lands.
-
-    Executes the actual remapper, stacked rules, and every attached
-    weight_loader (fused conv placement, expert stacking, merged gate_up)
-    against the assembled module tree — the closest thing to a checkpoint
-    load that runs without 306 GB. Vision keys must be skipped, never
-    loaded; with drafting off, the layer-45 stream must be skipped too.
-    """
+    """Raw HF-named stream -> load_weights -> every parameter lands."""
     model_a, cfg = _build_model(seed=20, mtp_num_draft_tokens=2)
     stream = list(_raw_checkpoint_stream(model_a, cfg))
     stream.append(("model.visual.patch_embed.proj.weight", torch.zeros(4, 4)))
@@ -959,13 +837,7 @@ def test_swiglu_clamp_engages_on_every_mlp_path():
 
 
 def test_moe_quant_kernel_resolution_and_clamp_guard():
-    """glm52 kimi quant_kernel semantics + the new SwiGLU-clamp-capability
-    guard. ``process_weights_after_loading`` resolves ``_use_fused``:
-    ``"reference"`` (the default) and ``"auto"`` without CUDA keep the clamped
-    reference loop (False); explicit ``"triton"`` on CPU must NOT silently
-    serve the unclamped fused kernel, so it raises -- and the message names
-    ``swiglu_limit``, the clamp guard that replaced the old blanket refusal.
-    A non-fp8 (bf16) block never fuses whatever the knob says."""
+    """glm52 kimi quant_kernel semantics + the new SwiGLU-clamp-capability guard."""
     cfg = Glm5NextModelConfig.reduced_fp8()
     assert cfg.moe_quant_kernel == "reference"
     blk = Glm5NextSparseMoeBlock(cfg)
@@ -992,10 +864,9 @@ def test_moe_quant_kernel_resolution_and_clamp_guard():
 
 
 def test_module_tree_matches_loader_expectations():
-    """The assembled tree == the loader's expected target set, name for
-    name — the loader <-> model integration seam, pinned without a
-    checkpoint. A drift on either side (a renamed module, a remap change)
-    fails here first instead of at the 306 GB load."""
+    """The assembled tree == the loader's expected target set, name for name — the loader
+    <-> model integration seam, pinned without a checkpoint.
+    """
     from mstar.model.glm5_next.weight_loader import expected_parameter_paths
 
     for k, load_mtp in ((0, False), (2, True)):
@@ -1014,12 +885,10 @@ def test_module_tree_matches_loader_expectations():
 
 @torch.no_grad()
 def test_submodule_engine_path_prefill_then_decode():
-    """``test_glm5next_engine_path.py`` folded in: the submodule's own seam
-    (prepare_inputs -> declare_step -> preprocess -> forward_batched) with
-    a greedy stand-in for the Triton sampler. Two requests interleave; the
-    third token of a stepwise trajectory equals the token a fresh request
-    gets from prefilling that trajectory whole, and the context guard
-    (``index_topk``) refuses the request that would cross it."""
+    """``test_glm5next_engine_path.py`` folded in: the submodule's own seam (prepare_inputs
+    -> declare_step -> preprocess -> forward_batched) with a greedy stand-in for the
+    Triton sampler.
+    """
     from types import SimpleNamespace
 
     h = _Harness(seed=0)

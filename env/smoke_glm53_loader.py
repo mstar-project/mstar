@@ -1,24 +1,4 @@
-"""Validate the glm5_next weight loader against a REAL GLM-5.3-Flash checkpoint.
-
-``weight_loader.py``'s ``__main__`` cross-checks names + shard counts against
-``model.safetensors.index.json``. The index carries no shapes or dtypes, so it
-cannot catch the bugs that only surface on real weights: an fp8-vs-bf16
-misclassification, a wrong fused-conv concat dim, the KDA-vs-MLA ``o_proj``
-shape collision, a dt_bias/A_log that is not actually fp32. This reads the 62
-safetensors *headers* (no tensor data, no GPU, seconds) and checks:
-
-  1. real tensor names == index weight_map names (no file/index drift);
-  2. the loader pipeline maps every real name (0 unmapped) — same contract as
-     the index cross-check, now on the files themselves;
-  3. dtype partition: every fp8 family is float8_e4m3fn with a scale sibling,
-     every bf16 family is bfloat16 with none, the fp32-restore set is float32;
-  4. representative shapes against config-derived expectations, one tensor per
-     module kind (embed, lm_head, KDA conv/o_proj, MLA o_proj, dense + expert
-     MLP, dt_bias, A_log, router gate).
-
-Usage: ``python env/smoke_glm53_loader.py <checkpoint_dir>`` (the HF snapshot
-dir with config.json + *.safetensors + the index). Exit 0 = PASS.
-"""
+"""Validate the glm5_next weight loader against a REAL GLM-5.3-Flash checkpoint."""
 
 from __future__ import annotations
 

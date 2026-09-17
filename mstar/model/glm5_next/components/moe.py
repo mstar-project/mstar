@@ -1,48 +1,4 @@
-"""GLM-5.3-Flash MLP/MoE: the glm52 blocks parameterized + the SwiGLU clamp.
-
-Two deltas vs GLM-5.2, both from the reference (assembly spec section 2):
-
-1. **SwiGLU clamp everywhere** — ``gate.clamp(max=swiglu_limit)`` (no min),
-   ``up.clamp(-limit, limit)``, then ``silu(gate) * up`` — dense MLP,
-   shared expert, and routed experts alike (``swiglu_limit = 10.0``).
-   GLM-5.2 clamps nothing, so every dispatch path is forked here; the
-   shared triton ``act_and_mul_kernel`` now takes an OPT-IN ``swiglu_limit``
-   so the clamp threads into the fused ``fused_experts_fp8`` path too, which
-   ``process_weights_after_loading`` selects for fp8 experts on CUDA.
-2. **Router topk normalization carries ``+ 1e-20``** in the denominator
-   (HF ``norm_topk_prob`` parity; glm52's gate omits the eps).
-3. **Combine weights stay fp32 through the per-expert multiply** (HF
-   ``Glm5NextTextExperts`` promotes the bf16 expert output by the fp32
-   router weight and downcasts once at ``index_add_``; glm52 downcasts
-   the weights before dispatch — a ~1-ulp deviation this port does not
-   inherit).
-
-Everything else — the noaux_tc sigmoid router shape (bias-added scores
-select, raw sigmoid scores combine, groupless n_group=1), fp8-resident
-expert containers, stacked per-expert loaders, TP slicing — is GLM-5.2's
-``Glm52SparseMoeBlock`` carried in here verbatim (same [2048, 4096] expert
-geometry, same [128, 128] block divisibility; 288 experts instead of 256 is
-just a config number), so the package stands on its own on main.
-
-Two dispatch paths, resolved in ``process_weights_after_loading``:
-
-* ``_dispatch_clamped`` -- the clamped reference per-expert loop for bf16 AND
-  fp8-resident experts (dequantize only the experts a batch hit). Like glm52's
-  reference dispatch it hosts ``.nonzero()`` plus a per-hit-expert
-  ``torch.where`` -- ~(1 + top_k) host syncs per MoE layer per decode step --
-  so it is NOT capture-safe. It is the HF-faithful fallback and the default
-  (``moe_quant_kernel="reference"``, the M1 eager parity anchor).
-* ``_dispatch_fused`` -- the clamped fp8 fused kernel
-  (``fused_experts_fp8(..., swiglu_limit=...)``, the opt-in clamp now in the
-  shared ``act_and_mul_kernel``). No host sync, so cuda graphs capture; it is
-  the fast production path, selected by ``moe_quant_kernel="auto"/"triton"`` on
-  CUDA. NOT bit-exact vs the reference (fp8 GEMM vs the bf16 reference GEMM,
-  the same gap glm52 accepts); the clamp is what makes it CORRECT.
-
-Enabling the fused path is the ~13x M3 lever; schedule it TOGETHER with the
-mHC Sinkhorn fusion (``mhc.py``) -- capture is the cheap mitigation for the
-Sinkhorn launch storm, and this dispatch was what blocked capture.
-"""
+"""GLM-5.3-Flash MLP/MoE: the glm52 blocks parameterized + the SwiGLU clamp."""
 from __future__ import annotations
 
 import inspect
@@ -63,10 +19,9 @@ _TOPK_NORM_EPS = 1e-20
 
 
 def _fused_supports_swiglu_clamp(fused_fn) -> bool:
-    """True iff the loaded fused fp8 kernel accepts ``swiglu_limit`` -- the
-    SwiGLU clamp GLM-5.3 needs. Guards against an older ``fused_experts_fp8``
-    (no clamp arg) silently serving the unclamped activations the reference
-    forbids."""
+    """True iff the loaded fused fp8 kernel accepts ``swiglu_limit`` -- the SwiGLU clamp
+    GLM-5.3 needs.
+    """
     return "swiglu_limit" in inspect.signature(fused_fn).parameters
 
 
@@ -79,14 +34,7 @@ def _gate_up_fp8_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: str | int | None = None,
 ):
-    """Route one expert's gate/up tensor into the stacked per-rank param.
-
-    ``row_unit`` is 1 for the fp8 bytes and block_size[0] for the scale rows;
-    the same slicing logic covers both because scales tile the row axis.
-    Shape-driven: a full checkpoint tensor is TP-sliced here; a pre-sliced
-    shard (the ``slice_spec`` fast read path — each rank reads only its
-    bytes) is written as-is.
-    """
+    """Route one expert's gate/up tensor into the stacked per-rank param."""
     assert loaded_shard_id is not None
     kind, expert_str = str(loaded_shard_id).split(":")
     expert_idx = int(expert_str)
@@ -132,12 +80,7 @@ def _down_fp8_loader(
 
 
 class Glm5NextGatedMLP(ParallelGatedMLP):
-    """``ParallelGatedMLP`` with the GLM-5.3 SwiGLU clamp.
-
-    Used for the three dense layers and every shared expert; activation
-    stays config ``hidden_act`` (silu). The clamp bounds pre-activation
-    magnitudes, not the output — order is clamp, then silu, then product.
-    """
+    """``ParallelGatedMLP`` with the GLM-5.3 SwiGLU clamp."""
 
     def __init__(self, *args, swiglu_limit: float = 10.0, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -154,12 +97,6 @@ class Glm5NextGatedMLP(ParallelGatedMLP):
 class Glm5NextMoEGate(nn.Module):
     """DeepSeek-V3 noaux_tc sigmoid router, groupless (n_group=1), with the
     ``+ 1e-20`` topk-norm eps of HF's ``Glm5NextTextTopkRouter``.
-
-    Bias-added scores drive expert *selection*; raw sigmoid scores drive the
-    combine weights. Everything runs in fp32 (``moe_router_dtype``): sigmoid
-    scores, the fp32 selection bias (checkpoint convention;
-    ``restore_fp32_params`` re-widens it), and the normalization — only the
-    returned combine weights are downcast by the caller.
     """
 
     def __init__(
@@ -216,16 +153,7 @@ class Glm5NextMoEGate(nn.Module):
 
 
 class Glm5NextSparseMoeBlock(nn.Module):
-    """288 routed + 1 shared expert with the clamp on every path.
-
-    The container/loader half is GLM-5.2's ``Glm52SparseMoeBlock`` (fp8
-    bytes in uint8 containers with fp32 block scales, per-shard stacked
-    loaders, ``_apply`` reattachment, TP slicing) brought in here so this
-    package stands on its own on main; the dispatch half is GLM-5.3's: the
-    eps'd gate, the clamped shared expert, and every routed path clamped.
-    The routed partial and the shared partial each reduce themselves (the
-    one-reduce fusion is a measured perf call, not a port default).
-    """
+    """288 routed + 1 shared expert with the clamp on every path."""
 
     def __init__(
         self, config: Glm5NextModelConfig, comm_group: CommGroup | None = None
@@ -389,16 +317,7 @@ class Glm5NextSparseMoeBlock(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Clamped per-expert loop over the experts this batch hit.
-
-        Same loop shape as glm52's ``_dispatch_fp8_reference`` (the
-        weighted ``index_add_`` keeps partial sums linear, so the TP
-        all-reduce of the (T, hidden) result equals reduce-then-sum);
-        returns this rank's PARTIAL — the caller reduces.
-        ``topk_weights`` arrives fp32: the per-expert multiply promotes the
-        expert output to fp32 and ``index_add_`` downcasts once — exactly
-        the reference ``Glm5NextTextExperts.forward`` arithmetic.
-        """
+        """Clamped per-expert loop over the experts this batch hit."""
         final = torch.zeros_like(flat)
 
         with torch.no_grad():
@@ -427,23 +346,7 @@ class Glm5NextSparseMoeBlock(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Clamped fp8 fused dispatch -- the fast, capture-safe production path.
-
-        Same fp8-resident experts as ``_dispatch_clamped``, but through the
-        shared grouped-GEMM kernel with GLM-5.3's SwiGLU clamp threaded in
-        (``swiglu_limit``: gate max ``L``, up ``[-L, L]`` before the
-        activation). Same reduce semantics: ``reduce_results`` (default True)
-        sums over top-k and returns this rank's PARTIAL ``(T, hidden)`` -- the
-        caller does the TP all-reduce, matching ``_dispatch_clamped``.
-        ``topk_weights`` stays fp32: the down-GEMM folds it into an fp32
-        accumulator and downcasts once (module docstring delta 3), so this is
-        the reference's fp32 combine, NOT glm52's bf16-pre-rounded weight.
-        NOT bit-exact vs ``_dispatch_clamped`` (fp8 GEMM + on-the-fly
-        activation quant vs the bf16 reference GEMM, exactly like glm52
-        fused-vs-reference); the clamp is what makes it CORRECT, so it replaces
-        the reference on the fast path while ``_dispatch_clamped`` stays the
-        HF-faithful fallback.
-        """
+        """Clamped fp8 fused dispatch -- the fast, capture-safe production path."""
         from mstar.utils.fused_moe import fused_experts_fp8
 
         return fused_experts_fp8(
@@ -459,19 +362,7 @@ class Glm5NextSparseMoeBlock(nn.Module):
         )
 
     def process_weights_after_loading(self, device) -> None:
-        """Finalize the fp32 router copy and resolve reference-vs-fused.
-
-        glm52 quant_kernel semantics (``"auto"`` probes, ``"triton"`` must not
-        silently downgrade, ``"reference"`` keeps the bit-exact loop) with ONE
-        extra guard: the shared ``fused_experts_fp8`` is usable here only if it
-        accepts ``swiglu_limit`` -- a clampless kernel would serve subtly wrong
-        activations (the reason ``"triton"`` used to be refused outright), so
-        ``"triton"`` errors when a clamp-capable kernel is unavailable rather
-        than downgrading correctness. The clamped reference loop stays the
-        fallback -- and the default (``moe_quant_kernel="reference"``, the M1
-        eager parity anchor) -- so ``_use_fused`` is False unless serving
-        explicitly asks for the fused path on CUDA.
-        """
+        """Finalize the fp32 router copy and resolve reference-vs-fused."""
         self.gate.finalize_weights()
         if not self.fp8_experts:
             self._use_fused = False

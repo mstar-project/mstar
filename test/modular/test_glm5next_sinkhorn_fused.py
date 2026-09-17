@@ -1,11 +1,4 @@
-"""Fused Sinkhorn (Triton) vs the pure-torch reference — parity (M3 Phase 2).
-
-The fused kernel (``sinkhorn_kernel.sinkhorn_normalize_fused``) collapses the
-reference's ~78 launches/site into one. It must be a numerical equivalent of
-``mhc.sinkhorn_normalize`` (same fp32 arithmetic; only the 4-element reduction
-order can differ). GPU-only (needs triton); the CPU dispatch-fallback test runs
-anywhere. See ``wiki/glm53-decode-capture`` (Phase 2).
-"""
+"""Fused Sinkhorn (Triton) vs the pure-torch reference — parity (M3 Phase 2)."""
 import pytest
 import torch
 

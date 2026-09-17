@@ -1,17 +1,4 @@
-"""FP8 block-scale helpers for the GLM-5.2 checkpoint.
-
-The checkpoint stores most weights as float8_e4m3fn with per-[128, 128]-block
-fp32 scales under ``<base>.weight_scale_inv`` (DeepSeek-V3 layout: dequant is
-``fp8 * scale_inv``). ``modules_to_not_convert`` names the bf16 remainder
-(embeddings, norms, router gates, lm_head), which shows up in the stream as
-plain ``.weight`` keys with no scale sibling.
-
-Load-time policy (see ``weight_loader.py``): everything dequantizes to bf16
-except routed experts, which must stay FP8-resident — bf16 experts alone are
-~181 GB/rank at TP8, over the H200's 141 GB. Resident expert bytes live in
-uint8 containers (ints dodge the module-wide autocast the same way Kimi's
-packed int32 weights do) and are re-viewed as e4m3 at dispatch time.
-"""
+"""FP8 block-scale helpers for the GLM-5.2 checkpoint."""
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
@@ -53,11 +40,7 @@ def dequantize_fp8_block_weight(
     block_size: tuple[int, int] = (128, 128),
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Dequantize one 2-D fp8 weight: ``w[i, j] * scale_inv[i//bo, j//bi]``.
-
-    ``weight_fp8`` may be e4m3 or its uint8 byte view. Scales broadcast per
-    block and are cropped to the weight shape, so ragged tail blocks are fine.
-    """
+    """Dequantize one 2-D fp8 weight: ``w[i, j] * scale_inv[i//bo, j//bi]``."""
     if weight_fp8.dtype == torch.uint8:
         weight_fp8 = weight_fp8.view(FP8_DTYPE)
     out_f, in_f = weight_fp8.shape
@@ -80,14 +63,7 @@ def dequant_fp8_block_stream(
     out_dtype: torch.dtype = torch.bfloat16,
     keep_fp8: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Pair fp8 ``.weight`` keys with ``.weight_scale_inv`` and dequantize.
-
-    Unlike compressed-tensors, quantized and bf16 weights share the plain
-    ``.weight`` suffix — an fp8 dtype is what marks a tensor as needing its
-    scale sibling. Bases matching ``keep_fp8`` pass both keys through raw
-    (the FP8-resident expert path). Order-independent; raises at stream end
-    if any fp8 weight never met its scale (or vice versa).
-    """
+    """Pair fp8 ``.weight`` keys with ``.weight_scale_inv`` and dequantize."""
     buffers: dict[str, dict[str, torch.Tensor]] = {}
 
     def emit(base: str, slot: dict[str, torch.Tensor]) -> tuple[str, torch.Tensor]:

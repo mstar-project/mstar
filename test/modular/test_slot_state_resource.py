@@ -1,11 +1,5 @@
 """The slot-state resource: fixed-size per-request state as an engine
 resource, driven the way the runner drives it.
-
-Pins the slot lease (first admit with tokens, never at ingest — capture
-dummies are ingested up front), the sink for padding rows of a leased
-replay, commit-after-forward accounting, exhaustion as a retryable admit
-failure, the static per-cg-slot index buffers, and sharding of a declared
-head axis.
 """
 
 from __future__ import annotations
@@ -223,7 +217,8 @@ class TestCaptureAndPadding:
         lease like real ones, and every reset (free=False between captures,
         free=True at release_all) hands the slot back — the runner holds
         dummies per (config, cg slot), so keeping slots across resets would
-        drain the pool on the second slot's capture."""
+        drain the pool on the second slot's capture.
+        """
         m = _manager(2)
         dummies = ["__cg_x_0__", "__cg_x_1__"]
         for rid in dummies:

@@ -1,13 +1,4 @@
-"""KDA head-sharding across TP, simulated on CPU.
-
-Two rank-local ``Glm5NextKdaAttention`` layers (a fake 2-way comm group
-whose all-reduce sums the partials by hand) are loaded from one unsharded
-layer's weights through the real ``weight_loader`` hooks — once from full
-tensors, once from the read plan's pre-sliced shards — and must reproduce
-the unsharded layer: prefill and decode outputs, and each rank's recurrent
-/ conv state equal to its head block of the full state. The slot-state
-config shards the same axes, and the read plan names the same tensors.
-"""
+"""KDA head-sharding across TP, simulated on CPU."""
 from __future__ import annotations
 
 import sys

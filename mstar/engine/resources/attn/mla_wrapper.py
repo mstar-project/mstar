@@ -1,14 +1,5 @@
 """FlashInfer's absorbed-MLA kernel behind the wrapper shape the attention
 resource plans and runs.
-
-Ported from the GLM-5.2/5.3 lane's ``FlashInferMLAWrapper``
-(``mstar/utils/flashinfer_utils.py`` there) minus the latent scatter: on the
-resource-pool engine the KV resource writes the latent rows
-(``KVManager.write_latent``), so this wrapper only plans and attends.
-
-The kernel is hard-locked to the Kimi/DeepSeek dims (ckv=512, kpe=64) on sm90;
-an off-dim call corrupts the CUDA context rather than raising, so callers gate
-on ``mla_kernel_available`` BEFORE constructing one of these.
 """
 
 import functools
@@ -33,10 +24,9 @@ def _mla_kernel_available_cached(ckv: int, kpe: int, sm_major: int) -> bool:
 
 
 def mla_kernel_available(ckv: int, kpe: int, device: torch.device) -> bool:
-    """Whether ``flashinfer.mla.BatchMLAPagedAttentionWrapper`` can serve
-    these latent dims on this device. False on CPU, pre-sm90, Blackwell (which
-    wants the trtllm MLA path), reduced test dims, or without flashinfer — the
-    resource then attends through its fp32 SDPA fallback."""
+    """Whether ``flashinfer.mla.BatchMLAPagedAttentionWrapper`` can serve these latent dims
+    on this device.
+    """
     if device.type != "cuda":
         return False
     sm_major = torch.cuda.get_device_capability(device)[0]
@@ -106,12 +96,6 @@ class FlashInferMLAWrapper:
             )
 
         # Fence between consecutive plans on this wrapper. FlashInfer's plan()
-        # copies the index tensors and its own pinned int-workspace to the
-        # device with non_blocking copies and no guard of its own; the next
-        # plan must not overwrite either source before those DMAs executed.
-        # Recorded after every plan; waited on before the next. Normally
-        # already complete: it only bites when the CPU is more than one
-        # replay ahead of the GPU.
         self._fence_ok = torch.cuda.is_available() and device.type == "cuda"
         self._plan_event: torch.cuda.Event | None = None
 
@@ -126,14 +110,7 @@ class FlashInferMLAWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        """Plan the MLA kernel for one batch.
-
-        Pass **host** int32 tensors: FlashInfer's ``plan()`` does ``.to("cpu")``
-        on three of them (a stream-draining D2H per tensor when they live on
-        the device) and copies them into its graph-mode buffers with
-        ``non_blocking=True``. ``kv_len_arr`` is the TOTAL length per request,
-        the tokens this step writes included.
-        """
+        """Plan the MLA kernel for one batch."""
         self.dtype = dtype
         if self._plan_event is not None and not self._plan_event.query():
             self._plan_event.synchronize()
@@ -166,12 +143,7 @@ class FlashInferMLAWrapper:
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the planned kernel.
-
-        ``q_nope`` [T, H, ckv], ``q_pe`` [T, H, kpe]; ``ckv_cache`` /
-        ``kpe_cache`` are the [pages, page_size, ckv] / [.., kpe] slices of one
-        layer's latent plane. Returns [T, H, ckv].
-        """
+        """Run the planned kernel."""
         return self.attn_wrapper.run(
             q_nope.to(self.dtype), q_pe.to(self.dtype),
             ckv_cache, kpe_cache, return_lse=False,

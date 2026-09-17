@@ -1,21 +1,5 @@
 """Slot-pooled fixed-size per-request state (recurrent / conv state of
 linear-attention layers) as an engine resource.
-
-Storage: one pool tensor per declared name, ``max_slots + 1`` slots along
-``slot_dim``; slot ``SINK_SLOT`` (0) is reserved. Slot authority lives here:
-a request leases a slot the first time a step with tokens admits it, keeps
-it across steps, and gives it back when the engine removes the request.
-
-Per step the manager plans a ``SlotStatePlan``: the packed batch's slot
-index (device, staged pinned -> persistent buffer so a captured decode can
-read it at a fixed address and every replay overwrites it) and, for chunked
-steps, the host spans a prefill loop walks against in-place slot views.
-Commit runs after the forward and advances the committed-token count, so a
-step whose forward never ran commits nothing — no rollback API.
-
-Padding rows of a captured replay (`ctx.padded_request_ids` minus
-`ctx.request_ids`) and rids without a slot index the sink slot: they run the
-recurrence on garbage that nothing reads back, and they are never committed.
 """
 
 from __future__ import annotations
@@ -177,14 +161,6 @@ class SlotStateManager(Resource):
     def reset_request(self, rid: str, free: bool = False):
         """Padding rows between captures / after a replay: forget what they
         committed and hand the slot back.
-
-        The slot is released whatever ``free`` says. ``free=False`` is the
-        KV resource's "keep the pages resident so the next replay allocates
-        nothing" — a slot here costs nothing to re-lease (the next admit
-        zeroes it), while keeping it would let the runner's dummy rows,
-        which it holds per (config, cg slot) and resets between captures,
-        drain a pool sized for the serve batch and fail every capture past
-        the first slot. Replay padding rows never lease a slot at all.
         """
         del free
         with self._lock:

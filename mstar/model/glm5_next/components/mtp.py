@@ -1,31 +1,4 @@
-"""GLM-5.3-Flash MTP module — the layer-45 draft model (M2 wiring target).
-
-The HF implementation has NO MTP class (``_keys_to_ignore_on_load_unexpected``
-drops ``layers.45.`` wholesale); glm52's ``components/mtp.py`` plus the
-checkpoint tensors are the specification. Checkpoint anatomy at
-``model.language_model.layers.45.*`` (1,760 tensors): DeepSeek-V3 glue —
-``enorm`` / ``hnorm`` [4096], ``eh_proj`` [4096, 8192] fusing
-``cat(enorm(tok_embed), hnorm(prev_hidden))``, ``shared_head.norm`` — plus
-one full decoder layer: NoPE MLA with its OWN full DSA indexer (the 12th)
-and a 288+1-expert MoE. **No ``hc_attn_*``/``hc_ffn_*`` tensors** — the
-draft layer is plain-residual, running on the collapsed single stream, NOT
-the mHC layer. No embedding and no head under layer 45: drafts reuse the
-trunk's ``embed_tokens``/``lm_head`` exactly like glm52.
-
-Call contract (glm52 MTP-loop compatible): ``forward(token_embeds,
-prev_hidden)`` returns ``(head_input,
-raw_hidden)`` — the shared_head-normed state for the caller-owned
-``lm_head``, and the raw layer output for chaining draft iterations
-(``hnorm`` expects the UN-normalized stream; feeding normed hidden
-double-norms the fusion and zeroed acceptance in glm52, 2026-08-09).
-
-M2 open items this module deliberately does not decide: which trunk stream
-``prev_hidden`` pairs against (post-``hc_head`` pre-final-norm vs post-norm
-vs a single stream — port glm52's env-switch A/B, do not assume), the
-``index_share_for_mtp_iteration`` selection reuse, and KV + **KDA
-recurrent-state** rewind on rejection (the KDA store's snapshot/restore is
-the primitive).
-"""
+"""GLM-5.3-Flash MTP module — the layer-45 draft model (M2 wiring target)."""
 from __future__ import annotations
 
 import torch
@@ -69,14 +42,6 @@ class Glm5NextSharedHead(nn.Module):
 class Glm5NextMTPModule(nn.Module):
     """One draft iteration: fuse (token embedding, previous hidden) and run
     the layer-45 plain-residual decoder layer.
-
-    The draft KV lives at plane ``kv_plane = len(full_attn_layer_indices)``
-    (11 for the full model — plane indices are dense over full-attention
-    layers, NOT layer indices), and the transformer layer sets it itself,
-    so a glm52-style loop calling ``set_layer_idx(num_hidden_layers)``
-    first is harmlessly overridden instead of silently addressing a
-    nonexistent plane 45. The engine half owns allocating that plane and
-    rewinding it (with the KDA state snapshots) on draft rejection.
     """
 
     def __init__(
@@ -111,12 +76,7 @@ class Glm5NextMTPModule(nn.Module):
         prev_hidden: torch.Tensor,
         dsa_ctx=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns ``(head_input, raw_hidden)`` — see the module docstring.
-
-        ``dsa_ctx`` exists for glm52-loop signature parity only; the
-        glm5_next DSA engine path is a post-M1 follow-up and MTP v1 stays
-        in the ctx <= index_topk identity regime.
-        """
+        """Returns ``(head_input, raw_hidden)`` — see the module docstring."""
         if dsa_ctx is not None:
             raise NotImplementedError(
                 "glm5_next MTP has no DSA engine path yet (identity regime "

@@ -1,34 +1,4 @@
-"""AR submodule for the GLM-5.3-Flash text backbone on the resource-pool engine.
-
-One fat TP node (``LLM``): embed + 45 hybrid decoder layers + lm_head, MTP
-off (the draft loop is M2). The submodule owns no per-request state and
-plans nothing itself — it *declares* each step and the engine drives the
-node's four resources around the forward:
-
-- ``KV_CACHE`` (``KVLayout.MLA``): the 11 full-attention layers' latent
-  pages; the KV resource allocates, plans the write slots, commits.
-- ``ATTN`` (``AttnBackend.MLA``): plans FlashInfer's MLA kernel per label
-  (or the fp32 SDPA fallback) off the KV plan.
-- ``KDA_STATE`` (``SlotStateManager``): the 34 KDA layers' recurrent + conv
-  state, one slot per request; ``SlotStateStep.mode`` tells it whether this
-  step is a chunk (prefill: host span loop) or a single-token step (decode:
-  batched gather/scatter by the planned slot index). Padding rows of a
-  captured replay read the reserved sink slot, so there is no capture stub
-  and no rid-prefix detection.
-- ``SAMPLER``: samples inside the forward (graph-shaped under capture).
-
-The forward reads only the resources' per-step plans and the one tensor
-``preprocess`` returns (``input_ids``) — exactly what a captured decode
-replay can repoint. Prefill stays eager: KDA prefill is a host span loop
-over python-int slot views, structurally uncapturable; decode captures
-(``BatchedCudaGraphConfig``) when the fused fp8 MoE resolved, since the
-reference MoE dispatch hosts ``.nonzero()``.
-
-Serving regime: every context is held to ``index_topk`` (2048), where dense
-MLA is bit-exactly GLM-5.3-Flash's DSA computation (the indexer never runs).
-``prepare_inputs`` refuses the request that would cross it, dropping that
-rid only.
-"""
+"""AR submodule for the GLM-5.3-Flash text backbone on the resource-pool engine."""
 from __future__ import annotations
 
 import logging
@@ -77,7 +47,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     # The eager prefill forward hosts the KDA span loop (@torch.compiler.disable
     # inside a compiled outer frame) and the fp8 reference MoE loop; the
     # post-capture torch.compile of the eager forwards is untested for it.
-    # Opt in with MSTAR_GLM53_TORCH_COMPILE=1 once measured.
     disable_torch_compile: bool = os.environ.get("MSTAR_GLM53_TORCH_COMPILE", "0") != "1"
 
     def __init__(self, language_model: nn.Module, config: Glm5NextModelConfig) -> None:
@@ -90,10 +59,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     # -- load-time GPU liveness heartbeat (reaper boxes) ------------------
 
     def set_load_heartbeat_stop(self, stop) -> None:
-        """Adopt the load-time GPU liveness tick. Stopped before CUDA-graph
-        capture (the runner captures in global error mode, so no other
-        thread may touch CUDA meanwhile) and, failing that, on the first
-        forward."""
+        """Adopt the load-time GPU liveness tick."""
         self._load_heartbeat_stop = stop
 
     def _stop_load_heartbeat(self) -> None:
@@ -110,7 +76,8 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         """True iff the loaded MoE blocks resolved to the clamped fused fp8
         kernel (``moe_quant_kernel`` "triton"/"auto" on CUDA); False on the
         "reference" default, whose per-hit-expert loop hosts ``.nonzero()``
-        and cannot be captured."""
+        and cannot be captured.
+        """
         from mstar.model.glm5_next.components.moe import Glm5NextSparseMoeBlock
 
         lm = getattr(self, "language_model", None)
@@ -152,8 +119,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return []
         # DECODE-ONLY: KDA prefill is a host span loop over python-int slot
         # views (decoder_layer._run_kda_prefill), structurally uncapturable.
-        # The decode bucket cannot exceed the slot pool: the padded batch
-        # reads one slot row per request (padding rows the sink).
         max_slots = self._kda_max_slots()
         batch_sizes = [
             b for b in DEFAULT_CAPTURE_BATCH_SIZES
@@ -179,14 +144,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     # -- dtype discipline -------------------------------------------------
 
     def to(self, *args, **kwargs):
-        """Honor device moves; refuse post-load dtype casts.
-
-        The loader's ``restore_fp32_params`` left mixed per-param dtypes (bf16
-        compute, fp32 block scales / Sinkhorn / router bias / the mHC
-        ``hc_*.base``/``scale``, uint8 fp8 bytes). The engine manager's blanket
-        ``submodule.to(device, autocast_dtype)`` would re-narrow the fp32 params
-        and corrupt every dequant + the top-8/Sinkhorn — so dtype is dropped
-        here (glm52 verbatim)."""
+        """Honor device moves; refuse post-load dtype casts."""
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
         if dtype is not None:
             logger.info(

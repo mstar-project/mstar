@@ -1,21 +1,4 @@
-"""GLM-5.3-Flash decoder layers: the mHC hybrid trunk layer + the plain MTP layer.
-
-The trunk layer threads the ``hc_mult``-stream residual: each of its two
-sites collapses the streams through ``attn_hc``/``ffn_hc`` (Sinkhorn at
-forward time), runs a perfectly ordinary ``(T, hidden)`` sublayer on the
-collapsed vector, and writes back via ``post`` placement + ``comb``-mixed
-residual — so attention and MLP components need zero mHC awareness
-(assembly spec section 1.3). The attention sublayer switches on the
-config's ``layer_types`` entry: KDA (34 layers, per-request recurrent
-state, never touches the paged cache) or MLA+DSA (11 layers, each owning
-KV plane ``full_attn_layer_indices.index(layer_idx)`` — planes are DENSE
-over full-attention layers, not layer indices, because only they have KV).
-
-``Glm5NextPlainDecoderLayer`` is the layer-45 (MTP) shape: the checkpoint
-ships NO ``hc_attn_*``/``hc_ffn_*`` tensors there — a plain single-stream
-residual layer, structurally glm52's ``Glm52DecoderLayer`` with the NoPE
-attention and the clamped MoE.
-"""
+"""GLM-5.3-Flash decoder layers: the mHC hybrid trunk layer + the plain MTP layer."""
 from __future__ import annotations
 
 import torch
@@ -46,13 +29,7 @@ def build_hyper_connection(config: Glm5NextModelConfig) -> Glm5NextHyperConnecti
 
 
 class Glm5NextDecoderLayer(nn.Module):
-    """One mHC trunk layer over streams ``(1, T, hc_mult, hidden)``.
-
-    The leading singleton batch axis exists because the engine layout is a
-    flattened token batch ``(T, hidden)`` while the mHC math is written for
-    ``[B, S, H, D]`` — mHC is strictly per-token, so ``B=1, S=T`` is exact.
-    Sublayers see the collapsed ``(T, hidden)``.
-    """
+    """One mHC trunk layer over streams ``(1, T, hc_mult, hidden)``."""
 
     def __init__(
         self,
@@ -125,13 +102,6 @@ class Glm5NextDecoderLayer(nn.Module):
     def _run_kda(self, hidden: torch.Tensor) -> torch.Tensor:
         """Phase-routed KDA over the flat ``(T, hidden)`` batch, by the
         slot-state resource's plan for this step.
-
-        A single-token step stays graph-shaped: one gather by the planned
-        slot index, the fixed-shape recurrent step mutating the gathered
-        copies in place, one scatter — no host syncs, no data-dependent
-        control flow (ground rule 2). Padding rows of a captured replay
-        index the resource's sink slot. A chunked step is the host span
-        loop below.
         """
         if self._kda is None:
             raise RuntimeError(
@@ -148,16 +118,7 @@ class Glm5NextDecoderLayer(nn.Module):
 
     @torch.compiler.disable
     def _run_kda_prefill(self, hidden: torch.Tensor, spans) -> torch.Tensor:
-        """Per-request chunked prefill against in-place slot views.
-
-        Host loop over the planned spans (variable trip count — the glm52
-        ``_dsa_update`` idiom, kept out of dynamo). A fresh zeroed slot
-        through the continue path is bit-exact with a stateless first
-        prefill (zero conv state IS the zero left-pad; zero S IS
-        ``initial_state=None``), so one uniform call covers first prefill,
-        chunked resume, and the M2 verify. The varlen fused kernel that
-        removes this loop is an M3 lever.
-        """
+        """Per-request chunked prefill against in-place slot views."""
         outputs = []
         for span in spans:
             if span.q_len == 0:
@@ -171,14 +132,7 @@ class Glm5NextDecoderLayer(nn.Module):
 
 
 class Glm5NextPlainDecoderLayer(nn.Module):
-    """Plain-residual NoPE MLA + MoE layer — the MTP layer-45 structure.
-
-    ``kv_plane`` must be the DRAFT plane (``len(full_attn_layer_indices)``
-    = 11 for the full model), NOT the layer index 45 — the glm52 MTP loop
-    hardcodes ``set_layer_idx(num_hidden_layers)``, which only coincides
-    with its plane because glm52 planes equal layer indices. This layer
-    sets its own plane so the M2 loop cannot repeat that trap.
-    """
+    """Plain-residual NoPE MLA + MoE layer — the MTP layer-45 structure."""
 
     def __init__(
         self,

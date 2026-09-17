@@ -1,25 +1,5 @@
 """Absorbed multi-head latent attention (DeepSeek/Kimi/GLM MLA) over a
 ``KVLayout.MLA`` cache.
-
-The layer writes one compressed latent row per token (ckv||kpe) through the
-KV resource and attends with a per-head no-rope query ``q_nope`` [T, H, ckv]
-plus a rope query ``q_pe`` [T, H, kpe] against the shared single-head latent:
-
-    score = q_nope . ckv + q_pe . kpe ;  out = softmax(score) . ckv   -> [T, H, ckv]
-
-so the value is the ckv slice of the same row and the caller folds ``w_vc``
-back out afterwards. Two paths, chosen once at build:
-
-- FlashInfer's ``BatchMLAPagedAttentionWrapper`` (sm90, ckv 512 / kpe 64 —
-  the dims the kernel is hard-locked to), prefill and decode alike through
-  the ragged ``qo_indptr``; eager wrappers per label, static-buffer wrappers
-  per captured (bucket, slot, label) like the paged backend.
-- An fp32 causal SDPA fallback over the request's gathered pages (CPU tests,
-  reduced dims, non-Hopper). Same math, so a CPU parity test pins the kernel
-  path's contract.
-
-A NoPE model (GLM-5.3-Flash) zero-pads ``q_pe``/``kpe`` to the kernel's 64:
-the pe term is exactly 0, the kernel still captures.
 """
 
 import logging

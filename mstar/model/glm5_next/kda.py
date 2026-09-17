@@ -1,52 +1,4 @@
-"""GLM-5.3-Flash KDA (Kimi Delta Attention) linear attention — pure-torch math.
-
-KDA is a gated delta rule: per head, a fixed-size fp32 matrix memory
-``S (k_dim, v_dim)`` is decayed PER KEY-CHANNEL every token, written with a
-beta-weighted error-correcting update, then read by the query. 34 of the 45
-decoder layers are KDA; they carry no RoPE and no position input of any
-kind — position enters only through the depthwise causal conv and the
-recurrence order. Math and op order are transcribed 1:1 from the reference
-(``raw/glm53-flash/transformers/modular_glm5_next.py`` —
-``Glm5NextTextLinearAttention``, ``chunk_kimi_delta_attention``,
-``recurrent_kimi_delta_attention``) so each path is bit-exact vs the HF
-fallback math; derivation and pitfall list:
-``drafts/2026-08-31-glm53-kda-spec.md``.
-
-Import discipline: torch + stdlib ONLY (no flashinfer/triton/engine — lane
-ground rule 4); the file must import and test on any machine.
-
-Dtype discipline (each line here is a real parity trap):
-
-- conv weight, ``dt_bias`` and ``A_log`` are fp32 (HF
-  ``_keep_in_fp32_modules_strict``) and the conv computes in fp32; every
-  other weight is bf16. Never blanket-``.to(bf16)`` this module.
-- ``g``, the log forget gate, is fp32 from its ``.float()`` on and is a
-  smooth parameterization bounded to ``(gate_lower_bound, 0)`` — not a
-  clamp. ``beta``'s sigmoid runs in bf16 and is upcast inside the kernel.
-- the delta-rule kernels cast q/k/v/g/beta to fp32, l2norm q and k with
-  ``x / sqrt(sum(x^2) + 1e-6)`` (the FLA form — NOT ``F.normalize``), THEN
-  scale q by ``head_dim**-0.5``; outputs downcast once at kernel exit.
-- recurrent state ``S`` is fp32 end to end (a bf16 ``S`` drifts over long
-  decodes); conv state stores RAW post-projection, pre-SiLU q|k|v columns
-  (bf16-exact), oldest to newest — zero init IS the first-prefill zero pad.
-
-Path selection is per-phase engine logic, never tensor-dependent control
-flow: ``prefill`` covers first prefill (no state) and multi-token continue
-(chunked-prefill resume, MTP verify) via carried state; ``decode_step`` is
-the fixed-shape single-token step — no ``.item()``/``.cpu()``, no
-data-dependent branching, CUDA-graph/compile friendly. The delta rule is
-not rewindable: rejected speculative tokens must never be committed to
-``S`` — the engine checkpoints or defers the state commit (M2).
-
-Weight-loader contract (``weight_loader.py``'s job; shapes recorded here):
-the checkpoint stores THREE conv weights ``{q,k,v}_conv1d.weight
-[8192, 1, 4]`` bf16, fused as ``cat(dim=0)`` into ``conv1d.weight
-[24576, 1, 4]`` (channel order q|k|v, matching the activation concat) and
-cast fp32 at load; the ForgetGate params (``A_log [64]`` fp32, ``dt_bias
-[8192]`` fp32, ``f_{a,b}_proj``) live FLAT under ``self_attn.`` in the
-checkpoint; no KDA tensor is FP8 and none has a bias — exactly 15 tensors
-per layer, identical across all 34 KDA layers.
-"""
+"""GLM-5.3-Flash KDA (Kimi Delta Attention) linear attention — pure-torch math."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -58,14 +10,7 @@ from torch import nn
 
 @dataclass
 class Glm5NextKdaConfig:
-    """Standalone slice of ``Glm5NextModelConfig`` that KDA needs.
-
-    Attribute names match ``mstar/model/glm5_next/config.py`` exactly, so
-    ``Glm5NextLinearAttention`` duck-types against either object; this
-    dataclass only exists to keep ``kda.py`` importable with no package
-    siblings (torch + stdlib only). Defaults are the real checkpoint values
-    (config.json ``linear_attn_config``).
-    """
+    """Standalone slice of ``Glm5NextModelConfig`` that KDA needs."""
 
     hidden_size: int = 4096
     linear_num_heads: int = 64
@@ -95,12 +40,7 @@ class Glm5NextKdaConfig:
 def apply_mask_to_padding_states(
     hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
 ) -> torch.Tensor:
-    """Zero padded positions BEFORE any projection (2D boolean ``(B, L)`` mask).
-
-    A padded token must never enter a conv window or the state: with
-    bias-free projections, x = 0 gives k = v = 0, so the delta rule neither
-    decays a live carry (left pad sits ahead of any real token) nor writes.
-    """
+    """Zero padded positions BEFORE any projection (2D boolean ``(B, L)`` mask)."""
     if attention_mask is not None:
         dtype = hidden_states.dtype
         hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
@@ -108,24 +48,13 @@ def apply_mask_to_padding_states(
 
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """FLA-form l2 normalization: ``x / sqrt(sum(x^2) + eps)``, fp32 inputs.
-
-    Intentionally sqrt-add-divide — ``F.normalize`` (max-eps) and rsqrt-mul
-    variants are last-ulp different and break bit-exactness vs the
-    reference triton kernel's fallback math.
-    """
+    """FLA-form l2 normalization: ``x / sqrt(sum(x^2) + eps)``, fp32 inputs."""
     inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x / inv_norm
 
 
 def causal_conv1d_prefill(mixed_qkv: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Depthwise causal conv + SiLU over ``(B, channels, L)``, fp32 compute.
-
-    Left-pads ``kernel_size - 1`` zeros (F.conv1d pads both sides; keeping
-    the first L outputs makes it left-pad-only), then SiLU on ALL of
-    q, k, v. ``weight`` is the fused ``(channels, 1, kernel_size)`` fp32
-    conv weight; output downcasts to the input dtype after the activation.
-    """
+    """Depthwise causal conv + SiLU over ``(B, channels, L)``, fp32 compute."""
     seq_len = mixed_qkv.shape[-1]
     num_channels = mixed_qkv.shape[1]
     out = F.conv1d(
@@ -141,14 +70,7 @@ def causal_conv1d_prefill(mixed_qkv: torch.Tensor, weight: torch.Tensor) -> torc
 def causal_conv1d_update(
     mixed_qkv: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
-    """Single/multi-token conv step against a rolled state, fp32 compute.
-
-    ``conv_state (B, channels, W)`` holds the last W RAW post-projection,
-    pre-SiLU columns (W >= kernel_size - 1; widths 3 and 4 are both
-    bit-exact with the full prefill conv). Rolls the state in place, then
-    emits the last ``seq_len`` valid conv outputs + SiLU. Fixed shapes, no
-    branches — decode capture-safe.
-    """
+    """Single/multi-token conv step against a rolled state, fp32 compute."""
     seq_len = mixed_qkv.shape[-1]
     num_channels = mixed_qkv.shape[1]
     state_len = conv_state.shape[-1]
@@ -168,26 +90,7 @@ def chunk_kda(
     chunk_size: int = 64,
     initial_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunked gated delta rule (reference ``chunk_kimi_delta_attention``).
-
-    Inputs ``(B, L, H, D)`` (beta ``(B, L, H)``), any float dtype; all
-    compute in fp32 with q/k l2norm and the ``D**-0.5`` q-scale applied
-    in-kernel. Right-pads to a multiple of ``chunk_size`` (padded rows are
-    provably inert), cumsums ``g`` within chunks, builds
-    ``T = (I - A)^-1`` by forward substitution over the strictly-lower
-    ``A``, and carries the recurrent state across chunks with per-channel
-    decay ``exp(g_C)`` along the KEY dim.
-
-    Returns ``(core_attn_out (B, L, H, D) in the input dtype,
-    final_state (B, H, D, D) fp32)``. Multi-token continue (chunked-prefill
-    resume, MTP verify) is THIS path with ``initial_state`` — never a
-    recurrent python loop. Continue calls shrink the effective chunk to
-    cover ``L`` (an M2 k+1-token verify runs a k-iteration substitution
-    loop, not 63): chunk size changes rounding, not math, and chunk-vs-
-    recurrent parity is tolerance-bar by spec. First prefill keeps the
-    fixed reference chunking — it is the one path with an HF bitwise
-    counterpart.
-    """
+    """Chunked gated delta rule (reference ``chunk_kimi_delta_attention``)."""
     initial_dtype = query.dtype
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32)
@@ -304,19 +207,7 @@ def recurrent_kda_step(
     beta: torch.Tensor,
     state: torch.Tensor,
 ) -> torch.Tensor:
-    """One recurrent delta-rule token (reference ``recurrent_kimi_delta_attention``).
-
-    Inputs ``(B, 1, H, D)`` (beta ``(B, 1, H)``); ``state (B, H, D, D)``
-    fp32, mutated IN PLACE (persistent per-request slot — no reallocation,
-    capture-safe). The order is load-bearing:
-
-    1. ``S *= exp(g_t)``        (decay first, per key-channel)
-    2. ``kv_mem = k_t . S``     (read what memory returns for this key)
-    3. ``S += k_t (x) ((v_t - kv_mem) * beta_t)``  (delta write)
-    4. ``o_t = q_t . S``        (read AFTER the write — token sees itself)
-
-    Returns the core output ``(B, 1, H, D)`` in the input dtype.
-    """
+    """One recurrent delta-rule token (reference ``recurrent_kimi_delta_attention``)."""
     if state.dtype != torch.float32:
         raise ValueError(f"KDA recurrent state must be fp32, got {state.dtype}")
     initial_dtype = query.dtype
@@ -345,15 +236,7 @@ def recurrent_kda_step(
 
 
 class Glm5NextForgetGate(nn.Module):
-    """Per-head, per-key-channel log forget gate ``g (B, L, H, D)``, fp32.
-
-    ``g = gate_lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))``
-    — a smooth parameterization bounded to ``(gate_lower_bound, 0)``, NOT a
-    clamp. The low-rank matmuls run bf16; the ``.float()`` happens BEFORE
-    the fp32 ``dt_bias`` add, and everything after is fp32. The HF softplus
-    branch (``gate_lower_bound is None``) is dead for this checkpoint and
-    deliberately not implemented.
-    """
+    """Per-head, per-key-channel log forget gate ``g (B, L, H, D)``, fp32."""
 
     def __init__(self, config: Glm5NextKdaConfig, dtype: torch.dtype = torch.bfloat16) -> None:
         super().__init__()
@@ -384,13 +267,7 @@ class Glm5NextForgetGate(nn.Module):
 
 
 class Glm5NextRMSNormGated(nn.Module):
-    """Gated RMSNorm over head_dim, weight shared across heads, strict fp32.
-
-    ``eps`` must be config ``rms_norm_eps = 1e-5`` — NOT the HF class
-    default 1e-6. Gate activation is SIGMOID (GLM-5.3 overrides the
-    Qwen3-family SiLU). Norm, weight and gating all run fp32; the result
-    downcasts once to the input dtype.
-    """
+    """Gated RMSNorm over head_dim, weight shared across heads, strict fp32."""
 
     def __init__(self, head_dim: int, eps: float, dtype: torch.dtype = torch.bfloat16) -> None:
         super().__init__()
@@ -408,20 +285,7 @@ class Glm5NextRMSNormGated(nn.Module):
 
 
 class Glm5NextLinearAttention(nn.Module):
-    """One KDA layer: projections + fused causal conv + delta rule + gated out.
-
-    ``config`` duck-types ``Glm5NextModelConfig`` (or the standalone
-    ``Glm5NextKdaConfig``): ``hidden_size``, ``linear_num_heads``,
-    ``linear_head_dim``, ``linear_conv_kernel_size``, ``gate_lower_bound``,
-    ``rms_norm_eps``. Big trap baked into both paths: ``g``, ``beta`` and
-    the output ``gate`` are computed from the PRE-conv layer input, never
-    from the conv output.
-
-    Per-request state (see ``init_state``): recurrent ``S (H, D, D)`` fp32
-    mandatory (4 MiB/layer full-size; 136 MiB/request over the 34 KDA
-    layers) + conv tail ``(3*H*D, kernel-1)`` in the module dtype
-    (144 KiB/layer bf16). Fixed size — NOT paged KV.
-    """
+    """One KDA layer: projections + fused causal conv + delta rule + gated out."""
 
     def __init__(self, config: Glm5NextKdaConfig, dtype: torch.dtype = torch.bfloat16) -> None:
         super().__init__()
@@ -441,7 +305,6 @@ class Glm5NextLinearAttention(nn.Module):
         # Fused depthwise conv over cat(q, k, v); fp32 weight, no bias
         # (loader fuses the checkpoint's three [8192, 1, 4] bf16 taps and
         # upcasts). padding is unused (both paths call F.conv1d directly)
-        # but kept so the module mirrors the reference geometry.
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
             out_channels=self.conv_dim,
@@ -461,11 +324,7 @@ class Glm5NextLinearAttention(nn.Module):
     def init_state(
         self, batch_size: int, device: torch.device | str | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Zero per-request state: ``(S (B, H, D, D) fp32, conv (B, 3HD, K-1))``.
-
-        Zero conv init is exactly the zero left-padding of a first prefill —
-        one convention shared by both paths.
-        """
+        """Zero per-request state: ``(S (B, H, D, D) fp32, conv (B, 3HD, K-1))``."""
         if device is None:
             device = self.o_proj.weight.device
         recurrent_state = torch.zeros(
@@ -516,20 +375,7 @@ class Glm5NextLinearAttention(nn.Module):
         conv_state: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full or continued prefill over ``(B, L, hidden)``; chunked kernel.
-
-        With no state: first prefill (zero left-context conv, delta rule
-        from zeros). With both states: multi-token continue — prepend the
-        cached raw conv tail, keep the LAST L conv outputs (bit-exact with
-        one long conv), and chunk with ``initial_state`` (MTP verify and
-        chunked-prefill resume take this path, never a recurrent loop).
-        Passed-in states are updated IN PLACE and also returned; fresh ones
-        are allocated when none are passed. ``attention_mask`` is a 2D
-        boolean padding mask applied to ``hidden_states`` before any
-        projection.
-
-        Returns ``(output (B, L, hidden), recurrent_state fp32, conv_state)``.
-        """
+        """Full or continued prefill over ``(B, L, hidden)``; chunked kernel."""
         if (recurrent_state is None) != (conv_state is None):
             raise ValueError(
                 "pass both recurrent_state and conv_state (continue) or neither "
@@ -574,12 +420,7 @@ class Glm5NextLinearAttention(nn.Module):
         recurrent_state: torch.Tensor,
         conv_state: torch.Tensor,
     ) -> torch.Tensor:
-        """One decode token ``(B, 1, hidden)``; states mutated IN PLACE.
-
-        Fixed shapes, no host syncs, no data-dependent branching — the
-        whole step is capture/compile friendly. Both states are required:
-        the first generated token always follows a ``prefill``.
-        """
+        """One decode token ``(B, 1, hidden)``; states mutated IN PLACE."""
         batch_size, seq_len = hidden_states.shape[:2]
         if seq_len != 1:
             raise ValueError(

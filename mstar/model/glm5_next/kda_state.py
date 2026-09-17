@@ -1,32 +1,4 @@
-"""Per-request KDA state: the model's view of the engine's slot-state resource.
-
-KDA layers keep a fixed-size recurrent matrix memory ``S (H, D, D)`` fp32 and
-a conv tail ``(3*H*D, kernel-1)`` per request per layer — NOT paged KV. On
-the resource-pool engine that state is a ``SlotStateManager`` (declared by
-:func:`kda_slot_state_config`): the engine owns the slot pool, the
-``request -> slot`` lease, the per-step slot index and the committed-token
-count, and drives them through ingest / admit / plan / commit / remove. The
-model never allocates or frees anything.
-
-What stays model-side is the layer-facing access this module provides:
-
-- pool layout: ``recurrent (L_kda, S+1, H, D, D)`` fp32 and ``conv (L_kda,
-  S+1, 3*H*D, kernel-1)`` in the compute dtype — layer-major so a decode
-  step's per-layer gather touches one contiguous ``(S+1, ...)`` plane;
-- the decode gather/scatter by the planned ``[bs]`` slot index into
-  persistent staging planes (one plane per pool, reused layer to layer —
-  stream order serializes scatter before the next gather): fixed shapes, no
-  ``.item()``, no per-step allocation, capture/compile friendly;
-- in-place slot views for the prefill span loop (host loop, eager phase).
-
-Memory (full model, per TP rank at TP8, heads 64 -> 8): 512 KB recurrent +
-18 KB conv per layer x 34 layers ~= 17.6 MB/request/rank, ~0.6 GB at 32
-slots.
-
-MTP (M2): the delta rule is not rewindable, so verify must ``snapshot``
-before the speculative window and ``restore`` on rejection; both are here
-(and double as the test seam for prefill/decode parity across a save/restore).
-"""
+"""Per-request KDA state: the model's view of the engine's slot-state resource."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -47,17 +19,7 @@ CONV = "conv"
 def kda_slot_state_config(
     config, max_slots: int, conv_dtype: torch.dtype = torch.bfloat16,
 ) -> SlotStateConfig:
-    """The ``SlotStateConfig`` for this model's KDA state.
-
-    ``config`` duck-types ``Glm5NextModelConfig`` (``kda_layer_indices``,
-    ``linear_num_heads``, ``linear_head_dim``, ``linear_conv_channels``,
-    ``linear_conv_kernel_size``). ``conv_dtype`` must be the KDA projection
-    dtype (the continue path ``cat``s the conv tail onto the projected
-    activations bit-exactly). Shapes are the FULL model's; the resource
-    divides the ``shard_dim`` axes (recurrent heads, conv q|k|v channel
-    blocks) by the joint world size, matching ``Glm5NextKdaAttention``'s
-    head-block sharding.
-    """
+    """The ``SlotStateConfig`` for this model's KDA state."""
     num_layers = len(config.kda_layer_indices)
     return SlotStateConfig(
         tensors={

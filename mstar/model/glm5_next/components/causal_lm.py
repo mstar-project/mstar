@@ -1,18 +1,4 @@
-"""Assembled GLM-5.3-Flash text backbone (45-layer hybrid + mHC + KDA state).
-
-Forked from ``glm52/components/causal_lm.py``. Deltas: no rotary (NoPE —
-no cos/sin computed or threaded), the residual enters as ``hc_mult``
-replicated streams and exits through the unweighted ``hc_head`` mean, and
-the per-layer cache planes are compact full-attention indices (each layer
-addresses its own).
-
-Engine forward protocol (resource-pool engine): flattened token batch in,
-``(T, hidden)`` out. Every layer reaches its engine resources through the
-references it bound at load (``bind_resources``): the MLA layers the KV +
-attention resources, the KDA layers the slot-state resource whose per-step
-plan says which slot each row reads. The engine plans before and commits
-after the forward, so the model advances nothing itself.
-"""
+"""Assembled GLM-5.3-Flash text backbone (45-layer hybrid + mHC + KDA state)."""
 from __future__ import annotations
 
 import torch
@@ -57,17 +43,7 @@ class Glm5NextLanguageModel(nn.Module):
         input_ids: torch.Tensor,
         return_prenorm: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """``input_ids (T,)`` flat batch -> ``(T, hidden)`` final hidden.
-
-        The KDA layers read the slot-state resource's plan for this step;
-        the full-attention layers address their own compact KV plane.
-
-        ``return_prenorm``: additionally return the ``hc_head``-collapsed
-        stream BEFORE the final norm as ``(normed, prenorm)``. Which stream
-        the MTP ``hnorm`` pairs against is an OPEN three-way A/B for M2
-        (post-``hc_head`` pre-norm — returned here — vs post-norm vs a
-        single stream); port glm52's env-switch pattern, do not assume.
-        """
+        """``input_ids (T,)`` flat batch -> ``(T, hidden)`` final hidden."""
         hidden_states = self.embed_tokens(input_ids)
         # (1, T, hc_mult, hidden): embedding replicated into all streams.
         # B=1 over the flat token batch is exact — mHC is per-token.
@@ -93,9 +69,6 @@ class Glm5NextForCausalLM(nn.Module):
         self.lm_head = build_lm_head(config, comm_group=comm_group)
         # Per-request KDA state is the engine's slot-state resource
         # (get_node_resources declares it; kda_state.py is the model's view).
-        # The layer-45 draft module exists only when drafting is on, so
-        # flag-off keeps the parameter set (and load) byte-identical to a
-        # no-MTP build (glm52 flag pattern).
         self.mtp = None
         if config.mtp_num_draft_tokens > 0:
             from mstar.model.glm5_next.components.mtp import Glm5NextMTPModule

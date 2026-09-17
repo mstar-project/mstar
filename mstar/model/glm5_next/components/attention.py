@@ -1,38 +1,4 @@
-"""GLM-5.3-Flash attention modules: NoPE MLA (fork of glm52) + loader-aware KDA.
-
-``Glm5NextMLAAttention`` is ``glm52/components/attention.py`` with the rope
-plumbing deleted and the GLM-5.3 geometry read from config — q_lora 1536,
-nope 256, **rope 0** (``mla_use_nope``), v_head 256, 64 heads. NoPE
-simplifications vs glm52: ``kv_a_proj_with_mqa`` output is the pure 512-dim
-latent (nothing to split), no cos/sin threading anywhere, the absorbed path
-loses the rope-slice bookkeeping, and the cache latent is exactly
-``kv_lora_rank``. Nothing takes positions: NoPE rotates by none, and the
-engine's KV resource does the cache bookkeeping.
-
-Engine seam (resource-pool engine): the layer binds the KV and attention
-resources once (``bind_resources``), writes its per-token latent through
-``kv.write_latent`` and attends through ``attn.run_mla`` over the layer's
-own latent plane (``kv.layer_view(kv_plane)``). Only the absorbed path is
-served — the engine's MLA backend has an fp32 SDPA fallback, so reduced
-CPU configs run the same code.
-
-DSA status (M0): every full-attention layer OWNS a full k-pool indexer
-(``indexer_types`` is all "full"; no glm52 IndexShare formula), so the
-parameter container is always built and always loads — but selection is
-never RUN: serving holds every context to ``index_topk`` = 2048, where
-dense MLA is bit-exactly the DSA computation (top-(topk/kpool) of
-<= topk/kpool pools is the identity, tail included — assembly spec
-section 3.2/6.4, the glm52 M1 regime). The k-pool scoring math (pooled
-softmax + ape prior, fixed 2051-wide output, masked — never
-data-dependent-shaped) is the M1 port.
-
-``Glm5NextKdaAttention`` adds exactly one thing to the pure-math
-``kda.Glm5NextLinearAttention``: the fused-conv ``weight_loader`` the
-stacked-param rules dispatch into (checkpoint stores three
-``{q,k,v}_conv1d.weight [qkv_dim, 1, K]`` bf16 tensors; the module runs one
-fp32 ``[3*qkv_dim, 1, K]`` depthwise conv in q|k|v order). The math file
-stays torch-only (lane ground rule 4); loader coupling lives here.
-"""
+"""GLM-5.3-Flash attention modules: NoPE MLA (fork of glm52) + loader-aware KDA."""
 from __future__ import annotations
 
 import torch
@@ -54,23 +20,7 @@ _INDEXER_K_NORM_EPS = 1e-6
 
 
 class Glm5NextIndexer(nn.Module):
-    """DSA k-pool indexer parameters for one full-attention layer.
-
-    M0 is a checkpoint-shaped parameter container: the six tensors load
-    (all bf16 — unlike glm52, none are fp8 here) so the module tree matches
-    the weight map, and selection stays off behind the ctx <= index_topk
-    guard where dense MLA IS the DSA computation. The M1 port adds the
-    scoring: per pool of ``index_kpool`` consecutive tokens, a learned
-    softmax over members (``F.linear(x, index_kpool_compress_gate)`` gate
-    scores + the ``index_kpool_compress_ape`` per-slot prior, fp32) builds
-    a probability-weighted pool key; ReLU'd q-pool dots are head-combined
-    by ``weights_proj``; top-(topk/kpool) pools expand x kpool back to
-    token indices with the raw tail pool always appended
-    (``index_kpool_always_select_tail``) — fixed output width
-    ``index_topk + index_kpool - 1``, -1 padded, so the port must mask
-    invalid pools to -inf rather than compact them (the HF
-    ``pool_valid.any(0)`` shape is a ground-rule-2 violation to not copy).
-    """
+    """DSA k-pool indexer parameters for one full-attention layer."""
 
     def __init__(self, config: Glm5NextModelConfig) -> None:
         super().__init__()
@@ -182,18 +132,7 @@ class Glm5NextMLAAttention(nn.Module):
         self.attn = resources[ATTN]
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """``hidden_states (T, hidden)`` flat engine layout, out the same.
-
-        MLA over the compressed 512-dim latent cache, kv_b folded into Q/O.
-
-        The rope halves of the glm52 original are gone (NoPE). ``q_pe``/``k_pe``
-        are ZERO vectors of width ``mla_cache_kpe`` (64): MLA's score is
-        ``q_nope·k_ckv + q_pe·k_pe``, so zeros make the pe term exactly 0 —
-        bit-identical NoPE. Width 64 (not 0) is deliberate — the capturable
-        FlashInfer MLA kernel is hard-locked to kpe=64, so this zero-pad is what
-        lets decode CUDA-graph capture instead of falling to eager SDPA
-        (wiki/glm53-decode-capture). The softmax scale rides the AttentionSpec.
-        """
+        """``hidden_states (T, hidden)`` flat engine layout, out the same."""
         if self.kv is None or self.attn is None:
             raise RuntimeError(
                 "Glm5NextMLAAttention has no engine resources bound; the "
@@ -272,10 +211,6 @@ def _slice_rows_loader(
 ) -> None:
     """Head-block row shard of a checkpoint tensor whose dim 0 is
     ``full_rows`` (q/k/v/f_b/g_b/b projections, dt_bias, A_log).
-
-    Shape-driven like the expert loaders: a full tensor is sliced to this
-    rank's block; a pre-sliced shard (the read plan's fast path, each rank
-    reading only its rows) is written as-is.
     """
     del loaded_shard_id
     rows = divide(full_rows, tp_size)
@@ -311,27 +246,6 @@ def _slice_cols_loader(
 class Glm5NextKdaAttention(Glm5NextLinearAttention):
     """``kda.Glm5NextLinearAttention`` head-sharded across TP + the
     checkpoint loaders.
-
-    Every KDA quantity is per head (the projections' output columns, the
-    depthwise conv channels, the forget/beta gates, the gated RMSNorm over
-    ``head_dim``, the recurrent state ``S (H, D, D)``), so the layer shards
-    cleanly by head block: this rank instantiates the single-rank math file
-    with ``H / tp`` heads and slices every head-indexed weight to its block
-    on load — q/k/v/f_b/g_b/b column-wise, ``dt_bias``/``A_log`` by the
-    same blocks, the fused conv's q|k|v channel blocks, ``o_proj`` row-wise
-    (contraction dim) — while ``f_a``/``g_a``/``o_norm`` replicate. The
-    output is this rank's ``o_proj`` partial, all-reduced once per layer
-    (exact: the reduction is a sum over head blocks). The per-request state
-    pool shards the same way (``kda_slot_state_config`` shard_dim), so a
-    rank stores only its heads' recurrence.
-
-    The stacked-param rules route ``{q,k,v}_conv1d.weight`` shards here with
-    shard ids ``"q"``/``"k"``/``"v"``; each lands at its row block of the
-    fp32 fused ``conv1d.weight`` (channel order q|k|v, matching the
-    activation ``cat`` — kda spec pitfall 11), the ``copy_`` doing the
-    bf16 -> fp32 promotion HF's ``_keep_in_fp32_modules_strict`` pins.
-    Attached-loader + ``_apply`` reattachment follows the repo's parallel
-    linears (attributes on parameters do not survive ``to_empty``).
     """
 
     _CONV_SHARD_ROW = {"q": 0, "k": 1, "v": 2}

@@ -1,12 +1,4 @@
-"""The MLA attention backend and the latent KV layout it reads, on CPU.
-
-Pins (1) the ``KVLayout.MLA`` cache: shape, the single-latent write/read,
-page copies and chunk views; (2) the manager's plan: ``kv_len_arr`` derived
-from the KV views, last-token indices for prefill sampling; (3) the fp32 SDPA
-fallback against a naive dense reference — the contract the FlashInfer kernel
-path is held to on sm90 (the kernel itself is GPU-only). (4) the spec builds
-the right backend and validates its config.
-"""
+"""The MLA attention backend and the latent KV layout it reads, on CPU."""
 
 from __future__ import annotations
 

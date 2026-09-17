@@ -1,42 +1,5 @@
 """GLM-5.3-Flash serving submodule on the resource-pool engine — CPU, reduced
 config, no GPU deps.
-
-Drives ``Glm5NextLLMSubmodule`` through the engine seam — ``prepare_inputs``
--> ``declare_step`` -> (runner admit / plan) -> ``preprocess`` ->
-``forward_batched`` -> (runner commit) -> ``postprocess`` / ``check_stop`` /
-``cleanup_request`` — over the REAL v1 resources the model declares
-(``get_node_resources``: the MLA-layout KV cache, the MLA attention backend
-on its fp32 SDPA fallback, the slot-state resource) sequenced by a
-``StepRunner``, exactly as ``test_glm5next_engine_path`` does. The one
-substitution is the sampler: its kernels are Triton/FlashInfer, so a greedy
-``Resource`` stand-in takes its key (argmax == temperature-0 greedy, the M1
-parity bar).
-
-What this file pins:
-
-1. The submodule owns no per-request state: it *declares* each step (one
-   segment per row, the four resource steps, ``SlotStateStep.mode`` chunk
-   on prefill / step on decode, the prompt handed to the sampler for the
-   penalty mask) and ``preprocess`` returns nothing but ``input_ids``.
-2. The serving regime: ``prepare_inputs`` refuses the request whose context
-   would cross ``index_topk`` (from the KDA resource's committed count) and
-   passes at the boundary.
-3. Capture policy: no graphs while the reference MoE is active, one
-   decode-only ``BatchedCudaGraphConfig`` clamped to the KDA slot pool once
-   the fused kernel resolved, ``compile`` from ``MSTAR_GLM53_GRAPH_COMPILE``,
-   the load heartbeat stopped before capture; ``max_batch_size`` is the pool.
-4. The slow-postprocess path: ``postprocess`` rebinding, ``check_stop`` (EOS,
-   ``ignore_eos`` off the sampler config, ``max_tokens`` with the +2 rule),
-   the ``.to()`` dtype refusal, ``cleanup_request`` touching resources not.
-5. Lifecycle through the runner: prefill -> decode -> decode commits one
-   token per step, stepwise output equals a whole-sequence prefill, two
-   requests batched jointly match each alone, and a PADDED decode (a
-   captured replay's ``padded_request_ids``) maps the padding row to the sink
-   slot, commits only the real row, and emits one entry per padded rid.
-
-flashinfer is stubbed per test through ``monkeypatch`` (``sys.modules``
-writes at import time would win over a real install on a GPU box); triton is
-stubbed by ``conftest.py``.
 """
 from __future__ import annotations
 
@@ -142,10 +105,10 @@ def _build_model(
     max_slots: int = MAX_SLOTS,
     mtp_num_draft_tokens: int = 0,
 ) -> tuple[Glm5NextModel, Glm5NextForCausalLM, Glm5NextModelConfig]:
-    """Reduced-config model with small random weights, finalized the way the
-    loader finalizes it (``process_weights_after_loading`` resolves the MoE
-    dispatch and builds the absorbed MLA projections). ``dtype`` widens the
-    whole model (float64 for the joint-vs-isolated parity test)."""
+    """Reduced-config model with small random weights, finalized the way the loader
+    finalizes it (``process_weights_after_loading`` resolves the MoE dispatch and builds
+    the absorbed MLA projections).
+    """
     torch.manual_seed(seed)
     model = Glm5NextModel(
         "x", config_variant="reduced", kda_conv_dtype=dtype,
@@ -232,7 +195,8 @@ class _Harness:
         """One engine step over ``inputs`` (rid -> token ids); ``padded`` is
         the captured-replay addressing (real rids first, then the padding
         rids), each padding row carrying the capture config's one-token
-        input. Returns the emitted token per rid the forward answered for."""
+        input. Returns the emitted token per rid the forward answered for.
+        """
         rids = list(inputs)
         node_inputs = [self.prepare(walk, rid, ids) for rid, ids in inputs.items()]
         step_rids = rids if padded is None else list(padded)
@@ -497,11 +461,7 @@ class TestCudaGraphs:
 
     @pytest.mark.parametrize("max_slots", [3, MAX_SLOTS])
     def test_fused_moe_returns_one_decode_graph_clamped_to_pool(self, max_slots, monkeypatch):
-        """The capture flip is entirely ``_use_fused``-driven. Once the fp8
-        MoE blocks resolved the clamped fused kernel, the decode-only config
-        comes back: KDA prefill is a host span loop (uncapturable), and the
-        decode bucket cannot exceed the slot pool — a padded batch reads one
-        slot row per request."""
+        """The capture flip is entirely ``_use_fused``-driven."""
         monkeypatch.delenv("MSTAR_GLM53_GRAPH_COMPILE", raising=False)
         h = _Harness(seed=34, max_slots=max_slots)
         sub, lm = h.sub, h.lm
@@ -711,11 +671,10 @@ class TestEngineSeam:
         assert not h.kv._streams
 
     def test_batched_two_requests_match_isolated_and_free_all(self):
-        """Two requests prefilled AND decoded jointly emit, at every step, the
-        greedy tokens each emits alone — per-request slot / KV-stream
-        isolation across a real batch, over the >1-row decode slot index.
-        float64 so a joint-vs-isolated mismatch is the recurrence, not an fp32
-        near-tie in the greedy pick."""
+        """Two requests prefilled AND decoded jointly emit, at every step, the greedy
+        tokens each emits alone — per-request slot / KV-stream isolation across a real
+        batch, over the >1-row decode slot index.
+        """
         lens = {"a": 7, "b": 4}
         num_decode = 4
         torch.manual_seed(39)
@@ -753,12 +712,9 @@ class TestEngineSeam:
             assert got[rid] == ref[rid], (rid, got[rid], ref[rid])
 
     def test_padded_decode_reads_the_sink_and_commits_only_real_rows(self):
-        """A captured replay pads the batch with ``__cg_*`` rows: the engine
-        declares over ``padded_request_ids`` and runs the forward over them.
-        The slot-state plan maps the padding row to SINK_SLOT, commit advances
-        the real row only, and the forward answers for every padded rid — with
-        the real row's token unchanged by its neighbour (chunk-vs-step parity
-        against an unpadded whole-sequence prefill)."""
+        """A captured replay pads the batch with ``__cg_*`` rows: the engine declares over
+        ``padded_request_ids`` and runs the forward over them.
+        """
         h = _Harness(seed=8)
         pad = "__cg_x_0__"
         # the dummy-row pool ingests padding rids up front, like real ones

@@ -1,13 +1,5 @@
 """What a model declares about a fixed-size per-request state: its tensors,
 its spec, its step.
-
-Linear-attention / SSM families (KDA, GDN, Mamba) keep a fixed-size
-recurrent state per request — a matrix memory and a short-conv tail per
-layer — instead of a paged KV cache. This is the first resource on the pool
-engine that is not paged: one slot per request, allocated at first admit,
-freed at removal, and addressed by a per-row slot index the forward gathers
-and scatters through. Kept free of the manager so a submodule can declare
-the step without pulling anything in behind it.
 """
 
 from dataclasses import dataclass, field
@@ -31,15 +23,7 @@ SINK_SLOT = 0
 
 @dataclass
 class SlotTensorSpec:
-    """One named per-slot tensor of the pool.
-
-    ``shape`` is the per-request shape WITHOUT the slot axis; the pool inserts
-    an axis of ``max_slots + 1`` at ``slot_dim`` (layer-major state keeps the
-    layer axis outermost so a per-layer gather touches one contiguous plane).
-    ``shard_dim`` names the axis of ``shape`` that is divided across the
-    joint (tp * sp) world size — a head axis, once the model shards the
-    layer — or None for state that is replicated on every rank.
-    """
+    """One named per-slot tensor of the pool."""
     shape: tuple[int, ...]
     dtype: torch.dtype
     slot_dim: int = 0
@@ -107,15 +91,7 @@ class SlotStateSpec(NodeResourceSpec):
 
 @dataclass(frozen=True)
 class SlotStateStep(ResourceStep):
-    """``mode`` says how the forward walks the state:
-
-    - ``"step"``: one new token per row; the forward gathers every row's
-      slot by the planned ``slot_index``, runs the recurrence once, scatters
-      back — graph-shaped, no host work.
-    - ``"chunk"``: a span of tokens per row; the forward loops the planned
-      ``spans`` on the host against in-place slot views (prefill, chunked
-      continue).
-    """
+    """``mode`` says how the forward walks the state:"""
     mode: str = "step"
     # per-request state a step reads but must not commit (speculative draft)
     commit: bool = True

@@ -1,15 +1,6 @@
 """glm5_next through the real ``Engine`` on CPU: load_model -> add_request ->
 prepare_inputs -> exec_and_postprocess -> check_stop -> remove_request, for a
 prefill and a batch of decodes, with two requests interleaved.
-
-The one substitution is the sampler: its kernels are Triton/FlashInfer, so a
-greedy stand-in takes its resource key after load. Everything else — the
-MLA-layout KV cache, the MLA attention backend (fp32 SDPA fallback), the
-slot-state resource, the runner, the engine's step protocol — is the real
-thing. What this pins that the resource-level tests cannot: the engine
-binds the resources into the layers, drives declare/admit/plan/commit around
-the forward, pads nothing eagerly, and the model's output for a sequence
-generated stepwise equals the output of prefilling that sequence whole.
 """
 from __future__ import annotations
 

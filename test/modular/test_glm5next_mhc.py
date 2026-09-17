@@ -1,17 +1,4 @@
-"""GLM-5.3-Flash mHC: Sinkhorn manifold, shapes, stack parity, dtype discipline.
-
-The parity test does NOT call ``mhc.py`` against itself: the expected path is
-an independent numpy fp64 port of the HF reference computation written inline
-here (explicit einsums / division-form RMSNorm), so a transcription bug in
-``mhc.py`` cannot regenerate its own expectation. The dtype test runs the whole
-forward under a ``TorchDispatchMode`` recorder and asserts no aten op ever
-produced fp64 — and, as a decode-path canary, that no host-sync
-(``_local_scalar_dense``) or data-dependent-shape op was dispatched (lane
-ground rule 2). The KDA forget gate is imported from ``kda.py`` — the ONE
-implementation the model graph uses (the duplicate that once lived in
-``mhc.py`` diverged in projection dtype). Pure torch + numpy; imports without
-flashinfer/triton on any machine (lane ground rule 4).
-"""
+"""GLM-5.3-Flash mHC: Sinkhorn manifold, shapes, stack parity, dtype discipline."""
 import sys
 from pathlib import Path
 
@@ -98,12 +85,7 @@ def test_sinkhorn_rows_and_cols_sum_to_one():
 
 
 def test_sinkhorn_near_permutation_regime():
-    """Sharpened logits (x3): near-permutation matrices converge slower.
-
-    Columns are exact regardless (the last op is a column normalize; only the
-    eps guard offsets them, ~4e-6); rows land within 5e-2 at 20 iterations
-    (measured max 2.7e-2 at this seed) and keep shrinking with more rounds.
-    """
+    """Sharpened logits (x3): near-permutation matrices converge slower."""
     torch.manual_seed(1)
     start = torch.softmax(torch.randn(5, 7, 4, 4) * 3.0, dim=-1) + HC_EPS
     ones = torch.ones(5, 7, 4)
@@ -135,8 +117,6 @@ def test_mixing_shapes_at_checkpoint_size():
     assert comb.shape == (2, 3, 4, 4)
     assert collapsed.shape == (2, 3, 4096)
     # The comb the module hands out is on the doubly-stochastic manifold.
-    # Random-init fn at hidden 4096 gives O(2.5) comb logits, so the slowest
-    # rows sit ~1e-3 from 1 after the 20 fixed iterations (cols are exact).
     ones = torch.ones(2, 3, 4)
     assert torch.allclose(comb.sum(dim=-1), ones, atol=5e-3)
     assert torch.allclose(comb.sum(dim=-2), ones, atol=1e-4)

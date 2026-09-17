@@ -1,19 +1,4 @@
-"""GLM-5.3-Flash (glm5_next) architecture + generation config.
-
-Architecture values transcribed from the official checkpoint's config.json
-(zai-org/GLM-5.3-Flash, architectures=["Glm5NextForConditionalGeneration"],
-top-level model_type "glm5_next" with a nested text_config of model_type
-"glm5_next_text"). This package is the text-only port (milestone
-``glm5_next_text``): the vision tower in the checkpoint is out of scope and
-its tensors are explicitly skipped at load (see ``weight_loader.py``).
-
-Unlike GLM-5.2 the layer schedule is heterogeneous — 34 KDA
-(gated-delta-rule linear attention) layers and 11 MLA+DSA full-attention
-layers — so the schedule lists (``layer_types``, ``mlp_layer_types``,
-``indexer_types``) are carried verbatim as config fields. Read them; do not
-trust code-side formulas (the checkpoint's ``index_kpool`` is 4 where the HF
-class default is 16 — defaults lie).
-"""
+"""GLM-5.3-Flash (glm5_next) architecture + generation config."""
 
 from dataclasses import dataclass, field
 
@@ -135,10 +120,6 @@ class Glm5NextModelConfig:
     # --- DSA sparse-attention indexer (k-pool compression) ---
     # Scoring runs over pools of index_kpool consecutive tokens (learned
     # softmax over members + additive prior), top-(index_topk/index_kpool)
-    # pools expand back to token indices; the incomplete tail pool is
-    # always appended raw (index_kpool_always_select_tail), so the output
-    # width is fixed at index_topk + index_kpool - 1. Every layer's entry
-    # in indexer_types is "full" — no cross-layer IndexShare formula.
     index_n_heads: int = 32
     index_head_dim: int = 128
     index_topk: int = 2048
@@ -171,7 +152,6 @@ class Glm5NextModelConfig:
     moe_router_dtype: str = "float32"
     # SwiGLU clamp on every MLP (dense, shared, routed experts alike):
     # gate.clamp(max=limit), up.clamp(-limit, limit), then silu(gate) * up.
-    # New vs GLM-5.2, which clamps nothing.
     swiglu_limit: float = 10.0
 
     # --- lengths (NoPE: no rope_theta / interleave fields) ---
@@ -325,19 +305,7 @@ class Glm5NextModelConfig:
 
     @property
     def mla_cache_kpe(self) -> int:
-        """kpe (rope-slice) width stored in the MLA latent cache.
-
-        The real model rope is ``qk_rope_head_dim`` (0 = NoPE for GLM-5.3). But
-        the only CAPTURABLE MLA decode kernel — FlashInfer's, gated by
-        ``cache_manager._mla_kernel_available`` — is hard-locked to kpe=64. So
-        under ``mla_absorb`` we pad the (empty) rope slot to 64 with ZEROS:
-        MLA's score is ``q_nope·k_ckv + q_pe·k_pe``, and zero pe-vectors make
-        the second term exactly 0 — bit-identical NoPE, but the kernel now
-        accepts it and decode can CUDA-graph capture (else it falls to the
-        uncapturable absorbed-SDPA path). The cache widens 512->576 on the 11
-        full layers (+12.5%/token, negligible at decode batch). Kept SEPARATE
-        from ``cache_latent_dim`` (the true 512 latent, which the strict
-        config check pins). See ``wiki/glm53-decode-capture``."""
+        """kpe (rope-slice) width stored in the MLA latent cache."""
         return 64
 
     @property
@@ -371,14 +339,7 @@ class Glm5NextModelConfig:
     def from_hf_config(
         cls, hf_config: dict, strict: bool = True
     ) -> "Glm5NextModelConfig":
-        """Build from the checkpoint's config.json dict.
-
-        Accepts the full multimodal dict (text fields under ``text_config``,
-        ``quantization_config`` at top level) or a bare text config.
-        ``strict`` additionally pins the known GLM-5.3-Flash geometry so a
-        drifted or mispointed checkpoint fails loudly instead of serving
-        garbage; pass ``strict=False`` for reduced HF-style configs.
-        """
+        """Build from the checkpoint's config.json dict."""
         text = hf_config.get("text_config", hf_config)
         model_type = text.get("model_type")
         if model_type not in (None, "glm5_next_text", "glm5_next"):
@@ -519,13 +480,7 @@ class Glm5NextModelConfig:
 
     @classmethod
     def reduced(cls) -> "Glm5NextModelConfig":
-        """Tiny-dim variant for CPU tests: same shapes family, random weights.
-
-        8 layers is the minimum that exercises every block kind the real
-        schedule has: dense MLP (0..2), KDA (0, 1, 2, 4, 5, 6), MLA+DSA
-        (3, 7), MoE (3..7) — while keeping the idx % 4 == 3 rule and the
-        index_topk % index_kpool divisibility the real config has.
-        """
+        """Tiny-dim variant for CPU tests: same shapes family, random weights."""
         return cls(
             vocab_size=256,
             hidden_size=128,

@@ -1,31 +1,4 @@
-"""GPU golden for GLM-5.3's opt-in SwiGLU clamp on the fused fp8 MoE path.
-
-glm5_next's reference MoE dispatch (``_dispatch_clamped``) hosts a
-``.nonzero()`` host sync (uncapturable), so with it active decode runs eager.
-The fast path threads GLM-5.3's SwiGLU clamp through the shared
-``fused_experts_fp8`` kernel (``mstar.utils.fused_moe``) so the fp8 fused
-path -- which HAS no host sync -- becomes correct and decode cuda graphs can
-capture. Three guards, all box-side (a CPU torch has no triton, so this whole
-file skips off CUDA -- and runs in its own pytest process, see
-env/ci_glm53.sh):
-
-(a) the clamped fused dispatch (``_dispatch_fused``) tracks the clamped
-    reference (``_dispatch_clamped``) structurally (cosine > 0.99; fp8 GEMM +
-    on-the-fly activation quant vs the bf16 reference GEMM is NOT bit-exact);
-(b) the SHARED kernel with ``swiglu_limit`` unset is a numerical NO-OP -- it
-    applies NO clamp even when activations dwarf any limit (the regression
-    guard for the other fused-MoE users; the exact-PTX half is a ptxas /
-    triton-cache diff, this asserts the arithmetic no-op);
-(c) with the fused path resolved, ``get_cuda_graph_configs`` registers the
-    decode-only ``BatchedCudaGraphConfig`` instead of ``[]``.
-
-v1-engine port of the lane's test: the fp8 helpers come from
-``mstar.model.glm5_next.quantization`` (the glm52 package is not on main;
-``fake_quantize_fp8_block`` is inlined below), and (c) expects ONE decode
-config -- KDA prefill is a host span loop, so v1 captures decode only.
-Triton-touching modules are imported inside the test bodies so collection
-stays clean on CUDA-less machines.
-"""
+"""GPU golden for GLM-5.3's opt-in SwiGLU clamp on the fused fp8 MoE path."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -50,12 +23,7 @@ def fake_quantize_fp8_block(
     weight: torch.Tensor,
     block_size: tuple[int, int] = (128, 128),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (fp8 weight, fp32 scale_inv, exact bf16 dequantized reference).
-
-    Per block: scale = amax / 448 (e4m3 max normal), quantize w / scale to
-    e4m3, store scale as ``weight_scale_inv`` (the multiply-back convention).
-    Test-only: the real checkpoint arrives pre-quantized.
-    """
+    """Return (fp8 weight, fp32 scale_inv, exact bf16 dequantized reference)."""
     out_f, in_f = weight.shape
     bo, bi = block_size
     n_bo, n_bi = -(-out_f // bo), -(-in_f // bi)

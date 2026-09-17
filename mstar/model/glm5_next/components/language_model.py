@@ -1,10 +1,4 @@
-"""GLM-5.3-Flash language-model builders over existing mstar primitives.
-
-Same shape as ``glm52/components/language_model.py``; the two deltas are
-that ``build_mlp_for_layer`` reads the config's ``mlp_layer_types``
-schedule (not a ``first_k_dense_replace`` formula — though the config
-validates they agree) and that the dense MLP carries the SwiGLU clamp.
-"""
+"""GLM-5.3-Flash language-model builders over existing mstar primitives."""
 from __future__ import annotations
 
 from mstar.distributed.communication import CommGroup

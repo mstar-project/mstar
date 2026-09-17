@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""Keep a TP serve's rank-0 GPU "active" for coriander's idle reaper during load + capture.
-
-The box's gpu-management daemon SIGTERMs a process whose per-process NVML SM
-utilization stays <= 10% for its idle threshold (~30 min observed). Rank 0
-waits on the CPU through the 25-min weight load and the capture, so it is the
-rank that dies. The daemon refreshes every same-user process on a GPU when any
-one of them is above the line, so a sibling process on rank 0's GPU protects
-the serve without touching it.
-
-This script runs 8192x8192 bf16 matmul bursts on one GPU and doubles the burst
-until its OWN NVML reading is >= --target (NVML attributes only ~1/3 of wall
-time to a process when nine contexts share the GPU, so a fixed duty cycle is
-not enough). It exits at --until (UTC HH:MM:SS) — set that before the serve's
-READY time so the benchmark runs uncontended.
-
-    CUDA_VISIBLE_DEVICES=0 python env/gpu0_keeper.py --until 22:20:30 \\
-        --log $P/tmp/keeper.log &
-"""
+"""Keep a TP serve's rank-0 GPU "active" for coriander's idle reaper during load + capture."""
 import argparse
 import datetime as dt
 import os
