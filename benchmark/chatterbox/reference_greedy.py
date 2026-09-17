@@ -18,8 +18,8 @@ import json
 import time
 from pathlib import Path
 
+import soundfile as sf
 import torch
-import torchaudio
 
 
 def _argmax_multinomial(probs: torch.Tensor, num_samples: int = 1, **kwargs) -> torch.Tensor:
@@ -72,7 +72,7 @@ def main() -> None:
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
 
-    torchaudio.save(str(out / "reference.wav"), wav, model.sr)
+    sf.write(str(out / "reference.wav"), wav.reshape(-1).cpu().numpy(), model.sr)
     tokens = captured.get("tokens", torch.empty(0)).reshape(-1)
     torch.save(tokens, out / "tokens.pt")
     meta = {
