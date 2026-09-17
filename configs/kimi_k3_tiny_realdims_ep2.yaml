@@ -19,4 +19,4 @@ resources:
     max_num_pages: 512
     page_size: 64
   kda_state:
-    max_num_slots: 128
+    max_slots: 129
