@@ -26,6 +26,7 @@ class AttentionConfig:
     kv_cache: str # name of the KV cache
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
+    sliding_window: int | None = None
 
 
 @dataclass

@@ -27,10 +27,13 @@ class FlashInferManager(AttentionManager):
         dtype: torch.dtype,
         kv_config: KVConfig,
         backend: str="auto",
+        sliding_window: int | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._device = device
         self._dtype = dtype
+        # FlashInfer counts preceding positions; M* counts the current token too.
+        self._window_left = -1 if sliding_window is None else sliding_window - 1
 
         # label to plan state
         self._current_plan_states: dict[str, AttentionWrapper] = {}
@@ -133,6 +136,8 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
+        if self._window_left >= 0 and not step.causal:
+            raise ValueError("sliding_window requires causal attention")
         self.reset_default_cursors()
         lease = ctx.slot_lease
         assert not ctx.is_preplan or lease is not None, (
@@ -174,6 +179,7 @@ class FlashInferManager(AttentionManager):
             wrapper.plan(
                 causal=step.causal,
                 dtype=self._dtype,
+                window_left=self._window_left,
                 **indptrs.to_kwargs_dict()
             )
             plan_states[label] = wrapper
@@ -228,4 +234,3 @@ class FlashInferManager(AttentionManager):
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o
-

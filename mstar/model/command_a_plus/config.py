@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Resource names shared by the text components and the future LLM node.
+KV_CACHE = "kv_cache"
+LOCAL_ATTN = "local_attn"
+GLOBAL_ATTN = "global_attn"
+ROPE = "rope"
+
+
 @dataclass
 class CommandAPlusTextConfig:
     vocab_size: int

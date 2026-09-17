@@ -30,12 +30,18 @@ class AttentionManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
+        backend = spec.config.backend
+        if spec.config.sliding_window is not None and backend != AttnBackend.FLASHINFER:
+            raise ValueError(
+                f"sliding_window is unsupported for attention backend {backend!r}; "
+                "use the flashinfer backend"
+            )
         # the KV resource's own config, not a copy; per-rank head counts, and
         # `shard` is idempotent so both builders can call it
         kv_config = info.dependency(spec.config.kv_cache).config
         if info.joint_comm_group is not None:
             kv_config.shard(info.joint_comm_group.world_size)
-        backend = spec.config.backend
+
         if backend == AttnBackend.DENSE:
             # A dense backend needs the FlashAttention-3 kernel; where the
             # wheel does not match the installed torch/CUDA build, degrade to
@@ -69,6 +75,7 @@ class AttentionManager(AttentionResource):
                 dtype=info.kv_dtype,
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
+                sliding_window=spec.config.sliding_window,
             )
         if backend == AttnBackend.XPU_PAGED:
             from mstar.engine.resources.attn.xpu import (
