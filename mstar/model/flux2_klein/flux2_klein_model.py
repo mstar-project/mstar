@@ -35,6 +35,7 @@ import logging
 import math
 from collections.abc import Hashable
 
+import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
@@ -237,7 +238,7 @@ class Flux2KleinModel(Model):
         crop_w, crop_h = (width // align) * align, (height // align) * align
         left, top = (width - crop_w) // 2, (height - crop_h) // 2
         image = image.crop((left, top, left + crop_w, top + crop_h))
-        tensor = torch.from_numpy(__import__("numpy").array(image)).permute(2, 0, 1).contiguous()
+        tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
         return TensorAndMetadata(tensor.to(torch.float32).div_(255.0).to(device))
 
     def _resolve_size(self, model_kwargs: dict, ref_dims: list[tuple[int, int]]) -> tuple[int, int]:
