@@ -1,20 +1,22 @@
-"""What a model declares about constant-size per-request recurrent state: its parts,
-its spec, its step.
+"""What a model declares about a pool of recurrent state.
 
-A linear-attention / SSM layer keeps a fixed-size state per request per layer (for
-Kimi Delta Attention: a ``[H, 128, 128]`` fp32 recurrent matrix plus a ``[3*H*128, W]``
-short-conv window). Unlike a paged KV cache the state does not grow with the sequence,
-so the resource hands out *slots*: one row per request per layer in a preallocated
-``[num_layers, max_num_slots + 1, *shape]`` tensor per part. Slot 0 is scratch: padding
-rows in a captured replay point at it and rows without a resident state gather zeros
-instead of reading it.
+Kept free of the manager and its kernels so a submodule can declare a step
+without pulling a backend in behind it.
 
-Kept free of the manager so a submodule can declare a step without importing it.
+The pool is deliberately ignorant of what the state means. A slot is a fixed
+number of bytes per layer, held for as long as a request needs it; whether
+those bytes are a delta-net [HV, V, K] matrix, a Mamba SSM block, or something
+else is the calling resource's business. Contrast the KV cache, whose geometry
+(pages, tokens, heads) is baked into its own contract.
+
+The consequence that shapes everything here: this state does not grow with the
+sequence. Capacity is a slot count, not a byte budget that scales with length,
+and a fork is a fixed-size copy rather than a page-count-dependent one.
 """
-from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, replace
+from math import prod
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,66 +29,205 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class StatePart:
-    """One tensor of the per-request state.
+class RecurrentBlockConfig:
+    """One per-slot, per-layer tensor block.
 
-    ``shape`` is the *unsharded* per-request, per-layer shape. ``shard_dim`` names the
-    dimension a tensor-parallel deployment divides by the instance world size (the head
-    dimension for KDA: heads are split across TP ranks), or ``None`` for replicated.
+    ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
+    across ranks — shape arithmetic, not semantics: the pool never learns that
+    axis 0 happens to be a head count.
     """
+
     shape: tuple[int, ...]
     dtype: torch.dtype
-    shard_dim: int | None = None
+    shard_dims: tuple[int, ...] = ()
+
+    def __post_init__(self):
+        self.shape = tuple(self.shape)
+        self._unsharded_shape = self.shape
+
+    def shard(self, num_shards: int) -> None:
+        from mstar.distributed.utils import divide
+
+        shape = list(self._unsharded_shape)
+        for dim in self.shard_dims:
+            shape[dim] = divide(self._unsharded_shape[dim], num_shards)
+        self.shape = tuple(shape)
+
+    @property
+    def numel(self) -> int:
+        return prod(self.shape)
+
+    @property
+    def nbytes(self) -> int:
+        return self.numel * torch.empty((), dtype=self.dtype).element_size()
+
+
+class RecurrentGeometry(ABC):
+    @abstractmethod
+    def to_blocks(self, *args, **kwargs) -> dict[str, RecurrentBlockConfig]:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def from_blocks(
+        cls, blocks: dict[str, RecurrentBlockConfig],
+    ) -> "RecurrentGeometry":
+        pass
+
+
+@dataclass(frozen=True)
+class DeltaNetGeometry(RecurrentGeometry):
+    """Head geometry of the delta-net family: gated delta rule (Qwen3.5,
+    Qwen3-Next) and Kimi delta attention (Kimi Linear, GLM-5.3).
+
+    Both carry the same two blocks: a K-last [HV, V, K] state matrix — the
+    layout FlashInfer's pool paths want, and what lets one pool serve either —
+    and a short conv window holding every tap but the current token's.
+
+    ``to_blocks`` and ``from_blocks`` are inverses, so a backend reads its
+    geometry off the pool it was pointed at rather than the model declaring it
+    twice and the two drifting.
+    """
+
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    conv_kernel_size: int
+
+    @property
+    def conv_dim(self) -> int:
+        """The depthwise conv runs over [q | k | v] concatenated."""
+        return (
+            2 * self.num_k_heads * self.head_k_dim
+            + self.num_v_heads * self.head_v_dim
+        )
+
+    def to_blocks(
+        self,
+        state_dtype: torch.dtype = torch.float32,
+        conv_dtype: torch.dtype = torch.bfloat16,
+    ) -> dict[str, RecurrentBlockConfig]:
+        """Pool blocks for this geometry.
+
+        Head counts are pre-sharding; ``shard_dims`` narrows them at build, as
+        a ``KVConfig``'s head counts are.
+        """
+        return {
+            "state": RecurrentBlockConfig(
+                shape=(self.num_v_heads, self.head_v_dim, self.head_k_dim),
+                dtype=state_dtype,
+                shard_dims=(0,),
+            ),
+            "conv": RecurrentBlockConfig(
+                shape=(self.conv_dim, self.conv_kernel_size - 1),
+                dtype=conv_dtype,
+                shard_dims=(0,),
+            ),
+        }
+
+    @classmethod
+    def from_blocks(
+        cls, blocks: dict[str, RecurrentBlockConfig],
+    ) -> "DeltaNetGeometry":
+        """Recover head counts from block shapes. Works on sharded shapes,
+        since every axis involved shards.
+
+        Raises if the shapes are not a delta-net's — the check that a pool and
+        the resource planning against it were built for the same model.
+        """
+        for name in ("state", "conv"):
+            if name not in blocks:
+                raise ValueError(
+                    f"not a delta-net state pool: no {name!r} block, got "
+                    f"{sorted(blocks)}"
+                )
+        state, conv = blocks["state"].shape, blocks["conv"].shape
+        if len(state) != 3:
+            raise ValueError(
+                f"delta-net 'state' block must be [HV, V, K], got {state}"
+            )
+        if len(conv) != 2:
+            raise ValueError(
+                f"delta-net 'conv' block must be [conv_dim, width], got {conv}"
+            )
+        num_v_heads, head_v_dim, head_k_dim = state
+        conv_dim, width = conv
+
+        # conv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+        key_span = conv_dim - num_v_heads * head_v_dim
+        if key_span <= 0 or key_span % (2 * head_k_dim):
+            raise ValueError(
+                f"conv block {conv} does not match state block {state}: "
+                f"[q|k|v] over {num_v_heads}x{head_v_dim} values leaves "
+                f"{key_span} for 2 x num_k_heads x {head_k_dim}"
+            )
+        return cls(
+            num_k_heads=key_span // (2 * head_k_dim),
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+            conv_kernel_size=width + 1,
+        )
 
 
 @dataclass
 class RecurrentStateConfig:
+    # The total number of recurrent layers, not total transformer layers
     num_layers: int
-    parts: dict[str, StatePart]
-    max_num_slots: int = 256
-    # pinned host slots kept for offload; 0 disables it
-    cpu_offload_slots: int = 0
+    # Named blocks, e.g. what `DeltaNetGeometry.to_blocks` returns. A backend declares
+    # what it needs; the pool allocates one tensor per block and hands back
+    # per-layer views.
+    blocks: dict[str, RecurrentBlockConfig] = field(default_factory=dict)
+
+    # Slots the pool can hand out at once. A request holds one per label, so
+    # this bounds concurrent requests times their labels, not requests alone.
+    # The sink, when there is one, comes out of this the way SINK_PAGE comes
+    # out of a KV cache's `max_num_pages`.
+    max_slots: int = 256
+
+    # Whether padding rows address a real sink slot or a negative sentinel.
+    #
+    # Not the model author's call: it turns on what the backend's kernels do
+    # with an unaddressed row, and they disagree. FlashInfer's fp32 GDN decode
+    # skips a -1 row entirely; its bf16 fast path redirects -1 onto slot 0 and
+    # writes there anyway. A sink is correct under both, so it is the default
+    # and the sentinel is opt-in.
+    #
+    # TODO: derive this from (backend, dtype, ...) once there is more than one
+    # backend to ask, and drop the knob.
+    disable_sink_slot: bool = False
 
     def __post_init__(self):
-        self._unsharded_parts = {k: StatePart(p.shape, p.dtype, p.shard_dim) for k, p in self.parts.items()}
+        if not self.blocks:
+            raise ValueError("a recurrent state pool must declare a block")
+        if not self.disable_sink_slot and self.max_slots < 2:
+            raise ValueError(
+                f"max_slots={self.max_slots} leaves nothing to hand out: the "
+                "sink takes one. Raise it or set disable_sink_slot."
+            )
+
+    @property
+    def usable_slots(self) -> int:
+        """Slots requests can hold; the sink is not one of them."""
+        return self.max_slots - (0 if self.disable_sink_slot else 1)
 
     def shard(self, num_shards: int) -> None:
-        """Narrow every sharded part to one rank's slice. Idempotent."""
-        from mstar.distributed.utils import divide
+        """Narrow every block's sharded axes; see ``KVConfig.shard``.
 
-        for name, full in self._unsharded_parts.items():
-            if full.shard_dim is None:
-                continue
-            shape = list(full.shape)
-            shape[full.shard_dim] = divide(shape[full.shard_dim], num_shards)
-            self.parts[name] = StatePart(tuple(shape), full.dtype, full.shard_dim)
+        Idempotent, so one config shared by the pool and the resource planning
+        against it can be sharded by both on construction.
+        """
+        for block in self.blocks.values():
+            block.shard(num_shards)
 
-    def slot_nbytes(self) -> int:
-        """Bytes one request's state takes across all layers (per rank)."""
-        total = 0
-        for p in self.parts.values():
-            n = 1
-            for s in p.shape:
-                n *= s
-            total += n * torch.empty(0, dtype=p.dtype).element_size()
-        return total * self.num_layers
+    @property
+    def slot_bytes(self) -> int:
+        return self.num_layers * sum(b.nbytes for b in self.blocks.values())
 
-
-class CommitMode(Enum):
-    """How a step's writes become the request's resident state.
-
-    * ``IN_PLACE``: the kernels update the slot directly during the forward (the
-      default for prefill and plain decode).
-    * ``CHECKPOINT``: as ``IN_PLACE``, and the prefill additionally snapshots the state
-      at a chunk-aligned offset into a checkpoint slot (prefix caching; FlashKDA
-      ``checkpoint_state``).
-    * ``DEFERRED``: the forward must not write the resident slot; ``commit`` receives
-      the accepted length afterwards and replays only the accepted prefix (speculative
-      decoding, RecoverSSM style).
-    """
-    IN_PLACE = "in_place"
-    CHECKPOINT = "checkpoint"
-    DEFERRED = "deferred"
+    @property
+    def total_bytes(self) -> int:
+        return self.slot_bytes * self.max_slots
 
 
 @dataclass
@@ -95,39 +236,54 @@ class RecurrentStateSpec(NodeResourceSpec):
 
     @property
     def resource_class(self) -> "type[Resource]":
-        from mstar.engine.resources.recurrent.manager import RecurrentStateManager
+        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
-        return RecurrentStateManager
+        return RecurrentStatePool
 
     def apply_yaml_overrides(
-        self, max_num_slots: int | None = None, cpu_offload_slots: int | None = None,
+        self, max_slots: int | None = None, state_dtype: str | None = None,
     ):
-        """How many requests can hold state at once, and how many can be parked on the host."""
-        if max_num_slots is not None:
-            self.config.max_num_slots = max_num_slots
-        if cpu_offload_slots is not None:
-            self.config.cpu_offload_slots = cpu_offload_slots
+        """How many slots this deployment gets, and how precise they are.
+
+        Block *shapes* are not tunable: they are the model's, and a pool sized
+        for shapes the backend does not produce is a crash, not a slow run.
+        The state's dtype is a deployment call — it trades precision that
+        accumulates over a whole generation against half the bandwidth on a
+        tensor read and written every step, and it decides which kernels the
+        backend can reach. The model's default stands unless this is set.
+        """
+        if max_slots is not None:
+            self.config.max_slots = max_slots
+        if state_dtype is not None:
+            try:
+                dtype = getattr(torch, state_dtype)
+            except AttributeError:
+                dtype = None
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"state_dtype {state_dtype!r} is not a torch dtype"
+                )
+            block = self.config.blocks.get("state")
+            if block is None:
+                raise ValueError(
+                    "state_dtype was set but this pool has no 'state' block; "
+                    f"it has {sorted(self.config.blocks)}"
+                )
+            self.config.blocks["state"] = replace(block, dtype=dtype)
 
 
 @dataclass(frozen=True)
-class RecurrentStateStep(ResourceStep):
-    commit_mode: CommitMode = CommitMode.IN_PLACE
+class RecurrentStep(ResourceStep):
+    """One step's work against the pool.
 
+    There is no ``commit`` flag, unlike ``KVStep``. A backend writes the pool
+    in place, so by the time commit ran the bytes would already be gone.
+    A consumer that needs it would have to have two labels: reading one label
+    and writing an other.
 
-@dataclass
-class RecurrentPlanOutput:
-    """What a layer reads to address the state for one step.
-
-    ``slot_ids[i]`` / ``has_state[i]`` describe the i-th segment (request row) in
-    declaration order; under a CUDA-graph lease both live in static buffers padded to
-    the capture batch size, so the captured kernels read stable addresses.
+    Forks mirror ``KVStep``'s: ``(from_label, to_label)`` pairs, reserved at
+    admit and copied at plan (pre) or commit (post).
     """
-    slot_ids: torch.Tensor  # int32 [rows] on device
-    has_state: torch.Tensor  # int32 0/1 [rows] on device (one packed copy with slot_ids and cu_seqlens)
-    cu_seqlens: torch.Tensor  # int32 [rows + 1] on device: token boundaries of the rows
-    slot_ids_cpu: list[int] = field(default_factory=list)
-    has_state_cpu: list[bool] = field(default_factory=list)
-    cu_seqlens_cpu: list[int] = field(default_factory=list)
-    is_decode: bool = False  # every row appends exactly one token
-    num_rows: int = 0  # real (unpadded) rows
-    num_tokens: int = 0
+
+    pre_forks: tuple[tuple[str, str], ...] = ()
+    post_forks: tuple[tuple[str, str], ...] = ()
