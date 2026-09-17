@@ -158,19 +158,21 @@ def test_slot_indexed_conv_update_matches_fla(rows, d, dtype):
     and updated windows bit for bit (same fp32 taps, same rounding), and leaves the other slots alone."""
     from fla.modules.conv.triton.ops import causal_conv1d_update
 
-    from mstar.model.kimi_k3.components.conv_kernel import conv_update_slots
+    from mstar.engine.resources.linear_attn.conv_update import conv_update_slots
 
     torch.manual_seed(0)
     w = 4
     slots = rows + 9
-    state = torch.randn(slots, d, w, device=DEV, dtype=dtype)
+    # the pool keeps W - 1 columns; fla's window is one wider with a dead oldest column
+    state = torch.randn(slots, d, w - 1, device=DEV, dtype=dtype)
     slot_ids = torch.randperm(slots, device=DEV)[:rows].to(torch.int32)
     weight = (torch.randn(d, w, device=DEV) * 0.3).to(dtype)
     x = torch.randn(rows, d, device=DEV, dtype=dtype)
     ref_state = state.clone()
-    cache = ref_state.index_select(0, slot_ids)
+    kept = ref_state.index_select(0, slot_ids)
+    cache = torch.cat([kept.new_zeros(rows, d, 1), kept], dim=-1)
     y_ref, cache = causal_conv1d_update(x.view(rows, 1, -1), cache, weight=weight, activation="silu")
-    ref_state[slot_ids] = cache.to(ref_state.dtype)
+    ref_state[slot_ids] = cache[..., 1:].to(ref_state.dtype)
     y = conv_update_slots(x, state, slot_ids, weight, activation="silu")
     if dtype == torch.float32:  # fla's autotuned split can order the four taps differently: one ulp
         torch.testing.assert_close(y.view(rows, -1), y_ref.view(rows, -1), rtol=0, atol=2e-7)
