@@ -189,7 +189,10 @@ class KVManager(AttentionResource):
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+            plan_after: tuple[str, ...] = (),
     ):
+        # plans that must precede this cache's (KVSpec.plan_after)
+        self._plan_after = set(plan_after)
         self.config = cfg
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
@@ -251,8 +254,12 @@ class KVManager(AttentionResource):
             device=info.device,
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
+            plan_after=tuple(spec.plan_after),
             dtype=info.kv_dtype,
         )
+
+    def depends_on(self) -> set[str]:
+        return set(self._plan_after)
 
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
