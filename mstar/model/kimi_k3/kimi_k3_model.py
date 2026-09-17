@@ -7,9 +7,8 @@ the same files. The vision tower is not loaded (a later ``prefill_vision`` walk 
 """
 from __future__ import annotations
 
-import os
-
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -20,21 +19,25 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    DeltaNetGeometry,
     KVConfig,
     KVLayout,
     KVSpec,
+    LinearAttnBackend,
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnVariant,
     NodeResourceSpec,
     RecurrentStateConfig,
     RecurrentStateSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
-    StatePart,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.kimi_k3.config import KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
+from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
 from mstar.model.kimi_k3.tokenizer import KimiK3Tokenizer
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -77,6 +80,8 @@ class KimiK3Model(Model):
         # 1 (default) shards every expert on its intermediate dim, tp_size gives each rank whole
         # experts, in between is the hybrid (ExpertSharding); must divide tp_size and num_experts
         self.moe_ep_size = int(kwargs.get("moe_ep_size", 1))
+        # KDA kernels: auto (FlashKDA prefill where it fits, fla otherwise) | fla | flashkda
+        self.kda_backend = str(kwargs.get("kda_backend", "auto"))
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
         # requests per prefill step (the scheduler splits larger groups); None lifts the cap
@@ -179,13 +184,17 @@ class KimiK3Model(Model):
             max_seq_len=t.max_position_embeddings, num_qo_heads=t.num_attention_heads,
             layout=KVLayout.MLA, kv_lora_rank=t.kv_lora_rank, qk_rope_head_dim=t.qk_rope_head_dim,
         )
-        p = t.kda_projection_size
+        # the KDA state: a pool of per-layer slots (fp32 V-first recurrent state, bf16 conv window
+        # of the W - 1 inputs before the token; both sharded over the heads at TP) and the KDA
+        # resource planned against it; yaml `resources.kda_state.max_slots` sizes the pool
+        # (one slot per resident request plus the sink the padded rows write to)
+        geometry = DeltaNetGeometry(
+            num_k_heads=t.kda_num_heads, num_v_heads=t.kda_num_heads, head_k_dim=t.kda_head_dim,
+            head_v_dim=t.kda_head_dim, conv_kernel_size=t.kda_conv_kernel_size,
+        )
         state_config = RecurrentStateConfig(
             num_layers=t.num_kda_layers,
-            parts={
-                "conv": StatePart((3 * p, t.kda_conv_kernel_size), torch.bfloat16, shard_dim=0),
-                "recurrent": StatePart((t.kda_num_heads, t.kda_head_dim, t.kda_head_dim), torch.float32, shard_dim=0),
-            },
+            blocks=geometry.to_blocks(state_dtype=torch.float32, conv_dtype=torch.bfloat16),
         )
         return [
             KVSpec(resource_key=MLA_KV, nodes={LLM}, config=kv_config),
@@ -194,6 +203,13 @@ class KimiK3Model(Model):
                 config=AttentionConfig(kv_cache=MLA_KV, backend=AttnBackend.FLASHINFER_MLA, sm_scale=t.mla_scale),
             ),
             RecurrentStateSpec(resource_key=KDA_STATE, nodes={LLM}, config=state_config),
+            LinearAttnSpec(
+                resource_key=KDA_ATTN, nodes={LLM},
+                config=LinearAttnConfig(
+                    recurrent_state=KDA_STATE, variant=LinearAttnVariant.KDA,
+                    backend=LinearAttnBackend(self.kda_backend), gate_lower_bound=t.kda_gate_lower_bound,
+                ),
+            ),
             SamplerSpec(resource_key=SAMPLER, nodes={LLM}, vocab_size=t.vocab_size, enable_repetion_penalty=False),
         ]
 
@@ -276,7 +292,7 @@ class KimiK3Model(Model):
         logger.info("Kimi K3 routed-expert backend: %s", moe_backend)
         _log_gpu_memory("experts converted", device, language_model)
 
-        graph_safe = select_kda_kernels(language_model, device) and flashinfer_mla_supports(
+        graph_safe = select_kda_kernels(language_model, device, self.kda_backend) and flashinfer_mla_supports(
             self.config.text.kv_lora_rank, self.config.text.qk_rope_head_dim
         )
         submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config, cuda_graphs=graph_safe,
