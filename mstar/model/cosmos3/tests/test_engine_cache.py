@@ -491,7 +491,8 @@ def _scenario(num_frames):
 
     device, dtype, mpipe = base["device"], base["dtype"], base["mpipe"]
     cond_ids, uncond_ids = tokenize_prompt(
-        base["model"].tokenizer, PROMPT, "", num_frames=num_frames, height=H, width=W
+        base["model"].tokenizer, PROMPT, "", num_frames=num_frames, height=H, width=W,
+        use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
     )
     lat_t = 1 if num_frames == 1 else 1 + (num_frames - 1) // mpipe.vae_scale_temporal
     gen = torch.Generator(device=device).manual_seed(SEED)
@@ -855,7 +856,8 @@ def _windowed_scenario():
         [], ["video"],
     )
     cond_ids, uncond_ids = tokenize_prompt(
-        model.tokenizer, PROMPT, "", num_frames=W_NUM_FRAMES, height=H, width=W
+        model.tokenizer, PROMPT, "", num_frames=W_NUM_FRAMES, height=H, width=W,
+        use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
     )
     ref = mpipe.windowed_kv(
         cond_ids, uncond_ids,
