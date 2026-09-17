@@ -22,7 +22,8 @@ from pathlib import Path
 # Resource keys shared by the model declaration, the submodules and the layers.
 MLA_KV = "mla_kv"
 MLA_ATTN = "mla_attn"
-KDA_STATE = "kda_state"
+KDA_STATE = "kda_state"  # the recurrent state pool (RecurrentStatePool)
+KDA_ATTN = "kda_attn"  # KDA planned against it (LinearAttnManager, variant KDA)
 POS = "pos"
 SAMPLER = "sampler"
 
