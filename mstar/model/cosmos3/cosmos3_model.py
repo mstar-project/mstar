@@ -1149,6 +1149,10 @@ class Cosmos3Model(Model):
         default_guidance = (
             self.config.guidance_scale_action if action_mode is not None else self.config.guidance_scale
         )
+        if self.config.distilled_sigmas:
+            steps, default_guidance = self._resolve_distilled_params(
+                mk, steps, action_mode, input_modalities, output_modalities,
+            )
         params = {
             "width": int(mk.get("width", width)),
             "height": int(mk.get("height", height)),
@@ -1268,6 +1272,32 @@ class Cosmos3Model(Model):
                 params["sound_duration"] = float(mk["sound_duration"])
         self._resolve_window_params(mk, params, num_frames, action_mode, has_video_condition)
         return params
+
+    def _resolve_distilled_params(self, mk, steps, action_mode, input_modalities, output_modalities):
+        """The 4-step distilled checkpoints fix the sampler: their sigma list
+        sets the step count, guidance is baked into the weights (scale 1), and
+        the task is the checkpoint's own (t2i / i2v) — no action, sound,
+        video-to-video or windowed modes. Mirrors the reference's
+        ``Cosmos3DistilledSetTimestepsStep`` checks."""
+        fixed = len(self.config.distilled_sigmas)
+        if mk.get("num_inference_steps") is not None and int(mk["num_inference_steps"]) != fixed:
+            raise ValueError(
+                f"This Cosmos3 checkpoint is distilled: num_inference_steps is fixed at {fixed} "
+                f"(got {mk['num_inference_steps']}); leave it unset."
+            )
+        if mk.get("guidance_scale") is not None and float(mk["guidance_scale"]) != 1.0:
+            raise ValueError(
+                "This Cosmos3 checkpoint is distilled: classifier-free guidance is baked into the "
+                f"weights, guidance_scale must be 1.0 (got {mk['guidance_scale']}); leave it unset."
+            )
+        if action_mode is not None or mk.get("generate_sound") or mk.get("sound_gen") or mk.get("window_mode"):
+            raise ValueError(
+                "This Cosmos3 checkpoint is distilled for text/image-to-video generation; action, "
+                "sound and windowed modes are not available on it."
+            )
+        if "video" in (input_modalities or []):
+            raise ValueError("This Cosmos3 checkpoint is distilled; video conditioning is not available on it.")
+        return fixed, 1.0
 
     def _resolve_window_params(self, mk, params, num_frames, action_mode, has_video_condition) -> None:
         """Opt-in windowed AR video: the clip is generated window by window.
@@ -1674,9 +1704,20 @@ class Cosmos3Model(Model):
     def _build_scheduler(self):
         if self.skip_weight_loading:
             return None
-        from diffusers import UniPCMultistepScheduler
+        return self._scheduler_class().from_pretrained(str(self._ensure_repo() / "scheduler"))
 
-        return UniPCMultistepScheduler.from_pretrained(str(self._ensure_repo() / "scheduler"))
+    def _scheduler_class(self):
+        """The diffusers scheduler the checkpoint ships: UniPC for the base
+        checkpoints, FlowMatchEuler (stochastic, fixed sigmas) for the 4-step
+        distilled ones."""
+        import diffusers
+
+        name = self.config.scheduler.scheduler_class
+        if name == "FlowMatchEulerDiscreteScheduler":
+            return diffusers.FlowMatchEulerDiscreteScheduler
+        if name == "UniPCMultistepScheduler":
+            return diffusers.UniPCMultistepScheduler
+        raise ValueError(f"Unsupported Cosmos3 scheduler class {name!r}")
 
     def _build_transformer(self, device: str, tp_group=None, sp_group=None):
         # Built once per process: the DiT and the reasoner nodes share it.
