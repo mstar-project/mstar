@@ -228,6 +228,22 @@ class Cosmos3ReasonerConfig:
 # ``model_type`` of a checkpoint whose top-level config.json describes the
 # reasoner (vision tower + projector over the DiT's text pathway).
 REASONER_MODEL_TYPES: frozenset[str] = frozenset({"cosmos3_edge"})
+# transformer/config.json ``backbone_type`` of the Edge checkpoints, and the
+# model card's serving recipe for them: 832x480 video (121 frames, 20 UniPC
+# steps on the native flow schedule at flow shift 12), 640x640 images,
+# cover-scale + center-crop image conditioning (the diffusers 0.40 pipeline
+# recipe), action modes at flow shift 10. Applied by ``from_pretrained`` where
+# a field still holds the Nano default, so a yaml overrides any of them.
+EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+EDGE_RECIPE_DEFAULTS = {
+    "conditioning_resize": "aspect_crop",
+    "image_size_default": (640, 640),
+    "video_size_default": (832, 480),
+    "num_frames_video": 121,
+    "num_inference_steps_video": 20,
+    "flow_shift_video": 12.0,
+    "flow_shift_action": 10.0,
+}
 
 
 @dataclass
@@ -492,6 +508,12 @@ class Cosmos3Config:
             with open(index_path) as f:
                 index = json.load(f)
             cfg.use_native_flow_schedule = bool(index.get("use_native_flow_schedule", False))
+
+        if cfg.backbone_type == EDGE_BACKBONE_TYPE:
+            defaults = cls()
+            for name, value in EDGE_RECIPE_DEFAULTS.items():
+                if getattr(cfg, name) == getattr(defaults, name):
+                    setattr(cfg, name, value)
 
         modular_path = root / "modular_model_index.json"
         if modular_path.exists():
