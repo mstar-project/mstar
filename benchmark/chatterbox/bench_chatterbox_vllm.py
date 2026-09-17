@@ -24,8 +24,8 @@ import statistics
 import time
 from pathlib import Path
 
+import soundfile as sf
 import torch
-import torchaudio
 
 S3_TOKEN_RATE = 25  # T3 emits 25 speech tokens per second of audio
 
@@ -81,7 +81,7 @@ def main() -> None:
             })
             if rep == 0:
                 for i, w in enumerate(wavs):
-                    torchaudio.save(str(out / f"{start + i:03d}.wav"), w, model.sr)
+                    sf.write(str(out / f"{start + i:03d}.wav"), w.reshape(-1).cpu().numpy(), model.sr)
 
     total_elapsed = sum(b["elapsed_s"] for b in per_batch)
     total_audio = sum(b["audio_s"] for b in per_batch)
