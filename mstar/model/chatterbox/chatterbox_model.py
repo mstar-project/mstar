@@ -73,7 +73,7 @@ from mstar.model.chatterbox.config import (
 )
 from mstar.model.chatterbox.loader import resolve_snapshot
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.chunk_policy import FixedChunkPolicy, RampChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,8 @@ class ChatterboxModel(Model):
         variant: str | None = None,
         voices_dir: str | None = None,
         watermark: bool | None = None,
+        stream_chunk_tokens: int | None = None,
+        stream_first_chunk_tokens: int | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -124,6 +126,10 @@ class ChatterboxModel(Model):
         )
         if watermark is not None:
             self.config.generation.watermark = bool(watermark)
+        if stream_chunk_tokens is not None:
+            self.config.stream_chunk_tokens = int(stream_chunk_tokens)
+        if stream_first_chunk_tokens is not None:
+            self.config.stream_first_chunk_tokens = int(stream_first_chunk_tokens)
         self.voices_dir = Path(voices_dir) if voices_dir else None
         self.local_dir = resolve_snapshot(model_path_hf, cache_dir)
         self.tokenizer = self._build_text_tokenizer()
@@ -324,9 +330,18 @@ class ChatterboxModel(Model):
             ),
         ]
 
+    def _chunk_policy(self):
+        """Speech tokens reach S3Gen in a small first chunk and fixed later
+        chunks; ``stream_chunk_tokens=0`` hands the whole utterance over once
+        T3 finishes (the reference's offline decode)."""
+        if self.config.stream_chunk_tokens <= 0:
+            return FixedChunkPolicy(chunk_size=self.config.t3.max_speech_tokens + 1)
+        return RampChunkPolicy(
+            first_chunk=self.config.stream_first_chunk_tokens,
+            chunk_size=self.config.stream_chunk_tokens,
+        )
+
     def get_partition_topology(self) -> PartitionTopology:
-        # One chunk per utterance for now: the buffer flushes everything when
-        # T3 finishes. Chunked streaming replaces this policy (see STATUS).
         return PartitionTopology(
             partitions=[T3_PARTITION, S3GEN_PARTITION],
             connections=[
@@ -334,9 +349,7 @@ class ChatterboxModel(Model):
                     from_partition=T3_PARTITION,
                     to_partition=S3GEN_PARTITION,
                     edge_name=SPEECH_TOKENS,
-                    chunk_policy_factory=lambda: FixedChunkPolicy(
-                        chunk_size=self.config.t3.max_speech_tokens + 1
-                    ),
+                    chunk_policy_factory=self._chunk_policy,
                 ),
             ],
         )
