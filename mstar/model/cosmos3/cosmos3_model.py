@@ -1024,11 +1024,18 @@ class Cosmos3Model(Model):
                     extra_options={"threads": "0"},
                 )
                 data = encoded.numpy().tobytes()
-            except ImportError:
-                # Fallback for environments without torchcodec (or with the
-                # older decode-only torchcodec that lacks VideoEncoder), where
-                # torchvision still ships write_video.
+            except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError/OSError without FFmpeg
+                # Fallback for environments without a loadable torchcodec (no
+                # FFmpeg shared libraries, or the older decode-only build that
+                # lacks VideoEncoder), where torchvision still ships
+                # write_video (PyAV-backed).
                 import tempfile
+
+                if not isinstance(exc, ImportError):
+                    logger.warning(
+                        "Cosmos3 video encode: torchcodec unavailable (%s); using torchvision write_video",
+                        str(exc).splitlines()[0][:160],
+                    )
 
                 from torchvision.io import write_video
 
@@ -1446,14 +1453,17 @@ class Cosmos3Model(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        if "text" in (output_modalities or []):
-            return self._initial_reasoner_args(input_modalities, output_modalities, input_signals, model_kwargs)
-        params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
-        # The windowed decoder partition starts idle on its decode walk; the
-        # window stream self-triggers its passes, and the resolved params ride
-        # along for its per-request window bookkeeping. Non-windowed requests
-        # leave it idle until the stream's terminal flush, which it skips.
+        # The windowed decoder partition starts idle on its decode walk for
+        # every request — text ones included, which is why this comes before
+        # the reasoner dispatch: a walk the partition does not serve would
+        # never complete there and the request would hang after its last
+        # token. The window stream self-triggers its passes, and the resolved
+        # params ride along for its per-request window bookkeeping;
+        # non-windowed requests leave it idle until the stream's terminal
+        # flush, which it skips.
         if partition_name == constants.WINDOW_DECODER_PARTITION:
+            is_text = "text" in (output_modalities or [])
+            params = {} if is_text else self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
             md = CurrentForwardConductorMetadata(
                 input_modalities=input_modalities,
                 output_modalities=output_modalities,
@@ -1465,6 +1475,9 @@ class Cosmos3Model(Model):
                 full_metadata=md, inputs=[], unpersist_tensors=[],
                 step_metadata=self._step_metadata(md),
             )
+        if "text" in (output_modalities or []):
+            return self._initial_reasoner_args(input_modalities, output_modalities, input_signals, model_kwargs)
+        params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
         # Visual conditioning routes through a conditioned prefill that also feeds
         # the DiT the input to VAE-encode: a video (action inverse-dynamics) or an
         # image (image-to-video, action policy/forward-dynamics). Fall back to the
@@ -1576,13 +1589,6 @@ class Cosmos3Model(Model):
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         metadata = partition_metadata
-        if metadata.graph_walk in (
-            self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK, self.REASONER_DECODE_WALK,
-        ):
-            return self._reasoner_partition_args(metadata, persist_signals)
-        request_done = False
-        inputs: list[GraphEdge] = []
-
         # The windowed decoder partition is self-triggered by its stream
         # buffer; the conductor only keeps its walk pinned. Its completion is
         # the stream's final chunk, not a conductor decision.
@@ -1592,6 +1598,12 @@ class Cosmos3Model(Model):
                 full_metadata=metadata, inputs=[], unpersist_tensors=[],
                 step_metadata=self._step_metadata(metadata),
             )
+        if metadata.graph_walk in (
+            self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK, self.REASONER_DECODE_WALK,
+        ):
+            return self._reasoner_partition_args(metadata, persist_signals)
+        request_done = False
+        inputs: list[GraphEdge] = []
 
         # Forward-dynamics conditions on a clean action chunk and emits the
         # predicted video; inverse-dynamics / policy emit the action.
