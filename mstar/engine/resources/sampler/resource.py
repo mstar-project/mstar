@@ -25,9 +25,11 @@ class SamplerResource(Resource):
         vocab_size: int | None,
         enable_repetion_penalty: bool,
         device: torch.device,
-        comm_group: JointGroups | None=None
+        comm_group: JointGroups | None=None,
+        enable_min_p: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
+        self._enable_min_p = enable_min_p
         self._vocab_size = vocab_size if self._track_seen_tokens else None
         self._sampler = Sampler(
             device=device,
@@ -91,6 +93,7 @@ class SamplerResource(Resource):
             enable_repetion_penalty=spec.enable_repetion_penalty,
             device=info.device,
             comm_group=info.joint_comm_group,
+            enable_min_p=spec.enable_min_p,
         )
 
     def build_cuda_graph_buffers(
@@ -113,6 +116,7 @@ class SamplerResource(Resource):
             tp_group=self._comm_group,
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
+            enable_min_p=self._enable_min_p,
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -125,8 +129,17 @@ class SamplerResource(Resource):
         )
         # Read off the resolved config rather than `overrides`, so a request
         # that leaves the penalty unset takes the same default the sampler will.
-        if self._sampler._sampling_config[rid].repetition_penalty != 1.0:
+        resolved = self._sampler._sampling_config[rid]
+        if resolved.repetition_penalty != 1.0:
             self._penalty_rids.add(rid)
+        if resolved.min_p > 0 and not self._enable_min_p:
+            # the graph-captured sampler has no min-p buffer, so honouring it
+            # eagerly but not in graph would make sampling depend on the path
+            self._sampler.remove_request(rid)
+            raise ValueError(
+                f"request {rid!r} asks for min_p={resolved.min_p} but the node's "
+                "SamplerSpec has enable_min_p=False"
+            )
         if self._cg_buffers is not None:
             self._cg_buffers.register_request(
                 rid, sampling_config=self._sampler._sampling_config[rid]
