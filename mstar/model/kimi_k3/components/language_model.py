@@ -129,16 +129,26 @@ class KimiK3LanguageModel(nn.Module):
             return self.output_attn_res.read(prefix, blocks, out_norm=self.norm, add=pending)[0]
         return self.norm(prefix if pending is None else prefix + pending)
 
-    def forward(self, hidden: torch.Tensor, *, label: str = "main") -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor, *, label: str = "main", aux_layers: tuple[int, ...] | None = None):
         """Paged path over packed tokens ``hidden [T, H]``; returns the final-normed
-        hidden states ``[T, H]``."""
+        hidden states ``[T, H]``. With ``aux_layers`` also the residual stream entering each of
+        those layers (the stream after layer ``L - 1``: the running prefix plus the pending MLP
+        output, vLLM's default aux capture for Kimi K3), as a list in the given order, for a
+        speculative draft."""
         self.bind_label(label)
         prefix, pending = hidden, None
         blocks = hidden.new_zeros(hidden.shape[0], 0, hidden.shape[1])
-        for layer in self.layers:
+        aux: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
             self._set_cursors(layer)
             prefix, blocks, pending = layer(prefix, blocks, pending)
-        return self._finish(prefix, blocks, pending)
+            if aux_layers is not None and i + 1 in aux_layers:
+                aux.append(prefix if pending is None else prefix + pending)
+        final = self._finish(prefix, blocks, pending)
+        if aux_layers is None:
+            return final
+        assert list(aux_layers) == sorted(aux_layers) and len(aux) == len(aux_layers), (aux_layers, len(self.layers))
+        return final, aux
 
     def forward_dense(
         self, input_ids: torch.Tensor, state: list | None = None,
