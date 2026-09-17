@@ -107,13 +107,22 @@ class DeltaNetGeometry(RecurrentGeometry):
         self,
         state_dtype: torch.dtype = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
+        speculative_tokens: int = 0,
     ) -> dict[str, RecurrentBlockConfig]:
         """Pool blocks for this geometry.
 
         Head counts are pre-sharding; ``shard_dims`` narrows them at build, as
         a ``KVConfig``'s head counts are.
+
+        With ``speculative_tokens = k > 0`` the pool also keeps, per slot, what a
+        speculating node's verify step leaves behind for the next one (the
+        checkpoint recurrence, plan section 8.3 item 6): the block's ``k + 1``
+        pre-conv inputs, raw gates and raw betas (the pending prefix), and how
+        many of them were accepted (``spec_len``, 0 after a prefill: no
+        prefix). The ``state`` and ``conv`` blocks then hold the checkpoint,
+        the state and window after the last accepted prefix.
         """
-        return {
+        blocks = {
             "state": RecurrentBlockConfig(
                 shape=(self.num_v_heads, self.head_v_dim, self.head_k_dim),
                 dtype=state_dtype,
@@ -125,6 +134,25 @@ class DeltaNetGeometry(RecurrentGeometry):
                 shard_dims=(0,),
             ),
         }
+        if speculative_tokens > 0:
+            k1 = speculative_tokens + 1
+            blocks["spec_prefix"] = RecurrentBlockConfig(
+                shape=(k1, self.conv_dim), dtype=conv_dtype, shard_dims=(1,),
+            )
+            blocks["spec_g"] = RecurrentBlockConfig(
+                shape=(k1, self.num_v_heads, self.head_k_dim), dtype=conv_dtype, shard_dims=(1,),
+            )
+            blocks["spec_beta"] = RecurrentBlockConfig(
+                shape=(k1, self.num_v_heads), dtype=conv_dtype, shard_dims=(1,),
+            )
+            blocks["spec_len"] = RecurrentBlockConfig(shape=(1,), dtype=torch.int32, shard_dims=())
+        return blocks
+
+    @staticmethod
+    def speculative_tokens_of(blocks: dict[str, RecurrentBlockConfig]) -> int:
+        """``k`` the blocks were built with (``to_blocks(speculative_tokens=k)``), 0 without."""
+        prefix = blocks.get("spec_prefix")
+        return 0 if prefix is None else prefix.shape[0] - 1
 
     @classmethod
     def from_blocks(
