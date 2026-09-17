@@ -379,9 +379,10 @@ class ChatterboxModel(Model):
                 f"Unknown voice {voice!r}: no voices_dir is configured; use "
                 f"voice={BUILTIN_VOICE!r} or upload reference audio (ref_audio)"
             )
-        for ext in (".wav", ".flac", ".mp3", ".ogg", ".m4a"):
+        # a bare stem ("Abigail") or the file name other servers expect ("Abigail.wav")
+        for ext in ("", ".wav", ".flac", ".mp3", ".ogg", ".m4a"):
             path = self.voices_dir / f"{voice}{ext}"
-            if path.is_file():
+            if path.is_file() and path.parent == self.voices_dir:
                 return path
         available = sorted(p.stem for p in self.voices_dir.iterdir() if p.is_file())
         raise ValueError(f"Unknown voice {voice!r}; presets: {available}")
