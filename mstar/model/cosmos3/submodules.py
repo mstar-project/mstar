@@ -711,9 +711,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             self._session_tails.popitem(last=False)
 
     def _window_statics_for(self, st, plan, device):
-        start_unit = plan.start if st.get("ar_kv_mode") else 0
+        # Chained windows restart their positions at 0, so every window past
+        # the first shares one statics entry (cached). kv windows carry
+        # absolute positions and are each used once, so they are built on
+        # demand and never cached: a long rollout's state stays flat.
+        kv = bool(st.get("ar_kv_mode"))
+        start_unit = plan.start if kv else 0
         key = (plan.units, plan.cond_units, start_unit, plan.index == 0)
-        cached = st["ar_statics"].get(key)
+        cached = None if kv else st["ar_statics"].get(key)
         if cached is not None:
             return cached
         height, width = st["ar_size"]
@@ -724,7 +729,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             first_window=plan.index == 0, start_unit=start_unit,
         )
         self._slim_statics(cond, uncond)
-        st["ar_statics"][key] = (cond, uncond)
+        if not kv:
+            st["ar_statics"][key] = (cond, uncond)
         return cond, uncond
 
     @staticmethod
