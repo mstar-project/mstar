@@ -16,6 +16,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKLConfig
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig
 
 # Resource key the dit node declares its ragged joint attention under.
@@ -77,25 +78,23 @@ class Flux2TransformerConfig:
 
 @dataclass(frozen=True)
 class Flux2VaeConfig:
-    """``vae/config.json`` of ``AutoencoderKLFlux2`` (an SD-style KL autoencoder
-    whose BatchNorm running statistics normalize the 2x2-patchified latents)."""
+    """``vae/config.json`` of ``AutoencoderKLFlux2``: the shared KL autoencoder config plus the
+    FLUX.2 specifics (BatchNorm latent statistics over 2x2 patches)."""
 
-    in_channels: int = 3
-    out_channels: int = 3
-    latent_channels: int = 32
-    block_out_channels: tuple[int, ...] = (128, 256, 512, 512)
-    layers_per_block: int = 2
-    norm_num_groups: int = 32
+    autoencoder: AutoencoderKLConfig = field(default_factory=lambda: AutoencoderKLConfig(
+        latent_channels=32, use_quant_conv=True, use_post_quant_conv=True,
+    ))
     batch_norm_eps: float = 1e-4
     patch_size: tuple[int, int] = (2, 2)
-    use_quant_conv: bool = True
-    use_post_quant_conv: bool = True
-    mid_block_add_attention: bool = True
+
+    @property
+    def latent_channels(self) -> int:
+        return self.autoencoder.latent_channels
 
     @property
     def spatial_compression(self) -> int:
-        """Pixels per latent cell along each axis (2 ** (#blocks - 1) == 8)."""
-        return 2 ** (len(self.block_out_channels) - 1)
+        """Pixels per latent cell along each axis (8)."""
+        return self.autoencoder.spatial_compression
 
     @property
     def patched_latent_channels(self) -> int:
@@ -103,24 +102,10 @@ class Flux2VaeConfig:
 
     @classmethod
     def from_dict(cls, cfg: dict) -> "Flux2VaeConfig":
-        if cfg.get("act_fn", "silu") != "silu":
-            raise NotImplementedError(f"FLUX.2 VAE port implements act_fn='silu', got {cfg['act_fn']!r}")
-        if any(t != "DownEncoderBlock2D" for t in cfg.get("down_block_types", ())) or any(
-            t != "UpDecoderBlock2D" for t in cfg.get("up_block_types", ())
-        ):
-            raise NotImplementedError("FLUX.2 VAE port implements DownEncoderBlock2D / UpDecoderBlock2D only")
         return cls(
-            in_channels=int(cfg.get("in_channels", 3)),
-            out_channels=int(cfg.get("out_channels", 3)),
-            latent_channels=int(cfg["latent_channels"]),
-            block_out_channels=tuple(int(c) for c in cfg["block_out_channels"]),
-            layers_per_block=int(cfg.get("layers_per_block", 2)),
-            norm_num_groups=int(cfg.get("norm_num_groups", 32)),
+            autoencoder=AutoencoderKLConfig.from_dict(cfg),
             batch_norm_eps=float(cfg.get("batch_norm_eps", 1e-4)),
             patch_size=tuple(int(p) for p in cfg.get("patch_size", (2, 2))),
-            use_quant_conv=bool(cfg.get("use_quant_conv", True)),
-            use_post_quant_conv=bool(cfg.get("use_post_quant_conv", True)),
-            mid_block_add_attention=bool(cfg.get("mid_block_add_attention", True)),
         )
 
 
