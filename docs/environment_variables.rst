@@ -36,8 +36,14 @@ Communication
        is a counter increment per step.
    * - ``MSTAR_SYMM_MEM_ALLREDUCE``
      - ``auto``
-     - How small tensor-parallel all-reduces (``CommGroup.all_reduce``) run. ``auto`` (or
-       ``multimem``) uses torch's symmetric-memory NVLink-multicast ``multimem_all_reduce_``
+     - How small tensor-parallel all-reduces (``CommGroup.all_reduce``) run. ``auto`` runs 2-D
+       bf16/fp16 messages of up to ``MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS`` rows (decode batches)
+       through a Lamport one-shot kernel: flashinfer's TensorRT-LLM kernel when its comm module
+       imports (``flashinfer`` pins it; 2.5 us for a decode-sized message at TP2), else M*'s own
+       Triton kernel (``lamport`` pins it; ``mstar/distributed/lamport_allreduce.py``: every rank
+       pushes its partial into its peers' symmetric buffers and sums what arrives, no barrier, one
+       launch; it also serves ``CommGroup.all_gather`` along the last dim), and everything else, like
+       ``multimem``, through torch's symmetric-memory NVLink-multicast ``multimem_all_reduce_``
        kernel, in place on a ring of four symmetric buffers per shape (a result stays valid
        until three more all-reduces of that shape); it falls back to the one-shot/two-shot
        kernels where the node lacks NVLS and to NCCL where the group spans nodes. ``1`` uses
@@ -48,6 +54,11 @@ Communication
        a Kimi K3 decode step pays three per MoE layer, and the multicast default took it from
        28 to 23 ms at one request (together with the other 2026-09-15 changes). Producers can
        write straight into the buffer (``CommGroup.symm_buffer`` / ``all_reduce_symm_buffer``).
+   * - ``MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS``
+     - ``128``
+     - Largest row count (tokens) the Lamport kernel takes; its workspace holds
+       ``2 x world x rows x width`` elements per (dtype, width) channel, so on an 8-rank group
+       at width 7168 the default is 29 MB per rank. Bigger messages use the other tiers.
    * - ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``
      - ``262144``
      - Largest message (bytes) the one-shot kernel takes; up to
