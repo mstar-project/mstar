@@ -299,15 +299,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return None
         if graph_walk in PREFILL_WALKS:
             return True
-        if graph_walk != IMAGE_GEN_WALK:
+        if graph_walk not in GEN_WALKS:
             return None
-        shapes = {tuple(st["latent_shape"]) for st in states}
-        if len(shapes) != 1:
+        keys = {self._capture_key(graph_walk, st) for st in states}
+        if len(keys) != 1:
             return None
-        shape = shapes.pop()
-        if shape not in (getattr(self, "_capture_layout", None) or {}):
-            return None
-        return shape
+        return keys.pop()
 
     def _step_info(self, graph_walk: str, st, step_index: int) -> GenStepInfo:
         """The per-request facts ``declare_step`` needs, resolved here where
@@ -321,8 +318,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _capture_key(self, graph_walk: str, st) -> object | None:
         """This one request's half of ``cg_key_info``: everything that does
         not depend on the rest of the batch. See ``GenStepInfo.capture_key``."""
-        if graph_walk != IMAGE_GEN_WALK or st.get("uncond") is None:
+        if graph_walk not in GEN_WALKS or st.get("uncond") is None:
             return None
+        if graph_walk == VIDEO_GEN_AR_WALK and st.get("ar_kv_mode"):
+            # kv windows interleave commit iterations — a different step
+            # declaration the lease could not know about — so they run eager.
+            return None
+        # The latent shape is fixed for the request's lifetime (a windowed
+        # request's windows all share the padded window shape), and the
+        # clean/noisy layout rides along as a mask input, so one graph per
+        # shape serves t2i, t2v, i2v and chained windows alike.
         shape = tuple(st["latent_shape"])
         layout = getattr(self, "_capture_layout", None) or {}
         return shape if shape in layout else None
@@ -1065,26 +1070,47 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         elif step_index >= len(scheduler.timesteps):
             return None
         tensors = {"latents": latents, "time_index": time_index}
-        # The CUDA-graph capture reads the timestep and rotary positions as static
-        # buffers (it can't reach the per-request scheduler at replay), so
-        # materialize them here. The eager path ignores these and recomputes from
-        # per-request state. Only built in the two-branch guidance regime — the
-        # one the graph captures. Windowed requests run eager only.
-        if st["uncond"] is not None and not windowed:
+        # The CUDA-graph capture reads the timestep, rotary positions and the
+        # clean/noisy token mask as static buffers (it can't reach the
+        # per-request scheduler at replay), so materialize them here. The eager
+        # path ignores these and recomputes from per-request state. Only built
+        # for a request that could land on a captured graph (two-branch
+        # guidance at a captured shape; see ``_capture_key``).
+        if st["uncond"] is not None and self._capture_key(graph_walk, st) is not None:
             # The denoise loop may dispatch one extra (discarded) step past this
             # request's step count; clamp so materializing the static timestep
-            # buffer can't index past the schedule.
-            n_steps = len(st["scheduler"].timesteps)
-            idx = time_index.reshape(-1).clamp(max=n_steps - 1)
-            t = st["scheduler"].timesteps[idx].to(torch.float32)
-            tensors["vision_timesteps"] = t.expand(st["cond"]["num_noisy_vision_tokens"]).contiguous()
+            # buffer can't index past the schedule. ``step_index`` is the
+            # within-window step for a windowed request.
+            n_steps = len(scheduler.timesteps)
+            t = scheduler.timesteps[min(step_index, n_steps - 1)].to(torch.float32)
+            # Every graph is built with all frames declared noisy, so the
+            # timestep buffer spans every generation token.
+            tensors["vision_timesteps"] = t.reshape(1).expand(st["cond"]["num_vision_tokens"]).contiguous()
             tensors["position_ids_cond"] = st["cond"]["vision_mrope_ids"]
             tensors["position_ids_uncond"] = st["uncond"]["vision_mrope_ids"]
+            tensors["noisy_token_mask"] = self._noisy_masks(st, device)[0]
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"],
             tensor_inputs=tensors,
             resource_step_info=self._step_info(graph_walk, st, step_index),
         )
+
+    def _noisy_masks(self, st, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """The request's current clean/noisy layout as data for a captured
+        graph: a per-token mask (``[num_vision_tokens]``, 1 on noisy frames'
+        tokens) and the same per frame (``[1, T, 1, 1]``). Cached per
+        statics object, so a windowed request refreshes it at each window."""
+        cond = st["cond"]
+        cache = st.get("noisy_masks")
+        if cache is not None and cache[0] is cond:
+            return cache[1], cache[2]
+        ((t_frames, patch_h, patch_w),) = cond["vision_token_shapes"]
+        frame_mask = torch.zeros(t_frames, device=device, dtype=torch.float32)
+        frame_mask[cond["vision_noisy_frame_indexes"][0].to(device)] = 1.0
+        token_mask = frame_mask.repeat_interleave(patch_h * patch_w).contiguous()
+        frame_mask = frame_mask.view(1, t_frames, 1, 1)
+        st.add("noisy_masks", (cond, token_mask, frame_mask))
+        return token_mask, frame_mask
 
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.request_id]
@@ -1351,13 +1377,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "vision_timesteps": torch.stack([inp.tensor_inputs["vision_timesteps"] for inp in inputs]),
             "position_ids_cond": torch.stack([inp.tensor_inputs["position_ids_cond"] for inp in inputs]),
             "position_ids_uncond": torch.stack([inp.tensor_inputs["position_ids_uncond"] for inp in inputs]),
+            "noisy_token_mask": torch.stack([inp.tensor_inputs["noisy_token_mask"] for inp in inputs]),
         }
 
     def preprocess(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs]
     ) -> dict:
-        if graph_walk == IMAGE_GEN_WALK and engine_inputs.captured:
+        if graph_walk in GEN_WALKS and getattr(engine_inputs, "captured", False):
             return self._preprocess_image_gen_captured(inputs)
 
         if graph_walk in PREFILL_WALKS:
@@ -2047,78 +2074,115 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         two_d = self.transformer.sp_group.world_size > 1 and self.transformer.comm_group.world_size > 1
         self._capture_layout: dict[tuple, dict] = {}
         configs = []
-        for height, width in resolutions:
-            latent_shape = self._latent_shape(height, width, num_frames=1)
-            # The capture is bit-faithful at every resolution (the rotary uses a
-            # broadcast multiply — see Cosmos3RotaryEmbedding), but only HELPS
-            # the launch-bound tiers: the graph's per-step input copies grow
-            # with resolution and lose to the eager dense path at large latents.
-            # Capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W).
+        # The capture is bit-faithful at every resolution (the rotary uses a
+        # broadcast multiply — see Cosmos3RotaryEmbedding), but only HELPS
+        # the launch-bound tiers: the graph's per-step input copies grow
+        # with resolution and lose to the eager dense path at large latents.
+        # Capture only below COSMOS3_GRAPH_MAX_LATENT_AREA (latent H*W).
+        max_area = int(os.environ.get(
+            "COSMOS3_GRAPH_MAX_LATENT_AREA", self.config.graph_max_latent_area))
+        if two_d:
+            max_area = min(max_area, 1000)  # 256p latent 240 captures; 480p 1560 does not
+        # Video tiers (height, width, frames): a plain clip length and/or the
+        # windowed rollout's window; one graph per latent shape serves t2v,
+        # i2v and chained windows (see ``_capture_key``).
+        video_env = os.environ.get("COSMOS3_GEN_CAPTURE_VIDEO")
+        if video_env:
+            video_tiers = tuple(
+                tuple(int(x) for x in tier.split("x")) for tier in video_env.split(",") if tier.strip()
+            )
+        else:
+            video_tiers = tuple(tuple(int(x) for x in tier) for tier in (self.config.gen_capture_video or ()))
+        tiers = [(h, w, 1, IMAGE_GEN_WALK, None) for h, w in resolutions] + [
+            (h, w, f, VIDEO_GEN_WALK, [VIDEO_GEN_WALK, VIDEO_GEN_AR_WALK]) for h, w, f in video_tiers
+        ]
+        for height, width, frames, walk, replay_walks in tiers:
+            latent_shape = self._latent_shape(height, width, num_frames=frames)
             latent_area = latent_shape[3] * latent_shape[4]
-            max_area = int(os.environ.get(
-                "COSMOS3_GRAPH_MAX_LATENT_AREA", self.config.graph_max_latent_area))
-            if two_d:
-                max_area = min(max_area, 1000)  # 256p latent 240 captures; 480p 1560 does not
             if latent_area > max_area:
                 logger.info(
-                    "Cosmos3: skipping CUDA-graph capture for %dx%d (latent H*W "
+                    "Cosmos3: skipping CUDA-graph capture for %dx%dx%d (latent H*W "
                     "%d > %d -> graph net-slower than eager dense here -> eager)",
-                    height, width, latent_area, max_area,
+                    height, width, frames, latent_area, max_area,
                 )
                 continue
-            static = self._build_static(
-                [0] * 8, height, width, num_frames=1, fps=24.0,
-                has_image_condition=False, device=device,
-            )
-            num_vision = static["num_vision_tokens"]
-            num_noisy = static["num_noisy_vision_tokens"]
-            self._capture_layout[tuple(latent_shape)] = {
-                "vision_token_shapes": static["vision_token_shapes"],
-                "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
-                "mse_gen_indexes": static["mse_gen_indexes"],
-            }
-            single = ARNodeInputs(
-                input_seq_len=num_vision,
-                tensor_inputs={
-                    "latents": torch.zeros(latent_shape, device=device, dtype=dtype),
-                    "vision_timesteps": torch.zeros(num_noisy, device=device, dtype=torch.float32),
-                    "position_ids_cond": static["vision_mrope_ids"].clone(),
-                    "position_ids_uncond": static["vision_mrope_ids"].clone(),
-                },
-                # What the capture's own `declare_step` reads: this bucket's
-                # step is the two-branch one, over the paged backend. Padding
-                # rows carry it too, so a partly-filled replay declares the
-                # same segments the capture did.
-                resource_step_info=GenStepInfo(
-                    cfg=True, cfg_active=True, capture_key=tuple(latent_shape),
-                ),
-            )
-            configs.append(BatchedCudaGraphConfig(
-                capture_graph_walk=IMAGE_GEN_WALK,
-                single_request_inputs=single,
-                # One bucket per resolution: the token layout is baked into the
-                # capture, so a request at another latent shape must not land
-                # here. `cg_key_info` returns this same latent shape, and
-                # `declare_step` stamps it on the step.
-                additional_key_info=tuple(latent_shape),
-                capture_forward_method="forward_captured",
-                compile=False,
-                capture_batch_sizes=capture_batch_sizes,
-                # The captured sizes (default bs=1; COSMOS3_GEN_CAPTURE_BS adds
-                # more) are an acceleration subset, not a batch ceiling —
-                # uncaptured sizes / mixed resolutions run the eager batched
-                # denoise, so don't cap max_batch_size to them.
-                caps_eager_batch_size=False,
-                # This bucket's step always runs both guidance branches
-                # combined into one KV plan (``resource_step_info`` below is
-                # cfg=True/cfg_active=True unconditionally) — `single.input_seq_len`
-                # is one branch's span (declare_step replicates it per label),
-                # but the combined plan commits both branches' tokens, so the
-                # static buffer needs double the capacity or the real replay's
-                # KV plan overruns it (KVPlanState.copy_ shape mismatch).
-                total_tokens_multiplier=2,
+            if tuple(latent_shape) in self._capture_layout:
+                continue
+            configs.append(self._gen_capture_config(
+                latent_shape, height, width, frames, device, dtype, capture_batch_sizes,
+                walk, replay_walks,
             ))
 
+        configs.extend(self._prefill_capture_configs(device))
+        return configs
+
+    def _gen_capture_config(
+        self, latent_shape, height, width, frames, device, dtype, capture_batch_sizes,
+        walk, replay_walks,
+    ) -> BatchedCudaGraphConfig:
+        """One denoise-step capture bucket per latent shape. The graph is
+        built with every frame declared noisy (its token layout is baked); the
+        request's clean/noisy layout rides in as the ``noisy_token_mask``
+        static input, which zeroes the timestep embedding on clean frames —
+        the same tokens the eager scatter-add skips — so the noisy frames'
+        velocities match the eager step exactly, and ``postprocess`` zeroes
+        the clean frames' velocities the way the eager unpatchify would."""
+        static = self._build_static(
+            [0] * 8, height, width, num_frames=frames, fps=24.0,
+            has_image_condition=False, device=device,
+        )
+        num_vision = static["num_vision_tokens"]
+        self._capture_layout[tuple(latent_shape)] = {
+            "vision_token_shapes": static["vision_token_shapes"],
+            "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
+            "mse_gen_indexes": static["mse_gen_indexes"],
+        }
+        single = ARNodeInputs(
+            input_seq_len=num_vision,
+            tensor_inputs={
+                "latents": torch.zeros(latent_shape, device=device, dtype=dtype),
+                "vision_timesteps": torch.zeros(num_vision, device=device, dtype=torch.float32),
+                "position_ids_cond": static["vision_mrope_ids"].clone(),
+                "position_ids_uncond": static["vision_mrope_ids"].clone(),
+                "noisy_token_mask": torch.ones(num_vision, device=device, dtype=torch.float32),
+            },
+            # What the capture's own `declare_step` reads: this bucket's
+            # step is the two-branch one, over the paged backend. Padding
+            # rows carry it too, so a partly-filled replay declares the
+            # same segments the capture did.
+            resource_step_info=GenStepInfo(
+                cfg=True, cfg_active=True, capture_key=tuple(latent_shape),
+            ),
+        )
+        return BatchedCudaGraphConfig(
+            capture_graph_walk=walk,
+            replay_graph_walks=replay_walks,
+            single_request_inputs=single,
+            # One bucket per latent shape: the token layout is baked into the
+            # capture, so a request at another latent shape must not land
+            # here. `cg_key_info` returns this same latent shape, and
+            # `declare_step` stamps it on the step.
+            additional_key_info=tuple(latent_shape),
+            capture_forward_method="forward_captured",
+            compile=False,
+            capture_batch_sizes=capture_batch_sizes,
+            # The captured sizes (default bs=1; COSMOS3_GEN_CAPTURE_BS adds
+            # more) are an acceleration subset, not a batch ceiling —
+            # uncaptured sizes / mixed resolutions run the eager batched
+            # denoise, so don't cap max_batch_size to them.
+            caps_eager_batch_size=False,
+            # This bucket's step always runs both guidance branches combined
+            # into one KV plan (``resource_step_info`` above is
+            # cfg=True/cfg_active=True unconditionally) — `single.input_seq_len`
+            # is one branch's span (declare_step replicates it per label), but
+            # the combined plan commits both branches' tokens, so the static
+            # buffer needs double the capacity or the real replay's KV plan
+            # overruns it (KVPlanState.copy_ shape mismatch).
+            total_tokens_multiplier=2,
+        )
+
+    def _prefill_capture_configs(self, device) -> list:
+        configs = []
         # Understanding-tower text prefill: cond+uncond packed into one combined
         # sequence (batched CFG). The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
@@ -2185,7 +2249,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def forward_captured(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
-        latents, vision_timesteps, position_ids_cond, position_ids_uncond, **kwargs,
+        latents, vision_timesteps, position_ids_cond, position_ids_uncond, noisy_token_mask,
+        **kwargs,
     ) -> dict:
         """Velocity-only denoise forward captured into a CUDA graph: both guidance
         branches in one pass (the combined plan), no scheduler step. The token
@@ -2206,7 +2271,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
                 layout["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
-                prefer_all_gather=True,
+                prefer_all_gather=True, noisy_token_mask=noisy_token_mask[0],
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [
@@ -2218,6 +2283,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 "vision_token_shapes": layout["vision_token_shapes"],
                 "vision_noisy_frame_indexes": layout["vision_noisy_frame_indexes"],
                 "vision_mse_loss_indexes": layout["mse_gen_indexes"],
+                "noisy_token_mask": noisy_token_mask[i],
             }
             for i in range(latents.shape[0])
         ]
@@ -2245,8 +2311,23 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # step_index is in range here: prepare_inputs vetoes the loop's extra
         # dispatched step and the engine prunes vetoed requests before postprocess.
         step_index = int(time_index.reshape(-1)[0].item())
+        windowed = "ar_schedule" in st
+        window_index = local = None
+        if windowed:
+            # Chained windows only (kv requests never take a lease); the loop
+            # counter is global, the schedule index is the within-window step.
+            window_index, local, _ = self._window_step(st, step_index)
+            step_index = local
+        # The graph predicts every frame; clean frames (i2v anchor, chained
+        # overlap) get the zero velocity the eager unpatchify gives them.
+        velocity = velocity * self._noisy_masks(st, velocity.device)[1].to(velocity.dtype)
         t = st["scheduler"].timesteps[step_index]
         new_latents = self._scheduler_step(st, velocity, t, latents)
+        if st.get("vmask") is not None:
+            new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * st["cond_video_latents"]
+        if windowed and local + 1 == st["ar_steps"]:
+            outputs.update(self._finish_window(st, new_latents, time_index, window_index))
+            return
         outputs["latents"] = [new_latents]
         outputs["time_index"] = [time_index + 1]
 
