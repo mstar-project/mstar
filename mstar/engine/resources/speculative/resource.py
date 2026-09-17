@@ -92,6 +92,10 @@ class SpecAcceptance(Resource):
 
     def plan(self, step: SpecStep, ctx: StepContext) -> dict[str, SpecAccepted]:
         self._current_slot = ctx.slot_lease.slot if ctx.slot_lease is not None else None
+        # the buffers `stage` writes are made here, before a capture step's forward records them
+        # (an allocation inside the capture would be the graph's, and a pinned host allocation there
+        # is not allowed at all)
+        self._buffers(self._current_slot, max(len(ctx.padded_request_ids), 1))
         self._settle()
         out: dict[str, SpecAccepted] = {}
         for segment in step.segments or ():
@@ -109,15 +113,15 @@ class SpecAcceptance(Resource):
 
     # ------------------------------------------------------------ submodule side
     def _buffers(self, slot: int | None, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The slot's device buffer and pinned mirror, at least ``rows`` wide (a capture slot's are
+        sized to the widest bucket any runner announced and never shrink; the eager slot, None, is
+        resized as needed and rewritten every step)."""
         size = max(self._cg_max_bs, rows) if slot is not None else rows
         dev = self._acc_dev.get(slot)
-        if dev is None or dev.shape[0] < size or slot is None:
+        if dev is None or dev.shape[0] < size:
             dev = torch.zeros(size, dtype=torch.int32, device=self.device)
             host = torch.zeros(size, dtype=torch.int32, **self._pin)
-            if slot is not None:
-                self._acc_dev[slot], self._acc_host[slot] = dev, host
-            else:
-                self._acc_dev[None], self._acc_host[None] = dev, host
+            self._acc_dev[slot], self._acc_host[slot] = dev, host
         return self._acc_dev[slot], self._acc_host[slot]
 
     def stage(self, accepted: torch.Tensor) -> None:
@@ -125,7 +129,7 @@ class SpecAcceptance(Resource):
         first) to the host mirror of the current slot and bump the step counter after it. Capturable:
         two device copies, two device-to-host copies into pinned memory."""
         rows = int(accepted.shape[0])
-        dev, host = self._buffers(self._current_slot, rows)
+        dev, host = self._buffers(self._current_slot, rows)  # made in plan; a no-op here
         dev[:rows].copy_(accepted.to(torch.int32))
         host[:rows].copy_(dev[:rows], non_blocking=True)
         self._counter_dev.add_(1)
