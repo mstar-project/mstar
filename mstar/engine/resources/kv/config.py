@@ -96,6 +96,12 @@ class KVReqConfig(ResourceReqConfig):
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # resources whose plan must run before this cache's (their plan results are read in
+    # `KVManager.plan`): the speculative acceptance verdicts that trim a verify step's tail
+    plan_after: tuple[str, ...] = ()
+
+    def depends_on(self) -> set[str]:
+        return set(self.plan_after)
 
     @property
     def resource_class(self) -> "type[Resource]":
