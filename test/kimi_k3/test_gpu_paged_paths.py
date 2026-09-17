@@ -16,8 +16,8 @@ from mstar.engine.resources import (
     KVLayout,
     KVSpec,
     KVStep,
-    RecurrentPlanOutput,
-    RecurrentStateStep,
+    LinearAttnStep,
+    RecurrentStep,
     SamplerStep,
     Segment,
     StepContext,
@@ -26,7 +26,8 @@ from mstar.engine.resources import (
     resolve_spec_dependencies,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
-from mstar.model.kimi_k3.config import KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
+from mstar.engine.resources.linear_attn.kda import KDAPlan
+from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 DEV = torch.device("cuda")
@@ -83,7 +84,8 @@ def _assert_rel(actual, expected, tol, what):
 def _fresh_steps():
     """New per-resource step objects for every batch: ``SubmoduleStep`` binds the batch's
     segments into a step only if it has none, so reusing them would keep the first batch's."""
-    return {MLA_KV: KVStep(), MLA_ATTN: AttentionStep(causal=True), KDA_STATE: RecurrentStateStep(),
+    return {MLA_KV: KVStep(), MLA_ATTN: AttentionStep(causal=True), KDA_STATE: RecurrentStep(),
+            KDA_ATTN: LinearAttnStep(),
             SAMPLER: SamplerStep(apply_penalty=False)}
 
 def _step(runner, keys_steps, segs, walk):
@@ -214,7 +216,7 @@ def test_tiny_model_paged_forward_matches_dense(tiny_dir, device):
 def test_fla_kernels_match_torch_reference(tiny_dir):
     """The slot-indexed fla kernels (prefill chunk + decode recurrent, conv update) agree
     with the torch reference kernels on the same resource-style state tensors."""
-    from mstar.model.kimi_k3.components.kda_kernels import FLAKDAKernels
+    from mstar.engine.resources.linear_attn.kda_kernels import FLAKDAKernels
     from mstar.model.kimi_k3.components.language_model import KimiK3ForCausalLM
     from mstar.model.kimi_k3.config import KimiK3Config
     from mstar.model.loader import load_weights
@@ -236,15 +238,16 @@ def test_fla_kernels_match_torch_reference(tiny_dir):
     x = torch.randn(t, cfg.hidden_size, device=DEV, dtype=torch.bfloat16)
     qkv, g_raw, beta_raw, _ = layer._project(x)
     n_slots = 5
-    conv_t = torch.zeros(n_slots, 3 * layer.projection_size, cfg.kda_conv_kernel_size, device=DEV, dtype=torch.bfloat16)
+    conv_t = torch.zeros(n_slots, 3 * layer.projection_size, cfg.kda_conv_kernel_size - 1, device=DEV,
+                         dtype=torch.bfloat16)
     rec_t = torch.zeros(n_slots, layer.num_heads, layer.head_dim, layer.head_dim, device=DEV)
     conv_f, rec_f = conv_t.clone(), rec_t.clone()
     cu = [0, lens[0], lens[0] + lens[1], t]
     slots, has = [1, 3, 4], [False, False, False]
-    plan = RecurrentPlanOutput(
-        slot_ids=torch.tensor(slots, dtype=torch.int32, device=DEV),
-        has_state=torch.tensor(has, device=DEV), cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=DEV),
-        slot_ids_cpu=slots, has_state_cpu=has, cu_seqlens_cpu=cu, is_decode=False, num_rows=3, num_tokens=t,
+    plan = KDAPlan(
+        slot_ids=torch.tensor(slots, dtype=torch.int32, device=DEV), has_state=torch.tensor(has, device=DEV),
+        cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=DEV), cu_seqlens_cpu=cu, num_rows=3, num_tokens=t,
+        is_decode=False,
     )
     o_t = layer.kernels.run_paged(qkv, g_raw, beta_raw, plan, conv_t, rec_t, p)
     o_f = FLAKDAKernels().run_paged(qkv, g_raw, beta_raw, plan, conv_f, rec_f, p)
@@ -255,10 +258,10 @@ def test_fla_kernels_match_torch_reference(tiny_dir):
     x2 = torch.randn(2, cfg.hidden_size, device=DEV, dtype=torch.bfloat16)
     qkv2, g2, b2, _ = layer._project(x2)
     slots2, has2, cu2 = [4, 1], [True, True], [0, 1, 2]
-    plan2 = RecurrentPlanOutput(
-        slot_ids=torch.tensor(slots2, dtype=torch.int32, device=DEV),
-        has_state=torch.tensor(has2, device=DEV), cu_seqlens=torch.tensor(cu2, dtype=torch.int32, device=DEV),
-        slot_ids_cpu=slots2, has_state_cpu=has2, cu_seqlens_cpu=cu2, is_decode=True, num_rows=2, num_tokens=2,
+    plan2 = KDAPlan(
+        slot_ids=torch.tensor(slots2, dtype=torch.int32, device=DEV), has_state=torch.tensor(has2, device=DEV),
+        cu_seqlens=torch.tensor(cu2, dtype=torch.int32, device=DEV), cu_seqlens_cpu=cu2, num_rows=2, num_tokens=2,
+        is_decode=True,
     )
     o2_t = layer.kernels.run_paged(qkv2, g2, b2, plan2, conv_t, rec_t, p)
     o2_f = FLAKDAKernels().run_paged(qkv2, g2, b2, plan2, conv_f, rec_f, p)
@@ -312,8 +315,8 @@ def test_tiny_model_paged_forward_with_fla_kernels(tiny_dir):
 def test_flashkda_prefill_matches_fla_kernels():
     """FlashKDA prefill (D=128, H=4) vs the fla chunk kernel on the same random layer."""
     pytest.importorskip("flash_kda")
+    from mstar.engine.resources.linear_attn.kda_kernels import FLAKDAKernels, FlashKDAKernels
     from mstar.model.kimi_k3.components.kda import ParallelKDAAttention
-    from mstar.model.kimi_k3.components.kda_kernels import FLAKDAKernels, FlashKDAKernels
 
     torch.manual_seed(7)
     hidden, h, d = 256, 4, 128
@@ -333,7 +336,7 @@ def test_flashkda_prefill_matches_fla_kernels():
     x = torch.randn(t, hidden, device=DEV, dtype=torch.bfloat16)
     qkv, g_raw, beta_raw, _ = layer._project(x)
     n_slots = 4
-    conv_a = torch.zeros(n_slots, 3 * h * d, 4, device=DEV, dtype=torch.bfloat16)
+    conv_a = torch.zeros(n_slots, 3 * h * d, 3, device=DEV, dtype=torch.bfloat16)
     rec_a = torch.zeros(n_slots, h, d, d, device=DEV)
     conv_b, rec_b = conv_a.clone(), rec_a.clone()
     # give slot 1 a resident state so the initial-state path is exercised
@@ -341,10 +344,10 @@ def test_flashkda_prefill_matches_fla_kernels():
     rec_b.copy_(rec_a)
     cu = [0, lens[0], lens[0] + lens[1], t]
     slots, has = [1, 2, 3], [True, False, False]
-    plan = RecurrentPlanOutput(
-        slot_ids=torch.tensor(slots, dtype=torch.int32, device=DEV),
-        has_state=torch.tensor(has, device=DEV), cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=DEV),
-        slot_ids_cpu=slots, has_state_cpu=has, cu_seqlens_cpu=cu, is_decode=False, num_rows=3, num_tokens=t,
+    plan = KDAPlan(
+        slot_ids=torch.tensor(slots, dtype=torch.int32, device=DEV), has_state=torch.tensor(has, device=DEV),
+        cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=DEV), cu_seqlens_cpu=cu, num_rows=3, num_tokens=t,
+        is_decode=False,
     )
     o_fla = FLAKDAKernels().run_paged(qkv, g_raw, beta_raw, plan, conv_a, rec_a, p)
     o_fk = FlashKDAKernels().run_paged(qkv, g_raw, beta_raw, plan, conv_b, rec_b, p)
