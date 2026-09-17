@@ -17,6 +17,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``bagel``
      - ``ByteDance-Seed/BAGEL-7B-MoT``
      - Unified multimodal model (text + image understanding and generation).
+   * - ``chatterbox`` / ``chatterbox_turbo``
+     - ``ResembleAI/chatterbox``, ``ResembleAI/chatterbox-turbo``
+     - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
+       for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
+       HiFT vocoder, PerTh watermark. 24 kHz.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -130,6 +135,35 @@ The benchmark stops on the model's natural codec EOS by default. Use
 fixed-length decode throughput rather than end-user latency.
 The first process-local request can include eager FlashInfer kernel JIT, so
 keep the warmup requests enabled when reporting steady-state latency.
+
+Chatterbox notes
+----------------
+
+- ``pip install -e '.[chatterbox]'`` then ``mstar serve chatterbox --gpus 0``
+  (``chatterbox_turbo`` for the distilled Turbo checkpoint). Both variants are
+  one model class; the variant follows the registry key or ``model_kwargs:
+  variant``.
+- Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
+  voice shipped in the checkpoint, or a preset name resolved under the
+  deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
+  ``ref_audio`` (data URL / base64 / path / URL of a reference clip, 5-30 s,
+  cloning), ``exaggeration`` (0-1, emotion intensity, default 0.5),
+  ``cfg_weight`` (default 0.5; 0 disables guidance and halves the T3 work),
+  ``temperature``/``top_p``/``top_k``/``min_p``/``repetition_penalty``,
+  ``seed``, ``n_cfm_timesteps`` (S3Gen Euler steps, 10; Turbo 2),
+  ``max_new_tokens`` and ``watermark`` (default on). Turbo ignores
+  ``cfg_weight``, ``exaggeration`` and ``min_p`` like the reference package.
+  The native ``/generate`` route and ``client.tts(...)`` take the same knobs;
+  a clip uploaded as ``audio`` input is the reference voice.
+- Graph: ``voice_encoder`` (speaker LSTM + S3 tokenizer over the reference,
+  cached per clip hash) -> ``T3`` (paged KV, continuous batching; guidance runs
+  the conditional and unconditional streams through one attention plan and one
+  captured decode graph per batch size) -> ``s3gen`` (own streaming partition).
+- Outputs are watermarked with Resemble's PerTh network when ``resemble-perth``
+  is installed; ``watermark: false`` per request or in ``model_kwargs`` turns it
+  off, and a deployment without the package logs that outputs are unmarked.
+- Text longer than 512 tokens is rejected: the reference model has no chunking
+  either; split long inputs into sentences client-side.
 
 Cosmos3 environment requirements
 --------------------------------
