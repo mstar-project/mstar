@@ -248,6 +248,28 @@ class SamplingConfig:
         return self._seed
 
 
+
+
+def verify_greedy(logits: torch.Tensor, drafts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Greedy verification of a speculative block.
+
+    ``logits [N * (k + 1), V]`` are the target's logits at a request's ``k + 1``
+    input positions (the bonus token it was given, then its ``k`` drafted
+    tokens), rows grouped by request; ``drafts [N, k]`` are those drafted
+    tokens. Position ``j``'s argmax is the target's choice of the token after
+    input ``j``, so draft ``j`` is accepted while every earlier draft was and
+    it equals that argmax. Returns ``tokens [N, k + 1]`` (the argmaxes: the
+    ones at ``[:accepted + 1]`` are the tokens the request emits, the last of
+    them the new bonus) and ``accepted [N]`` (int32, 0..k). Tensor ops only,
+    so it captures into a CUDA graph.
+    """
+    n, k = drafts.shape
+    tokens = logits.view(n, k + 1, -1).argmax(dim=-1)
+    match = tokens[:, :k] == drafts.to(tokens.dtype)
+    accepted = torch.cumprod(match.to(torch.int32), dim=1).sum(dim=1).to(torch.int32)
+    return tokens, accepted
+
+
 @dataclass
 class BaseSampler(ABC):
     def _broadcast_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
