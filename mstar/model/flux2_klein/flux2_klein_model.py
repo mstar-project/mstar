@@ -44,6 +44,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.diffusion.image_io import uint8_to_png
+from mstar.model.components.diffusion.lora import LoraSpec
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -91,6 +92,7 @@ class Flux2KleinModel(Model):
         capture_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
+        lora: list | None = None,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
@@ -107,6 +109,8 @@ class Flux2KleinModel(Model):
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
+        # LoRA adapters folded into the transformer at load time (static merge).
+        self.loras = [LoraSpec.parse(item) for item in (lora or [])]
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
@@ -416,6 +420,10 @@ class Flux2KleinModel(Model):
             return KleinVaeDecoderSubmodule(self._vae_module(device), self.config, max_batch_size=self.max_batch_size)
         if node_name == "dit":
             transformer = build_transformer(self.config, self.snapshot, device)
+            if self.loras:
+                from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
+
+                apply_transformer_loras(transformer, self.loras)
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
