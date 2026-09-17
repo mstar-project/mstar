@@ -318,8 +318,16 @@ class ParallelKDAAttention(nn.Module):
         layer = self.attn.default_layer_idx
         assert layer is not None, "set the KDA layer cursor (attn.set_default_layer_idx) before the forward"
         qkv, g_raw, beta_raw, g_out = self._project(x)
+        spec = None
+        if self.attn.current_plan().is_verify:
+            # a speculative verify step: the pending prefix and its length (one block for every layer)
+            spec = SpecBlocks(
+                self.pool.block("spec_prefix", layer), self.pool.block("spec_g", layer),
+                self.pool.block("spec_beta", layer), self.pool.block("spec_len", 0),
+            )
         o = self.attn.run(
             qkv, g_raw, beta_raw, self.pool.block("conv", layer), self.pool.block("state", layer), self.params(),
+            spec=spec,
         )
         return self._finish(g_out, o)
 
