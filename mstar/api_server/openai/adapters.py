@@ -507,6 +507,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "flux2_klein": DiffusionImageAdapter(),
+    "flux2_klein_9b": DiffusionImageAdapter(),
 }
 
 
