@@ -226,6 +226,20 @@ def fused_temperature_softmax(
     return probs
 
 
+def apply_min_p(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+    """Min-p filter on a ``[B, V]`` distribution: zero every probability below
+    ``min_p`` times the row's largest, then renormalise.
+
+    The same tokens HF's ``MinPLogitsWarper`` keeps (``probs >= min_p * max``,
+    so the argmax always survives). Rows with ``min_p == 0`` and one-hot
+    (greedy) rows come back unchanged. No CPU branches or data-dependent
+    shapes, so it can sit inside a captured graph.
+    """
+    threshold = probs.amax(dim=-1, keepdim=True) * min_p[:, None]
+    kept = torch.where(probs >= threshold, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True)
+
+
 @dataclass
 class SamplingConfig:
     # Sizes the per-request seen-token mask for the repetition penalty. When set,
@@ -238,6 +252,7 @@ class SamplingConfig:
     top_p: float = 1
     ignore_eos: bool = False # used for benchmark parity
     repetition_penalty: float = 1
+    min_p: float = 0.0  # 0 = disabled; see ``SamplingReqConfig.min_p``
     _seed: int = 0 # set by the conductor
 
     def set_seed(self, seed: int):
@@ -364,6 +379,10 @@ class Sampler(BaseSampler):
         top_k = torch.tensor([c.top_k for c in configs], device=logits.device, dtype=torch.int32)
         top_p = torch.tensor([c.top_p for c in configs], device=logits.device)
         r_pen = torch.tensor([c.repetition_penalty for c in configs], device=logits.device)
+        min_p = (
+            torch.tensor([c.min_p for c in configs], device=logits.device)
+            if any(c.min_p > 0 for c in configs) else None
+        )
         seed = torch.tensor([c.seed for c in configs], device=logits.device, dtype=torch.long)
         rand_offset = torch.tensor(
             [self._step_offset.get(rid, 0) for rid in request_ids],
@@ -400,6 +419,7 @@ class Sampler(BaseSampler):
             all_top_k_zero=all_top_k_zero,
             seed=seed,
             rand_offset=rand_offset,
+            min_p=min_p,
         )
 
         # TODO: make this scatter async. Currently runs 2 kernels per rid
@@ -444,6 +464,7 @@ def _sample_cuda(
     all_top_k_zero: bool | None,
     seed: torch.Tensor | None,
     rand_offset: torch.Tensor | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample normalized CUDA inputs with FlashInfer."""
     import flashinfer
@@ -465,6 +486,8 @@ def _sample_cuda(
                 seen_mask=seen_token_mask,
                 include_greedy=run_greedy,
             )
+            if min_p is not None:
+                probs = apply_min_p(probs, min_p)
             result = flashinfer.sampling.top_p_sampling_from_probs(
                 probs, top_p,
                 deterministic=True,
@@ -478,6 +501,8 @@ def _sample_cuda(
             seen_mask=seen_token_mask,
             include_greedy=run_greedy,
         )
+        if min_p is not None:
+            probs = apply_min_p(probs, min_p)
         result = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             probs, top_k, top_p,
             deterministic=True,
@@ -497,6 +522,7 @@ def _sample_xpu(
     any_top_k_zero: bool | None,
     seed: torch.Tensor | None,
     rand_offset: torch.Tensor | None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample normalized XPU inputs with vllm-xpu-kernels."""
     import vllm_xpu_kernels._xpu_C  # noqa: F401
@@ -516,6 +542,11 @@ def _sample_xpu(
     )
     scores = (scores / safe_temperature[:, None]).contiguous()
     greedy_tokens = scores.argmax(dim=-1) if run_greedy else None
+    if min_p is not None:
+        # the kernel samples from raw logits, so the filter masks those
+        probs = scores.softmax(dim=-1)
+        threshold = probs.amax(dim=-1, keepdim=True) * min_p[:, None]
+        scores = scores.masked_fill(probs < threshold, float("-inf")).contiguous()
 
     # The XPU kernel accepts one CPU [seed, offset] pair per invocation.
     # Invoke it per row to preserve independent request RNG streams.
@@ -603,6 +634,7 @@ def sample_tokens(
     all_top_k_zero: bool | None = None,
     seed: torch.Tensor | None = None,
     rand_offset: torch.Tensor | None = None,
+    min_p: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample tokens from logits with temperature, top-k, top-p, and repetition penalty.
 
@@ -618,6 +650,9 @@ def sample_tokens(
             branch entirely. None = unknown → run the full path.
         any_top_k_zero: CPU-side hint. When False, skips the `top_k == 0 → vocab`
             masked_fill. None = unknown → run the full path.
+        min_p: Scalar or per-request tensor [batch_size]; None/0 = disabled.
+            Applied to the temperature-scaled, penalised distribution before
+            top-k/top-p (the HF processor order).
 
     Returns:
         tokens: [batch_size] sampled token IDs.
@@ -630,6 +665,8 @@ def sample_tokens(
     top_p = _to_tensor(top_p, batch_size, logits.device)
     if seen_token_mask is not None:
         repetition_penalty = _to_tensor(repetition_penalty, batch_size, logits.device)
+    if min_p is not None:
+        min_p = _to_tensor(min_p, batch_size, logits.device)
 
     # Default to the conservative "unknown → do the work" path.
     run_greedy = True if any_greedy is None else any_greedy
@@ -646,6 +683,7 @@ def sample_tokens(
             all_top_k_zero,
             seed,
             rand_offset,
+            min_p=min_p,
         )
     elif logits.device.type == "xpu":
         return _sample_xpu(
@@ -659,6 +697,7 @@ def sample_tokens(
             any_top_k_zero,
             seed,
             rand_offset,
+            min_p=min_p,
         )
     else:
         raise ValueError(
@@ -701,6 +740,7 @@ def sample_cuda_graphable_gpu(
     apply_penalty: bool = False,
     rep_penalty: torch.Tensor | None = None,
     seen_tokens: torch.Tensor | None = None,
+    min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Deterministic per-batch top-k/top-p sampling for graph-captured code.
 
@@ -729,6 +769,8 @@ def sample_cuda_graphable_gpu(
         apply_penalty: when True, ``rep_penalty`` + ``seen_tokens`` are applied.
         rep_penalty: ``[batch_size]`` float tensor (1.0 = disabled per row).
         seen_tokens: ``[batch_size, vocab_size]`` bool mask of seen tokens.
+        min_p: ``[batch_size]`` float tensor (0.0 = disabled per row); None
+            leaves the filter out of the captured graph entirely.
 
     Returns:
         ``[batch_size]`` int64 sampled token IDs. FlashInfer's default
@@ -744,6 +786,8 @@ def sample_cuda_graphable_gpu(
             seen_mask=seen_tokens if apply_penalty else None,
             include_greedy=True,
         )
+        if min_p is not None:
+            probs = apply_min_p(probs, min_p)
         top_k = torch.where(top_k > 0, top_k, logits.shape[1])
         # NOTE: this is NOT batch-invariant — flashinfer's deterministic RNG
         # folds the batch row index into philox, so identical (probs, seed,
@@ -769,6 +813,8 @@ class CudaGraphableSampler(BaseSampler):
     # that don't opt into seen-token tracking (then ``apply_penalty`` is a no-op).
     rep_penalty_buf: torch.Tensor | None = None
     seen_tokens_buf: torch.Tensor | None = None  # [bs, V] bool
+    # ``None`` for submodules whose ``SamplerSpec`` leaves ``enable_min_p`` off.
+    min_p_buf: torch.Tensor | None = None
     tp_group: "CommGroup | None" = None  # noqa: F821
 
     # Set during graph capture, and used by the cuda graph runner to determine
@@ -787,6 +833,7 @@ class CudaGraphableSampler(BaseSampler):
             apply_penalty=apply_penalty,
             rep_penalty=self.rep_penalty_buf,
             seen_tokens=self.seen_tokens_buf,
+            min_p=self.min_p_buf,
         )
         self.offset_buf += 1
         codes = self._broadcast_tokens(codes)
@@ -973,6 +1020,9 @@ class SamplerBuffers:
     # only for submodules that opt in by declaring a vocab size (e.g. the
     # Qwen3-Omni Talker). ``None`` => the CUDA-graph path applies no penalty.
     seen_tokens: "MaskBuffer | None" = None
+    # Per-request min-p; allocated only for submodules whose spec enables it,
+    # so every other node's captured sampler is unchanged.
+    min_p: "Buffer | None" = None
     # Master cache capacity (grown by doubling when more requests are
     # concurrently registered than the per-step buffer holds).
     _master_capacity: int = field(default=0, repr=False)
@@ -1010,7 +1060,10 @@ class SamplerBuffers:
         return self.seen_tokens is not None
 
     def _scalar_buffers(self) -> list[Buffer]:
-        return [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
+        bufs = [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
+        if self.min_p is not None:
+            bufs.append(self.min_p)
+        return bufs
 
     @classmethod
     def allocate(
@@ -1020,6 +1073,7 @@ class SamplerBuffers:
         tp_group: "CommGroup | None" = None,  # noqa: F821
         vocab_size: int | None = None,
         cg_slots: int = 1,
+        enable_min_p: bool = False,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -1053,6 +1107,7 @@ class SamplerBuffers:
             offset=mk(torch.long, 0, slots=1),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
+            min_p=mk(torch.float32, 0.0) if enable_min_p else None,
             _master_capacity=cap,
             cg_slots=cg_slots,
             _slot_idx_cpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, pin_memory=pinned),
@@ -1074,6 +1129,7 @@ class SamplerBuffers:
             "offset_buf": self.offset.slot_view(cg_slot, bs),
             "rep_penalty_buf": self.rep_penalty.slot_view(cg_slot, bs),
             "seen_tokens_buf": self.seen_tokens.slot_view(cg_slot, bs) if self.seen_tokens is not None else None,
+            "min_p_buf": self.min_p.slot_view(cg_slot, bs) if self.min_p is not None else None,
             "tp_group": self.tp_group,
         }
 
@@ -1104,6 +1160,8 @@ class SamplerBuffers:
         self.top_p.write_master_row(slot, p)
         self.seed.write_master_row(slot, cfg.seed)
         self.rep_penalty.write_master_row(slot, float(cfg.repetition_penalty))
+        if self.min_p is not None:
+            self.min_p.write_master_row(slot, float(cfg.min_p) if cfg.temperature > 0 else 0.0)
 
     def _grow_master(self, new_capacity: int) -> None:
         """Double-and-copy the master buffers up to at least ``new_capacity``.
