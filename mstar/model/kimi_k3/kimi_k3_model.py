@@ -82,6 +82,8 @@ class KimiK3Model(Model):
         self.moe_ep_size = int(kwargs.get("moe_ep_size", 1))
         # KDA kernels: auto (FlashKDA prefill where it fits, fla otherwise) | fla | flashkda
         self.kda_backend = str(kwargs.get("kda_backend", "auto"))
+        # the MoE latent down-projection: column-parallel + all-gathered (default) or replicated
+        self.moe_shard_latent = bool(kwargs.get("moe_shard_latent", True))
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
         # requests per prefill step (the scheduler splits larger groups); None lifts the cap
@@ -248,7 +250,8 @@ class KimiK3Model(Model):
         quantized = self.config.quant is not None and self.config.quant.is_mxfp4
         with torch.device("meta"):
             language_model = KimiK3ForCausalLM(
-                self.config.text, comm_group=tp_group, quantized_experts=quantized, moe_ep_size=self.moe_ep_size)
+                self.config.text, comm_group=tp_group, quantized_experts=quantized, moe_ep_size=self.moe_ep_size,
+                moe_shard_latent=self.moe_shard_latent)
         if self.moe_ep_size > 1:
             moes = [m for m in language_model.modules() if hasattr(m, "sharding") and hasattr(m, "routed_expert_norm")]
             if moes:
