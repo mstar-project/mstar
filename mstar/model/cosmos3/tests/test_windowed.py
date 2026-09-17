@@ -726,3 +726,43 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
            "session_id": "ghost", "resume_latent_units": 2}
     out3 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md3), stream[:, :, 6:10])
     assert out3["video_output"][0].shape[2] == 5
+
+
+def test_long_rollout_state_stays_flat(monkeypatch) -> None:
+    """A long rollout (24 windows, both modes) keeps a flat per-request
+    state: the chained statics cache holds one entry per distinct window
+    layout, kv windows are built on demand and not retained, the cached
+    layout masks follow the current window, and every window is emitted."""
+    sub = _dit()
+    sub.transformer = SimpleNamespace(proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)))
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: SimpleNamespace(timesteps=torch.arange(3)))
+    for mode, kv in (("chained", False), ("kv", True)):
+        if kv:
+            schedule = WindowSchedule(total_units=8 * 24, window_units=8, context_units=16)
+        else:
+            schedule = WindowSchedule(total_units=8 + 6 * 23, window_units=8, overlap_units=2)
+        assert schedule.num_windows == 24
+        st = sub.request_state(mode)
+        cond0, uncond0 = sub._build_window_statics(
+            list(range(7)), list(range(9)), 64, 64, 8, 24.0, has_image_condition=False, cond_units=0, device="cpu",
+        )
+        sub._slim_statics(cond0, uncond0)
+        per = 4 if kv else 3
+        st.add_all(
+            ar_schedule=schedule, ar_steps=3, ar_iters_per_window=per, ar_total_iters=24 * per,
+            ar_kv_mode=kv, ar_size=(64, 64), ar_fps=24.0, ar_cond_ids=list(range(7)), ar_uncond_ids=list(range(9)),
+            ar_has_image_condition=False, ar_flow_shift=None, ar_karras=None, ar_statics={},
+            ar_generator=torch.Generator().manual_seed(0), cond=cond0, uncond=uncond0,
+            scheduler=SimpleNamespace(timesteps=torch.arange(3)), latent_shape=sub._window_latent_shape(64, 64, 8),
+        )
+        x = torch.zeros(sub._window_latent_shape(64, 64, 8))
+        for w in range(schedule.num_windows):
+            out = sub._finish_window(st, x, torch.tensor([w * per + 2]), window_index=w)
+            assert out["window_latents"][0].shape[2] == 8
+            # The layout masks are rebuilt for the new window's statics only.
+            token_mask, frame_mask = sub._noisy_masks(st, "cpu")
+            assert token_mask.shape == (8 * 4,) and frame_mask.shape == (1, 8, 1, 1)
+            if w + 1 < schedule.num_windows:
+                assert int(frame_mask.sum()) == (8 if kv else 6)
+        assert len(st["ar_statics"]) == (0 if kv else 1)
+        assert len(st.get("noisy_masks")) == 3
