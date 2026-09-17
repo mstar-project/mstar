@@ -197,7 +197,10 @@ request, and the engine passes each config to its resource when the request is i
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
-  ``repetition_penalty`` and ``ignore_eos``. The conductor fills in the per-request seed.
+  ``repetition_penalty``, ``min_p`` and ``ignore_eos``. The conductor fills in the
+  per-request seed. ``min_p`` follows the HF processor order (after the penalty and
+  temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
+  ``SamplerSpec``, which adds the filter to that node's captured sampler only.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
