@@ -310,6 +310,11 @@ class Cosmos3Config:
     # window so the causal VAE's conv stack is warm at the kept frames; the
     # context-derived pixels are trimmed. Raise if window boundaries seam.
     windowed_decode_context_latents: int = 8
+    # Sessions (``session_id`` on a windowed request): the DiT node keeps the
+    # last window's clean latents and the streaming decoder its decode
+    # context per session, so a later request with ``resume_session`` picks
+    # the rollout up where the previous one ended. Most-recent sessions kept.
+    session_store_size: int = 8
     video_temporal_causal: bool = False
     freeze_und: bool = False
 
