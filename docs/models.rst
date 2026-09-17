@@ -162,8 +162,30 @@ Chatterbox notes
 - Outputs are watermarked with Resemble's PerTh network when ``resemble-perth``
   is installed; ``watermark: false`` per request or in ``model_kwargs`` turns it
   off, and a deployment without the package logs that outputs are unmarked.
+- Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
+  the first after 15 tokens, then every 25 (``model_kwargs:
+  stream_first_chunk_tokens`` / ``stream_chunk_tokens``). Each chunk re-runs
+  the flow decoder over all tokens so far with a fixed noise field, holds back
+  the three look-ahead tokens and crossfades the vocoder tail, so the stream
+  is continuous but not sample-identical to the whole-utterance decode;
+  ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
+  path, bit-exact with the package at a fixed seed). Requests whose chunks
+  are ready together share one padded flow solve (up to 8 per step).
+- Sampling follows the reference order inside the sampler resource:
+  repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
+  declares ``enable_min_p`` on its ``SamplerSpec`` (see
+  :doc:`adding_models`). ``model_kwargs: t3_dtype: float32`` runs the
+  transformer in float32 for token-level parity checks (bf16 by default).
+- Reference clips are decoded with ``soundfile`` (WAV/FLAC/OGG/MP3 through
+  the bundled libsndfile); other codecs fall back to ``torchcodec``, which
+  needs FFmpeg's shared libraries on the node.
 - Text longer than 512 tokens is rejected: the reference model has no chunking
   either; split long inputs into sentences client-side.
+- Benchmarks and parity scripts live in ``benchmark/chatterbox/``
+  (``bench_all.sh`` drives M*, Chatterbox-TTS-Server and chatterbox-vllm on
+  one GPU; ``reference_greedy.py`` + ``serve_parity.py`` compare a served
+  greedy synthesis with the reference package; ``wer_eval.py`` is the Whisper
+  intelligibility guard).
 
 Cosmos3 environment requirements
 --------------------------------
