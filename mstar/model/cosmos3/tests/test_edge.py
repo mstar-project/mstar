@@ -335,6 +335,35 @@ def test_native_flow_sigmas() -> None:
     assert all(a > b for a, b in zip(sig, sig[1:], strict=False))
 
 
+def test_native_flow_scheduler_builds_from_the_edge_config() -> None:
+    """The served per-request UniPC scheduler on the Edge (native flow)
+    schedule: explicit linspaced sigmas handed to diffusers' UniPC (which
+    applies the flow shift to them arithmetically — a Python list raised
+    inside ``set_timesteps`` on the pinned diffusers), karras off, the
+    request's step count and flow shift honored."""
+    from diffusers import UniPCMultistepScheduler
+
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+
+    # nvidia/Cosmos3-Edge scheduler/scheduler_config.json (karras on there;
+    # the native flow path turns it off).
+    template = UniPCMultistepScheduler(
+        num_train_timesteps=1000, prediction_type="flow_prediction", predict_x0=True, solver_order=2,
+        solver_type="bh2", use_flow_sigmas=True, use_karras_sigmas=True, final_sigmas_type="zero",
+        flow_shift=1.0, sigma_min=0.147, sigma_max=200.0, timestep_spacing="linspace",
+    )
+    sub = Cosmos3DiTSubmodule(transformer=None, config=_tiny_edge_config(), scheduler=template)
+    sched = sub._new_scheduler(20, torch.device("cpu"), flow_shift=12.0)
+    assert len(sched.timesteps) == 20 and not sched.config.use_karras_sigmas
+    assert sched.config.flow_shift == 12.0
+    # sigma_0 = 0.999 shifted by 12: 12 s / (1 + 11 s).
+    s0 = 0.999
+    assert abs(float(sched.sigmas[0]) - 12 * s0 / (1 + 11 * s0)) < 1e-5
+    assert int(sched.timesteps[0]) == 999 and float(sched.sigmas[-1]) == 0.0
+    # A request may keep karras on explicitly.
+    assert sub._new_scheduler(4, torch.device("cpu"), use_karras_sigma=True).config.use_karras_sigmas
+
+
 # ---------------------------------------------------------------------------
 # Reasoner prompt plumbing
 # ---------------------------------------------------------------------------
