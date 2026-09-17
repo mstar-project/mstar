@@ -54,11 +54,12 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
                  max_capture_batch_size: int | None = None, max_prefill_batch_size: int | None = 8,
                  mixed_prefill_decode: bool = False, speculative_tokens: int = 0, draft: DSparkDraft | None = None):
         super().__init__()
-        # speculative decoding (plan section 8.5): a decode row carries k + 1 ids (the bonus token
-        # and k drafts), the target verifies them in one pass, `sample_verify` keeps the accepted
-        # prefix plus a new bonus, and the next row is drafted. 0 = one token per step. Until the
-        # DSpark draft lands the drafts are the bonus token repeated (`_draft`), which exercises the
-        # whole verify path with near-zero acceptance.
+        # speculative decoding (plan sections 8.5, 8.6): a decode row arrives with its bonus token
+        # (one id, as the conductor hands the prefill's token to the decode loop), the step drafts
+        # k tokens for it, the target verifies [bonus, drafts] in one pass, `sample_verify` keeps
+        # the accepted prefix plus a new bonus. 0 = one token per step. Without the DSpark draft the
+        # drafts are the bonus token repeated (`_draft`), which exercises the whole verify path
+        # with near-zero acceptance.
         self.speculative_tokens = int(speculative_tokens)
         self.k1 = self.speculative_tokens + 1
         self._acceptance = None  # the SpecAcceptance resource, bound with the node's resources
@@ -95,8 +96,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
-                    input_ids=torch.zeros(1 if self.draft is not None else self.k1, dtype=torch.long, device=device),
-                    input_seq_len=self.k1,
+                    input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=self.k1,
                 ),
                 capture_batch_sizes=self.capture_batch_sizes, compile=False),
             # no prefill capture: the KDA varlen conv/chunk kernels size work on the host
@@ -108,8 +108,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> ARNodeInputs:
         ids = inputs["text_inputs"][0].reshape(-1)
-        # a speculating decode row spans k + 1 tokens (the bonus token and the drafts the step
-        # verifies) whatever it carries as ids: one with the real draft, k + 1 with the stand-in
+        # a speculating decode row carries its bonus token and spans k + 1 tokens (it and the
+        # drafts the step verifies)
         span = self.k1 if self.speculative_tokens > 0 and graph_walk == "decode" else ids.shape[0]
         return ARNodeInputs(input_ids=ids, input_seq_len=span)
 
@@ -174,52 +174,45 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         return bonus.expand(-1, self.speculative_tokens)
 
     def _forward_verify(self, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor) -> dict[str, torch.Tensor]:
-        """One speculative decode step. With the DSpark draft (plan section 8.6): the rows carry
-        their bonus tokens, the draft proposes ``k`` tokens per row against its context cache, the
-        target verifies ``[bonus, drafts]`` in one pass (greedy), the acceptance counts are staged for
-        the next plan and the KDA prefix lengths, and the draft's context KV for the block's ``k + 1``
-        positions is written from this pass's aux states. With the stand-in, the rows arrive with
-        ``k + 1`` ids and the next rows are the new bonus repeated. Batch-wide sentinels of static
-        shape; ``unpack_packed_outputs`` cuts them per request post-replay."""
+        """One speculative decode step (plan section 8.6). The rows carry their bonus tokens (one
+        id each); the draft proposes ``k`` tokens per row (the DSpark draft against its context cache,
+        or the stand-in's repeated bonus); the target verifies ``[bonus, drafts]`` in one pass
+        (greedy); the acceptance counts are staged for the next plan and the KDA prefix lengths; with
+        the DSpark draft the context KV of the block's ``k + 1`` positions is written from this pass's
+        aux states. Batch-wide sentinels of static shape; ``unpack_packed_outputs`` cuts them per
+        request post-replay, the new bonus being the next row's id."""
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         acceptance: SpecAcceptance = engine_inputs.resources[SPEC]
         kda = engine_inputs.resources[KDA_ATTN]
         pool = engine_inputs.resources[KDA_STATE]
         k = self.speculative_tokens
+        bonus = text_inputs.view(-1)
         if self.draft is not None:
-            bonus = text_inputs.view(-1)  # one id per row
             ctx_len = engine_inputs.resources[DSPARK_ATTN].kv_len_buf()[: bonus.shape[0]]
             offsets = torch.arange(self.k1, device=bonus.device)
             drafts = self.draft.draft(bonus, (ctx_len[:, None] + offsets[None, :k]).reshape(-1), k)
-            ids = torch.cat([bonus[:, None], drafts], dim=1)
+        else:
+            drafts = self._draft(bonus[:, None])
+        ids = torch.cat([bonus[:, None], drafts], dim=1)
+        if self.draft is not None:
             hidden, aux = self.language_model.model(
                 self.embed_tokens(ids.reshape(-1)), label="main", aux_layers=self.draft.cfg.target_layer_ids)
         else:
-            ids = text_inputs.view(-1, self.k1)
-            hidden = self.language_model.model(self.embed_tokens(text_inputs), label="main")
+            hidden = self.language_model.model(self.embed_tokens(ids.reshape(-1)), label="main")
         logits = self.lm_head(hidden)
         tokens, accepted = sampler.sample_verify(engine_inputs.request_ids, logits, ids[:, 1:])
         acceptance.stage(accepted)
         kda.set_prefix_len(pool.block("spec_len", 0), accepted)
-        bonus = tokens.gather(1, accepted.to(torch.long).unsqueeze(1))
+        new_bonus = tokens.gather(1, accepted.to(torch.long).unsqueeze(1))
         if self.draft is not None:
             positions = (ctx_len[:, None] + offsets[None, :]).reshape(-1)
             self.draft.write_context(self.draft.combine(torch.cat(aux, dim=-1)), positions)
-            next_inputs = bonus
-        else:
-            next_inputs = torch.cat([bonus, self._draft(bonus)], dim=1)
-        return {"spec_tokens": tokens, "spec_accepted": accepted, "next_inputs": next_inputs}
+        return {"spec_tokens": tokens, "spec_accepted": accepted, "next_inputs": new_bonus}
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor, **kwargs):
         if self.speculative_tokens > 0 and graph_walk == "decode":
             return self._forward_verify(engine_inputs, text_inputs)
         new_token = self._forward(graph_walk, engine_inputs, text_inputs)
-        if self.speculative_tokens > 0:
-            # a prefill under speculation hands the next row its bonus (and, for the stand-in, its
-            # drafts) as the loop-back edge itself: on this path the keys are the edge names
-            bonus = new_token.view(-1, 1)
-            nxt = bonus if self.draft is not None else torch.cat([bonus, self._draft(bonus)], dim=1)
-            return {"new_token": new_token, "text_inputs": nxt.reshape(-1)}
         return {"new_token": new_token}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
@@ -243,13 +236,9 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             # host, which `unpack_packed_outputs` reads after the replay
             return self._forward_verify(engine_inputs, text_inputs)
         new_tokens = self._forward(graph_walk, engine_inputs, text_inputs)
-        out = {rid: {"new_token": [new_tokens[i : i + 1]]} for i, rid in enumerate(engine_inputs.request_ids)}
-        if self.speculative_tokens > 0:
-            bonus = new_tokens.view(-1, 1)
-            next_inputs = bonus if self.draft is not None else torch.cat([bonus, self._draft(bonus)], dim=1)
-            for i, rid in enumerate(engine_inputs.request_ids):
-                out[rid]["text_inputs"] = [next_inputs[i]]
-        return out
+        # the prefill's token reaches the decode loop through the conductor (the persisted
+        # `new_token` becomes the first `text_inputs`), one id per row, as every later row
+        return {rid: {"new_token": [new_tokens[i : i + 1]]} for i, rid in enumerate(engine_inputs.request_ids)}
 
     def unpack_packed_outputs(self, static_output: dict, request_ids: list[str], real_seq_lens: list[int],
                               inputs: list, per_request_info: dict) -> dict[str, dict[str, list[torch.Tensor]]]:
