@@ -36,6 +36,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.engine.resources.speculative.config import SPEC_ACCEPTANCE
 
 logger = logging.getLogger(__name__)
 
@@ -584,6 +585,13 @@ class KVManager(AttentionResource):
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.padded_request_ids:
                 self._apply_fork(rid, from_label, to_label, undo=undo)
+        # a speculating node's previous step committed its full block; take the
+        # rejected tail back before the views are built (a fact about that step,
+        # so it is not part of a preplan's undo record)
+        verdicts = ctx.plan_results.get(SPEC_ACCEPTANCE)
+        if verdicts:
+            for rid, verdict in verdicts.items():
+                self.correct_len(rid, verdict.label, -verdict.rejected)
         res = KVPlanOutputs(
             {
                 plan_label: self._plan_output(self._sequence_views(segments))
@@ -634,6 +642,18 @@ class KVManager(AttentionResource):
         self._preplanned = False
         self._preplan_states = {}
         self._cached_plan_output = None
+
+    def correct_len(self, rid: str, label: str, delta: int) -> None:
+        """Move a stream's stored length by ``delta`` tokens, pages kept: a
+        speculative verify step commits its whole block and its rejected tail
+        is taken back here once the acceptance is known. The generation moves
+        so an offload claimed against the old length fails its guard."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or delta == 0:
+                return
+            stream.stored_len = max(0, stream.stored_len + delta)
+            stream.generation += 1
 
     def commit(self, step: KVStep, ctx: StepContext):
         # atomic against admit_retrieve reading stored_len on another thread
