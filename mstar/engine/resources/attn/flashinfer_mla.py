@@ -17,7 +17,7 @@ from mstar.engine.resources.attn.base import AttentionManager, WorkspacePool
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
-from mstar.engine.resources.kv.plan import KVPlanOutputs
+from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, context_only_views
 from mstar.engine.resources.step import SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
@@ -141,25 +141,32 @@ class FlashInferMLAWrapper:
         self.kv_dtype = kv_dtype or dtype
 
     @torch.compiler.disable
-    def run(self, q_nope: torch.Tensor, q_pe: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(self, q_nope: torch.Tensor, q_pe: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False):
         """``q_nope [T, H, kv_lora_rank]`` (absorbed), ``q_pe [T, H, qk_rope_head_dim]``,
-        ``kv_cache_layer [pages, page_size, latent]`` -> ``[T, H, kv_lora_rank]``."""
+        ``kv_cache_layer [pages, page_size, latent]`` -> ``[T, H, kv_lora_rank]`` (and, with
+        ``return_lse``, the natural log-sum-exp of the scores ``[T, H]`` fp32)."""
         ckv = kv_cache_layer[..., : self.kv_lora_rank]
         kpe = kv_cache_layer[..., self.kv_lora_rank :]
         if self.fallback:
-            return self._run_fallback(q_nope, q_pe, kv_cache_layer)
-        return self.attn_wrapper.run(q_nope.to(self.dtype), q_pe.to(self.dtype), ckv, kpe)
+            return self._run_fallback(q_nope, q_pe, kv_cache_layer, return_lse)
+        return self.attn_wrapper.run(q_nope.to(self.dtype), q_pe.to(self.dtype), ckv, kpe,
+                                     return_lse=return_lse, return_lse_base_on_e=return_lse)
 
-    def _run_fallback(self, q_nope: torch.Tensor, q_pe: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def _run_fallback(self, q_nope: torch.Tensor, q_pe: torch.Tensor, kv_cache_layer: torch.Tensor,
+                      return_lse: bool = False):
         """Per-request gather of the paged latents and a dense fp32 softmax attention:
         the reference semantics of the kernel, for latent shapes it does not support."""
         assert self._fb is not None, "plan() before run()"
         qo, kv_indptr, kv_indices, kv_len, causal = self._fb
         out = torch.empty(q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank, dtype=q_nope.dtype, device=q_nope.device)
+        lse = torch.full(q_nope.shape[:2], float("-inf"), dtype=torch.float32, device=q_nope.device)
         for i in range(len(qo) - 1):
             n = qo[i + 1] - qo[i]
             m = kv_len[i]
             if n == 0:
+                continue
+            if m == 0:
+                out[qo[i]:qo[i + 1]] = 0
                 continue
             pages = kv_indices[kv_indptr[i]:kv_indptr[i + 1]]
             kv = kv_cache_layer.index_select(0, pages).reshape(-1, kv_cache_layer.shape[-1])[:m].float()
@@ -174,7 +181,8 @@ class FlashInferMLAWrapper:
                 scores = scores.masked_fill(~allowed[None], float("-inf"))
             probs = torch.softmax(scores, dim=-1)
             out[qo[i]:qo[i + 1]] = torch.einsum("hqk,kl->qhl", probs, ckv).to(out.dtype)
-        return out
+            lse[qo[i]:qo[i + 1]] = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+        return (out, lse) if return_lse else out
 
 
 class FlashInferMLAManager(AttentionManager):
@@ -257,6 +265,12 @@ class FlashInferMLAManager(AttentionManager):
         plan_states.clear()
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
+            if step.context_only:
+                # the rows' query counts come from this step's own segments, the kv from the
+                # stored context (the cache's segments describe what the step appends)
+                spans = [int(seg.span) for seg in (step.segments or ()) if seg.label == label]
+                views = context_only_views(kv_out.views, spans, self._kv_config.page_size)
+                indptrs = build_paged_indptrs(views, self._kv_config.page_size)
             if lease is not None:
                 wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1)
             else:
@@ -283,16 +297,21 @@ class FlashInferMLAManager(AttentionManager):
         kv_cache_layer: torch.Tensor | None = None,
         k: torch.Tensor | None = None, v: torch.Tensor | None = None,
         layer_idx: int | None = None, q_pe: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ):
         """``q`` is the absorbed ``q_nope`` (``[T, H, kv_lora_rank]``); ``q_pe`` the
-        rope-part query (``[T, H, qk_rope_head_dim]``)."""
+        rope-part query (``[T, H, qk_rope_head_dim]``). With ``return_lse`` also the natural
+        log-sum-exp of the scores ``[T, H]`` fp32, for merging with another key segment."""
         del k, v, layer_idx
         if label is None:
             label = self._default_label
         assert q_pe is not None, "MLA needs the rope-part query"
-        return self._attend(q, q_pe, label, kv_cache_layer)
+        return self._attend(q, q_pe, label, kv_cache_layer, return_lse)
 
     @torch.compiler.disable
-    def _attend(self, q_nope, q_pe, label, kv_cache_layer):
-        o = self._current_plan_states[label].run(q_nope, q_pe, kv_cache_layer)
-        return o.to(q_nope.dtype) if o.dtype != q_nope.dtype else o
+    def _attend(self, q_nope, q_pe, label, kv_cache_layer, return_lse=False):
+        out = self._current_plan_states[label].run(q_nope, q_pe, kv_cache_layer, return_lse=return_lse)
+        o, lse = out if return_lse else (out, None)
+        if o.dtype != q_nope.dtype:
+            o = o.to(q_nope.dtype)
+        return (o, lse) if return_lse else o
