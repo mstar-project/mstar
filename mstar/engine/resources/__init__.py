@@ -59,6 +59,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.speculative import SPEC_ACCEPTANCE, SpecAccepted, SpecAcceptanceSpec, SpecStep
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -134,4 +135,8 @@ __all__ = [
     "apply_yaml_overrides",
     "resolve_spec_dependencies",
     "topo_sort",
+    "SPEC_ACCEPTANCE",
+    "SpecAccepted",
+    "SpecAcceptanceSpec",
+    "SpecStep",
 ]
