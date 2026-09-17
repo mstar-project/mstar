@@ -1,17 +1,28 @@
 """Configuration for the Cosmos3 omni generator.
 
 A single ``Cosmos3Config`` describes every Cosmos3 checkpoint (Nano, Super,
-Policy-DROID, and the Super task variants). The checkpoints share one
-architecture; they differ only in the transformer dimensions
-(``num_hidden_layers`` / ``hidden_size`` / ``num_attention_heads`` /
-``intermediate_size``) and two capability flags (``sound_gen``,
-``action_gen``).
+Edge, the Policy-DROID fine-tunes and the Super task variants). The
+checkpoints share one dual-pathway MoT architecture; they differ in the
+transformer dimensions (``num_hidden_layers`` / ``hidden_size`` /
+``num_attention_heads`` / ``intermediate_size``), the two capability flags
+(``sound_gen``, ``action_gen``) and, for Edge, the backbone family: a dense
+Nemotron text tower (``hidden_act="relu2"``, Nemotron RMSNorm ordering, no
+text QK-norm, a ``k_norm_und_for_gen`` on the understanding K the generation
+tower reads) instead of Nano's Qwen3-VL one.
+
+Edge checkpoints also carry the reasoner (the understanding tower served as a
+VLM): a top-level ``config.json`` with the SigLIP2-style vision tower and
+patch-merger projector, plus ``vision_encoder/model.safetensors``. That is
+parsed into ``Cosmos3Config.reasoner`` (``None`` for checkpoints without it).
 
 Values load from a local HF checkpoint directory laid out the diffusers way::
 
     <ckpt>/transformer/config.json   -> the DiT (dual-pathway MoT) dimensions
     <ckpt>/vae/config.json           -> AutoencoderKLWan factors + latent stats
     <ckpt>/scheduler/scheduler_config.json -> UniPC flow scheduler settings
+    <ckpt>/model_index.json          -> pipeline flags (native flow schedule)
+    <ckpt>/config.json               -> reasoner (vision tower + projector), Edge only
+    <ckpt>/preprocessor_config.json, video_preprocessor_config.json -> reasoner media processors
 
 Dataclass defaults mirror Cosmos3-Nano so a bare ``Cosmos3Config()`` is a
 valid Nano config without any file present.
@@ -81,6 +92,134 @@ class Cosmos3SchedulerConfig:
 
 
 @dataclass
+class Cosmos3VisionEncoderConfig:
+    """The reasoner's packed SigLIP2-style vision tower (``vision_config`` of the
+    Edge ``config.json``): patch-embedding linear over ``patch_size**2 * 3``
+    pixel patches, a learned square position grid of ``num_patches`` entries
+    that is bilinearly resized to each image's patch grid, ``num_hidden_layers``
+    pre-LayerNorm encoder blocks attending within one frame, and a post
+    LayerNorm. ``spatial_merge_size`` is the projector's 2x2 patch merge."""
+
+    hidden_size: int = 1152
+    intermediate_size: int = 4304
+    num_hidden_layers: int = 27
+    num_attention_heads: int = 16
+    num_channels: int = 3
+    patch_size: int = 16
+    num_patches: int = 256
+    spatial_merge_size: int = 2
+    hidden_act: str = "gelu_pytorch_tanh"
+    layer_norm_eps: float = 1e-6
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Cosmos3VisionEncoderConfig":
+        return cls(**_filtered(cls, d))
+
+
+@dataclass
+class Cosmos3MediaProcessorConfig:
+    """Resize/normalize/patchify settings of the reasoner's image and video
+    processors (``preprocessor_config.json`` / ``video_preprocessor_config.json``).
+
+    An input is resized (bicubic, antialiased) so both sides are multiples of
+    ``patch_size * merge_size`` and the pixel count lands in
+    ``[min_pixels, max_pixels]``, normalized with ``image_mean`` /
+    ``image_std``, and cut into ``patch_size`` patches in block-major 2x2
+    order. Video inputs are first sampled at ``fps`` frames per second, clamped
+    to ``[min_frames, max_frames]``."""
+
+    patch_size: int = 16
+    merge_size: int = 2
+    temporal_patch_size: int = 1
+    min_pixels: int = 65536
+    max_pixels: int = 16777216
+    image_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    image_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    # Video sampling (the video processor only).
+    fps: float = 2.0
+    min_frames: int = 4
+    max_frames: int = 768
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Cosmos3MediaProcessorConfig":
+        kwargs = _filtered(cls, d)
+        size = d.get("size") or {}
+        if "shortest_edge" in size:
+            kwargs["min_pixels"] = int(size["shortest_edge"])
+        if "longest_edge" in size:
+            kwargs["max_pixels"] = int(size["longest_edge"])
+        for key in ("image_mean", "image_std"):
+            if key in kwargs:
+                kwargs[key] = tuple(float(x) for x in kwargs[key])
+        return cls(**kwargs)
+
+
+@dataclass
+class Cosmos3ReasonerConfig:
+    """Everything the understanding tower needs beyond the DiT weights to be
+    served as a VLM (the Edge ``config.json``): the vision tower, the
+    patch-merger projector (``LayerNorm -> 2x2 merge -> Linear -> GELU ->
+    Linear`` into the text hidden size), the placeholder token ids, and the
+    media processors. The text tower itself is the DiT's understanding
+    pathway (``embed_tokens`` / ``layers.N.self_attn.to_*`` / ``mlp`` /
+    ``norm`` / ``lm_head``)."""
+
+    vision: Cosmos3VisionEncoderConfig = field(default_factory=Cosmos3VisionEncoderConfig)
+    image_processor: Cosmos3MediaProcessorConfig = field(default_factory=Cosmos3MediaProcessorConfig)
+    video_processor: Cosmos3MediaProcessorConfig = field(
+        default_factory=lambda: Cosmos3MediaProcessorConfig(min_pixels=4096, max_pixels=25165824)
+    )
+    projector_input_hidden_size: int = 1152
+    projector_hidden_size: int = 11520
+    projector_out_hidden_size: int = 2048
+    use_postshuffle_norm: bool = False
+    image_token_id: int = 19
+    video_token_id: int = 18
+    vision_start_token_id: int = 20
+    vision_end_token_id: int = 21
+    eos_token_id: int = 11
+    max_position_embeddings: int = 131072
+    # The chat template thinks by default (``enable_thinking``); a request may
+    # turn it off.
+    enable_thinking: bool = True
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Cosmos3ReasonerConfig":
+        kwargs = _filtered(cls, d)
+        vision = d.get("vision_config") or {}
+        proj = d.get("projector_config") or {}
+        text = d.get("text_config") or {}
+        kwargs["vision"] = Cosmos3VisionEncoderConfig.from_dict(
+            {**vision, "spatial_merge_size": proj.get("spatial_merge_size", vision.get("spatial_merge_size", 2))}
+        )
+        if "input_hidden_size" in proj:
+            kwargs["projector_input_hidden_size"] = int(proj["input_hidden_size"])
+        if "merger_intermediate_size" in proj:
+            kwargs["projector_hidden_size"] = int(proj["merger_intermediate_size"])
+        elif "projector_hidden_size" in d:
+            kwargs["projector_hidden_size"] = int(d["projector_hidden_size"])
+        if "out_hidden_size" in proj:
+            kwargs["projector_out_hidden_size"] = int(proj["out_hidden_size"])
+        elif "hidden_size" in text:
+            kwargs["projector_out_hidden_size"] = int(text["hidden_size"])
+        if "use_postshuffle_norm" in proj:
+            kwargs["use_postshuffle_norm"] = bool(proj["use_postshuffle_norm"])
+        eos = text.get("eos_token_id")
+        if isinstance(eos, list):
+            eos = eos[0]
+        if eos is not None:
+            kwargs["eos_token_id"] = int(eos)
+        if "max_position_embeddings" in text:
+            kwargs["max_position_embeddings"] = int(text["max_position_embeddings"])
+        return cls(**kwargs)
+
+
+# ``model_type`` of a checkpoint whose top-level config.json describes the
+# reasoner (vision tower + projector over the DiT's text pathway).
+REASONER_MODEL_TYPES: frozenset[str] = frozenset({"cosmos3_edge"})
+
+
+@dataclass
 class Cosmos3Config:
     """Cosmos3 generator configuration (one architecture, swappable weights)."""
 
@@ -116,6 +255,21 @@ class Cosmos3Config:
     qk_norm_for_diffusion: bool = True
     qk_norm_for_text: bool = True
     use_moe: bool = True  # MoT two-FFN split (mlp / mlp_moe_gen), NOT sparse experts
+
+    # ----- backbone family -----
+    # Nano/Super descend from Qwen3-VL: SwiGLU MLPs (gate/up/down) and the
+    # diffusers RMSNorm rounding (normalize, round to bf16, multiply by the
+    # weight). Edge descends from a dense Nemotron LM: ``hidden_act="relu2"``
+    # (down(relu(up(x))^2), no gate) and the Nemotron RMSNorm ordering (the
+    # weight multiplies in fp32, one rounding at the end). Both are read from
+    # transformer/config.json; ``hidden_act`` selects the norm family like the
+    # diffusers reference does.
+    hidden_act: str = "silu"
+    backbone_type: str | None = None
+    # Edge only: the generation tower attends to a re-normalized view of the
+    # understanding K (``layers.N.self_attn.k_norm_und_for_gen``); the text
+    # tower's own causal attention keeps the raw K.
+    use_und_k_norm_for_gen: bool = False
 
     # ----- capability flags + modality heads -----
     action_gen: bool = True
@@ -160,6 +314,25 @@ class Cosmos3Config:
     num_inference_steps_action: int = 30
     guidance_scale_action: float = 1.0
     flow_shift_action: float = 5.0
+    # Default output size (width, height) for image and video requests that
+    # send no ``size``: Nano/Super serve 1024^2 images and the same square for
+    # video unless the deployment says otherwise; Edge is 480p-native (the
+    # yaml sets 640x640 images and 832x480 video).
+    image_size_default: tuple[int, int] = (1024, 1024)
+    video_size_default: tuple[int, int] | None = None
+    # Classifier-free guidance defaults for image/video requests (action
+    # requests use ``guidance_scale_action``).
+    guidance_scale: float = 6.0
+    # Flow shifts: text-to-image follows the reference t2i recipe (3.0);
+    # video keeps the checkpoint scheduler's shift unless set (Edge: 12.0).
+    flow_shift_image: float | None = 3.0
+    flow_shift_video: float | None = None
+    # ``model_index.json``: the pipeline sets the UniPC schedule from
+    # explicitly linspaced flow sigmas (1 - 1/T ... 0) instead of the
+    # scheduler's own timestep spacing. Edge checkpoints set it; the karras
+    # transform is off on that path (the reference recipes pass
+    # ``use_karras_sigmas=False``) unless a request re-enables it.
+    use_native_flow_schedule: bool = False
 
     # ----- denoise CUDA-graph capture (serving knobs) -----
     # Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier
@@ -186,9 +359,27 @@ class Cosmos3Config:
     # ----- sub-configs -----
     vae: Cosmos3VAEConfig = field(default_factory=Cosmos3VAEConfig)
     scheduler: Cosmos3SchedulerConfig = field(default_factory=Cosmos3SchedulerConfig)
+    # The understanding tower served as a VLM (vision tower + projector);
+    # None for checkpoints that ship no reasoner (Nano/Super generators).
+    reasoner: Cosmos3ReasonerConfig | None = None
 
     # ----- provenance -----
     local_dir: str = ""
+
+    @property
+    def nemotron_norm(self) -> bool:
+        """Whether every RMSNorm uses the Nemotron ordering (fp32 weight
+        multiply, then one cast) — the dense relu2 backbone family."""
+        return self.hidden_act == "relu2"
+
+    @property
+    def gated_mlp(self) -> bool:
+        """SwiGLU (gate/up/down) MLPs vs the dense two-projection relu2 ones."""
+        return self.hidden_act != "relu2"
+
+    @property
+    def serves_reasoner(self) -> bool:
+        return self.reasoner is not None
 
     @classmethod
     def from_transformer_dict(cls, d: dict[str, Any]) -> "Cosmos3Config":
@@ -225,5 +416,27 @@ class Cosmos3Config:
         if sched_path.exists():
             with open(sched_path) as f:
                 cfg.scheduler = Cosmos3SchedulerConfig.from_dict(json.load(f))
+
+        index_path = root / "model_index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                index = json.load(f)
+            cfg.use_native_flow_schedule = bool(index.get("use_native_flow_schedule", False))
+
+        top_path = root / "config.json"
+        if top_path.exists():
+            with open(top_path) as f:
+                top = json.load(f)
+            if top.get("model_type") in REASONER_MODEL_TYPES and (root / "vision_encoder").exists():
+                reasoner = Cosmos3ReasonerConfig.from_dict(top)
+                for name, attr in (
+                    ("preprocessor_config.json", "image_processor"),
+                    ("video_preprocessor_config.json", "video_processor"),
+                ):
+                    proc_path = root / name
+                    if proc_path.exists():
+                        with open(proc_path) as f:
+                            setattr(reasoner, attr, Cosmos3MediaProcessorConfig.from_dict(json.load(f)))
+                cfg.reasoner = reasoner
 
         return cfg
