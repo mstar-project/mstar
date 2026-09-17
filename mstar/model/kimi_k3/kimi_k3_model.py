@@ -88,6 +88,18 @@ class KimiK3Model(Model):
         # speculative decoding (plan section 8): k drafted tokens per step, verified in one
         # k + 1 token pass; 0 = one token per step. Greedy verification for now.
         self.speculative_tokens = int(kwargs.get("speculative_tokens", 0))
+        # the DSpark draft checkpoint (a directory with config.json + model.safetensors); without it a
+        # speculating node drafts the bonus token repeated (the stand-in, for exercising the path)
+        self.speculative_draft = kwargs.get("speculative_draft")
+        self.draft_config = None
+        if self.speculative_draft:
+            from mstar.model.kimi_k3.dspark.config import DSparkConfig
+
+            if self.speculative_tokens <= 0:
+                raise ValueError("speculative_draft needs speculative_tokens > 0")
+            self.draft_config = DSparkConfig.from_dir(_resolve_snapshot(self.speculative_draft, cache_dir))
+            if self.draft_config.hidden_size != self.config.text.hidden_size:
+                raise ValueError("the draft shares the target's embedding and head: hidden sizes must match")
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
         # requests per prefill step (the scheduler splits larger groups); None lifts the cap
@@ -207,6 +219,24 @@ class KimiK3Model(Model):
             [SpecAcceptanceSpec(resource_key=SPEC, nodes={LLM}, num_speculative=self.speculative_tokens)]
             if self.speculative_tokens > 0 else []
         )
+        if self.draft_config is not None:
+            from mstar.model.kimi_k3.dspark.model import DSPARK_ATTN, DSPARK_KV
+            from mstar.model.kimi_k3.dspark.rope import yarn_mscale
+
+            d = self.draft_config
+            # the draft's own latent cache: the context KV of the target's positions, 5 layers; it
+            # appends k + 1 entries per step and is trimmed by the same verdict as the target's cache
+            draft_kv = KVConfig(
+                num_layers=d.num_hidden_layers, num_kv_heads=1, head_dim=d.kv_lora_rank + d.qk_rope_head_dim,
+                max_seq_len=t.max_position_embeddings, num_qo_heads=d.num_attention_heads, layout=KVLayout.MLA,
+                kv_lora_rank=d.kv_lora_rank, qk_rope_head_dim=d.qk_rope_head_dim,
+            )
+            scale = d.qk_head_dim ** -0.5 * yarn_mscale(d.rope.factor, d.rope.mscale_all_dim) ** 2
+            speculative += [
+                KVSpec(resource_key=DSPARK_KV, nodes={LLM}, config=draft_kv, plan_after=(SPEC,)),
+                AttentionSpec(resource_key=DSPARK_ATTN, nodes={LLM},
+                              config=AttentionConfig(kv_cache=DSPARK_KV, backend=AttnBackend.FLASHINFER_MLA, sm_scale=scale)),
+            ]
         return [
             # the cache trims a verify step's rejected tail from the acceptance verdicts, so it plans after them
             KVSpec(resource_key=MLA_KV, nodes={LLM}, config=kv_config,
@@ -310,11 +340,32 @@ class KimiK3Model(Model):
         graph_safe = select_kda_kernels(language_model, device, self.kda_backend) and flashinfer_mla_supports(
             self.config.text.kv_lora_rank, self.config.text.qk_rope_head_dim
         )
+        draft = None
+        if self.draft_config is not None:
+            from mstar.engine.resources.attn.flashinfer_mla import flashinfer_mla_supports
+            from mstar.model.kimi_k3.dspark.model import DSparkDraft
+
+            d = self.draft_config
+            with torch.device("meta"):
+                draft = DSparkDraft(d, language_model.model.embed_tokens, language_model.lm_head, comm_group=tp_group,
+                                    max_positions=min(self.config.text.max_position_embeddings, 65536))
+            draft = draft.to(dtype)
+            draft.to_empty(device=device)
+            draft.rope.__init__(d.qk_rope_head_dim, d.rope, min(self.config.text.max_position_embeddings, 65536))
+            draft.rope.to(device)
+            loaded = draft.load_weights(_resolve_snapshot(self.speculative_draft, self.cache_dir))
+            missing = {n for n, _ in draft.named_parameters()} - loaded
+            if missing:
+                raise ValueError(f"draft checkpoint left {len(missing)} parameters unloaded, e.g. {sorted(missing)[:3]}")
+            draft.eval()
+            graph_safe = graph_safe and flashinfer_mla_supports(d.kv_lora_rank, d.qk_rope_head_dim)
+            logger.info("Loaded the DSpark draft (%d layers, %d drafts per step) on %s", d.num_hidden_layers,
+                        self.speculative_tokens, device)
         submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config, cuda_graphs=graph_safe,
                                        max_capture_batch_size=self.max_capture_batch_size,
                                        max_prefill_batch_size=self.max_prefill_batch_size,
                                        mixed_prefill_decode=self.mixed_prefill_decode,
-                                       speculative_tokens=self.speculative_tokens)
+                                       speculative_tokens=self.speculative_tokens, draft=draft)
         self._submodule_cache[node_name] = submodule
         logger.info("Loaded Kimi K3 %s on %s", node_name, device)
         return submodule
