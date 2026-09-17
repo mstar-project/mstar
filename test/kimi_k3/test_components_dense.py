@@ -74,7 +74,7 @@ def test_kda_paged_kernel_matches_dense(mstar_model, tiny_dir):
     # paged: slots 1 (A) and 2 (B), packed prefill of both, then a decode of A only
     p = layer.params()
     n_slots = 3
-    conv = torch.zeros(n_slots, 3 * layer.projection_size, cfg.kda_conv_kernel_size)
+    conv = torch.zeros(n_slots, 3 * layer.projection_size, cfg.kda_conv_kernel_size - 1)  # the pool's W - 1 columns
     rec = torch.zeros(n_slots, layer.num_heads, layer.head_dim, layer.head_dim)
     qkv, g_raw, beta_raw, g_out = layer._project(x)
     o = layer.kernels.run_lists(qkv, g_raw, beta_raw, [0, t1, t1 + t2], [1, 2], [False, False], conv, rec, p)
@@ -87,7 +87,7 @@ def test_kda_paged_kernel_matches_dense(mstar_model, tiny_dir):
     o2 = layer.kernels.run_lists(qkv2, g2, b2, [0, 2], [1], [True], conv, rec, p)
     torch.testing.assert_close(layer._finish(gout2, o2), out_a2, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(from_v_first(rec[1]), st_a2.recurrent, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(conv[1, : layer.projection_size], st_a2.conv_q, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(conv[1, : layer.projection_size], st_a2.conv_q[:, 1:], rtol=1e-5, atol=1e-5)
 
 
 def test_kda_params_bundle_is_cached_and_invalidated(mstar_model):
