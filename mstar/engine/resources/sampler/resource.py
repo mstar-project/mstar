@@ -11,7 +11,7 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
-from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
+from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers, verify_greedy
 from mstar.engine.resources.step import SlotLease, StepContext
 
 
@@ -256,6 +256,25 @@ class SamplerResource(Resource):
             )
 
     ### Submodule-level functionality
+
+    def sample_verify(
+        self, request_ids: list[str], logits: torch.Tensor, drafts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify a speculative block: ``logits [N * (k + 1), V]`` at each
+        request's bonus-plus-drafts positions, ``drafts [N, k]``. Returns
+        ``(tokens [N, k + 1], accepted [N])`` as ``verify_greedy`` defines them,
+        agreed across TP ranks (rank 0's result is broadcast, as for ``sample``:
+        the all-reduces may round differently per rank). Greedy only for now:
+        a request's temperature is not applied here (rejection sampling against
+        the draft distribution is the follow-up), so a node that speculates
+        should refuse requests with temperature > 0 or say so.
+        """
+        del request_ids
+        tokens, accepted = verify_greedy(logits, drafts)
+        packed = torch.cat([tokens, accepted.to(tokens.dtype).unsqueeze(1)], dim=1)
+        packed = (self._cg_sampler or self._sampler)._broadcast_tokens(packed)
+        return packed[:, :-1], packed[:, -1].to(torch.int32)
+
 
     def sample(
         self, request_ids: list[str], logits: torch.Tensor, **kwargs
