@@ -1381,6 +1381,8 @@ class PiecewiseCudaGraphRunner:
                 self._config.replay_seq_lens(data.shape, seq_lens, real_bs),
                 data.bucket,
                 capture=False,
+                slot=self._current_slot,
+                real_bs=real_bs,
                 step_kwargs=step_kwargs,
             )
         self._plan(step, data.shape)
