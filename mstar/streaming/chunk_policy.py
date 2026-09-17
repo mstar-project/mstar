@@ -150,3 +150,40 @@ class FixedChunkPolicy(ChunkPolicy):
 
     def continue_after_producer_done(self) -> bool:
         return self._continue_after_done
+
+
+class RampChunkPolicy(ChunkPolicy):
+    """A smaller first chunk, then fixed non-overlapping chunks.
+
+    A streaming consumer that re-runs over the whole accumulated stream on
+    every chunk (a flow-matching mel decoder conditioned on all tokens so far)
+    wants its first chunk as early as the model allows, for time-to-first-audio,
+    and later chunks sized for throughput. ``first_chunk`` items release the
+    first chunk; every later chunk is ``chunk_size`` items. No overlap: the
+    consumer keeps its own history.
+
+    ``continue_after_done`` behaves as in :class:`FixedChunkPolicy`.
+    """
+
+    def __init__(self, first_chunk: int, chunk_size: int, continue_after_done: bool = False):
+        super().__init__()
+        if first_chunk <= 0 or chunk_size <= 0:
+            raise ValueError("first_chunk and chunk_size must be positive")
+        self._first_chunk = first_chunk
+        self._chunk_size = chunk_size
+        self._continue_after_done = continue_after_done
+
+    def _current(self) -> int:
+        return self._chunk_size if self.first_chunk_read else self._first_chunk
+
+    def is_ready(self, buffer_len: int) -> bool:
+        return buffer_len >= self._current()
+
+    def next_chunk_size(self, buffer_len: int) -> int:
+        return self._current()
+
+    def window_size(self) -> int:
+        return self._current()
+
+    def continue_after_producer_done(self) -> bool:
+        return self._continue_after_done
