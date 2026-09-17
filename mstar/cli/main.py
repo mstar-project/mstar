@@ -41,6 +41,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "wan22": "wan22.yaml",
     "flux2_klein": "flux2_klein.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
+    "z_image_turbo": "z_image_turbo.yaml",
 }
 
 
@@ -103,7 +104,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
     if model in ("cosmos3", "cosmos3_super"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
-    if model in ("flux2_klein", "flux2_klein_9b"):
+    if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
         lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
@@ -133,7 +134,8 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
-    if model in ("bagel", "qwen3_omni", "orpheus", "cosmos3", "cosmos3_super", "flux2_klein", "flux2_klein_9b"):
+    if model in ("bagel", "qwen3_omni", "orpheus", "cosmos3", "cosmos3_super", "flux2_klein", "flux2_klein_9b",
+                 "z_image_turbo"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
@@ -147,7 +149,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
             lines.append("    oai.images.generate(model=\"bagel\", prompt=\"a cat\")")
         if model in ("cosmos3", "cosmos3_super"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
-        if model in ("flux2_klein", "flux2_klein_9b"):
+        if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
     lines.append("")
     return "\n".join(lines)
