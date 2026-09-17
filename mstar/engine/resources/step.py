@@ -80,6 +80,14 @@ class StepContext:
     def set_padded_rids(self, padded_rids: Sequence[str] | None):
         self._padded_request_ids = padded_rids
 
+    def is_padding_row(self, rid: str) -> bool:
+        """Whether ``rid`` is one of the runner's padding rows: in the padded
+        addressing of a captured replay but not among this step's real
+        requests. Such a row carries a template span so the replay's shapes
+        match the capture, yet it stands for no request, so a resource must
+        reserve, address and commit nothing for it."""
+        return self._padded_request_ids is not None and rid not in self.request_ids
+
     def set_piecewise_leases(self, leases: "Mapping[str, SlotLease]"):
         self.piecewise_leases = leases
 
