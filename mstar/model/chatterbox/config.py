@@ -400,6 +400,18 @@ class ChatterboxConfig:
     max_text_tokens: int = 512
     voice_cache_size: int = 64
 
+    # S3Gen streaming: the first waveform chunk is synthesised once
+    # ``stream_first_chunk_tokens`` speech tokens exist, later chunks every
+    # ``stream_chunk_tokens`` tokens (0 = one chunk per utterance, the
+    # reference's offline behaviour). Each chunk re-runs the flow decoder over
+    # every token so far with a fixed per-request noise field and withholds the
+    # encoder's look-ahead tokens; the vocoder keeps ``stream_mel_cache_frames``
+    # mel frames of context and crossfades the re-synthesised tail
+    # (CosyVoice 2's token2wav scheme).
+    stream_first_chunk_tokens: int = 15
+    stream_chunk_tokens: int = 25
+    stream_mel_cache_frames: int = 8
+
     @property
     def sample_rate(self) -> int:
         return self.s3gen.sample_rate
