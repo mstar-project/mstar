@@ -59,6 +59,10 @@ class _TokenizerStub:
         return torch.arange(1, self.n + 1, dtype=torch.long)
 
 
+def _sampler_spec(model: ChatterboxModel) -> SamplerSpec:
+    return next(s for s in model.get_node_resources() if isinstance(s, SamplerSpec))
+
+
 def _make_model(variant: str = "chatterbox", voices_dir=None) -> ChatterboxModel:
     model = object.__new__(ChatterboxModel)
     model.config = ChatterboxConfig.from_variant(variant)
@@ -473,7 +477,8 @@ def test_t3_prefill_inputs_and_cfg_step_declaration():
     assert packed["input_embeds"].shape[0] == 2 * total  # main rows then uncond rows
     assert packed["requires_cfg"] is True
     assert packed["cfg_weight"].tolist() == [[0.5], [0.5]]
-    assert torch.allclose(packed["temperature"], torch.full((2, 1), 0.8))
+    # sampling knobs are the sampler resource's, not forward inputs
+    assert set(packed) == {"input_embeds", "requires_cfg", "cfg_weight"}
 
     step = sub.declare_step("prefill", ["a", "b"], inputs)
     assert step.cg_key_info is True
@@ -536,18 +541,16 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     assert turbo.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}) is False
 
 
-def test_t3_min_p_mask_matches_hf_semantics():
-    logits = torch.tensor([[2.0, 1.0, -3.0, 0.5]])
-    temperature = torch.tensor([[0.8]])
-    min_p = torch.tensor([[0.05]])
-    probs = torch.softmax(logits / temperature, dim=-1)
-    keep = probs >= min_p * probs.max()
-    masked = T3Submodule._apply_min_p(logits, min_p, temperature)
-    assert torch.equal(torch.isfinite(masked), keep)
-    # min_p 0 keeps everything; greedy keeps the argmax
-    assert torch.isfinite(T3Submodule._apply_min_p(logits, torch.zeros(1, 1), temperature)).all()
-    greedy = T3Submodule._apply_min_p(logits, min_p, torch.zeros(1, 1))
-    assert torch.isfinite(greedy).sum() == 1 and torch.isfinite(greedy[0, 0])
+def test_sampler_min_p_goes_through_the_resource():
+    """The reference applies min_p after the penalty and temperature; that
+    order only exists inside the sampler, so the knob rides the request's
+    SamplingReqConfig and the T3 node declares the capability."""
+    model = _make_model()
+    assert model.get_request_resource_configs({}, {"seed": 1})[T3_SAMPLER].min_p == 0.05
+    assert _sampler_spec(model).enable_min_p is True
+    turbo = _make_model("turbo")
+    assert turbo.get_request_resource_configs({}, {"min_p": 0.1, "seed": 1})[T3_SAMPLER].min_p == 0.0
+    assert _sampler_spec(turbo).enable_min_p is False
 
 
 def test_t3_stop_on_eos_and_token_budget():
