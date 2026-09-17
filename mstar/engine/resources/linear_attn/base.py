@@ -47,6 +47,7 @@ class LinearAttnManager(AttentionResource):
 
             return KDAManager(
                 config=spec.config, geometry=geometry, num_layers=pool_config.num_layers, device=info.device,
+                speculative_tokens=DeltaNetGeometry.speculative_tokens_of(pool_config.blocks),
             )
         if backend is not LinearAttnBackend.FLASHINFER:
             raise ValueError(f"Unknown linear attention backend {backend!r}")
