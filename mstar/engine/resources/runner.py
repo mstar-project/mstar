@@ -312,7 +312,10 @@ class StepRunner:
                     range_pop()
 
     def publish(
-        self, request_ids: list[str], node_name: str | None = None,
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
@@ -328,7 +331,9 @@ class StepRunner:
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
-                info = resource.publish(rid)
+                info = resource.publish_for_step(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
                 if info is not None:
                     per_key[key] = info
             out[rid] = per_key

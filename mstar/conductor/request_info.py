@@ -115,6 +115,6 @@ class PartitionState:
     wg_rank_completions: dict[str, int] = field(default_factory=dict)
     num_output_tokens: int = 0
     curr_forward_outputs: list[str] = field(default_factory=list)
-    # resource label -> PublishedInfo, accumulated from the rank-0 worker's
-    # reports and handed back out on the next forward
+    # resource label -> PublishedInfo, accumulated across all TP ranks and
+    # handed back out on the next forward
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)

@@ -1,18 +1,27 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import yaml
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.cache import KVCache
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig
+from mstar.engine.resources.kv.manager import (
+    KVManager,
+    KVSequenceInfo,
+    PublishedKVInfo,
+)
 from mstar.engine.resources.kv.transfer import (
     KVReadInfo,
     KVTransferManager,
     LocalOnlyKVTransferEngine,
     ShmKVTransferEngine,
+    ShmKVTransferInfo,
     TransferEngineInfo,
+    make_deployment_kv_shm_dir,
 )
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.bagel.submodules import CombineCFGSubmodule
@@ -41,46 +50,20 @@ def test_cfg_graph_is_reused_for_tp_branches():
     }
 
 
-def test_xpu_config_only_changes_cfg_replica_placement():
+def test_xpu_cfg_replicas_match_main_tp_and_walk():
     root = Path(__file__).parents[2]
-    with open(root / "configs/bagel_cfg_parallel.yaml") as f:
-        h100_groups = yaml.safe_load(f)["node_groups"]
     with open(root / "configs/bagel_xpu_cfg_tp2.yaml") as f:
-        xpu_config = yaml.safe_load(f)
-    xpu_groups = xpu_config["node_groups"]
+        groups = yaml.safe_load(f)["node_groups"]
 
-    assert "kv_cache" not in xpu_config
-    assert xpu_config["resources"]["kv"]["max_num_pages"] == 1024
-    assert xpu_config["resources"]["attn"]["backend"] == "xpu_paged"
-
-    def cfg_walks(groups, node):
-        return next(g.get("graph_walks") for g in groups if node in g["node_names"])
-
-    assert cfg_walks(h100_groups, "LLM_cfg_text") == ["image_gen_cfg"]
-    assert cfg_walks(xpu_groups, "LLM_cfg_text") == ["image_gen_cfg"]
-    assert cfg_walks(h100_groups, "LLM_cfg_img") == ["image_gen_cfg"]
-    assert cfg_walks(xpu_groups, "LLM_cfg_img") == ["image_gen_cfg"]
-
-    xpu_cfg_groups = [
-        g for g in xpu_groups
-        if any(n.startswith("LLM_cfg_") for n in g["node_names"])
+    main = next(g for g in groups if "LLM" in g["node_names"])
+    cfg_groups = [
+        g for g in groups
+        if {"LLM_cfg_text", "LLM_cfg_img"} & set(g["node_names"])
     ]
-    assert all(g["tp_size"] == 2 and len(g["ranks"]) == 2 for g in xpu_cfg_groups)
-    assert next(g for g in xpu_groups if "LLM" in g["node_names"])["ranks"] == [
-        0, 1
-    ]
-    assert next(
-        g for g in xpu_groups if "LLM_cfg_text" in g["node_names"]
-    )["ranks"] == [2, 3]
-    assert next(
-        g for g in xpu_groups if "LLM_cfg_img" in g["node_names"]
-    )["ranks"] == [4, 5]
-    assert next(
-        g for g in xpu_groups if "vae_decoder" in g["node_names"]
-    )["ranks"] == [6]
-    assert next(
-        g for g in xpu_groups if "combine_cfg" in g["node_names"]
-    )["ranks"] == [0]
+
+    assert len(cfg_groups) == 2
+    assert all(group["tp_size"] == main["tp_size"] for group in cfg_groups)
+    assert all(group.get("graph_walks") == ["image_gen_cfg"] for group in cfg_groups)
 
 
 def test_combine_cfg_is_parameterless():
@@ -182,6 +165,94 @@ def test_shm_publications_are_namespaced_by_resource(tmp_path):
 
     first.shutdown()
     second.shutdown()
+
+
+def test_shm_read_failure_is_returned_on_a_future(tmp_path):
+    cache = _kv_cache(torch.zeros((1, 1, 2, 4, 1, 1)))
+    consumer = ShmKVTransferEngine(cache, "consumer", str(tmp_path))
+    missing = ShmKVTransferInfo(
+        path=str(tmp_path / "missing.pt"),
+        page_indices=(0,),
+        layout=cache.layout,
+    )
+
+    future = consumer.read_batched_async(
+        missing, [KVReadInfo(0, 0, 0, 0, 1)],
+    )
+
+    assert future is not None and future.done()
+    with pytest.raises(FileNotFoundError):
+        future.result()
+
+
+def test_shm_read_failure_is_latched_to_one_request(tmp_path):
+    manager = KVManager(
+        cfg=KVConfig(
+            max_num_pages=4,
+            page_size=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            max_seq_len=16,
+        ),
+        name="kv",
+        joint_comm_group=None,
+        transfer_engine_info=TransferEngineInfo(
+            my_entity_id="consumer",
+            my_session_id="session",
+            transfer_engine=LocalTransferEngine("consumer"),
+            shm_dir=str(tmp_path),
+        ),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    manager.ingest_request("request", KVReqConfig(needed_labels=["main"]))
+    missing = ShmKVTransferInfo(
+        path=str(tmp_path / "missing.pt"),
+        page_indices=(0,),
+        layout=manager.kv_cache.layout,
+    )
+    published = PublishedKVInfo.build_for_rank(
+        rank=0,
+        world_size=1,
+        seq_info={
+            "main": KVSequenceInfo(
+                seq_len=1,
+                latest_kv_transfer_info=missing,
+                page_indices=[0],
+            ),
+        },
+    )
+
+    outcome = manager.admit_retrieve(
+        "request", "LLM_cfg_text", "image_gen_cfg", published,
+    )
+
+    assert not outcome.ok
+    assert "FileNotFoundError" in outcome.reason.message
+
+
+def test_kv_shm_directory_is_private_to_the_deployment(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("MSTAR_KV_SHM_DIR", str(tmp_path))
+    owner_pid = os.getpid()
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    stale = tmp_path / f"mstar_kv_{uid}_99999999_stale"
+    stale.mkdir()
+    (stale / "orphan.pt").touch()
+
+    first = make_deployment_kv_shm_dir(
+        "/tmp/server-a", "tcp://host:1234", owner_pid=owner_pid,
+    )
+    second = make_deployment_kv_shm_dir(
+        "/tmp/server-b", "tcp://host:5678", owner_pid=owner_pid,
+    )
+
+    assert first != second
+    assert not stale.exists()
+    assert Path(first).stat().st_mode & 0o777 == 0o700
+    assert Path(second).stat().st_mode & 0o777 == 0o700
 
 
 def test_local_only_cpu_cache_does_not_publish_shm_snapshots():

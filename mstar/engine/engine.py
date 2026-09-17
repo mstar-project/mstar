@@ -1072,7 +1072,9 @@ class Engine:
         try:
             # Returns rid -> {resource label -> published info}
             published = self._runner.publish(
-                batch.request_ids, node_name=batch.node_name,
+                batch.request_ids,
+                node_name=batch.node_name,
+                graph_walk=batch.step_context.graph_walk,
             )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
