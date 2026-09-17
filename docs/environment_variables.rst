@@ -192,13 +192,6 @@ Read by :mod:`mstar.engine.cuda_graph_runner`.
      - unset
      - When set (e.g. ``ATEN`` or ``ATEN,TRITON``), restricts Inductor's
        ``max_autotune_gemm_backends``; only matters under an autotuning mode.
-   * - ``MSTAR_PROFILE_STEPS``
-     - unset
-     - ``<first>:<count>``: per-kernel ``torch.profiler`` trace of ``count``
-       consecutive GPU-thread executes starting at the ``first``-th
-       (:class:`mstar.utils.profiler.StepKernelTrace`), written under
-       ``MSTAR_PROFILE_DIR``; summarise with ``env/kernel_trace_summary.py``.
-       ``MSTAR_PROFILE_NSYS=1`` emits NVTX ranges instead.
 
 GLM-5.2 (MTP, capture, collectives)
 -----------------------------------
