@@ -1,17 +1,20 @@
 """Windowed (sliding-window) autoregressive generation support.
 
 ``WindowSchedule`` is pure window arithmetic over abstract sequence units
-(latent frames for video models). ``WindowedKVSession`` turns schedule events
-into KV-cache lifecycle calls — protect the immutable prefix once, release
-aged-out context after each window commit — so a model drives windowed
-generation without hand-rolling page/token bookkeeping. Models own their
-walk, conditioning math, and attention plans; this module owns the schedule
-and the lifecycle sequencing. The handle is the KV resource
-(``KVManager.protect_prefix`` / ``release_oldest``).
+(latent frames for video models). ``WindowedKVSession`` turns a schedule into
+the KV cache's retention policy — the immutable prefix protected, everything
+older than the context horizon released as each window commits — so a model
+drives windowed generation without hand-rolling page/token bookkeeping.
+Models own their walk, conditioning math, and step declarations; this module
+owns the schedule and the retention arithmetic. The handle is the KV resource
+(``KVManager.set_retention``); the pool applies the policy inside each commit,
+which is what makes the release safe under the engine's step pre-planning.
 
 Ported from #198 (merceod) onto the resource-pool engine.
 """
 from dataclasses import dataclass
+
+from mstar.engine.resources.kv.manager import RetentionPolicy
 
 
 @dataclass(frozen=True)
@@ -104,14 +107,13 @@ class WindowSchedule:
 
 
 class WindowedKVSession:
-    """KV lifecycle driver for one (request, label) under a ``WindowSchedule``.
+    """KV retention for one (request, label) under a ``WindowSchedule``.
 
-    ``handle`` provides ``protect_prefix(request_id, num_tokens, label=...)``
-    and ``release_oldest(request_id, num_tokens, label=...) -> int`` (the
+    ``handle`` provides ``set_retention(request_id, policy, label=...)`` (the
     ``KVManager`` surface). Units convert to cache tokens via
-    ``tokens_per_unit``. Releases are page-floored by the
-    allocator; the session re-offers the shortfall on the next call, so the
-    realized context tracks the nominal one within a page.
+    ``tokens_per_unit``. Releases are page-floored by the pool and the
+    shortfall re-offered at the next commit, so the realized context tracks
+    the nominal one within a page.
     """
 
     def __init__(
@@ -131,38 +133,32 @@ class WindowedKVSession:
         self._label = label
         self._schedule = schedule
         self._tokens_per_unit = tokens_per_unit
-        self._prefix_protected = False
-        self._released_tokens = 0
+        self._bound = False
 
     @property
-    def released_tokens(self) -> int:
-        return self._released_tokens
+    def context_tokens(self) -> int | None:
+        """Committed generation tokens the cache keeps behind the prefix;
+        ``None`` when the schedule retains everything."""
+        if self._schedule.context_units == 0:
+            return None
+        return self._schedule.context_units * self._tokens_per_unit
 
-    def protect_prefix(self, prefix_tokens: int) -> None:
-        """Protect the immutable stream head (e.g. the text prefix). Call
-        once, after the prefix has committed and before any release."""
-        if self._prefix_protected:
+    def bind(self, prefix_tokens: int) -> RetentionPolicy | None:
+        """Install the retention once the immutable stream head (e.g. the
+        text prefix) has committed and before the first window commits. A
+        schedule with unbounded context installs nothing (there is never a
+        release, so nothing to protect). Returns the installed policy."""
+        if self._bound:
             raise RuntimeError(
-                f"prefix already protected for request "
+                f"retention already bound for request "
                 f"{self._request_id!r} label {self._label!r}"
             )
-        self._handle.protect_prefix(
-            self._request_id, prefix_tokens, label=self._label
+        self._bound = True
+        budget = self.context_tokens
+        if budget is None:
+            return None
+        policy = RetentionPolicy(
+            context_budget=budget, protected_prefix=prefix_tokens,
         )
-        self._prefix_protected = True
-
-    def after_commit(self, window_index: int) -> int:
-        """Release context that aged out once ``window_index`` committed.
-        Returns tokens actually freed (0 when nothing aged out yet, or the
-        accumulated shortfall is still under a page)."""
-        target = (
-            self._schedule.released_end(window_index) * self._tokens_per_unit
-        )
-        ask = target - self._released_tokens
-        if ask <= 0:
-            return 0
-        freed = self._handle.release_oldest(
-            self._request_id, ask, label=self._label
-        )
-        self._released_tokens += freed
-        return freed
+        self._handle.set_retention(self._request_id, policy, label=self._label)
+        return policy
