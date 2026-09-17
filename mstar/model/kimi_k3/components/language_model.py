@@ -102,7 +102,7 @@ class KimiK3LanguageModel(nn.Module):
     def _set_cursors(self, layer: KimiK3DecoderLayer) -> None:
         i = layer.layer_idx
         if layer.is_kda:
-            layer.self_attn.state.set_default_layer_idx(self._kda_slots[i])
+            layer.self_attn.attn.set_default_layer_idx(self._kda_slots[i])
         else:
             layer.self_attn.kv.set_default_layer_idx(self._mla_slots[i])
             layer.self_attn.attn.set_default_layer_idx(self._mla_slots[i])
@@ -151,19 +151,19 @@ class KimiK3LanguageModel(nn.Module):
         return self._finish(prefix, blocks, pending), new_state
 
 
-def select_kda_kernels(model: nn.Module, device) -> bool:
-    """Install the best KDA kernels for ``device`` on every KDA layer; returns whether
-    the decode path may be captured in a CUDA graph."""
-    from mstar.model.kimi_k3.components.kda_kernels import default_kernels
+def select_kda_kernels(model: nn.Module, device, backend: str = "auto") -> bool:
+    """Whether the KDA decode path may be captured in a CUDA graph on ``device``: the
+    ``KDAManager`` the engine builds for the model picks the same kernels
+    (``kda_kernels.default_kernels``), and only the fla / FlashKDA bundles address the pool
+    through tensors. Off-GPU the layers install the torch reference at bind time."""
+    from mstar.engine.resources.linear_attn.kda_kernels import default_kernels
 
     layers = [mod for mod in model.modules() if isinstance(mod, ParallelKDAAttention)]
     if not layers:
         return True
     # FlashKDA is specialised for head_dim 128 with a bounded gate; other shapes use fla
     fits = all(m.head_dim == 128 and m.gate_lower_bound is not None for m in layers)
-    kernels = default_kernels(device, prefer="flashkda" if fits else "fla")
-    for mod in layers:
-        mod.set_kernels(kernels)
+    kernels = default_kernels(device, backend, fits)
     return bool(getattr(kernels, "cuda_graph_safe", False))
 
 
