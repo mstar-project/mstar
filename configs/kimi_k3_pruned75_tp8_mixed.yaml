@@ -7,7 +7,7 @@ max_seq_len: 16384
 model_kwargs:
   checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ckpt/Kimi-K3-pruned75
   max_output_tokens: 2048
-  max_capture_batch_size: 64   # = kda_state.max_num_slots
+  max_capture_batch_size: 64   # = kda_state.max_slots - 1
   max_prefill_batch_size: 8    # prompts per prefill step
   mixed_prefill_decode: true
 node_groups:
@@ -20,4 +20,4 @@ resources:
     max_num_pages: 1792      # 64 requests x 24 pages (1024+512 tokens) + 128 capture rows; 3.2 GB per rank
     page_size: 64
   kda_state:
-    max_num_slots: 64        # 64 x 54 MiB = 3.5 GB per rank (captures/padding use the scratch slot)
+    max_slots: 65        # 64 x 54 MiB = 3.5 GB per rank (+1 sink slot for captures/padding)
