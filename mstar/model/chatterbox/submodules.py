@@ -481,14 +481,44 @@ class T3Submodule(ARNodeSubmodule):
 # ===========================================================================
 
 
-class S3GenSubmodule(NodeSubmodule):
-    """Flow-matching mel decoder + HiFT vocoder over one utterance's tokens.
+@dataclass
+class StreamState:
+    """One request's progress through chunked synthesis.
 
-    The reference conditioning (prompt tokens, prompt mel, x-vector) comes from
-    the checkpoint's built-in voice or from the request's reference clip,
-    computed on first use and cached per voice. The CFM noise and the vocoder's
-    source excitation are drawn from a generator seeded with the request seed,
-    so a request is reproducible.
+    ``tokens`` is every speech token received so far; ``token_offset`` how
+    many of them have been turned into mel and vocoded. ``noise`` is the
+    request's fixed flow-matching noise field (drawn once, indexed by frame),
+    which is what keeps the mel of already-emitted frames stable when the
+    decoder is re-run with more context. ``hift_mel`` / ``hift_source`` /
+    ``hift_speech`` are the vocoder's held-back tail: the last mel frames,
+    their harmonic excitation and the waveform that was not emitted yet; the
+    next chunk re-vocodes those frames in context and crossfades them.
+    """
+
+    tokens: torch.Tensor
+    token_offset: int = 0
+    noise: torch.Tensor | None = None
+    hift_mel: torch.Tensor | None = None
+    hift_source: torch.Tensor | None = None
+    hift_speech: torch.Tensor | None = None
+    chunks_emitted: int = 0
+    done: bool = False
+
+
+class S3GenSubmodule(NodeSubmodule):
+    """Flow-matching mel decoder + HiFT vocoder over a stream of speech tokens.
+
+    A request whose whole token sequence arrives in one final chunk (the
+    offline policy) is synthesised exactly as the reference does it. A
+    streamed request follows CosyVoice 2's token2wav: every chunk re-runs the
+    flow decoder over all tokens so far (fixed noise field, look-ahead tokens
+    withheld until the end), vocodes only the new frames behind a small mel
+    cache, continues the harmonic source from the previous chunk and
+    crossfades the re-synthesised tail before emitting.
+
+    The reference conditioning (prompt tokens, prompt mel, x-vector) comes
+    from the checkpoint's built-in voice or from the request's reference clip,
+    computed on first use and cached per voice.
     """
 
     disable_torch_compile = True
@@ -505,6 +535,19 @@ class S3GenSubmodule(NodeSubmodule):
         self.builtin_voice = builtin_voice
         self.watermarker = watermarker
         self.cache = VoiceCache(config.voice_cache_size)
+        s3 = config.s3gen
+        self.frames_per_token = s3.token_mel_ratio
+        self.samples_per_frame = s3.hift.upsample_factor
+        self.lookahead_tokens = s3.encoder.pre_lookahead_len
+        self.cache_frames = config.stream_mel_cache_frames
+        self.cache_samples = self.cache_frames * self.samples_per_frame
+        # crossfade of the re-synthesised tail: the second half of a Hamming
+        # window fades the old tail out while the first half fades the new in
+        self.register_buffer(
+            "fade_window", torch.hamming_window(2 * self.cache_samples, periodic=False), persistent=False,
+        )
+
+    # -- reference conditioning ---------------------------------------------
 
     @torch.no_grad()
     def condition(self, wav24: torch.Tensor):
@@ -516,7 +559,7 @@ class S3GenSubmodule(NodeSubmodule):
         return self.s3gen.embed_reference(wav24[None], wav16[None], tokens[:, : int(lens[0])])
 
     def _reference(self, inputs: NameToTensorList):
-        if REF_AUDIO not in inputs:
+        if not inputs.get(REF_AUDIO):
             if self.builtin_voice is None:
                 raise ValueError("No reference voice given and the checkpoint ships no built-in voice")
             return self.builtin_voice
@@ -528,61 +571,156 @@ class S3GenSubmodule(NodeSubmodule):
             self.cache.put(key, ref)
         return ref
 
+    # -- inputs ----------------------------------------------------------------
+
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> NodeInputs:
-        del graph_walk, kwargs
+        del graph_walk
         device = self.get_device()
-        chunk = inputs.get(SPEECH_TOKENS, [None])[0]
-        tokens = (
+        chunks = inputs.get(SPEECH_TOKENS) or []
+        chunk = chunks[0] if chunks else None
+        raw = (
             torch.empty(0, dtype=torch.long, device=device)
-            if chunk is None
+            if chunk is None or chunk.numel() == 0
             else chunk.to(device, torch.long).reshape(-1)
         )
+        # The engine names the final chunk; without that (older engines) the
+        # stream ends with T3's stop token or an empty flush.
+        is_final = bool(kwargs.get("is_final_stream_chunk", False)) or chunk is None \
+            or bool((raw == self.config.t3.stop_speech_token).any())
         # BOS/EOS and any other control id are not speech (reference
         # ``drop_invalid_tokens`` + ``< 6561`` filter)
-        tokens = tokens[tokens < self.config.s3gen.vocab_size]
-        if self.config.trailing_silence_tokens and tokens.numel() > 0:
-            silence = torch.full(
-                (self.config.trailing_silence_tokens,), S3GEN_SILENCE_TOKEN,
-                dtype=torch.long, device=device,
-            )
-            tokens = torch.cat([tokens, silence])
+        tokens = raw[raw < self.config.s3gen.vocab_size]
         meta = fwd_info.step_metadata
         return NodeInputs(
             tensor_inputs={SPEECH_TOKENS: tokens},
             kwargs={
+                "request_id": fwd_info.request_id,
                 "ref": self._reference(inputs),
                 "n_timesteps": int(meta.get("n_cfm_timesteps", self.config.generation.n_cfm_timesteps)),
                 "watermark": bool(meta.get("watermark", self.config.generation.watermark)),
                 "seed": int(fwd_info.random_seed),
+                "is_final": is_final,
             },
         )
+
+    # -- synthesis ----------------------------------------------------------------
+
+    def _generator(self, seed: int, device) -> torch.Generator:
+        return torch.Generator(device=device).manual_seed(seed)
+
+    def _with_trailing_silence(self, tokens: torch.Tensor) -> torch.Tensor:
+        n = self.config.trailing_silence_tokens
+        if n <= 0 or tokens.numel() == 0:
+            return tokens
+        silence = torch.full((n,), S3GEN_SILENCE_TOKEN, dtype=torch.long, device=tokens.device)
+        return torch.cat([tokens, silence])
 
     @torch.no_grad()
     def synthesize(
         self, tokens: torch.Tensor, ref, n_timesteps: int, seed: int, watermark: bool,
     ) -> torch.Tensor:
-        """PCM16 for one utterance's speech tokens."""
+        """Whole-utterance synthesis, PCM16: the reference path, one call."""
+        tokens = self._with_trailing_silence(tokens)
         if tokens.numel() == 0:
             return torch.zeros(0, dtype=torch.int16, device=tokens.device)
-        generator = torch.Generator(device=tokens.device).manual_seed(seed)
+        generator = self._generator(seed, tokens.device)
         lens = torch.tensor([tokens.numel()], dtype=torch.long, device=tokens.device)
-        mel = self.s3gen.tokens_to_mel(
-            tokens[None], lens, ref, n_timesteps=n_timesteps, generator=generator,
-        )
+        mel = self.s3gen.tokens_to_mel(tokens[None], lens, ref, n_timesteps=n_timesteps, generator=generator)
         wav = self.s3gen.mel_to_wav(mel, generator=generator)[0]
-        if watermark and self.watermarker is not None:
+        return self._finish(wav, watermark)
+
+    def _finish(self, wav: torch.Tensor, watermark: bool) -> torch.Tensor:
+        if watermark and self.watermarker is not None and wav.numel() > 0:
             wav = self.watermarker.apply(wav, self.config.sample_rate)
         return (wav.clamp(-1, 1) * 32767).to(torch.int16)
 
+    def _noise_field(self, state: StreamState, ref, generator: torch.Generator) -> torch.Tensor:
+        if state.noise is None:
+            prompt_frames = ref.num_prompt_tokens * self.frames_per_token
+            max_tokens = self.config.t3.max_speech_tokens + self.config.trailing_silence_tokens
+            frames = prompt_frames + max_tokens * self.frames_per_token
+            state.noise = torch.randn(
+                (1, self.config.s3gen.output_size, frames),
+                dtype=self.s3gen.dtype, device=self.get_device(), generator=generator,
+            )
+        return state.noise
+
+    @torch.no_grad()
+    def synthesize_chunk(
+        self, state: StreamState, new_tokens: torch.Tensor, is_final: bool, ref,
+        n_timesteps: int, generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Advance one request by a chunk of tokens; returns the waveform to
+        emit now (float, possibly empty)."""
+        device = self.get_device()
+        if state.done:
+            return torch.zeros(0, device=device)
+        state.tokens = torch.cat([state.tokens, new_tokens.to(device)])
+        if is_final:
+            state.tokens = self._with_trailing_silence(state.tokens)
+        n = state.tokens.numel()
+        usable = n if is_final else max(n - self.lookahead_tokens, 0)
+        if usable <= state.token_offset:
+            if not is_final:
+                return torch.zeros(0, device=device)  # not enough new tokens yet
+            state.done = True
+            # nothing new to decode: release the held-back tail as it is
+            tail = state.hift_speech
+            return tail[0] if tail is not None else torch.zeros(0, device=device)
+
+        lens = torch.tensor([n], dtype=torch.long, device=device)
+        noise = self._noise_field(state, ref, generator)
+        mel = self.s3gen.tokens_to_mel(
+            state.tokens[None], lens, ref, n_timesteps=n_timesteps, noise=noise, finalize=is_final,
+        )
+        new_mel = mel[:, :, state.token_offset * self.frames_per_token:]
+        state.token_offset = usable
+
+        first = state.hift_mel is None
+        mel_in = new_mel if first else torch.cat([state.hift_mel, new_mel], dim=2)
+        wav, source = self.s3gen.vocode(
+            mel_in, generator=generator, cache_source=state.hift_source, fade_in=first,
+        )
+        if not first:
+            n_fade = self.cache_samples
+            wav[:, :n_fade] = (
+                wav[:, :n_fade] * self.fade_window[:n_fade]
+                + state.hift_speech[:, -n_fade:] * self.fade_window[n_fade:]
+            )
+        if is_final:
+            state.done = True
+            state.hift_mel = state.hift_source = state.hift_speech = None
+            emitted = wav
+        else:
+            state.hift_mel = mel_in[:, :, -self.cache_frames:]
+            state.hift_source = source[:, :, -self.cache_samples:]
+            state.hift_speech = wav[:, -self.cache_samples:]
+            emitted = wav[:, : -self.cache_samples]
+        state.chunks_emitted += 1
+        return emitted[0]
+
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, speech_tokens: torch.Tensor,
-        ref=None, n_timesteps: int = 10, watermark: bool = True, seed: int = 0, **kwargs,
+        request_id: str = "", ref=None, n_timesteps: int = 10, watermark: bool = True,
+        seed: int = 0, is_final: bool = True, **kwargs,
     ) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
-        return {AUDIO_CHUNK: [self.synthesize(speech_tokens, ref, n_timesteps, seed, watermark)]}
-
+        state = self.request_state(request_id)
+        stream: StreamState | None = state.get("stream")
+        if stream is None and is_final:
+            # the whole utterance in one chunk: the offline reference path
+            state.add("stream", StreamState(tokens=speech_tokens, done=True))
+            return {AUDIO_CHUNK: [self.synthesize(speech_tokens, ref, n_timesteps, seed, watermark)]}
+        if stream is None:
+            device = self.get_device()
+            stream = StreamState(tokens=torch.empty(0, dtype=torch.long, device=device))
+            state.add_all(stream=stream, generator=self._generator(seed, device))
+        wav = self.synthesize_chunk(
+            stream, speech_tokens, is_final, ref, n_timesteps, state["generator"],
+        )
+        return {AUDIO_CHUNK: [self._finish(wav, watermark)]}
 
 def audio_seconds(num_samples: int, sample_rate: int) -> float:
     return num_samples / float(sample_rate) if sample_rate else math.nan
