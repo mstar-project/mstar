@@ -40,6 +40,7 @@ class AttentionConfig:
     # one-token rows on the decode wrapper and their prompt rows on a prefill
     # wrapper sized to them (`FlashInferMixedWrapper`)
     splits: tuple[CombinedSplit, ...] = ()
+    sliding_window: int | None = None
 
 
 @dataclass

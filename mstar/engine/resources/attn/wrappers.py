@@ -188,9 +188,13 @@ class FlashInferPrefillWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        window_left: int = -1,
         **kwargs
     ):
-        """Plan attention and compute KV write indices.
+        """Plan attention over the KV resource's page mappings.
+
+        ``window_left`` counts preceding positions inclusively; -1 is unbounded.
+        KV writes are performed separately by the KV resource.
 
         In CUDA graph mode, updates static buffers via .copy_() so that
         the same GPU addresses are used during graph replay.
@@ -230,6 +234,7 @@ class FlashInferPrefillWrapper:
             q_data_type=dtype,
             # host lengths, so plan neither rebuilds them nor copies pageable ones
             seq_lens=kv_lens,
+            window_left=window_left,
         )
         if self._pinned_done is not None:
             # every copy out of the staging buffers is issued: the next
@@ -343,13 +348,14 @@ class FlashInferDecodeWrapper:
         paged_kv_last_page_len: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
         kv_lens: torch.Tensor | None = None,
+        window_left: int = -1,
         **kwargs
     ):
-        """Plan decode attention and compute KV write locations.
+        """Plan attention for one new query per request.
 
-        For decode, each request appends exactly 1 token. The write
-        location is the last page at position = last_page_len (before
-        the append; after append it becomes last_page_len).
+        The page mappings include the new token's reserved cache position;
+        KV writes are performed separately by the KV resource.
+        ``window_left`` counts preceding positions inclusively; -1 is unbounded.
 
         Inputs may be on CPU; see prefill wrapper's plan docstring.
         """
@@ -383,6 +389,7 @@ class FlashInferDecodeWrapper:
                 q_data_type=dtype,
                 # host lengths, so plan skips rebuilding them (`get_seq_lens`)
                 seq_lens=kv_lens,
+                window_left=window_left,
             )
         finally:
             if self.enable_nvtx:
