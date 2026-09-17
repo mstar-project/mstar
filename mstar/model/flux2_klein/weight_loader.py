@@ -45,7 +45,7 @@ import torch
 
 from mstar.model.components.diffusion.text_encoder import Qwen3HiddenStateEncoder
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
-from mstar.model.flux2_klein.components.vae import Flux2VAE
+from mstar.model.flux2_klein.components.vae import Flux2VAE, remap_flux2_vae_key
 from mstar.model.flux2_klein.config import Flux2KleinConfig, Qwen3EncoderConfig
 from mstar.model.loader.base import StackedParamRule, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_file
@@ -112,14 +112,7 @@ def remap_transformer_key(name: str) -> str:
     return name
 
 
-def remap_vae_key(name: str) -> str:
-    name = name.replace(".down_blocks.", ".down_stages.").replace(".up_blocks.", ".up_stages.")
-    name = name.replace(".downsamplers.0.conv.", ".downsample.").replace(".upsamplers.0.conv.", ".upsample.")
-    name = name.replace(".mid_block.resnets.0.", ".mid.resnet1.").replace(".mid_block.resnets.1.", ".mid.resnet2.")
-    name = name.replace(".mid_block.attentions.0.", ".mid.attn.").replace(".mid.attn.to_out.0.", ".mid.attn.to_out.")
-    name = name.replace(".conv_norm_out.", ".norm_out.")
-    name = name.replace("bn.running_mean", "latent_mean").replace("bn.running_var", "latent_var")
-    return name
+remap_vae_key = remap_flux2_vae_key
 
 
 def remap_text_encoder_key(name: str) -> str:
