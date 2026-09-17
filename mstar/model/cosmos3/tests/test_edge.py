@@ -570,3 +570,24 @@ def test_edge_reasoner_video_prompt() -> None:
         input_metadata={"video_inputs": [{"average_fps": 10.0}]}, video_num_frames=4,
     )
     assert int(out2["vision_grid_thw"][0][0, 0]) == 4
+
+
+@needs_edge
+def test_edge_text_chunks_are_byte_faithful() -> None:
+    """Streamed reasoner text is emitted as each token's raw UTF-8 bytes, so
+    characters split across tokens reassemble exactly; special tokens drop."""
+    from transformers import AutoTokenizer
+
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    model = Cosmos3Model(model_path_hf=str(EDGE_DIR), skip_weight_loading=True)
+    model.tokenizer = AutoTokenizer.from_pretrained(str(EDGE_DIR))
+    text = "naïve café — 日本語のテキスト 🙂 ok"
+    ids = model.tokenizer.encode(text, add_special_tokens=False)
+    assert len(ids) > 4
+    streamed = b"".join(model.postprocess(torch.tensor([i]), "text") for i in ids)
+    assert streamed.decode("utf-8") == text
+    # Per-token decode would have produced replacement characters here.
+    assert any("\ufffd" in model.tokenizer.decode([i]) for i in ids)
+    eos = model.tokenizer.eos_token_id
+    assert model.postprocess(torch.tensor([ids[0], eos]), "text") == model.postprocess(torch.tensor([ids[0]]), "text")
