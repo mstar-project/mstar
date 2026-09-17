@@ -58,6 +58,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.chatterbox.components.audio_frontend import resample
 from mstar.model.chatterbox.config import (
     COND_LABEL,
     S3GEN_NODE,
@@ -365,13 +366,33 @@ class ChatterboxModel(Model):
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (the rate S3Gen's
         reference mel needs; the 16 kHz views are derived on the worker)."""
-        from torchcodec.decoders import AudioDecoder
-
-        decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
-        audio = decoder.get_all_samples().data[0].to(device)
+        audio = self._decode_audio(filepath).to(device)
         return TensorAndMetadata(
             data=audio, metadata=dict(sample_rate=S3GEN_SR, num_channels=1)
         )
+
+    @staticmethod
+    def _decode_audio(filepath: str) -> torch.Tensor:
+        """``[T]`` float32 at 24 kHz, mono.
+
+        libsndfile (bundled with ``soundfile``) covers WAV/FLAC/OGG/MP3 without
+        any system library; torchcodec needs FFmpeg's shared libraries, which
+        the nodes may not have, so it is only the fallback for other codecs.
+        """
+        try:
+            import soundfile as sf
+
+            data, sr = sf.read(filepath, dtype="float32", always_2d=True)
+            wav = torch.from_numpy(data).mean(dim=1)
+        except Exception as exc:  # noqa: BLE001 - any decode failure falls through
+            logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
+            from torchcodec.decoders import AudioDecoder
+
+            decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
+            return decoder.get_all_samples().data[0].float()
+        if sr != S3GEN_SR:
+            wav = resample(wav, sr, S3GEN_SR)
+        return wav
 
     def _preset_voice_path(self, voice: str) -> Path:
         if self.voices_dir is None:
