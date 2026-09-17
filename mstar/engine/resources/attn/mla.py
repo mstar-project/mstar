@@ -37,7 +37,6 @@ from mstar.engine.resources.attn.base import WorkspacePool
 from mstar.engine.resources.base import (
     AttentionResource,
     CGSlotKey,
-    CGSlotSpec,
     EngineResourceInfo,
 )
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutputs, SequenceView
@@ -384,7 +383,9 @@ class SdpaMLAWrapper:
         self.max_total_tokens = max_total_tokens
         self.dtype: torch.dtype | None = None
         self._total_tokens = 0
-        self._qo_indptr_buf: torch.Tensor | None = None
+        # static like every other buffer here: a captured replay reads it at a
+        # fixed address, so plan() stages into it rather than rebinding it
+        self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
         self.token_to_page = torch.full(
             (max_total_tokens,), SINK_PAGE, dtype=torch.long, device=device
         )
@@ -440,7 +441,10 @@ class SdpaMLAWrapper:
             table[i, :len(pages)] = torch.as_tensor(pages, dtype=torch.long)
         self.page_table.copy_(pinned(table, torch.long), non_blocking=True)
         self._stage(self.kv_lens, host.kv_len_arr, 0)
-        self._qo_indptr_buf = to_device_async(host.qo_indptr, torch.int32, self.device)
+        qo = host.qo_indptr
+        self._qo_indptr_buf[:len(qo)].copy_(pinned(qo, torch.int32), non_blocking=True)
+        if len(qo) < self._qo_indptr_buf.numel():
+            self._qo_indptr_buf[len(qo):].fill_(qo[-1] if qo else 0)
 
     _rows = FlashInferMLAWrapper._rows
 
@@ -528,7 +532,6 @@ class MlaAttentionManager(AttentionResource):
                 "sm%d); using the SDPA fallback", kv_cache, self._ckv, self._kpe, sm_major,
             )
         self._workspaces = WorkspacePool(device)
-        self._cg_max_tokens = 0
 
         self._current: dict[str, _LabelPlan] = {}
         self._eager: dict[str, _LabelPlan] = {}  # persistent eager wrappers per label
@@ -561,10 +564,6 @@ class MlaAttentionManager(AttentionResource):
     @property
     def ckv_dim(self) -> int:
         return self._ckv
-
-    def build_cuda_graph_buffers(self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int):
-        del slots, max_bs
-        self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
     # ── wrappers ──
 
