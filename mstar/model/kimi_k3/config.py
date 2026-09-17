@@ -26,6 +26,9 @@ KDA_STATE = "kda_state"  # the recurrent state pool (RecurrentStatePool)
 KDA_ATTN = "kda_attn"  # KDA planned against it (LinearAttnManager, variant KDA)
 POS = "pos"
 SAMPLER = "sampler"
+# the speculative acceptance resource (only declared with model_kwargs.speculative_tokens > 0);
+# its key is fixed by the KV manager's lookup of the verdicts in the plan results
+SPEC = "spec_acceptance"
 
 
 @dataclass
