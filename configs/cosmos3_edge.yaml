@@ -25,6 +25,9 @@ model_kwargs:
   num_inference_steps_video: 20
   guidance_scale: 6.0
   flow_shift_video: 12.0
+  # Image-to-video conditioning follows the model card's diffusers recipe:
+  # cover-scale, antialiased resize, center crop, 8-bit rounding.
+  conditioning_resize: aspect_crop
   # Action requests (forward/inverse dynamics, policy) follow the Edge model
   # card: 30 steps, guidance 1.0, flow shift 10.0.
   num_inference_steps_action: 30
