@@ -173,6 +173,36 @@ Cosmos3 environment requirements
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
 
+Cosmos3-Edge reasoner and action loop
+-------------------------------------
+
+``cosmos3_edge`` serves the understanding tower as a vision-language model on the
+same transformer instance and KV pool as the generator. ``/v1/chat/completions``
+takes image and video content parts (URLs or data URIs) and streams tokens; the
+chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
+``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
+``repetition_penalty``, and for video attachments ``video_fps`` / ``video_num_frames``
+(frames are sampled at 2 fps by default, each frame a timestamped span).
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+     "model": "cosmos3_edge", "stream": true, "max_tokens": 256,
+     "messages": [{"role": "user", "content": [
+       {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+       {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
+     "enable_thinking": false}'
+
+The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
+``domain_name``) predicts a chunk of robot actions from the current observation:
+``output_modalities=action`` with ``model_kwargs``
+``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10,
+"action_chunk_size": 32}``; the reply's ``action`` payload is float32
+``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
+embodiment's actions. For a control loop use ``/generate/ws`` (one connection,
+pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
+reports chunks/s, actions/s and latency percentiles.
+
 Cosmos3 streaming rollout (windowed video)
 ------------------------------------------
 
