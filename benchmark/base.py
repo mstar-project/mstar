@@ -169,6 +169,12 @@ class Chatterbox(Model):
     def get_supported_modalities(self):
         return {RequestType.T2S}
 
+    def get_model_kwargs(self, request_type: RequestType):
+        # The checkpoint's built-in voice and the reference package's defaults
+        # (temperature 0.8, exaggeration 0.5, cfg 0.5), so every system
+        # synthesises the same request; stop on the model's own EOS.
+        return {"voice": "default", "temperature": 0.8}
+
 
 class Qwen3Omni(Model):
     def get_hf_url(self):
