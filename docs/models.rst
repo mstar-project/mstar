@@ -63,6 +63,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``black-forest-labs/FLUX.2-klein-9B``
      - FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
        the FLUX Non-Commercial License; check it before deploying.
+   * - ``z_image_turbo``
+     - ``Tongyi-MAI/Z-Image-Turbo``
+     - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
+       encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.
 
 Notes
 -----
