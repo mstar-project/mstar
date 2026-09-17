@@ -1,5 +1,5 @@
 """GLM-5.2 MoE block: the noaux_tc router, fp8-resident expert dispatch vs
-the bf16 reference, the post-load dtype guards, the fused-allreduce arm,
+the bf16 reference, the post-load dtype guards, the fused-allreduce path,
 and the end-to-end reduced fp8 load (whose checkpoint fabricator the
 indexer / MTP / read-plan suites reuse).
 """
@@ -58,9 +58,8 @@ def _noaux_tc_reference(h, weight, bias, top_k, scale):
 
 
 def test_gate_is_noaux_tc_groupless():
-    """GLM's router is the DeepSeek-V3 noaux_tc sigmoid gate with n_group=1
-    (what KimiMoEGate computed at n_group=1; Kimi is no longer in this
-    tree) — pin it bitwise against an independent transcription."""
+    """GLM's router is the DeepSeek-V3 noaux_tc sigmoid gate with n_group=1 —
+    pin it bitwise against an independent transcription of the rule."""
     torch.manual_seed(0)
     glm = Glm52MoEGate(
         hidden_size=64, n_routed_experts=8, num_experts_per_tok=3,
@@ -174,8 +173,8 @@ def test_submodule_refuses_post_load_dtype_cast():
 
 
 def test_moe_quant_kernel_resolution():
-    """Kimi quant_kernel semantics: auto probes, triton must not downgrade,
-    reference (the default until the M1 baseline is banked) keeps the loop."""
+    """quant_kernel resolution: auto probes the device, an explicit triton ask
+    must not silently downgrade, and reference keeps the host loop."""
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     assert cfg.moe_quant_kernel == "reference"
 
@@ -327,8 +326,8 @@ def _fabricate_checkpoint(cfg, include_mtp=False):
                       torch.randn(hid).bfloat16()))
         return state, refs
 
-    # Poison: MTP layer keys (Phase D) — including the MTP block's own
-    # indexer, which must skip by layer index even with load_indexer=True.
+    # Poison: MTP layer keys — including the MTP block's own indexer, which
+    # must skip by layer index even with load_indexer=True.
     state.append((f"{mtp}.enorm.weight", torch.randn(cfg.hidden_size).bfloat16()))
     state.append((f"{mtp}.mlp.experts.0.gate_proj.weight",
                   torch.randn(cfg.moe_intermediate_size, cfg.hidden_size)
@@ -354,7 +353,7 @@ def test_load_end_to_end_reduced_fp8():
     # Completeness both ways: every model param got a tensor, nothing extra.
     assert loaded == set(dict(model.named_parameters()))
 
-    # Dense fp8 modules dequantized bit-exactly (bf16 -> fp32 copy is exact).
+    # Dense fp8 modules dequantize exactly (the bf16 -> fp32 copy is lossless).
     q_a = model.model.layers[0].self_attn.q_a_proj.weight
     _, _, deq = refs["model.layers.0.self_attn.q_a_proj"]
     assert torch.equal(q_a.data, deq.to(q_a.dtype))
@@ -394,11 +393,11 @@ def test_load_end_to_end_reduced_fp8():
 
 
 def test_per_token_group_quant_is_compiler_disabled():
-    """The quant wrapper must stay outside torch.compile: Inductor's
-    recompile of its Triton kernel crashes (PassManager::run failed,
-    08-07 — in-process and subprocess alike) and killed all 296 graph
-    captures. The graph break keeps compile+graphs coexisting; this pins
-    the wrap so a refactor can't silently drop it.
+    """The quant wrapper must stay outside torch.compile: Inductor's recompile
+    of its Triton kernel crashes (PassManager::run failed, in-process and
+    subprocess alike) and takes every graph capture down with it. The graph
+    break keeps compile and graphs coexisting; this pins the wrap so a
+    refactor cannot silently drop it.
     """
     from mstar.utils.fused_moe.kernels import per_token_group_quant_fp8
 

@@ -101,13 +101,10 @@ class Glm52MoEGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(n_routed_experts, dtype=torch.float32)
         )
-        # fp32 copy of ``weight`` built once by ``finalize_weights`` (called
-        # from the MoE block's process_weights_after_loading). Without it the
-        # forward cast the (E, hidden) bf16 router to fp32 on every layer of
-        # every step: 6.3 MB written × 75 layers = 470 MB/step and 75 kernel
-        # launches for a value that never changes. Plain attribute, not a
-        # buffer, so model.to(bf16) cannot downcast it (rope inv_freq
-        # precedent). Bit-identical: the same fp32 values, computed once.
+        # fp32 copy of ``weight``, built once by ``finalize_weights``: the
+        # forward needs fp32 and the router never changes, so casting it once
+        # per layer per step is pure waste. A plain attribute, not a buffer,
+        # so model.to(bf16) cannot downcast it.
         self._weight_fp32: torch.Tensor | None = None
 
     def finalize_weights(self) -> None:
@@ -214,15 +211,10 @@ class Glm52SparseMoeBlock(nn.Module):
             )
         self._attach_expert_weight_loaders()
 
-        # One all-reduce per MoE block instead of two (vLLM's DeepseekV2MoE
-        # layout): the shared expert returns its per-rank partial, it is
-        # added to the routed partial, and the SUM is reduced once. Saves 76
-        # collectives per decode step at TP8 (~15-25 us each on NVSwitch
-        # [estimate] -> ~1-2 ms of a 19 ms step), MTP off and on alike.
-        # DEFAULT OFF: bf16 rounding moves (sum-then-reduce vs reduce-then-
-        # sum), so the emitted stream can differ from today's at FP near-ties
-        # — a policy call to make with a measurement, not silently.
-        # MSTAR_GLM52_MOE_FUSED_ALLREDUCE=1 to enable.
+        # One all-reduce per block instead of two: the shared expert's
+        # per-rank partial is summed with the routed partial and reduced once.
+        # Off by default — sum-then-reduce rounds differently from
+        # reduce-then-sum in bf16, so the emitted tokens can shift at ties.
         self._fused_allreduce = (
             self.tp_size > 1
             and os.environ.get("MSTAR_GLM52_MOE_FUSED_ALLREDUCE", "0") == "1"
@@ -360,9 +352,9 @@ class Glm52SparseMoeBlock(nn.Module):
         return final
 
     def process_weights_after_loading(self, device) -> None:
-        """Resolve reference-vs-fused dispatch on the real device (kimi
-        quant_kernel semantics: explicit "triton" must not silently
-        downgrade; "auto" probes; "reference" keeps the bitwise loop)."""
+        """Resolve reference-vs-fused dispatch on the real device: explicit
+        "triton" must not silently downgrade, "auto" probes for the fused
+        path, "reference" keeps the bitwise loop."""
         self.gate.finalize_weights()
         if not self.fp8_experts:
             return

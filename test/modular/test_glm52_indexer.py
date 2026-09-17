@@ -1,4 +1,4 @@
-"""Phase C DSA indexer: skip formula, selection semantics, sparse==dense, load."""
+"""DSA indexer: skip formula, selection semantics, sparse == dense, load."""
 import sys
 import types
 from pathlib import Path
@@ -191,8 +191,8 @@ def _build_attention(seed):
 
 
 def test_sparse_forward_matches_dense_bitwise_within_topk():
-    """THE identity Phase C rests on: at ctx <= topk the selection is the
-    full prefix, so DSA attention IS dense causal attention — bitwise."""
+    """At ctx <= topk the selection IS the full prefix, so DSA attention is
+    dense causal attention — bitwise, not merely close."""
     attn, cfg = _build_attention(seed=2)
     dense_resources = _CausalDenseResources()
     attn.bind_resources({KV_RESOURCE: dense_resources, ATTN_RESOURCE: dense_resources})
@@ -233,7 +233,7 @@ def test_load_indexer_keys_land_dequantized_on_full_layer():
     assert idxr is not None
     assert model.model.layers[1].self_attn.indexer is None  # SHARED layer
 
-    # fp8 pairs dequantized bit-exactly despite plain ``.weight`` names.
+    # fp8 pairs dequantize exactly despite their plain ``.weight`` names.
     _, _, wq_deq = refs["model.layers.0.self_attn.indexer.wq_b"]
     assert torch.equal(idxr.wq_b.weight.data, wq_deq.to(idxr.wq_b.weight.dtype))
     _, _, wk_deq = refs["model.layers.0.self_attn.indexer.wk"]

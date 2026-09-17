@@ -1,4 +1,4 @@
-"""THE MISSING RUNG: the MTP piecewise graphs against the REAL runner, one GPU, seconds."""
+"""The MTP piecewise graphs against the real runner, on a single GPU."""
 from __future__ import annotations
 
 import gc
@@ -49,10 +49,10 @@ DEVICE = torch.device("cuda:0")
 DTYPE = torch.bfloat16  # the serving autocast dtype; the KV cache takes it too
 NODE = "LLM"
 # The deployment's ``resources: kv:`` block, applied to the model's declared
-# specs exactly as the worker applies a YAML (page_size 8 / 64 pages: what the
-# H200 rung ran with; a page per ~one MTP step keeps the padded plans small).
+# specs exactly as the worker applies a YAML. A page holding roughly one MTP
+# step keeps the padded plans small.
 KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 64, "page_size": 8}}}
-PROMPT_A = 5  # arange(5) + 3, as the CPU rung
+PROMPT_A = 5  # arange(5) + 3, as in the CPU tests
 PROMPT_B = 3  # arange(3) + 9
 
 
@@ -121,8 +121,8 @@ def _build_resources(cfg: Glm52ModelConfig) -> tuple[dict, StepRunner]:
     """The node's resources the way ``Engine.load_model`` builds them: from the
     model's own declaration, through the YAML overrides, ``build_resource`` on
     the serving dtype, and a ``StepRunner`` scoped to the node."""
-    # inside: mstar.model.base pulls the sampler's Triton kernels, which keeps
-    # collection clean on a CUDA-less machine (test_fused_moe_fp8.py precedent)
+    # Imported inside: mstar.model.base pulls the sampler's Triton kernels, so
+    # collection stays clean on a machine without CUDA.
     from mstar.model.glm52.glm52_model import Glm52Model
 
     model = Glm52Model(model_path_hf="", config_variant="reduced")
@@ -158,9 +158,9 @@ def _capture_runners(
     them captures, then each captures, and a region whose capture failed is
     dropped so the forward takes its eager path for that label.
     """
-    # PORT-CHECK: if an eager-vs-replay assertion fails ONLY with the compile
-    # flag on, re-run with MSTAR_GLM52_GRAPH_COMPILE=0 — an Inductor fusion
-    # that moved a rounding is a numerics finding, not a replay-plumbing bug.
+    # If an eager-vs-replay assertion fails ONLY with the compile flag on,
+    # re-run with MSTAR_GLM52_GRAPH_COMPILE=0: an Inductor fusion that moved a
+    # rounding is a numerics finding, not a replay-plumbing bug.
     configs = sub.get_piecewise_cuda_graph_configs(DEVICE, DTYPE, tp_world_size=1)
     runners = {
         label: PiecewiseCudaGraphRunner(
@@ -182,8 +182,8 @@ def _capture_runners(
 
 
 class _Driver:
-    """The engine's per-step cycle for one node, over real resources — the
-    CPU rung's ``_Driver`` with the real ``PiecewiseCudaGraphRunner``s in
+    """The engine's per-step cycle for one node, over real resources — the CPU
+    suite's ``_Driver`` with real ``PiecewiseCudaGraphRunner``s in
     ``piecewise_runners`` (``regions=True``) instead of eager stand-ins.
     """
 
@@ -330,10 +330,10 @@ def test_every_region_captures_every_bucket(monkeypatch, k):
             pw = driver.piecewise[label]
             for shape in config.get_capture_shapes(sorted(config.capture_batch_sizes)):
                 assert pw.can_run(shape.bs, shape.total_tokens), (label, shape)
-        # mtp_trunk and mtp_sync are both (bs, k+1): the shape collision that
-        # once made two runners address one padding slot (dummy ids were
-        # derived from the shape alone). The pool keys them by runner label
-        # now; asserted structurally because the symptom is silent.
+        # mtp_trunk and mtp_sync are both (bs, k+1): deriving dummy ids from
+        # the shape alone would let the two runners address one padding slot,
+        # so the pool keys them by runner label. Asserted structurally because
+        # the symptom is silent.
         trunk, sync = driver.piecewise[MTP_TRUNK_LABEL], driver.piecewise[MTP_SYNC_LABEL]
         assert set(trunk._graphs) & set(sync._graphs), "no shared (bs, tokens) bucket"
         t_ids = {rid for g in trunk._graphs.values() for rid in g.dummy_rids}
@@ -349,7 +349,9 @@ def test_every_region_captures_every_bucket(monkeypatch, k):
 
 @pytest.mark.parametrize("k", [1, 2, 3])
 def test_replayed_regions_match_eager_and_plain_decode_bitwise(monkeypatch, k):
-    """THE property, per k. Same weights, same prompt, three arms:"""
+    """Same weights and prompt, three ways: plain decode, eager MTP regions,
+    and replayed MTP regions must all emit the same stream, bitwise.
+    """
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2])
     cfg = _cfg(k)
     model = _model(cfg)
@@ -367,11 +369,11 @@ def test_replayed_regions_match_eager_and_plain_decode_bitwise(monkeypatch, k):
     assert replayed == eager, (
         f"captured replay diverged from the eager regions:\n eager    {eager}\n"
         f" replayed {replayed}")
-    # PORT-CHECK: plain decode runs the trunk at M=1 rows, the MTP trunk at
-    # M=k+1; cuBLAS may pick a different kernel per M and round a bf16 logit
-    # differently. If ONLY this assertion fails on the box, find the first
-    # divergent step and check whether the top-2 logits there sit within one
-    # bf16 ulp (a near-tie, numerics) before treating it as a plumbing bug.
+    # Plain decode runs the trunk at M=1 rows, the MTP trunk at M=k+1; cuBLAS
+    # may pick a different kernel per M and round a bf16 logit differently. If
+    # ONLY this assertion fails, find the first divergent step and check
+    # whether the top-2 logits there sit within one bf16 ulp (a near-tie, so
+    # numerics) before treating it as a plumbing bug.
     assert replayed == plain, (
         f"captured replay diverged from plain decode:\n plain    {plain}\n"
         f" replayed {replayed}")
@@ -397,8 +399,7 @@ def test_first_decode_without_the_prefill_bundle_matches(monkeypatch):
 
 
 def _drive_batch(driver: _Driver, prompts: dict[str, torch.Tensor], max_tokens: int):
-    """Prefill each request alone, then decode them as one batch; the CPU
-    rung's batch loop."""
+    """Prefill each request alone, then decode them as one batch."""
     infos = {rid: _fwd_info(rid, max_tokens) for rid in prompts}
     emitted = {rid: [] for rid in prompts}
     texts = {}
@@ -435,7 +436,7 @@ def test_batch_of_two_padded_to_four_matches_single_streams(monkeypatch, k):
         rid: _stream(model, cfg, k, regions=True, prompt=p, max_tokens=14, rid=rid)[0]
         for rid, p in prompts.items()
     }
-    # alone, eager (the CPU rung's reference)
+    # alone, eager (the reference path)
     singles_eager = {
         rid: _stream(model, cfg, k, regions=False, prompt=p, max_tokens=14, rid=rid)[0]
         for rid, p in prompts.items()
@@ -453,8 +454,8 @@ def test_batch_of_two_padded_to_four_matches_single_streams(monkeypatch, k):
         assert batched[rid] == singles[rid], (
             f"{rid}: padded (bs=2 -> 4) replay diverged from the request alone:\n"
             f" alone   {singles[rid]}\n batched {batched[rid]}")
-        # PORT-CHECK: eager runs the trunk at M=k+1 rows per request, the bs=4
-        # bucket at M=4(k+1); same near-tie caveat as the plain-decode arm.
+        # Eager runs the trunk at M=k+1 rows per request, the bs=4 bucket at
+        # M=4(k+1); same near-tie caveat as the plain-decode comparison.
         assert batched[rid] == singles_eager[rid], (
             f"{rid}: padded replay diverged from the eager regions:\n"
             f" eager   {singles_eager[rid]}\n batched {batched[rid]}")

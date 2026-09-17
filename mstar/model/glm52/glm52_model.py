@@ -2,7 +2,6 @@
 
 import logging
 import os
-import threading
 from pathlib import Path
 
 import torch
@@ -39,47 +38,6 @@ logger = logging.getLogger(__name__)
 def _mtp_prefill_drafts_enabled() -> bool:
     """Carry the MTP prefill's [emitted, k drafts] bundle into decode step 1."""
     return os.environ.get("MSTAR_GLM52_MTP_PREFILL_DRAFTS", "1") == "1"
-
-
-def _start_gpu_liveness_heartbeat(device: str) -> "threading.Event | None":
-    """Tick a small CUDA kernel until the first real forward pass."""
-    if not str(device).startswith("cuda"):
-        return None
-    stop = threading.Event()
-
-    def _tick():
-        # Sized to REGISTER in sampled utilization (~15-25%), not just to
-        # execute: a microsecond kernel per second still samples as 0% —
-        # measured the hard way (third external kill, offset +33:59, with
-        # the 64x64 version ticking). ~2.7 ms of matmul every 50 ms.
-        # 0.25 s cadence: 20 wakeups/s of GIL churn measurably taxed the
-        # loader's hot python loop (~2.5x slower load).
-        #
-        # What the reaper actually measures (coriander's gpu-management
-        # daemon, read 2026-08-29): per-process SM utilization from NVML
-        # (nvmlDeviceGetProcessUtilization) every 10 s; a process counts as
-        # active only above 10%, or if a same-user process on the SAME GPU
-        # is. Rank 0 waits on the CPU through load + capture while the other
-        # ranks spin in NCCL kernels (sampled as busy) — hence rank 0 is the
-        # one killed. With all 8 ranks holding a context on GPU 0, NVML
-        # attributes only ~1/3 of a process's wall-clock kernel time to it:
-        # this tick at 14 matmuls (~90 ms per 250 ms wall) still read 4-6%
-        # on 2026-08-29. It keeps the process visibly alive but does NOT
-        # clear the line by itself; a same-user keeper process on rank 0's
-        # GPU during load + capture does (env/gpu0_keeper.py).
-        a = torch.ones(8192, 8192, device=device, dtype=torch.bfloat16)
-        while not stop.wait(0.25):
-            try:
-                for _ in range(14):
-                    torch.mm(a, a)
-            except torch.AcceleratorError:
-                # A CUDA graph capture is in flight somewhere in the process
-                # (global capture mode rejects unsafe calls from any thread).
-                continue
-
-    t = threading.Thread(target=_tick, daemon=True, name="glm52-load-heartbeat")
-    t.start()
-    return stop
 
 
 def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
@@ -163,9 +121,8 @@ class Glm52Model(Model):
                 # The checkpoint's tokenizer_config declares transformers-5's
                 # TokenizersBackend class, which transformers 4.x cannot
                 # construct — but the underlying tokenizer.json is
-                # version-independent. Verified on transformers 4.57:
-                # template render, roundtrip, and special-token decode all
-                # match the checkpoint's declared ids.
+                # version-independent, so building a fast tokenizer straight
+                # from it encodes identically.
                 self._tokenizer = self._fast_tokenizer_fallback(tokenizer_source)
         return self._tokenizer
 
@@ -254,25 +211,18 @@ class Glm52Model(Model):
             ),
         ]
         if self.config.mtp_num_draft_tokens > 0 and _mtp_prefill_drafts_enabled():
-            # M3: the MTP prefill's forward also returns "text_inputs" =
-            # [emitted token, k drafts]. Without a declared edge the worker
-            # drops it (undeclared outputs are unrouted), the prefill's whole
-            # sync+draft pass is wasted, and the first decode step runs
-            # unspeculated at m=1 — which also pollutes the acceptance
-            # histogram with one artificial n_acc=0 per request. Persisted
-            # (not emitted) so the prefill→decode transition can seed the
-            # decode loop with it, exactly the qwen3_tts talker_input_embeds
-            # pattern.
+            # The MTP prefill also returns [emitted token, k drafts]. Without
+            # a declared edge the worker drops it (undeclared outputs are
+            # unrouted), the prefill's sync+draft pass is wasted, and the
+            # first decode step runs unspeculated. Persisted rather than
+            # emitted, so the prefill→decode transition can seed the decode
+            # loop with it.
             #
-            # DEFAULT OFF pending GPU validation.
-            #
-            # TP8 is NOT a hazard here, contrary to an earlier note in this
-            # spot: all 8 ranks do persist (to_conductor has no
-            # is_first_tp_rank gate) and persist_signals accumulates all 8,
-            # but _send_partition_inputs re-splits by source_tp_rank and
-            # glm52 is fully replicated, so each rank receives exactly its
-            # own copy — (k+1) tokens, not 8*(k+1). The shipping new_token
-            # seed rides the identical mechanism, which is the proof.
+            # Tensor parallelism is not a hazard: every rank persists and
+            # persist_signals accumulates all of them, but
+            # _send_partition_inputs re-splits by source_tp_rank and this
+            # model is fully replicated, so each rank gets back exactly its
+            # own (k+1) tokens.
             prefill_outputs.append(
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
@@ -371,24 +321,21 @@ class Glm52Model(Model):
         from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
         graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        # M3: an MTP prefill can persist [emitted, k drafts]; seeding decode
-        # with it makes the first decode step a speculated (k+1)-row step
-        # like every other. k=0 persists no such signal and seeds from
-        # new_token exactly as before.
+        # An MTP prefill can persist [emitted, k drafts]; seeding decode with
+        # it makes the first decode step a speculated (k+1)-row step like
+        # every other. k=0 persists no such signal and seeds from new_token.
         #
         # The bundle MUST NOT be called "text_inputs". The conductor seeds
         # persist_signals from initial_signals (conductor.py), and the
-        # initial signal for this model IS named "text_inputs" — the PROMPT.
-        # Reading that key handed decode the whole prompt back as its first
-        # step: measured 2026-08-10 as a 17-row decode step with no capture
-        # bucket (eager trunk, wrong stream) and, with the prefill edge also
-        # on, the p1 0.18 acceptance collapse. A dedicated name cannot
-        # collide.
-        # Gated on the SAME flag as the edge that produces it. get_graph_walk_
-        # graphs() is evaluated independently in the conductor and in every
-        # worker, so a worker with the flag set and a conductor without it
-        # would persist a bundle that an ungated read here would consume —
-        # the write-gated/read-live split that already cost this lane a run.
+        # initial signal for this model IS named "text_inputs" — the PROMPT,
+        # so reading that key hands decode the whole prompt back as its first
+        # step. A dedicated name cannot collide.
+        #
+        # Gated on the SAME flag as the edge that produces it:
+        # get_graph_walk_graphs() is evaluated independently in the conductor
+        # and in every worker, so a worker with the flag set and a conductor
+        # without it would persist a bundle that an ungated read here would
+        # consume.
         drafts = (
             persist_signals.get(MTP_DRAFT_BUNDLE, [])
             if _mtp_prefill_drafts_enabled() else []
@@ -543,18 +490,12 @@ class Glm52Model(Model):
         if autocast_dtype is not None:
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
-        heartbeat_stop = _start_gpu_liveness_heartbeat(device)
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
         submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
-        # The heartbeat outlives the load: the first request's flashinfer JIT
-        # is another long 0%-GPU stretch, and the reaper's per-process idle
-        # clock doesn't care whose fault that is. The submodule stops the
-        # tick on its first real forward.
-        submodule.set_load_heartbeat_stop(heartbeat_stop)
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:

@@ -28,6 +28,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``glm52``
+     - ``zai-org/GLM-5.2-FP8``
+     - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights,
+       optional MTP speculative decoding, TP8.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.

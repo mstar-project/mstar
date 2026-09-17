@@ -21,7 +21,7 @@ class Glm52RotaryEmbedding(nn.Module):
         self.base = base
         # Not a registered buffer: meta->to_empty leaves derived buffers
         # uninitialized and model.to(bf16) would downcast it. Recompute fp32
-        # lazily per device (kimi rope.py precedent).
+        # lazily per device instead.
         self._inv_freq_cache: torch.Tensor | None = None
 
     def _get_inv_freq(self, device: torch.device) -> torch.Tensor:

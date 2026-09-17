@@ -1,4 +1,4 @@
-"""HF GLM-5.2 checkpoint loading for the glm52 module tree."""
+"""HF GLM-5.2 checkpoint loading."""
 from __future__ import annotations
 
 import logging
@@ -188,7 +188,7 @@ def build_glm52_read_plan(
 
 
 def _make_glm52_name_remapper(num_hidden_layers: int, load_mtp: bool):
-    """Trunk remapping, plus (M3) layer-78 routing onto the ``mtp.``
+    """Trunk remapping, plus layer-78 routing onto the ``mtp.``
     submodule: strip the layer prefix, apply ``remap_mtp_key`` (glue keys
     direct, the rest under ``transformer_layer.``), then the trunk naming
     conventions — the expert/shared-expert regexes are prefix-agnostic, so

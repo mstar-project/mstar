@@ -66,8 +66,8 @@ class Glm52ForCausalLM(nn.Module):
         self.config = config
         self.model = Glm52LanguageModel(config, comm_group=comm_group)
         self.lm_head = build_lm_head(config, comm_group=comm_group)
-        # M3: the layer-78 draft module exists only when drafting is on, so
-        # flag-off keeps the parameter set (and load) byte-identical to M1.
+        # Build the draft module only when drafting is on, so the parameter
+        # set and the weight load are unchanged when it is off.
         self.mtp = None
         if config.mtp_num_draft_tokens > 0:
             from mstar.model.glm52.components.mtp import Glm52MTPModule

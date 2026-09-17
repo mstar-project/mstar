@@ -1,4 +1,4 @@
-"""CPU tests for the sync-free planning pieces (2026-08-19)."""
+"""CPU tests for the sync-free planning pieces."""
 import random
 import sys
 import types
@@ -72,8 +72,8 @@ def test_to_device_async_cpu_roundtrip():
 # ------------------------------------------------- MLA scatter map on host
 
 def _device_style_scatter(qo_indptr, kv_indptr, kv_indices, kv_len_arr, page_size):
-    """The device-side scatter arithmetic the host map replaced (the old
-    ``FlashInferMLAWrapper._plan_scatter_device``), on CPU tensors."""
+    """The device-side scatter arithmetic the host map replaces
+    (``FlashInferMLAWrapper._plan_scatter_device``), on CPU tensors."""
     n_req = qo_indptr.shape[0] - 1
     starts = qo_indptr[:-1].to(torch.int32)
     lens = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)

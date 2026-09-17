@@ -176,12 +176,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.language_model = language_model  # Glm52ForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
-        self._load_heartbeat_stop = None
+        self._capture_block_warned = False
         # Under MTP the forward is a host-side driver (verify readback, per
         # request bookkeeping, region replays, rewinds) whose heavy halves are
         # captured graphs compiled at capture; compiling the driver itself
-        # gains nothing and lets dynamo inline plan-time host code (the
-        # "Only CPU tensors can be pinned" failure of 2026-08-28).
+        # gains nothing and lets dynamo inline plan-time host code, which
+        # fails with "Only CPU tensors can be pinned".
         self.disable_torch_compile = config.mtp_num_draft_tokens > 0
         # DSA indexer k-cache (dsa.py): per-request index keys, appended by
         # FULL layers each forward when dsa_long_context is on; evicted in
@@ -195,7 +195,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
         # Which trunk stream the MTP plane pairs drafts against (see
-        # _mtp_pair_rows): post-final-norm (vLLM's convention) by default.
+        # _mtp_pair_rows): the post-final-norm one by default.
         self._mtp_pair_postnorm = (
             os.environ.get("MSTAR_GLM52_MTP_PAIR_POSTNORM", "1") == "1"
         )
@@ -222,13 +222,14 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # slots), the contiguous positions P0+1..P0+k+1, and sub-plan 0's
         # attention plan go in through runner.stage() while the host would
         # otherwise sit in the .tolist(); only last_rows, chain_pos_* and the
-        # k-1 chain sub-plans wait for e. Bit-exact by construction; default
-        # off until a TP8 arm measures it.
+        # k-1 chain sub-plans wait for e. Numerically identical by
+        # construction; off by default.
         self._mtp_phase_prepare = (
             os.environ.get("MSTAR_GLM52_MTP_PHASE_PREPARE", "0") == "1"
         )
-        # One-shot warnings: an MTP step whose graphs silently run eager is a
-        # 13x regression that looks like "MTP is slow".
+        # One-shot warnings: an MTP step whose graphs silently fall back to
+        # eager is an order-of-magnitude regression that looks like "MTP is
+        # slow".
         self._mtp_trunk_eager_warned = False
         self._mtp_draft_eager_warned = False
         self._mtp_sync_eager_warned = False
@@ -240,18 +241,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_stat_acc_hist = [0] * (config.mtp_num_draft_tokens + 1)
         self._mtp_timer = _MtpStepTimer(
             int(os.environ.get("MSTAR_GLM52_MTP_STEP_TIMING", "0") or "0"))
-
-    def set_load_heartbeat_stop(self, stop) -> None:
-        """Adopt the load-time GPU liveness tick; stopped before capture."""
-        self._load_heartbeat_stop = stop
-
-    def _stop_load_heartbeat(self) -> None:
-        # getattr: the graph-config getters call this first, and CPU tests
-        # construct partially-initialized submodules that never ran __init__
-        stop = getattr(self, "_load_heartbeat_stop", None)
-        if stop is not None:
-            stop.set()
-            self._load_heartbeat_stop = None
 
     def cleanup_request(self, request_id: str):
         self._dsa_k_store.evict(request_id)
@@ -307,8 +296,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         )
 
     # Host-side bookkeeping reached from inside the compiled forward: kept
-    # out of dynamo, which once inlined a plan's pinned staging into the
-    # graph ("Only CPU tensors can be pinned", 8/20 requests failed).
+    # out of dynamo, which otherwise inlines a plan's pinned staging into the
+    # graph and fails with "Only CPU tensors can be pinned".
     @torch.compiler.disable
     def _eager_step(
         self, engine_inputs: ModelInputsFromEngine, request_ids: list[str],
@@ -397,12 +386,25 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             and not self._moe_resolved_fused()
         )
         naive_tp = self.config.quantization_config is None and tp_world_size > 1
-        return fp8_reference or naive_tp
+        blocked = fp8_reference or naive_tp
+        # getattr: some tests build submodules that never ran __init__
+        if blocked and not getattr(self, "_capture_block_warned", False):
+            self._capture_block_warned = True
+            logger.warning(
+                "Glm52LLMSubmodule: %s; no CUDA graphs are registered and "
+                "decode runs eager, which is far slower. %s",
+                "the reference MoE dispatch is active" if fp8_reference
+                else "naive TP MoE dispatch is active",
+                "Set model_kwargs.moe_quant_kernel='triton' for the "
+                "capturable fused fp8 kernel." if fp8_reference
+                else "Serve the fp8 checkpoint to get the fused kernel.",
+            )
+        return blocked
 
     def _compile_flags(self) -> dict[str, Any]:
         # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (escape hatch
-        # for an Inductor toolchain crash); the mode is the cuBLAS one
-        # (cuda_graph_runner.resolve_compile_mode: 90.03 -> 96.97 tok/s TP8).
+        # for an Inductor toolchain crash); "default" is the cuBLAS-backed
+        # mode of cuda_graph_runner.resolve_compile_mode, the fastest here.
         return {
             "compile": os.environ.get("MSTAR_GLM52_GRAPH_COMPILE", "1") == "1",
             "compile_mode": "default",
@@ -425,7 +427,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[CudaGraphConfig]:
-        self._stop_load_heartbeat()
         if self.config.dsa_long_context:
             # DSA maintenance is host-side per-request work; a captured
             # decode would skip index upkeep. Eager-only.
@@ -477,7 +478,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         """The MTP step's graphs. ``mtp_trunk``: the verify forward (embed + layers +
         lm_head over the packed (bs, k+1) rows).
         """
-        self._stop_load_heartbeat()
         k = self.config.mtp_num_draft_tokens
         if (
             k <= 0
@@ -846,9 +846,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         }
 
     def _mtp_pair_rows(self, normed: torch.Tensor, prenorm: torch.Tensor) -> torch.Tensor:
-        """The trunk stream the MTP plane pairs drafts against: post-final-
-        norm (vLLM's convention: p1/p2 0.89/0.74 vs pre-norm's 0.77/0.33
-        on this checkpoint) unless MSTAR_GLM52_MTP_PAIR_POSTNORM=0."""
+        """The trunk stream the MTP plane pairs drafts against: the
+        post-final-norm one, which the reference implementation pairs and
+        which accepts markedly better, unless
+        MSTAR_GLM52_MTP_PAIR_POSTNORM=0."""
         return normed if self._mtp_pair_postnorm else prenorm
 
     def _hidden(
@@ -882,7 +883,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         position_ids: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        self._stop_load_heartbeat()
         hidden = self._hidden(input_ids, position_ids, kwargs.get("dsa_ctx"))
         return {"logits": [self.lm_head(hidden[-1:])]}
 
@@ -901,7 +901,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return self._forward_batched_mtp(
                 graph_walk, engine_inputs, input_ids, position_ids, **kwargs
             )
-        self._stop_load_heartbeat()
         hidden = self._hidden(input_ids, position_ids, kwargs.get("dsa_ctx"))
         if graph_walk == "prefill":
             hidden = self._last_rows(engine_inputs, hidden, kwargs)
@@ -928,7 +927,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, NameToTensorList]:
         from mstar.model.glm52.components.mtp import mtp_greedy_verify_host
 
-        self._stop_load_heartbeat()
         kv = self._kv(engine_inputs)
         seq_lens = kwargs.get("seq_lens")
         assert seq_lens is not None, "MTP step needs seq_lens from preprocess"
@@ -1321,8 +1319,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return set()
         token = outputs["new_token"][0].item()
         is_eos = token in self.config.eos_token_ids
-        # total generated = 1 prefill-emitted token + (iters + 1) decode
-        # tokens (vLLM's max_tokens semantics)
+        # max_tokens counts the token the prefill emits, so the total is
+        # 1 + (iters + 1) decode tokens
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
         if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
             return {"decode_loop"}

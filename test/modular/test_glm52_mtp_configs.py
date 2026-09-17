@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import sys
-import threading
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -106,9 +105,9 @@ def _piecewise(sub: Glm52LLMSubmodule):
 
 
 def test_mtp_disables_full_forward_capture_configs():
-    """With MTP on, no full-forward CUDA-graph configs may register: their warmup captures
-    crash (host-side verify/rewind; packed prefill never runs preprocess) and the
-    failure mode is a silent 13x eager fallback.
+    """With MTP on, no full-forward CUDA-graph configs may register: their warmup
+    captures crash (host-side verify/rewind; packed prefill never runs
+    preprocess) and the failure mode is a silent, far slower eager fallback.
     """
     cfg = _mtp_cfg(2)
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
@@ -125,9 +124,8 @@ def test_mtp_trunk_piecewise_config_shapes():
     """
     cfg = _mtp_cfg(2)  # rows per request = 3
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
-    # Sync capture is env-default-ON as of 2026-08-11 (measured clean, 3264
-    # bit-exact, arm C). Pin it OFF here to check the trunk+draft-only set,
-    # then ON below for the sync-included set.
+    # Sync capture defaults on: pin it OFF here to check the trunk+draft-only
+    # set, then ON below for the sync-included set.
     sub._mtp_capture_sync = False
     sub._mtp_capture_prefill = False
     sub._mtp_draft_phase_graph = False
@@ -135,7 +133,7 @@ def test_mtp_trunk_piecewise_config_shapes():
     sub._mtp_capture_sync = True
     configs = _piecewise(sub)
     assert set(configs) == {MTP_TRUNK_LABEL, MTP_DRAFT_LABEL, MTP_SYNC_LABEL}
-    # The one-graph draft phase (2026-08-19): sync capture on + flag on adds
+    # The one-graph draft phase: sync capture on plus the flag on adds
     # a (bs, k+1) PACKED bucket per batch size whose step declares the k
     # attention sub-plans (resource-owned; its e_list arrives per replay
     # through run(step_kwargs=)), and the caller inputs.
@@ -160,9 +158,9 @@ def test_mtp_trunk_piecewise_config_shapes():
     assert MTP_DRAFT_PHASE_LABEL not in _piecewise(sub)
     cfg.mla_absorb = True
     sub._mtp_draft_phase_graph = False
-    # The captured MTP prefill (2026-08-19) is env-default-ON and adds the
-    # k=0 config's packed prefill buckets — bs x token-bucket, PACKED, the
-    # full-row hidden/prenorm outputs — never lm_head.
+    # The captured MTP prefill defaults on and adds the k=0 config's packed
+    # prefill buckets — bs x token-bucket, PACKED, the full-row hidden/prenorm
+    # outputs — never lm_head.
     sub._mtp_capture_prefill = True
     configs = _piecewise(sub)
     assert set(configs) == {
@@ -444,9 +442,9 @@ def test_mtp_acceptance_log_per_position(caplog):
     assert "[256, 128, 64, 64]" in pos_line
     assert "0.50 0.50 0.50" in pos_line
     assert ns._mtp_stat_logged == 512
-    # The line must name which trunk-pairing arm produced it: an acceptance
-    # profile whose arm you infer from launch env is one you cannot trust
-    # after the fact, and mislabelling an arm silently inverts the A/B.
+    # The line must name which trunk-pairing mode produced it: a profile whose
+    # mode you have to infer from the launch environment is one you cannot
+    # trust afterwards, and a mislabelled one inverts the comparison silently.
     assert "pre-final-norm" in pos_line and "POST" not in pos_line
 
     caplog.clear()
@@ -463,9 +461,6 @@ def test_mtp_acceptance_log_per_position(caplog):
     with caplog.at_level(logging.INFO, logger="mstar.model.glm52.submodules"):
         Glm52LLMSubmodule._maybe_log_mtp_acceptance(quiet)
     assert not caplog.records
-
-
-# ── load heartbeat ──
 
 
 class _Driver:
@@ -516,41 +511,6 @@ def _drive(driver: _Driver, prompt: torch.Tensor, info, max_steps=64) -> torch.T
             break
         walk, text = "decode", out["text_inputs"][0]
     return torch.cat(emitted)
-
-
-def test_graph_config_getters_stop_the_load_heartbeat():
-    """Both capture-config getters stop the load heartbeat FIRST: the tick is a
-    foreign-thread CUDA kernel, illegal during a (global-mode) graph capture, and
-    capture starts right after the configs are read.
-    """
-    cfg = _mtp_cfg(2)
-    model = Glm52ForCausalLM(cfg)
-
-    sub = Glm52LLMSubmodule(model, cfg)
-    stop = threading.Event()
-    sub.set_load_heartbeat_stop(stop)
-    sub.get_piecewise_cuda_graph_configs(CPU, torch.bfloat16)
-    assert stop.is_set(), "piecewise config getter must stop the heartbeat"
-    assert sub._load_heartbeat_stop is None
-
-    sub2 = Glm52LLMSubmodule(model, cfg)
-    stop2 = threading.Event()
-    sub2.set_load_heartbeat_stop(stop2)
-    sub2.get_cuda_graph_configs(CPU)
-    assert stop2.is_set(), "full-graph config getter must stop the heartbeat"
-    assert sub2._load_heartbeat_stop is None
-
-    # eager-only serving never reads a config: the first forward stops it
-    cfg.mtp_num_draft_tokens = 0
-    sub3 = Glm52LLMSubmodule(_model(cfg), cfg)
-    stop3 = threading.Event()
-    sub3.set_load_heartbeat_stop(stop3)
-    driver = _Driver(sub3, cfg, ["r0"])
-    driver.step("prefill", {"r0": (_fwd_info("r0", 4), torch.tensor([1, 2, 3]))})
-    assert stop3.is_set()
-    # idempotent once stopped (and on a submodule that never had one)
-    sub3._stop_load_heartbeat()
-    Glm52LLMSubmodule._stop_load_heartbeat(object.__new__(Glm52LLMSubmodule))
 
 
 # ── KV bookkeeping between the MTP-off and MTP-on runs ──

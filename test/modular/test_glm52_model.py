@@ -181,9 +181,7 @@ def test_glm52_prefill_transitions_to_decode():
 
 
 def test_glm52_prefill_drafts_default_on_and_escape_hatch(monkeypatch):
-    """The prefill-draft edge ships ON as of 2026-08-19 (arm L: 78.53 tok/s, 3264
-    bit-exact, forced n_acc=0 bin 143 -> 129).
-    """
+    """The prefill emits its draft edge by default; the env var only turns it off."""
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
     monkeypatch.delenv("MSTAR_GLM52_MTP_PREFILL_DRAFTS", raising=False)
@@ -215,7 +213,7 @@ def test_glm52_prefill_persists_drafts_only_under_mtp(monkeypatch):
 
 
 def test_glm52_decode_never_reseeds_from_the_prompt_signal(monkeypatch):
-    """REGRESSION (2026-08-10, cost a 27-min box run to find)."""
+    """Decode must be seeded from the emitted token, never from the prompt signal."""
     from mstar.model.glm52.submodules import MTP_DRAFT_BUNDLE
 
     assert MTP_DRAFT_BUNDLE != "text_inputs"
@@ -351,7 +349,7 @@ def test_glm52_request_config_is_the_sampler_config():
 
 
 def test_glm52_mtp_declares_greedy_default_but_honors_explicit_asks():
-    """MTP v1 decode is raw argmax."""
+    """MTP decode is raw argmax unless the request asks for something else."""
     k2 = _make_model_k(2)
     assert k2.get_request_resource_configs({})[SAMPLER_RESOURCE].temperature == 0.0
     assert k2.get_request_resource_configs(
@@ -420,9 +418,8 @@ def test_glm52_check_stop_ignore_eos_runs_to_max_tokens():
     sub = _make_submodule(Glm52ModelConfig())
     outputs = {"new_token": [torch.tensor([154820])]}
     assert sub.check_stop("r0", _fwd_info(ignore_eos=True), outputs) == set()
-    # max_tokens counts TOTAL generated (vLLM semantics): 1 prefill token +
-    # iters+1 decode tokens. For max 8 the stop fires at decode iter 6
-    # (8 total), not 7 (which produced the measured off-by-one).
+    # max_tokens counts every generated token, the prefill's included: 1 +
+    # iters+1. For max 8 the stop fires at decode iter 6 (8 total), not 7.
     assert sub.check_stop(
         "r0", _fwd_info(max_tokens=8, ignore_eos=True, iters=5), outputs,
     ) == set()
@@ -449,9 +446,8 @@ def test_glm52_no_cuda_graphs_under_reference_dispatch():
 
 def test_glm52_graph_compile_env_escape_hatch(monkeypatch):
     # MSTAR_GLM52_GRAPH_COMPILE=0 captures the eager forward (both walks) —
-    # the escape hatch for the Inductor-subprocess Triton crash that failed
-    # all 296 captures on 08-07. Default stays compile-on, in the cuBLAS
-    # ("default") mode.
+    # the escape hatch for an Inductor-subprocess Triton crash that fails
+    # every capture. Default stays compile-on, in the cuBLAS ("default") mode.
     sub = _make_submodule(Glm52ModelConfig.reduced())
     configs = sub.get_cuda_graph_configs(torch.device("cpu"))
     assert all(c.compile for c in configs)

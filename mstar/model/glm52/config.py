@@ -34,11 +34,11 @@ class Glm52ModelConfig:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 256
 
-    # Default absorbed MLA stores one compressed latent KV head (the kimi_k2_7
-    # engine path). The naive path is the reduced-test parity fallback.
+    # Absorbed MLA stores one compressed latent KV head; the naive path is
+    # the reduced-test parity fallback.
     mla_absorb: bool = True
 
-    # --- DSA sparse-attention indexer (Phase C) ---
+    # --- DSA sparse-attention indexer ---
     # indexer_types in the checkpoint alternate "full" every
     # index_topk_freq=4 layers with "shared" in between (IndexShare);
     # components/indexer.py::is_full_indexer_layer holds the exact formula.
@@ -49,19 +49,19 @@ class Glm52ModelConfig:
     index_skip_topk_offset: int = 3
     index_share_for_mtp_iteration: bool = True
     indexer_rope_interleave: bool = True
-    # M3 ablation switch (0 = MTP off, byte-identical to the M1 baseline;
-    # k > 0 = draft k tokens per step with the layer-78 MTP module). Gates
-    # both the Glm52MTPModule construction and the layer-78 weight load.
+    # Speculative decoding: 0 = off, k > 0 = draft k tokens per step with the
+    # layer-78 MTP module. Gates both the Glm52MTPModule construction and the
+    # layer-78 weight load.
     mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
-    # the exact DSA computation, and nothing about M1 serving changes. On:
-    # the guard checks max_seq_len instead, FULL layers maintain a
-    # per-request indexer k-store + compute selection, and decode beyond
-    # index_topk runs sparse absorbed attention over the selected latents
-    # (dsa.py / components/attention.py). v1 is decode-only beyond topk
-    # (prefill prompts must still fit index_topk) and eager-only (selection
-    # is host-side per-request work a captured graph would not replay).
+    # the exact DSA computation. On: the guard checks max_seq_len instead,
+    # FULL layers maintain a per-request indexer k-store + compute selection,
+    # and decode beyond index_topk runs sparse absorbed attention over the
+    # selected latents (dsa.py / components/attention.py). v1 is decode-only
+    # beyond topk (prefill prompts must still fit index_topk) and eager-only
+    # (selection is host-side per-request work a captured graph would not
+    # replay).
     dsa_long_context: bool = False
 
     # --- MoE ---
@@ -96,8 +96,8 @@ class Glm52ModelConfig:
     # --- tokens / generation defaults ---
     eos_token_ids: tuple[int, ...] = (154820, 154827, 154829)
     pad_token_id: int = 154820
-    # Kept under the ctx<=2048 exactness regime with room for the prompt;
-    # Phase C restores the checkpoint's 8192 default alongside long context.
+    # Kept under the ctx<=2048 exactness regime with room for the prompt; the
+    # checkpoint's own default (8192) belongs with long context.
     max_output_tokens: int = 1024
     temperature: float = 1.0
     top_p: float = 0.95
@@ -110,17 +110,16 @@ class Glm52ModelConfig:
     quantization_config: Fp8BlockQuantConfig | None = None
     # Keep routed experts FP8-resident (uint8 container + block scales);
     # everything else dequantizes to bf16 on load. Disabling this dequantizes
-    # experts too — fine for reduced tests, OOM on the real 753B checkpoint
-    # (bf16 experts alone are ~181 GB/rank at TP8 vs the H200's 141 GB).
+    # experts too — fine for reduced tests, but bf16 routed experts alone
+    # outsize a device at TP8 on the real 753B checkpoint.
     moe_fp8_resident: bool = True
-    # Routed-expert dispatch for the fp8-resident path (kimi quant_kernel
-    # semantics): "reference" = the per-hit-expert dequant loop (bitwise
-    # CPU-testable, uncapturable, slow); "triton" = fused_experts_fp8 W8A8
-    # (fast, capture-safe, activation-quant numerics) and must not silently
-    # downgrade; "auto" = triton on CUDA, reference elsewhere. Default stays
-    # "reference" until the M1 reference-path baseline is banked — the fused
-    # kernel changes numerics (activations quantize to fp8), so flipping it
-    # mid-baseline would invalidate the token-diff anchor.
+    # Routed-expert dispatch for the fp8-resident path: "reference" = the
+    # per-hit-expert dequant loop (bitwise CPU-testable, uncapturable, slow);
+    # "triton" = fused_experts_fp8 W8A8 (fast, capture-safe, activation-quant
+    # numerics) and must not silently downgrade; "auto" = triton on CUDA,
+    # reference elsewhere. The default is "reference" because the fused
+    # kernel changes numerics (activations quantize to fp8), so serving it
+    # is an explicit choice.
     moe_quant_kernel: str = "reference"
 
     prefill_token_buckets: list[int] | None = None

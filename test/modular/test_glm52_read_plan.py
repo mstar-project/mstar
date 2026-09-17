@@ -109,9 +109,9 @@ def _mtp_fp8_config():
 
 
 def test_read_plan_includes_mtp_when_enabled():
-    """The 2026-08-09 0.00-acceptance bug: the plan dropped every layer-78 key regardless
-    of drafting (1569/118629 keys on the real checkpoint), so the MTP module served
-    ``to_empty`` memory.
+    """With drafting on, the plan must keep the layer-78 keys. Dropping them
+    leaves the MTP module reading the uninitialized ``to_empty`` memory it was
+    constructed with, which loads without error and accepts no draft.
     """
     cfg = _mtp_fp8_config()
     keys = [
@@ -122,7 +122,7 @@ def test_read_plan_includes_mtp_when_enabled():
         "model.layers.4.mlp.experts.0.up_proj.weight",
         "model.layers.4.mlp.experts.0.up_proj.weight_scale_inv",
     ]
-    # Default stays M1 flag-off behavior: the MTP layer is never read.
+    # Default stays flag-off: the MTP layer is never read.
     plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=1, tp_size=2)
     assert "model.layers.3.self_attn.q_a_proj.weight" in plan_keys
     assert not any(".layers.4." in k for k in plan_keys)

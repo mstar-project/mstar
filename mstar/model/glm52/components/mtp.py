@@ -1,4 +1,4 @@
-"""GLM-5.2 MTP (multi-token-prediction) module — the M3 draft model."""
+"""GLM-5.2 MTP (multi-token-prediction) draft module."""
 from __future__ import annotations
 
 import torch
@@ -74,10 +74,10 @@ class Glm52MTPModule(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(head_input, raw_hidden)``: the shared_head-normed
         state for ``lm_head`` (applied by the caller that owns the head),
-        and the raw layer output for chaining the next draft iteration —
+        and the raw layer output for chaining the next draft iteration.
         ``hnorm``/``fuse`` expect the UN-normalized stream, exactly as the
-        trunk pairing does (feeding normed hidden double-norms the fusion
-        input; measured to zero out acceptance, 2026-08-09).
+        trunk pairing does; handing them a normed hidden state double-norms
+        the fusion input and drops acceptance to nothing.
         """
         hidden_states = self.fuse(token_embeds, prev_hidden)
         hidden_states = self.transformer_layer(
@@ -103,7 +103,7 @@ def remap_mtp_key(sub_key: str) -> str:
 def mtp_greedy_verify(
     draft_tokens: torch.Tensor, target_argmax: torch.Tensor
 ) -> tuple[int, torch.Tensor]:
-    """Greedy (temp-0) acceptance: the M3-v1 rule."""
+    """Greedy (temp-0) acceptance: the drafts' longest prefix matching argmax."""
     k = draft_tokens.shape[0]
     if target_argmax.shape[0] != k + 1:
         raise ValueError(

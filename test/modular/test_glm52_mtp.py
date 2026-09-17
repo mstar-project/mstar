@@ -1,4 +1,4 @@
-"""CPU tests for the GLM-5.2 MTP components (M3, Phase D)."""
+"""CPU tests for the GLM-5.2 MTP components."""
 
 import sys
 import types
@@ -118,7 +118,7 @@ def _expected_module_key(sub_key: str) -> str:
         fused = "down_proj" if proj == "down_proj" else "gate_up_proj"
         return f"{prefix}.experts.{fused}"
     # Shared expert is a ParallelGatedMLP: gate/up fuse into the merged
-    # column-parallel gate_up_proj (stacked weight_loader, Kimi convention).
+    # column-parallel gate_up_proj through its stacked weight_loader.
     m = re.match(r"(.*\.shared_expert)\.(gate_proj|up_proj|down_proj)\.weight$", routed)
     if m:
         prefix, proj = m.groups()
@@ -144,9 +144,9 @@ def test_mtp_module_refuses_shared_position():
 
 
 def test_mtp_module_covers_checkpoint_keys():
-    """Every layer-78 checkpoint key must land on a real module parameter under subtree
-    routing + the trunk loader's naming conventions — the loader contract, pinned before
-    the MTP loader exists.
+    """Every layer-78 checkpoint key must land on a real module parameter under
+    subtree routing plus the trunk loader's naming conventions: the module has
+    to be shaped for the checkpoint before any loader can fill it.
     """
     cfg = _reduced_mtp_config()
     module = Glm52MTPModule(cfg)
@@ -307,7 +307,7 @@ def test_verify_emission_invariant():
 
 
 # ---------------------------------------------------------------------------
-# M3 weight loader path: layer-78 keys -> the ``mtp.`` submodule.
+# Weight loader path: layer-78 keys -> the ``mtp.`` submodule.
 
 def test_mtp_flag_default_off_no_module():
     from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
@@ -320,7 +320,7 @@ def test_mtp_flag_default_off_no_module():
 
 
 def test_mtp_load_end_to_end_reduced_fp8():
-    """The M3 loader contract, executed: layer-78 keys ride the single-pass
+    """The loader contract, executed: layer-78 keys ride the single-pass
     stream — fp8 dequant, fused expert stacking, glue keys — onto the mtp
     submodule, with completeness both ways."""
     from test_glm52_moe import BLOCK, _fabricate_checkpoint
@@ -348,7 +348,7 @@ def test_mtp_load_end_to_end_reduced_fp8():
     assert any(n.startswith("mtp.") for n in params)
     assert loaded == params
 
-    # Glue: bf16 passthrough bit-exact; eh_proj dequantized bit-exact.
+    # Glue: bf16 passes through unchanged; eh_proj dequantizes exactly.
     ckpt = dict(state)
     mtp_p = f"model.layers.{cfg.num_hidden_layers}"
     for param, key in (

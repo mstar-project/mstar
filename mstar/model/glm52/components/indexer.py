@@ -1,4 +1,4 @@
-"""GLM-5.2 DSA sparse-attention indexer (Phase C, CPU-testable reference)."""
+"""GLM-5.2 DSA sparse-attention indexer (CPU-testable reference)."""
 from __future__ import annotations
 
 import torch
@@ -38,9 +38,9 @@ class Glm52Indexer(nn.Module):
         # main MLA rope (indexer_rope_interleave=True => GPT-J pairing).
         self.rotary = Glm52RotaryEmbedding(
             rotary_dim=config.qk_rope_head_dim, base=config.rope_theta)
-        # softmax_scale (head_dim^-0.5) AND n_heads^-0.5 both fold into the
-        # per-head weights (ref_deepseek_v2.py:738-741). vLLM also folds the
-        # fp8 q dequant scale here; the bf16/fp32 path has none.
+        # Both the softmax scale (head_dim^-0.5) and n_heads^-0.5 fold into
+        # the per-head weights, as the reference implementation does; the
+        # bf16/fp32 path carries no dequant scale to fold in alongside them.
         self.weight_scale = self.head_dim**-0.5 * self.n_heads**-0.5
 
     def _rope_first_dims(
