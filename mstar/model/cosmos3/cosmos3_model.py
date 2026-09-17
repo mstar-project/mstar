@@ -23,6 +23,17 @@ Graph walks (image generation):
                  attends to [frozen text K/V | current generation tokens],
                  predicts flow velocity, and applies one scheduler step; the
                  final latents go to the VAE decoder, which emits the image.
+
+Edge checkpoints add the reasoner (the understanding tower served as a VLM):
+    vision_encoder (stateless) - SigLIP2-style tower + 2x2 patch merger:
+                                 packed image/video patches -> text-space tokens.
+    reasoner       (kv_cache, sampler) - the same transformer instance as the
+                                 DiT (one copy of the text weights, the same KV
+                                 pool), run as a causal text model.
+    reasoner_prefill / reasoner_prefill_vision - embed the chat-templated
+                 prompt (vision tokens scattered over the media placeholders),
+                 write its K/V, sample the first token.
+    reasoner_decode - one token per loop iteration until EOS / max tokens.
 """
 
 from __future__ import annotations
@@ -47,6 +58,8 @@ from mstar.engine.resources import (
     KVSpec,
     NodeResourceSpec,
     ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
 )
 from mstar.graph.base import (
     GraphEdge,
@@ -70,14 +83,20 @@ from mstar.model.cosmos3.submodules import (
     COND_LABEL,
     IMAGE_GEN_LOOP,
     KV_CACHE,
+    REASONER_DECODE_LOOP,
+    REASONER_LABEL,
+    SAMPLER,
     UNCOND_LABEL,
     VIDEO_GEN_LOOP,
     VIDEO_SOUND_GEN_LOOP,
     Cosmos3AudioDecoderSubmodule,
     Cosmos3DiTSubmodule,
+    Cosmos3ReasonerSubmodule,
     Cosmos3VAEDecoderSubmodule,
     Cosmos3VAEEncoderSubmodule,
+    Cosmos3VisionEncoderSubmodule,
 )
+from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +104,8 @@ DIT_NODE = "dit"
 VAE_ENCODER_NODE = "vae_encoder"
 VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
+VISION_ENCODER_NODE = "vision_encoder"
+REASONER_NODE = "reasoner"
 
 
 class Cosmos3Model(Model):
@@ -98,6 +119,9 @@ class Cosmos3Model(Model):
     VIDEO_SOUND_GEN_WALK = constants.VIDEO_SOUND_GEN_WALK
     ACTION_GEN_WALK = constants.ACTION_GEN_WALK
     ACTION_VIDEO_GEN_WALK = constants.ACTION_VIDEO_GEN_WALK
+    REASONER_PREFILL_WALK = constants.REASONER_PREFILL_WALK
+    REASONER_PREFILL_VISION_WALK = constants.REASONER_PREFILL_VISION_WALK
+    REASONER_DECODE_WALK = constants.REASONER_DECODE_WALK
 
     def __init__(
         self,
@@ -117,8 +141,10 @@ class Cosmos3Model(Model):
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
         # The Wan VAE is shared between the DiT submodule (conditioning encode)
-        # and the decoder submodule, so build it once.
+        # and the decoder submodule, so build it once. The transformer is
+        # shared between the DiT and reasoner nodes likewise.
         self._vae = None
+        self._transformer = None
 
     # ------------------------------------------------------------------
     # Config + tokenizer
@@ -140,7 +166,12 @@ class Cosmos3Model(Model):
 
     def _load_config(self) -> Cosmos3Config:
         if self.skip_weight_loading:
-            cfg = Cosmos3Config()
+            # Dummy mode still parses a local checkpoint directory's configs
+            # (shapes only, no tensors), so structural tests see the served
+            # walks; a bare id falls back to the Nano defaults.
+            local = Path(self.model_path_hf)
+            cfg = Cosmos3Config.from_pretrained(local) if (local / "transformer" / "config.json").exists() \
+                else Cosmos3Config()
         else:
             try:
                 cfg = Cosmos3Config.from_pretrained(self._ensure_repo())
@@ -156,6 +187,8 @@ class Cosmos3Model(Model):
             valid = {f.name for f in Cosmos3Config.__dataclass_fields__.values()}
             for k, v in self._yaml_config_overrides.items():
                 if k in valid:
+                    if k in ("image_size_default", "video_size_default") and v is not None:
+                        v = tuple(int(x) for x in v)
                     setattr(cfg, k, v)
                 else:
                     logger.warning(
@@ -170,9 +203,11 @@ class Cosmos3Model(Model):
         from transformers import AutoTokenizer
 
         repo = self._ensure_repo()
-        # The published checkpoint ships the Qwen2 text tokenizer under
+        # The published checkpoint ships the text tokenizer under
         # ``text_tokenizer/``; fall back to the repo root for layouts that
-        # keep the tokenizer files at the top level.
+        # keep the tokenizer files at the top level (Edge's ``text_tokenizer/``
+        # names a tokenizer class the pinned transformers cannot resolve, its
+        # root copy resolves to PreTrainedTokenizerFast).
         for sub in (repo / "text_tokenizer", repo):
             try:
                 return AutoTokenizer.from_pretrained(str(sub), use_fast=True)
@@ -216,16 +251,26 @@ class Cosmos3Model(Model):
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_attention_heads,
         )
+        # The reasoner is the same transformer (the DiT's understanding
+        # pathway) run as a text model, so it shares the pool and the paged
+        # backend; only its sampler is its own.
+        kv_nodes = {DIT_NODE, REASONER_NODE} if self._reasoner_enabled() else {DIT_NODE}
         specs: list[NodeResourceSpec] = [
-            KVSpec(resource_key=KV_CACHE, nodes={DIT_NODE}, config=kv_config),
+            KVSpec(resource_key=KV_CACHE, nodes=kv_nodes, config=kv_config),
             AttentionSpec(
                 resource_key=ATTN,
-                nodes={DIT_NODE},
+                nodes=kv_nodes,
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.FLASHINFER,
                 ),
             ),
         ]
+        if self._reasoner_enabled():
+            specs.append(SamplerSpec(
+                resource_key=SAMPLER, nodes={REASONER_NODE},
+                vocab_size=self.config.vocab_size,
+                enable_repetion_penalty=True,
+            ))
         if self.config.attention_backend == "dense_gen":
             specs.append(AttentionSpec(
                 resource_key=ATTN_GEN,
@@ -254,10 +299,53 @@ class Cosmos3Model(Model):
         ``process_prompt`` resolves), and naming a label a request never
         writes costs nothing — labels are created on first write.
         """
-        del partition_fwd_args, model_kwargs
+        mk = model_kwargs or {}
+        if self._is_text_request(partition_fwd_args):
+            sampling = self.get_sampling_config(REASONER_NODE, mk)
+            return {
+                KV_CACHE: KVReqConfig(needed_labels=[REASONER_LABEL]),
+                SAMPLER: SamplingReqConfig(
+                    temperature=sampling.temperature, top_k=sampling.top_k,
+                    top_p=sampling.top_p, repetition_penalty=sampling.repetition_penalty,
+                    ignore_eos=sampling.ignore_eos,
+                ),
+            }
         return {
             KV_CACHE: KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL]),
         }
+
+    def get_sampling_config(self, node_name: str, model_kwargs: dict | None = None):
+        """The reasoner's sampling knobs: OpenAI-standard ``temperature`` /
+        ``top_p`` plus ``top_k`` / ``repetition_penalty`` / ``ignore_eos``
+        from ``extra_body``. Greedy at temperature 0."""
+        from mstar.engine.resources.sampler.utils import SamplingConfig
+
+        mk = model_kwargs or {}
+        return SamplingConfig(
+            vocab_size=self.config.vocab_size,
+            temperature=float(mk.get("temperature", self.config.reasoner_temperature)),
+            top_k=int(mk.get("top_k", 0)),
+            top_p=float(mk.get("top_p", 1.0)),
+            repetition_penalty=float(mk.get("repetition_penalty", 1.0)),
+            ignore_eos=bool(mk.get("ignore_eos", False)),
+        )
+
+    @staticmethod
+    def _is_text_request(partition_fwd_args: dict[str, ForwardPassArgs] | None) -> bool:
+        """Whether a request decodes text (the reasoner) rather than
+        generating media: read off the initial forward-pass args the
+        conductor resolved for its partitions."""
+        for args in (partition_fwd_args or {}).values():
+            md = getattr(args, "full_metadata", None)
+            if md is not None and "text" in (md.output_modalities or []):
+                return True
+        return False
+
+    def _reasoner_enabled(self) -> bool:
+        """Whether the reasoner walks (and the vision_encoder + reasoner
+        nodes) are served: the checkpoint ships the vision tower, and the
+        deployment did not switch it off (``enable_reasoner``)."""
+        return bool(self.config.serves_reasoner and self.config.enable_reasoner)
 
     def _sound_serving_enabled(self) -> bool:
         """Whether the opt-in sound walk (and its audio_decoder node) is served.
@@ -516,7 +604,62 @@ class Cosmos3Model(Model):
         # (and only needs a node_groups entry) when sound serving is enabled.
         if self._sound_serving_enabled():
             walks[self.VIDEO_SOUND_GEN_WALK] = video_sound_gen
+        if self._reasoner_enabled():
+            walks.update(self._reasoner_walks())
         return walks
+
+    def _reasoner_walks(self) -> dict[str, GraphSection]:
+        """The VLM walks. ``reasoner_prefill`` embeds a text-only prompt;
+        ``reasoner_prefill_vision`` first runs the vision encoder over the
+        request's packed patches and hands the projected tokens to the
+        reasoner, which scatters them over the media placeholders. Both
+        sample the first token, which persists into the decode loop; each
+        decode iteration emits its token and feeds it back."""
+        first_token = GraphEdge(
+            next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True,
+        )
+        prefill = GraphNode(
+            name=REASONER_NODE,
+            input_names=["text_inputs", "position_ids"],
+            outputs=[first_token],
+        )
+        prefill_vision = Sequential(
+            [
+                GraphNode(
+                    name=VISION_ENCODER_NODE,
+                    input_names=["pixel_values", "vision_grid_thw"],
+                    outputs=[GraphEdge(next_node=REASONER_NODE, name="vision_embeds")],
+                ),
+                GraphNode(
+                    name=REASONER_NODE,
+                    input_names=["text_inputs", "position_ids", "vision_embeds"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT, name="new_token",
+                            output_modality="text", persist=True,
+                        ),
+                    ],
+                ),
+            ]
+        )
+        decode = Loop(
+            name=REASONER_DECODE_LOOP,
+            section=GraphNode(
+                name=REASONER_NODE,
+                input_names=["text_inputs"],
+                outputs=[
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+                    GraphEdge(next_node=REASONER_NODE, name="text_inputs"),
+                ],
+            ),
+            max_iters=self.get_max_output_tokens(),
+            outputs=[],
+        )
+        return {
+            self.REASONER_PREFILL_WALK: prefill,
+            self.REASONER_PREFILL_VISION_WALK: prefill_vision,
+            self.REASONER_DECODE_WALK: decode,
+        }
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -528,8 +671,14 @@ class Cosmos3Model(Model):
         input_modalities: list[str],
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
+        prompt_parts: list[PromptPart] | None = None,
+        input_metadata: dict | None = None,
         **kwargs,
     ) -> NameToTensorList:
+        if "text" in (output_modalities or []):
+            return self._process_reasoner_prompt(
+                prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
+            )
         if prompt is None:
             return {}
         if self.tokenizer is None:
@@ -571,7 +720,99 @@ class Cosmos3Model(Model):
             ]
         }
 
+    def _process_reasoner_prompt(
+        self, prompt, input_modalities, tensors, prompt_parts, input_metadata, model_kwargs,
+    ) -> NameToTensorList:
+        """Render the chat prompt, preprocess its media, expand the
+        placeholders and compute the mRoPE positions — everything the
+        reasoner prefill needs besides the encoder pass.
+
+        Returns ``text_inputs`` (the token ids), ``position_ids`` ([3, N]) and,
+        with attachments, the packed ``pixel_values`` + ``vision_grid_thw``
+        the vision_encoder node consumes."""
+        from mstar.model.cosmos3.components.reasoner import (
+            IMAGE,
+            VIDEO,
+            expand_placeholders,
+            mrope_position_ids,
+            preprocess_image,
+            preprocess_video,
+            render_chat,
+        )
+
+        if not self._reasoner_enabled():
+            raise ValueError("This Cosmos3 checkpoint/deployment does not serve the reasoner (text output).")
+        if self.tokenizer is None:
+            raise ValueError("The Cosmos3 reasoner needs the checkpoint tokenizer.")
+        reasoner = self.config.reasoner
+        parts = parts_from_modalities(
+            input_modalities,
+            [p.text or "" for p in prompt_parts if p.modality == TEXT] if prompt_parts is not None else prompt,
+        )
+        unsupported = {p.modality for p in parts} - {TEXT, IMAGE, VIDEO}
+        if unsupported:
+            raise ValueError(
+                f"The Cosmos3 reasoner accepts image and video attachments only; got {sorted(unsupported)}."
+            )
+        check_attachments(parts, {
+            IMAGE: len(tensors.get("image_inputs", [])), VIDEO: len(tensors.get("video_inputs", [])),
+        })
+
+        image_grids, video_grids, patches = [], [], []
+        for image in tensors.get("image_inputs", []):
+            pv, grid = preprocess_image(image.cpu(), reasoner.image_processor)
+            patches.append(pv)
+            image_grids.append(grid)
+        video_meta = input_metadata.get("video_inputs", [])
+        for i, video in enumerate(tensors.get("video_inputs", [])):
+            meta = video_meta[i] if i < len(video_meta) else {}
+            source_fps = meta.get("average_fps") or meta.get("fps")
+            pv, grid = preprocess_video(
+                video.cpu(), reasoner.video_processor, source_fps,
+                num_frames=model_kwargs.get("video_num_frames"), fps=model_kwargs.get("video_fps"),
+            )
+            patches.append(pv)
+            video_grids.append(grid)
+        # Media patches are packed in prompt order (images, then videos, as
+        # the parts list them); the vision encoder returns tokens in that
+        # order and the placeholders are expanded in the same order.
+        ordered_patches: list[torch.Tensor] = []
+        ordered_grids: list[tuple[int, int, int]] = []
+        img_i = vid_i = 0
+        for part in parts:
+            if part.modality == IMAGE:
+                ordered_patches.append(patches[img_i])
+                ordered_grids.append(image_grids[img_i].thw)
+                img_i += 1
+            elif part.modality == VIDEO:
+                ordered_patches.append(patches[len(image_grids) + vid_i])
+                ordered_grids.append(video_grids[vid_i].thw)
+                vid_i += 1
+
+        text = render_chat(
+            self.tokenizer, parts, reasoner,
+            enable_thinking=model_kwargs.get("enable_thinking"),
+            system_prompt=model_kwargs.get("system_prompt"),
+        )
+        text = expand_placeholders(text, self.tokenizer, reasoner, image_grids, video_grids)
+        ids = torch.tensor(self.tokenizer(text, add_special_tokens=False)["input_ids"], dtype=torch.long)
+        max_len = int(reasoner.max_position_embeddings)
+        if ids.numel() > max_len:
+            raise ValueError(
+                f"Cosmos3 reasoner prompt is {ids.numel()} tokens, over the {max_len}-token context."
+            )
+        position_ids, _ = mrope_position_ids(ids, reasoner, image_grids, video_grids)
+        out: NameToTensorList = {"text_inputs": [ids], "position_ids": [position_ids]}
+        if ordered_patches:
+            out["pixel_values"] = [torch.cat(ordered_patches, dim=0)]
+            out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
+        return out
+
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
+        if modality == "text":
+            # One sampled token per chunk; the client concatenates the pieces.
+            ids = output.reshape(-1).tolist()
+            return self.tokenizer.decode(ids, skip_special_tokens=True).encode("utf-8")
         if modality == "image":
             import io
             import os
@@ -683,7 +924,11 @@ class Cosmos3Model(Model):
         ``process_prompt`` (for resolution-aware tokenization) and the forward-
         pass metadata, so the two stay consistent."""
         mk = model_kwargs or {}
-        width = height = 1024
+        is_video_request = "video" in (output_modalities or [])
+        default_size = self.config.image_size_default
+        if is_video_request and self.config.video_size_default is not None:
+            default_size = self.config.video_size_default
+        width, height = int(default_size[0]), int(default_size[1])
         size = mk.get("size")
         if isinstance(size, str) and "x" in size.lower():
             sw, sh = size.lower().split("x", 1)
@@ -754,7 +999,7 @@ class Cosmos3Model(Model):
         steps = int(mk.get("num_inference_steps", default_steps))
         steps = max(1, min(steps, self.config.max_inference_steps))
         default_guidance = (
-            self.config.guidance_scale_action if action_mode is not None else 6.0
+            self.config.guidance_scale_action if action_mode is not None else self.config.guidance_scale
         )
         params = {
             "width": int(mk.get("width", width)),
@@ -809,9 +1054,13 @@ class Cosmos3Model(Model):
         if fs is None and action_mode is not None:
             fs = self.config.flow_shift_action
         if fs is None and is_t2i:
-            fs = 3.0
+            fs = self.config.flow_shift_image
         if fs is None and has_video_condition:
             fs = constants.V2V_DEFAULT_FLOW_SHIFT
+        if fs is None and num_frames > 1:
+            # Plain t2v / i2v: the deployment's video shift (Edge: 12.0), else
+            # the checkpoint scheduler's own.
+            fs = self.config.flow_shift_video
         if fs is not None:
             params["flow_shift"] = float(fs)
         gi = mk.get("guidance_interval")
@@ -884,6 +1133,8 @@ class Cosmos3Model(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
+        if "text" in (output_modalities or []):
+            return self._initial_reasoner_args(input_modalities, output_modalities, input_signals, model_kwargs)
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
         # Visual conditioning routes through a conditioned prefill that also feeds
         # the DiT the input to VAE-encode: a video (action inverse-dynamics) or an
@@ -924,6 +1175,70 @@ class Cosmos3Model(Model):
             step_metadata=self._step_metadata(full_metadata),
         )
 
+    def _initial_reasoner_args(
+        self, input_modalities, output_modalities, input_signals, model_kwargs,
+    ) -> ForwardPassArgs:
+        """First walk of a text (reasoner) request: the vision prefill when the
+        prompt carried media, the text-only prefill otherwise."""
+        if not self._reasoner_enabled():
+            raise ValueError("This Cosmos3 deployment does not serve the reasoner (text output).")
+        mk = dict(model_kwargs or {})
+        has_vision = "pixel_values" in input_signals and "vision_grid_thw" in input_signals
+        walk = self.REASONER_PREFILL_VISION_WALK if has_vision else self.REASONER_PREFILL_WALK
+        kwargs = {
+            "max_output_tokens": self.get_max_output_tokens(**mk),
+            "enable_thinking": mk.get("enable_thinking"),
+        }
+        full_metadata = CurrentForwardConductorMetadata(
+            input_modalities=input_modalities,
+            output_modalities=output_modalities,
+            graph_walk=walk,
+            is_prefill=True,
+            kwargs=kwargs,
+        )
+        inputs: list[GraphEdge] = []
+        for name in ("text_inputs", "position_ids"):
+            edge = GraphEdge(next_node=REASONER_NODE, name=name)
+            edge.tensor_info = input_signals[name]
+            inputs.append(edge)
+        if has_vision:
+            for name in ("pixel_values", "vision_grid_thw"):
+                edge = GraphEdge(next_node=VISION_ENCODER_NODE, name=name)
+                edge.tensor_info = input_signals[name]
+                inputs.append(edge)
+        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+        return ForwardPassArgs(
+            full_metadata=full_metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata=self._step_metadata(full_metadata),
+        )
+
+    def _reasoner_partition_args(
+        self, metadata: CurrentForwardConductorMetadata, persist_signals,
+    ) -> ForwardPassArgs:
+        """Reasoner transitions: prefill -> decode loop (seeded with the
+        persisted first token); the loop's end (EOS / max tokens, decided by
+        the submodule's ``check_stop``) finishes the request."""
+        request_done = False
+        inputs: list[GraphEdge] = []
+        if metadata.graph_walk in (self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK):
+            metadata.is_prefill = False
+            metadata.graph_walk = self.REASONER_DECODE_WALK
+            edge = GraphEdge(next_node=REASONER_NODE, name="text_inputs")
+            edge.tensor_info = persist_signals.get("new_token", [])
+            inputs.append(edge)
+        elif metadata.graph_walk == self.REASONER_DECODE_WALK:
+            request_done = True
+        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata=self._step_metadata(metadata),
+            request_done=request_done,
+        )
+
     def get_partition_forward_pass_args(
         self,
         partition_name: str,
@@ -932,6 +1247,10 @@ class Cosmos3Model(Model):
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         metadata = partition_metadata
+        if metadata.graph_walk in (
+            self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK, self.REASONER_DECODE_WALK,
+        ):
+            return self._reasoner_partition_args(metadata, persist_signals)
         request_done = False
         inputs: list[GraphEdge] = []
 
@@ -1032,6 +1351,17 @@ class Cosmos3Model(Model):
             return Cosmos3AudioDecoderSubmodule(
                 sound_tokenizer=self._build_sound_tokenizer(device), config=self.config
             )
+        if node_name == REASONER_NODE:
+            # The same transformer instance as the DiT node (built once, cached
+            # below): one copy of the text weights, shared kv/attn resources.
+            return Cosmos3ReasonerSubmodule(
+                transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
+                config=self.config,
+            )
+        if node_name == VISION_ENCODER_NODE:
+            return Cosmos3VisionEncoderSubmodule(
+                vision_model=self._build_vision_model(device), config=self.config
+            )
         return None
 
     def _build_scheduler(self):
@@ -1042,6 +1372,13 @@ class Cosmos3Model(Model):
         return UniPCMultistepScheduler.from_pretrained(str(self._ensure_repo() / "scheduler"))
 
     def _build_transformer(self, device: str, tp_group=None, sp_group=None):
+        # Built once per process: the DiT and the reasoner nodes share it.
+        if self._transformer is not None:
+            return self._transformer
+        self._transformer = self._build_transformer_uncached(device, tp_group=tp_group, sp_group=sp_group)
+        return self._transformer
+
+    def _build_transformer_uncached(self, device: str, tp_group=None, sp_group=None):
         from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
         from mstar.model.cosmos3.loader import load_transformer_weights
 
@@ -1094,6 +1431,21 @@ class Cosmos3Model(Model):
 
         vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
         return vae.float().to(device).eval()
+
+    def _build_vision_model(self, device: str):
+        """The reasoner's vision tower + projector, from ``vision_encoder/``."""
+        from mstar.model.cosmos3.components.vision import Cosmos3VisionModel
+        from mstar.model.cosmos3.loader import load_vision_encoder_weights
+
+        with torch.device("meta"):
+            model = Cosmos3VisionModel(self.config.reasoner)
+        model = model.to(torch.bfloat16)
+        if self.skip_weight_loading:
+            return model.to_empty(device=device)
+        model.to_empty(device=device)
+        load_vision_encoder_weights(model, self._ensure_repo(), device=device)
+        model.eval()
+        return model
 
     def _build_sound_tokenizer(self, device: str):
         if self.skip_weight_loading:
