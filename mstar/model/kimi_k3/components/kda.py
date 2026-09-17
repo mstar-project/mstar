@@ -1,9 +1,9 @@
 """Kimi Delta Attention layer (spec C), tensor-parallel over heads, with pluggable
 kernels and two execution contexts:
 
-* **paged**: the layer is bound to a ``RecurrentStateManager`` (``state_key``) and reads
-  this step's addressing (``slot_ids``, ``has_state``, ``cu_seqlens``) from the resource;
-  conv and recurrent states live in the resource's per-layer slot tensors.
+* **paged**: the layer is bound to a ``RecurrentStatePool`` (``state_key``: the per-layer slot
+  blocks) and to the ``KDAManager`` planned against it (``attn_key``: this step's ``KDAPlan`` with
+  ``slot_ids``, ``has_state``, ``cu_seqlens``); ``attn.run`` hands the layer's blocks to the kernels.
 * **dense** (tests / eager reference): ``forward_dense(x, state)`` carries an explicit
   ``KDAState`` for one sequence.
 
@@ -14,19 +14,18 @@ rules ``q_proj -> 0, k_proj -> 1, v_proj -> 2``) and ``in_proj`` = ``g_proj | b_
 factor ``f_a`` is replicated). One 24 MB GEMM instead of three launches of 22, 0.2 and 1.8 MB
 that each paid the same fixed ramp (see ``MergedParallelLinear``).
 
-State layout in the resource (per layer, per slot):
-``conv``: ``[3 * P_local, W]`` = the last ``W`` pre-activation inputs of q | k | v;
-``recurrent``: ``[H_local, D, D]`` fp32, **V-first** (``S[v, k]``), the kernels' layout.
+State layout in the pool (``DeltaNetGeometry``, per layer, per slot):
+``conv``: ``[3 * P_local, W - 1]`` = the pre-activation inputs of q | k | v before the current token;
+``state``: ``[H_local, D, D]`` fp32, **V-first** (``S[v, k]``), the kernels' layout.
 """
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.linear_attn.kda_kernels import KDAParams
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -54,18 +53,6 @@ KDA_STACKED_PARAMS = [(".qkv_proj", ".q_proj", 0), (".qkv_proj", ".k_proj", 1), 
 KDA_IN_PROJ_PARAMS = [(".in_proj", ".g_proj", "g"), (".in_proj", ".b_proj", "b"), (".in_proj", ".f_a_proj", "f_a")]
 
 
-@dataclass
-class KDAParams:
-    """What a kernel needs besides activations: per-rank parameters and constants."""
-    conv_weight: torch.Tensor  # [3*P_local, W] (q | k | v)
-    A_log: torch.Tensor  # [H_local] fp32
-    dt_bias: torch.Tensor  # [P_local] fp32
-    lower_bound: float | None
-    num_heads: int
-    head_dim: int
-    scale: float
-
-
 class TorchKDAKernels:
     """Reference kernels: per-sequence Python loop over the fp32 recurrence. Correct on
     any device, but it addresses slots with host integers, so it must not be captured in
@@ -87,8 +74,10 @@ class TorchKDAKernels:
         conv_state: torch.Tensor, rec_state: torch.Tensor, p: KDAParams,
     ) -> torch.Tensor:
         """``qkv [T, 3P]`` pre-conv projections, ``g_raw [T, H, D]``, ``beta_raw [T, H]``;
-        ``conv_state [slots, 3P, W]`` and ``rec_state [slots, H, D, D]`` (V-first) are the
-        resource's layer views, updated in place. Returns ``o [T, H, D]`` in ``qkv.dtype``."""
+        ``conv_state [slots, 3P, W - 1]`` and ``rec_state [slots, H, D, D]`` (V-first) are the
+        pool's layer blocks, updated in place. Returns ``o [T, H, D]`` in ``qkv.dtype``. The
+        reference conv keeps a ``W``-wide window whose oldest column is never read, so the
+        block's ``W - 1`` columns are padded in front and the new window's tail is kept."""
         t = qkv.shape[0]
         h, d = p.num_heads, p.head_dim
         assert cu_seqlens[-1] == t, f"plan covers {cu_seqlens[-1]} tokens, forward got {t}: stale plan?"
@@ -98,7 +87,10 @@ class TorchKDAKernels:
             if e <= s:
                 continue
             slot = slot_ids[i]
-            conv_prev = conv_state[slot] if has_state[i] else None
+            conv_prev = None
+            if has_state[i]:
+                kept = conv_state[slot]
+                conv_prev = torch.cat([kept.new_zeros(kept.shape[0], 1), kept], dim=-1)
             rec_prev = from_v_first(rec_state[slot]) if has_state[i] else None
             x = qkv[s:e]
             y, conv_new = short_conv(x, p.conv_weight, conv_prev)
@@ -109,7 +101,7 @@ class TorchKDAKernels:
                 g_log, torch.sigmoid(beta_raw[s:e].float()), rec_prev, p.scale,
             )
             out[s:e] = o.to(out.dtype)
-            conv_state[slot].copy_(conv_new.to(conv_state.dtype))
+            conv_state[slot].copy_(conv_new[:, 1:].to(conv_state.dtype))
             rec_state[slot].copy_(to_v_first(rec_new))
         return out
 
@@ -126,6 +118,7 @@ class ParallelKDAAttention(nn.Module):
         norm_eps: float = 1e-5,
         comm_group: CommGroup | None = None,
         state_key: str = "kda_state",
+        attn_key: str = "kda_attn",
         kernels=None,
     ):
         super().__init__()
@@ -142,7 +135,10 @@ class ParallelKDAAttention(nn.Module):
         self.gate_lower_bound = gate_lower_bound
         self.norm_eps = norm_eps
         self._state_key = state_key
-        self.state = None
+        self._attn_key = attn_key
+        self.pool = None  # RecurrentStatePool
+        self.attn = None  # KDAManager
+        # kernels for the dense/reference paths; the paged path runs the manager's
         self.kernels = kernels or TorchKDAKernels()
 
         p_full = num_heads * head_dim
@@ -201,7 +197,12 @@ class ParallelKDAAttention(nn.Module):
 
     # ------------------------------------------------------------------ pieces
     def bind_resources(self, resources: dict) -> None:
-        self.state = resources.get(self._state_key)
+        """Resolve the pool and the manager planned against it. Off-GPU the manager has no
+        kernels of its own (fla and FlashKDA are CUDA); it gets the torch reference."""
+        self.pool = resources.get(self._state_key)
+        self.attn = resources.get(self._attn_key)
+        if self.attn is not None and getattr(self.attn, "kernels", None) is None:
+            self.attn.set_kernels(TorchKDAKernels())
 
     def params(self) -> KDAParams:
         """The kernels' parameter bundle; the q/k/v conv weights concatenated into one
@@ -256,14 +257,14 @@ class ParallelKDAAttention(nn.Module):
 
     # ------------------------------------------------------------------ paths
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Paged path: addressing and state come from the bound resource (layer cursor
-        set by the model loop)."""
-        assert self.state is not None, "bind_resources first, or use forward_dense"
-        plan = self.state.plan_output
+        """Paged path: the plan comes from the manager, the state blocks from the pool (the
+        model loop sets the manager's layer cursor to this layer's index among the KDA layers)."""
+        assert self.attn is not None and self.pool is not None, "bind_resources first, or use forward_dense"
+        layer = self.attn.default_layer_idx
+        assert layer is not None, "set the KDA layer cursor (attn.set_default_layer_idx) before the forward"
         qkv, g_raw, beta_raw, g_out = self._project(x)
-        o = self.kernels.run_paged(
-            qkv, g_raw, beta_raw, plan,
-            self.state.layer_view("conv"), self.state.layer_view("recurrent"), self.params(),
+        o = self.attn.run(
+            qkv, g_raw, beta_raw, self.pool.block("conv", layer), self.pool.block("state", layer), self.params(),
         )
         return self._finish(g_out, o)
 
