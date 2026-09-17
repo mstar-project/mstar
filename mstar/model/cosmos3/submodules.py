@@ -379,6 +379,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return target_samples, max(1, math.ceil(target_samples / hop))
 
     def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=None, flow_shift=None):
+        if self.config.distilled_sigmas:
+            return self._new_distilled_scheduler(device)
         from diffusers import UniPCMultistepScheduler
 
         # The checkpoint scheduler config carries the trained sigma schedule
@@ -409,6 +411,40 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         else:
             scheduler.set_timesteps(num_inference_steps, device=device)
         return scheduler
+
+    def _new_distilled_scheduler(self, device):
+        """The 4-step distilled sampler: a FlowMatchEuler scheduler with the
+        checkpoint's stochastic (SDE) step over the fixed sigma list — every
+        step re-noises with ``x' = (1 - sigma') (x - sigma v) + sigma' eps``
+        from the request's generator (see ``_scheduler_step``). Flow shift and
+        karras spacing do not apply: the sigmas are explicit."""
+        from diffusers import FlowMatchEulerDiscreteScheduler
+
+        template = self._scheduler_template
+        if template is not None:
+            scheduler = FlowMatchEulerDiscreteScheduler.from_config(template.config)
+        else:
+            sc = self.config.scheduler
+            scheduler = FlowMatchEulerDiscreteScheduler(
+                num_train_timesteps=int(sc.num_train_timesteps), shift=1.0,
+                stochastic_sampling=bool(sc.stochastic_sampling),
+            )
+        scheduler.set_timesteps(sigmas=[float(x) for x in self.config.distilled_sigmas], device=device)
+        return scheduler
+
+    @staticmethod
+    def _scheduler_step(st, velocity, t, latents):
+        """One scheduler update of a ``[C, T, H, W]`` latent. A distilled
+        request carries its SDE generator (``sde_generator``, the same one its
+        initial noise came from, as in the reference), so the stochastic step
+        is seedable; UniPC takes no generator."""
+        kwargs = {}
+        gen = st.get("sde_generator")
+        if gen is not None:
+            kwargs["generator"] = gen
+        return st["scheduler"].step(
+            velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False, **kwargs,
+        )[0].squeeze(0)
 
     def _build_action_static(
         self, ids: list[int], height: int, width: int, num_frames: int, action_chunk: int,
@@ -993,6 +1029,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # predicted velocity is zero on conditioning frames (unpatchify
                 # only fills the noisy frames), matching the fused pipeline.
                 latents[:, :, 0] = cond_latents[:, :, 0].to(latents.dtype)
+            if self.config.distilled_sigmas:
+                # The distilled SDE step re-noises every position from this
+                # generator (the reference passes the pipeline generator), and
+                # the i2v anchor must be re-pinned after each step — the same
+                # mask re-injection video-to-video uses.
+                st.add("sde_generator", gen)
+                if cond_latents is not None and st.get("vmask") is None:
+                    vmask = torch.zeros((1, 1, latents.shape[2], 1, 1), device=device, dtype=latents.dtype)
+                    vmask[:, :, 0] = 1.0
+                    cond_video = torch.zeros_like(latents)
+                    cond_video[:, :, 0] = cond_latents[:, :, 0].to(latents.dtype)
+                    st.add_all(vmask=vmask, cond_video_latents=cond_video)
             if st.get("vmask") is not None:
                 # Video-to-video: pinned latent frames start clean, the rest
                 # from the noise drawn above (the reference RNG order).
@@ -1511,9 +1559,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             uncond_v = self._denoise(attn, st["uncond"], latents, vision_timesteps, UNCOND_LABEL)
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
 
-        new_latents = scheduler.step(
-            velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
-        )[0].squeeze(0)
+        new_latents = self._scheduler_step(st, velocity, t, latents)
         if st.get("vmask") is not None:
             # Video-to-video: re-inject the clean conditioning frames after the
             # scheduler step (the reference pipeline does the same) so scheduler
@@ -1823,9 +1869,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         out = {}
         for (rid, st, lat, ti, t, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
             velocity = uncond_v + st["gs"] * (cond_v - uncond_v)
-            new_latents = st["scheduler"].step(
-                velocity.unsqueeze(0), t, lat.unsqueeze(0), return_dict=False
-            )[0].squeeze(0)
+            new_latents = self._scheduler_step(st, velocity, t, lat)
             if st.get("vmask") is not None:
                 # Video-to-video: re-inject the clean conditioning frames, as in
                 # the single-request path.
@@ -2201,11 +2245,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # step_index is in range here: prepare_inputs vetoes the loop's extra
         # dispatched step and the engine prunes vetoed requests before postprocess.
         step_index = int(time_index.reshape(-1)[0].item())
-        sched = st["scheduler"]
-        t = sched.timesteps[step_index]
-        new_latents = sched.step(
-            velocity.unsqueeze(0), t, latents.unsqueeze(0), return_dict=False
-        )[0].squeeze(0)
+        t = st["scheduler"].timesteps[step_index]
+        new_latents = self._scheduler_step(st, velocity, t, latents)
         outputs["latents"] = [new_latents]
         outputs["time_index"] = [time_index + 1]
 
