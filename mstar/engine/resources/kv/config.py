@@ -69,6 +69,11 @@ class KVReqConfig(ResourceReqConfig):
     publish_labels_per_node_walk: (
         dict[tuple[str, str], list[str]] | None
     ) = None
+    # Stop-time labels are exported once, after the final loop iteration has
+    # committed. None and an absent key both mean no stop-time publication.
+    final_publish_labels_per_node_walk: (
+        dict[tuple[str, str], list[str]] | None
+    ) = None
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -84,12 +89,20 @@ class KVReqConfig(ResourceReqConfig):
         node: str | None,
         walk: str | None,
         available: list[str],
+        *,
+        final: bool = False,
     ) -> list[str]:
-        if self.publish_labels_per_node_walk is None:
+        mapping = (
+            self.final_publish_labels_per_node_walk
+            if final else self.publish_labels_per_node_walk
+        )
+        if final and mapping is None:
+            return []
+        if mapping is None:
             return available
         if node is None or walk is None:
             return []
-        return self.publish_labels_per_node_walk.get((node, walk), [])
+        return mapping.get((node, walk), [])
 
 
 @dataclass

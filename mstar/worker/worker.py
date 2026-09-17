@@ -2281,6 +2281,7 @@ class Worker:
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
         # Stop loops, if applicable
+        stopped_rids: list[str] = []
         for rid, loop_names in stops.items():
             loop_names = set([
                 ln for ln in loop_names if \
@@ -2288,6 +2289,7 @@ class Worker:
             ])
             if not loop_names:
                 continue
+            stopped_rids.append(rid)
             self.worker_graphs_manager.stop_loops(
                 rid, partition=batch_N.partition,
                 loop_names=loop_names,
@@ -2324,6 +2326,12 @@ class Worker:
                         )
                     )
                 )
+
+        # Ordinary publication precedes stop detection on the GPU thread.
+        # Export final-only state now, after the last iteration committed and
+        # before routing reports the completed loop to the conductor.
+        if stopped_rids:
+            engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
