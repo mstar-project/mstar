@@ -8,8 +8,10 @@ byte-for-byte:
 
 * ``preprocess_image`` / ``preprocess_video``: bicubic antialiased resize to
   multiples of ``patch_size * merge_size`` inside ``[min_pixels, max_pixels]``
-  (on 8-bit pixels, like the reference), ``(x/255 - mean) / std``, then
-  block-major 2x2 patchify so consecutive patches form the merger's blocks.
+  (on 8-bit pixels through the torchvision v2 functional, whose native uint8
+  kernel is what the reference calls — the v1 API rounds differently by one
+  8-bit step on some pixels), ``(x/255 - mean) / std``, then block-major 2x2
+  patchify so consecutive patches form the merger's blocks.
 * ``expand_placeholders``: one ``<|image_pad|>`` per merged block for images;
   videos become one timestamped ``<t seconds><|vision_start|>...<|vision_end|>``
   span per frame.
@@ -25,8 +27,8 @@ import math
 from dataclasses import dataclass
 
 import torch
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as tvF
+from torchvision.transforms.v2 import InterpolationMode
+from torchvision.transforms.v2 import functional as tvF
 
 from mstar.model.cosmos3.config import Cosmos3MediaProcessorConfig, Cosmos3ReasonerConfig
 
