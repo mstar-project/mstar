@@ -527,3 +527,46 @@ def test_edge_prompt_rendering_matches_reference_layout() -> None:
     assert nxt == int(pos.max()) + 1
     # Thinking on by default: the generation prompt opens a <think> block.
     assert render_chat(tok, parts, cfg.reasoner).endswith("<think>\n")
+
+
+@needs_edge
+def test_edge_reasoner_video_prompt() -> None:
+    """A video attachment renders one timestamped span per sampled frame, the
+    packed patches cover every frame, and the positions advance per frame."""
+    from transformers import AutoTokenizer
+
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+    from mstar.model.multimodal import PromptPart
+
+    model = Cosmos3Model(model_path_hf=str(EDGE_DIR), skip_weight_loading=True)
+    model.tokenizer = AutoTokenizer.from_pretrained(str(EDGE_DIR))
+    r = model.config.reasoner
+    video = torch.rand(30, 3, 96, 160)  # 30 frames at 10 fps -> 3 s -> 6 frames at 2 fps
+    out = model.process_prompt(
+        None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
+        prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
+        input_metadata={"video_inputs": [{"average_fps": 10.0, "num_frames": 30}]},
+        enable_thinking=False,
+    )
+    ids = out["text_inputs"][0]
+    grid = out["vision_grid_thw"][0]
+    assert grid.shape == (1, 3) and int(grid[0, 0]) == 6
+    per_frame = int(grid[0, 1] * grid[0, 2]) // 4
+    assert int((ids == r.video_token_id).sum()) == 6 * per_frame
+    assert int((ids == r.vision_start_token_id).sum()) == 6
+    assert out["pixel_values"][0].shape[0] == int(grid[0].prod())
+    pos = out["position_ids"][0]
+    starts = (ids == r.vision_start_token_id).nonzero().flatten().tolist()
+    # Frame k's tokens sit at one temporal position; successive frames are
+    # separated by the timestamp text plus the merged grid's longer side.
+    temporal = [int(pos[0, s + 1]) for s in starts]
+    assert temporal == sorted(temporal) and len(set(temporal)) == 6
+    rendered = model.tokenizer.decode(ids[: starts[1]])
+    assert "<0.0 seconds>" in rendered
+    # Explicit frame count / sampling rate overrides.
+    out2 = model.process_prompt(
+        None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
+        prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
+        input_metadata={"video_inputs": [{"average_fps": 10.0}]}, video_num_frames=4,
+    )
+    assert int(out2["vision_grid_thw"][0][0, 0]) == 4
