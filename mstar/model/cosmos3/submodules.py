@@ -149,12 +149,14 @@ REASONER_DECODE_LOOP = "reasoner_decode_loop"
 REASONER_LABEL = "main"
 
 
-def native_flow_sigmas(num_inference_steps: int, num_train_timesteps: int) -> list[float]:
+def native_flow_sigmas(num_inference_steps: int, num_train_timesteps: int):
     """The native flow-matching sigma grid: ``num_inference_steps`` values
-    linearly spaced from ``1 - 1/T`` toward 0, the endpoint dropped."""
+    linearly spaced from ``1 - 1/T`` toward 0, the endpoint dropped. A numpy
+    array: UniPC's explicit-sigma path applies the flow shift arithmetically
+    to it (a Python list raises inside ``set_timesteps``)."""
     import numpy as np
 
-    return np.linspace(1.0 - 1.0 / num_train_timesteps, 0.0, num_inference_steps + 1)[:-1].tolist()
+    return np.linspace(1.0 - 1.0 / num_train_timesteps, 0.0, num_inference_steps + 1)[:-1]
 
 
 @dataclass(frozen=True)
