@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
@@ -170,10 +171,13 @@ class Chatterbox(Model):
         return {RequestType.T2S}
 
     def get_model_kwargs(self, request_type: RequestType):
-        # The checkpoint's built-in voice and the reference package's defaults
-        # (temperature 0.8, exaggeration 0.5, cfg 0.5), so every system
-        # synthesises the same request; stop on the model's own EOS.
-        return {"voice": "default", "temperature": 0.8}
+        # The reference package's defaults (temperature 0.8, exaggeration 0.5,
+        # cfg 0.5), so every system synthesises the same request and stops on
+        # the model's own EOS. The voice defaults to the checkpoint's built-in
+        # one; set CHATTERBOX_BENCH_VOICE to a preset file name (e.g.
+        # "Abigail.wav") that both M* (voices_dir) and Chatterbox-TTS-Server
+        # (predefined voices) resolve, for a same-voice comparison.
+        return {"voice": os.environ.get("CHATTERBOX_BENCH_VOICE", "default"), "temperature": 0.8}
 
 
 class Qwen3Omni(Model):
