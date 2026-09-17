@@ -194,6 +194,42 @@ def test_reference_kernels_run_the_paged_forward_against_the_pool():
         torch.testing.assert_close(out2[1:2], d_a, rtol=1e-4, atol=1e-4)
 
 
+def test_replay_padding_rows_take_no_slots():
+    """A captured replay pads the batch with the runner's dummy rows: ingested once, span 1 like the
+    template row, named per capture slot and row. They must reserve nothing (two slots times the widest
+    bucket of such names would drain a pool sized for the real concurrency), address the sink, and
+    never be committed; the real rows keep their own slots across the rotation of padding names."""
+    pool, attn, runner = build(max_slots=6)  # 5 usable slots for 2 real requests
+    for rid in ("a", "b"):
+        runner.ingest_request(rid)
+    dummies = [f"__cg_LLM_{slot}_{i}__" for slot in (0, 1) for i in range(4)]
+    for rid in dummies:
+        runner.ingest_request(rid)  # DummyRowPool.ensure ingests them once and keeps them
+    for _ in range(3):
+        for slot in (0, 1):
+            names = [f"__cg_LLM_{slot}_{i}__" for i in range(4)]
+            real = ["a", "b"]
+            padded = [*real, *names[2:]]
+            s = SubmoduleStep(
+                segments=[Segment(rid, "main", 1) for rid in padded],
+                steps={POOL: RecurrentStep(), ATTN: LinearAttnStep()})
+            ctx = StepContext(request_ids=real, graph_walk="decode", slot=slot, capture=False)
+            ctx.set_padded_rids(padded)
+            s.set_ctx(ctx)
+            assert runner.admit(s).ok
+            assert pool.num_free_slots == 3  # a and b hold one slot each, the padding rows none
+            runner.plan(s)
+            plan = attn.current_plan()
+            assert plan.num_rows == 4
+            assert plan.slot_ids_cpu[2] == plan.slot_ids_cpu[3] == SINK_SLOT
+            assert plan.has_state_cpu[2] is False and plan.has_state_cpu[3] is False
+            assert plan.slot_ids_cpu[0] != plan.slot_ids_cpu[1] and SINK_SLOT not in plan.slot_ids_cpu[:2]
+            runner.commit(s)
+    for rid in dummies:
+        assert not pool._slots.get(rid), rid  # no slot ever handed to a padding row
+    assert pool._slots["a"]["main"].has_state and pool._slots["b"]["main"].has_state
+
+
 def test_capture_rows_take_no_slots():
     """The CUDA-graph capture's dummy rows (``ctx.capture``) reserve nothing and address the sink:
     two capture slots of the widest bucket would otherwise exhaust a pool sized for the deployment."""
