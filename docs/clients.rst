@@ -73,6 +73,45 @@ arrive. ``GET /health`` returns ``{"status": "healthy"}``.
      -F 'text=hello there' -F 'output_modalities=audio' \
      -F 'model_kwargs={"voice":"tara"}' -F 'streaming=false'
 
+WebSocket ``/generate/ws``
+--------------------------
+
+``/generate/ws`` is the same request over one persistent WebSocket, for control loops
+that cannot afford an HTTP round trip per step (robot policies, streaming world models).
+Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
+``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
+``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
+as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as the
+message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
+then ``{"request_id", "finish": true}``. A rejected message answers
+``{"request_id", "error": ...}`` and the socket stays open. Messages may be pipelined —
+send the next observation before the current action chunk has returned — and the
+``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
+flight.
+
+.. code-block:: python
+
+   import msgpack, numpy as np, websockets.sync.client
+
+   with websockets.sync.client.connect("ws://localhost:8000/generate/ws", max_size=None) as ws:
+       ws.send(msgpack.packb({
+           "text": "pick up the mug",
+           "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
+           "output_modalities": ["action"],
+           "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
+                            "raw_action_dim": 10, "action_chunk_size": 32},
+           "request_id": "step-0",
+       }, use_bin_type=True))
+       while True:
+           reply = msgpack.unpackb(ws.recv(), raw=False)
+           if reply.get("modality") == "action":
+               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)
+           if reply.get("finish") or reply.get("error"):
+               break
+
+``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
+loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
+
 Python SDK
 ----------
 
