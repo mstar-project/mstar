@@ -24,6 +24,14 @@ PREFILL_COND_VIDEO_WALK = "prefill_cond_video"
 IMAGE_GEN_WALK = "image_gen"
 VIDEO_GEN_WALK = "video_gen"
 VIDEO_SOUND_GEN_WALK = "video_sound_gen"
+# Windowed autoregressive video (opt-in via ``enable_windowed_video``): the
+# denoise loop produces the clip window by window and streams each finished
+# window's latents to a dedicated decoder partition, which decodes them
+# incrementally and emits the video (whole, or per window with
+# ``stream_video``). Ported from #198 (merceod).
+VIDEO_GEN_AR_WALK = "video_gen_ar"
+VIDEO_DECODE_AR_WALK = "video_decode_ar"
+WINDOW_DECODER_PARTITION = "window_decoder"
 ACTION_GEN_WALK = "action_gen"
 # Forward-dynamics runs the same joint video+action denoise but emits the
 # predicted video (VAE-decoded) instead of the action, so it has its own walk.
