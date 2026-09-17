@@ -362,6 +362,13 @@ class Cosmos3Config:
     # The understanding tower served as a VLM (vision tower + projector);
     # None for checkpoints that ship no reasoner (Nano/Super generators).
     reasoner: Cosmos3ReasonerConfig | None = None
+    # Serve the reasoner walks (and load the vision tower) when the checkpoint
+    # has them; a deployment may switch them off to serve the generator alone.
+    enable_reasoner: bool = True
+    # Default sampling temperature for reasoner requests that send none
+    # (0 = greedy). The checkpoint's generation_config samples; the M* default
+    # keeps the other chat models' 0.6.
+    reasoner_temperature: float = 0.6
 
     # ----- provenance -----
     local_dir: str = ""
