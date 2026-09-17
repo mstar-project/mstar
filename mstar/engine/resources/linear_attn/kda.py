@@ -40,6 +40,8 @@ class KDAPlan:
     num_rows: int  # real (unpadded) rows
     num_tokens: int
     is_decode: bool  # every row appends exactly one token
+    # every row is a speculative verify block of k + 1 tokens (the checkpoint recurrence)
+    is_verify: bool = False
     _cpu: dict = field(default_factory=dict, repr=False)
 
     # host copies for reference kernels that loop over rows (a sync on CUDA; the fla kernels never ask)
@@ -64,6 +66,7 @@ class KDAManager(LinearAttnManager):
         num_layers: int,
         device: torch.device,
         kernels=None,
+        speculative_tokens: int = 0,
     ):
         from mstar.engine.resources.linear_attn.kda_kernels import default_kernels
 
@@ -72,6 +75,8 @@ class KDAManager(LinearAttnManager):
         self.num_layers = num_layers
         self._device = device
         self._pool_key = config.recurrent_state
+        # k > 0: rows of exactly k + 1 tokens are verify blocks (the pool carries the spec blocks)
+        self.speculative_tokens = int(speculative_tokens)
         # FlashKDA is specialised for head_dim 128 with a bounded gate; other shapes use fla
         fits = geometry.head_k_dim == 128 and geometry.head_v_dim == 128 and config.gate_lower_bound is not None
         self.kernels = kernels if kernels is not None else default_kernels(device, config.backend.value, fits)
@@ -166,9 +171,11 @@ class KDAManager(LinearAttnManager):
         # built on the host and copied in: the values come from Python bookkeeping
         host = torch.tensor(cu, dtype=torch.int32, pin_memory=torch.cuda.is_available())
         buf[: rows + 1].copy_(host, non_blocking=True)
+        k1 = self.speculative_tokens + 1
         return KDAPlan(
             slot_ids=addressing.slot_indices[:rows], has_state=addressing.has_state[:rows], cu_seqlens=buf,
             cu_seqlens_cpu=cu, num_rows=rows, num_tokens=cu[-1], is_decode=rows > 0 and all(s == 1 for s in spans),
+            is_verify=self.speculative_tokens > 0 and rows > 0 and all(s == k1 for s in spans),
         )
 
     def current_plan(self, label: str | None = None) -> KDAPlan:
@@ -187,13 +194,27 @@ class KDAManager(LinearAttnManager):
     @torch.compiler.disable
     def run(
         self, qkv: torch.Tensor, g_raw: torch.Tensor, beta_raw: torch.Tensor,
-        conv_layer: torch.Tensor, state_layer: torch.Tensor, params, label: str | None = None,
+        conv_layer: torch.Tensor, state_layer: torch.Tensor, params, label: str | None = None, spec=None,
     ) -> torch.Tensor:
         """One layer's KDA over this step's packed tokens: ``qkv [T, 3P]`` (pre-conv), ``g_raw [T, H, D]``,
         ``beta_raw [T, H]``; ``conv_layer`` / ``state_layer`` are the pool's ``block(name, layer)`` views,
         updated in place. Returns ``o [T, H, D]``."""
         assert self.kernels is not None, "no KDA kernels: on CUDA fla/FlashKDA are required, off-GPU call set_kernels"
-        return self.kernels.run_paged(qkv, g_raw, beta_raw, self.current_plan(label), conv_layer, state_layer, params)
+        plan = self.current_plan(label)
+        if plan.is_verify:
+            assert spec is not None, "a verify step needs the layer's speculative blocks (SpecBlocks)"
+            return self.kernels.run_verify(qkv, g_raw, beta_raw, plan, conv_layer, state_layer, spec, params)
+        return self.kernels.run_paged(qkv, g_raw, beta_raw, plan, conv_layer, state_layer, params)
+
+    @torch.compiler.disable
+    def set_prefix_len(self, spec_len: torch.Tensor, accepted: torch.Tensor, label: str | None = None) -> None:
+        """After the verification: the rows' blocks become their pending prefixes, ``accepted + 1``
+        tokens long (the bonus token is always kept). ``spec_len`` is the shared ``[slots, 1]`` int32
+        block; padding rows write the sink. Tensor ops only."""
+        plan = self.current_plan(label)
+        rows = plan.num_rows
+        values = (accepted[:rows].to(torch.int32) + 1).unsqueeze(1)
+        spec_len.index_copy_(0, plan.slot_ids[:rows].to(torch.long), values)
 
     # Engine lifecycle
 
