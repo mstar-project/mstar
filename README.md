@@ -80,7 +80,7 @@ uv pip install \
   "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
-Other models: `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
+Other models: `mstar serve flux2_klein` · `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
 
 **Python SDK** — works for every model (text, image, audio, video):
 
@@ -89,7 +89,8 @@ from mstar import MStarClient
 client = MStarClient("http://localhost:8000")
 
 client.chat("What is the capital of France?").text          # text
-client.generate_image("a cat in a hat")                     # → PNG bytes   (BAGEL, Cosmos3)
+client.generate_image("a cat in a hat")                     # → PNG bytes   (FLUX.2 klein, BAGEL, Cosmos3)
+client.edit_image("make it a watercolor", "cat.png")        # → PNG bytes   (FLUX.2 klein, BAGEL)
 client.tts("Hello there", voice="tara").to_wav("out.wav")   # → speech      (Orpheus)
 
 for event in client.chat("Tell me a story", stream=True):   # streaming
@@ -124,6 +125,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [Pi0.5](https://huggingface.co/lerobot/pi05_base) | Vision-language-action | text, image, state → robot actions | `/generate` |
 | [V-JEPA 2 / 2-AC](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | World model | video (+ actions) → latents, rollouts | `/generate` |
 | [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | Video diffusion | text, image → video | `/v1/videos/generations`, `/generate` |
+| [FLUX.2 klein 4B / 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image diffusion | text, image → image (4-step distilled, editing) | `/v1/images/generations`, `/v1/images/edits` |
 
 Every model is reachable through the SDK and the native `/generate` endpoint; the OpenAI-compatible
 routes cover the chat, speech, image, and video models.
