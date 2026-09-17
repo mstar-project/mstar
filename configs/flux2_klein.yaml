@@ -1,0 +1,25 @@
+model: "flux2_klein"
+
+# Every klein node is stateless except the dit's cacheless ragged attention; max_seq_len
+# only satisfies the conductor's config check (the 512-token prompt).
+max_seq_len: 512
+
+# FLUX.2 [klein] 4B, single GPU, all four nodes colocated. Serving knobs (forwarded to
+# Flux2KleinModel.__init__): attention_backend flashinfer|sdpa, torch.compile of the
+# transformer per shape, CUDA-graph capture of the denoise step for the listed
+# (height, width) shapes and batch sizes (other shapes run the eager batched path).
+model_kwargs:
+  attention_backend: flashinfer
+  compile: true
+  cuda_graph: true
+  capture_sizes: [[1024, 1024]]
+  capture_batch_sizes: [1, 2, 4, 8]
+  max_batch_size: 8
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_encoder, vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]
