@@ -62,9 +62,9 @@ class FakeCommGroup(CommGroup):
         self._mb.barrier.wait()
 
 
-def _build(cfg, tiny_dir, group, ep=1):
+def _build(cfg, tiny_dir, group, ep=1, shard_latent=True):
     with torch.device("meta"):
-        lm = KimiK3ForCausalLM(cfg, comm_group=group, moe_ep_size=ep)
+        lm = KimiK3ForCausalLM(cfg, comm_group=group, moe_ep_size=ep, moe_shard_latent=shard_latent)
     lm = lm.to(torch.bfloat16)
     for name, p in lm.named_parameters():
         if name.endswith(("A_log", "dt_bias", "e_score_correction_bias")):
@@ -75,9 +75,11 @@ def _build(cfg, tiny_dir, group, ep=1):
     return lm
 
 
-@pytest.mark.parametrize("tp,ep", [(2, 1), (4, 1), (2, 2), (4, 2), (4, 4)])
-def test_tp_dense_forward_matches_single_rank(tiny_dir, tp, ep):
-    """``tp`` ranks; the routed experts in ``ep`` expert-parallel groups (1: pure TP)."""
+@pytest.mark.parametrize("tp,ep,shard_latent", [(2, 1, True), (4, 1, True), (2, 2, True), (4, 2, True), (4, 4, True),
+                                                 (2, 1, False), (4, 2, False)])
+def test_tp_dense_forward_matches_single_rank(tiny_dir, tp, ep, shard_latent):
+    """``tp`` ranks; the routed experts in ``ep`` expert-parallel groups (1: pure TP); the MoE latent
+    down-projection column-parallel and all-gathered (``shard_latent``) or replicated."""
     cfg = KimiK3Config.from_hf_dir(tiny_dir).text
     ref = _build(cfg, tiny_dir, CommGroup.trivial())
     torch.manual_seed(0)
@@ -85,13 +87,23 @@ def test_tp_dense_forward_matches_single_rank(tiny_dir, tp, ep):
     with torch.no_grad():
         ref_logits, _ = ref.forward_dense(ids)
     mb = _Mailbox(tp)
-    lms = [_build(cfg, tiny_dir, FakeCommGroup(r, mb), ep) for r in range(tp)]
+    lms = [_build(cfg, tiny_dir, FakeCommGroup(r, mb), ep, shard_latent) for r in range(tp)]
     # the column-parallel lm_head shards concatenate back to the full weight
     assert torch.equal(torch.cat([lm.lm_head.weight for lm in lms], 0), ref.lm_head.weight)
     # expert placement: ep groups of whole experts, each sharded over tp / ep ranks
     moe_ref, moe = ref.model.layers[1].block_sparse_moe, lms[tp - 1].model.layers[1].block_sparse_moe
     n_exp, inter = cfg.num_experts, cfg.moe_intermediate_size
     assert moe.experts.gate_up_proj.shape == (n_exp // ep, 2 * inter // (tp // ep), moe_ref.latent_size)
+    # the latent down-projection: 1/tp of its rows per rank when sharded, all of them otherwise; the
+    # single-rank reference never shards it
+    latent = moe_ref.latent_size
+    assert not moe_ref.latent_sharded and moe_ref.in_proj.local_sizes["routed_down"] == latent
+    assert moe.latent_sharded == shard_latent
+    assert moe.in_proj.local_sizes["routed_down"] == (latent // tp if shard_latent else latent)
+    w_ref = moe_ref.in_proj.weight.narrow(0, 0, latent)
+    shards = [lm.model.layers[1].block_sparse_moe.in_proj.weight.narrow(0, 0, latent // tp if shard_latent else latent)
+              for lm in lms]
+    assert torch.equal(torch.cat(shards, 0) if shard_latent else shards[0], w_ref)
     sh = moe.sharding
     for le in range(sh.local_experts):
         cols = slice(sh.inter_offset, sh.inter_offset + sh.inter_local)
