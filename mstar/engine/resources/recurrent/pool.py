@@ -200,8 +200,14 @@ class RecurrentStatePool(Resource):
     # Step lifecycle
 
     def admit(self, step: RecurrentStep, ctx: StepContext) -> AdmitOutcome:
-        """Reserve a slot per addressed (rid, label), plus fork targets."""
-        del ctx
+        """Reserve a slot per addressed (rid, label), plus fork targets.
+
+        A CUDA-graph capture step (``ctx.capture``) reserves nothing: its rows are the runner's
+        dummy requests, up to the widest bucket per capture slot, and they would exhaust a pool
+        sized for the real concurrency. They address the sink instead (``_build_addressing``), so
+        the captured kernels are the same slot-indexed ones a replay runs with real slots."""
+        if ctx.capture:
+            return ADMIT_OK
         for segment in step.segments or ():
             if segment.span <= 0:
                 # reads its state without extending it, or a padding row
@@ -344,10 +350,15 @@ class RecurrentStatePool(Resource):
         self, label: str, segments: list[Segment], ctx: StepContext,
     ) -> RecurrentAddressing:
         pad = self.pad_index
+        if ctx.capture and pad == NO_SLOT:
+            raise ValueError(
+                "a CUDA-graph capture needs the pool's sink slot for its dummy rows (a -1 index cannot be "
+                "written by every backend). Unset RecurrentStateConfig.disable_sink_slot."
+            )
         indices = []
         has_state = []
         for seg in segments:
-            slot = self._slots.get(seg.request_id, {}).get(label)
+            slot = None if ctx.capture else self._slots.get(seg.request_id, {}).get(label)
             if slot is None or seg.span <= 0:
                 indices.append(pad)
                 has_state.append(False)
