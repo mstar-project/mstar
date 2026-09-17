@@ -190,16 +190,22 @@ def test_publish_exports_only_labels_declared_for_remote_consumers():
         KVReqConfig(
             publish_labels_per_node_walk={
                 ("producer", "prefill"): ["branch"],
-            }
+            },
+            final_publish_labels_per_node_walk={
+                ("producer", "decode"): ["branch"],
+            },
         ),
     )
     _grow(kv, "r0", 16)
     _grow(kv, "r0", 16, label="branch")
 
     assert kv.publish("r0", "producer", "decode") is None
+    assert kv.publish_after_stop("r0", "producer", "prefill") is None
     published = kv.publish("r0", "producer", "prefill")
+    final_published = kv.publish_after_stop("r0", "producer", "decode")
 
     assert set(published.get(0)) == {"branch"}
+    assert set(final_published.get(0)) == {"branch"}
 
 
 def test_publish_is_consistent_against_a_concurrent_commit():

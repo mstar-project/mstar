@@ -1084,6 +1084,20 @@ class Engine:
             if self._enable_nvtx:
                 range_pop()
 
+    def finalize_stopped_requests(
+        self,
+        batch: ExecutingBatch,
+        request_ids: list[str],
+    ) -> None:
+        """Publish state that must include the last iteration of a stopped loop."""
+        published = self._runner.publish_after_stop(
+            request_ids,
+            node_name=batch.node_name,
+            graph_walk=batch.step_context.graph_walk,
+        )
+        for rid in request_ids:
+            batch.per_request_info[rid].update_publish_info(published.get(rid, {}))
+
     def _collect_outputs(
         self,
         submodule_mgmt: SubmoduleManagement,

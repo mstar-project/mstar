@@ -899,6 +899,8 @@ class KVManager(AttentionResource):
         request_id: str,
         node_name: str | None = None,
         graph_walk: str | None = None,
+        *,
+        final: bool = False,
     ):
         with self._lock:
             # remove_request can race finalize on another thread. Resolve the
@@ -908,7 +910,7 @@ class KVManager(AttentionResource):
             if streams is None or overrides is None:
                 return None
             labels = overrides.get_publish_labels(
-                node_name, graph_walk, list(streams),
+                node_name, graph_walk, list(streams), final=final,
             )
             if not labels:
                 return None
@@ -938,6 +940,19 @@ class KVManager(AttentionResource):
     ):
         return self.publish(
             request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id,
+            node_name=node_name,
+            graph_walk=graph_walk,
+            final=True,
         )
 
     def reset_request(self, rid: str, free: bool=False):

@@ -803,12 +803,15 @@ class BagelModel(Model):
                 },
                 # Only the main LLM instance creates cache branches consumed
                 # by the remote CFG replicas. Text-only requests export
-                # nothing. Think-then-image keeps cfg_img current during
-                # decode because image_gen_cfg consumes it after EOS.
+                # nothing. Think-then-image exports cfg_img once after decode
+                # stops, so image_gen_cfg sees the final KV without rewriting
+                # the SHM payload on every token.
                 publish_labels_per_node_walk={
                     ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
                     ("LLM", "prefill_vit"): ["cfg_text"],
                     ("LLM", "prefill_vae"): ["cfg_text"],
+                } if cfg else {},
+                final_publish_labels_per_node_walk={
                     ("LLM", "decode"): ["cfg_img"],
                 } if cfg else {},
             ),

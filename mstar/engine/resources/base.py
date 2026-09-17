@@ -145,6 +145,16 @@ class Resource(ABC):
         del node_name, graph_walk
         return self.publish(request_id)
 
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Publish state that is useful only when a dynamic loop stops."""
+        del request_id, node_name, graph_walk
+        return None
+
     def reset_request(self, rid: str, free: bool=False):
         """For clearing dummy RIDs during cuda graph capture"""
         return
