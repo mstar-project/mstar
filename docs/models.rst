@@ -233,8 +233,12 @@ own ``window_decoder`` partition; a request opts in per call:
 
 The schedule is padded up to whole windows and the video trimmed back to
 ``num_frames``; a seeded request is deterministic end to end (later windows draw
-their noise from the same generator). Windowed requests run the eager denoise
-path and batch with each other and with plain requests at the same walk.
+their noise from the same generator). Windowed requests batch with each other
+and with plain requests at the same walk. With ``gen_capture_video`` listing the
+(height, width, frames) tiers to capture — ``configs/cosmos3_edge.yaml`` captures
+the 121-frame clip and the 29-frame window at 832x480 — plain t2v/i2v steps and
+``chained`` window steps replay a per-step CUDA graph (one graph per latent shape,
+the clean/noisy frame layout carried as a mask input); ``kv`` windows run eager.
 
 Wan2.2 (``wan22``)
 ------------------
