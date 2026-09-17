@@ -48,6 +48,18 @@ serve_vllm_reasoner() {
 }
 
 here=$(dirname "$0")
+
+# Streaming rollout (M* only; no baseline streams frames): TTFF, window cadence
+# and frames/s for kv / chained windows vs the same clip generated whole.
+#   usage: bench_stream <mstar_port> [cond_image.jpg]
+bench_stream() {
+  local mp="$1" img="${2:-}" extra=()
+  [ -n "$img" ] && extra=(--image "$img")
+  for mode in kv chained none; do
+    python "$here/bench_stream_video.py" --port "$mp" --mode "$mode" --size 832x480 \
+      --frames 241 --window-frames 29 --steps 20 --gs 6.0 --rounds 2 "${extra[@]}"
+  done
+}
 # Generator: i2v 480p x 121 frames x 20 steps (the model-card recipe), t2v same, t2i 640x640.
 #   usage: bench_generator <mstar_port> <vllm_omni_port> <cond_image.jpg>
 bench_generator() {
@@ -77,5 +89,6 @@ case "${1:-}" in
   serve-vllm-reasoner) shift; serve_vllm_reasoner "$@";;
   bench-generator)     shift; bench_generator "$@";;
   bench-reasoner)      shift; bench_reasoner "$@";;
-  *) echo "usage: $0 {serve-mstar <gpu> <port> | serve-vllm-omni <gpu> <port> | serve-vllm-reasoner <gpu> <port> | bench-generator <mp> <vp> <img> | bench-reasoner <mp> <vp> <img>}";;
+  bench-stream)        shift; bench_stream "$@";;
+  *) echo "usage: $0 {serve-mstar <gpu> <port> | serve-vllm-omni <gpu> <port> | serve-vllm-reasoner <gpu> <port> | bench-generator <mp> <vp> <img> | bench-reasoner <mp> <vp> <img> | bench-stream <mp> [img]}";;
 esac
