@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Intelligibility guard for TTS benchmark outputs.
+
+Transcribes every ``<index>.wav`` (or ``req_<index>.wav``) in a directory with Whisper and scores it
+against the sentence set the audio was synthesised from (line ``index`` of
+``--sentences``), so throughput numbers can be reported alongside a WER that
+proves the speed did not come from garbled speech::
+
+    python benchmark/chatterbox/wer_eval.py --wavs results/<date>/mstar_c8/wavs \
+        --sentences /path/sentences_200.txt --out results/<date>/mstar_c8/wer.json
+
+Runs offline against the shared HF cache (``HF_HUB_OFFLINE=1``).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import torch
+import torchaudio
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from benchmark.asr_eval import _compute_wer  # noqa: E402
+
+ASR_MODEL = "openai/whisper-large-v3-turbo"
+
+
+def transcribe(wavs: list[Path], model_id: str, device: str, batch_size: int) -> list[str]:
+    from transformers import pipeline
+
+    dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    asr = pipeline("automatic-speech-recognition", model=model_id, torch_dtype=dtype, device=device)
+    samples = []
+    for path in wavs:
+        wav, sr = torchaudio.load(str(path))
+        wav = wav.mean(dim=0)
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+        samples.append({"raw": wav.numpy(), "sampling_rate": 16000})
+    outputs = asr(samples, batch_size=batch_size, generate_kwargs={"language": "en", "task": "transcribe"})
+    return [o["text"].strip() for o in outputs]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--wavs", required=True, help="directory of <index>.wav files")
+    parser.add_argument("--sentences", required=True, help="reference sentences, one per line")
+    parser.add_argument("--asr-model", default=ASR_MODEL)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args()
+
+    sentences = [s.strip() for s in Path(args.sentences).read_text().splitlines() if s.strip()]
+    # "<index>.wav" from the offline drivers or "req_<index>.wav" from benchmark.runner
+    indexed = {p: int(p.stem.removeprefix("req_")) for p in Path(args.wavs).glob("*.wav")
+               if p.stem.removeprefix("req_").isdigit()}
+    wavs = sorted(indexed, key=indexed.get)
+    if not wavs:
+        raise SystemExit(f"no <index>.wav / req_<index>.wav files under {args.wavs}")
+    references = [sentences[indexed[p] % len(sentences)] for p in wavs]
+
+    hypotheses = transcribe(wavs, args.asr_model, args.device, args.batch_size)
+    report = _compute_wer(references, hypotheses)
+    durations = [torchaudio.info(str(p)).num_frames / torchaudio.info(str(p)).sample_rate for p in wavs]
+    result = {
+        "asr_model": args.asr_model, "num_files": len(wavs), "wer": report["wer"],
+        "total_audio_s": sum(durations), "mean_audio_s": sum(durations) / len(durations),
+        "worst": sorted(report["per_sample"], key=lambda s: -s["wer"])[:10],
+        "files": [p.name for p in wavs],
+    }
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps({**result, "per_sample": report["per_sample"]}, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k != "worst"}, indent=2))
+    for s in result["worst"][:5]:
+        print(f"  [{s['index']}] wer={s['wer']:.2f}\n    ref: {s['ref']}\n    hyp: {s['hyp']}")
+
+
+if __name__ == "__main__":
+    main()
