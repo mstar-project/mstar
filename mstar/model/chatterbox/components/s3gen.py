@@ -21,7 +21,7 @@ Frame bookkeeping a caller must respect:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -54,6 +54,20 @@ class ReferenceConditioning:
     @property
     def num_prompt_tokens(self) -> int:
         return int(self.prompt_tokens.shape[1])
+
+
+@dataclass
+class FlowRow:
+    """One request's share of a batched flow solve: its tokens so far, its
+    reference, whether the sequence is complete (else the look-ahead tokens are
+    provisional) and, for a stream, the fixed noise field it was started with
+    (``[1, 80, >= 2(N + n)]``) so every chunk denoises the same draw. Rows
+    without a field draw fresh noise from ``generator`` (the offline path)."""
+    tokens: torch.Tensor  # [n] long, S3 speech tokens
+    ref: ReferenceConditioning
+    finalize: bool = True
+    noise: torch.Tensor | None = None
+    generator: torch.Generator | None = None
 
 
 class S3Gen(nn.Module):
@@ -182,6 +196,55 @@ class S3Gen(nn.Module):
         else:
             mel = self.decoder.solve(mu, mask, spk, cond, noise, n_timesteps)
         return mel[:, :, mel_prompt:]
+
+    @torch.no_grad()
+    def tokens_to_mel_rows(self, rows: Sequence[FlowRow], *, n_timesteps: int | None = None) -> list[torch.Tensor]:
+        """Several requests, each with its own reference, look-ahead state and
+        noise, solved as one right-padded batch. Returns each row's generated
+        mel ``[1, 80, 2 * usable]`` (``usable = n`` when final, ``n - 3`` while
+        streaming), the same frames ``tokens_to_mel`` produces for it alone.
+
+        Right padding is invisible to the valid frames: the encoder zeroes the
+        padding before its look-ahead convolution and masks attention, and the
+        estimator's convolutions are causal or masked, so a row's result does
+        not depend on the longer rows it shares the batch with.
+        """
+        n_timesteps = n_timesteps or self.config.cfm.n_timesteps
+        ratio = self.config.token_mel_ratio
+        lookahead = self.config.encoder.pre_lookahead_len * ratio
+        refs = [row.ref.to(self.device, self.dtype) for row in rows]
+        full = [
+            torch.cat([ref.prompt_tokens[0], row.tokens.to(self.device, torch.long).reshape(-1)])
+            for ref, row in zip(refs, rows, strict=True)
+        ]
+        full_lens = torch.tensor([f.numel() for f in full], dtype=torch.long, device=self.device)
+        tokens = torch.nn.utils.rnn.pad_sequence(full, batch_first=True)
+
+        spk = self.flow_encoder.project_speaker(torch.cat([ref.embedding for ref in refs], dim=0))
+        mu, h_masks = self.flow_encoder(tokens, full_lens)
+        cuts = torch.tensor([0 if row.finalize else lookahead for row in rows], device=self.device)
+        h_lens = (h_masks.sum(dim=-1).squeeze(-1) - cuts).clamp_min(0)
+        total = mu.shape[-1]
+
+        cond = torch.zeros(len(rows), self.config.output_size, total, device=self.device, dtype=mu.dtype)
+        noise = torch.zeros_like(cond)
+        for i, (ref, row) in enumerate(zip(refs, rows, strict=True)):
+            mel_prompt = ref.num_prompt_tokens * ratio
+            valid = int(h_lens[i])
+            cond[i, :, :mel_prompt] = ref.prompt_feat[0].transpose(0, 1)
+            if row.noise is not None:
+                noise[i, :, :valid] = row.noise[0, :, :valid].to(noise.dtype)
+            else:
+                noise[i, :, :valid] = self._draw_noise(1, mel_prompt, valid - mel_prompt, row.generator)[0]
+        mask = lengths_to_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
+        if self.config.meanflow:
+            mel = self.decoder.solve_meanflow(mu, mask, spk, cond, noise, n_timesteps)
+        else:
+            mel = self.decoder.solve(mu, mask, spk, cond, noise, n_timesteps)
+        return [
+            mel[i : i + 1, :, ref.num_prompt_tokens * ratio : int(h_lens[i])]
+            for i, ref in enumerate(refs)
+        ]
 
     # ------------------------------------------------------------------
     # Mel -> waveform
