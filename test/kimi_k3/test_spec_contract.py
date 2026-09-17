@@ -4,6 +4,7 @@ import torch
 
 from mstar.engine.resources import SPEC_ACCEPTANCE, DeltaNetGeometry, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.runner import topo_sort
 from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, SPEC
 from mstar.model.registry import get_model_class
 from mstar.model.submodule_base import ARNodeInputs
@@ -25,6 +26,11 @@ def test_speculative_mode_declares_the_acceptance_resource_and_the_prefix_blocks
     attn = build_resource(specs[KDA_ATTN], EngineResourceInfo(device=torch.device("cpu"),
                                                                dependencies={KDA_STATE: specs[KDA_STATE]}))
     assert attn.speculative_tokens == 3
+    # the cache plans after the verdicts (independent resources are otherwise ordered by name, which
+    # would put mla_kv first); the specs answer depends_on like the resources they build
+    assert specs[MLA_KV].depends_on() == {SPEC}
+    order = topo_sort(specs)
+    assert order.index(SPEC) < order.index(MLA_KV) < order.index(MLA_ATTN)
     # without the kwarg nothing changes
     plain = resolve_spec_dependencies(get_model_class("kimi_k3")(model_path_hf=str(tiny_dir)).get_node_resources())
     assert SPEC not in plain and "spec_prefix" not in plain[KDA_STATE].config.blocks
