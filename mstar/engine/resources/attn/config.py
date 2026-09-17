@@ -19,6 +19,10 @@ class AttnBackend(Enum):
     FLASHINFER = "flashinfer"
     DENSE = "dense"
     XPU_PAGED = "xpu_paged"
+    # Weight-absorbed multi-head latent attention over a ``KVLayout.MLA``
+    # cache: one ckv||kpe latent row per token, and the attention resource
+    # owns the write.
+    MLA = "mla"
 
 
 @dataclass
@@ -26,6 +30,12 @@ class AttentionConfig:
     kv_cache: str # name of the KV cache
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
+    # MLA only. ``mla_ckv_dim`` splits the latent row into ckv (the value
+    # width) and kpe (the rest of ``head_dim``). ``softmax_scale`` is the
+    # model's score scale, which under absorption is a function of the
+    # original qk head dim, not of the latent width, so the model must say it.
+    mla_ckv_dim: int | None = None
+    softmax_scale: float | None = None
 
 
 @dataclass

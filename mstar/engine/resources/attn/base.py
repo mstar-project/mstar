@@ -60,6 +60,23 @@ class AttentionManager(AttentionResource):
             _warn_dense_fallback(reason)
             backend = AttnBackend.FLASHINFER
 
+        if backend == AttnBackend.MLA:
+            from mstar.engine.resources.attn.mla import MlaAttentionManager
+
+            if spec.config.mla_ckv_dim is None or spec.config.softmax_scale is None:
+                raise ValueError(
+                    "attention backend 'mla' needs mla_ckv_dim and "
+                    "softmax_scale on the AttentionConfig"
+                )
+            return MlaAttentionManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
+                softmax_scale=spec.config.softmax_scale,
+                ckv_dim=spec.config.mla_ckv_dim,
+                backend=spec.config.flashinfer_backend,
+            )
         if backend == AttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.flashinfer import FlashInferManager
 

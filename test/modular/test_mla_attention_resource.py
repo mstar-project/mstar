@@ -307,3 +307,59 @@ def test_sub_plan_past_declared_span_is_refused():
             MlaAttentionStep(sub_plans=(MlaSubPlan(q_lens=(1,), kv_lens=(6,)),)),
             ["a"], [1],
         )
+
+
+def test_spec_with_the_mla_backend_builds_this_manager():
+    """``AttentionSpec(backend=MLA)`` resolves here, and the two MLA-only
+    fields are required rather than silently defaulted."""
+    from mstar.engine.resources import AttentionConfig, AttentionSpec, AttnBackend
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+
+    cfg = KVConfig(
+        num_layers=2, num_kv_heads=1, head_dim=CKV + KPE, max_seq_len=64,
+        max_num_pages=32, page_size=PAGE, num_qo_heads=HEADS, layout=KVLayout.MLA,
+    )
+    kv = KVManager(
+        cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=DEV, dtype=torch.float32,
+    )
+    info = EngineResourceInfo(
+        device=DEV, kv_dtype=torch.float32, dependencies={"kv": kv},
+    )
+
+    spec = AttentionSpec(
+        resource_key="attn", nodes={"n"},
+        config=AttentionConfig(
+            kv_cache="kv", backend=AttnBackend.MLA,
+            mla_ckv_dim=CKV, softmax_scale=SCALE,
+        ),
+    )
+    attn = build_resource(spec, info)
+    assert isinstance(attn, MlaAttentionManager)
+    assert attn.ckv_dim == CKV
+    # the attention resource owns the latent write, so the layer must not
+    # also write through the KV resource
+    assert attn.requires_kv_write is False
+
+    bare = AttentionSpec(
+        resource_key="attn", nodes={"n"},
+        config=AttentionConfig(kv_cache="kv", backend=AttnBackend.MLA),
+    )
+    with pytest.raises(ValueError, match="mla_ckv_dim"):
+        build_resource(bare, info)
+
+
+def test_mla_backend_accepts_its_yaml_overrides():
+    """``flashinfer_backend`` is the deployment's kernel choice for MLA too."""
+    from mstar.engine.resources import AttentionConfig, AttentionSpec, AttnBackend
+
+    spec = AttentionSpec(
+        resource_key="attn", nodes={"n"},
+        config=AttentionConfig(
+            kv_cache="kv", backend=AttnBackend.MLA,
+            mla_ckv_dim=CKV, softmax_scale=SCALE,
+        ),
+    )
+    spec.apply_yaml_overrides(flashinfer_backend="fa2")
+    assert spec.config.flashinfer_backend == "fa2"
+    assert spec.config.backend is AttnBackend.MLA

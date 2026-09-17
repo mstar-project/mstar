@@ -20,8 +20,6 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.mla import (
-    MlaAttentionConfig,
-    MlaAttentionSpec,
     MlaAttentionStep,
     MlaSubPlan,
 )

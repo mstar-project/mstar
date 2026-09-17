@@ -33,49 +33,19 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.attn.base import WorkspacePool
-from mstar.engine.resources.base import (
-    AttentionResource,
-    CGSlotKey,
-    EngineResourceInfo,
-)
+from mstar.engine.resources.attn.base import AttentionManager, WorkspacePool
+from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.plan import SINK_PAGE, KVPlanOutputs, SequenceView
-from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep, SlotLease, StepContext
 from mstar.utils.pinned_staging import pinned, to_device_async
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.base import Resource
     from mstar.engine.resources.kv.config import KVConfig
 
 logger = logging.getLogger(__name__)
 
 
 # ── Spec / step ─────────────────────────────────────────────────────────
-
-
-@dataclass
-class MlaAttentionConfig:
-    kv_cache: str  # name of the KVLayout.MLA KV resource
-    softmax_scale: float
-    ckv_dim: int  # compressed KV rank; the rest of head_dim is the RoPE key
-    backend: str = "auto"  # flashinfer MLA backend
-
-
-@dataclass
-class MlaAttentionSpec(NodeResourceSpec):
-    config: MlaAttentionConfig
-
-    def depends_on(self) -> set[str]:
-        return {self.config.kv_cache}
-
-    @property
-    def resource_class(self) -> "type[Resource]":
-        return MlaAttentionManager
-
-    def apply_yaml_overrides(self, backend: str | None = None):
-        if backend is not None:
-            self.config.backend = backend
 
 
 class MlaSubPlan(NamedTuple):
@@ -494,7 +464,11 @@ class _LabelPlan:
 # ── The resource ────────────────────────────────────────────────────────
 
 
-class MlaAttentionManager(AttentionResource):
+class MlaAttentionManager(AttentionManager):
+    """Built from an ``AttentionSpec`` whose backend is ``AttnBackend.MLA``;
+    ``AttentionManager.build`` constructs it.
+    """
+
     def __init__(
         self,
         kv_cache: str,
@@ -539,20 +513,12 @@ class MlaAttentionManager(AttentionResource):
         self._preplan: dict[str, _LabelPlan] = {}
         self._preplanned = False
 
-    @classmethod
-    def build(cls, spec: MlaAttentionSpec, info: EngineResourceInfo):
-        kv_config = info.dependency(spec.config.kv_cache).config
-        if info.joint_comm_group is not None:
-            kv_config.shard(info.joint_comm_group.world_size)
-        return cls(
-            kv_cache=spec.config.kv_cache,
-            device=info.device,
-            dtype=info.kv_dtype,
-            kv_config=kv_config,
-            softmax_scale=spec.config.softmax_scale,
-            ckv_dim=spec.config.ckv_dim,
-            backend=spec.config.backend,
-        )
+    @property
+    def requires_kv_write(self) -> bool:
+        """False: this resource owns the latent write (``write_latent``), so a
+        layer must not also write through the KV resource.
+        """
+        return False
 
     def depends_on(self):
         return {self._kv_cache_name}
