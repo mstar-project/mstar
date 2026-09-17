@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.linear_attn.kda_kernels import KDAParams
+from mstar.engine.resources.linear_attn.kda_kernels import KDAParams, SpecBlocks
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -103,6 +103,61 @@ class TorchKDAKernels:
             out[s:e] = o.to(out.dtype)
             conv_state[slot].copy_(conv_new[:, 1:].to(conv_state.dtype))
             rec_state[slot].copy_(to_v_first(rec_new))
+        return out
+
+
+    @torch.compiler.disable
+    def run_verify(
+        self, qkv: torch.Tensor, g_raw: torch.Tensor, beta_raw: torch.Tensor, plan, conv_state: torch.Tensor,
+        rec_state: torch.Tensor, spec: SpecBlocks, p: KDAParams,
+    ) -> torch.Tensor:
+        """The checkpoint recurrence of a speculative verify step (plan section 8.3 item 6), row by
+        row. ``qkv [rows * k1, 3P]`` pre-conv, ``g_raw [rows * k1, H, D]``, ``beta_raw [rows * k1, H]``:
+        each row's block of ``k1 = k + 1`` new tokens. The pool's ``conv`` / ``state`` blocks hold
+        the checkpoint (window and state after the last accepted prefix) and ``spec`` the pending
+        prefix (this row's previous block, ``spec.length`` of them accepted). Per row: the prefix's
+        conv from the checkpoint window and its recurrence from the checkpoint state advance both
+        blocks to the new checkpoint (nothing when the prefix is empty, as after a prefill); the
+        block's conv and recurrence continue from there for the outputs, their final state and
+        window discarded; the block's pre-conv inputs, raw gates and raw betas replace the prefix.
+        ``spec.length`` is set afterwards by ``KDAManager.set_prefix_len`` once the accepted counts
+        are known. Returns ``o [rows * k1, H, D]``."""
+        h, d = p.num_heads, p.head_dim
+        rows = plan.num_rows
+        k1 = qkv.shape[0] // max(rows, 1)
+        assert rows * k1 == qkv.shape[0] and all(
+            plan.cu_seqlens_cpu[i + 1] - plan.cu_seqlens_cpu[i] == k1 for i in range(rows)
+        ), "a verify step has k + 1 tokens in every row"
+        out = torch.empty(rows * k1, h, d, dtype=qkv.dtype, device=qkv.device)
+        for i in range(rows):
+            slot = plan.slot_ids_cpu[i]
+            rows_i = slice(i * k1, (i + 1) * k1)
+            kept = conv_state[slot]
+            cache = torch.cat([kept.new_zeros(kept.shape[0], 1), kept], dim=-1)  # the reference's W-wide window
+            state = from_v_first(rec_state[slot]) if plan.has_state_cpu[i] else None
+            plen = int(spec.length[slot, 0])
+            if plen > 0:
+                y, cache = short_conv(spec.prefix[slot, :plen].to(qkv.dtype), p.conv_weight, cache)
+                q, k, v = y.split([h * d, h * d, h * d], dim=-1)
+                g_log = kda_gate(spec.g[slot, :plen], p.A_log, p.dt_bias, p.lower_bound)
+                _, state = kda_recurrent(
+                    l2norm(q.reshape(-1, h, d)), l2norm(k.reshape(-1, h, d)), v.reshape(-1, h, d),
+                    g_log, torch.sigmoid(spec.beta[slot, :plen].float()), state, p.scale,
+                )
+                conv_state[slot].copy_(cache[:, 1:].to(conv_state.dtype))
+                rec_state[slot].copy_(to_v_first(state))
+            x = qkv[rows_i]
+            y, _ = short_conv(x, p.conv_weight, cache)
+            q, k, v = y.split([h * d, h * d, h * d], dim=-1)
+            g_log = kda_gate(g_raw[rows_i], p.A_log, p.dt_bias, p.lower_bound)
+            o, _ = kda_recurrent(
+                l2norm(q.reshape(-1, h, d)), l2norm(k.reshape(-1, h, d)), v.reshape(-1, h, d),
+                g_log, torch.sigmoid(beta_raw[rows_i].float()), state, p.scale,
+            )
+            out[rows_i] = o.to(out.dtype)
+            spec.prefix[slot].copy_(x.to(spec.prefix.dtype))
+            spec.g[slot].copy_(g_raw[rows_i].to(spec.g.dtype))
+            spec.beta[slot].copy_(beta_raw[rows_i].to(spec.beta.dtype))
         return out
 
 
