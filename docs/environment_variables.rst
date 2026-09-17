@@ -55,10 +55,20 @@ Communication
        28 to 23 ms at one request (together with the other 2026-09-15 changes). Producers can
        write straight into the buffer (``CommGroup.symm_buffer`` / ``all_reduce_symm_buffer``).
    * - ``MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS``
+     - ``128 // world``
+     - Largest row count (tokens) an all-reduce takes through the Lamport kernel; bigger
+       messages go to the multicast ring. The one-shot's cost grows with rows times ranks, so
+       the default is 128 divided by the group size (16 at TP8, 64 at TP2, never below 8).
+       Measured on 8xH100 at width 7168 in a CUDA graph (2026-09-17): flashinfer's one-shot
+       4.0 / 5.9 / 28 / 62 us at 1 / 8 / 64 / 128 rows against the multicast ring's 7.9 / 8.6 /
+       12.6 / 15.8, so the tiers cross near 16 rows; a Kimi K3 decode step at 64 requests pays
+       about 190 of these all-reduces.
+   * - ``MSTAR_LAMPORT_ALLGATHER_MAX_ROWS``
      - ``128``
-     - Largest row count (tokens) the Lamport kernel takes; its workspace holds
-       ``2 x world x rows x width`` elements per (dtype, width) channel, so on an 8-rank group
-       at width 7168 the default is 29 MB per rank. Bigger messages use the other tiers.
+     - Largest row count ``CommGroup.all_gather`` takes through M*'s Lamport kernel, and the
+       row capacity of every Lamport workspace (``2 x world x rows x width`` elements per
+       (dtype, width) channel: 29 MB per rank at width 7168 on 8 ranks). The all-gather stays
+       far ahead of NCCL at every measured size (6.4 to 9.2 us against 65 us up to 64 rows at TP8).
    * - ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``
      - ``262144``
      - Largest message (bytes) the one-shot kernel takes; up to
