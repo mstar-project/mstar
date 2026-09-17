@@ -32,12 +32,13 @@ from mstar.engine.resources import (
     RecurrentStateSpec,
     ResourceReqConfig,
     SamplerSpec,
+    SpecAcceptanceSpec,
     SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
+from mstar.model.kimi_k3.config import SPEC, KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
 from mstar.model.kimi_k3.tokenizer import KimiK3Tokenizer
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -84,6 +85,9 @@ class KimiK3Model(Model):
         self.kda_backend = str(kwargs.get("kda_backend", "auto"))
         # the MoE latent down-projection: column-parallel + all-gathered (default) or replicated
         self.moe_shard_latent = bool(kwargs.get("moe_shard_latent", True))
+        # speculative decoding (plan section 8): k drafted tokens per step, verified in one
+        # k + 1 token pass; 0 = one token per step. Greedy verification for now.
+        self.speculative_tokens = int(kwargs.get("speculative_tokens", 0))
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
         # requests per prefill step (the scheduler splits larger groups); None lifts the cap
@@ -196,7 +200,12 @@ class KimiK3Model(Model):
         )
         state_config = RecurrentStateConfig(
             num_layers=t.num_kda_layers,
-            blocks=geometry.to_blocks(state_dtype=torch.float32, conv_dtype=torch.bfloat16),
+            blocks=geometry.to_blocks(state_dtype=torch.float32, conv_dtype=torch.bfloat16,
+                                      speculative_tokens=self.speculative_tokens),
+        )
+        speculative = (
+            [SpecAcceptanceSpec(resource_key=SPEC, nodes={LLM}, num_speculative=self.speculative_tokens)]
+            if self.speculative_tokens > 0 else []
         )
         return [
             KVSpec(resource_key=MLA_KV, nodes={LLM}, config=kv_config),
@@ -213,6 +222,7 @@ class KimiK3Model(Model):
                 ),
             ),
             SamplerSpec(resource_key=SAMPLER, nodes={LLM}, vocab_size=t.vocab_size, enable_repetion_penalty=False),
+            *speculative,
         ]
 
     def get_request_resource_configs(
@@ -301,7 +311,8 @@ class KimiK3Model(Model):
         submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config, cuda_graphs=graph_safe,
                                        max_capture_batch_size=self.max_capture_batch_size,
                                        max_prefill_batch_size=self.max_prefill_batch_size,
-                                       mixed_prefill_decode=self.mixed_prefill_decode)
+                                       mixed_prefill_decode=self.mixed_prefill_decode,
+                                       speculative_tokens=self.speculative_tokens)
         self._submodule_cache[node_name] = submodule
         logger.info("Loaded Kimi K3 %s on %s", node_name, device)
         return submodule
