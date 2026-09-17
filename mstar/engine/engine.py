@@ -503,6 +503,10 @@ class Engine:
                     fwd_info=batch.per_request_info[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
+                    # a stream consumer's last chunk: the step that must flush
+                    # whatever it held back (a vocoder's crossfade tail, the
+                    # look-ahead frames a token encoder withholds)
+                    is_final_stream_chunk=rid in batch.final_stream_rids,
                 )
             except Exception as error:
                 logger.exception(
