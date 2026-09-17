@@ -229,8 +229,23 @@ class HiFTGenerator(nn.Module):
         x = self._istft(magnitude, phase)
         return torch.clamp(x, -self.config.audio_limit, self.config.audio_limit)
 
-    def forward(self, mel: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+    def vocode(
+        self,
+        mel: torch.Tensor,
+        generator: torch.Generator | None = None,
+        cache_source: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(wav [B, 480T], source [B, 1, 480T])``; ``cache_source`` overwrites
+        the head of the excitation so consecutive chunks share their harmonics
+        (reference ``inference(cache_source=...)``)."""
         f0 = self.f0_predictor(mel)
         source = F.interpolate(f0[:, None], scale_factor=float(self.upsample_factor), mode="nearest").transpose(1, 2)
         source = self.m_source(source, generator=generator).transpose(1, 2)
-        return self.decode(mel, source)
+        if cache_source is not None and cache_source.shape[-1] > 0:
+            n = min(cache_source.shape[-1], source.shape[-1])
+            source = source.clone()
+            source[:, :, :n] = cache_source[:, :, :n].to(source.dtype)
+        return self.decode(mel, source), source
+
+    def forward(self, mel: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        return self.vocode(mel, generator=generator)[0]
