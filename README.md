@@ -126,6 +126,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [V-JEPA 2 / 2-AC](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | World model | video (+ actions) → latents, rollouts | `/generate` |
 | [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | Video diffusion | text, image → video | `/v1/videos/generations`, `/generate` |
 | [FLUX.2 klein 4B / 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | Image diffusion | text, image → image (4-step distilled, editing) | `/v1/images/generations`, `/v1/images/edits` |
+| [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) | Image diffusion | text → image (8-step distilled) | `/v1/images/generations` |
 
 Every model is reachable through the SDK and the native `/generate` endpoint; the OpenAI-compatible
 routes cover the chat, speech, image, and video models.
