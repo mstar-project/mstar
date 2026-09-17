@@ -187,6 +187,18 @@ wan22 = [
     "av",
 ]
 
+flux2_klein = [
+    # FLUX.2 [klein] 4B/9B: diffusers is the parity oracle in the tests only; serving
+    # runs the native ports. transformers provides the Qwen3 tokenizer (chat template).
+    "diffusers>=0.39",
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "Pillow",
+    "safetensors",
+    "torchvision",
+    "transformers",
+]
+
 vjepa2_ac = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
