@@ -121,3 +121,7 @@ class CrossAttentionSpec(NodeResourceSpec):
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
     causal: bool = True
+    # queries attend to the stream's stored context only, not to the tokens this step appends
+    # (a draft block over the context the target has produced so far); the step's own
+    # `segments` then carry the query counts, the cache's segments the appended counts
+    context_only: bool = False
