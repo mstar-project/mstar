@@ -1,20 +1,4 @@
-"""AR submodule for the GLM-5.2 text backbone.
-
-Engine contract (resource pools): the node owns three resources — the paged
-latent KV cache (``KV_RESOURCE``), the attention resource planned over it
-(``ATTN_RESOURCE``) and the sampler. Layers call the first two directly
-(bound at load); this submodule declares each step (``declare_step``) and
-drives the speculative-decoding regions itself.
-
-MTP speculative decoding (``mtp_num_draft_tokens = k > 0``): every decode
-step feeds k+1 rows per request (last emitted token + k drafts), verifies
-them in one trunk forward, keeps the accepted prefix + 1 (rewinding the
-rejected KV rows), then extends the MTP plane and drafts the next k with the
-layer-78 module. The trunk verify, the draft phase and the prefill trunk are
-piecewise CUDA graphs that declare their own resource steps; the host phases
-(one ``.tolist()`` verify, rewind, emission bookkeeping) stay eager. Greedy
-verify keeps the stream bit-identical to plain decode at temperature 0.
-"""
+"""AR submodule for the GLM-5.2 text backbone."""
 from __future__ import annotations
 
 import logging
@@ -88,21 +72,7 @@ MTP_DRAFT_BUNDLE = "mtp_draft_bundle"
 def mtp_sync_padded_layout(
     e_list: list[int], starts: list[int], k: int,
 ) -> tuple[list[int], list[int], list[int]]:
-    """Row layout for a PADDED MTP sync pass.
-
-    Each request contributes ``e = n_acc + 1`` real rows, padded out to
-    ``k+1`` — the shape ``mtp_trunk`` already captures — so the pass has one
-    fixed shape per batch size instead of one per row-count composition.
-
-    Returns ``(positions, last_rows, rewind)`` for ``rows = k+1`` per request:
-    ``positions`` — RoPE position per row, real rows first (``start-e+1 ..
-    start``), pads continuing monotonically past ``start`` (they land on
-    plane slots the draft chain overwrites next); ``last_rows`` — index of
-    each request's last REAL row (``i*rows + e - 1``), where draft 1 comes
-    from; ``rewind`` — ``rows - e`` per request, the counter correction after
-    a step that advanced by ``rows``. Real rows precede pads within a
-    request, so causality never lets a real row see a pad.
-    """
+    """Row layout for a PADDED MTP sync pass."""
     rows = k + 1
     positions: list[int] = []
     last_rows: list[int] = []
@@ -121,7 +91,8 @@ class Glm52MtpTrunkGraphConfig(PiecewiseCudaGraphConfig):
     capture batch size: an MTP step feeds a fixed row count per request, so
     the generic bs x token-bucket cross product would enumerate shapes that
     never occur. PACKED because replay slices outputs to the real rows and
-    pads absent requests with zero-length plan rows."""
+    pads absent requests with zero-length plan rows.
+    """
     rows_per_request: int
 
     def get_config_type(self) -> PiecewiseConfigType:
@@ -148,17 +119,7 @@ class Glm52MtpTrunkGraphConfig(PiecewiseCudaGraphConfig):
 
 
 class _MtpStepTimer:
-    """nsys-lite for one MTP decode step, gated by MSTAR_GLM52_MTP_STEP_TIMING=N.
-
-    On every N-th step, records a CUDA event + host timestamp at each phase
-    boundary (trunk replay, verify, sync replay, each chain replay, tail) and,
-    at the next sampled step, reads them back: the GPU column is the device
-    timeline between consecutive events (includes any idle the GPU spent
-    waiting for the host to enqueue), the host column is the wall the host
-    spent enqueueing that phase. GPU >> host means the phase is GPU-bound;
-    GPU ≈ host means the host is the bottleneck. Costs one event sync per
-    sampled step; zero cost when off.
-    """
+    """nsys-lite for one MTP decode step, gated by MSTAR_GLM52_MTP_STEP_TIMING=N."""
 
     def __init__(self, every: int):
         self.every = every
@@ -354,10 +315,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         spans: list[int], sub_plans: tuple[MlaSubPlan, ...] | None = None,
         commit: bool = True,
     ) -> tuple[SubmoduleStep, StepContext]:
-        """Admit + plan a KV/attention step by hand, for an eager pass this
-        submodule drives itself (an MTP plane pass with no captured bucket).
-        The engine's runner does the same two calls for a declared step;
-        ``_commit_eager`` closes it after the forward."""
+        """Admit + plan a KV/attention step by hand, for an eager pass this submodule
+        drives itself (an MTP plane pass with no captured bucket).
+        """
         step = self._kv_attn_step(request_ids, spans, sub_plans, commit)
         ctx = StepContext(
             request_ids=tuple(request_ids), graph_walk="decode", slot=0, capture=False,
@@ -429,9 +389,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     def _moe_capture_blocked(self, tp_world_size: int) -> bool:
         """The reference MoE dispatch paths (.nonzero() / host loops) are not
-        stream-capturable; only the fused fp8 path is. Registering no
-        configs makes eager-only serving explicit instead of every capture
-        failing at warmup."""
+        stream-capturable; only the fused fp8 path is.
+        """
         fp8_reference = (
             self.config.quantization_config is not None
             and self.config.moe_fp8_resident
@@ -515,12 +474,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         autocast_dtype: torch.dtype,
         tp_world_size: int = 1,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
-        """The MTP step's graphs. ``mtp_trunk``: the verify forward (embed +
-        layers + lm_head over the packed (bs, k+1) rows). ``mtp_draft_phase``:
-        the padded sync pass, draft-1 head and k-1 chain iterations as one
-        graph over k attention sub-plans. ``mtp_sync`` + ``mtp_draft``: the
-        three-graph fallback. ``mtp_prefill``: the prefill trunk over the
-        packed prompt."""
+        """The MTP step's graphs. ``mtp_trunk``: the verify forward (embed + layers +
+        lm_head over the packed (bs, k+1) rows).
+        """
         self._stop_load_heartbeat()
         k = self.config.mtp_num_draft_tokens
         if (
@@ -655,11 +611,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         ``e_list`` arrives per replay (``run(step_kwargs=)``); capture and
         warmup have fresh streams at 0 and plan e=0 (P0 = 0), which gives
         every sub-plan a valid shape.
-
-        ``phase="prepare"`` (``runner.stage`` before the verify readback):
-        sub-plan 0 only, with the stream still at P0+k+1 (nothing rewound
-        yet), so it needs no e and no span. ``phase="finish"`` (the paired
-        ``run``, after the rewind to P0+e): sub-plans 1..k-1 beside it."""
+        """
         k = self.config.mtp_num_draft_tokens
         rows = k + 1
         kv = self._kv()
@@ -731,10 +683,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return {"draft_ids": self.lm_head(h_head).argmax(dim=-1), "prev_hidden": h_raw}
 
     def _mtp_sync_captured(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-        """The PADDED sync pass: the committed tokens' embeddings fused with
-        their paired trunk rows through the layer-78 module, k+1 rows per
-        request (real first, pads after). Draft 1's gather stays outside:
-        which row it reads is data-dependent."""
+        """The PADDED sync pass: the committed tokens' embeddings fused with their paired
+        trunk rows through the layer-78 module, k+1 rows per request (real first, pads
+        after).
+        """
         mtp = self.language_model.mtp
         embed = self.language_model.model.embed_tokens
         h_head, h_raw = mtp(
@@ -745,10 +697,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         return {"h_head": h_head, "h_raw": h_raw}
 
     def _mtp_draft_phase_captured(self, call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-        """The whole draft phase: padded sync pass on sub-plan 0, gather each
-        request's last real row, draft 1 = head argmax, then k-1 chain
-        iterations on sub-plans 1..k-1. ``select_plan_slot`` is host-only:
-        the graph reads each sub-plan's static buffers."""
+        """The whole draft phase: padded sync pass on sub-plan 0, gather each request's
+        last real row, draft 1 = head argmax, then k-1 chain iterations on sub-plans
+        1..k-1.
+        """
         k = self.config.mtp_num_draft_tokens
         mtp = self.language_model.mtp
         embed = self.language_model.model.embed_tokens
@@ -1142,15 +1094,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     ) -> list[torch.Tensor]:
         """Extend the MTP plane over the newly committed tokens, then draft
         k tokens autoregressively. Returns per-request (k,) draft tensors.
-
-        The MTP plane (KV layer ``num_hidden_layers``) shares the trunk's
-        page table and length, SHIFTED BY ONE: the entry for the token at
-        stream position p — ``fuse(embed(t_p), h_{p-1})`` — lives at plane
-        slot p-1, so after the sync pass the plane holds exactly
-        ``stored_len`` entries, aligned with the trunk. RoPE uses the token's
-        true position. Draft-iteration entries beyond the length are
-        transient: the length is restored at the end and the next step's
-        writes overwrite them in place.
         """
         k = self.config.mtp_num_draft_tokens
         kv = self._kv(engine_inputs)
@@ -1201,9 +1144,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             return [drafts[i] for i in range(num)]
 
         # Sync pass (+ draft 1 from its last row): plane slots start-e ..
-        # start-1, token positions start-e+1 .. start. The stream is rewound
-        # by e so the pass appends at P0 and commits, then the length is
-        # corrected back to start.
         for rid, e in zip(request_ids, e_list, strict=True):
             kv.rewind(rid, e)
         if sync_runner is not None:

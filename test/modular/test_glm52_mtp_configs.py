@@ -1,13 +1,4 @@
-"""The MTP step's graph configs and host-side bookkeeping (CPU, reduced).
-
-What test_glm52_engine_cycle.py does not already run: the piecewise config
-inventory per k / flag (labels, PACKED buckets, ``declare_step`` callables,
-static inputs, compile mode), the no-full-forward-graphs rule under MTP,
-the region step declarations (trunk rows committed, draft phase's k
-sub-plans uncommitted), preprocess's per-walk runner selection through
-``can_run``, the acceptance log line, the load heartbeat's stop, and the
-trunk-KV / plane bookkeeping between an MTP-off and an MTP-on run.
-"""
+"""The MTP step's graph configs and host-side bookkeeping (CPU, reduced)."""
 from __future__ import annotations
 
 import logging
@@ -81,7 +72,8 @@ def _model(cfg: Glm52ModelConfig, seed: int = 0) -> Glm52ForCausalLM:
     """Every parameter randomized: the MoE expert containers are raw
     ``torch.empty`` at construction (the loader fills them), and garbage
     there NaNs the logits — a NaN model emits an all-zero argmax stream on
-    every path, which makes any stream comparison vacuous."""
+    every path, which makes any stream comparison vacuous.
+    """
     torch.manual_seed(seed)
     model = Glm52ForCausalLM(cfg)
     for name, p in model.named_parameters():
@@ -114,10 +106,10 @@ def _piecewise(sub: Glm52LLMSubmodule):
 
 
 def test_mtp_disables_full_forward_capture_configs():
-    """With MTP on, no full-forward CUDA-graph configs may register: their
-    warmup captures crash (host-side verify/rewind; packed prefill never
-    runs preprocess) and the failure mode is a silent 13x eager fallback.
-    Flag off keeps the decode + prefill capture pair."""
+    """With MTP on, no full-forward CUDA-graph configs may register: their warmup captures
+    crash (host-side verify/rewind; packed prefill never runs preprocess) and the
+    failure mode is a silent 13x eager fallback.
+    """
     cfg = _mtp_cfg(2)
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
     assert sub.get_cuda_graph_configs(CPU) == []
@@ -127,11 +119,10 @@ def test_mtp_disables_full_forward_capture_configs():
 
 
 def test_mtp_trunk_piecewise_config_shapes():
-    """The trunk graph registers exactly one (bs, [k+1]*bs) PACKED bucket
-    per capture batch size — never the bs x token-bucket cross product —
-    and k >= 2 adds the 1-row-per-request draft-chain graph. Every region
-    declares its own resource step (``declare_step``), and the compile mode
-    is the config's ``"default"`` (the cuBLAS one: 90.03 -> 96.97 tok/s TP8)."""
+    """The trunk graph registers exactly one (bs, [k+1]*bs) PACKED bucket per capture batch
+    size — never the bs x token-bucket cross product — and k >= 2 adds the
+    1-row-per-request draft-chain graph.
+    """
     cfg = _mtp_cfg(2)  # rows per request = 3
     sub = Glm52LLMSubmodule(Glm52ForCausalLM(cfg), cfg)
     # Sync capture is env-default-ON as of 2026-08-11 (measured clean, 3264
@@ -285,7 +276,8 @@ def test_region_steps_trunk_commits_draft_phase_declares_sub_plans():
     draft phase declares k attention sub-plans over the same stream from
     ``e_list`` — the padded sync pass at P0 = stored - e over k+1 rows,
     then one chain row per iteration — and commits nothing; capture (no
-    e_list) plans e=0 at the stored length."""
+    e_list) plans e=0 at the stored length.
+    """
     k = 2
     cfg = _mtp_cfg(k)
     sub, resources, runner = _bound(cfg)
@@ -371,7 +363,8 @@ def test_preprocess_selects_runners_per_walk_through_can_run():
     trunk / prefill asked for the real token count, sync and draft phase
     for the padded (k+1) x bs rows, the chain for one row per request.
     Prefill takes the prefill trunk and the chain; decode the trunk, sync,
-    phase and chain."""
+    phase and chain.
+    """
     k = 2
     cfg = _mtp_cfg(k)
     sub, resources, _ = _bound(cfg, ["r0", "r1"])
@@ -425,10 +418,9 @@ def test_preprocess_selects_runners_per_walk_through_can_run():
 
 
 def test_mtp_acceptance_log_per_position(caplog):
-    """The 512-step acceptance line must carry the conditional per-position
-    profile (the datum that separates "first draft mediocre" from "chained
-    drafts collapse"). Short tests never cross the threshold, so drive the
-    method directly with a synthetic histogram."""
+    """The 512-step acceptance line must carry the conditional per-position profile (the
+    datum that separates "first draft mediocre" from "chained drafts collapse").
+    """
     k = 3
 
     def _ns(pair_postnorm: bool) -> SimpleNamespace:
@@ -527,12 +519,10 @@ def _drive(driver: _Driver, prompt: torch.Tensor, info, max_steps=64) -> torch.T
 
 
 def test_graph_config_getters_stop_the_load_heartbeat():
-    """Both capture-config getters stop the load heartbeat FIRST: the tick
-    is a foreign-thread CUDA kernel, illegal during a (global-mode) graph
-    capture, and capture starts right after the configs are read. The
-    keeper process covers the box reaper across capture (it used to be the
-    tick + thread_local capture mode). A forward stops it too, for the
-    eager-only paths that never capture."""
+    """Both capture-config getters stop the load heartbeat FIRST: the tick is a
+    foreign-thread CUDA kernel, illegal during a (global-mode) graph capture, and
+    capture starts right after the configs are read.
+    """
     cfg = _mtp_cfg(2)
     model = Glm52ForCausalLM(cfg)
 
@@ -582,7 +572,8 @@ def test_mtp_trunk_kv_and_plane_bookkeeping():
     engine's ``flashinfer_rmsnorm`` op by one ulp (~8e-3 at these
     magnitudes), so they are pinned to that bound. The MTP plane exists
     only in the flag-on run (one extra KV layer) and holds an entry for
-    every stored position."""
+    every stored position.
+    """
     cfg = _mtp_cfg(2)
     model = _model(cfg)
     prompt = torch.arange(5, dtype=torch.long) + 3
@@ -618,13 +609,7 @@ def test_mtp_trunk_kv_and_plane_bookkeeping():
 
 @pytest.mark.parametrize("accepted", [2, 1, 0], ids=["all", "first", "none"])
 def test_mtp_verify_and_rewind_under_forced_acceptance(accepted):
-    """Random weights draft ~nothing, so the stream tests never see an
-    accepted draft. Replace the draft phase with an oracle that reads the
-    baseline stream and proposes a fixed number of correct drafts per step:
-    every step then keeps e = accepted + 1 rows of its k+1 committed
-    (``KVManager.rewind`` by the rest), the emission is e tokens, the
-    acceptance histogram lands entirely in that bin, and the stream is
-    still the baseline's, bit for bit."""
+    """Random weights draft ~nothing, so the stream tests never see an accepted draft."""
     k = 2
     cfg = _mtp_cfg(k)
     model = _model(cfg, seed=1)

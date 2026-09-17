@@ -1,11 +1,4 @@
-"""Phase C DSA indexer: skip formula, selection semantics, sparse==dense, load.
-
-The load tests reuse ``test_glm52_moe._fabricate_checkpoint`` (same reduced
-fp8 stream, now carrying indexer keys on FULL layers). ``flashinfer.norm.
-rmsnorm`` is forced to a CPU stub per test — ``run_rms_norm`` does ``import
-flashinfer`` per call, so the per-test swap reaches it and never leaks into
-sessions that have the real library.
-"""
+"""Phase C DSA indexer: skip formula, selection semantics, sparse==dense, load."""
 import sys
 import types
 from pathlib import Path
@@ -164,10 +157,6 @@ def test_indexer_rope_hits_first_dims_only():
 class _CausalDenseResources:
     """The naive path's two resources, on CPU, for ONE dense pass: the layer
     writes K/V through ``kv.write_kv`` and attends through ``attn.run``.
-
-    ``run`` uses the SAME masked-attention helper as the sparse path, with a
-    plain causal mask — so bitwise dense-vs-sparse equality reduces exactly
-    to mask equality, i.e. to the selection covering the full causal prefix.
     """
 
     def __init__(self):

@@ -1,12 +1,5 @@
 """The TP fast read path's GLM-5.2 half: the read plan and the shape-driven
 expert loaders.
-
-The generic loader has every rank read the full checkpoint and keep its
-slice (8x the bytes at TP8). ``build_glm52_read_plan`` excludes never-loaded
-keys and hands the iterator ``(dim, start, stop)`` specs so each rank reads
-only its shard of the routed-expert tensors; the expert loaders accept the
-pre-sliced shards by shape. (The iterator's sliced read and the on-disk
-fast-path-vs-generic parity live with the loader's own tests.)
 """
 import sys
 from pathlib import Path
@@ -116,11 +109,10 @@ def _mtp_fp8_config():
 
 
 def test_read_plan_includes_mtp_when_enabled():
-    """The 2026-08-09 0.00-acceptance bug: the plan dropped every layer-78
-    key regardless of drafting (1569/118629 keys on the real checkpoint),
-    so the MTP module served ``to_empty`` memory. ``load_mtp=True`` must
-    read the MTP layer like trunk: glue + decoder + FULL indexer, with
-    its routed experts sliced by the same specs."""
+    """The 2026-08-09 0.00-acceptance bug: the plan dropped every layer-78 key regardless
+    of drafting (1569/118629 keys on the real checkpoint), so the MTP module served
+    ``to_empty`` memory.
+    """
     cfg = _mtp_fp8_config()
     keys = [
         "model.layers.3.self_attn.q_a_proj.weight",

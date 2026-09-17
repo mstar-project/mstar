@@ -1,11 +1,4 @@
-"""``MSTAR_TP_ALLREDUCE``: which all-reduces go through symmetric memory.
-
-The rule in ``CommGroup.all_reduce``: contiguous CUDA tensors of at most
-``MSTAR_TP_SYMM_AR_MAX_KB`` take the symmetric-memory path when it was set
-up; everything else — and everything under the default ``nccl`` mode — is
-``dist.all_reduce``. No GPU here: ``_SymmAllReduce`` is faked, and the CUDA
-tensor is a stand-in exposing only what the routing check reads.
-"""
+"""``MSTAR_TP_ALLREDUCE``: which all-reduces go through symmetric memory."""
 
 from __future__ import annotations
 

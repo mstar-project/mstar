@@ -1,30 +1,4 @@
-"""GLM-5.2 DSA engine plumbing: per-request indexer k-cache + selection threading.
-
-Two pieces the sparse path needs that the Phase C components deliberately left
-to the engine half:
-
-``Glm52DsaKStore`` — the indexer k-cache. v1 keeps it OUTSIDE the paged KV
-pool: a glm52-local ``request_id -> FULL-layer -> growing buffer`` of the
-roped+normed ``index_head_dim`` keys ``Glm52Indexer.compute_k`` produces,
-owned by ``Glm52LLMSubmodule`` and evicted in its ``cleanup_request`` (the
-engine calls that from ``KVCacheEngine.remove_request`` — the contract
-``test/modular/test_kv_cache_engine_cleanup.py`` pins). Cost at full dims:
-128 dims x bf16 = 256 B/token/layer over 21 FULL layers = 5.4 KB/token,
-replicated per TP rank (the whole indexer is replicated, so every rank
-recomputes the identical selection with no collective). The reference
-layout — fp8 e4m3 + ue8m0 scale packed 132 B/token in a paged pool
-(dsa-indexer-spec.md section 2) — is the perf follow-up; the spec marks
-bf16 storage semantically equivalent up to fp8 rounding, set-exact at
-ctx <= index_topk.
-
-``Glm52DsaForwardContext`` — one per forward pass, built by the submodule's
-``preprocess`` and threaded ``Glm52LanguageModel -> decoder layer ->
-attention``. It carries the per-request token spans of the flattened batch
-plus the ONE transient the IndexShare scheme needs: ``last_selection``,
-written by each FULL layer and consumed as-is by the SHARED layers after it
-(spec section 3: layers 3-5 reuse 2's selection, 7-9 reuse 6's, ...). The
-selection never persists across forwards — only the k-store does.
-"""
+"""GLM-5.2 DSA engine plumbing: per-request indexer k-cache + selection threading."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -35,14 +9,7 @@ _INITIAL_CAPACITY = 64
 
 
 class Glm52DsaKStore:
-    """Per-request, per-FULL-layer growing buffers of roped+normed index keys.
-
-    Buffers grow by doubling so a long decode is O(n) amortized copies
-    rather than the O(n^2) of per-step ``torch.cat``. Rows are appended in
-    strict position order — ``append`` refuses any gap or overlap loudly,
-    because a silent desync would corrupt every later selection for the
-    request.
-    """
+    """Per-request, per-FULL-layer growing buffers of roped+normed index keys."""
 
     def __init__(self) -> None:
         # request_id -> layer_idx -> [buffer (capacity, head_dim), filled rows]
@@ -55,10 +22,7 @@ class Glm52DsaKStore:
         keys: torch.Tensor,
         start_pos: int,
     ) -> None:
-        """Append one chunk of ``(n, head_dim)`` keys at positions
-        ``start_pos .. start_pos + n - 1``; ``start_pos`` must equal the rows
-        already stored (prefill and decode both append exactly once per
-        token, in order)."""
+        """Append one chunk of ``(n, head_dim)`` keys at positions ``start_pos .."""
         per_layer = self._buffers.setdefault(request_id, {})
         num_new, head_dim = keys.shape
         entry = per_layer.get(layer_idx)
@@ -110,16 +74,7 @@ class Glm52DsaKStore:
 
 @dataclass
 class Glm52DsaRequestSpan:
-    """One request's slice of the flattened token batch, frozen at preprocess.
-
-    ``ctx_start`` is the request's cached length BEFORE this chunk (the
-    alloc-manager ``position_id_start``, which ``advance_seq_lens`` bumps only
-    after the forward), so the chunk covers absolute positions
-    ``ctx_start .. ctx_start + q_len - 1``. ``page_indices`` is a snapshot of
-    the request's latent-cache page table taken AFTER ``plan_attention``
-    allocated this chunk's pages, so it covers every position the sparse path
-    may scatter or gather.
-    """
+    """One request's slice of the flattened token batch, frozen at preprocess."""
 
     request_id: str
     q_start: int
@@ -130,21 +85,7 @@ class Glm52DsaRequestSpan:
 
 @dataclass
 class Glm52DsaForwardContext:
-    """Per-forward DSA state threaded through the decoder stack.
-
-    ``needs_selection`` is the batch-level routing bit: False means every
-    request's post-chunk context fits ``index_topk``, where top-k of <= topk
-    candidates selects the full prefix — the identity regime — so layers skip
-    selection entirely and run the UNTOUCHED dense paged path (bit-identical
-    to the flag-off serve, M1's foundation). FULL layers still append to the
-    k-store either way: history must be complete from token 0 for the step
-    that first crosses topk.
-
-    ``last_selection`` is the IndexShare transient: ``(batch_tokens, topk)``
-    int32 rows, -1 padded, overwritten by each FULL layer and read as-is by
-    SHARED layers (which carry no indexer weights). It is never reused across
-    forwards — the context object dies with the forward pass.
-    """
+    """Per-forward DSA state threaded through the decoder stack."""
 
     spans: list[Glm52DsaRequestSpan]
     k_store: Glm52DsaKStore

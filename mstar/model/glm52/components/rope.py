@@ -1,11 +1,4 @@
-"""Plain interleaved RoPE for GLM-5.2 MLA.
-
-GLM-5.2 reaches 1M context with a large base (rope_theta 8e6) and NO
-position-interpolation scaling — unlike Kimi's deepseek_yarn there is no
-factor/mscale machinery, so the rotation is textbook RoPE over the
-qk_rope_head_dim slice. ``rope_interleave`` in the checkpoint config means
-GPT-J pairing (``x[..., ::2]`` / ``x[..., 1::2]``).
-"""
+"""Plain interleaved RoPE for GLM-5.2 MLA."""
 from __future__ import annotations
 
 import torch
@@ -40,14 +33,7 @@ class Glm52RotaryEmbedding(nn.Module):
         return cached
 
     def cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(cos, sin)`` for ``position_ids``, each ``(T, 1, rotary_dim)`` fp32.
-
-        Every decoder layer rotates with the SAME positions, so the model
-        computes this once per forward and hands it down (``rope_cos_sin``)
-        instead of each of the 78 layers redoing outer/cos/sin/repeat —
-        ~6 launches × 77 layers per decode step. Same ops, same order as the
-        per-layer path: bit-identical.
-        """
+        """``(cos, sin)`` for ``position_ids``, each ``(T, 1, rotary_dim)`` fp32."""
         inv_freq = self._get_inv_freq(position_ids.device)
         freqs = torch.outer(position_ids.float(), inv_freq)  # (T, rotary_dim/2)
         cos = freqs.cos().repeat_interleave(2, dim=-1).unsqueeze(-2)
@@ -61,17 +47,7 @@ class Glm52RotaryEmbedding(nn.Module):
         k_pe: torch.Tensor,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rotate the pe slices.
-
-        Args:
-            position_ids: ``(tokens,)`` int positions.
-            q_pe: ``(tokens, num_heads, rotary_dim)``.
-            k_pe: ``(tokens, 1, rotary_dim)`` (shared MQA rope key).
-            cos_sin: the precomputed ``cos_sin(position_ids)``; computed here
-                when None (single-layer callers such as the MTP plane).
-        Returns:
-            rotated ``(q_pe, k_pe)`` in the input dtypes.
-        """
+        """Rotate the pe slices."""
         cos, sin = self.cos_sin(position_ids) if cos_sin is None else cos_sin
 
         q32, k32 = q_pe.float(), k_pe.float()

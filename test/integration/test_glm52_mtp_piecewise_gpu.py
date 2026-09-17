@@ -1,48 +1,4 @@
-"""THE MISSING RUNG: the MTP piecewise graphs against the REAL runner, one GPU, seconds.
-
-The GLM-5.2 ladder is
-
-    test/modular/test_glm52_engine_cycle.py   CPU, real resources, regions run EAGER
-    this file                                 one GPU, real resources, regions REPLAYED
-    the 753B checkpoint on 8 GPUs             minutes per boot
-
-The CPU rung drives the engine's per-step contract over the real ``KVManager``
-(MLA latent layout), the real MLA attention resource on its SDPA fallback and
-the real sampler, but every captured region runs its Python each call
-(``EagerPiecewiseRunner``). It proves the caller's arithmetic and nothing about
-replay: static buffers padded to a bucket, the k attention sub-plans landing at
-the addresses the graph recorded, padding rows over the runner's dummy streams,
-the sink-page scatter tail, ``can_run``/``_resolve`` bucket choice. Every bug in
-that list is silent — greedy verify rejects a bad draft, so the only symptom is
-lower acceptance, which reads as a modelling problem.
-
-This rung is the CPU rung plus real capture: the same reduced config
-(``Glm52ModelConfig.reduced()`` at 4 layers so the MTP plane lands on a FULL
-indexer position, ``mla_absorb=True``), the resources built exactly the way
-``Engine.load_model`` builds them (``get_node_resources`` -> YAML overrides ->
-``build_resource``), the submodule bound to them, and ``PiecewiseCudaGraphRunner``s
-built like ``Engine._build_piecewise_runners`` and captured. The reduced latent
-dims (ckv 32, kpe 8) cannot use the FlashInfer MLA kernel, so the attention
-resource takes its SDPA fallback — shape-static by design, so it captures and
-replays exactly like the kernel path would.
-
-The property: **at temperature 0 a decode step routed through the captured
-regions emits the byte-identical token stream that the eager path emits**, and
-the graphs were actually replayed rather than silently serving eager (a 13x
-regression wearing a correctness costume).
-
-Box notes (H200, 2026-09-08): the runner needs an INDEXED device
-(``torch.cuda.set_device`` rejects a bare ``"cuda"``); grads must be off before
-capture or Inductor tries to backward through ``mstar::flashinfer_rmsnorm`` and
-every bucket fails; every parameter is randomized explicitly because a freshly
-allocated reduced model can carry an all-zero ``lm_head`` and emit token 0
-forever, which makes bit-identity vacuous.
-
-Not covered here: TP>1 collectives, the FlashInfer MLA kernel path
-(``test_mla_kernel_vs_fallback_gpu.py`` covers kernel-vs-fallback at real dims),
-real-checkpoint numerics, and the full-forward ``CudaGraphRunner`` (MTP registers
-none).
-"""
+"""THE MISSING RUNG: the MTP piecewise graphs against the REAL runner, one GPU, seconds."""
 from __future__ import annotations
 
 import gc
@@ -123,11 +79,7 @@ def _cfg(k: int) -> Glm52ModelConfig:
 
 
 def _model(cfg: Glm52ModelConfig, seed: int = 0) -> Glm52ForCausalLM:
-    """Reduced model with finite, explicitly randomized weights. Values are
-    arbitrary — the property is eager-vs-replay equality on the SAME weights,
-    not quality — but every parameter is written: a freshly allocated
-    ``lm_head`` can be all zeros on a GPU, and an all-zero head emits token 0
-    forever, which any bit-identity check passes vacuously."""
+    """Reduced model with finite, explicitly randomized weights."""
     torch.manual_seed(seed)
     model = Glm52ForCausalLM(cfg).to(DEVICE, DTYPE)
     for name, p in model.named_parameters():
@@ -205,10 +157,7 @@ def _capture_runners(
     ``Engine.warmup``: every runner claims its static buffers before any of
     them captures, then each captures, and a region whose capture failed is
     dropped so the forward takes its eager path for that label.
-
-    The regions compile as the config says (``compile_mode="default"``,
-    MSTAR_GLM52_GRAPH_COMPILE=1 unless the environment says otherwise) — the
-    production capture, not a test-only eager one."""
+    """
     # PORT-CHECK: if an eager-vs-replay assertion fails ONLY with the compile
     # flag on, re-run with MSTAR_GLM52_GRAPH_COMPILE=0 — an Inductor fusion
     # that moved a rounding is a numerics finding, not a replay-plumbing bug.
@@ -236,9 +185,7 @@ class _Driver:
     """The engine's per-step cycle for one node, over real resources — the
     CPU rung's ``_Driver`` with the real ``PiecewiseCudaGraphRunner``s in
     ``piecewise_runners`` (``regions=True``) instead of eager stand-ins.
-
-    Order matches the worker: bind resources, capture (the runners' padding
-    rows are ingested during capture), then open the real requests."""
+    """
 
     def __init__(
         self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rids: list[str],
@@ -307,12 +254,7 @@ def _drive(
     driver: _Driver, prompt: torch.Tensor, info: CurrentForwardPassInfo,
     max_steps: int = 64, carry_prefill_drafts: bool = True,
 ) -> list[int]:
-    """Prefill + decode until ``check_stop``; the emitted stream as a list.
-
-    ``carry_prefill_drafts`` feeds the prefill's ``[emitted, k drafts]`` bundle
-    into the first decode step, as the persisted ``MTP_DRAFT_BUNDLE`` edge does
-    in production (MSTAR_GLM52_MTP_PREFILL_DRAFTS=1, the default); off, the
-    first decode is a 1-row step on a (bs, k+1) bucket."""
+    """Prefill + decode until ``check_stop``; the emitted stream as a list."""
     rid = info.request_id
     emitted = []
     walk, text, decode_step = "prefill", prompt, 0
@@ -340,11 +282,7 @@ def _stream(
     prompt: torch.Tensor, max_tokens: int, rid: str = "r0",
     carry_prefill_drafts: bool = True,
 ) -> tuple[list[int], dict[str, bool], set[str]]:
-    """One arm: the stream, which regions fell back to eager, which captured.
-
-    ``mode_k=0`` is plain decode (MTP off) on the same weights — the MTP plane
-    exists on the model but nothing reads it — the baseline greedy verify must
-    reproduce by construction."""
+    """One arm: the stream, which regions fell back to eager, which captured."""
     k = cfg.mtp_num_draft_tokens
     cfg.mtp_num_draft_tokens = mode_k
     try:
@@ -376,10 +314,9 @@ def _expected_labels(k: int, draft_phase: bool = True) -> set[str]:
 
 @pytest.mark.parametrize("k", [1, 2, 3])
 def test_every_region_captures_every_bucket(monkeypatch, k):
-    """Every MTP region captures at every reduced bucket, and same-shape
-    regions keep their padding rows apart. Capture failure is logged, not
-    raised (the engine serves eager on a failed region), so a benchmark would
-    report it as 'MTP is slow'; this is the check that makes it a failure."""
+    """Every MTP region captures at every reduced bucket, and same-shape regions keep their
+    padding rows apart.
+    """
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2])
     cfg = _cfg(k)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
@@ -412,17 +349,7 @@ def test_every_region_captures_every_bucket(monkeypatch, k):
 
 @pytest.mark.parametrize("k", [1, 2, 3])
 def test_replayed_regions_match_eager_and_plain_decode_bitwise(monkeypatch, k):
-    """THE property, per k. Same weights, same prompt, three arms:
-
-    - plain decode (MTP off): the stream greedy verify reproduces by
-      construction;
-    - MTP on, every region eager (the CPU rung's regime, on the GPU);
-    - MTP on, every region REPLAYED from its captured graph.
-
-    Replay vs eager is the plumbing claim — at bs=1 the captured trunk is
-    shape-identical to the eager one, so ANY divergence is the replay path.
-    Replay vs plain decode is the design guarantee the feature rests on.
-    """
+    """THE property, per k. Same weights, same prompt, three arms:"""
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2])
     cfg = _cfg(k)
     model = _model(cfg)
@@ -498,11 +425,6 @@ def test_batch_of_two_padded_to_four_matches_single_streams(monkeypatch, k):
     through regions captured ONLY at bs=4: two padding rows per replay —
     zero-length plan rows, sink-page scatter tails, static buffers zeroed
     past the real rows. Each must emit what it emits alone.
-
-    k=3 with num < bs is the layout the flat chain-position buffer once got
-    wrong (blocks of ``num`` written, blocks of bucket ``bs`` read): the
-    per-iteration ``chain_pos_{it}`` inputs are what makes padding safe, and
-    only two chain iterations with padding rows exercise it.
     """
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [4])
     cfg = _cfg(k)
@@ -545,7 +467,8 @@ def test_three_graph_fallback_matches_plain_decode(monkeypatch):
     """MSTAR_GLM52_MTP_DRAFT_PHASE_GRAPH=0: no draft-phase graph; the decode
     draft phase is the padded sync graph, the eager draft-1 gather, and k-1
     replays of the one-row chain graph, with the runner committing each and
-    the submodule rewinding after."""
+    the submodule rewinding after.
+    """
     monkeypatch.setenv("MSTAR_GLM52_MTP_DRAFT_PHASE_GRAPH", "0")
     monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [1, 2])
     cfg = _cfg(3)
@@ -565,21 +488,7 @@ def test_three_graph_fallback_matches_plain_decode(monkeypatch):
 
 
 def test_captured_decode_step_syncs_exactly_once(monkeypatch):
-    """The sync discipline behind the draft-chain speedup.
-
-    A captured MTP decode step must touch the host exactly ONCE — the batched
-    ``.tolist()`` in greedy verify (a true data dependency: e decides the
-    rewind and the plans). Everything else — the trunk and draft-phase plans,
-    RoPE positions, the scatter maps, the per-iteration chain positions —
-    reaches the device through pinned staging with non_blocking copies, so
-    the CPU queues the whole draft phase without waiting on the GPU.
-
-    ``torch.cuda.set_sync_debug_mode("warn")`` reports every synchronizing op
-    PyTorch can see (``.item()``, ``.tolist()``, ``nonzero``, a blocking
-    ``copy_`` from host memory, ``torch.tensor(..., device=cuda)``). It cannot
-    see a ``non_blocking`` copy from *pageable* memory (CUDA drains the stream
-    for that too) — ``pinned()`` is what closes that hole, asserted first.
-    """
+    """The sync discipline behind the draft-chain speedup."""
     from mstar.utils.pinned_staging import pinned
 
     assert pinned([1, 2, 3], torch.long).is_pinned(), (

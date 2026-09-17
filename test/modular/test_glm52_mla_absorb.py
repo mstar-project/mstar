@@ -192,7 +192,8 @@ class _Path:
     """One attention layer bound to the node's resources for its
     ``mla_absorb`` value, driven a step at a time: declare -> admit ->
     plan -> layer forward -> commit, what the engine does around a
-    forward."""
+    forward.
+    """
 
     def __init__(self, attn: Glm52MLAAttention, cfg: Glm52ModelConfig, page_size: int):
         self.attn, self.cfg = attn, cfg
@@ -237,12 +238,9 @@ def _build_pair(seed):
 
 
 def test_absorbed_resource_path_matches_naive_and_dense_reference():
-    """Prefill 7 tokens, then decode at positions 7, 8, 9 (page size 8: the
-    last two land on a second page). Every step: absorbed path == naive
-    path (fp32 op-order residual only), and both == the dense fp32
-    reference's rows for those positions up to the layer's RMSNorm, which
-    the engine's ``flashinfer_rmsnorm`` op runs in bf16 (fp32 input is
-    recast) — a few 1e-4 on these activations, identical on both paths."""
+    """Prefill 7 tokens, then decode at positions 7, 8, 9 (page size 8: the last two land
+    on a second page).
+    """
     (naive, naive_cfg), (absorbed, absorbed_cfg) = _build_pair(seed=5)
     page = 8
     naive_path = _Path(naive, naive_cfg, page)

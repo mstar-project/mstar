@@ -1,10 +1,5 @@
 """The MLA attention resource on the FlashInfer kernel (real dims, Hopper)
 against its own SDPA fallback over the same host plans, on one GPU.
-
-Prefill, decode, a packed batch, and the speculative shape: a k+1-row verify
-step, a rewind, and a draft-phase step with k sub-plans over the same
-stream. The fallback is the reference the CPU suites run; agreeing with it
-here is what makes those suites evidence for the kernel path.
 """
 
 from __future__ import annotations

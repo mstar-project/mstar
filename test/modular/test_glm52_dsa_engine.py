@@ -1,22 +1,6 @@
 """DSA engine half: k-store lifecycle, guard states, IndexShare threading,
 and the sparse gather path vs an independent masked reference — over the
 real ``KVManager`` (MLA latent layout) and MLA attention resource on CPU.
-
-Layout of the suite:
-  - ``Glm52DsaKStore`` unit behavior + eviction through ``cleanup_request``
-    (the hook the engine calls on request removal).
-  - preprocess guard in both flag states, including the decode-only v1
-    refusal for prefill beyond topk and span construction (page tables come
-    from the attention resource's current plan).
-  - FULL -> SHARED selection threading order over the reduced 2-layer model
-    (layer 1 must consume the very selection object layer 0 published),
-    asserted via a recorded call trace.
-  - ``_run_sparse_absorbed`` two ways: the gather path over the real latent
-    cache vs a mask-based dense reference written independently here, plus
-    a discrimination control (dense-over-everything must NOT match).
-  - CPU decode loop across the topk boundary through the real per-step
-    contract: bitwise prefix property inside topk (the untouched dense
-    path is the MLA resource's SDPA fallback), divergence beyond it.
 """
 import sys
 import types
@@ -541,11 +525,9 @@ def test_sparse_path_refuses_prefill_shape():
 # ---------------------------------------------------------------------------
 
 def test_decode_across_topk_prefix_property_and_divergence():
-    """Teacher-forced decode with topk=6 vs a dense comparator (topk lifted
-    so selection never engages). Steps whose post-step context fits topk
-    must be BITWISE identical — the identity regime runs the untouched
-    dense path (the MLA resource's SDPA fallback) — and every step beyond
-    must differ (the sparse path actually engages)."""
+    """Teacher-forced decode with topk=6 vs a dense comparator (topk lifted so selection
+    never engages).
+    """
     topk = 6
     cfg = _longctx_reduced_cfg(topk)
     model = _build_absorbed_model(cfg, seed=3)

@@ -1,17 +1,4 @@
-"""GPU golden for the block-scaled FP8 fused-MoE path (GLM-5.2 experts).
-
-``fused_experts_fp8`` and the per-expert reference loop below dequantize the
-same e4m3 bytes with the same ``weight_scale_inv`` blocks, so the only
-divergence is the fused path's on-the-fly per-token-group fp8 activation
-quant (plus fp8-dot vs bf16-mm rounding) -- elementwise closeness at ~2e-2
-is the bar, not bitwise equality.
-
-Self-contained: the quant / dequant helpers mirror the GLM-5.2 model's
-``fake_quantize_fp8_block`` / ``dequantize_fp8_block_weight`` so the test
-does not depend on the model package.  ``mstar.utils.fused_moe`` imports
-triton, so it is imported inside the tests to keep collection clean on
-CUDA-less machines.
-"""
+"""GPU golden for the block-scaled FP8 fused-MoE path (GLM-5.2 experts)."""
 import pytest
 import torch
 import torch.nn.functional as F

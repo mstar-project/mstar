@@ -1,11 +1,4 @@
-"""Host-side contract of the fp8 fused-MoE path, runnable without a GPU.
-
-``conftest.py`` stubs triton, so the kernels never run; every launcher is
-replaced by a recorder.  Covered here: tile-config selection (the decode
-tiles per launch), ``_grid_rows`` / ``EM`` arithmetic, and the shape/dtype
-plumbing of ``fused_experts_fp8`` and ``per_token_group_quant_fp8``.  The
-numerics live in ``test/integration/test_fused_moe_fp8.py`` (GPU).
-"""
+"""Host-side contract of the fp8 fused-MoE path, runnable without a GPU."""
 from __future__ import annotations
 
 import inspect

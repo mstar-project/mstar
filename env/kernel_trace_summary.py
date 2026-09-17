@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Summarise a StepKernelTrace chrome trace: kernels, gaps, collectives.
-
-    python env/kernel_trace_summary.py step-trace-worker_0.json [--top 25]
-
-Reads the JSON that ``MSTAR_PROFILE_STEPS`` writes (see
-``mstar/utils/profiler.py``), keeps the GPU-side events (kernels, memcpy,
-memset), and prints what the phase timers cannot: how many kernels a step is,
-how long they run, how much of the wall is gaps between them, which names
-dominate by time and by count, and how much of it is collectives. Gaps are
-computed on the union of all streams, so overlapping streams do not count as
-idle.
-"""
+"""Summarise a StepKernelTrace chrome trace: kernels, gaps, collectives."""
 import argparse
 import collections
 import json

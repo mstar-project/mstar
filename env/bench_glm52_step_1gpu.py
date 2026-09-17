@@ -1,41 +1,5 @@
 #!/usr/bin/env python3
-"""One-GPU GLM-5.2 MTP decode step at the REAL TP8 per-rank shapes.
-
-The 753B config needs 8 GPUs and ~35 minutes to reach its first decode step,
-so every trunk-graph kernel experiment costs half an hour. But TP8 shards the
-model: each rank runs 8 attention heads, a 256-per-rank-intermediate MoE and a
-19360-row lm_head — shapes that fit on ONE H200 as long as you keep the layer
-COUNT down instead of the layer WIDTH. This script builds exactly those
-per-rank dims with tp_size=1, captures the same piecewise graphs the engine
-captures (``mtp_trunk``, ``mtp_draft``, ``mtp_sync``, ``mtp_draft_phase``,
-the real ``PiecewiseCudaGraphRunner`` over the real resources), and times
-decode steps through the captured path.
-
-Every kernel therefore runs at the shape it runs at in production. What is
-NOT here, and what the printed table repeats so no number leaves without it:
-
-- **no TP collectives** — o_proj's RowParallel all-reduce, the MoE block's
-  all-reduce and the lm_head all-gather are all identity at tp_size=1. A TP8
-  rank pays ~76 all-reduces per decode step on top of what this measures.
-- **fewer layers** — ``--layers N`` (default 8) instead of 78. The trunk is
-  the only phase that scales with N; the MTP draft plane is ONE layer in
-  production too, so it does not. Both scalings are printed.
-- **random weights** — timing only. Acceptance is ~0, which does NOT move the
-  step time: the sync pass and draft chain are padded to k+1 rows per request
-  by construction (``mtp_sync_padded_layout``), so a step costs the same
-  whether 0 or k drafts are accepted.
-- **vocab is the per-rank shard** (19360, not 154880), so the lm_head GEMM
-  matches a rank but the verify argmax reads 8x fewer columns than the
-  post-all-gather argmax a real rank runs.
-
-Usage (one GPU, minutes):
-
-    python env/bench_glm52_step_1gpu.py --layers 8 --steps 30
-
-Output: per-step ms (captured and eager), the per-phase GPU|host split from
-the engine's own ``_MtpStepTimer``, a torch.profiler kernel summary of 3
-captured steps via ``env/kernel_trace_summary.py``, and a 78-layer estimate.
-"""
+"""One-GPU GLM-5.2 MTP decode step at the REAL TP8 per-rank shapes."""
 from __future__ import annotations
 
 import argparse
@@ -109,17 +73,7 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------- config ----
 
 def indexer_offset_for(num_layers: int) -> int:
-    """``index_skip_topk_offset`` that keeps the MTP layer FULL.
-
-    ``Glm52MTPModule.__init__`` refuses to construct unless layer index
-    ``num_hidden_layers`` is FULL under the IndexShare formula
-    ``max(idx - offset + 1, 0) % freq == 0`` (freq=4). Production's offset=3
-    works because 78 - 3 + 1 = 76 is a multiple of 4; an arbitrary --layers is
-    not, so the offset moves instead. This is free: with dsa_long_context off
-    the indexer NEVER runs (``_forward_absorbed`` passes dsa_ctx=None), so the
-    offset only decides which dormant layers carry indexer weights — memory,
-    not kernels.
-    """
+    """``index_skip_topk_offset`` that keeps the MTP layer FULL."""
     return ((num_layers + 1) % 4) or 4
 
 
@@ -173,12 +127,7 @@ def build_config(args):
 # ----------------------------------------------------------------- model ----
 
 def _fill_fp8_(param: torch.Tensor, chunk: int = 16, scale: float = 0.5) -> None:
-    """Random e4m3 bytes in the uint8 container, generated per expert chunk.
-
-    Materialising randn for all 256 experts at once would be a 3 GB fp32
-    temporary; 16 at a time is ~200 MB. Going through the fp8 cast (rather
-    than random BYTES) keeps the values finite — 0x7F/0xFF are e4m3 NaN.
-    """
+    """Random e4m3 bytes in the uint8 container, generated per expert chunk."""
     for s in range(0, param.shape[0], chunk):
         e = min(s + chunk, param.shape[0])
         t = torch.randn(param[s:e].shape, device=param.device, dtype=torch.float32)
@@ -310,13 +259,7 @@ def make_fwd_info(cfg, rid, max_tokens):
 # ------------------------------------------------------------------ step ----
 
 def drain_phase_timer(sub) -> list[tuple[str, float, float]]:
-    """Pull the last step's marks out of the submodule's own ``_MtpStepTimer``.
-
-    ``MSTAR_GLM52_MTP_STEP_TIMING=1`` (set before the submodule is built) makes
-    it record a CUDA event + host timestamp at every phase boundary. Its
-    ``report()`` logs them at the START of the next step; draining here gets
-    the same numbers as data and leaves report() a no-op.
-    """
+    """Pull the last step's marks out of the submodule's own ``_MtpStepTimer``."""
     timer = getattr(sub, "_mtp_timer", None)
     marks = getattr(timer, "_pending", None) if timer is not None else None
     if not marks:
@@ -344,11 +287,7 @@ def decode_step(sub, ei, infos, rids, nxt):
 
 
 def run_arm(cfg, model, args, *, use_graphs: bool, steps: int, trace_path=None):
-    """Prefill once, then warmup + `steps` timed decode steps on a fresh cache.
-
-    ``use_graphs`` is the only difference between the two arms — exactly as in
-    test_glm52_mtp_piecewise_gpu.py::_drive.
-    """
+    """Prefill once, then warmup + `steps` timed decode steps on a fresh cache."""
     from mstar.engine.resources import StepContext
     from mstar.model.glm52.submodules import (
         MTP_DRAFT_BUNDLE,

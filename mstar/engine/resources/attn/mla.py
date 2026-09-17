@@ -1,28 +1,4 @@
-"""Weight-absorbed MLA attention over a ``KVLayout.MLA`` latent cache.
-
-DeepSeek-style MLA keeps one compressed row per token — ``ckv_dim`` latent
-values plus the decoupled RoPE key — that every query head attends. The
-resource owns what the paged kernel needs around that row: the FlashInfer
-``BatchMLAPagedAttentionWrapper`` plans, the per-token scatter map the layer
-writes the latent through, and their static buffers under a CUDA graph.
-
-Plans are built on the host from the KV resource's ``SequenceView``s and
-staged through pinned memory, so a decode step never syncs to plan: the
-index tensors reach FlashInfer as host tensors (its ``.to("cpu")`` is a
-no-op) and the scatter map as one async copy each.
-
-**Sub-plans.** A captured region that runs several attention passes over the
-same stream at different lengths — a speculative draft chain: a padded sync
-pass over the k+1 verify rows, then k-1 single-row iterations, all inside one
-graph — declares them as ``MlaAttentionStep.sub_plans``. Each gets its own
-wrapper and scatter map (planned before the replay, read by the kernels at
-fixed addresses); the region's Python selects the active one with
-``select_plan_slot`` at capture time, and the graph carries the choice.
-
-Where the kernel cannot serve — reduced test dims, a pre-Hopper GPU, no
-``flashinfer.mla`` — a shape-static SDPA fallback runs over the same plan
-buffers, so the capture/replay path is exercised end to end at small dims.
-"""
+"""Weight-absorbed MLA attention over a ``KVLayout.MLA`` latent cache."""
 
 from __future__ import annotations
 
@@ -80,10 +56,10 @@ class MlaAttentionSpec(NodeResourceSpec):
 
 
 class MlaSubPlan(NamedTuple):
-    """One attention pass of a step, per request positionally with the step's
-    segments. Row ``j`` of request ``i`` lands at slot ``kv_lens[i] -
-    q_lens[i] + j`` and attends ``[0, kv_lens[i])``. A request with
-    ``q_lens[i] == 0`` is absent from the pass (a padding row)."""
+    """One attention pass of a step, per request positionally with the step's segments. Row
+    ``j`` of request ``i`` lands at slot ``kv_lens[i] - q_lens[i] + j`` and attends
+    ``[0, kv_lens[i])``.
+    """
     q_lens: tuple[int, ...]
     kv_lens: tuple[int, ...]
 
@@ -93,7 +69,6 @@ class MlaAttentionStep(ResourceStep):
     causal: bool = True
     # Several passes over the step's streams inside one forward; None means
     # the one pass the KV segments describe (q = span, kv = stored + span).
-    # Every kv length must fit the segment's declared span.
     sub_plans: tuple[MlaSubPlan, ...] | None = None
     # Which slot the first entry of ``sub_plans`` occupies, and how many the
     # region has in all. A region can plan its passes in two steps — the
@@ -105,13 +80,7 @@ class MlaAttentionStep(ResourceStep):
 
 @functools.cache
 def _mla_kernel_available(ckv: int, kpe: int, sm_major: int) -> bool:
-    """Whether the FlashInfer MLA kernel can serve these latent dims.
-
-    ``flashinfer.mla.BatchMLAPagedAttentionWrapper`` is hard-locked to
-    ckv=512, kpe=64; an off-dim call corrupts the CUDA context rather than
-    raising, so the decision is made before any wrapper is built. Hopper
-    only (``backend="auto"`` -> fa3). Everything else takes the SDPA fallback.
-    """
+    """Whether the FlashInfer MLA kernel can serve these latent dims."""
     if not (ckv == 512 and kpe == 64):
         return False
     if sm_major != 9:
@@ -130,14 +99,7 @@ def paged_scatter_map_host(
     kv_len_arr: list[int],
     page_size: int,
 ) -> tuple[list[int], list[int]]:
-    """Where each new token of a planned batch lands, on the host.
-
-    Token ``j`` of request ``i`` (whose ``kv_len_arr[i]`` counts the new
-    tokens) is global slot ``g = kv_len[i] - len[i] + j``: page
-    ``kv_indices[kv_indptr[i] + g // page_size]``, offset ``g % page_size``.
-    Every input is host-known, so this is a loop over a few thousand ints
-    instead of ~10 device kernels and a sync.
-    """
+    """Where each new token of a planned batch lands, on the host."""
     t2p: list[int] = []
     t2c: list[int] = []
     for i in range(len(qo_indptr) - 1):
@@ -169,11 +131,7 @@ class _HostPlan(NamedTuple):
 def build_host_plan(
     views: list[SequenceView], sub_plan: MlaSubPlan, page_size: int,
 ) -> _HostPlan:
-    """The pass's indptrs over the streams' page tables.
-
-    ``views`` come from the KV plan (one per request, its pages sliced to the
-    declared length); ``sub_plan`` may attend a prefix of that length.
-    """
+    """The pass's indptrs over the streams' page tables."""
     if len(sub_plan.q_lens) != len(views) or len(sub_plan.kv_lens) != len(views):
         raise ValueError(
             f"sub-plan over {len(sub_plan.q_lens)}/{len(sub_plan.kv_lens)} "
@@ -210,11 +168,6 @@ def build_host_plan(
 class FlashInferMLAWrapper:
     """``flashinfer.mla.BatchMLAPagedAttentionWrapper`` plus the latent scatter
     map, with static buffers under a CUDA graph.
-
-    ``plan`` takes host (pinned) int32 tensors on purpose: FlashInfer's plan
-    does ``.to("cpu")`` on three of them and copies into its graph-mode
-    buffers ``non_blocking`` — from pinned memory that is a no-op plus an
-    async DMA; from device tensors it is three stream-draining D2H copies.
     """
 
     def __init__(
@@ -358,13 +311,7 @@ class FlashInferMLAWrapper:
 
 
 class SdpaMLAWrapper:
-    """Reference MLA attention over the same plan, in plain torch.
-
-    Shape-static: the per-token request/position and per-request page-table
-    and length buffers are fixed-size tensors updated by ``plan``, so the
-    fallback captures and replays exactly like the kernel path. For reduced
-    dims and CPU tests; O(bs * max_len) per layer, never for serving.
-    """
+    """Reference MLA attention over the same plan, in plain torch."""
 
     def __init__(
         self,

@@ -1,15 +1,4 @@
-"""The MLA attention resource over a ``KVLayout.MLA`` KV resource, on CPU.
-
-The FlashInfer kernel needs Hopper and the real dims, so these run the SDPA
-fallback — over the same host plans, scatter maps and static buffers the
-kernel path uses. Every step is checked against dense causal attention over
-the tokens the request has seen, computed from the same latents.
-
-Covers: the host plan math, prefill + decode, a batch of two at different
-lengths across a page boundary, the speculative shape (k+1 verify rows,
-rewind, a draft-phase step with k sub-plans over the same stream), and the
-"kv length past the declared span" guard.
-"""
+"""The MLA attention resource over a ``KVLayout.MLA`` KV resource, on CPU."""
 
 from __future__ import annotations
 
@@ -220,7 +209,8 @@ def test_speculative_verify_rewind_and_draft_phase_sub_plans():
     """The MTP shape at k=3: the trunk writes k+1 rows and commits them, the
     model keeps e, then one step runs the padded sync pass (k+1 rows at the
     rewound length) and k-1 chain rows, each its own sub-plan over the same
-    stream, without committing."""
+    stream, without committing.
+    """
     k = 3
     kv, attn, runner = _make()
     kv.ingest_request("a")

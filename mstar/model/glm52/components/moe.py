@@ -1,20 +1,4 @@
-"""GLM-5.2 fine-grained MoE: groupless sigmoid router + FP8-resident experts.
-
-The router is DeepSeek-V3 noaux_tc math (identical to ``KimiMoEGate``) minus
-the group machinery — GLM-5.2 has no ``n_group``/``topk_group`` fields, i.e.
-n_group=1, where group selection is the identity. A CPU test pins parity
-against ``KimiMoEGate(n_group=1, topk_group=1)``.
-
-Routed experts stay FP8: bytes in uint8 containers (ints dodge the
-module-wide autocast like Kimi's packed int32 weights) with fp32
-``weight_scale_inv`` block scales. Dispatch v1 dequantizes only the experts
-a batch actually routes to and reuses the shared bf16 per-expert loop — the
-"simplest correct" resolution of the FP8 kernel decision. At decode that
-touches top-k+shared experts (~30 MB/layer); large prefills touch most of
-the 256 and pay full dequant traffic. Perf debt, on the M4 ledger: port
-sglang's fp8_w8a8 branch back into ``utils/fused_moe`` (it was stripped —
-M* has no fp8 kernel today) or adopt DeepGEMM.
-"""
+"""GLM-5.2 fine-grained MoE: groupless sigmoid router + FP8-resident experts."""
 from __future__ import annotations
 
 import logging
@@ -50,14 +34,7 @@ def _gate_up_fp8_loader(
     param: nn.Parameter, loaded_weight: torch.Tensor,
     loaded_shard_id: str | int | None = None,
 ):
-    """Route one expert's gate/up tensor into the stacked per-rank param.
-
-    ``row_unit`` is 1 for the fp8 bytes and block_size[0] for the scale rows;
-    the same slicing logic covers both because scales tile the row axis.
-    Shape-driven: a full checkpoint tensor is TP-sliced here; a pre-sliced
-    shard (the ``slice_spec`` fast read path — each rank reads only its
-    bytes) is written as-is.
-    """
+    """Route one expert's gate/up tensor into the stacked per-rank param."""
     assert loaded_shard_id is not None
     kind, expert_str = str(loaded_shard_id).split(":")
     expert_idx = int(expert_str)
@@ -103,12 +80,7 @@ def _down_fp8_loader(
 
 
 class Glm52MoEGate(nn.Module):
-    """DeepSeek-V3 noaux_tc sigmoid router, groupless (n_group=1).
-
-    Bias-added scores drive expert *selection*; raw sigmoid scores drive the
-    combine weights. The selection bias is fp32 by checkpoint convention
-    (``restore_fp32_params`` re-widens it before loading).
-    """
+    """DeepSeek-V3 noaux_tc sigmoid router, groupless (n_group=1)."""
 
     def __init__(
         self,
@@ -355,12 +327,7 @@ class Glm52SparseMoeBlock(nn.Module):
         topk_ids: torch.Tensor,
         reduce: bool = True,
     ) -> torch.Tensor:
-        """Per-expert loop that dequantizes only the experts this batch hit.
-
-        Same loop shape as the shared ``dispatch_experts_fused``; the weighted
-        ``index_add`` makes partial sums linear, so the TP all_reduce of the
-        (T, hidden) result equals the stock all_reduce-then-sum path.
-        """
+        """Per-expert loop that dequantizes only the experts this batch hit."""
         final = torch.zeros_like(flat)
 
         with torch.no_grad():

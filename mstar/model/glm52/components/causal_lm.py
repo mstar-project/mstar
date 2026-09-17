@@ -45,15 +45,7 @@ class Glm52LanguageModel(nn.Module):
         off): layer order IS the IndexShare order — each FULL layer
         overwrites ``dsa_ctx.last_selection`` and the SHARED layers between
         it and the next FULL layer consume that value.
-
-        ``return_prenorm``: additionally return the raw last-layer hidden
-        BEFORE the final norm as ``(normed, prenorm)``. Both streams reach
-        the MTP step because WHICH one the plane's learned ``hnorm`` pairs
-        against is an open A/B — see ``Glm52LLMSubmodule._mtp_pair_rows``.
-        (vLLM pairs post-norm on this checkpoint and scores higher. The
-        0.00-acceptance number that once condemned post-norm here was
-        re-attributed by 474a95e9 to the read plan never loading the MTP
-        weights; do not cite it as pairing evidence.)"""
+        """
         hidden_states = self.embed_tokens(input_ids)
         rope_cos_sin = self.rotary.cos_sin(position_ids)
         for decoder_layer in self.layers:
