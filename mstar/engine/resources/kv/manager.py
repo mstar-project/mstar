@@ -1154,8 +1154,13 @@ class KVManager(AttentionResource):
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
-        Under ``KVLayout.MLA`` ``k`` is the latent row and ``v`` is None.
         """
+        if self.kv_cache.layout == KVLayout.MLA:
+            raise NotImplementedError(
+                "an MLA cache is written by its attention resource "
+                "(MlaAttentionManager.write_latent), which owns the per-token "
+                "addressing; this manager plans no write states for it"
+            )
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         if label is None:
