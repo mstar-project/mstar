@@ -33,6 +33,8 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3_super_i2v_4step": "cosmos3_super_i2v_4step_tp2.yaml",
     "cosmos3_super_t2i_4step": "cosmos3_super_t2i_4step_tp2.yaml",
     "kokoro": "kokoro.yaml",
+    "chatterbox": "chatterbox.yaml",
+    "chatterbox_turbo": "chatterbox_turbo.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
@@ -126,6 +128,10 @@ def _next_steps(model: str, host: str, port: int) -> str:
             "qwen3_tts": "Vivian",
         }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
+    if model in ("chatterbox", "chatterbox_turbo"):
+        lines.append("    client.tts(\"Hello there\", voice=\"default\", cfg_weight=0.5).to_wav(\"out.wav\")")
+        lines.append("    # clone a voice: client.generate(text=\"Hello\", audio=\"ref.wav\",")
+        lines.append("    #     input_modalities=(\"text\",\"audio\"), output_modalities=(\"audio\",))")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
