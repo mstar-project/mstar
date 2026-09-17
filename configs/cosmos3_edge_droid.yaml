@@ -15,6 +15,9 @@ model_kwargs:
   num_inference_steps_video: 20
   guidance_scale: 6.0
   flow_shift_video: 12.0
+  # Image-to-video conditioning follows the model card's diffusers recipe:
+  # cover-scale, antialiased resize, center crop, 8-bit rounding.
+  conditioning_resize: aspect_crop
   # The released Edge DROID policy serves a 4-step denoise at guidance 3.0;
   # its scheduler config carries the 480p training flow shift (5.0).
   num_inference_steps_action: 4
