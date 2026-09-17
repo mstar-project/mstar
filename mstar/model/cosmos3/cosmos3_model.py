@@ -1340,6 +1340,30 @@ class Cosmos3Model(Model):
             if context_frames:
                 context_units = 1 + (context_frames - 1) // tf
         total_units = 1 + (num_frames - 1) // tf
+        # Sessions: a request may name a session (its last window is kept for
+        # a follow-up) and resume one — the stored tail then re-pins the head
+        # of window 0 as clean conditioning (the chained overlap, at least the
+        # two-frame V2V floor), and the schedule grows by those units so
+        # ``num_frames`` stays the count of new frames the client receives.
+        session_id = mk.get("session_id")
+        resume = bool(mk.get("resume_session"))
+        if resume and not session_id:
+            raise ValueError("Cosmos3 resume_session requires a session_id.")
+        if resume and params.get("has_image_condition"):
+            raise ValueError(
+                "Cosmos3 resume_session conditions on the session's last frames; "
+                "drop the conditioning image."
+            )
+        if session_id is not None:
+            params["session_id"] = str(session_id)
+        resume_units = max(overlap_units, 2) if resume else 0
+        if resume_units and resume_units >= window_units:
+            raise ValueError(
+                f"Cosmos3 resume_session needs window_frames large enough for its "
+                f"{resume_units}-frame conditioning head (window {window_units} latent frames)."
+            )
+        params["resume_latent_units"] = resume_units
+        total_units += resume_units
         # Pad the schedule up to whole windows: a short final window can
         # regenerate just a frame or two off almost pure conditioning, which
         # comes out degraded. The decoder trims the assembled video back to
