@@ -25,9 +25,23 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
        ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
        serves the released policy sampling defaults (4 steps, guidance 3.0).
+   * - ``cosmos3_edge``
+     - ``nvidia/Cosmos3-Edge``
+     - Cosmos3-Edge (4B): dense Nemotron backbone, 480p-native t2i/t2v/i2v and
+       robot-action modes, plus the reasoner (image/video chat through
+       ``/v1/chat/completions``) on the shared understanding tower.
+   * - ``cosmos3_edge_droid``
+     - ``nvidia/Cosmos3-Edge-Policy-DROID``
+     - Edge action-policy fine-tune for DROID (``domain_name``
+       ``droid_lerobot``); serves the released 4-step, guidance-3.0 policy
+       defaults.
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``cosmos3_super_t2i_4step`` / ``cosmos3_super_i2v_4step``
+     - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
+     - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
+       stochastic sampler); TP=2 deployments.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
