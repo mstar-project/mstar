@@ -19,8 +19,9 @@ import json
 import sys
 from pathlib import Path
 
+import soundfile as sf
 import torch
-import torchaudio
+from torchaudio.functional import resample
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -36,10 +37,10 @@ def transcribe(wavs: list[Path], model_id: str, device: str, batch_size: int) ->
     asr = pipeline("automatic-speech-recognition", model=model_id, torch_dtype=dtype, device=device)
     samples = []
     for path in wavs:
-        wav, sr = torchaudio.load(str(path))
-        wav = wav.mean(dim=0)
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        wav = torch.from_numpy(data).mean(dim=1)
         if sr != 16000:
-            wav = torchaudio.functional.resample(wav, sr, 16000)
+            wav = resample(wav, sr, 16000)
         samples.append({"raw": wav.numpy(), "sampling_rate": 16000})
     outputs = asr(samples, batch_size=batch_size, generate_kwargs={"language": "en", "task": "transcribe"})
     return [o["text"].strip() for o in outputs]
@@ -66,7 +67,7 @@ def main() -> None:
 
     hypotheses = transcribe(wavs, args.asr_model, args.device, args.batch_size)
     report = _compute_wer(references, hypotheses)
-    durations = [torchaudio.info(str(p)).num_frames / torchaudio.info(str(p)).sample_rate for p in wavs]
+    durations = [sf.info(str(p)).duration for p in wavs]
     result = {
         "asr_model": args.asr_model, "num_files": len(wavs), "wer": report["wer"],
         "total_audio_s": sum(durations), "mean_audio_s": sum(durations) / len(durations),
