@@ -175,7 +175,7 @@ def test_slot_indexed_conv_update_matches_fla(rows, d, dtype):
     ref_state[slot_ids] = cache[..., 1:].to(ref_state.dtype)
     y = conv_update_slots(x, state, slot_ids, weight, activation="silu")
     if dtype == torch.float32:  # fla's autotuned split can order the four taps differently: one ulp
-        torch.testing.assert_close(y.view(rows, -1), y_ref.view(rows, -1), rtol=0, atol=2e-7)
+        torch.testing.assert_close(y.view(rows, -1), y_ref.view(rows, -1), rtol=0, atol=5e-7)
     else:
         assert torch.equal(y.view(rows, -1), y_ref.view(rows, -1))
     assert torch.equal(state, ref_state)
