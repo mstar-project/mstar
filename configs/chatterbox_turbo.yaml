@@ -1,0 +1,15 @@
+model: "chatterbox_turbo"
+# cond (376) + text (<= 512) + speech (<= 4096) tokens; single stream (no CFG)
+max_seq_len: 5000
+resources:
+  t3_kv:
+    # 24 layers x 16 kv heads x 64 dims x bf16 = 96 KB per token
+    page_size: 64
+    max_num_pages: 1536
+node_groups:
+  - node_names: [voice_encoder, T3]
+    ranks: [0]
+    graph_walks: [prefill, prefill_voice, decode]
+  - node_names: [s3gen]
+    ranks: [0]
+    graph_walks: [s3gen_chunk, s3gen_chunk_voice]
