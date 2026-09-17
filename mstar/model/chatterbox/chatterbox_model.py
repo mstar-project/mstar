@@ -114,9 +114,13 @@ class ChatterboxModel(Model):
         watermark: bool | None = None,
         stream_chunk_tokens: int | None = None,
         stream_first_chunk_tokens: int | None = None,
+        t3_dtype: str | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
+        # T3 runs in bf16 by default; ``t3_dtype: float32`` (a parity switch)
+        # keeps the reference package's numerics at about half the decode speed.
+        self._t3_dtype = _parse_dtype(t3_dtype) if t3_dtype else torch.bfloat16
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = (
@@ -550,6 +554,9 @@ class ChatterboxModel(Model):
     # Output
     # -----------------------------------------------------------------------
 
+    def get_autocast_dtype(self):
+        return self._t3_dtype
+
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
 
@@ -691,6 +698,18 @@ class ChatterboxModel(Model):
         from mstar.model.chatterbox.components.watermark import PerthWatermarker
 
         return PerthWatermarker.build(device) if self.config.generation.watermark else None
+
+
+def _parse_dtype(name: str) -> torch.dtype:
+    dtypes = {
+        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+        "float16": torch.float16, "fp16": torch.float16,
+        "float32": torch.float32, "fp32": torch.float32,
+    }
+    try:
+        return dtypes[name.lower()]
+    except KeyError:
+        raise ValueError(f"Unknown t3_dtype {name!r}; use bfloat16, float16 or float32") from None
 
 
 def voice_key_for(wav: torch.Tensor) -> torch.Tensor:
