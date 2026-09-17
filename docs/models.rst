@@ -67,10 +67,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        are sharded on their intermediate dim across the tensor-parallel ranks by default;
        ``model_kwargs.moe_ep_size`` (a divisor of ``tp_size``) places whole experts on
        each rank instead (expert parallelism, ``configs/kimi_k3_pruned75_ep8.yaml``), or
-       mixes the two. The KDA state lives in the engine's recurrent state pool
-       (``RecurrentStatePool``, one slot per resident request; ``resources.kda_state.max_slots``
-       in the yaml, sink slot included) and the layers run through the ``LinearAttnManager``
-       planned against it (variant ``KDA``, fla / FlashKDA kernels; ``model_kwargs.kda_backend``).
+       mixes the two. The MoE latent down-projection is column-parallel and all-gathered
+       by default (``model_kwargs.moe_shard_latent: false`` replicates it). The KDA state
+       lives in the engine's recurrent state pool (``RecurrentStatePool``, one slot per
+       resident request; ``resources.kda_state.max_slots`` in the yaml, sink slot included)
+       and the layers run through the ``LinearAttnManager`` planned against it (variant
+       ``KDA``, fla / FlashKDA kernels; ``model_kwargs.kda_backend``).
        ``model_kwargs.mixed_prefill_decode: true`` lets decoding requests
        ride along in prefill steps instead of pausing for them. Tensor-parallel
        deployments run the async scheduling protocol by default (the submodule sets
