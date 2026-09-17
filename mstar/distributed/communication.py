@@ -118,11 +118,16 @@ class CommGroup:
     _symm_one_shot_max_bytes: int = 256 * 1024
     _symm_max_bytes: int = 4 * 1024 * 1024
     # the Lamport one-shot kernel (mstar/distributed/lamport_allreduce.py): one launch, no barrier,
-    # for 2-D bf16/fp16 messages of up to MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS rows (decode batches); one
-    # workspace per (dtype, width), built eagerly on first use (a collective, never under capture)
+    # for 2-D bf16/fp16 messages (decode batches); one workspace per (dtype, width), built eagerly on
+    # first use (a collective, never under capture). All-gathers take it up to
+    # MSTAR_LAMPORT_ALLGATHER_MAX_ROWS rows (also the workspaces' row capacity); all-reduces only up to
+    # MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS rows, by default 128 // world_size: the one-shot's cost grows
+    # with rows x ranks and on 8xH100 it crosses the multicast ring near 16 rows at width 7168
+    # (4.0 / 5.9 / 28 / 62 us at 1 / 8 / 64 / 128 rows against 7.9 / 8.6 / 12.6 / 15.8; 2026-09-17)
     _lamport_enabled: bool = False
     _lamport_flashinfer: bool = False
     _lamport_max_rows: int = 128
+    _lamport_reduce_max_rows: int | None = None
 
     def _symm_available(self) -> bool:
         if self._symm_enabled is None:
@@ -142,28 +147,41 @@ class CommGroup:
                     os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES", self._symm_one_shot_max_bytes))
                 self._lamport_enabled = enabled and _lamport_mode(mode)
                 self._lamport_flashinfer = self._lamport_enabled and _flashinfer_mode(mode)
-                self._lamport_max_rows = int(os.environ.get("MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS", self._lamport_max_rows))
+                self._lamport_max_rows = int(os.environ.get("MSTAR_LAMPORT_ALLGATHER_MAX_ROWS", self._lamport_max_rows))
+                reduce_rows = os.environ.get("MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS")
+                if reduce_rows is not None:
+                    self._lamport_reduce_max_rows = int(reduce_rows)
             self._symm_enabled = enabled
             self._symm_bufs: dict = {}
             self._lamport_channels: dict = {}
         return self._symm_enabled
 
     # --- Lamport one-shot tier ----------------------------------------------------------
-    def lamport_applies(self, shape, dtype: torch.dtype, device: torch.device) -> bool:
-        """Whether a 2-D message of this shape would take the Lamport kernel (all-reduce, or
-        all-gather along the last dim)."""
+    @property
+    def lamport_reduce_max_rows(self) -> int:
+        """Largest row count an all-reduce takes through the Lamport kernel (the all-gathers take
+        ``_lamport_max_rows``): ``MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS`` or ``128 // world_size``, at
+        least 8 and never above the workspaces' capacity."""
+        if self._lamport_reduce_max_rows is None:
+            self._lamport_reduce_max_rows = min(self._lamport_max_rows, max(8, 128 // max(self.world_size, 1)))
+        return self._lamport_reduce_max_rows
+
+    def lamport_applies(self, shape, dtype: torch.dtype, device: torch.device, gather: bool = False) -> bool:
+        """Whether a 2-D message of this shape would take the Lamport kernel (all-reduce, or with
+        ``gather`` the all-gather along the last dim)."""
         if self.world_size == 1 or device.type != "cuda" or not self._symm_available() or not self._lamport_enabled:
             return False
         if len(shape) != 2 or dtype not in (torch.bfloat16, torch.float16):
             return False
         rows, width = int(shape[0]), int(shape[1])
-        return 0 < rows <= self._lamport_max_rows and width > 0 and rows * width * 2 <= self._symm_max_bytes
+        cap = self._lamport_max_rows if gather else self.lamport_reduce_max_rows
+        return 0 < rows <= cap and width > 0 and rows * width * 2 <= self._symm_max_bytes
 
     def _lamport_channel(self, x: torch.Tensor, gather: bool = False):
         """The workspace for ``x``'s (dtype, width), or None when the tier does not apply (or the
         channel is missing while a CUDA graph is being captured: the caller stays on its other path).
         All-reduces take flashinfer's kernel when selected and importable, all-gathers always ours."""
-        if not self.lamport_applies(x.shape, x.dtype, x.device) or x.stride(1) != 1:
+        if not self.lamport_applies(x.shape, x.dtype, x.device, gather=gather) or x.stride(1) != 1:
             return None
         kind = "gather" if gather or not self._lamport_flashinfer else "reduce"
         key = (kind, x.dtype, x.shape[1], x.device)
@@ -181,8 +199,9 @@ class CommGroup:
                     channel = FlashInferAllReduce(
                         self.device_group, self.rank, self.world_size, self._lamport_max_rows, x.shape[1], x.dtype,
                         x.device)
-                    logger.info("all-reduce channel ready (flashinfer one-shot): %s x %d, up to %d rows, %d ranks",
-                                x.dtype, x.shape[1], self._lamport_max_rows, self.world_size)
+                    logger.info("all-reduce channel ready (flashinfer one-shot): %s x %d, up to %d rows "
+                                "(workspace %d), %d ranks", x.dtype, x.shape[1], self.lamport_reduce_max_rows,
+                                self._lamport_max_rows, self.world_size)
                 except Exception as ex:  # flashinfer missing or its workspace failing: our kernel
                     logger.warning("flashinfer all-reduce unavailable (%s); using M*'s Lamport kernel", ex)
                     self._lamport_flashinfer = False
@@ -194,7 +213,7 @@ class CommGroup:
                         x.shape[1], x.dtype, x.device)
                     logger.info("Lamport %s channel ready: %s x %d (%s), up to %d rows, %d ranks",
                                 "all-gather" if gather else "all-reduce", x.dtype, x.shape[1], x.device,
-                                self._lamport_max_rows, self.world_size)
+                                self._lamport_max_rows if gather else self.lamport_reduce_max_rows, self.world_size)
                 except (RuntimeError, ValueError) as ex:  # no symmetric memory across nodes, odd group sizes
                     logger.warning("Lamport all-reduce unavailable for this group (%s); using the other tiers", ex)
                     self._lamport_enabled = False
