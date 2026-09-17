@@ -173,6 +173,60 @@ Cosmos3 environment requirements
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
 
+Cosmos3 streaming rollout (windowed video)
+------------------------------------------
+
+Long clips can be generated window by window instead of in one denoise loop,
+with each finished window streamed to the client while the next one is being
+denoised. The deployment opts in with ``enable_windowed_video: true`` in the
+config YAML (``configs/cosmos3_edge.yaml`` and ``configs/cosmos3_nano_ar.yaml``
+do), which adds the ``video_gen_ar`` walk and a ``vae_decoder_ar`` node in its
+own ``window_decoder`` partition; a request opts in per call:
+
+.. list-table:: Windowed request knobs (``model_kwargs`` or the video request body)
+   :header-rows: 1
+   :widths: 22 14 64
+
+   * - Knob
+     - Default
+     - Meaning
+   * - ``window_mode``
+     - —
+     - ``chained``: every window is a full bidirectional denoise conditioned on
+       the previous window's tail (``overlap_frames`` pinned clean). ``kv``: the
+       finished window's clean K/V is committed to the cache and later windows
+       attend to it block-causally; no overlap, and frames older than
+       ``context_frames`` behind the frontier are released from the cache
+       (the persistent world state of a long rollout stays bounded).
+   * - ``window_frames``
+     - 29
+     - Pixel frames per window (quantized to latent frames).
+   * - ``overlap_frames``
+     - 8
+     - ``chained`` only: frames re-pinned from the previous window (at least two
+       latent frames).
+   * - ``context_frames``
+     - 61
+     - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.
+   * - ``stream_video``
+     - ``false``
+     - Emit each window as its own video chunk as it is decoded instead of one
+       assembled clip. ``/generate`` streams the chunks as NDJSON lines,
+       ``/generate/ws`` as frames, ``/v1/videos/generations`` switches to an
+       NDJSON body (``video`` lines with a running ``index``, closed by ``done``).
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/generate \
+     -F 'text=a drone flies over a coastal town at dawn' \
+     -F 'output_modalities=video' \
+     -F 'model_kwargs={"num_frames":241,"window_mode":"kv","window_frames":29,"context_frames":61,"stream_video":true}'
+
+The schedule is padded up to whole windows and the video trimmed back to
+``num_frames``; a seeded request is deterministic end to end (later windows draw
+their noise from the same generator). Windowed requests run the eager denoise
+path and batch with each other and with plain requests at the same walk.
+
 Wan2.2 (``wan22``)
 ------------------
 
