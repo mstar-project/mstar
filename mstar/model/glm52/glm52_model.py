@@ -11,11 +11,10 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
+    AttnBackend,
     KVConfig,
     KVLayout,
     KVSpec,
-    MlaAttentionConfig,
-    MlaAttentionSpec,
     NodeResourceSpec,
     ResourceReqConfig,
     SamplerSpec,
@@ -163,12 +162,13 @@ class Glm52Model(Model):
                 num_qo_heads=self.config.num_attention_heads,
                 layout=KVLayout.MLA,
             )
-            attn = MlaAttentionSpec(
+            attn = AttentionSpec(
                 resource_key=ATTN_RESOURCE, nodes=nodes,
-                config=MlaAttentionConfig(
+                config=AttentionConfig(
                     kv_cache=KV_RESOURCE,
+                    backend=AttnBackend.MLA,
                     softmax_scale=self.config.qk_head_dim ** -0.5,
-                    ckv_dim=self.config.kv_lora_rank,
+                    mla_ckv_dim=self.config.kv_lora_rank,
                 ),
             )
         else:

@@ -40,9 +40,9 @@ from mstar.conductor.request_info import (  # noqa: E402
 )
 from mstar.engine.resources import (  # noqa: E402
     AttentionSpec,
+    AttnBackend,
     KVLayout,
     KVSpec,
-    MlaAttentionSpec,
     SamplerSpec,
     SamplingReqConfig,
 )
@@ -116,10 +116,11 @@ def test_glm52_resources_absorbed_is_mla_latent_layout():
     assert kv.config.head_dim == 512 + 64
     assert kv.config.num_qo_heads == 64
     assert kv.config.max_seq_len == cfg.max_seq_len == 2048
-    assert isinstance(attn, MlaAttentionSpec)
+    assert isinstance(attn, AttentionSpec)
+    assert attn.config.backend is AttnBackend.MLA
     assert attn.config.kv_cache == KV_RESOURCE
     assert attn.config.softmax_scale == cfg.qk_head_dim ** -0.5  # 256**-0.5, no mscale
-    assert attn.config.ckv_dim == cfg.kv_lora_rank == 512
+    assert attn.config.mla_ckv_dim == cfg.kv_lora_rank == 512
     assert attn.depends_on() == {KV_RESOURCE}
     assert sampler.vocab_size == cfg.vocab_size
 
@@ -140,7 +141,8 @@ def test_glm52_resources_flag_off_is_naive():
     assert kv.config.num_kv_heads == cfg.num_attention_heads == 4
     assert kv.config.head_dim == cfg.padded_head_dim == 64  # qk 24 -> FlashInfer 64
     assert kv.config.num_qo_heads == 4
-    assert isinstance(attn, AttentionSpec) and not isinstance(attn, MlaAttentionSpec)
+    assert isinstance(attn, AttentionSpec)
+    assert attn.config.backend is AttnBackend.FLASHINFER
     assert attn.config.kv_cache == KV_RESOURCE
 
 
