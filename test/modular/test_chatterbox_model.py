@@ -735,3 +735,19 @@ def test_voice_cache_is_lru():
     assert cache.get(1) == "a"
     cache.put(3, "c")
     assert cache.get(2) is None and cache.get(1) == "a" and cache.get(3) == "c"
+
+
+def test_load_audio_decodes_with_soundfile_to_24k_mono(tmp_path):
+    sf = pytest.importorskip("soundfile")
+    sr = 16000
+    t = torch.arange(sr) / sr
+    stereo = torch.stack([torch.sin(2 * torch.pi * 440 * t), torch.zeros(sr)], dim=1)
+    sf.write(str(tmp_path / "ref.wav"), stereo.numpy(), sr)
+
+    loaded = _make_model().load_audio(str(tmp_path / "ref.wav"), "cpu")
+
+    assert loaded.metadata == {"sample_rate": 24000, "num_channels": 1}
+    assert loaded.data.dtype == torch.float32 and loaded.data.ndim == 1
+    # one second of audio, resampled to 24 kHz and averaged to mono (half amplitude)
+    assert abs(loaded.data.shape[0] - 24000) <= 1
+    assert 0.4 < loaded.data.abs().max() < 0.55
