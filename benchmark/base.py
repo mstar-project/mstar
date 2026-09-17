@@ -185,6 +185,17 @@ class Kokoro(Model):
         return "kokoro"
 
 
+class Chatterbox(Model):
+    """Chatterbox (Resemble AI) zero-shot TTS; the Turbo checkpoint shares the
+    request shape and is served under the ``chatterbox_turbo`` registry key."""
+
+    def get_hf_url(self):
+        return "ResembleAI/chatterbox"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2S}
+
+
 class Qwen3Omni(Model):
     def get_hf_url(self):
         return "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -353,6 +364,7 @@ class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     KOKORO = "kokoro"
+    CHATTERBOX = "chatterbox"
     QWEN3OMNI = "qwen3omni"
     QWEN3TTS = "qwen3_tts"
     PI05 = "pi05"
@@ -367,6 +379,8 @@ class ModelType(Enum):
             return Orpheus(**kwargs)
         if self == ModelType.KOKORO:
             return Kokoro(**kwargs)
+        if self == ModelType.CHATTERBOX:
+            return Chatterbox(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
         if self == ModelType.QWEN3TTS:
