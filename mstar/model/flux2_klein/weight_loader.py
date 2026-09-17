@@ -43,6 +43,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.model.components.diffusion.lora import LoraSpec, apply_loras
 from mstar.model.components.diffusion.text_encoder import Qwen3HiddenStateEncoder
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.components.vae import Flux2VAE, remap_flux2_vae_key
@@ -257,3 +258,63 @@ def make_text_encoder(text_config: Qwen3EncoderConfig) -> Qwen3HiddenStateEncode
         rope_theta=text_config.rope_theta,
         tap_layers=text_config.hidden_state_layers,
     )
+
+
+# --------------------------------------------------------------------------- LoRA
+_BFL_EXTRA = {
+    "img_in": "x_embedder",
+    "txt_in": "context_embedder",
+    "time_in.in_layer": "time_guidance_embed.timestep_embedder.linear_1",
+    "time_in.out_layer": "time_guidance_embed.timestep_embedder.linear_2",
+    "guidance_in.in_layer": "time_guidance_embed.guidance_embedder.linear_1",
+    "guidance_in.out_layer": "time_guidance_embed.guidance_embedder.linear_2",
+    "final_layer.linear": "proj_out",
+    "final_layer.adaLN_modulation.1": "norm_out.linear",
+    "single_stream_modulation.lin": "single_stream_modulation.linear",
+    "double_stream_modulation_img.lin": "double_stream_modulation_img.linear",
+    "double_stream_modulation_txt.lin": "double_stream_modulation_txt.linear",
+}
+_BFL_DOUBLE = {
+    "img_attn.proj": "attn.to_out.0", "txt_attn.proj": "attn.to_add_out",
+    "img_mlp.0": "ff.linear_in", "img_mlp.2": "ff.linear_out",
+    "txt_mlp.0": "ff_context.linear_in", "txt_mlp.2": "ff_context.linear_out",
+}
+_BFL_SINGLE = {"linear1": "attn.to_qkv_mlp_proj", "linear2": "attn.to_out"}
+_BFL_QKV = {"img_attn.qkv": ("to_q", "to_k", "to_v"), "txt_attn.qkv": ("add_q_proj", "add_k_proj", "add_v_proj")}
+_BLOCK_KEY = re.compile(r"^(double|single)_blocks\.(\d+)\.(.+)\.lora_([AB])\.weight$")
+
+
+def convert_bfl_lora_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rewrite FLUX.2's native (BFL / ai-toolkit) LoRA keys to diffusers module paths; the
+    fused ``qkv`` adapters split their B matrix into q/k/v (A is shared). Keys already in
+    diffusers naming pass through."""
+    out: dict[str, torch.Tensor] = {}
+    for key, value in sd.items():
+        m = _BLOCK_KEY.match(key)
+        if m is None:
+            for src, dst in _BFL_EXTRA.items():
+                if key.startswith(src + "."):
+                    key = dst + key[len(src):]
+                    break
+            out[key] = value
+            continue
+        kind, idx, inner, ab = m.groups()
+        if kind == "single":
+            out[f"single_transformer_blocks.{idx}.{_BFL_SINGLE[inner]}.lora_{ab}.weight"] = value
+            continue
+        block = f"transformer_blocks.{idx}"
+        if inner in _BFL_QKV:
+            names = _BFL_QKV[inner]
+            parts = [value] * 3 if ab == "A" else list(value.chunk(3, dim=0))
+            for name, part in zip(names, parts, strict=True):
+                out[f"{block}.attn.{name}.lora_{ab}.weight"] = part
+        elif inner in _BFL_DOUBLE:
+            out[f"{block}.{_BFL_DOUBLE[inner]}.lora_{ab}.weight"] = value
+        else:
+            raise ValueError(f"unsupported FLUX.2 LoRA key {key!r}")
+    return out
+
+
+def apply_transformer_loras(dit: Flux2DiT, specs: list[LoraSpec]) -> None:
+    """Fold the configured adapters into the transformer weights (static merge)."""
+    apply_loras(dit, specs, remap_transformer_key, _QKV_RULES_DIT, convert_keys=convert_bfl_lora_keys)
