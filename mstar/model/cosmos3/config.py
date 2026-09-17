@@ -327,6 +327,12 @@ class Cosmos3Config:
     # video keeps the checkpoint scheduler's shift unless set (Edge: 12.0).
     flow_shift_image: float | None = 3.0
     flow_shift_video: float | None = None
+    # How an image-to-video conditioning frame reaches the generation size:
+    # "stretch" (plain bilinear resize; the diffusers 0.39 pipeline the Nano
+    # checkpoints were validated against) or "aspect_crop" (cover-scale,
+    # antialiased resize, center crop, 8-bit rounding; the diffusers 0.40 /
+    # vLLM-Omni recipe, set by the Edge yamls). See components/conditioning.py.
+    conditioning_resize: str = "stretch"
     # ``model_index.json``: the pipeline sets the UniPC schedule from
     # explicitly linspaced flow sigmas (1 - 1/T ... 0) instead of the
     # scheduler's own timestep spacing. Edge checkpoints set it; the karras
