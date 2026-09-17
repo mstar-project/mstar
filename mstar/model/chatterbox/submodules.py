@@ -203,17 +203,13 @@ class T3Submodule(ARNodeSubmodule):
         return flags.pop() if len(flags) == 1 else None
 
     def _scalar_inputs(self, fwd_info: CurrentForwardPassInfo, requires_cfg: bool) -> dict[str, torch.Tensor]:
-        device = self.get_device()
-        meta = fwd_info.step_metadata
-        sampling = fwd_info.resource_configs.get(T3_SAMPLER)
-        temperature = float(getattr(sampling, "temperature", self.config.generation.temperature))
+        # sampling knobs (temperature, min_p, penalty) live in the request's
+        # SamplingReqConfig and are applied by the sampler resource
         return {
             "cfg_weight": torch.tensor(
-                [float(self._knob(meta, "cfg_weight")) if requires_cfg else 0.0],
-                dtype=torch.float32, device=device,
+                [float(self._knob(fwd_info.step_metadata, "cfg_weight")) if requires_cfg else 0.0],
+                dtype=torch.float32, device=self.get_device(),
             ),
-            "min_p": torch.tensor([float(self._knob(meta, "min_p"))], dtype=torch.float32, device=device),
-            "temperature": torch.tensor([temperature], dtype=torch.float32, device=device),
         }
 
     # -- inputs ----------------------------------------------------------------
@@ -285,11 +281,8 @@ class T3Submodule(ARNodeSubmodule):
             embeds = torch.cat([main, uncond], dim=0)
         else:
             embeds = main
-        scalars = {
-            name: torch.cat([inp.tensor_inputs[name] for inp in inputs]).view(-1, 1)
-            for name in ("cfg_weight", "min_p", "temperature")
-        }
-        return {"input_embeds": embeds, "requires_cfg": requires_cfg, **scalars}
+        cfg_weight = torch.cat([inp.tensor_inputs["cfg_weight"] for inp in inputs]).view(-1, 1)
+        return {"input_embeds": embeds, "requires_cfg": requires_cfg, "cfg_weight": cfg_weight}
 
     def declare_step(
         self,
@@ -336,29 +329,12 @@ class T3Submodule(ARNodeSubmodule):
 
     # -- compute ----------------------------------------------------------------
 
-    @staticmethod
-    def _apply_min_p(
-        logits: torch.Tensor, min_p: torch.Tensor, temperature: torch.Tensor,
-    ) -> torch.Tensor:
-        """HF ``MinPLogitsWarper`` on pre-temperature logits: keep ``z`` with
-        ``softmax(z/T) >= min_p * max`` <=> ``z >= max(z) + T*log(min_p)``.
-        ``min_p == 0`` keeps everything; greedy (``T == 0``) keeps the argmax."""
-        margin = torch.where(
-            min_p > 0,
-            temperature * torch.log(min_p.clamp_min(1e-30)),
-            torch.full_like(min_p, float("-inf")),
-        )
-        threshold = logits.amax(dim=-1, keepdim=True) + margin
-        return logits.masked_fill(logits < threshold, float("-inf"))
-
     def _forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         input_embeds: torch.Tensor,
         cfg_weight: torch.Tensor,
-        min_p: torch.Tensor,
-        temperature: torch.Tensor,
         requires_cfg: bool,
     ) -> torch.Tensor:
         attn = engine_inputs.resources[T3_ATTN]
@@ -374,28 +350,25 @@ class T3Submodule(ARNodeSubmodule):
         if requires_cfg:
             cond, uncond = logits.chunk(2, dim=0)
             logits = cond + cfg_weight * (cond - uncond)
-        logits = self._apply_min_p(logits, min_p, temperature)
+        # penalty -> temperature -> min_p -> top-p happen in the sampler, in
+        # the reference's order
         return sampler.sample(engine_inputs.request_ids, logits)
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
-        cfg_weight: torch.Tensor, min_p: torch.Tensor, temperature: torch.Tensor,
-        requires_cfg: bool = False, **kwargs,
+        cfg_weight: torch.Tensor, requires_cfg: bool = False, **kwargs,
     ) -> NameToTensorList:
         del kwargs
-        tokens = self._forward(
-            graph_walk, engine_inputs, input_embeds, cfg_weight, min_p, temperature, requires_cfg,
-        )
+        tokens = self._forward(graph_walk, engine_inputs, input_embeds, cfg_weight, requires_cfg)
         return {SPEECH_TOKENS: [tokens.reshape(-1)[:1]]}
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
-        cfg_weight: torch.Tensor, min_p: torch.Tensor, temperature: torch.Tensor,
-        requires_cfg: bool = False, **kwargs,
+        cfg_weight: torch.Tensor, requires_cfg: bool = False, **kwargs,
     ) -> dict[str, NameToTensorList]:
         del kwargs
         tokens = self._forward(
-            graph_walk, engine_inputs, input_embeds, cfg_weight, min_p, temperature, requires_cfg,
+            graph_walk, engine_inputs, input_embeds, cfg_weight, requires_cfg,
         ).reshape(-1)
         return {
             rid: {SPEECH_TOKENS: [tokens[i : i + 1]]}
@@ -457,8 +430,6 @@ class T3Submodule(ARNodeSubmodule):
                     input_seq_len=1,
                     tensor_inputs={
                         "cfg_weight": torch.full((1,), 0.5 if requires_cfg else 0.0, device=device),
-                        "min_p": torch.zeros(1, device=device),
-                        "temperature": torch.ones(1, device=device),
                     },
                     resource_step_info=requires_cfg,
                 ),
