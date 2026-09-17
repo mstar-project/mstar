@@ -691,16 +691,21 @@ def test_postprocess_finishes_captured_step() -> None:
         def step(velocity, t, latents, return_dict=False):
             return (latents + velocity,)
 
-    dit.request_state("r").add_all(gs=2.0, scheduler=_Sched())
+    # One all-noisy latent frame of 2x2 patches (the layout the captured
+    # graph's velocity mask is derived from).
+    dit.request_state("r").add_all(
+        gs=2.0, scheduler=_Sched(),
+        cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]},
+    )
     info = types.SimpleNamespace(graph_walk="image_gen")
-    lat, ti = torch.ones(1, 4), torch.tensor([1])
+    lat, ti = torch.ones(1, 1, 2, 2), torch.tensor([1])
     inp = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": ti})
 
     # Captured shape: velocity = uncond + gs*(cond - uncond) = 3, latents += 3.
-    out = {"cond_v": [torch.full((1, 4), 2.0)], "uncond_v": [torch.ones(1, 4)]}
+    out = {"cond_v": [torch.full((1, 1, 2, 2), 2.0)], "uncond_v": [torch.ones(1, 1, 2, 2)]}
     dit.postprocess("r", info, out, inputs=inp)
     assert set(out) == {"latents", "time_index"}
-    assert torch.equal(out["latents"][0], torch.full((1, 4), 4.0))
+    assert torch.equal(out["latents"][0], torch.full((1, 1, 2, 2), 4.0))
     assert torch.equal(out["time_index"][0], torch.tensor([2]))
 
     # Eager shape (already finished) and non-gen walks stay untouched.
