@@ -208,7 +208,9 @@ class KimiK3Model(Model):
             if self.speculative_tokens > 0 else []
         )
         return [
-            KVSpec(resource_key=MLA_KV, nodes={LLM}, config=kv_config),
+            # the cache trims a verify step's rejected tail from the acceptance verdicts, so it plans after them
+            KVSpec(resource_key=MLA_KV, nodes={LLM}, config=kv_config,
+                   plan_after=(SPEC,) if self.speculative_tokens > 0 else ()),
             AttentionSpec(
                 resource_key=MLA_ATTN, nodes={LLM},
                 config=AttentionConfig(kv_cache=MLA_KV, backend=AttnBackend.FLASHINFER_MLA, sm_scale=t.mla_scale),
