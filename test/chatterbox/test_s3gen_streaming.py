@@ -127,3 +127,58 @@ def test_streaming_lookahead_and_tail_accounting(setup):
         last = sub.synthesize_chunk(state, tokens[15:30], True, ref, 2, gen)
         assert last.numel() == 18 * 960 + sub.cache_samples
     assert first.numel() + last.numel() == 30 * 960 and state.done
+
+
+def test_batched_streams_match_their_single_runs(setup):
+    """Two streams with different chunkings advanced through ``forward_batched``
+    (one padded flow solve per step) emit, step by step, the audio each gets
+    from ``forward`` on its own."""
+    from types import SimpleNamespace
+
+    from mstar.model.chatterbox.submodules import SPEECH_TOKENS
+
+    sub, ref, tokens = setup
+    schedules = {"a": [18, 24, 18], "b": [15, 15, 15, 15]}
+    steps = max(len(s) for s in schedules.values())
+
+    def chunk(rid, step):
+        sizes = schedules[rid]
+        if step >= len(sizes):
+            return None  # this stream has already ended
+        start = sum(sizes[:step])
+        return tokens[start:start + sizes[step]], step == len(sizes) - 1
+
+    def prepared(rid, step, request_id=None):
+        toks, final = chunk(rid, step)
+        info = SimpleNamespace(
+            request_id=request_id or rid, random_seed=21, step_metadata={"n_cfm_timesteps": 4},
+        )
+        return sub.prepare_inputs("s3gen_chunk", info, {SPEECH_TOKENS: [toks]}, is_final_stream_chunk=final)
+
+    single = {rid: [] for rid in schedules}
+    for rid, sizes in schedules.items():
+        for step in range(len(sizes)):
+            inp = prepared(rid, step)
+            single[rid].append(sub.forward("s3gen_chunk", None, **inp.tensor_inputs, **inp.kwargs)["audio_chunk"][0])
+
+    # the batched pass runs under its own request ids, so it starts from fresh state
+    batched = {rid: [] for rid in schedules}
+    for step in range(steps):
+        live = [rid for rid in schedules if chunk(rid, step) is not None]
+        inputs = [prepared(rid, step, request_id=f"{rid}-batched") for rid in live]
+        if len(inputs) > 1:
+            out = sub.forward_batched("s3gen_chunk", None, **sub.preprocess("s3gen_chunk", None, inputs))
+        else:
+            inp = inputs[0]
+            out = {inp.kwargs["request_id"]: sub.forward("s3gen_chunk", None, **inp.tensor_inputs, **inp.kwargs)}
+        for rid in live:
+            batched[rid].append(out[f"{rid}-batched"]["audio_chunk"][0])
+
+    for rid in schedules:
+        for step, (mine, alone) in enumerate(zip(batched[rid], single[rid], strict=True)):
+            assert mine.shape == alone.shape, (rid, step)
+            diff = (mine.float() - alone.float()).abs().max().item() if mine.numel() else 0.0
+            print(f"[{rid} step {step}] batched vs single: {diff:.0f} LSB over {mine.numel()} samples")
+            # float32 reassociation in the padded batch, amplified by the vocoder;
+            # measured 1-6 LSB on CPU
+            assert diff <= 16.0, (rid, step, diff)
