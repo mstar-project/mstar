@@ -158,6 +158,22 @@ qwen3_tts = [
     "transformers>=4.57.3",
 ]
 
+# Chatterbox / Chatterbox-Turbo: resemble-perth (MIT) carries the PerTh
+# watermark network applied to every output; pyloudnorm normalises Turbo's
+# reference clip like the reference package. Both are imported lazily.
+chatterbox = [
+    "flashinfer-python>=0.6.4",
+    "huggingface-hub",
+    "librosa",
+    "mooncake-transfer-engine",
+    "pyloudnorm",
+    "resemble-perth",
+    "safetensors",
+    "tokenizers",
+    "torchcodec",
+    "transformers",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python>=0.6.4",
