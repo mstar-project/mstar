@@ -6,7 +6,11 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_edge": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_edge_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -28,10 +32,23 @@ HF_MODELS: dict[str, dict] = {
     # class; the checkpoint's config disables the sound pathway (sound_gen
     # false, no sound_tokenizer/), so the model self-serves without audio.
     "cosmos3_droid": {"model_path_hf": "nvidia/Cosmos3-Nano-Policy-DROID"},
+    # Cosmos3-Edge (4B) — same class; the dense Nemotron backbone family
+    # (relu2 MLPs, Nemotron norms, no text QK-norm, k_norm_und_for_gen),
+    # 480p-native generation and the reasoner (understanding tower + SigLIP2
+    # vision encoder served as a VLM) all load from the checkpoint's configs.
+    "cosmos3_edge": {"model_path_hf": "nvidia/Cosmos3-Edge"},
+    # Edge action-policy fine-tune for DROID (domain droid_lerobot); Edge
+    # backbone, no reasoner weights beyond the shared text tower.
+    "cosmos3_edge_droid": {"model_path_hf": "nvidia/Cosmos3-Edge-Policy-DROID"},
     # Cosmos3-Super (64B) — same architecture + class; dims (64 layers / 5120
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).
     "cosmos3_super": {"model_path_hf": "nvidia/Cosmos3-Super"},
+    # 4-step distilled Super task checkpoints (guidance baked in; a fixed
+    # 4-sigma stochastic Euler sampler instead of UniPC). Same class + TP
+    # deployment as Super.
+    "cosmos3_super_i2v_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Image2Video-4Step"},
+    "cosmos3_super_t2i_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Text2Image-4Step"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
