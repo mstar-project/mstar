@@ -31,6 +31,13 @@ from mstar.engine.resources.kv.config import (
     KVSpec,
     KVStep,
 )
+from mstar.engine.resources.linear_attn.config import (
+    LinearAttnBackend,
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnStep,
+    LinearAttnVariant,
+)
 from mstar.engine.resources.position.config import (
     PosBackend,
     PositionConfig,
@@ -39,12 +46,12 @@ from mstar.engine.resources.position.config import (
     PosScheme,
 )
 from mstar.engine.resources.recurrent.config import (
-    CommitMode,
-    RecurrentPlanOutput,
+    DeltaNetGeometry,
+    RecurrentBlockConfig,
+    RecurrentGeometry,
     RecurrentStateConfig,
     RecurrentStateSpec,
-    RecurrentStateStep,
-    StatePart,
+    RecurrentStep,
 )
 from mstar.engine.resources.runner import StepRunner, topo_sort
 from mstar.engine.resources.sampler.config import (
@@ -102,12 +109,17 @@ __all__ = [
     "PublishedInfo",
     "RaggedAttentionConfig",
     "RaggedAttentionSpec",
-    "CommitMode",
-    "RecurrentPlanOutput",
+    "DeltaNetGeometry",
+    "LinearAttnBackend",
+    "LinearAttnConfig",
+    "LinearAttnSpec",
+    "LinearAttnStep",
+    "LinearAttnVariant",
+    "RecurrentBlockConfig",
+    "RecurrentGeometry",
     "RecurrentStateConfig",
     "RecurrentStateSpec",
-    "RecurrentStateStep",
-    "StatePart",
+    "RecurrentStep",
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
