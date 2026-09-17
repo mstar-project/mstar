@@ -73,7 +73,7 @@ def test_lamport_tier_selection(monkeypatch):
     cg = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
     monkeypatch.setattr(cg, "_symm_available", lambda: True)
     cg._lamport_enabled = True
-    cg._lamport_max_rows = 128
+    cg._lamport_max_rows = cg._lamport_reduce_max_rows = 128
     cuda = torch.device("cuda", 0)
     assert cg.lamport_applies((1, 7168), torch.bfloat16, cuda)
     assert cg.lamport_applies((128, 3584), torch.float16, cuda)
@@ -87,6 +87,27 @@ def test_lamport_tier_selection(monkeypatch):
     assert not cg.lamport_applies((1, 7168), torch.bfloat16, cuda)
     assert cg.symm_applies((1, 7168), torch.bfloat16, cuda)
     assert not CommGroup.trivial().lamport_applies((1, 7168), torch.bfloat16, cuda)
+
+
+def test_lamport_reduce_rows_default(monkeypatch):
+    """All-reduces take the Lamport kernel up to 128 // world_size rows by default (the one-shot's
+    cost grows with rows x ranks; it crosses the multicast ring near 16 rows at TP8), all-gathers up
+    to the workspace capacity; rows above the reduce cap go to the multicast ring."""
+    from mstar.distributed.communication import CommGroup
+
+    cuda = torch.device("cuda", 0)
+    for members, cap in (([0, 1], 64), (list(range(4)), 32), (list(range(8)), 16), (list(range(32)), 8)):
+        cg = CommGroup(my_global_rank=0, my_group_rank=0, group_members=members)
+        monkeypatch.setattr(cg, "_symm_available", lambda: True)
+        cg._lamport_enabled = True
+        assert cg.lamport_reduce_max_rows == cap
+        assert cg.lamport_applies((cap, 7168), torch.bfloat16, cuda)
+        assert not cg.lamport_applies((cap + 1, 7168), torch.bfloat16, cuda)
+        assert cg.symm_applies((cap + 1, 7168), torch.bfloat16, cuda)  # the multicast ring takes it
+        assert cg.lamport_applies((128, 896), torch.bfloat16, cuda, gather=True)
+        assert not cg.lamport_applies((129, 896), torch.bfloat16, cuda, gather=True)
+    cg._lamport_reduce_max_rows = 128  # MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS pins it
+    assert cg.lamport_applies((100, 7168), torch.bfloat16, cuda)
 
 
 def test_lamport_channel_kinds(monkeypatch):
