@@ -13,6 +13,8 @@ per second. Run it inside the baseline env::
 
 Per-batch timing: ``generate_with_conds`` prints ``[T3] ... time`` and
 ``[S3Gen] ... time``; the same numbers are measured here around the calls.
+``from_pretrained`` symlinks the T3 weights into ``./t3-model`` under the
+current directory, so run it from a scratch directory (``bench_all.sh`` does).
 """
 
 from __future__ import annotations
@@ -41,6 +43,9 @@ def main() -> None:
     parser.add_argument("--exaggeration", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--diffusion-steps", type=int, default=10)
+    # the port's own defaults (the reference package uses top_p 1.0 and penalty 1.2)
+    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--repetition-penalty", type=float, default=2.0)
     parser.add_argument("--max-model-len", type=int, default=1200)
     parser.add_argument("--out", required=True, help="output directory (wavs + summary.json)")
     args = parser.parse_args()
@@ -62,6 +67,8 @@ def main() -> None:
             audio_prompt_path=args.audio_prompt,
             exaggeration=args.exaggeration,
             temperature=args.temperature,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
             diffusion_steps=args.diffusion_steps,
         )
         return wavs, time.perf_counter() - t0
@@ -91,6 +98,8 @@ def main() -> None:
     ttfa = [b["elapsed_s"] for b in per_batch]
     summary = {
         "system": "chatterbox-vllm", "batch": args.batch, "num_sentences": len(sentences),
+        "sampling": {"temperature": args.temperature, "top_p": args.top_p,
+                     "repetition_penalty": args.repetition_penalty, "exaggeration": args.exaggeration},
         "repeats": args.repeats, "model_load_s": load_time,
         "ttfa_p50_s": statistics.median(ttfa), "ttfa_p95_s": sorted(ttfa)[int(0.95 * (len(ttfa) - 1))],
         "rtf": total_elapsed / total_audio, "audio_seconds_per_second": total_audio / total_elapsed,
