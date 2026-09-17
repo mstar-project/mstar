@@ -97,6 +97,21 @@ class Cosmos3Pipeline:
         else:
             scheduler.set_timesteps(num_inference_steps, device=device)
 
+    def _conditioning_frame(self, image, height: int, width: int) -> torch.Tensor:
+        """The i2v conditioning frame as ``[1, 3, H, W]`` in [-1, 1], through
+        the config's ``conditioning_resize`` recipe (the served node's choice)."""
+        mode = getattr(self.config, "conditioning_resize", "stretch")
+        if mode == "stretch":
+            return self.video_processor.preprocess(image, height=height, width=width)
+        import numpy as np
+
+        from mstar.model.cosmos3.components.conditioning import prepare_conditioning_frames
+
+        if not isinstance(image, torch.Tensor):
+            arr = np.asarray(image.convert("RGB") if hasattr(image, "convert") else image)
+            image = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
+        return prepare_conditioning_frames(image, height, width, mode)[:, :, 0]
+
     def _encode_video(self, x: torch.Tensor) -> torch.Tensor:
         """[1,3,T,H,W] in [-1,1] -> normalized latents [1,C,T_lat,H/16,W/16].
 
@@ -132,9 +147,7 @@ class Cosmos3Pipeline:
 
         conditioning_frame_2d = None
         if image is not None:
-            conditioning_frame_2d = self.video_processor.preprocess(image, height=height, width=width).to(
-                device=device, dtype=dtype
-            )
+            conditioning_frame_2d = self._conditioning_frame(image, height, width).to(device=device, dtype=dtype)
 
         if is_image:
             vision_tensor = (
