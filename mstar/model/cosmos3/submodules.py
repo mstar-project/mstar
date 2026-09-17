@@ -1907,11 +1907,21 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
             ]
             vision = torch.stack(frames, dim=1).unsqueeze(0).to(device=device, dtype=torch.float32)
         elif image:
-            # load_image gives [C, H, W] in [0, 1]; preprocess -> [1, 3, H, W] in [-1, 1].
-            frame = self._video_processor.preprocess(image[0], height=height, width=width).to(
-                device=device, dtype=torch.float32
-            )
-            vision = frame.unsqueeze(2)
+            # load_image gives [C, H, W] in [0, 1]. Image-to-video follows the
+            # deployment's conditioning_resize recipe (stretch vs aspect-crop);
+            # the action modes keep the reference action pipelines' plain
+            # resize of the repeated frame.
+            if is_action:
+                frame = self._video_processor.preprocess(image[0], height=height, width=width).to(
+                    device=device, dtype=torch.float32
+                )
+                vision = frame.unsqueeze(2)
+            else:
+                from mstar.model.cosmos3.components.conditioning import prepare_conditioning_frames
+
+                vision = prepare_conditioning_frames(
+                    image[0], height, width, self.config.conditioning_resize,
+                ).to(device=device, dtype=torch.float32)
             if is_action and num_frames > 1:
                 # Policy / forward-dynamics condition on latent frame 0 but the
                 # reference pipelines encode the frame repeated across the whole
