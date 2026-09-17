@@ -588,6 +588,7 @@ class _FakeS3Gen(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
         self.calls = []
+        self.rows_calls = []
 
     def tokens_to_mel(self, tokens, lens, ref, *, n_timesteps, generator=None, noise=None, finalize=True):
         self.calls.append(("mel", tokens.shape, int(lens[0]), n_timesteps, ref, finalize, noise is not None))
@@ -595,6 +596,17 @@ class _FakeS3Gen(torch.nn.Module):
         if not finalize:
             frames = frames[:, :, :-6]
         return frames.expand(-1, 80, -1).clone()
+
+    def tokens_to_mel_rows(self, rows, *, n_timesteps):
+        mels = [
+            self.tokens_to_mel(
+                row.tokens[None], torch.tensor([row.tokens.numel()]), row.ref, n_timesteps=n_timesteps,
+                generator=row.generator, noise=row.noise, finalize=row.finalize,
+            )
+            for row in rows
+        ]
+        self.rows_calls.append(len(rows))  # kept apart so ``calls`` keeps its per-row order
+        return mels
 
     def vocode(self, mel, *, generator=None, cache_source=None, fade_in=True):
         self.calls.append(("vocode", mel.shape[-1], cache_source is not None, fade_in))
@@ -754,3 +766,51 @@ def test_load_audio_decodes_with_soundfile_to_24k_mono(tmp_path):
     # one second of audio, resampled to 24 kHz and averaged to mono (half amplitude)
     assert abs(loaded.data.shape[0] - 24000) <= 1
     assert 0.4 < loaded.data.abs().max() < 0.55
+
+
+def test_s3gen_batches_requests_into_one_flow_solve_and_matches_sequential():
+    """Two streams advanced together give exactly the audio each gets alone,
+    while their flow solves go through one rows call."""
+    batched, fake_b = _s3_submodule()
+    single, fake_s = _s3_submodule()
+    chunks = {"a": [torch.arange(1, 21), torch.arange(21, 41), torch.tensor([41, 42])],
+              "b": [torch.arange(101, 116), torch.arange(116, 131), torch.tensor([])]}
+    finals = [False, False, True]
+
+    expected = {rid: [] for rid in chunks}
+    for rid, parts in chunks.items():
+        for part, final in zip(parts, finals, strict=True):
+            expected[rid].append(_run(single, part.long(), is_final=final, rid=rid)[1])
+
+    got = {rid: [] for rid in chunks}
+    for step, final in enumerate(finals):
+        inputs = [
+            batched.prepare_inputs(
+                "s3gen_chunk", _s3_info(rid=rid), {SPEECH_TOKENS: [chunks[rid][step].long()]},
+                is_final_stream_chunk=final,
+            )
+            for rid in chunks
+        ]
+        assert batched.can_batch(None, inputs)
+        packed = batched.preprocess("s3gen_chunk", None, inputs)
+        assert packed["request_id"] == ["a", "b"] and packed["is_final"] == [final, final]
+        out = batched.forward_batched("s3gen_chunk", None, **packed)
+        for rid in chunks:
+            got[rid].append(out[rid]["audio_chunk"][0])
+
+    for rid in chunks:
+        for mine, theirs in zip(got[rid], expected[rid], strict=True):
+            assert torch.equal(mine, theirs)
+    # every step solves both streams in one padded batch ("b"'s empty final
+    # flush still finalises its three withheld look-ahead tokens)
+    assert fake_b.rows_calls == [2, 2, 2]
+    assert set(fake_s.rows_calls) == {1}
+
+
+def test_s3gen_batching_is_bounded_and_single_requests_keep_the_plain_path():
+    sub, _ = _s3_submodule()
+    one = [sub.prepare_inputs("s3gen_chunk", _s3_info(rid="a"), {SPEECH_TOKENS: [torch.tensor([1, 2])]})]
+    assert not sub.can_batch(None, one)
+    assert set(sub.preprocess("s3gen_chunk", None, one)) >= {SPEECH_TOKENS, "request_id", "ref", "is_final"}
+    many = one * (sub.MAX_BATCH_SIZE + 1)
+    assert not sub.can_batch(None, many) and sub.can_batch(None, one * 2)
