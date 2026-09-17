@@ -18,6 +18,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "z_image_turbo": ("mstar.model.z_image.z_image_model", "ZImageModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -64,6 +65,9 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
+    # FLUX.1 VAE), text-to-image only. Apache-2.0.
+    "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
 }
 
 
