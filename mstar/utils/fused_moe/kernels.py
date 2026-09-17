@@ -537,8 +537,10 @@ def act_and_mul_kernel(
     gateup_output_ptr,
     down_input_ptr,
     hidden_size,
+    SWIGLU_LIMIT,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
+    HAS_SWIGLU_CLAMP: tl.constexpr,
 ):
     """Per-slot SwiGLU activation.
 
@@ -562,6 +564,9 @@ def act_and_mul_kernel(
         mask = offset < half
         gate = tl.load(gate_row + offset, mask=mask)
         up = tl.load(up_row + offset, mask=mask)
+        if HAS_SWIGLU_CLAMP:
+            gate = tl.minimum(gate, SWIGLU_LIMIT)
+            up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
         activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
         out = activated * up
         tl.store(out_row + offset, out.to(out_dtype), mask=mask)
@@ -571,8 +576,9 @@ def act_and_mul_triton(
     gateup_output: torch.Tensor,
     down_input: torch.Tensor,
     activation: str = "silu",
+    swiglu_limit: float | None = None,
 ) -> None:
-    """Wrapper launching :func:`act_and_mul_kernel` per intermediate slot."""
+    """Launch SwiGLU with an optional pre-activation clamp."""
     assert gateup_output.is_contiguous()
     assert down_input.is_contiguous()
     assert gateup_output.shape[0] == down_input.shape[0]
@@ -584,8 +590,10 @@ def act_and_mul_triton(
         gateup_output,
         down_input,
         hidden_size,
+        0.0 if swiglu_limit is None else swiglu_limit,
         BLOCK_SIZE=512,
         ACTIVATION_TYPE=activation,
+        HAS_SWIGLU_CLAMP=swiglu_limit is not None,
     )
 
 

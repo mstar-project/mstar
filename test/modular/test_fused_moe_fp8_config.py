@@ -199,8 +199,9 @@ def fp8_fakes(monkeypatch):
     def fake_gemm(**kw):
         launches.append(kw)
 
-    def fake_act(gateup, down, activation="silu"):
+    def fake_act(gateup, down, activation="silu", swiglu_limit=None):
         assert gateup.shape[1] == 2 * down.shape[1]
+        assert swiglu_limit is None
 
     def fake_reduce(inp, out, routed_scaling_factor=1.0):
         reduces.append((tuple(inp.shape), tuple(out.shape)))
@@ -282,6 +283,18 @@ def test_fused_experts_fp8_reduce_results_false(fp8_fakes):
                                    reduce_results=False)
     assert out.shape == (3, 2, 256) and out.dtype == torch.bfloat16
     assert reduces == []
+
+
+def test_fused_experts_fp8_forwards_swiglu_limit(fp8_fakes, monkeypatch):
+    seen = []
+
+    def fake_act(gateup, down, activation="silu", swiglu_limit=None):
+        seen.append(swiglu_limit)
+
+    monkeypatch.setattr(runner, "act_and_mul_triton", fake_act)
+    args = _fp8_inputs(tokens=2)
+    runner.fused_experts_fp8(*args, block_size=BLOCK, swiglu_limit=10.0)
+    assert seen == [10.0]
 
 
 def test_fused_experts_fp8_rejects_bad_scale_shapes_and_groups(fp8_fakes):

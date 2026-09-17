@@ -174,6 +174,7 @@ def fused_experts_fp8(
     block_size: tuple[int, int] = (128, 128),
     activation: str = "silu",
     reduce_results: bool = True,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Grouped-GEMM MoE dispatch for block-scaled FP8 experts (W8A8).
 
@@ -297,7 +298,9 @@ def fused_experts_fp8(
     )
 
     # 4. SwiGLU in bf16, then requantize the intermediate for GEMM-2.
-    act_and_mul_triton(cache1, cache2, activation=activation)
+    act_and_mul_triton(
+        cache1, cache2, activation=activation, swiglu_limit=swiglu_limit,
+    )
     a2_q, a2_s = per_token_group_quant_fp8(cache2, block_k)
 
     # 5. Down GEMM (weighted); top_k=1 exactly as in fused_experts so the
