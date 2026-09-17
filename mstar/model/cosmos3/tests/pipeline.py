@@ -1,4 +1,4 @@
-"""Fused generation pipeline for Cosmos3-Nano (text/image-to-image/video).
+"""Fused generation pipeline for Cosmos3 (text/image-to-image/video).
 
 Runs the generator in one fused forward per denoising step (text + vision
 together), using mstar's DiT forward + packing and the imported diffusers UniPC
@@ -53,7 +53,7 @@ _TF_SOUND_STATIC_FIELDS = (
 
 
 class Cosmos3Pipeline:
-    """Fused t2i / t2v / i2v pipeline for Cosmos3-Nano."""
+    """Fused t2i / t2v / i2v pipeline for Cosmos3 (Nano/Super/Edge)."""
 
     def __init__(self, transformer, vae, scheduler, tokenizer, config, device, dtype=torch.bfloat16):
         self.transformer = transformer
@@ -84,6 +84,18 @@ class Cosmos3Pipeline:
         vae = model._build_vae(device)
         scheduler = UniPCMultistepScheduler.from_pretrained(str(model._ensure_repo() / "scheduler"))
         return cls(transformer, vae, scheduler, model.tokenizer, model.config, device, dtype)
+
+    def _set_timesteps(self, scheduler, num_inference_steps: int, device) -> None:
+        """The checkpoint's timestep schedule: explicit linspaced flow sigmas
+        for ``use_native_flow_schedule`` checkpoints (Edge), the scheduler's
+        own spacing otherwise — the same choice the served node makes."""
+        if getattr(self.config, "use_native_flow_schedule", False):
+            from mstar.model.cosmos3.submodules import native_flow_sigmas
+
+            sigmas = native_flow_sigmas(num_inference_steps, int(scheduler.config.num_train_timesteps))
+            scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
+        else:
+            scheduler.set_timesteps(num_inference_steps, device=device)
 
     def _encode_video(self, x: torch.Tensor) -> torch.Tensor:
         """[1,3,T,H,W] in [-1,1] -> normalized latents [1,C,T_lat,H/16,W/16].
@@ -263,7 +275,7 @@ class Cosmos3Pipeline:
             preds_vision, preds_sound = self.transformer(**kwargs)
             return preds_vision[0], (preds_sound[0] if generate_sound else None)
 
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        self._set_timesteps(self.scheduler, num_inference_steps, device)
         for t in self.scheduler.timesteps:
             vision_tokens = [latents.to(dtype)]
             vision_timesteps = torch.full((num_noisy,), t.item(), device=device)
@@ -346,7 +358,7 @@ class Cosmos3Pipeline:
             scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config, flow_shift=flow_shift)
         else:
             scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
-        scheduler.set_timesteps(num_inference_steps, device=device)
+        self._set_timesteps(scheduler, num_inference_steps, device)
 
         if cond_ids is None or uncond_ids is None:
             cond_ids, uncond_ids = tokenize_prompt(
