@@ -209,13 +209,19 @@ class RecurrentStatePool(Resource):
         if ctx.capture:
             return ADMIT_OK
         for segment in step.segments or ():
-            if segment.span <= 0:
-                # reads its state without extending it, or a padding row
+            if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
+                # reads its state without extending it, or a padding row: a replay pads a capture
+                # bucket with the runner's dummy rows, ingested once and carrying the template span,
+                # and a slot handed to one of those is never given back (there are two capture slots
+                # times the widest bucket of such names, enough to drain a pool sized for the real
+                # concurrency); they address the sink instead
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
                 return self._out_of_slots(segment.request_id, segment.label)
 
         for rid in self._fork_rids(step):
+            if ctx.is_padding_row(rid):
+                continue
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
                     return self._out_of_slots(rid, to_label)
@@ -261,6 +267,8 @@ class RecurrentStatePool(Resource):
 
         undo = self._preplan_fork_undo if ctx.is_preplan else None
         for rid in self._fork_rids(step):
+            if ctx.is_padding_row(rid):
+                continue
             for from_label, to_label in step.pre_forks:
                 self._apply_fork(rid, from_label, to_label, undo=undo)
 
@@ -292,10 +300,9 @@ class RecurrentStatePool(Resource):
         self._cached_plan_output = None
 
     def commit(self, step: RecurrentStep, ctx: StepContext) -> None:
-        del ctx
         with self._lock:
             for segment in step.segments or ():
-                if segment.span <= 0:
+                if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 slot = self._slots.get(segment.request_id, {}).get(segment.label)
                 if slot is not None:
@@ -358,7 +365,10 @@ class RecurrentStatePool(Resource):
         indices = []
         has_state = []
         for seg in segments:
-            slot = None if ctx.capture else self._slots.get(seg.request_id, {}).get(label)
+            slot = (
+                None if ctx.capture or ctx.is_padding_row(seg.request_id)
+                else self._slots.get(seg.request_id, {}).get(label)
+            )
             if slot is None or seg.span <= 0:
                 indices.append(pad)
                 has_state.append(False)
