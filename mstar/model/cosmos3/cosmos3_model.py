@@ -808,6 +808,40 @@ class Cosmos3Model(Model):
             out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
         return out
 
+    def load_video(self, filepath: str, device: str):
+        """Decode a conditioning / reasoner video to ``[T, C, H, W]`` in [0, 1].
+
+        torchcodec (the base implementation) needs system FFmpeg shared
+        libraries; where they are absent, PyAV — which ships its own — decodes
+        the same frames. The metadata carries the frame rate under
+        ``average_fps`` either way (the reasoner's frame sampling and
+        timestamps read it)."""
+        from mstar.model.base import TensorAndMetadata
+
+        try:
+            return super().load_video(filepath, device)
+        except (ImportError, RuntimeError, OSError) as exc:
+            reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+            logger.warning("torchcodec video decode unavailable (%s); decoding %s with PyAV.", reason, filepath)
+        import av
+
+        frames = []
+        with av.open(filepath) as container:
+            stream = container.streams.video[0]
+            rate = stream.average_rate or stream.guessed_rate or stream.base_rate
+            fps = float(rate) if rate else None
+            for frame in container.decode(stream):
+                frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
+        if not frames:
+            raise ValueError(f"no video frames decoded from {filepath}")
+        video = torch.stack(frames).to(device).float() / 255.0
+        metadata = {
+            "num_frames": len(frames), "average_fps": fps,
+            "duration_seconds": (len(frames) / fps) if fps else None,
+            "height": int(video.shape[-2]), "width": int(video.shape[-1]),
+        }
+        return TensorAndMetadata(data=video, metadata=metadata)
+
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "text":
             # One sampled token per chunk; the client concatenates the pieces.
