@@ -139,9 +139,18 @@ class S3Gen(nn.Module):
         n_timesteps: int | None = None,
         noise: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
+        finalize: bool = True,
     ) -> torch.Tensor:
         """``tokens`` ``[B, L]`` (right-padded to ``token_lens``) -> mel ``[B, 80, 2L]``
-        of the generated part only (padding frames are zero)."""
+        of the generated part only (padding frames are zero).
+
+        ``finalize=False`` is the streaming call on a sequence that will still
+        grow: the encoder's look-ahead makes the last ``pre_lookahead_len``
+        tokens provisional, so their ``2 * pre_lookahead_len`` frames are cut
+        before the flow solve and the mel returned is ``[B, 80, 2(L - 3)]``
+        (reference ``CausalMaskedDiffWithXvec.inference``). ``noise`` then must
+        cover the full ``2(N + L)`` frames; its head is used.
+        """
         n_timesteps = n_timesteps or self.config.cfm.n_timesteps
         batch = tokens.shape[0]
         ref = ref.to(self.device, self.dtype)
@@ -152,15 +161,22 @@ class S3Gen(nn.Module):
 
         spk = self.flow_encoder.project_speaker(ref.embedding.expand(batch, -1))
         mu, h_masks = self.flow_encoder(full_tokens, full_lens)
+        h_lens = h_masks.sum(dim=-1).squeeze(-1)
+        if not finalize:
+            cut = self.config.encoder.pre_lookahead_len * self.config.token_mel_ratio
+            mu = mu[:, :, :-cut]
+            h_lens = (h_lens - cut).clamp_min(0)
         mel_prompt = prompt_len * self.config.token_mel_ratio
         total = mu.shape[-1]
 
         cond = torch.zeros(batch, self.config.output_size, total, device=self.device, dtype=mu.dtype)
         cond[:, :, :mel_prompt] = ref.prompt_feat.expand(batch, -1, -1).transpose(1, 2)
-        mask = lengths_to_mask(h_masks.sum(dim=-1).squeeze(-1), total).unsqueeze(1).to(mu.dtype)
+        mask = lengths_to_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
 
         if noise is None:
             noise = self._draw_noise(batch, mel_prompt, total - mel_prompt, generator)
+        elif noise.shape[-1] != total:
+            noise = noise[:, :, :total]
         if self.config.meanflow:
             mel = self.decoder.solve_meanflow(mu, mask, spk, cond, noise, n_timesteps)
         else:
@@ -172,14 +188,32 @@ class S3Gen(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def mel_to_wav(
-        self, mel: torch.Tensor, *, generator: torch.Generator | None = None, fade_in: bool = True,
-    ) -> torch.Tensor:
-        wav = self.vocoder(mel.to(self.dtype), generator=generator)
+    def vocode(
+        self,
+        mel: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+        cache_source: torch.Tensor | None = None,
+        fade_in: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``[B, 80, T]`` mel -> (waveform ``[B, 480T]``, harmonic source ``[B, 1, 480T]``).
+
+        ``cache_source`` (``[B, 1, n]``) replaces the head of the freshly drawn
+        excitation so a chunk continues the previous chunk's harmonics
+        (reference ``HiFTGenerator.inference(cache_source=...)``). ``fade_in``
+        applies the utterance-head trim/fade and belongs on the first chunk only.
+        """
+        wav, source = self.vocoder.vocode(mel.to(self.dtype), generator=generator, cache_source=cache_source)
         if fade_in:
             n = self.trim_fade.shape[0]
             wav[:, :n] = wav[:, :n] * self.trim_fade
-        return wav
+        return wav, source
+
+    @torch.no_grad()
+    def mel_to_wav(
+        self, mel: torch.Tensor, *, generator: torch.Generator | None = None, fade_in: bool = True,
+    ) -> torch.Tensor:
+        return self.vocode(mel, generator=generator, fade_in=fade_in)[0]
 
     # ------------------------------------------------------------------
     # Weights
