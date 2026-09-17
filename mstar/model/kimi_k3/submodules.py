@@ -18,14 +18,15 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
     KVStep,
-    RecurrentStateStep,
+    LinearAttnStep,
+    RecurrentStep,
     SamplerStep,
     Segment,
     SlotLease,
     SubmoduleStep,
 )
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.model.kimi_k3.config import KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
+from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             steps={
                 MLA_KV: KVStep(),
                 MLA_ATTN: AttentionStep(causal=True),
-                KDA_STATE: RecurrentStateStep(),
+                KDA_STATE: RecurrentStep(),
+                KDA_ATTN: LinearAttnStep(),
                 SAMPLER: SamplerStep(apply_penalty=False),
             },
         )
