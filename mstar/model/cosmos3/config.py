@@ -396,6 +396,16 @@ class Cosmos3Config:
     # (720p+, video) run eager+dense where the graph is net-slower. The env var
     # COSMOS3_GRAPH_MAX_LATENT_AREA overrides this.
     graph_max_latent_area: int = 2000
+    # Video denoise steps to capture as CUDA graphs, as (height, width,
+    # frames) pixel tiers: a plain t2v/i2v clip length and/or the windowed
+    # rollout's window length (e.g. Edge: (480, 832, 121) and (480, 832, 29)).
+    # The graph is built with every latent frame declared noisy and carries
+    # the clean/noisy layout as a per-token mask input, so one graph per shape
+    # serves t2v, i2v (anchor frame) and chained windows (overlap frames);
+    # kv-mode windows run eager (their commit iteration is a different step).
+    # Empty = no video capture. COSMOS3_GEN_CAPTURE_VIDEO ("480x832x29,...",
+    # height x width x frames) overrides.
+    gen_capture_video: tuple[tuple[int, int, int], ...] = ()
     # torch.compile the denoise compute (the generation-layer stack around the
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
