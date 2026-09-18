@@ -18,6 +18,7 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.engine.resources import KVSpec  # noqa: E402
+from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.components.audio_features import (  # noqa: E402
     LogMelSpectrogram,
     load_audio_file,
@@ -25,8 +26,10 @@ from mstar.model.components.audio_features import (  # noqa: E402
 )
 from mstar.model.registry import HF_MODELS, get_model_class  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs  # noqa: E402
+from mstar.model.whisper.components.decoder import WhisperDecoderModel  # noqa: E402
 from mstar.model.whisper.components.encoder import WhisperEncoderModel  # noqa: E402
 from mstar.model.whisper.config import (  # noqa: E402
+    ALIGN_WALK,
     CONTEXT_LABEL,
     CROSS_ATTN,
     CROSS_KV_CACHE,
@@ -46,6 +49,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 # large-v3 token ids, as in the checkpoints' generation_config.json
 SOT, EOT, EN, DE, TRANSCRIBE, TRANSLATE, PREV, NOTS = 50258, 50257, 50259, 50261, 50360, 50359, 50362, 50364
+STARTOFLM = 50361  # opens the align walk's word timings
 
 
 def _tiny_config(**overrides) -> WhisperModelConfig:
@@ -65,12 +69,19 @@ class _FakeTokenizer:
     """Just enough of the Whisper tokenizer for prompt and detokenizer tests."""
 
     def __init__(self, config: WhisperModelConfig):
-        specials = {SOT, EOT, EN, DE, TRANSCRIBE, TRANSLATE, PREV, NOTS}
+        specials = {SOT, EOT, EN, DE, TRANSCRIBE, TRANSLATE, PREV, NOTS, STARTOFLM}
         self.all_special_ids = sorted(specials)
         self._names = {SOT: "<|startoftranscript|>", EOT: "<|endoftext|>", EN: "<|en|>", DE: "<|de|>",
                        TRANSCRIBE: "<|transcribe|>", TRANSLATE: "<|translate|>",
-                       PREV: "<|startofprev|>", NOTS: "<|notimestamps|>"}
+                       PREV: "<|startofprev|>", NOTS: "<|notimestamps|>", STARTOFLM: "<|startoflm|>"}
         self.config = config
+
+    def convert_tokens_to_ids(self, token):
+        return {name: i for i, name in self._names.items()}[token]
+
+    def decode(self, ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(self.convert_ids_to_tokens(list(ids))).replace("\u0120", " ")
 
     def convert_ids_to_tokens(self, ids):
         single = isinstance(ids, int)
@@ -447,7 +458,10 @@ def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
 def test_graph_walks_and_resources():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
-    assert set(walks) == {PREFILL_WALK, DETECT_LANGUAGE_WALK, PREFILL_PROMPT_WALK, DECODE_WALK}
+    assert set(walks) == {PREFILL_WALK, DETECT_LANGUAGE_WALK, PREFILL_PROMPT_WALK, DECODE_WALK, ALIGN_WALK}
+    align = walks[ALIGN_WALK]
+    assert align.name == DECODER_NODE and set(align.input_names) == {"encoder_states", "transcript", "audio_frames"}
+    assert [(e.name, e.next_node) for e in align.outputs] == [("word_tokens", EMIT_TO_CLIENT)]
     loop_node = walks[DECODE_WALK].section
     assert set(loop_node.input_names) == {"text_inputs", "ts_rules"}
     assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {"text_inputs", "ts_rules"}
@@ -489,6 +503,34 @@ def test_state_machine_forced_language():
     assert done.request_done
 
 
+def test_state_machine_aligns_words_after_decoding():
+    model = _make_model()
+    frames = object()
+    args = model.get_initial_forward_pass_args(
+        "default", ["audio", "text"], ["text"],
+        {**_signals(["audio", "text_inputs"]), "audio_frames": [frames]}, model_kwargs={"timestamps": "word"},
+    )
+    assert args.full_metadata.kwargs["word_timestamps"] and args.full_metadata.kwargs["audio_frames"] == [frames]
+    first, rules = object(), object()
+    nxt = model.get_partition_forward_pass_args(
+        "default", args.full_metadata, {"new_token": [first], "ts_rules": [rules]},
+    )
+    assert nxt.full_metadata.graph_walk == DECODE_WALK
+    # the first transcript token is not released: the align walk needs every token
+    assert nxt.unpersist_tensors == [rules]
+    enc, tokens = object(), [first, object(), object()]
+    align = model.get_partition_forward_pass_args(
+        "default", nxt.full_metadata, {"new_token": tokens, "ts_rules": [rules], "encoder_states": [enc]},
+    )
+    assert align.full_metadata.graph_walk == ALIGN_WALK and not align.request_done
+    assert [(e.next_node, e.name, e.tensor_info) for e in align.inputs] == [
+        (DECODER_NODE, "encoder_states", [enc]), (DECODER_NODE, "transcript", tokens),
+        (DECODER_NODE, "audio_frames", [frames]),
+    ]
+    assert set(map(id, align.unpersist_tensors)) == set(map(id, [enc, *tokens, frames, rules]))
+    assert model.get_partition_forward_pass_args("default", align.full_metadata, {}).request_done
+
+
 def test_state_machine_language_detection():
     model = _make_model()
     tail = object()
@@ -522,6 +564,7 @@ def test_process_prompt_builds_window_and_prompts():
     wave = torch.randn(8_000)  # half the tiny config's 1 s window
     out = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
     assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder pads and makes the mel
+    assert out["audio_frames"][0].tolist() == [wave.numel() // model.config.hop_length]
     assert out["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert "prompt_tail" not in out
 
@@ -588,3 +631,35 @@ def test_node_inputs_clone_keeps_encoder_template_shape():
     clone = template.clone()
     assert clone.tensor_inputs["audio_features"].shape == (4, 6) and clone.input_seq_len == 1
     assert clone.tensor_inputs["audio_features"] is not template.tensor_inputs["audio_features"]
+
+
+def test_decoder_align_walk_emits_word_timings_in_the_timestamp_vocabulary():
+    cfg = _tiny_config(alignment_heads=[[0, 1], [1, 2]])
+    model = _make_model(cfg)
+    torch.manual_seed(0)
+    decoder = WhisperDecoderModel(cfg)
+    for param in decoder.parameters():  # fused projections start from torch.empty
+        torch.nn.init.normal_(param, std=0.05)
+    sub = WhisperDecoderSubmodule(decoder, cfg, tokenizer=model.tokenizer).eval()
+    fwd = type("F", (), {"request_id": "r"})()
+    enc = torch.randn(cfg.max_source_positions, cfg.d_model)
+    # forced English prompt recorded at prefill, then two text tokens and end-of-text generated
+    sub.request_state("r").add("language", EN)
+    sub.request_state("r").add("task", TRANSCRIBE)
+    row = sub.prepare_inputs(ALIGN_WALK, fwd, {
+        "transcript": [torch.tensor([7]), torch.tensor([33]), torch.tensor([EOT])],
+        "encoder_states": [enc], "audio_frames": [torch.tensor([cfg.num_frames])],
+    })
+    assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 7, 33, EOT]
+    assert sub.declare_step(ALIGN_WALK, ["r"], [row]) is None and sub.max_batch_size(ALIGN_WALK) == 1
+    batch = sub.preprocess(ALIGN_WALK, _engine_inputs(["r"]), [row])
+    with torch.no_grad():
+        out = sub.forward_batched(ALIGN_WALK, _engine_inputs(["r"]), **batch)
+    ids = out["r"]["word_tokens"][0].tolist()
+    assert ids[0] == STARTOFLM
+    stamps = [i for i in ids[1:] if cfg.is_timestamp(i)]
+    assert len(stamps) % 2 == 0 and stamps == sorted(stamps)  # <start> word <end> per word, monotonic
+    assert all(cfg.timestamp_seconds(t) <= cfg.chunk_length for t in stamps)
+    rendered = model._detokenizer.to_bytes(ids).decode()
+    assert rendered.startswith("<|startoflm|><|") and rendered.count("<|") == 1 + len(stamps)
+
