@@ -25,6 +25,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.qwen3_asr.config import (
@@ -59,8 +60,9 @@ WINDOW_LABEL = "main"
 class Qwen3ASREncoderSubmodule(NodeSubmodule):
     """Packed AuT encoder.
 
-    Consumes one unpadded log-mel clip per request (``(num_mel_bins, T)``
-    from ``process_prompt``) and emits ``audio_embeds`` of shape
+    Consumes one clip of samples per request (from ``process_prompt``),
+    turns it into unpadded log-mel features on the GPU (``prepare_inputs``)
+    and emits ``audio_embeds`` of shape
     ``(num_audio_tokens, hidden)`` in LLM space. Requests are packed into
     one forward; every 8 s attention window of every request is one
     segment of the node's ragged-attention step, so the runner plans the
@@ -79,6 +81,14 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.encoder = encoder
         self.config = config
+        # built here, after the encoder was materialized, so its filter bank
+        # and window are real tensors on the encoder's device
+        self.log_mel = LogMelSpectrogram(
+            num_mel_bins=config.num_mel_bins,
+            sampling_rate=config.sampling_rate,
+            n_fft=config.n_fft,
+            hop_length=config.hop_length,
+        ).to(encoder.conv2d1.weight.device)
 
     def _param_dtype(self) -> torch.dtype:
         return self.encoder.conv2d1.weight.dtype
@@ -90,11 +100,9 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        feats = inputs["audio_features"][0]
-        if feats.dim() == 3:
-            feats = feats.squeeze(0)
+        audio = inputs["audio"][0].reshape(-1).to(device=self.get_device(), dtype=torch.float32)
+        feats = self.log_mel(audio).to(self._param_dtype())  # (num_mel_bins, T)
         num_frames = int(feats.shape[-1])
-        feats = feats.to(device=self.get_device(), dtype=self._param_dtype())
         return NodeInputs(
             tensor_inputs={"audio_features": feats},
             kwargs={"num_frames": num_frames},
