@@ -877,3 +877,11 @@ def test_streaming_and_compile_knobs_reach_the_config():
     )
     assert model.config.stream_context_tokens == 25 and model.config.s3gen_compile is True
     assert _make_model().config.s3gen_compile is False
+
+
+def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
+    """The micro-scheduler only groups requests up to ``max_batch_size``; the
+    base default is one, which would silently disable the batched flow solve."""
+    sub, _ = _s3_submodule()
+    assert sub.max_batch_size("s3gen_chunk") == sub.MAX_BATCH_SIZE == 8
+    assert sub.max_batch_size("s3gen_chunk_voice") == 8
