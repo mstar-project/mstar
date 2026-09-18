@@ -451,7 +451,8 @@ class Flux2KleinModel(Model):
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
-                compile_transformer=self.compile_transformer, compile_eager_rounding=self.compile_eager_rounding, max_batch_size=self.max_batch_size,
+                compile_transformer=self.compile_transformer,
+                compile_eager_rounding=self.compile_eager_rounding, max_batch_size=self.max_batch_size,
                 capture_shapes=self.capture_shapes(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("FLUX.2 klein has no submodule for node %r; running it dummy", node_name)
