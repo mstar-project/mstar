@@ -12,8 +12,8 @@ The ``k`` logits go through the target's ``lm_head`` and a sequential Markov cor
 256 bias from the previously drafted token). Embedding and ``lm_head`` are the target's modules.
 
 Tensor-parallel like the target: heads split for ``q_b_proj`` / ``kv_b_proj`` / ``o_proj``, the
-MLP intermediate split, ``context_proj``, the LoRA-A projections, norms and the Markov head
-replicated. Parameter names follow the checkpoint (``ckpt/Kimi-K3-DSpark``), so the loader needs
+MLP intermediate split, ``context_proj`` split on its outputs and all-gathered, the LoRA-A
+projections, norms and the Markov head replicated. Parameter names follow the checkpoint (``ckpt/Kimi-K3-DSpark``), so the loader needs
 only the gate/up fusion rule; ``embed_tokens`` and ``confidence_head`` are skipped.
 """
 from __future__ import annotations
@@ -174,7 +174,10 @@ class DSparkDraft(nn.Module):
         self.cfg = cfg
         self._embed_tokens, self._lm_head = (embed_tokens,), (lm_head,)  # the target's, not owned
         self.rope = YarnRotary(cfg.qk_rope_head_dim, cfg.rope, max_positions)
-        self.context_proj = ReplicatedLinear(cfg.context_width, cfg.hidden_size)
+        # [hidden, 5 * target_hidden]: 514 MB in bf16 for K3, so each rank holds a slice of the
+        # outputs and the slices are all-gathered (the aux states, its input, are replicated)
+        self.context_proj = ColumnParallelLinear(comm_group, cfg.context_width, cfg.hidden_size, bias=False,
+                                                 gather_output=True)
         self.context_norm = KimiRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.layers = nn.ModuleList(DSparkLayer(cfg, comm_group, self.rope) for _ in range(cfg.num_hidden_layers))
         self.final_norm = KimiRMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
