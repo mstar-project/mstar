@@ -111,6 +111,16 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     )
 
 
+def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
+    """The device string a worker rank runs on: its own number unless the
+    deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
+    GPU); CPU deployments ignore the mapping."""
+    if device_type == "cpu":
+        return "cpu"
+    index = (rank_devices or {}).get(rank, rank)
+    return f"{device_type}:{index}"
+
+
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
@@ -317,6 +327,14 @@ class Conductor:
         )
         assert "max_seq_len" in self.model_config
         assert "node_groups" in self.model_config
+        # Optional ``rank_devices: {rank: device_index}`` places a worker rank
+        # on a device other than the one its number implies, e.g. two workers
+        # sharing one GPU so a light node's steps stop interleaving with a
+        # heavy node's on the same worker loop.
+        self.rank_devices = {
+            int(rank): int(index)
+            for rank, index in (self.model_config.get("rank_devices") or {}).items()
+        }
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
         self.worker_graphs = {
@@ -491,10 +509,7 @@ class Conductor:
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": (
-                        f"{self.device_type}:{rank}"
-                        if self.device_type != "cpu" else "cpu"
-                    ),
+                    "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device
