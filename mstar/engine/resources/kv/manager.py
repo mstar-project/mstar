@@ -368,8 +368,13 @@ class KVManager(AttentionResource):
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
-            # pages were already reserved by the preplan pass
-            return ADMIT_OK
+            if self._preplan_key == self._plan_key(step, ctx):
+                # pages were already reserved by the preplan pass
+                return ADMIT_OK
+            # a different step arrived first (see `plan`): drop the staged
+            # plan and reserve for this step normally. The staged step's own
+            # span pages stay with its stream, where its re-admit finds them.
+            self.clear_preplan()
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
