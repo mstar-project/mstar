@@ -13,7 +13,8 @@
 # Environment: SENTENCES (prompt file), RESULTS (output root), VOICE (preset
 # file name resolved by every system, default Abigail.wav), VOICES_DIR (the
 # preset directory, default the TTS server's), WS (workspace with the baseline
-# venvs), NUM (requests, default 200).
+# venvs), NUM (requests, default 200). For M* variants: EXTRA_MODEL_KWARGS
+# (extra indented "  key: value" model_kwargs lines) and RUN_TAG (run name suffix).
 set -euo pipefail
 
 WS=${WS:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -87,10 +88,11 @@ record_env() {
 case ${1:-} in
   env) record_env ;;
   mstar)
-    cfg=$2 c=$3 out=$RESULTS/mstar_$(basename "${cfg%.yaml}")_c$c
+    cfg=$2 c=$3 out=$RESULTS/mstar_$(basename "${cfg%.yaml}")${RUN_TAG:+_$RUN_TAG}_c$c
     mkdir -p "$out"
-    # same preset voices as the TTS server, appended as model_kwargs to a copy of the config
-    { cat "$MSTAR/$cfg"; printf 'model_kwargs:\n  voices_dir: %s\n' "$VOICES_DIR"; } > "$out/config.yaml"
+    # same preset voices as the TTS server, appended as model_kwargs to a copy of the config;
+    # EXTRA_MODEL_KWARGS (indented "  key: value" lines) adds deployment knobs, RUN_TAG names the run
+    { cat "$MSTAR/$cfg"; printf 'model_kwargs:\n  voices_dir: %s\n%s' "$VOICES_DIR" "${EXTRA_MODEL_KWARGS:-}"; } > "$out/config.yaml"
     cd "$MSTAR"
     start_group "$out/server.log" mstar-serve --config "$out/config.yaml" --port "$PORT" \
         --tensor-comm-protocol SHM --socket-path-prefix "/tmp/mstar_${USER}_bench_$$/"
