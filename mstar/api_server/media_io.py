@@ -201,11 +201,35 @@ def decode_audio(path: str, sample_rate: int = 16000):
     return audio
 
 
-def split_windows(audio, window_seconds: float, sample_rate: int = 16000) -> list:
-    """Cut a waveform into consecutive windows of ``window_seconds`` (the last
-    one shorter); concatenating them gives the input back sample for sample."""
+def split_windows(
+    audio, window_seconds: float, sample_rate: int = 16000,
+    search_seconds: float = 0.0, frame_seconds: float = 0.02,
+) -> list:
+    """Cut a waveform into consecutive windows of at most ``window_seconds``;
+    concatenating them gives the input back sample for sample.
+
+    With ``search_seconds`` a cut is moved back from its nominal boundary to
+    the end of the quietest ``frame_seconds`` frame within that span (the
+    last such frame on a tie, so silence cuts at the boundary): the cut lands
+    in a pause rather than on a word when there is one to find.
+    """
+    audio = np.asarray(audio)
     step = int(round(window_seconds * sample_rate))
-    return [audio[i:i + step] for i in range(0, len(audio), step)]
+    search = int(round(search_seconds * sample_rate))
+    frame = max(1, int(round(frame_seconds * sample_rate)))
+    pieces, start = [], 0
+    while start < len(audio):
+        stop = min(len(audio), start + step)
+        if stop < len(audio) and search > 0:
+            num_frames = (min(search, stop - start - frame)) // frame
+            if num_frames > 0:
+                span = audio[stop - num_frames * frame:stop].astype(np.float32)
+                energy = np.square(span.reshape(num_frames, frame)).mean(axis=1)
+                quietest = num_frames - 1 - int(np.argmin(energy[::-1]))
+                stop = stop - num_frames * frame + (quietest + 1) * frame
+        pieces.append(audio[start:stop])
+        start = stop
+    return pieces
 
 
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
