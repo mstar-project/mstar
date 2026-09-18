@@ -1499,7 +1499,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
         {"audio_inputs": [clip], "prompt_layout": [torch.tensor([0, 2, 1, 5, 7])]},
     )
     assert prepared.tensor_inputs["waveform"].shape == (4000,)
-    assert prepared.kwargs == {"ref_frames": 7}
+    assert prepared.kwargs["ref_frames"] == 7
     engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
     out = submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
         "talker_prefill_clone", engine_inputs, [prepared]))
@@ -1517,3 +1517,53 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
         "talker_prefill_clone", engine_inputs, [prepared]))
     assert out["ref_codes"][0].shape == (1, config.codec.num_quantizers)
     assert encoder.calls == 1
+
+
+def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
+    from mstar.model.qwen3_tts.components.speaker_encoder import (
+        Qwen3TTSMelFrontEnd,
+        Qwen3TTSSpeakerEncoder,
+    )
+    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
+    from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
+
+    config = _tiny_model_config()
+    speaker_config = Qwen3TTSSpeakerEncoderConfig(
+        enc_dim=config.talker.hidden_size, enc_channels=(16, 16, 16, 16, 48),
+        enc_se_channels=8, enc_attention_channels=8,
+    )
+    encoder = _FakeCodecEncoder(config.codec.num_quantizers)
+    submodule = RefEncoderSubmodule(
+        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+    )
+    engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
+
+    def encode(rid: str, clip: torch.Tensor, ref_frames: int):
+        prepared = submodule.prepare_inputs(
+            "talker_prefill_clone", SimpleNamespace(request_id=rid),
+            {"audio_inputs": [clip], "prompt_layout": [torch.tensor([0, 2, 1, ref_frames, ref_frames])]},
+        )
+        return submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
+            "talker_prefill_clone", engine_inputs, [prepared]))
+
+    clip_a = torch.randn(4000) * 0.1
+    first = encode("a1", clip_a, 7)
+    assert encoder.calls == 1
+    # The same samples again (a fresh tensor, as an upload produces) cost no encoder pass
+    # and yield the same conditioning.
+    again = encode("a2", clip_a.clone(), 7)
+    assert encoder.calls == 1
+    assert again["speaker_embed"][0] is first["speaker_embed"][0]
+    assert torch.equal(again["ref_codes"][0], first["ref_codes"][0])
+    # Other content, or the same clip used x-vector-only, is a different entry.
+    encode("b1", torch.randn(4000) * 0.1, 7)
+    assert encoder.calls == 2
+    xvec = encode("a3", clip_a, 0)
+    assert encoder.calls == 2 and xvec["ref_codes"][0].shape == (1, config.codec.num_quantizers)
+    assert len(submodule._conditioning) == 3
+    # The memo is bounded, oldest first.
+    submodule.CONDITIONING_CACHE_SIZE = 2
+    encode("c1", torch.randn(4000) * 0.1, 7)
+    assert encoder.calls == 3 and len(submodule._conditioning) == 2
+    encode("a4", clip_a, 7)   # evicted, so encoded again
+    assert encoder.calls == 4
