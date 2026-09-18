@@ -88,7 +88,15 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
             sampling_rate=config.sampling_rate,
             n_fft=config.n_fft,
             hop_length=config.hop_length,
-        ).to(encoder.conv2d1.weight.device)
+        ).to(device=encoder.conv2d1.weight.device, dtype=torch.float32)  # float32 even under a bf16 default dtype
+
+    def _mel(self, audio: torch.Tensor) -> torch.Tensor:
+        """The spectrogram in float32 whatever dtype the engine cast this
+        module to (it casts submodules to the compute dtype after they are
+        built; a bf16 STFT would not match the reference features)."""
+        if self.log_mel.window.dtype != torch.float32:
+            self.log_mel.float()
+        return self.log_mel(audio)
 
     def _param_dtype(self) -> torch.dtype:
         return self.encoder.conv2d1.weight.dtype
@@ -101,7 +109,7 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
         **kwargs,
     ) -> NodeInputs:
         audio = inputs["audio"][0].reshape(-1).to(device=self.get_device(), dtype=torch.float32)
-        feats = self.log_mel(audio).to(self._param_dtype())  # (num_mel_bins, T)
+        feats = self._mel(audio).to(self._param_dtype())  # (num_mel_bins, T)
         num_frames = int(feats.shape[-1])
         return NodeInputs(
             tensor_inputs={"audio_features": feats},
