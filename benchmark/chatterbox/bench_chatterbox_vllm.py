@@ -47,6 +47,9 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.8)
     parser.add_argument("--repetition-penalty", type=float, default=2.0)
     parser.add_argument("--max-model-len", type=int, default=1200)
+    # the port's own heuristic (1.55 GB + 128 KB/token) leaves no room for KV blocks on an 80 GB
+    # card once the engine core runs in-process; give vLLM a fixed share instead
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument("--out", required=True, help="output directory (wavs + summary.json)")
     args = parser.parse_args()
 
@@ -57,7 +60,10 @@ def main() -> None:
     sentences = [s.strip() for s in Path(args.sentences).read_text().splitlines() if s.strip()][: args.num]
 
     load_start = time.perf_counter()
-    model = ChatterboxTTS.from_pretrained(max_batch_size=max(args.batch, 1), max_model_len=args.max_model_len)
+    model = ChatterboxTTS.from_pretrained(
+        max_batch_size=max(args.batch, 1), max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
     load_time = time.perf_counter() - load_start
 
     def run(prompts: list[str]):
@@ -98,6 +104,8 @@ def main() -> None:
     ttfa = [b["elapsed_s"] for b in per_batch]
     summary = {
         "system": "chatterbox-vllm", "batch": args.batch, "num_sentences": len(sentences),
+        "vllm": {"max_model_len": args.max_model_len, "gpu_memory_utilization": args.gpu_memory_utilization,
+                 "engine_core_in_process": os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"},
         "sampling": {"temperature": args.temperature, "top_p": args.top_p,
                      "repetition_penalty": args.repetition_penalty, "exaggeration": args.exaggeration},
         "repeats": args.repeats, "model_load_s": load_time,
