@@ -207,3 +207,30 @@ def test_client_can_force_chunking_below_the_threshold(client_and_stub, monkeypa
     assert r.status_code == 200 and len(stub.submits) >= 2
     assert " ".join(s["text"] for s in stub.submits) == text
     assert all(len(s["text"]) <= 60 for s in stub.submits)
+
+
+def test_streaming_request_that_fails_up_front_returns_the_error_status(client_and_stub):
+    client, stub = client_and_stub
+
+    def failing_submit(**kw):
+        stub.submits.append(kw)
+        stub._chunks[kw["request_id"]] = [
+            _Chunk("error", b"Unsupported Qwen3-TTS speaker 'nobody'", {"status": 400}),
+        ]
+        return kw["request_id"]
+
+    stub.submit_request = failing_submit
+    payload = {"model": "orpheus", "input": "hi there", "voice": "nobody", "stream": True}
+    r = client.post("/v1/audio/speech", json=payload)
+    assert r.status_code == 400
+    assert "nobody" in r.json()["error"]["message"]
+    # and the non-streaming path keeps returning the error too
+    stub._chunks.clear()
+
+    async def collect(request_id, raw_request=None):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Unsupported Qwen3-TTS speaker 'nobody'")
+
+    stub.collect_results = collect
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi there", "voice": "nobody"})
+    assert r.status_code == 400
