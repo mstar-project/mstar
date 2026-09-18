@@ -1419,11 +1419,18 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     assert [c.additional_key_info for c in graph_configs] == [1, 4]
     for graph_config in graph_configs:
         assert graph_config.capture_graph_walk == "codec_chunk"
-        assert set(graph_config.replay_graph_walks) == {"codec_chunk", "codec_chunk_clone"}
+        # CustomVoice has no clone walk; a Base config would add codec_chunk_clone.
+        assert set(graph_config.replay_graph_walks) == {"codec_chunk"}
         assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16]
         assert graph_config.single_request_inputs.tensor_inputs["codec_tokens"].shape == (
             4, graph_config.additional_key_info,
         )
+    base_config = _tiny_model_config()
+    base_config.tts_model_type = "base"
+    base_codec = CodecSubmodule(_FakeCodecDecoder(4), base_config)
+    assert set(base_codec.get_cuda_graph_configs(torch.device("cpu"))[0].replay_graph_walks) == {
+        "codec_chunk", "codec_chunk_clone",
+    }
     assert submodule.max_batch_size("codec_chunk") == 16
     # The batch's capture key is the bucket its requests were padded to.
     for rid in ("a", "b"):
