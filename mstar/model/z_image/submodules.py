@@ -26,7 +26,15 @@ from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSu
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
-from mstar.model.z_image.components.transformer import ZImageRoPE, patchify_image, unpatchify_image
+from mstar.model.z_image.components.transformer import (
+    ATTENTION_SPANS,
+    CAPTION_SPAN,
+    IMAGE_SPAN,
+    MAIN_SPAN,
+    ZImageRoPE,
+    patchify_image,
+    unpatchify_image,
+)
 from mstar.model.z_image.config import SEQ_MULTIPLE, ZImageConfig
 
 logger = logging.getLogger(__name__)
@@ -178,6 +186,19 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
     def num_tokens(self, shape_key: ZShape) -> int:
         return shape_key.total_tokens
 
+    def attention_segments(self, shape_key: ZShape):
+        # the refiners attend over the padded image tokens / the caption alone, the main layers over both
+        return (
+            (IMAGE_SPAN, shape_key.image_tokens_padded),
+            (CAPTION_SPAN, shape_key.cap_len),
+            (MAIN_SPAN, shape_key.total_tokens),
+        )
+
+    def _ragged_spans(self):
+        if self.ragged_for(MAIN_SPAN) is None:
+            return None
+        return {span: self.ragged_for(span) for span in ATTENTION_SPANS}
+
     def capture_request_inputs(self, shape_key: ZShape, device) -> dict[str, torch.Tensor]:
         tcfg = self.config.transformer
         h, w = shape_key.grid
@@ -213,7 +234,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         t_cond = (1000.0 - timestep) / 1000.0
         out = self.transformer(
             tokens, cond[TEXT_EMBEDS], cond[CAP_PAD_MASK], layout["image_pad_mask"].expand(tokens.shape[0], -1),
-            t_cond, layout["image_freqs"], layout["caption_freqs"], ragged=self._ragged(),
+            t_cond, layout["image_freqs"], layout["caption_freqs"], ragged=self._ragged_spans(),
         )
         channels = self.config.transformer.in_channels
         velocity = -torch.stack([unpatchify_image(row, shape_key.grid, patch, channels) for row in out.float()])
