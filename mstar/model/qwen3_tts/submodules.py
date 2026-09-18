@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -85,6 +86,8 @@ DEPTH_LOOP_REGION = "code_predictor_loop"
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
 # ===========================================================================
+
+logger = logging.getLogger(__name__)
 
 
 class TalkerSubmodule(ARNodeSubmodule):
@@ -785,6 +788,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             not ignore_eos and token == self.talker_config.codec_eos_token_id
         )
         if reached_eos or generated >= max_tokens:
+            logger.debug("talker %s: stop after %d frames (eos=%s)", request_id, generated, reached_eos)
             return {"talker_decode_loop"}
         return set()
 
@@ -1024,13 +1028,17 @@ class CodecSubmodule(ARNodeSubmodule):
         bucket = self._bucket(max(int(meta.get("num_items", num_items)), 1))
         if frames < bucket:
             codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
-        state.add_all(
-            latest_codec_frames=frames,
-            latest_context_frames=min(context, frames),
-            codec_bucket=bucket,
+        logger.debug(
+            "codec %s: window items=%d context=%d frames=%d bucket=%d final=%s",
+            fwd_info.request_id, num_items, context, frames, bucket, meta.get("is_final"),
         )
+        state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream metadata
+        # The window's geometry rides with this pass: under speculative
+        # scheduling the next window of the same request is prepared before
+        # this one is postprocessed, so request state would be overwritten.
         return ARNodeInputs(
             tensor_inputs={"codec_tokens": codes.t().contiguous()},
+            kwargs={"frames": frames, "context": min(context, frames)},
         )
 
     def preprocess(
@@ -1081,15 +1089,22 @@ class CodecSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
+        inputs: ARNodeInputs | None = None,
         **kwargs: Any,
     ) -> None:
-        """Drop padding, repeated-context audio and (clone) reference audio before emission."""
+        """Drop padding, repeated-context audio and (clone) reference audio before emission.
+
+        ``inputs`` is this pass's ``prepare_inputs`` result (the engine hands it
+        back), which carries the window's frame and context counts.
+        """
         del request_info, kwargs
         if "audio_chunk" not in outputs:
             return
+        if inputs is None:
+            raise ValueError("codec postprocess needs the pass's inputs for its window geometry")
         state = self.request_state(request_id)
-        frames = int(state.get("latest_codec_frames", 0))
-        context = int(state.get("latest_context_frames", 0))
+        frames = int(inputs.kwargs["frames"])
+        context = int(inputs.kwargs["context"])
         start = context * self.total_upsample
         end = frames * self.total_upsample
         skip = int(state.get("skip_samples", 0))
@@ -1098,6 +1113,9 @@ class CodecSubmodule(ARNodeSubmodule):
             start += dropped
             state.add("skip_samples", skip - dropped)
         outputs["audio_chunk"][0] = outputs["audio_chunk"][0][start:end]
+        logger.debug(
+            "codec %s: emit frames %d..%d (%d samples)", request_id, context, frames, max(end - start, 0)
+        )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Batch codec requests only when their decoder input shapes match."""
