@@ -119,9 +119,17 @@ class ChatterboxModel(Model):
         **kwargs: Any,
     ) -> None:
         del kwargs
-        # T3 runs in bf16 by default; ``t3_dtype: float32`` (a parity switch)
-        # keeps the reference package's numerics at about half the decode speed.
+        # T3 runs in bf16 by default (``t3_dtype: float16`` is the other
+        # option); the engine sizes the KV cache and plans attention in it too
         self._t3_dtype = _parse_dtype(t3_dtype) if t3_dtype else torch.bfloat16
+        if self._t3_dtype == torch.float32:
+            # the engine sizes the KV cache and plans attention in this dtype,
+            # and FlashInfer has no float32 kernels; fp32 token parity is
+            # covered by the CPU tests (test/chatterbox) instead
+            raise ValueError(
+                "t3_dtype float32 cannot be served: the paged attention runs in "
+                "bfloat16/float16 only. Use bfloat16 (default) or float16."
+            )
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.config = (
