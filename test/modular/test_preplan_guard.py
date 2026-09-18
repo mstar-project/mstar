@@ -85,3 +85,119 @@ def test_kv_preplan_still_promotes_for_its_own_step() -> None:
     assert promoted is staged and not m._preplanned
     m.commit(step, _ctx("a"))
     assert m._streams["a"]["main"].stored_len == PS + 1
+
+
+# ── runner-level: the stage is all-or-nothing across resources ──────────────
+#
+# The attention wrappers and the position manager promote whatever is staged
+# when their `plan` is next called; they plan against the KV plan output, so
+# a KV manager that drops its stage for a foreign step while they promote
+# theirs would attend with wrappers laid out for another step's rows
+# (observed on H100 as FlashInfer's "q implies q_len_per_req=5 but plan()
+# used 1" once five decode rows followed a one-row pre-plan). The runner sees
+# the whole step, so it drops the stage on every resource before a foreign
+# step admits or plans.
+
+from mstar.engine.resources.base import Resource  # noqa: E402
+from mstar.engine.resources.runner import StepRunner  # noqa: E402
+from mstar.engine.resources.step import ResourceStep, SlotLease, SubmoduleStep  # noqa: E402
+
+
+class _Blind(Resource):
+    """Promotes a staged pre-plan into whichever step calls `plan` next."""
+
+    def __init__(self, deps: tuple[str, ...] = ()):
+        self._deps = set(deps)
+        self._preplanned = False
+        self.events: list[str] = []
+
+    @classmethod
+    def build(cls, spec, info):  # pragma: no cover - not built from a spec here
+        raise NotImplementedError
+
+    def depends_on(self):
+        return set(self._deps)
+
+    @property
+    def supports_preplan(self):
+        return True
+
+    def plan(self, step, ctx):
+        if self._preplanned:
+            self._preplanned = False
+            self.events.append("promote")
+            return "staged"
+        self._preplanned = ctx.is_preplan
+        self.events.append("pre_plan" if ctx.is_preplan else "plan")
+        return "fresh"
+
+    def clear_preplan(self):
+        self._preplanned = False
+        self.events.append("clear")
+
+
+def _step(*rids: str, span: int = 1, slot: int | None = 1, preplan: bool = False) -> SubmoduleStep:
+    step = SubmoduleStep(
+        steps={"kv": ResourceStep(), "attn": ResourceStep()},
+        segments=[Segment(rid, "main", span) for rid in rids],
+    )
+    lease = None if slot is None else SlotLease(slot=slot, bucket=None)
+    step.set_ctx(StepContext(
+        request_ids=tuple(rids), graph_walk="decode", slot=slot or 0, capture=False,
+        is_preplan=preplan, slot_lease=lease,
+    ))
+    return step
+
+
+def _runner() -> tuple[StepRunner, _Blind, _Blind]:
+    kv, attn = _Blind(), _Blind(deps=("kv",))
+    return StepRunner({"kv": kv, "attn": attn}), kv, attn
+
+
+def test_runner_drops_the_stage_on_every_resource_for_a_foreign_step() -> None:
+    runner, kv, attn = _runner()
+    staged = _step("a", preplan=True)
+    assert runner.pre_admit(staged).ok
+    runner.pre_plan(staged)
+    assert kv.events == ["pre_plan"] and attn.events == ["pre_plan"]
+
+    # b's prefill (more rows, no lease) reaches the GPU thread first: both
+    # resources drop the stage and plan b afresh — the blind promoter included.
+    foreign = _step("b", span=17, slot=None)
+    assert runner.admit(foreign).ok
+    out = runner.plan(foreign)
+    assert out == {"kv": "fresh", "attn": "fresh"}
+    assert kv.events == ["pre_plan", "clear", "plan"]
+    assert attn.events == ["pre_plan", "clear", "plan"]
+
+    # a's own step then plans inline like any un-staged step.
+    assert runner.plan(_step("a")) == {"kv": "fresh", "attn": "fresh"}
+    assert attn.events[-1] == "plan"
+
+
+def test_runner_promotes_the_stage_into_its_own_step_only() -> None:
+    runner, kv, attn = _runner()
+    runner.pre_plan(_step("a", "b", preplan=True))
+    assert runner.plan(_step("a", "b")) == {"kv": "staged", "attn": "staged"}
+    assert kv.events == ["pre_plan", "promote"] and attn.events == ["pre_plan", "promote"]
+    # consumed: nothing stays staged for the next step to pick up
+    assert runner.plan(_step("a", "b")) == {"kv": "fresh", "attn": "fresh"}
+
+    # the same rows re-declared without their lease are a different step
+    runner.pre_plan(_step("a", "b", preplan=True))
+    assert runner.plan(_step("a", "b", slot=None)) == {"kv": "fresh", "attn": "fresh"}
+    assert attn.events[-2:] == ["clear", "plan"]
+
+    # and so are the same rows on another slot, or with another span
+    runner.pre_plan(_step("a", "b", preplan=True))
+    assert runner.plan(_step("a", "b", slot=2)) == {"kv": "fresh", "attn": "fresh"}
+    runner.pre_plan(_step("a", "b", preplan=True))
+    assert runner.plan(_step("a", "b", span=4)) == {"kv": "fresh", "attn": "fresh"}
+
+
+def test_runner_clear_preplan_reaches_every_resource() -> None:
+    runner, kv, attn = _runner()
+    runner.pre_plan(_step("a", preplan=True))
+    runner.clear_preplan()
+    assert kv.events[-1] == "clear" and attn.events[-1] == "clear"
+    assert runner.plan(_step("a")) == {"kv": "fresh", "attn": "fresh"}
