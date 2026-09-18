@@ -60,13 +60,32 @@ def _histories(rng: random.Random) -> list[list[int]]:
 
 
 def test_rule_state_phases():
-    assert rule_state([], CFG) == [1, FIRST_TOKEN, TB, TB + 11]
-    assert rule_state([5, 6], CFG)[1] == IN_TEXT
-    assert rule_state([TB + 3], CFG) == [1, AFTER_PAIR, TB + 4, CFG.vocab_size]  # first stamp counts as a pair
+    assert rule_state([], CFG) == [1, FIRST_TOKEN, TB - 1, TB + 11]
+    assert rule_state([5, 6], CFG) == [1, IN_TEXT, TB - 1, CFG.vocab_size]
+    assert rule_state([TB + 3], CFG) == [1, AFTER_PAIR, TB + 3, CFG.vocab_size]  # first stamp counts as a pair
     assert rule_state([TB + 3, 7, TB + 9], CFG) == [1, AFTER_SEGMENT_END, TB + 9, CFG.vocab_size]
-    assert rule_state([TB + 3, 7, TB + 9, TB + 9], CFG) == [1, AFTER_PAIR, TB + 10, CFG.vocab_size]
-    assert rule_state([TB + 3, 7, TB + 9, TB + 9, 8], CFG) == [1, IN_TEXT, TB + 10, CFG.vocab_size]
+    assert rule_state([TB + 3, 7, TB + 9, TB + 9], CFG) == [1, AFTER_PAIR, TB + 9, CFG.vocab_size]
+    assert rule_state([TB + 3, 7, TB + 9, TB + 9, 8], CFG) == [1, IN_TEXT, TB + 9, CFG.vocab_size]
     assert inactive_state()[0] == 0 and len(inactive_state()) == STATE_SIZE
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_advance_reproduces_rule_state_token_by_token(seed):
+    """Folding ``advance`` over a history from the first-token state lands on
+    exactly the row ``rule_state`` builds from that history."""
+    rng = random.Random(100 + seed)
+    rules = TimestampRules(CFG)
+    for history in _histories(rng):
+        state = torch.tensor([rule_state([], CFG)])
+        for i, tok in enumerate(history):
+            state = rules.advance(state, torch.tensor([tok]))
+            assert state[0].tolist() == rule_state(history[: i + 1], CFG), (history[: i + 1], state[0].tolist())
+    # inactive rows never move; active rows advance independently in a batch
+    state = torch.tensor([inactive_state(), rule_state([], CFG), rule_state([TB + 3, 7], CFG)])
+    out = rules.advance(state, torch.tensor([TB + 5, TB + 2, TB + 9]))
+    assert out[0].tolist() == inactive_state()
+    assert out[1].tolist() == rule_state([TB + 2], CFG)
+    assert out[2].tolist() == rule_state([TB + 3, 7, TB + 9], CFG)
 
 
 @pytest.mark.parametrize("seed", range(4))
