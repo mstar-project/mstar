@@ -30,6 +30,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequentia
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.components.diffusion.image_io import encode_image
+from mstar.model.flux2_klein.submodules import VAE_DECODE_BATCH_SIZES
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, Z_IMAGE_TURBO, ZImageConfig, resolve_snapshot_dir
 from mstar.model.z_image.submodules import (
@@ -289,7 +290,7 @@ class ZImageModel(Model):
                 build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,
                 compile_decode=self.vae_compile,
                 warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes],
-                decode_batch_sizes=self.capture_batch_sizes,
+                decode_batch_sizes=[s for s in VAE_DECODE_BATCH_SIZES if s <= self.max_batch_size],  # see klein
             )
         if node_name == "dit":
             return ZImageDenoiseSubmodule(
