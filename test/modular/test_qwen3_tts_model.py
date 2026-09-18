@@ -61,9 +61,14 @@ class _TokenizerStub:
     def __call__(self, text, **kwargs):
         self.texts.append(text)
         assert kwargs == {"return_tensors": "pt", "padding": True}
-        if text.startswith("<|im_start|>assistant\n"):
+        if text.endswith("<|im_end|>\n<|im_start|>assistant\n"):
+            # the assistant turn to synthesize
             body = text[len("<|im_start|>assistant\n"):-len("<|im_end|>\n<|im_start|>assistant\n")]
             prefix, suffix = ASSISTANT_PREFIX, ASSISTANT_SUFFIX
+        elif text.startswith("<|im_start|>assistant\n"):
+            # the reference transcript turn (voice clone)
+            body = text[len("<|im_start|>assistant\n"):-len("<|im_end|>\n")]
+            prefix, suffix = ASSISTANT_PREFIX, USER_SUFFIX
         else:
             assert text.startswith("<|im_start|>user\n")
             body = text[len("<|im_start|>user\n"):-len("<|im_end|>\n")]
@@ -226,8 +231,14 @@ def test_qwen3_tts_1p7b_variants_share_class_configs_and_adapter():
             (CONFIG_PATH.parent / yaml_name).read_text(encoding="utf-8")
         )
         assert deployment["model"] == key
-        assert deployment["node_groups"] == base_yaml["node_groups"]
         assert deployment["resources"] == base_yaml["resources"]
+        ranks = {name: group["ranks"] for group in deployment["node_groups"] for name in group["node_names"]}
+        base_ranks = {name: group["ranks"] for group in base_yaml["node_groups"] for name in group["node_names"]}
+        assert ranks["Talker"] == base_ranks["Talker"] and ranks["Codec"] == base_ranks["Codec"]
+        if key == "qwen3_tts_base":
+            assert ranks["RefEncoder"] == ranks["Talker"]   # the clone prefill runs on the Talker's GPU
+        else:
+            assert deployment["node_groups"] == base_yaml["node_groups"]
         assert isinstance(get_adapter(key), Qwen3TTSAdapter)
     assert isinstance(get_adapter("qwen3_tts"), Qwen3TTSAdapter)
 
@@ -255,9 +266,9 @@ def test_qwen3_tts_decoder_import_does_not_probe_sox():
     script = """
 import sys
 import importlib.util
-from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_decoder_classes
-config_cls, decoder_cls = _load_qwen3_tts_decoder_classes()
-print(config_cls.__name__, decoder_cls.__name__)
+from mstar.model.qwen3_tts.qwen3_tts_model import _load_qwen3_tts_codec_classes
+config_cls, decoder_cls, encoder_cls = _load_qwen3_tts_codec_classes()
+print(config_cls.__name__, decoder_cls.__name__, encoder_cls.__name__)
 print('sox_loaded=' + str('sox' in sys.modules))
 print('public_qwen_tts_loaded=' + str(any(
     name == 'qwen_tts' or name.startswith('qwen_tts.') for name in sys.modules
@@ -271,7 +282,7 @@ print('public_qwen_tts_origin=' + str(public_spec.origin))
         capture_output=True,
         text=True,
     )
-    assert "Qwen3TTSTokenizerV2DecoderConfig Qwen3TTSTokenizerV2Decoder" in (
+    assert "Qwen3TTSTokenizerV2DecoderConfig Qwen3TTSTokenizerV2Decoder Qwen3TTSTokenizerV2Encoder" in (
         result.stdout
     )
     assert "sox_loaded=False" in result.stdout
@@ -331,8 +342,10 @@ def test_qwen3_tts_process_prompt_matches_official_template():
         "<|im_start|>assistant\n"
     )
     assert tensors["text_inputs"][0].tolist() == ASSISTANT_PREFIX + [1000] + ASSISTANT_SUFFIX
-    # CustomVoice default: whole text in the prefill (stream_text = 0).
-    assert tensors["prompt_layout"][0].tolist() == [0, 1, 0]
+    # CustomVoice default: whole text in the prefill (stream_text = 0); no
+    # reference transcript or frames.
+    assert tensors["prompt_layout"][0].tolist() == [0, 1, 0, 0, 0]
+    assert "ref_frames" not in tensors
     assert tensors["speaker_id"][0].item() == 3065
     assert tensors["language_id"][0].item() == 2055
 
@@ -366,7 +379,7 @@ def test_qwen3_tts_1p7b_custom_voice_prepends_instruction_turn():
     assistant_ids = ASSISTANT_PREFIX + [1000, 1001, 1002] + ASSISTANT_SUFFIX
     assert model.tokenizer.texts[-1] == "<|im_start|>user\nspeak slowly<|im_end|>\n"
     assert tensors["text_inputs"][0].tolist() == instruct_ids + assistant_ids
-    assert tensors["prompt_layout"][0].tolist() == [len(instruct_ids), 3, 1]
+    assert tensors["prompt_layout"][0].tolist() == [len(instruct_ids), 3, 1, 0, 0]
     assert tensors["speaker_id"][0].item() == 3061
 
 
@@ -382,7 +395,7 @@ def test_qwen3_tts_voice_design_requires_instruct_and_has_no_speakers():
         instruct="A deep, calm male voice",
     )
     assert tensors["speaker_id"][0].item() == -1
-    assert tensors["prompt_layout"][0].tolist() == [3 + 5 + 2, 1, 0]
+    assert tensors["prompt_layout"][0].tolist() == [3 + 5 + 2, 1, 0, 0, 0]
 
     with pytest.raises(ValueError, match="requires an 'instruct'"):
         model.process_prompt("hello", input_modalities=["text"], output_modalities=["audio"])
@@ -400,8 +413,100 @@ def test_qwen3_tts_base_config_declares_speaker_encoder():
     assert model.config.speaker_encoder.enc_dim == 2048
     # Base feeds text one token per frame by default (reference default).
     assert model.config.default_non_streaming_mode is False
-    with pytest.raises(ValueError, match="reference audio"):
+
+
+def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
+    model = _variant_model("base")
+    clip = torch.zeros(24000 + 1)  # 1 s + 1 sample -> 13 codec frames at 1920 samples/frame
+    tensors = model.process_prompt(
+        "hello big world",
+        input_modalities=["audio", "text"],
+        output_modalities=["audio"],
+        tensors={"audio_inputs": [clip]},
+        ref_text="the reference says",
+        language="English",
+    )
+    ref_ids = ASSISTANT_PREFIX + [1000, 1001, 1002] + USER_SUFFIX  # same <|im_end|>\n tail
+    assistant_ids = ASSISTANT_PREFIX + [1000, 1001, 1002] + ASSISTANT_SUFFIX
+    assert model.tokenizer.texts[-1] == "<|im_start|>assistant\nthe reference says<|im_end|>\n"
+    assert tensors["text_inputs"][0].tolist() == assistant_ids + ref_ids
+    # [instruct_len, text_len, stream_text (Base default: streaming), ref_text_len, ref_frames]
+    assert tensors["prompt_layout"][0].tolist() == [0, 3, 1, len(ref_ids), 13]
+    assert tensors["ref_frames"][0].item() == 13
+    assert tensors["speaker_id"][0].item() == -1
+
+    xvec = model.process_prompt(
+        "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+        tensors={"audio_inputs": [clip]}, x_vector_only_mode=True,
+    )
+    assert xvec["prompt_layout"][0].tolist() == [0, 1, 1, 0, 0]
+    assert xvec["ref_frames"][0].item() == 0
+
+    with pytest.raises(ValueError, match="ref_text"):
+        model.process_prompt(
+            "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+            tensors={"audio_inputs": [clip]},
+        )
+    with pytest.raises(ValueError, match="exactly one reference clip"):
         model.process_prompt("hello", input_modalities=["text"], output_modalities=["audio"])
+    with pytest.raises(ValueError, match="no built-in speakers"):
+        model.process_prompt(
+            "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+            tensors={"audio_inputs": [clip]}, ref_text="x", voice="vivian",
+        )
+    # Other variants refuse reference audio instead of ignoring it.
+    with pytest.raises(ValueError, match="does not take reference audio"):
+        _variant_model("custom_voice").process_prompt(
+            "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+            tensors={"audio_inputs": [clip]},
+        )
+
+
+def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
+    model = _variant_model("base")
+    walks = model.get_graph_walk_graphs()
+    assert {"talker_prefill_clone", "codec_chunk_clone"} <= set(walks)
+    assert "RefEncoder" in model.nodes
+    partitions = {part.name: part for part in model.get_partitions()}
+    assert "talker_prefill_clone" in partitions["Talker"].graph_walks
+    assert "codec_chunk_clone" in partitions["Codec"].graph_walks
+    # Non-Base variants do not even declare the clone walks (config-driven).
+    assert "talker_prefill_clone" not in _variant_model("voice_design").get_graph_walk_graphs()
+
+    pointers = {
+        name: [SimpleNamespace(name=name)]
+        for name in (*Qwen3TTSModel.PREFILL_INPUTS, "audio_inputs", "ref_frames")
+    }
+    talker = model.get_initial_forward_pass_args(
+        "Talker", input_modalities=["audio", "text"], output_modalities=["audio"],
+        input_signals=pointers,
+    )
+    assert talker.full_metadata.graph_walk == "talker_prefill_clone"
+    routes = {(edge.name, edge.next_node) for edge in talker.inputs}
+    assert ("audio_inputs", "RefEncoder") in routes and ("prompt_layout", "RefEncoder") in routes
+    assert ("text_inputs", "Talker") in routes
+    codec = model.get_initial_forward_pass_args(
+        "Codec", input_modalities=["audio", "text"], output_modalities=["audio"],
+        input_signals=pointers,
+    )
+    assert codec.full_metadata.graph_walk == "codec_chunk_clone"
+    rearmed = model.get_partition_forward_pass_args(
+        "Codec", codec.full_metadata, persist_signals={"ref_frames": pointers["ref_frames"]},
+    )
+    assert rearmed.full_metadata.graph_walk == "codec_chunk_clone"
+    assert [edge.name for edge in rearmed.inputs] == ["ref_frames"]
+    assert rearmed.inputs[0].tensor_info == pointers["ref_frames"]
+
+    # The Base deployment maps the extra node and walks.
+    deployment = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base.yaml").read_text(encoding="utf-8"))
+    groups = {name: group for group in deployment["node_groups"] for name in group["node_names"]}
+    assert "RefEncoder" in groups
+    assert "talker_prefill_clone" in groups["RefEncoder"]["graph_walks"]
+    assert "codec_chunk_clone" in groups["Codec"]["graph_walks"]
+    by_walk = {}
+    for worker_graph in model.get_worker_graphs(str(CONFIG_PATH.parent / "qwen3tts_base.yaml")):
+        by_walk.setdefault(next(iter(worker_graph.graph_walks)), worker_graph)
+    assert {"talker_prefill_clone", "codec_chunk_clone"} <= set(by_walk)
 
 
 def test_qwen3_tts_config_rejects_unknown_variant():
@@ -691,6 +796,78 @@ def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
             speaker_id=-1,
             language_id=-1,
         )
+
+
+def test_qwen3_tts_talker_builds_in_context_clone_prefill():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+    )
+    submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
+    submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
+    assistant = torch.arange(1, 13)                      # 4 text tokens
+    reference = torch.tensor([1, 2, 3, 50, 51, 8, 9])     # 2 transcript tokens + <|im_end|>\n
+    text_ids = torch.cat([assistant, reference])
+    ref_codes = torch.randint(0, 32, (5, config.talker.num_code_groups))
+    speaker_embed = torch.randn(config.talker.hidden_size)
+
+    def build(layout):
+        return submodule._build_prefill(
+            request_id="clone", text_ids=text_ids, prompt_layout=torch.tensor(layout),
+            speaker_id=-1, language_id=-1, speaker_embed=speaker_embed, ref_codes=ref_codes,
+        )
+
+    # Streaming text (Base default): text (2 ref + 4 + eos = 7) longer than
+    # codec (bos + 5 frames = 6) -> 6 in the prefill, 1 trailing.
+    embeds = build([0, 4, 1, 7, 5])
+    # role(3) + [nothink, think_bos, think_eos, xvec, pad](5) + icl(6)
+    assert embeds.shape == (3 + 5 + 6, 16)
+    state = submodule.request_state("clone")
+    assert state["trailing_text_hidden"].shape == (1, 16)
+    assert torch.equal(state["reference_frames"], ref_codes)
+    # The x-vector occupies the speaker slot right after the three think tags.
+    tags = embeds[3:3 + 5]
+    assert torch.allclose(tags[3], speaker_embed.to(tags.dtype) + state["tts_pad_embed"], atol=1e-5)
+
+    # Non-streaming: (text + eos) over codec pads, then (bos + frames) + tts pad.
+    embeds = build([0, 4, 0, 7, 5])
+    assert embeds.shape == (3 + 5 + 7 + 6, 16)
+    assert submodule.request_state("clone")["trailing_text_hidden"].shape == (0, 16)
+
+    # Text shorter than the codec span: padded with TTS PAD, nothing trails.
+    short = torch.cat([torch.tensor([1, 2, 3, 4, 8, 9, 10, 11, 12]), reference])
+    embeds = submodule._build_prefill(
+        request_id="clone", text_ids=short, prompt_layout=torch.tensor([0, 1, 1, 7, 5]),
+        speaker_id=-1, language_id=-1, speaker_embed=speaker_embed, ref_codes=ref_codes,
+    )
+    assert embeds.shape == (3 + 5 + 6, 16)
+    assert submodule.request_state("clone")["trailing_text_hidden"].shape == (0, 16)
+
+    # x-vector only: standard layout with the x-vector in the speaker slot.
+    embeds = submodule._build_prefill(
+        request_id="xvec", text_ids=assistant, prompt_layout=torch.tensor([0, 4, 1, 0, 0]),
+        speaker_id=-1, language_id=-1, speaker_embed=speaker_embed, ref_codes=None,
+    )
+    assert embeds.shape == (3 + 5 + 1, 16)
+    assert "reference_frames" not in submodule.request_state("xvec")
+
+    with pytest.raises(ValueError, match="reference frames"):
+        build([0, 4, 1, 7, 9])
+
+
+def test_qwen3_tts_clone_prefill_streams_reference_frames_first():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+    )
+    reference = torch.arange(8).view(2, 4)
+    submodule.request_state("clone").add("reference_frames", reference)
+    frame = torch.tensor([9, 9, 9, 9])
+    items = submodule._codec_stream_items("talker_prefill_clone", "clone", frame)
+    assert [item.tolist() for item in items] == [[0, 1, 2, 3], [4, 5, 6, 7], [9, 9, 9, 9]]
+    # Only the clone prefill leads with the reference; decode never does.
+    assert submodule._codec_stream_items("talker_decode", "clone", frame) == [frame]
+    assert submodule._codec_stream_items("talker_prefill_clone", "other", frame) == [frame]
 
 
 def test_qwen3_tts_talker_rejects_changed_chatml_layout():
@@ -1089,6 +1266,30 @@ def test_qwen3_tts_codec_trims_overlap_after_first_chunk():
     assert second["audio_chunk"][0].tolist() == list(range(8, 20))
 
 
+def test_qwen3_tts_codec_trims_reference_audio_from_clone_streams():
+    config = _tiny_model_config()   # upsample 4 samples per frame, chunk 3, left context 2
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
+    codes = torch.ones(3, 4, dtype=torch.long)
+    submodule.prepare_inputs(
+        "codec_chunk_clone", SimpleNamespace(request_id="clone"),
+        {"codec_tokens": [codes], "ref_frames": [torch.tensor([4])]},
+    )
+    state = submodule.request_state("clone")
+    assert state["skip_samples"] == 16
+
+    # First chunk: 3 frames = 12 samples, all reference -> nothing emitted.
+    first = {"audio_chunk": [torch.arange(20)]}
+    submodule.postprocess("clone", None, first)
+    assert first["audio_chunk"][0].numel() == 0
+    assert state["skip_samples"] == 4
+    # Second chunk: 2 context + 3 new frames; 4 more samples belong to the reference.
+    state.add("latest_codec_frames", 5)
+    second = {"audio_chunk": [torch.arange(20)]}
+    submodule.postprocess("clone", None, second)
+    assert second["audio_chunk"][0].tolist() == list(range(12, 20))
+    assert state["skip_samples"] == 0
+
+
 def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
     config = _tiny_model_config()
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
@@ -1180,3 +1381,63 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     oversized = model_inputs * 5
     assert len(oversized) == 10
     assert not submodule.can_batch(batch, oversized)
+
+
+class _FakeCodecEncoder(torch.nn.Module):
+    """Stands in for the Mimi encoder: deterministic codes, one frame per 4 samples."""
+
+    def __init__(self, num_quantizers: int):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.num_quantizers = num_quantizers
+        self.calls = 0
+
+    def encode(self, input_values, return_dict=True):
+        del return_dict
+        self.calls += 1
+        frames = input_values.shape[-1] // 4 + 2   # the real encoder pads a little
+        codes = torch.arange(frames).repeat(self.num_quantizers + 1, 1).unsqueeze(0)
+        return SimpleNamespace(audio_codes=codes)
+
+
+def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
+    from mstar.model.qwen3_tts.components.speaker_encoder import (
+        Qwen3TTSMelFrontEnd,
+        Qwen3TTSSpeakerEncoder,
+    )
+    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
+    from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
+
+    config = _tiny_model_config()
+    speaker_config = Qwen3TTSSpeakerEncoderConfig(
+        enc_dim=config.talker.hidden_size, enc_channels=(16, 16, 16, 16, 48),
+        enc_se_channels=8, enc_attention_channels=8,
+    )
+    encoder = _FakeCodecEncoder(config.codec.num_quantizers)
+    submodule = RefEncoderSubmodule(
+        Qwen3TTSSpeakerEncoder(speaker_config), Qwen3TTSMelFrontEnd(speaker_config), encoder, config,
+    )
+    clip = torch.randn(2, 4000) * 0.1   # stereo, averaged to mono
+    prepared = submodule.prepare_inputs(
+        "talker_prefill_clone", SimpleNamespace(request_id="clone"),
+        {"audio_inputs": [clip], "prompt_layout": [torch.tensor([0, 2, 1, 5, 7])]},
+    )
+    assert prepared.tensor_inputs["waveform"].shape == (4000,)
+    assert prepared.kwargs == {"ref_frames": 7}
+    engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
+    out = submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
+        "talker_prefill_clone", engine_inputs, [prepared]))
+    assert out["speaker_embed"][0].shape == (config.talker.hidden_size,)
+    assert out["ref_codes"][0].shape == (7, config.codec.num_quantizers)
+    assert out["ref_codes"][0][:, 0].tolist() == list(range(7))
+    assert encoder.calls == 1
+
+    # x-vector only: the codec encoder is skipped and a placeholder frame rides the edge.
+    prepared = submodule.prepare_inputs(
+        "talker_prefill_clone", SimpleNamespace(request_id="xvec"),
+        {"audio_inputs": [clip[0]], "prompt_layout": [torch.tensor([0, 2, 1, 0, 0])]},
+    )
+    out = submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
+        "talker_prefill_clone", engine_inputs, [prepared]))
+    assert out["ref_codes"][0].shape == (1, config.codec.num_quantizers)
+    assert encoder.calls == 1
