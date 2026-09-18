@@ -171,6 +171,10 @@ class Kokoro(Model):
     def get_model_kwargs(self, request_type: RequestType):
         return {"voice": self.config.get("voice", "af_heart")}
 
+    def get_tokenizer(self):
+        # Audio-only output: nothing to re-tokenize, and the checkpoint has no HF tokenizer.
+        return None
+
 
 class Qwen3Omni(Model):
     def get_hf_url(self):
