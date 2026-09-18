@@ -867,11 +867,17 @@ def test_qwen3_tts_clone_prefill_streams_reference_frames_first():
     submodule = TalkerSubmodule(
         Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
     )
-    reference = torch.arange(8).view(2, 4)
+    # Three reference frames, left context 2: the stream carries the last two
+    # (all a window can use as context) ahead of the first generated frame.
+    reference = torch.arange(12).view(3, 4)
     submodule.request_state("clone").add("reference_frames", reference)
     frame = torch.tensor([9, 9, 9, 9])
     items = submodule._codec_stream_items("talker_prefill_clone", "clone", frame)
-    assert [item.tolist() for item in items] == [[0, 1, 2, 3], [4, 5, 6, 7], [9, 9, 9, 9]]
+    assert [item.tolist() for item in items] == [[4, 5, 6, 7], [8, 9, 10, 11], [9, 9, 9, 9]]
+    submodule.request_state("short").add("reference_frames", reference[:1])
+    assert [item.tolist() for item in submodule._codec_stream_items("talker_prefill_clone", "short", frame)] == [
+        [0, 1, 2, 3], [9, 9, 9, 9],
+    ]
     # Only the clone prefill leads with the reference; decode never does.
     assert submodule._codec_stream_items("talker_decode", "clone", frame) == [frame]
     assert submodule._codec_stream_items("talker_prefill_clone", "other", frame) == [frame]
@@ -1334,18 +1340,18 @@ def test_qwen3_tts_codec_trims_reference_audio_from_clone_streams():
         {"codec_tokens": [codes], "ref_frames": [torch.tensor([4])]},
     )
     state = submodule.request_state("clone")
-    assert state["skip_samples"] == 16
+    # A 4-frame clip with left context 2: the stream carried its last 2 frames (8 samples).
+    assert state["skip_samples"] == 8
 
-    # First chunk: 3 frames = 12 samples, all reference -> nothing emitted.
+    # First chunk: 3 frames = 12 samples, the first 8 are reference -> one frame emitted.
     first = {"audio_chunk": [torch.arange(20)]}
     submodule.postprocess("clone", None, first, inputs=_geometry(frames=3, context=0))
-    assert first["audio_chunk"][0].numel() == 0
-    assert state["skip_samples"] == 4
-    # Second chunk: 2 context + 3 new frames; 4 more samples belong to the reference.
+    assert first["audio_chunk"][0].tolist() == [8, 9, 10, 11]
+    assert state["skip_samples"] == 0
+    # Second chunk: 2 context + 3 new frames, nothing left to drop.
     second = {"audio_chunk": [torch.arange(20)]}
     submodule.postprocess("clone", None, second, inputs=_geometry(frames=5, context=2))
-    assert second["audio_chunk"][0].tolist() == list(range(12, 20))
-    assert state["skip_samples"] == 0
+    assert second["audio_chunk"][0].tolist() == list(range(8, 20))
 
 
 def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
