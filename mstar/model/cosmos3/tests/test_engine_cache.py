@@ -355,6 +355,7 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
 
     groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
     transfer = TransferEngineInfo("h", "h", LocalTransferEngine("h"))
+    specs_by_key = {spec.resource_key: spec for spec in specs}
     resources = {
         spec.resource_key: build_resource(
             spec,
@@ -363,6 +364,9 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
                 joint_comm_group=groups,
                 transfer_engine_info=transfer,
                 kv_dtype=dtype,
+                # the attention specs name the cache they run over (engine.py
+                # resolves `depends_on` the same way)
+                dependencies={key: specs_by_key[key] for key in spec.depends_on()},
             ),
         )
         for spec in specs
