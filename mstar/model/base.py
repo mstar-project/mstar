@@ -545,6 +545,16 @@ class Model(ABC):
         audio. Mono default (the speech models); stereo models override."""
         return 1
 
+    def get_voices(self) -> list[str] | None:
+        """The speaker ids a speech model accepts as ``voice``, for
+        ``GET /v1/audio/voices``. ``None`` (the default) means the model has no
+        fixed voice list, and the route answers 404."""
+        return None
+
+    def get_default_voice(self) -> str | None:
+        """The ``voice`` used when a speech request names none."""
+        return None
+
     # ------------------------------------------------------------------
     # Partition API (optional, backward-compatible defaults)
     # ------------------------------------------------------------------
