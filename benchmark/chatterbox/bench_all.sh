@@ -99,6 +99,11 @@ case ${1:-} in
         --log-stats --log-stats-file "$out/stats.log"
     trap 'stop_group' EXIT
     wait_http "http://127.0.0.1:$PORT/health" 900
+    # one long-timeout request first: JIT kernels, CUDA-graph and torch.compile
+    # warm-up must not eat into the runner's own warmup (300 s client timeout)
+    curl -s --max-time 1800 "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"chatterbox\",\"input\":\"Warming up the server before the benchmark run.\",\"voice\":\"$VOICE\"}" \
+        -o "$out/warmup.wav"
     runner "http://127.0.0.1:$PORT" "$c" "$out"
     ;;
   tts)
