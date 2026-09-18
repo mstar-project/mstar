@@ -455,28 +455,40 @@ def test_short_seek_or_no_closed_segment_takes_the_whole_window(client_and_stub)
     assert [round(_wav_seconds(s["file_paths"]["audio"][0]), 2) for s in stub.submits] == [30.0, 30.0, 5.0]
 
 
-def test_repetitive_window_falls_back_to_higher_temperatures_and_resets_the_prompt(client_and_stub):
+def test_repetitive_window_first_drops_the_prompt_then_warms_up(client_and_stub):
     client, stub = client_and_stub
     loop = " the apostle and" * 60
     assert serving_transcriptions.compression_ratio(loop) > 2.4
     assert serving_transcriptions.compression_ratio("He hoped there would be stew for dinner.") < 2.4
     stub.queued_chunks = [
         _text("<|en|>", "<|0.00|>", " Hello there.", "<|20.00|>"),
-        _text("<|0.00|>", loop, "<|29.00|>"),           # window 2 at 0.0
-        _text("<|0.00|>", loop, "<|29.00|>"),           # 0.2
-        _text("<|0.00|>", loop, "<|29.00|>"),           # 0.4
-        _text("<|0.00|>", " Fine now.", "<|10.00|>"),   # 0.6: accepted
+        _text("<|0.00|>", loop, "<|29.00|>"),           # window 2: greedy with the prompt loops
+        _text("<|0.00|>", loop, "<|29.00|>"),           # greedy without it still loops
+        _text("<|0.00|>", " Fine now.", "<|10.00|>"),   # 0.2 without the prompt: accepted
         _text("<|0.00|>", " The end.", "<|15.00|>"),
     ]
     r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
               filename="long.wav", content=_wav_bytes(75))
     body = r.json()
     assert body["text"] == "Hello there. Fine now. The end."
-    assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.0, 0.0, 0.2, 0.4, 0.6, 0.0]
-    assert body["segments"][1]["temperature"] == 0.6 and body["segments"][1]["compression_ratio"] < 2.4
-    # retries keep the conditioning text; the window after a hot one loses it
-    assert all(s["model_kwargs"]["initial_prompt"] == "Hello there." for s in stub.submits[1:5])
-    assert "initial_prompt" not in stub.submits[5]["model_kwargs"]
+    assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.0, 0.0, 0.0, 0.2, 0.0]
+    assert [s["model_kwargs"].get("initial_prompt") for s in stub.submits] == [
+        None, "Hello there.", None, None, "Hello there. Fine now.",
+    ]
+    assert body["segments"][1]["temperature"] == 0.2 and body["segments"][1]["compression_ratio"] < 2.4
+
+
+def test_window_accepted_hot_stops_conditioning_the_next(client_and_stub):
+    client, stub = client_and_stub
+    loop = " the apostle and" * 60
+    stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " Hello there.", "<|20.00|>")]
+    stub.queued_chunks += [_text("<|0.00|>", loop, "<|29.00|>")] * 5   # prompt, no prompt, 0.2, 0.4, 0.6
+    stub.queued_chunks += [_text("<|0.00|>", " Warm.", "<|10.00|>"), _text("<|0.00|>", " The end.", "<|15.00|>")]
+    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(75))
+    assert r.json() == {"text": "Hello there. Warm. The end."}
+    assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 0.0]
+    # the window accepted at 0.8 does not condition the one after it
+    assert "initial_prompt" not in stub.submits[7]["model_kwargs"]
 
 
 def test_pinned_temperature_is_not_escalated(client_and_stub):
@@ -485,6 +497,7 @@ def test_pinned_temperature_is_not_escalated(client_and_stub):
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", loop, "<|29.00|>"), _text("<|0.00|>", " two", "<|15.00|>")]
     r = _post(client, {"model": "whisper_large", "temperature": "0.3"}, filename="long.wav", content=_wav_bytes(45))
     assert r.status_code == 200
+    # window 1 has no prompt to drop, so its loop is kept as is; nothing escalates
     assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.3, 0.3]
 
 
