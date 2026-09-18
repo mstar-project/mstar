@@ -64,6 +64,7 @@ class ZImageModel(Model):
         capture_caption_lengths: list[int] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
+        vae_compile: bool = False,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
@@ -79,6 +80,7 @@ class ZImageModel(Model):
         self.capture_caption_lengths = [int(n) for n in (capture_caption_lengths or [32, 64])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
+        self.vae_compile = bool(vae_compile)
         self._snapshot = None
         self._config: ZImageConfig | None = None
         self.tokenizer = None
@@ -284,7 +286,7 @@ class ZImageModel(Model):
                                               max_batch_size=self.max_batch_size)
         if node_name == "vae_decoder":
             return ZImageVaeDecoderSubmodule(build_vae(self.config, self.snapshot, device), self.config,
-                                             max_batch_size=self.max_batch_size)
+                                             max_batch_size=self.max_batch_size, compile_decode=self.vae_compile)
         if node_name == "dit":
             return ZImageDenoiseSubmodule(
                 build_transformer(self.config, self.snapshot, device), self.config, loop_name=DENOISE_LOOP,
