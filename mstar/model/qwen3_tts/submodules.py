@@ -942,8 +942,8 @@ class CodecSubmodule(ARNodeSubmodule):
     # Windows are at most chunk + left_context frames (50 by default, 4 s of
     # audio), so the decoder's activations stay small enough to capture
     # batches of 16 next to the Talker; ``can_batch`` keeps the ceiling.
-    MAX_BATCH_SIZE = 16
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    MAX_BATCH_SIZE = 32
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     def __init__(self, decoder: torch.nn.Module, config: Qwen3TTSModelConfig):
         super().__init__()
