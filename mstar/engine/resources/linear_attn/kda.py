@@ -43,6 +43,14 @@ class KDAPlan:
     # every row is a speculative verify block of k + 1 tokens (the checkpoint recurrence)
     is_verify: bool = False
     _cpu: dict = field(default_factory=dict, repr=False)
+    _dev: dict = field(default_factory=dict, repr=False)
+
+    def verify_cu_seqlens(self) -> torch.Tensor:
+        """Token boundaries of the rows' prefix + block sequences (``2 (k + 1)`` each), the packing
+        ``kda_recurrent_checkpoint`` reads; built once per plan (one launch a step, not one a layer)."""
+        if "verify_cu" not in self._dev:
+            self._dev["verify_cu"] = self.cu_seqlens[: self.num_rows + 1] * 2
+        return self._dev["verify_cu"]
 
     # host copies for reference kernels that loop over rows (a sync on CUDA; the fla kernels never ask)
     @property
