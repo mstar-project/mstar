@@ -124,7 +124,8 @@ async def run_session(
                 completed_time = now
                 break
             elif kind == "transcription.done":
-                final_text = event.get("text") or "".join(deltas)
+                # vLLM's ``text`` is the last utterance's; the deltas cover the session
+                final_text = "".join(deltas) or event.get("text") or ""
                 completed_time = now
                 break
             elif kind == "error":
