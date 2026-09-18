@@ -460,7 +460,8 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     config = Flux2KleinConfig()
     vae = RecordingVae()
     node = KleinVaeDecoderSubmodule(
-        vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)], decode_batch_sizes=(1, 2, 4, 8),
+        vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
+        decode_batch_sizes=(1, 2, 4, 8),
     )
     lc, ph, pw = config.vae.latent_channels, *config.vae.patch_size
     assert vae.shapes == [(bs, lc, 64 * ph, 64 * pw) for bs in (1, 2, 4, 8)]
