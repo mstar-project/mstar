@@ -20,6 +20,11 @@ node_groups:
   - node_names: ["dit"]
     ranks: [0, 1]
     tp_size: 2
-  # No audio_decoder: the i2v checkpoint has no sound pathway.
-  - node_names: ["vae_encoder", "vae_decoder"]
+  # No audio_decoder: the i2v checkpoint has no sound pathway. The decoder
+  # sits on rank 1: decoding a 121-frame 480p clip peaks well above the
+  # headroom rank 0 keeps beside its DiT shard, the encoder and the KV pool
+  # (measured: CUDA OOM in the Wan VAE decode with everything on rank 0).
+  - node_names: ["vae_encoder"]
     ranks: [0]
+  - node_names: ["vae_decoder"]
+    ranks: [1]
