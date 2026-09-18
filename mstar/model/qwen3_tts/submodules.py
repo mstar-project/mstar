@@ -407,8 +407,9 @@ class TalkerSubmodule(ARNodeSubmodule):
             generated_frames=0,
         )
         if ref_frames > 0:
-            # The codec decodes the reference frames ahead of the generated
-            # ones (their audio is trimmed), exactly as the reference does.
+            # The codec warms up on the tail of the reference clip ahead of
+            # the generated frames (their audio is trimmed); see
+            # ``_codec_stream_items``.
             state.add("reference_frames", reference)
         return prefill.squeeze(0)
 
@@ -689,16 +690,19 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _codec_stream_items(self, graph_walk: str, request_id: str, frame: torch.Tensor) -> list[torch.Tensor]:
         """Frames this step pushes into the codec stream, one item per frame.
 
-        The clone prefill leads with the reference clip's frames so the codec
-        warms up on the voice being cloned; ``CodecSubmodule`` trims their
-        audio. Decode steps (the captured path) always push exactly one frame.
+        The clone prefill leads with the tail of the reference clip's frames
+        so the codec warms up on the voice being cloned: only the last
+        ``left_context_frames`` matter, since that is all the context a
+        window ever carries, and every reference frame the stream carries
+        costs a codec pass whose audio ``CodecSubmodule`` then trims. Decode
+        steps (the captured path) always push exactly one frame.
         """
         if graph_walk != "talker_prefill_clone":
             return [frame]
         reference = self.request_state(request_id).get("reference_frames")
         if reference is None:
             return [frame]
-        return [*reference.unbind(0), frame]
+        return [*reference[-self.config.codec.left_context_frames:].unbind(0), frame]
 
     def forward(
         self,
@@ -1021,11 +1025,13 @@ class CodecSubmodule(ARNodeSubmodule):
         del graph_walk, kwargs
         state = self.request_state(fwd_info.request_id)
         if "ref_frames" in inputs and "skip_samples" not in state:
-            # Voice clone: the stream leads with the reference clip's frames,
-            # whose audio the client must not hear.
+            # Voice clone: the stream leads with the last ``left_context_frames``
+            # of the reference clip (all of it when shorter), whose audio the
+            # client must not hear.
+            ref_frames = int(inputs["ref_frames"][0].reshape(-1)[0].item())
             state.add(
                 "skip_samples",
-                int(inputs["ref_frames"][0].reshape(-1)[0].item()) * self.total_upsample,
+                min(ref_frames, self.config.codec.left_context_frames) * self.total_upsample,
             )
         codes = inputs["codec_tokens"][0].to(
             device=self.get_device(), dtype=torch.long
