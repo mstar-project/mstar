@@ -16,9 +16,12 @@ model_kwargs:
   # override.
   cuda_graph: true
   graph_max_latent_area: 2000
-  # Per-step CUDA graphs for the 480p video tiers too: the model-card clip
-  # (121 frames) and the streaming rollout's default window (29 frames).
-  gen_capture_video: [[480, 832, 121], [480, 832, 29]]
+  # Video denoise steps stay eager on the dense FA3 path: capturing them
+  # (gen_capture_video) forces the paged attention into the graph, which
+  # measured 3-6% slower at 832x480 for both the 121-frame clip and the
+  # 29-frame window (H100, 2026-09-17). Add tiers here only for small,
+  # launch-bound shapes.
+  gen_capture_video: []
   # Edge is 480p-native: the model card's generator recipe is 832x480 video
   # (121 frames, 24 fps, 20 UniPC steps, guidance 6.0, flow shift 12.0 on the
   # native flow schedule) and 640x640 images. Requests override any of these.
