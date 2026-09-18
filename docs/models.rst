@@ -80,8 +80,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        one): on pruned75 at TP8 it adds 10-14% decode throughput at every concurrency
        with identical outputs. Text only for now (no vision tower).
        Speculative decoding (experimental): ``model_kwargs.speculative_tokens: k`` makes
-       every decode step verify ``k`` drafted tokens in one pass (greedy verification only for
-       now; the KDA state is never rolled back, the pool keeps a checkpoint and the pending
+       every decode step verify ``k`` drafted tokens in one pass (speculative sampling with each
+       request's temperature / top-k / top-p in captured steps, greedy verification in eager
+       ones; the KDA state is never rolled back, the pool keeps a checkpoint and the pending
        prefix); ``model_kwargs.speculative_draft: <dir>`` loads the ``Inferact/Kimi-K3-DSpark``
        draft (5 rope MLA layers over the target's aux hidden states, its own latent cache
        ``resources.dspark_kv``), without it the drafts are the bonus token repeated (a path test).
