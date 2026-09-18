@@ -129,7 +129,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             SAMPLER: SamplerStep(apply_penalty=False),
         }
         if self.speculative_tokens > 0:
-            steps[SPEC] = SpecStep()
+            # every decode step of a speculating node verifies a block (its rows carry the bonus id)
+            steps[SPEC] = SpecStep(verify=graph_walk == "decode")
         if self.draft is not None:
             # the draft cache appends the rows' spans (the prompt, then k + 1 context entries per
             # step); in a decode step the draft's k queries per row attend to the stored context alone
@@ -249,7 +250,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         """A verify step's per-request outputs: ``new_token`` = the accepted tokens and the new
         bonus (``accepted + 1`` of the row's ``k1`` verified tokens, cut after the first stop token
         unless the request ignores EOS), ``text_inputs`` = the next row. Waits for the step's
-        verdicts (recorded mid-step, so the wait overlaps the draft). ``new_token`` is built on the
+        verdicts (staged mid-step and registered at its commit, so the wait overlaps the draft and
+        the plan thread may already have published them). ``new_token`` is built on the
         host from the verdict's pinned mirror, so no device copy is needed for it; ``text_inputs``
         is a view of the step's static row like the plain path's sampled token (the capture slots
         alternate, and the row is consumed before its slot is replayed again). Cloning both per
@@ -257,8 +259,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         if "spec_tokens" not in static_output:
             return {}
         acceptance: SpecAcceptance = self._acceptance
-        acceptance.note_step(request_ids)
-        verdicts = acceptance.verdicts_for(request_ids)
+        verdicts = acceptance.verdicts_for(request_ids)  # the step's commit registered the rows
         dtype, nxt = static_output["spec_tokens"].dtype, static_output["next_inputs"]
         out = {}
         for i, rid in enumerate(request_ids):
