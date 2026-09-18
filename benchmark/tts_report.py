@@ -51,9 +51,15 @@ def parity_rows(results: Path) -> list[str]:
             f"cos {clone['xvector_cosine']:.4f}, codes {clone.get('ref_code_agreement', float('nan')):.3f}"
             if clone else "-"
         )
+        def agreement(report: dict) -> str:
+            confident = report.get("confident_agreement")
+            confident_cell = f"{confident:.4f}" if confident is not None else "n/a"
+            rel = report.get("rel_mean_diff", float("nan"))
+            return f"{report['argmax_agreement']:.4f} / {confident_cell} / {rel:.4f}"
+
         rows.append(
             f"| {r['repo'].split('/')[-1]} | {re.sub(r'^parity_', '', path.stem)} | {r['frames']} | "
-            f"{r['talker']['argmax_agreement']:.4f} | {r['code_predictor']['argmax_agreement']:.4f} | "
+            f"{agreement(r['talker'])} | {agreement(r['code_predictor'])} | "
             f"{r['greedy_codes']['identical_frames_before_divergence']}/{r['greedy_codes']['frames_compared']} | "
             f"{r['codec']['max_abs_diff']:.2e} | {r['audio']['max_abs_diff']:.3f} | {clone_cell} |"
         )
@@ -71,7 +77,8 @@ def main(argv: list[str] | None = None) -> None:
              "| System (version) | concurrency | TTFA p50 / p95 ms | RTF | audio-s / s | WER % | errors | notes |",
              "|---|---|---|---|---|---|---|---|", *benchmark_rows(results), "",
              "## Parity vs qwen-tts (greedy, bf16 Talker, fp32 codec)", "",
-             "| checkpoint | mode | frames | Talker argmax agreement | CodePredictor argmax agreement | "
+             "| checkpoint | mode | frames | Talker argmax / confident agreement / rel. logit diff | "
+             "CodePredictor argmax / confident agreement / rel. logit diff | "
              "identical greedy frames | codec max-abs-diff | greedy audio max-abs-diff | "
              "clone (x-vector cosine, ref-code agreement) |",
              "|---|---|---|---|---|---|---|---|---|", *parity_rows(results)]
