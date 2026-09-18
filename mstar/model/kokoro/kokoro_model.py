@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 
 # What the API-side processes need: the config and the voice packs (28 MB).
 METADATA_PATTERNS = ["config.json", "voices/*.pt"]
+# Config fields a deployment may set through the YAML ``model_kwargs``.
+SERVING_OVERRIDES = {
+    "default_voice", "default_speed", "first_chunk_target_phonemes", "chunk_target_phonemes", "max_chunks",
+    "text_buckets", "frame_buckets", "capture_batch_sizes", "max_batch_frames",
+}
 
 
 def _resolve_snapshot(repo_id: str, cache_dir: str | None, allow_patterns: list[str] | None) -> str:
@@ -71,13 +76,19 @@ class KokoroModel(Model):
         cache_dir: str | None = None,
         lang_code: str | None = None,
         espeak_fallback: bool = True,
-        **kwargs: Any,
+        **config_overrides: Any,
     ) -> None:
-        del kwargs
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.local_dir = _resolve_snapshot(model_path_hf, cache_dir, METADATA_PATTERNS)
         self.config = KokoroModelConfig.from_pretrained(self.local_dir)
+        # Serving knobs (chunking targets, CUDA-graph buckets, batch caps) come
+        # from the deployment YAML's ``model_kwargs``; architecture fields stay
+        # with the checkpoint.
+        for name, value in config_overrides.items():
+            if name not in SERVING_OVERRIDES:
+                raise ValueError(f"Unknown Kokoro option {name!r}; deployment options: {sorted(SERVING_OVERRIDES)}")
+            setattr(self.config, name, value)
         self.default_lang = normalize_lang_code(lang_code) if lang_code else None
         self.voices = VoiceRegistry(
             Path(self.local_dir) / self.config.voices_dir, self.config.style_pack_rows, self.config.style_dim
