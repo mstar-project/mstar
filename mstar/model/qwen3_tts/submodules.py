@@ -28,7 +28,7 @@
 #                  -> postprocess -> check_stop (Talker only)
 #
 # Streaming topology:
-#   Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((4, 8, 16), 25, 25)]--> Codec
+#   Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 25)]--> Codec
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
