@@ -313,12 +313,14 @@ def mstar_greedy(driver: MStarTalkerDriver, tensors: dict, frames: int, greedy_k
         return talker.forward(fwd.graph_walk, engine_inputs, **kw)
 
     out = driver.step("talker_prefill", fwd, tensors, forward)
-    codes.append(out["codec_tokens"][0][0])
+    # ``codec_tokens`` is the list of stream items (one ``[groups]`` frame each;
+    # the clone prefill leads with the reference frames): keep the new frame.
+    codes.append(out["codec_tokens"][-1])
     talker.postprocess(rid, fwd, out)
     eos = talker.talker_config.codec_eos_token_id
     while len(codes) < frames and int(codes[-1][0]) != eos:
         out = driver.step("talker_decode", fwd, {"talker_input_embeds": out["talker_input_embeds"]}, forward)
-        codes.append(out["codec_tokens"][0][0])
+        codes.append(out["codec_tokens"][-1])
         talker.postprocess(rid, fwd, out)
     driver.close_request(rid)
     codes = torch.stack(codes)
@@ -411,6 +413,7 @@ def main(argv: list[str] | None = None) -> None:
         args.voice = None
 
     torch.manual_seed(0)
+    torch.set_grad_enabled(False)
     snapshot = resolve_snapshot(args.repo)
     t0 = time.perf_counter()
     ref = load_reference(snapshot, args.device)
