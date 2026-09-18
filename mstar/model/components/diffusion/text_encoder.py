@@ -3,7 +3,7 @@
 FLUX.2 [klein] and Z-Image condition their DiTs on intermediate hidden states of
 a Qwen3 language model (klein: layers 9/18/27 of Qwen3-4B/8B concatenated), not on
 its logits. This module is that encoder built from M*'s transformer components:
-``DecoderLayer`` + ``GatedMLP`` + ``RMSNorm`` with a GQA attention that carries
+``DecoderLayer`` + ``GatedMLP`` + an HF-order RMSNorm with a GQA attention that carries
 per-head q/k RMSNorm and plain RoPE, run only through the deepest tapped layer
 (klein skips the last quarter of the LM).
 
@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.components import DecoderLayer, GatedMLP, RMSNorm
+from mstar.model.components import DecoderLayer, GatedMLP
 from mstar.model.components.linear import FusedColumnLinear
 
 
@@ -49,6 +49,24 @@ def padded_causal_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return causal[None, None] & attention_mask.bool()[:, None, None, :]
 
 
+class Qwen3RMSNorm(nn.Module):
+    """RMSNorm in the HF ``Qwen3RMSNorm`` rounding order: normalize in fp32, round to the
+    input dtype, then multiply by the weight. In bf16 this is bit-exact with the reference
+    encoder; ``mstar.model.components.RMSNorm`` rounds ``rsqrt`` first (portable path) or the
+    whole product once (FlashInfer kernel), and either differs in the last bit, which the
+    27 to 35 layers below a tap then amplify."""
+
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.to(torch.float32)
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * h.to(x.dtype)
+
+
 class Qwen3EncoderAttention(nn.Module):
     """GQA self-attention with per-head q/k RMSNorm (Qwen3), fused qkv GEMM, masked SDPA."""
 
@@ -63,8 +81,8 @@ class Qwen3EncoderAttention(nn.Module):
             bias=False,
         )
         self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
-        self.q_norm = RMSNorm(head_dim, eps=eps)
-        self.k_norm = RMSNorm(head_dim, eps=eps)
+        self.q_norm = Qwen3RMSNorm(head_dim, eps=eps)
+        self.k_norm = Qwen3RMSNorm(head_dim, eps=eps)
         # Set per forward by the encoder (shared across layers).
         self.rotary: tuple[torch.Tensor, torch.Tensor] | None = None
         self.attn_mask: torch.Tensor | None = None
@@ -119,8 +137,8 @@ class Qwen3HiddenStateEncoder(nn.Module):
                     hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps, rope_theta,
                 ),
                 mlp=GatedMLP(hidden_size, intermediate_size, activation="silu", bias=False),
-                input_layernorm=RMSNorm(hidden_size, eps=rms_norm_eps),
-                post_attention_layernorm=RMSNorm(hidden_size, eps=rms_norm_eps),
+                input_layernorm=Qwen3RMSNorm(hidden_size, eps=rms_norm_eps),
+                post_attention_layernorm=Qwen3RMSNorm(hidden_size, eps=rms_norm_eps),
             )
             for _ in range(max(tap_layers))
         )
