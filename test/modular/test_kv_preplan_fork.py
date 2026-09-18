@@ -167,7 +167,7 @@ def test_staged_addressing_accounts_for_the_pending_fork():
         "the inline plan must see the fork it just applied"
     )
     assert got["cfg"].views == want["cfg"].views
-    for staged_t, inline_t in zip(got["cfg"].cpu_indptrs, want["cfg"].cpu_indptrs):
+    for staged_t, inline_t in zip(got["cfg"].cpu_indptrs, want["cfg"].cpu_indptrs, strict=True):
         torch.testing.assert_close(staged_t, inline_t)
 
     # and promotion keeps it that way

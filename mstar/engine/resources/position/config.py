@@ -71,9 +71,6 @@ class PositionSpec(NodeResourceSpec):
 
         return PositionManager
 
-    def depends_on(self):
-        return {self.config.kv_cache}
-
 
 @dataclass(frozen=True)
 class PositionStep(ResourceStep):
