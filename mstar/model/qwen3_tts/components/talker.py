@@ -6,6 +6,9 @@ The checkpoint has two coupled autoregressive axes:
   M*'s paged KV cache. Its attention/MLP projections are tensor-parallel.
 * Within one time step, the 5-layer CodePredictor walks codec groups 1-15.
   This short depth axis uses a fixed local KV tensor and is kept replicated.
+  Its inputs (the Talker hidden state and every codec embedding) live in the
+  Talker width; ``small_to_mtp_projection`` maps them into the predictor
+  width when the two differ (1.7B: 2048 -> 1024; 0.6B: identity).
 
 Class/module names intentionally follow Hugging Face checkpoint namespaces so
 ``load_hf_weights`` can stream parameters without a model-specific state-dict
@@ -227,18 +230,24 @@ class Qwen3TTSCodePredictor(nn.Module):
     Callers first write the Talker hidden state at position 0, then repeatedly
     feed the preceding codec embedding at positions 1-15. Keeping this as
     tensor-only code allows the complete depth loop to be CUDA-graph captured.
+
+    Every depth input arrives in the Talker width and passes through
+    ``small_to_mtp_projection`` (a biased linear layer on the 1.7B
+    checkpoints, identity on the 0.6B where both widths are 1024), exactly as
+    the reference ``Qwen3TTSTalkerCodePredictorModelForConditionalGeneration``
+    does before its decoder.
     """
 
     def __init__(self, config: Qwen3TTSModelConfig) -> None:
         super().__init__()
         cp = config.code_predictor
-        if cp.hidden_size != config.talker.hidden_size:
-            raise ValueError(
-                "M* currently requires equal Talker and CodePredictor hidden "
-                "sizes; the supported 0.6B checkpoint uses 1024 for both"
-            )
         self.config = cp
         self.model = Qwen3TTSCodePredictorInnerModel(config)
+        self.small_to_mtp_projection: nn.Module = (
+            nn.Linear(config.talker.hidden_size, cp.hidden_size, bias=True)
+            if cp.hidden_size != config.talker.hidden_size
+            else nn.Identity()
+        )
         self.lm_head = nn.ModuleList([
             nn.Linear(cp.hidden_size, cp.vocab_size, bias=False)
             for _ in range(config.num_code_groups - 1)
@@ -274,8 +283,11 @@ class Qwen3TTSCodePredictor(nn.Module):
         ``kv_cache`` layout is ``[layers, batch, K/V, groups, kv_heads,
         head_dim]``. Unlike Talker cache, it is frame-local scratch space:
         every generated frame starts at ``cache_pos=0`` and overwrites it.
+
+        ``inputs_embeds`` is ``[batch, 1, talker_hidden]``; the returned
+        hidden state is ``[batch, 1, predictor_hidden]``.
         """
-        hidden_states = inputs_embeds
+        hidden_states = self.small_to_mtp_projection(inputs_embeds)
         batch_size, seq_len, _ = hidden_states.shape
         if seq_len != 1:
             raise ValueError("CodePredictor decode expects exactly one token")
