@@ -80,3 +80,24 @@ def test_audiobuffer_wav_bytes():
     pcm = np.array([0, 16000, -16000], dtype="<i2").tobytes()
     wav = AudioBuffer(pcm, 24000).wav_bytes()
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE" and wav[44:] == pcm
+
+
+def test_tts_forwards_voice_and_reference_audio():
+    c = MStarClient("http://x")
+    calls = []
+
+    def fake_generate(**kwargs):
+        calls.append(kwargs)
+        return mock.Mock(audio=AudioBuffer(pcm=b"\x00\x00", sample_rate=24000))
+
+    c.generate = fake_generate
+    c.tts("hello", voice="vivian", language="English")
+    assert calls[-1]["voice"] == "vivian" and calls[-1]["language"] == "English"
+    assert calls[-1]["audio"] is None and calls[-1]["input_modalities"] is None
+    assert calls[-1]["output_modalities"] == ("audio",)
+
+    # A reference clip becomes the request's audio input (voice clone).
+    c.tts("hello", reference_audio=b"RIFF", ref_text="the transcript")
+    assert calls[-1]["audio"] == [b"RIFF"]
+    assert calls[-1]["input_modalities"] == ("audio", "text")
+    assert calls[-1]["ref_text"] == "the transcript" and calls[-1]["voice"] is None
