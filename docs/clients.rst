@@ -106,6 +106,9 @@ Convenience wrappers:
      - Text generation (and, with ``output_modalities=("text", "audio")``, speech).
    * - ``generate_image(prompt, **kw)``
      - PNG ``bytes`` (e.g. BAGEL text-to-image).
+   * - ``edit_image(prompt, image, **kw)``
+     - PNG ``bytes`` for an edit of ``image`` (a path, bytes, or a list of them for
+       multi-reference models).
    * - ``tts(text, *, voice=None, **kw)``
      - An ``AudioBuffer`` (``.to_wav(path)``, ``.to_numpy()``, ``len(...)`` samples).
    * - ``stream(**kw)``
