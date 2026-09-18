@@ -127,9 +127,12 @@ class Cosmos3Pipeline:
 
     def _decode(self, latents: torch.Tensor) -> torch.Tensor:
         """Latents [1,C,T,H,W] -> pixels [1,3,T,H,W] in [0,1] (un-normalize + Wan VAE)."""
-        mean = self._latents_mean.view(1, -1, 1, 1, 1)
-        inv_std = self._latents_inv_std.view(1, -1, 1, 1, 1)
-        z = latents.to(self.vae.dtype) / inv_std + mean
+        # The VAE instance is shared with the served decoder node, which casts
+        # it to its serving dtype; follow whatever it is now.
+        dtype = next(self.vae.parameters()).dtype
+        mean = self._latents_mean.to(dtype).view(1, -1, 1, 1, 1)
+        inv_std = self._latents_inv_std.to(dtype).view(1, -1, 1, 1, 1)
+        z = (latents.to(dtype) / inv_std + mean).to(dtype)
         decoded = self.vae.decode(z).sample  # [1,3,T,H,W] in [-1,1]
         return (decoded / 2 + 0.5).clamp(0, 1).to(torch.float32)
 
