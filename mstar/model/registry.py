@@ -7,6 +7,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "glm5_next": ("mstar.model.glm5_next.glm5_next_model", "Glm5NextModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
@@ -31,6 +32,10 @@ HF_MODELS: dict[str, dict] = {
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).
     "cosmos3_super": {"model_path_hf": "nvidia/Cosmos3-Super"},
+    # GLM-5.3-Flash (glm5_next): 320B/18B-active hybrid of 34 KDA linear-attention
+    # layers + 11 MLA/DSA layers with mHC residuals, fp8 e4m3 checkpoint (306 GB;
+    # TP8 on 8xH100). Text-only port (glm5_next_text); the ViT is skipped.
+    "glm5_next": {"model_path_hf": "zai-org/GLM-5.3-Flash"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},

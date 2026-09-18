@@ -2,15 +2,23 @@
 
 Yields ``(key, tensor)`` one at a time so the full state_dict never has
 to fit in memory.
+
+``slice_spec`` lets TP-aware callers read only their shard of a tensor:
+``slice_spec(key)`` returns ``(dim, start, stop)`` (dim 0 or 1) or ``None``
+for a full read. safetensors' ``get_slice`` then reads just those bytes —
+for checkpoints dominated by expert tensors this cuts per-rank IO by the
+TP factor (GLM-5.2 at TP8: ~704 GB -> ~120 GB per rank).
 """
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
+
+SliceSpec = Callable[[str], "tuple[int, int, int] | None"]
 
 
 def _resolve_safetensors_device(device: torch.device | str) -> str:
@@ -26,6 +34,7 @@ def iter_safetensors_file(
     device: torch.device | str = "cpu",
     prefix: str | None = None,
     keys: set[str] | None=None,
+    slice_spec: SliceSpec | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield ``(key, tensor)`` from a single safetensors file."""
     st_device = _resolve_safetensors_device(device)
@@ -36,7 +45,20 @@ def iter_safetensors_file(
                     (keys is not None and key not in keys):
                 continue
 
-            tensor = f.get_tensor(key)
+            spec = slice_spec(key) if slice_spec is not None else None
+            if spec is None:
+                tensor = f.get_tensor(key)
+            else:
+                dim, start, stop = spec
+                sl = f.get_slice(key)
+                if dim == 0:
+                    tensor = sl[start:stop]
+                elif dim == 1:
+                    tensor = sl[:, start:stop]
+                else:
+                    raise ValueError(
+                        f"slice_spec for {key!r} has dim={dim}; only 0/1 supported"
+                    )
             if str(device) != st_device:
                 tensor = tensor.to(device, non_blocking=True)
             yield key, tensor
@@ -46,6 +68,7 @@ def iter_safetensors_shards(
     repo_dir: str | Path, device: torch.device | str = "cpu",
     prefix: str | None = None,
     keys: set[str] | None=None,
+    slice_spec: SliceSpec | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield ``(key, tensor)`` from a sharded HF safetensors checkpoint.
 
@@ -73,14 +96,14 @@ def iter_safetensors_shards(
         for shard_file in shard_files:
             yield from iter_safetensors_file(
                 repo_dir / shard_file, device=device,
-                prefix=prefix, keys=keys
+                prefix=prefix, keys=keys, slice_spec=slice_spec,
             )
         return
     single = repo_dir / "model.safetensors"
     if single.exists():
         yield from iter_safetensors_file(
             single, device=device,
-            prefix=prefix, keys=keys
+            prefix=prefix, keys=keys, slice_spec=slice_spec,
         )
         return
     raise FileNotFoundError(
