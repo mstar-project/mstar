@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--voice", default="af_heart")
     parser.add_argument("--compile", action="store_true", help="torch.compile decode_frames with dynamic shapes")
+    parser.add_argument("--compile-text", action="store_true", help="also torch.compile encode_text")
     parser.add_argument("--decoder-dtype", default="float32", choices=["float32", "bfloat16", "float16"])
     args = parser.parse_args()
 
@@ -43,6 +44,8 @@ def main() -> None:
     model = model.to(args.device).eval()
     if args.compile:
         model.decode_frames = torch.compile(model.decode_frames, dynamic=True)
+    if args.compile_text:
+        model.encode_text = torch.compile(model.encode_text, dynamic=True)
     voices = VoiceRegistry(local_dir / config.voices_dir, config.style_pack_rows, config.style_dim)
     ids = torch.tensor([v for k, v in config.vocab.items() if k.isalpha()], device=args.device)
 
