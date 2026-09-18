@@ -87,6 +87,19 @@ class VramPoller:
                 self.peak_mib = mib if self.peak_mib is None else max(self.peak_mib, mib)
 
 
+def image_format(data: bytes | None) -> str | None:
+    """``png`` / ``jpeg`` / ``webp`` from the magic bytes, else None."""
+    if not data:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return "unknown"
+
+
 def _post(url: str, body: dict, timeout: float) -> tuple[float, bytes | None]:
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     t0 = time.perf_counter()
@@ -121,11 +134,12 @@ def _summary(samples: list[float]) -> dict:
 def run_latency(args, url: str, prompts: list[str]) -> dict:
     for i in range(args.warmup):
         _post(url, _body(args, prompts[i % len(prompts)], args.seed + i), args.timeout)
-    samples, saved = [], 0
+    samples, saved, observed = [], 0, None
     with VramPoller(args.vram_gpu) as vram:
         for i in range(args.n):
             dt, png = _post(url, _body(args, prompts[i % len(prompts)], args.seed + i), args.timeout)
             samples.append(dt)
+            observed = observed or image_format(png)
             if args.save_dir and png is not None:
                 Path(args.save_dir).mkdir(parents=True, exist_ok=True)
                 Path(args.save_dir, f"{args.tag}_{i:03d}.png").write_bytes(png)
@@ -133,7 +147,7 @@ def run_latency(args, url: str, prompts: list[str]) -> dict:
             print(f"  [{i + 1}/{args.n}] {dt:.3f}s", flush=True)
     result = {
         "mode": "latency", **_summary(samples), "samples_s": samples, "images_saved": saved,
-        "peak_vram_mib": vram.peak_mib,
+        "peak_vram_mib": vram.peak_mib, "observed_output_format": observed,
     }
     print(f"latency B=1 {args.size} steps={args.steps}: median {result['median_s']:.3f}s  p95 {result['p95_s']:.3f}s")
     return result
@@ -157,11 +171,16 @@ class _RoundRobin:
             self._next = 0
 
 
+_OBSERVED: dict[str, str | None] = {"format": None}
+
+
 def _one_request(args, url: str, prompts: list[str], counter: _RoundRobin, _index: int = 0) -> float:
     """One request; ``_index`` is the executor's map argument and is ignored (the counter
     assigns prompts/seeds in completion-independent submission order)."""
     i = counter.take()
-    dt, _png = _post(url, _body(args, prompts[i % len(prompts)], args.seed + i), args.timeout)
+    dt, png = _post(url, _body(args, prompts[i % len(prompts)], args.seed + i), args.timeout)
+    if _OBSERVED["format"] is None:
+        _OBSERVED["format"] = image_format(png)
     return dt
 
 
@@ -191,7 +210,7 @@ def run_throughput(args, url: str, prompts: list[str]) -> dict:
         print(f"throughput concurrency={concurrency}: {statistics.median(rates):.3f} images/s "
               f"(median of {len(runs)}; min {rates[0]:.3f}, max {rates[-1]:.3f}), "
               f"request median {runs[len(runs) // 2]['request_latency']['median_s']:.3f}s", flush=True)
-    return {"mode": "throughput", "by_concurrency": results}
+    return {"mode": "throughput", "by_concurrency": results, "observed_output_format": _OBSERVED["format"]}
 
 
 def main():
