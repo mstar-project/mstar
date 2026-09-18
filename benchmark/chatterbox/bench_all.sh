@@ -120,8 +120,10 @@ case ${1:-} in
     ;;
   vllm)
     b=$2 out=$RESULTS/chatterbox_vllm_c$b
-    mkdir -p "$out"
-    # run from the results dir: the port symlinks its T3 weights into ./t3-model
+    mkdir -p "$out/t3-model"
+    # run from the results dir: the port symlinks its T3 weights into ./t3-model, next to
+    # the vLLM model config files it ships in its repo
+    cp -rn "$WS/refs/chatterbox-vllm/t3-model/." "$out/t3-model/" 2>/dev/null || true
     ( cd "$out" && HF_HUB_OFFLINE=1 "$WS/baselines/chatterbox-vllm/.venv/bin/python" \
         "$MSTAR/benchmark/chatterbox/bench_chatterbox_vllm.py" --sentences "$SENTENCES" --num "$NUM" \
         --warmup "$WARMUP" --batch "$b" --out "$out" ) 2>&1 | tee "$out.log"
