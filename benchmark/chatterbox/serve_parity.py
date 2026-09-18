@@ -42,8 +42,8 @@ def synthesize(url: str, text: str, seed: int, voice: str, extra: dict) -> tuple
 def snr_db(a: np.ndarray, b: np.ndarray) -> float:
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
-    noise = np.sum((a - b) ** 2)
-    return float("inf") if noise == 0 else 10 * np.log10(np.sum(a ** 2) / noise)
+    noise = float(np.sum((a - b) ** 2))
+    return float("inf") if noise == 0 else float(10 * np.log10(float(np.sum(a ** 2)) / noise))
 
 
 def main() -> None:
