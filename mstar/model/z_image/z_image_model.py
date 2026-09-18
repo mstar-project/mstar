@@ -29,7 +29,7 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.components.diffusion.image_io import uint8_to_png
+from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, Z_IMAGE_TURBO, ZImageConfig, resolve_snapshot_dir
 from mstar.model.z_image.submodules import (
@@ -119,20 +119,21 @@ class ZImageModel(Model):
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
-            name="text_encoder", input_names=[TEXT_INPUTS],
+            name="text_encoder", input_names=[TEXT_INPUTS], enable_async_scheduling=False,
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=TEXT_EMBEDS, persist=True)],
         )
         loop = Loop(
             name=DENOISE_LOOP,
             section=GraphNode(
                 name="dit", input_names=[TEXT_EMBEDS, LATENTS],
-                outputs=[GraphEdge(next_node="dit", name=LATENTS)], enable_async_scheduling=True,
+                # lockstep scheduling so concurrent requests batch (see Flux2KleinModel)
+                outputs=[GraphEdge(next_node="dit", name=LATENTS)], enable_async_scheduling=False,
             ),
             max_iters=self.config.max_denoise_steps,
             outputs=[GraphEdge(next_node="vae_decoder", name=LATENTS)],
         )
         decoder = GraphNode(
-            name="vae_decoder", input_names=[LATENTS],
+            name="vae_decoder", input_names=[LATENTS], enable_async_scheduling=False,
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=IMAGE_OUTPUT, output_modality="image")],
         )
         return {ENCODE_TEXT_WALK: encode_text, IMAGE_GEN_WALK: Sequential([loop, decoder])}
@@ -251,7 +252,7 @@ class ZImageModel(Model):
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality != "image":
             raise ValueError(f"unsupported output modality for Z-Image: {modality!r}")
-        return uint8_to_png(output)
+        return encode_image(output, request_kwargs)
 
     # ------------------------------------------------------------- loading
     def get_autocast_dtype(self):
