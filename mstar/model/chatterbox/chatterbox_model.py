@@ -116,6 +116,7 @@ class ChatterboxModel(Model):
         stream_chunk_tokens: int | None = None,
         stream_first_chunk_tokens: int | None = None,
         stream_context_tokens: int | None = None,
+        s3gen_compile: bool | None = None,
         t3_dtype: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -146,6 +147,8 @@ class ChatterboxModel(Model):
             self.config.stream_first_chunk_tokens = int(stream_first_chunk_tokens)
         if stream_context_tokens is not None:
             self.config.stream_context_tokens = int(stream_context_tokens)
+        if s3gen_compile is not None:
+            self.config.s3gen_compile = bool(s3gen_compile)
         self.voices_dir = Path(voices_dir) if voices_dir else None
         self.local_dir = resolve_snapshot(model_path_hf, cache_dir)
         self.tokenizer = self._build_text_tokenizer()
@@ -718,6 +721,10 @@ class ChatterboxModel(Model):
         s3gen.load_weights(
             iter_weights(self._weights_path(self.config.s3gen_weights), device=device),
         )
+        s3gen.eval()
+        if self.config.s3gen_compile:
+            # after load_weights: the compiled wrapper renames parameters
+            s3gen.decoder.estimator = torch.compile(s3gen.decoder.estimator, dynamic=True)
         gen = self._builtin_voice()["gen"]
         builtin = ReferenceConditioning(
             prompt_tokens=gen["prompt_token"].to(device),
