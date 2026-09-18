@@ -230,6 +230,7 @@ class KVManager(AttentionResource):
 
         self._preplan_states: dict[str, KVPlanState] = {}
         self._preplanned = False
+        self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
         # (rid, to_label, stored_len, generation) for pre-forks appliedb by
@@ -569,17 +570,19 @@ class KVManager(AttentionResource):
         )
         self.reset_default_cursors()
         if self._preplanned:
-            self._current_plan_states = self._preplan_states
-            res = self._cached_plan_output
-            # promotion, not abandonment: the staged forks and marks are kept,
-            # so drop the undo records before clear_preplan replays them
-            self._preplan_fork_undo = []
-            self._preplan_new_labels = []
-            self._preplan_marked = []
-            # must reset here: otherwise the *next* step's admit still sees
-            # `_preplanned` and skips its allocation
+            if self._preplan_key == self._plan_key(step, ctx):
+                self._current_plan_states = self._preplan_states
+                res = self._cached_plan_output
+                self._preplan_fork_undo = []
+                self._preplan_new_labels = []
+                self._preplan_marked = []
+                self.clear_preplan()
+                return res
+            # A different step reached the GPU thread before the one planned
+            # ahead (e.g. a new request's prefill while a decode step sits
+            # pre-planned): it must not be served the staged plan's pages.
+            # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
-            return res
         undo = self._preplan_fork_undo if ctx.is_preplan else None
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.padded_request_ids:
@@ -596,6 +599,7 @@ class KVManager(AttentionResource):
         )
         self._setup_plan_states(res, ctx, ctx.slot_lease)
         if ctx.is_preplan:
+            self._preplan_key = self._plan_key(step, ctx)
             self._preplanned = True
             self._cached_plan_output = res
         return res
@@ -603,6 +607,13 @@ class KVManager(AttentionResource):
     @property
     def supports_preplan(self):
         return True
+
+    @staticmethod
+    def _plan_key(step: KVStep, ctx: StepContext):
+        """What identifies the step a pre-plan was staged for: its segments
+        and the replay slot it was leased on."""
+        lease = ctx.slot_lease
+        return tuple(step.segments), (lease.slot if lease is not None else None)
 
     def clear_preplan(self):
         # the staged step is not going to run, so undo what it did to live
@@ -632,6 +643,7 @@ class KVManager(AttentionResource):
             self._preplan_marked = []
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
+        self._preplan_key = None
         self._preplan_states = {}
         self._cached_plan_output = None
 
