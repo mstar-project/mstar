@@ -8,7 +8,11 @@ and reports what the benchmark protocol asks for:
 * ``--mode latency``     B=1 end-to-end latency at the given size (median / p95 over N prompts
                          after warmup)
 * ``--mode throughput``  images/s at a fixed concurrency (``--concurrency 4 8 16``): that many
-                         requests kept in flight, prompts round-robin from the prompt file
+                         requests kept in flight, prompts round-robin from the prompt file;
+                         each level is repeated (``--repeats``, default 3) and the median reported
+
+Peak VRAM (``memory.used`` of ``--vram-gpu`` sampled by ``nvidia-smi`` during the timed run)
+is recorded when the client runs on the server's node, as the protocol does.
 
 Prompts come from a text file (one per line; the shared protocol set lives under
 ``commons/bench/data/image/``), so every engine sees identical inputs. Results are
@@ -28,12 +32,59 @@ import argparse
 import base64
 import functools
 import json
+import shutil
 import statistics
+import subprocess
 import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+
+class VramPoller:
+    """Peak ``memory.used`` of one GPU (MiB) sampled by ``nvidia-smi`` while a run is timed.
+
+    The client runs on the server's node, so this is the device's high-water mark (the
+    engine's allocator plus context), which is what the protocol's "peak VRAM" means.
+    """
+
+    def __init__(self, gpu: str, interval_s: float = 0.5):
+        self.gpu, self.interval_s, self.peak_mib = gpu, interval_s, None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.available = bool(gpu) and shutil.which("nvidia-smi") is not None
+
+    def _sample(self) -> int | None:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "-i", self.gpu, "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5, check=True,
+            ).stdout.strip()
+            return int(out.splitlines()[0])
+        except (subprocess.SubprocessError, ValueError, IndexError, OSError):
+            return None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            mib = self._sample()
+            if mib is not None:
+                self.peak_mib = mib if self.peak_mib is None else max(self.peak_mib, mib)
+            self._stop.wait(self.interval_s)
+
+    def __enter__(self) -> "VramPoller":
+        if self.available:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            mib = self._sample()  # the level right after the run, for the record
+            if mib is not None:
+                self.peak_mib = mib if self.peak_mib is None else max(self.peak_mib, mib)
 
 
 def _post(url: str, body: dict, timeout: float) -> tuple[float, bytes | None]:
@@ -69,15 +120,19 @@ def run_latency(args, url: str, prompts: list[str]) -> dict:
     for i in range(args.warmup):
         _post(url, _body(args, prompts[i % len(prompts)], args.seed + i), args.timeout)
     samples, saved = [], 0
-    for i in range(args.n):
-        dt, png = _post(url, _body(args, prompts[i % len(prompts)], args.seed + i), args.timeout)
-        samples.append(dt)
-        if args.save_dir and png is not None:
-            Path(args.save_dir).mkdir(parents=True, exist_ok=True)
-            Path(args.save_dir, f"{args.tag}_{i:03d}.png").write_bytes(png)
-            saved += 1
-        print(f"  [{i + 1}/{args.n}] {dt:.3f}s", flush=True)
-    result = {"mode": "latency", **_summary(samples), "samples_s": samples, "images_saved": saved}
+    with VramPoller(args.vram_gpu) as vram:
+        for i in range(args.n):
+            dt, png = _post(url, _body(args, prompts[i % len(prompts)], args.seed + i), args.timeout)
+            samples.append(dt)
+            if args.save_dir and png is not None:
+                Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+                Path(args.save_dir, f"{args.tag}_{i:03d}.png").write_bytes(png)
+                saved += 1
+            print(f"  [{i + 1}/{args.n}] {dt:.3f}s", flush=True)
+    result = {
+        "mode": "latency", **_summary(samples), "samples_s": samples, "images_saved": saved,
+        "peak_vram_mib": vram.peak_mib,
+    }
     print(f"latency B=1 {args.size} steps={args.steps}: median {result['median_s']:.3f}s  p95 {result['p95_s']:.3f}s")
     return result
 
@@ -113,19 +168,27 @@ def run_throughput(args, url: str, prompts: list[str]) -> dict:
     for concurrency in args.concurrency:
         counter = _RoundRobin()
         request = functools.partial(_one_request, args, url, prompts, counter)
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        runs = []
+        with VramPoller(args.vram_gpu) as vram, ThreadPoolExecutor(max_workers=concurrency) as pool:
             # warm the shape / batch buckets before timing
             list(pool.map(request, range(min(args.warmup, concurrency))))
-            counter.reset()
-            t0 = time.perf_counter()
-            lat = list(pool.map(request, range(args.n)))
-            wall = time.perf_counter() - t0
+            for _ in range(max(1, args.repeats)):
+                counter.reset()
+                t0 = time.perf_counter()
+                lat = list(pool.map(request, range(args.n)))
+                wall = time.perf_counter() - t0
+                runs.append({"wall_s": wall, "images_per_s": args.n / wall, "request_latency": _summary(lat)})
+        rates = sorted(r["images_per_s"] for r in runs)
         results[str(concurrency)] = {
-            "concurrency": concurrency, "images": args.n, "wall_s": wall, "images_per_s": args.n / wall,
-            "request_latency": _summary(lat),
+            "concurrency": concurrency, "images": args.n, "repeats": len(runs),
+            "images_per_s": statistics.median(rates), "images_per_s_min": rates[0], "images_per_s_max": rates[-1],
+            "wall_s": statistics.median(r["wall_s"] for r in runs),
+            "request_latency": runs[len(runs) // 2]["request_latency"], "runs": runs,
+            "peak_vram_mib": vram.peak_mib,
         }
-        print(f"throughput concurrency={concurrency}: {args.n / wall:.3f} images/s "
-              f"(request median {statistics.median(lat):.3f}s) over {wall:.1f}s", flush=True)
+        print(f"throughput concurrency={concurrency}: {statistics.median(rates):.3f} images/s "
+              f"(median of {len(runs)}; min {rates[0]:.3f}, max {rates[-1]:.3f}), "
+              f"request median {runs[len(runs) // 2]['request_latency']['median_s']:.3f}s", flush=True)
     return {"mode": "throughput", "by_concurrency": results}
 
 
@@ -146,6 +209,10 @@ def main():
     ap.add_argument("--timeout", type=float, default=1800)
     ap.add_argument("--save-dir", default="", help="save the PNGs of the latency run here (for PSNR checks)")
     ap.add_argument("--tag", default="run")
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="throughput: repeat each concurrency level this many times and report the median images/s")
+    ap.add_argument("--vram-gpu", default="0",
+                    help="GPU index polled with nvidia-smi for peak memory.used during the run ('' to disable)")
     ap.add_argument("--out", default="", help="write the JSON result here")
     args = ap.parse_args()
 
