@@ -755,6 +755,12 @@ class S3GenSubmodule(NodeSubmodule):
         del batch
         return 1 < len(model_inputs) <= self.MAX_BATCH_SIZE
 
+    def max_batch_size(self, graph_walk: str) -> int:
+        # the scheduler sizes the node's batches from this (the base default is
+        # one request), so without it the padded multi-request solve never runs
+        del graph_walk
+        return self.MAX_BATCH_SIZE
+
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs]):
         del graph_walk, engine_inputs
         if len(inputs) == 1:
