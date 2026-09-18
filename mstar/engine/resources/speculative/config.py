@@ -33,7 +33,9 @@ class SpecAcceptanceSpec(NodeResourceSpec):
 
 @dataclass(frozen=True)
 class SpecStep(ResourceStep):
-    pass
+    # the step verifies a speculative block per row: its forward stages a verdict and its commit
+    # registers the rows (a prefill step of the same node declares the resource without either)
+    verify: bool = False
 
 
 @dataclass(frozen=True)
