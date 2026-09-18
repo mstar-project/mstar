@@ -1072,12 +1072,31 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     assert packed["input_embeds"].shape == (2, 16)
     assert packed["last_token_indices"].tolist() == [0, 1]
     assert packed["suppress_eos"].tolist() == [True, True]
-    graph_config = submodule.get_cuda_graph_configs(torch.device("cpu"))[0]
-    assert graph_config.capture_graph_walk == "talker_decode"
+    configs = {c.capture_graph_walk: c for c in submodule.get_cuda_graph_configs(torch.device("cpu"))}
+    graph_config = configs["talker_decode"]
     assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
     assert graph_config.single_request_inputs.tensor_inputs[
         "suppress_eos"
     ].item() is True
+    # Prefill replays a packed capture: token buckets, padding rows shaped like
+    # a prepared prefill (embeds + the dynamic EOS-suppression key).
+    prefill_config = configs["talker_prefill"]
+    assert prefill_config.capture_token_lengths == [32, 64, 128, 256, 512, 1024]
+    assert prefill_config.capture_batch_sizes == [1, 2, 4, 8]
+    padding = prefill_config.make_node_input(7)
+    assert padding.input_embeds.shape == (7, 16) and padding.input_seq_len == 7
+    assert padding.tensor_inputs["suppress_eos"].item() is True
+    assert prefill_config.replay_graph_walks == ["talker_prefill"]   # the clone prefill stays eager
+    prefill_batch = ExecutingBatch(
+        node_name="Talker", step_context=_step_context("talker_prefill", ["a", "b"]),
+        per_request_input_tensors={}, per_request_info=info,
+    )
+    assert submodule.can_use_cuda_graphs(prefill_batch, model_inputs)
+    clone_batch = ExecutingBatch(
+        node_name="Talker", step_context=_step_context("talker_prefill_clone", ["a", "b"]),
+        per_request_input_tensors={}, per_request_info=info,
+    )
+    assert not submodule.can_use_cuda_graphs(clone_batch, model_inputs)
     # Residual sampling params live in per-request sampler buffers, so requests
     # that disagree about them still batch AND still replay the decode graph.
     # (They used to fall out of both.)
