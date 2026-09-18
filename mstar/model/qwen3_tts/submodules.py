@@ -952,6 +952,13 @@ class CodecSubmodule(ARNodeSubmodule):
         ):
             self.total_upsample *= factor
 
+    def _codec_walks(self) -> list[str]:
+        """Walks this node runs: the clone walk exists only on Base checkpoints."""
+        walks = ["codec_chunk"]
+        if self.config.supports_reference_audio:
+            walks.append("codec_chunk_clone")
+        return walks
+
     def _bucket(self, frames: int) -> int:
         """Smallest captured window that holds ``frames`` (the terminal flush is shorter)."""
         for window in self.windows:
@@ -1118,7 +1125,7 @@ class CodecSubmodule(ARNodeSubmodule):
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk="codec_chunk",
-                replay_graph_walks=["codec_chunk", "codec_chunk_clone"],
+                replay_graph_walks=self._codec_walks(),
                 single_request_inputs=ARNodeInputs(
                     # 1, not the window: batched buckets match on bs, and this
                     # keeps the intern seq_len from aliasing the trailing dims.
@@ -1143,7 +1150,7 @@ class CodecSubmodule(ARNodeSubmodule):
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         return (
-            batch.graph_walk in ("codec_chunk", "codec_chunk_clone")
+            batch.graph_walk in self._codec_walks()
             and self.can_batch(batch, model_inputs)
             and all(
                 item.tensor_inputs["codec_tokens"].shape
