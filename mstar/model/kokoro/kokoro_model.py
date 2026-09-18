@@ -206,6 +206,13 @@ class KokoroModel(Model):
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
 
+    def get_voices(self) -> list[str]:
+        """The bundled voices; blends of them are accepted too (see ``VoiceRegistry``)."""
+        return self.voices.names
+
+    def get_default_voice(self) -> str:
+        return self.config.default_voice
+
     def get_autocast_dtype(self):
         return torch.float32
 
