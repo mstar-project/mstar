@@ -866,3 +866,12 @@ def test_s3gen_context_window_bounds_the_solve_and_keeps_the_frame_bookkeeping()
     # the final one starts at 57 - 10 = 47 of 62 tokens
     assert full_lens == [20, 40, 60, 62]
     assert win_lens == [20, 33, 33, 15]
+
+
+def test_streaming_and_compile_knobs_reach_the_config():
+    model = ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox",
+        stream_context_tokens=25, s3gen_compile=True,
+    )
+    assert model.config.stream_context_tokens == 25 and model.config.s3gen_compile is True
+    assert _make_model().config.s3gen_compile is False
