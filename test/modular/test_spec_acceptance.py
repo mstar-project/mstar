@@ -43,9 +43,12 @@ def test_verdicts_flow_from_stage_to_the_next_plan():
     s, ctx = step(["a", "b"])
     assert res.plan(s.get("spec_acceptance"), ctx) == {}  # nothing verified yet
     # the forward verified a and b: a kept 3 drafts, b kept 1; then the host noted the step
-    res.stage(torch.tensor([3, 1], dtype=torch.int32))
+    toks = torch.tensor([[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]], dtype=torch.int32)
+    res.stage(torch.tensor([3, 1], dtype=torch.int32), toks)
     res.note_step(["a", "b"])
     assert res.accepted_for(["a", "b"]) == [3, 1]
+    va, vb = res.verdicts_for(["a", "b"])
+    assert va.tokens == [10, 11, 12, 13, 14] and vb.accepted == 1 and vb.tokens[: vb.accepted + 1] == [20, 21]
     # next step: a and c (b is held), plus a padding row that must publish nothing
     s2, ctx2 = step(["a", "c"], padded=["a", "c", "__cg_LLM_0_2__"])
     out = res.plan(s2.get("spec_acceptance"), ctx2)
