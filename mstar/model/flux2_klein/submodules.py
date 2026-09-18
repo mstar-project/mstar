@@ -14,6 +14,7 @@ order (see ``notes`` in the PR description and the equivalence tests).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -275,10 +276,16 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
 VAE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
 
+VAE_WARMUP_BATCH_SIZES = (1, 2)
+
+
 def compile_vae_decode(vae: nn.Module):
-    """``vae.decode`` compiled per shape with inductor autotuning (no cudagraphs: the engine's
-    runner owns capture). Compilation happens on the first decode of each (batch, grid)."""
-    return torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE)
+    """``vae.decode`` compiled with inductor autotuning (no cudagraphs: the engine's runner owns
+    capture). ``dynamic=None``: the first batch size compiles a static graph, the second turns
+    the batch dimension symbolic, so warming batch sizes 1 and 2 per grid covers every batch
+    size after that — a fresh max-autotune compile costs tens of seconds, far too much to pay
+    inside a request."""
+    return torch.compile(vae.decode, fullgraph=False, dynamic=None, mode=VAE_COMPILE_MODE)
 
 
 class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
@@ -295,6 +302,7 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
 
     def __init__(
         self, vae: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 8, compile_decode: bool = False,
+        warmup_grids: Sequence[tuple[int, int]] = (),
     ):
         super().__init__()
         self.vae = vae
@@ -302,8 +310,23 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
         self._max_batch_size = max_batch_size
         # torch.compile (max-autotune, no cudagraphs) takes the 1024^2 decode from 89 to 29 ms on an
         # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
-        # deployment knob and stays off for the bit-exact parity path.
+        # deployment knob and stays off for the bit-exact parity path. CUDA graphs would add nothing:
+        # the compiled decode is not launch-bound (measured), so the node declares no captures.
         self._decode = compile_vae_decode(vae) if compile_decode else vae.decode
+        self.warmup(warmup_grids)
+
+    def warmup(self, grids: Sequence[tuple[int, int]], batch_sizes: Sequence[int] = VAE_WARMUP_BATCH_SIZES) -> None:
+        """Decode zeros at ``batch_sizes`` for every token grid at load, so the compile, its
+        autotuning and the switch to a symbolic batch dimension all happen before the first request."""
+        for h, w in grids:
+            patch = self.config.vae.patch_size
+            for bs in batch_sizes:
+                latent = torch.zeros(
+                    bs, self.config.vae.latent_channels, h * patch[0], w * patch[1],
+                    device=self.get_device(), dtype=self.vae.dtype,
+                )
+                with torch.no_grad():
+                    self._decode(latent)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         grid = self.config.latent_grid(int(fwd_info.step_metadata["height"]), int(fwd_info.step_metadata["width"]))
