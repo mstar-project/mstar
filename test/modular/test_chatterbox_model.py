@@ -821,3 +821,23 @@ def test_s3gen_batching_is_bounded_and_single_requests_keep_the_plain_path():
     assert set(sub.preprocess("s3gen_chunk", None, one)) >= {SPEECH_TOKENS, "request_id", "ref", "is_final"}
     many = one * (sub.MAX_BATCH_SIZE + 1)
     assert not sub.can_batch(None, many) and sub.can_batch(None, one * 2)
+
+
+def test_materialize_refuses_modules_with_computed_buffers():
+    """A meta build + to_empty() would hand back uninitialised memory for a
+    buffer computed in __init__ (the GPU HiFT window came out as garbage that
+    way); such modules must be built for real."""
+    from mstar.model.chatterbox.loader import materialize
+
+    class WithWindow(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4)
+            self.register_buffer("window", torch.hann_window(16), persistent=False)
+
+    with torch.device("meta"):
+        bad = WithWindow()
+        good = torch.nn.Linear(4, 4)
+    with pytest.raises(ValueError, match="window"):
+        materialize(bad, "cpu", torch.float32)
+    assert materialize(good, "cpu", torch.float32).weight.device.type == "cpu"
