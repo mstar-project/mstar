@@ -26,7 +26,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
-from mstar.model.flux2_klein.submodules import VAE_WARMUP_BATCH_SIZES, compile_vae_decode
+from mstar.model.flux2_klein.submodules import VAE_DECODE_BATCH_SIZES, compile_vae_decode, decode_in_chunks
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -256,25 +256,34 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
 
     def __init__(
         self, vae: nn.Module, config: ZImageConfig, max_batch_size: int = 8, compile_decode: bool = False,
-        warmup_grids: Sequence[tuple[int, int]] = (),
+        warmup_grids: Sequence[tuple[int, int]] = (), decode_batch_sizes: Sequence[int] = VAE_DECODE_BATCH_SIZES,
     ):
         super().__init__()
         self.vae = vae
-        self._decode_fn = compile_vae_decode(vae) if compile_decode else vae.decode  # see KleinVaeDecoderSubmodule
         self.config = config
         self._max_batch_size = max_batch_size
+        # see KleinVaeDecoderSubmodule: static per-size compiles, warmed at load, larger batches split
+        self._compiled = bool(compile_decode)
+        self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
+        self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
         self.warmup(warmup_grids)
 
-    def warmup(self, grids: Sequence[tuple[int, int]], batch_sizes: Sequence[int] = VAE_WARMUP_BATCH_SIZES) -> None:
-        """Decode zeros at ``batch_sizes`` per latent grid at load (see ``KleinVaeDecoderSubmodule.warmup``)."""
+    def _decode_fn(self, latents: torch.Tensor) -> torch.Tensor:
+        return decode_in_chunks(self._decode_one, latents, self._decode_batch_sizes)
+
+    def warmup(self, grids: Sequence[tuple[int, int]]) -> None:
+        """Decode zeros at every decode batch size per latent grid at load (compiled decode only)."""
+        if not self._compiled:
+            return
         patch = self.config.transformer.patch_size
         for h, w in grids:
-            for bs in batch_sizes:
+            for bs in self._decode_batch_sizes:
                 latent = torch.zeros(
                     bs, self.config.transformer.in_channels, h * patch, w * patch, device=self.get_device(),
+                    dtype=self.vae.dtype,
                 )
                 with torch.no_grad():
-                    self._decode(latent)
+                    self._decode_one(latent)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         latents = inputs[LATENTS][0]
