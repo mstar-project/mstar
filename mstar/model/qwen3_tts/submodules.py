@@ -46,6 +46,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     CudaGraphConfig,
+    PackedCudaGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
@@ -107,6 +108,11 @@ class TalkerSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # Prefill prompts are short (a sentence plus the ChatML frame, an optional
+    # instruction and speaker slot): a few token buckets cover them, and the
+    # eager alternative costs ~20 ms of launch overhead per request.
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS = CHATML_ASSISTANT_PREFIX_TOKEN_IDS
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
 
@@ -812,16 +818,34 @@ class TalkerSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
-        """Capture fixed one-token Talker decode batches, including sampling.
+        """Capture fixed one-token Talker decode batches and packed prefills,
+        sampling included.
 
         Dynamic EOS suppression is carried by ``ARNodeInputs`` and packed into
         a graph input, so replay never consults capture-slot dummy request state.
-        Prefill remains eager because it is variable-length and runs once per
-        request.
+        Prefill replays a packed capture of the smallest token bucket that
+        holds the batch; the clone prefill stays eager because it also pushes
+        the reference clip's frames into the codec stream.
         """
         del tp_world_size
         dtype = self.model.model.codec_embedding.weight.dtype
-        return [BatchedCudaGraphConfig(
+        hidden = self.talker_config.hidden_size
+
+        def prefill_input(num_tokens: int) -> ARNodeInputs:
+            return ARNodeInputs(
+                input_embeds=torch.zeros(num_tokens, hidden, dtype=dtype, device=device),
+                input_seq_len=num_tokens,
+                tensor_inputs={"suppress_eos": torch.ones(1, dtype=torch.bool, device=device)},
+            )
+
+        prefill = PackedCudaGraphConfig(
+            capture_graph_walk="talker_prefill",
+            capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+            make_node_input=prefill_input,
+            capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            compile=False,
+        )
+        return [prefill, BatchedCudaGraphConfig(
             capture_graph_walk="talker_decode",
             single_request_inputs=ARNodeInputs(
                 input_embeds=torch.zeros(
@@ -904,9 +928,9 @@ class TalkerSubmodule(ARNodeSubmodule):
     def can_use_cuda_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
-        """Replay the whole decode graph; sampling params are read from buffers,
-        so no request's settings can disqualify it."""
-        if batch.graph_walk != "talker_decode" or not self.can_batch(
+        """Replay the whole decode graph or a packed prefill; sampling params
+        are read from buffers, so no request's settings can disqualify it."""
+        if batch.graph_walk not in ("talker_decode", "talker_prefill") or not self.can_batch(
             batch, model_inputs
         ):
             return False
