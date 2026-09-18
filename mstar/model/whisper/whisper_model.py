@@ -58,7 +58,7 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_file
 from mstar.model.submodule_base import NodeSubmodule
@@ -272,6 +272,8 @@ class WhisperModel(Model):
                     output_modality="text",
                     persist=True,
                 ),
+                # the timestamp rule state the first decode step continues from
+                GraphEdge(next_node=EMPTY_DESTINATION, name="ts_rules", persist=True),
             ]
 
         def encoder_then_decoder() -> GraphSection:
@@ -298,7 +300,7 @@ class WhisperModel(Model):
             name=DECODE_LOOP,
             section=GraphNode(
                 name=DECODER_NODE,
-                input_names=["text_inputs"],
+                input_names=["text_inputs", "ts_rules"],
                 outputs=[
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
@@ -308,6 +310,11 @@ class WhisperModel(Model):
                     GraphEdge(
                         next_node=DECODER_NODE,
                         name="text_inputs",
+                    ),
+                    # the rule state advanced by this step's token
+                    GraphEdge(
+                        next_node=DECODER_NODE,
+                        name="ts_rules",
                     ),
                 ],
             ),
@@ -373,10 +380,13 @@ class WhisperModel(Model):
         ``[detect_language -> prefill_prompt | prefill] -> decode -> done``."""
         metadata = partition_metadata
         new_token = persist_signals.get("new_token", [])
+        ts_rules = persist_signals.get("ts_rules", [])
 
         if metadata.is_prefill:
             if metadata.graph_walk == DETECT_LANGUAGE_WALK:
-                # the sampled language token leads the rest of the prompt
+                # the sampled language token leads the rest of the prompt;
+                # the detection step's rule state is inactive by construction
+                # and is dropped, the prompt step builds the real one
                 metadata.graph_walk = PREFILL_PROMPT_WALK
                 inputs = [
                     self._edge(DECODER_NODE, "text_inputs", new_token),
@@ -385,7 +395,7 @@ class WhisperModel(Model):
                 return ForwardPassArgs(
                     full_metadata=metadata,
                     inputs=inputs,
-                    unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
+                    unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]) + list(ts_rules),
                     step_metadata={"is_prefill": True},
                 )
             metadata.is_prefill = False
@@ -400,7 +410,10 @@ class WhisperModel(Model):
                 request_done=True,
             )
 
-        inputs = [self._edge(DECODER_NODE, "text_inputs", new_token)]
+        inputs = [
+            self._edge(DECODER_NODE, "text_inputs", new_token),
+            self._edge(DECODER_NODE, "ts_rules", ts_rules),
+        ]
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
