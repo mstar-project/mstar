@@ -11,6 +11,7 @@ for audio helpers) — no torch / CUDA.
     print(client.chat("Hello!").text)
     client.tts("Hi there", voice="tara").to_wav("out.wav")
     open("cat.png", "wb").write(client.generate_image("a cat in a hat"))
+    open("edit.png", "wb").write(client.edit_image("make it a watercolor", "cat.png"))
 """
 
 from __future__ import annotations
@@ -135,6 +136,17 @@ class MStarClient:
     def generate_image(self, prompt: str, **model_kwargs) -> bytes:
         """Return PNG bytes for a text-to-image request (e.g. BAGEL)."""
         res = self.generate(text=prompt, output_modalities=("image",), **model_kwargs)
+        if not res.images:
+            raise RuntimeError("Server returned no image output")
+        return res.images[0]
+
+    def edit_image(self, prompt: str, image, **model_kwargs) -> bytes:
+        """Return PNG bytes for an image-editing request: ``image`` (a path, raw
+        bytes or a ``(filename, bytes)`` tuple, or a list of them for multi-reference
+        models) plus the edit instruction (e.g. BAGEL)."""
+        res = self.generate(
+            text=prompt, images=image, output_modalities=("image",), **model_kwargs,
+        )
         if not res.images:
             raise RuntimeError("Server returned no image output")
         return res.images[0]
