@@ -11,7 +11,7 @@ model_kwargs:
   capture_sizes: [[1024, 1024]]
   # captions are padded to multiples of 32 tokens; graphs are captured for these lengths
   capture_caption_lengths: [32, 64]
-  capture_batch_sizes: [1, 2, 4, 8]
+  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode
   vae_compile: true
