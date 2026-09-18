@@ -60,6 +60,7 @@ class ZImageModel(Model):
         skip_weight_loading: bool = False,
         attention_backend: str = "flashinfer",
         compile: bool = True,
+        compile_eager_rounding: bool = True,
         cuda_graph: bool = True,
         capture_sizes: list[list[int]] | None = None,
         capture_caption_lengths: list[int] | None = None,
@@ -75,6 +76,7 @@ class ZImageModel(Model):
         self.skip_weight_loading = skip_weight_loading
         self.attention_backend = attention_backend
         self.compile_transformer = bool(compile)
+        self.compile_eager_rounding = bool(compile_eager_rounding)
         self.cuda_graph = bool(cuda_graph)
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         # Captions round up to a multiple of 32 tokens; short prompts land in the first two buckets.
@@ -296,7 +298,7 @@ class ZImageModel(Model):
             return ZImageDenoiseSubmodule(
                 build_transformer(self.config, self.snapshot, device), self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
-                compile_transformer=self.compile_transformer, max_batch_size=self.max_batch_size,
+                compile_transformer=self.compile_transformer, compile_eager_rounding=self.compile_eager_rounding, max_batch_size=self.max_batch_size,
                 capture_shapes=self.capture_shapes(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("Z-Image has no submodule for node %r; running it dummy", node_name)
