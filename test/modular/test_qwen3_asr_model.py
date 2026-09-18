@@ -401,7 +401,9 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
 
     free = TranscriptionRequest()
     t = ad.parse_transcript("language English<asr_text> Hello there.", free)
-    assert (t.text, t.language) == ("Hello there.", "English")
+    assert (t.text, t.language) == ("Hello there.", "en")  # ISO code, like Whisper's language token
+    assert ad.parse_transcript("language Cantonese<asr_text> x", free).language == "yue"
+    assert ad.parse_transcript("language Klingon<asr_text> x", free).language == "Klingon"
     assert ad.parse_transcript("language None<asr_text>", free).language is None
     assert ad.parse_transcript(" plain words ", req).text == "plain words"
     assert ad.parse_transcript(" plain words ", req).language == "en"
