@@ -93,6 +93,7 @@ class Flux2KleinModel(Model):
         capture_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
+        vae_compile: bool = False,
         lora: list | None = None,
         **kwargs,
     ):
@@ -110,6 +111,7 @@ class Flux2KleinModel(Model):
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
+        self.vae_compile = bool(vae_compile)
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraSpec.parse(item) for item in (lora or [])]
 
@@ -429,7 +431,10 @@ class Flux2KleinModel(Model):
         if node_name == "vae_encoder":
             return KleinVaeEncoderSubmodule(self._vae_module(device), self.config)
         if node_name == "vae_decoder":
-            return KleinVaeDecoderSubmodule(self._vae_module(device), self.config, max_batch_size=self.max_batch_size)
+            return KleinVaeDecoderSubmodule(
+                self._vae_module(device), self.config, max_batch_size=self.max_batch_size,
+                compile_decode=self.vae_compile,
+            )
         if node_name == "dit":
             transformer = build_transformer(self.config, self.snapshot, device)
             if self.loras:
