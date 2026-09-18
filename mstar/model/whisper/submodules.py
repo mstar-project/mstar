@@ -82,6 +82,12 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     # fusions are a second-order gain on these GEMM-bound shapes and cost one
     # compile per bucket, so they are off until measured to win.
     ENCODER_COMPILE = False
+    # The engine's blanket torch.compile of ``forward_batched`` traces the
+    # per-request Python around the tensor work and guards on request ids
+    # and batch composition, so every new batch recompiled (1-2 s stalls,
+    # up to the recompile limit per frame) until it was measured and
+    # switched off. Every window is graph-replayed anyway.
+    disable_torch_compile = True
 
     def __init__(self, encoder: WhisperEncoderModel, config: WhisperModelConfig):
         super().__init__()
@@ -202,6 +208,10 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     # cache can't be admitted; with offload configured it evicts and retries,
     # without it there is nothing to evict and the batch reforms identically.
     MAX_PREFILL_BATCH_SIZE = 32
+    # See the encoder: dynamo recompiled the prefill walks per request id
+    # (a 1-2 s stall each, measured at RTFx 158 -> the fix's number at c=32);
+    # decode steps are graph replays and the prefill is four eager layers.
+    disable_torch_compile = True
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
         super().__init__()
