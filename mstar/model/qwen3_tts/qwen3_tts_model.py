@@ -1,10 +1,14 @@
 """Qwen3-TTS model contract and two-partition streaming topology.
 
-The 0.6B CustomVoice checkpoint is a text-to-speech model without the large
-multimodal Thinker used by Qwen3-Omni. Its autoregressive Talker predicts one
-12 Hz codec frame per step: group 0 comes from the Talker language model and
-groups 1-15 come from a small depth-wise CodePredictor. The speech-tokenizer
-decoder turns those frames into 24 kHz PCM.
+One class serves every 12 Hz checkpoint: 0.6B/1.7B CustomVoice (built-in
+speakers, style instructions on 1.7B), 1.7B VoiceDesign (voice described by
+an instruction) and 1.7B Base (voice cloned from reference audio). They share
+one architecture: an autoregressive Talker predicts one 12 Hz codec frame per
+step, group 0 from the Talker language model and groups 1-15 from a small
+depth-wise CodePredictor, and the speech-tokenizer decoder turns those frames
+into 24 kHz PCM. What differs is only the prefill conditioning, which is
+derived from ``config.json`` (``Qwen3TTSModelConfig``), never from the
+registry key.
 
 Architecture (two asynchronous partitions):
     Talker - text/voice prefill, then autoregressive 16-group codec frames
@@ -60,6 +64,8 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.qwen3_tts.config import (
+    CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
+    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
@@ -174,12 +180,86 @@ def _load_qwen3_tts_decoder_classes() -> tuple[type, type]:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint completeness
+# ---------------------------------------------------------------------------
+
+# Fused M* parameters and the per-shard checkpoint keys that feed them
+# (mirrors ``LLAMA_STACKED_PARAMS`` in the loader).
+_FUSED_SOURCES = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
+
+
+def _checkpoint_keys(checkpoint_dir: str | Path, prefix: str) -> set[str]:
+    """Tensor names under ``prefix`` in a (possibly sharded) safetensors checkpoint."""
+    import json
+
+    from safetensors import safe_open
+
+    root = Path(checkpoint_dir)
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        with index.open(encoding="utf-8") as f:
+            names = json.load(f)["weight_map"].keys()
+    else:
+        with safe_open(str(root / "model.safetensors"), framework="pt") as f:
+            names = list(f.keys())
+    return {name.removeprefix(prefix) for name in names if name.startswith(prefix)}
+
+
+def _expected_checkpoint_keys(module: torch.nn.Module) -> set[str]:
+    """Checkpoint keys an M* module consumes, expanding fused projections."""
+    expected: set[str] = set()
+    for name in dict(module.named_parameters()):
+        for fused, sources in _FUSED_SOURCES.items():
+            if f".{fused}." in name:
+                expected.update(name.replace(f".{fused}.", f".{source}.") for source in sources)
+                break
+        else:
+            expected.add(name)
+    return expected
+
+
+def _verify_checkpoint_coverage(
+    module: torch.nn.Module,
+    loaded: set[str],
+    checkpoint_keys: set[str],
+    component: str,
+) -> None:
+    """Fail startup on any parameter left uninitialized or any key left unused.
+
+    Both directions matter: a missing key means random weights would serve
+    requests; an unused key means the checkpoint carries a component this
+    port silently ignores (the 1.7B code predictor projection, for example).
+    """
+    expected = set(dict(module.named_parameters()))
+    missing = sorted(expected - loaded)
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise RuntimeError(
+            f"{component} checkpoint did not initialize {len(missing)} "
+            f"parameters: {preview}"
+        )
+    unused = sorted(
+        key for key in checkpoint_keys - _expected_checkpoint_keys(module)
+        if "rotary_emb" not in key
+    )
+    if unused:
+        preview = ", ".join(unused[:8])
+        raise RuntimeError(
+            f"{component} checkpoint has {len(unused)} tensors this port does "
+            f"not load: {preview}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Model contract
 # ---------------------------------------------------------------------------
 
 
 class Qwen3TTSModel(Model):
-    """Qwen3-TTS 12 Hz CustomVoice model contract.
+    """Qwen3-TTS 12 Hz model contract (CustomVoice, VoiceDesign, Base).
 
     GPU computation is split into an autoregressive Talker partition and a
     streaming Codec partition. This class owns only model-level scheduling,
@@ -197,12 +277,9 @@ class Qwen3TTSModel(Model):
 
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
+        # Rejects unknown ``tts_model_type`` values; every supported variant
+        # is handled below through the config's capability properties.
         self.config = Qwen3TTSModelConfig.from_pretrained(self.local_dir)
-        if self.config.tts_model_type != "custom_voice":
-            raise ValueError(
-                "The first Qwen3-TTS integration supports only CustomVoice "
-                f"checkpoints, got {self.config.tts_model_type!r}"
-            )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.local_dir,
@@ -286,7 +363,7 @@ class Qwen3TTSModel(Model):
         # Talker-to-Codec stream.
         talker_prefill = GraphNode(
             name="Talker",
-            input_names=["text_inputs", "speaker_id", "language_id"],
+            input_names=list(self.PREFILL_INPUTS),
             outputs=[
                 GraphEdge(
                     next_node=EMPTY_DESTINATION,
@@ -392,45 +469,56 @@ class Qwen3TTSModel(Model):
     # API preprocessing
     # -----------------------------------------------------------------------
 
-    def process_prompt(
-        self,
-        prompt: str | None,
-        input_modalities: list[str],
-        output_modalities: list[str],
-        tensors: NameToTensorList | None = None,
-        **kwargs: Any,
-    ) -> NameToTensorList:
-        """Validate a CustomVoice request and build Talker input tensors.
+    # Prompt templates of the reference ``qwen_tts`` inference wrapper. The
+    # assistant wrapper is fixed at 3 + 5 tokens (see ``_validate_chatml``),
+    # which is how the text span is located inside the tokenized turn.
+    ASSISTANT_TEMPLATE = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+    INSTRUCT_TEMPLATE = "<|im_start|>user\n{instruct}<|im_end|>\n"
+    # Tensors ``process_prompt`` produces and the Talker prefill consumes.
+    PREFILL_INPUTS = ("text_inputs", "prompt_layout", "speaker_id", "language_id")
 
-        Qwen3-TTS expects an assistant ChatML turn rather than a generic user
-        turn. Speaker and language are separate codec-side conditioning IDs;
-        ``-1`` means automatic language selection.
+    def _tokenize(self, text: str) -> torch.Tensor:
+        encoded = self.tokenizer(text, return_tensors="pt", padding=True)
+        ids = encoded["input_ids"]
+        if ids.ndim == 2:
+            ids = ids[0]
+        return ids.to(dtype=torch.long)
+
+    def _resolve_speaker(self, kwargs: dict[str, Any]) -> tuple[str | None, int]:
+        """Map ``voice``/``speaker`` onto a codec speaker tag (``-1`` = none).
+
+        CustomVoice checkpoints carry named speakers and fall back to the
+        default one. VoiceDesign and Base have none: the voice comes from the
+        instruction or the reference audio, so naming one is an error rather
+        than something to ignore silently.
         """
-        del tensors
-        if not prompt:
-            raise ValueError("Qwen3-TTS requires a non-empty text prompt")
-        if set(input_modalities) != {"text"}:
+        requested = kwargs.get("speaker", kwargs.get("voice"))
+        if requested is None or requested == "":
+            requested = self.config.default_speaker
+            if requested is None:
+                return None, -1
+        elif not self.config.has_builtin_speakers:
             raise ValueError(
-                "Qwen3-TTS CustomVoice currently supports text input only"
+                f"Qwen3-TTS {self.config.tts_model_type} checkpoints have no "
+                "built-in speakers; describe the voice with 'instruct' "
+                "(VoiceDesign) or supply reference audio (Base) instead of 'voice'"
             )
-        if set(output_modalities) != {"audio"}:
-            raise ValueError("Qwen3-TTS CustomVoice supports audio output only")
-        if kwargs.get("instruct"):
-            raise ValueError(
-                "Qwen3-TTS 0.6B CustomVoice does not support instructions"
-            )
-
-        speaker = str(
-            kwargs.get("speaker", kwargs.get("voice", self.config.default_speaker))
-        ).lower()
+        speaker = str(requested).lower()
         if speaker not in self.config.talker.spk_id:
             supported = ", ".join(sorted(self.config.talker.spk_id))
             raise ValueError(
                 f"Unsupported Qwen3-TTS speaker {speaker!r}; supported: {supported}"
             )
+        return speaker, self.config.talker.spk_id[speaker]
 
+    def _resolve_language(self, kwargs: dict[str, Any], speaker: str | None) -> int:
+        """Map ``language`` onto a codec language tag (``-1`` = automatic)."""
         language = str(kwargs.get("language", self.config.default_language)).lower()
-        dialect = self.config.talker.spk_is_dialect.get(speaker, False)
+        dialect = (
+            self.config.talker.spk_is_dialect.get(speaker, False)
+            if speaker is not None
+            else False
+        )
         if dialect and language in {"auto", "chinese"}:
             language = str(dialect).lower()
 
@@ -444,29 +532,80 @@ class Qwen3TTSModel(Model):
             raise ValueError(
                 f"Unsupported Qwen3-TTS language {language!r}; supported: {supported}"
             )
+        return self.config.talker.codec_language_id.get(language, -1)
 
-        # Match the official processor template exactly. `_build_prefill`
-        # relies on the fixed assistant suffix when separating prompt tokens
-        # into the initial prefill and per-frame text conditioning stream.
-        formatted = (
-            f"<|im_start|>assistant\n{prompt}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
-        encoded = self.tokenizer(
-            formatted,
-            return_tensors="pt",
-            padding=True,
-        )
-        text_inputs = encoded["input_ids"]
-        if text_inputs.ndim == 2:
-            text_inputs = text_inputs[0]
+    def _resolve_instruct(self, kwargs: dict[str, Any]) -> str:
+        """Style/voice instruction; ``instructions`` is the OpenAI field name."""
+        instruct = kwargs.get("instruct", kwargs.get("instructions")) or ""
+        instruct = str(instruct).strip()
+        if instruct and not self.config.supports_instruct:
+            raise ValueError(
+                f"Qwen3-TTS {self.config.tts_model_size} "
+                f"{self.config.tts_model_type} does not support instructions"
+            )
+        if not instruct and self.config.requires_instruct:
+            raise ValueError(
+                "Qwen3-TTS VoiceDesign requires an 'instruct' describing the voice"
+            )
+        return instruct
 
-        language_id = self.config.talker.codec_language_id.get(language, -1)
+    def process_prompt(
+        self,
+        prompt: str | None,
+        input_modalities: list[str],
+        output_modalities: list[str],
+        tensors: NameToTensorList | None = None,
+        **kwargs: Any,
+    ) -> NameToTensorList:
+        """Validate a request against the checkpoint variant and tokenize it.
+
+        Produces the four ``PREFILL_INPUTS`` tensors. ``text_inputs`` is the
+        optional instruction turn followed by the assistant turn (both in the
+        reference ChatML templates); ``prompt_layout`` is
+        ``[instruct_len, text_len, stream_text]``. ``stream_text`` follows the
+        reference default per variant (whole text in the prefill for
+        CustomVoice/VoiceDesign, one token per frame for Base) unless the
+        request sets ``non_streaming_mode``.
+        """
+        del tensors
+        if not prompt:
+            raise ValueError("Qwen3-TTS requires a non-empty text prompt")
+        if set(input_modalities) != {"text"}:
+            raise ValueError("Qwen3-TTS currently supports text input only")
+        if set(output_modalities) != {"audio"}:
+            raise ValueError("Qwen3-TTS supports audio output only")
+        if self.config.is_base:
+            raise ValueError(
+                "Qwen3-TTS Base clones a voice from reference audio, which "
+                "this build does not accept yet; use a CustomVoice or "
+                "VoiceDesign checkpoint for text-only requests"
+            )
+
+        speaker, speaker_id = self._resolve_speaker(kwargs)
+        language_id = self._resolve_language(kwargs, speaker)
+        instruct = self._resolve_instruct(kwargs)
+        stream_text = not bool(
+            kwargs.get("non_streaming_mode", self.config.default_non_streaming_mode)
+        )
+
+        assistant_ids = self._tokenize(self.ASSISTANT_TEMPLATE.format(text=prompt))
+        wrapper_len = len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS) + len(
+            CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
+        )
+        text_len = assistant_ids.numel() - wrapper_len
+        if text_len < 1:
+            raise ValueError("Qwen3-TTS prompt tokenized to no text tokens")
+        instruct_ids = (
+            self._tokenize(self.INSTRUCT_TEMPLATE.format(instruct=instruct))
+            if instruct
+            else assistant_ids.new_empty(0)
+        )
         return {
-            "text_inputs": [text_inputs.to(dtype=torch.long)],
-            "speaker_id": [torch.tensor(
-                [self.config.talker.spk_id[speaker]], dtype=torch.long
+            "text_inputs": [torch.cat([instruct_ids, assistant_ids])],
+            "prompt_layout": [torch.tensor(
+                [instruct_ids.numel(), text_len, int(stream_text)], dtype=torch.long
             )],
+            "speaker_id": [torch.tensor([speaker_id], dtype=torch.long)],
             "language_id": [torch.tensor([language_id], dtype=torch.long)],
         }
 
@@ -500,7 +639,7 @@ class Qwen3TTSModel(Model):
                 },
             )
             inputs = []
-            for name in ("text_inputs", "speaker_id", "language_id"):
+            for name in self.PREFILL_INPUTS:
                 edge = GraphEdge(next_node="Talker", name=name)
                 edge.tensor_info = input_signals.get(name, [])
                 inputs.append(edge)
@@ -694,22 +833,6 @@ class Qwen3TTSModel(Model):
         self._submodule_cache[node_name] = submodule
         return submodule
 
-    @staticmethod
-    def _verify_loaded(
-        module: torch.nn.Module,
-        loaded: set[str],
-        component: str,
-    ) -> None:
-        """Fail startup if checkpoint filtering left any parameter uninitialized."""
-        expected = set(dict(module.named_parameters()))
-        missing = sorted(expected - loaded)
-        if missing:
-            preview = ", ".join(missing[:8])
-            raise RuntimeError(
-                f"{component} checkpoint did not initialize {len(missing)} "
-                f"parameters: {preview}"
-            )
-
     def _create_talker_submodule(
         self,
         device: str,
@@ -746,7 +869,12 @@ class Qwen3TTSModel(Model):
             talker_weights(),
             stacked_params=LLAMA_STACKED_PARAMS,
         )
-        self._verify_loaded(talker, loaded, "Qwen3-TTS Talker")
+        cp_prefix = "talker.code_predictor."
+        talker_keys = {
+            key for key in _checkpoint_keys(self.local_dir, "talker.")
+            if not key.startswith("code_predictor.")
+        }
+        _verify_checkpoint_coverage(talker, loaded, talker_keys, "Qwen3-TTS Talker")
         talker.eval()
 
         # CodePredictor is small and depth-wise. It is loaded separately from
@@ -756,7 +884,6 @@ class Qwen3TTSModel(Model):
         if autocast_dtype is not None:
             code_predictor = code_predictor.to(autocast_dtype)
         code_predictor.to_empty(device=device)
-        cp_prefix = "talker.code_predictor."
         cp_weights = (
             (name.removeprefix(cp_prefix), tensor)
             for name, tensor in iter_safetensors_shards(
@@ -768,8 +895,11 @@ class Qwen3TTSModel(Model):
             cp_weights,
             stacked_params=LLAMA_STACKED_PARAMS,
         )
-        self._verify_loaded(
-            code_predictor, loaded, "Qwen3-TTS CodePredictor"
+        _verify_checkpoint_coverage(
+            code_predictor,
+            loaded,
+            _checkpoint_keys(self.local_dir, cp_prefix),
+            "Qwen3-TTS CodePredictor",
         )
         # The captured depth loop indexes all residual LM heads as one tensor;
         # consolidate after the individual checkpoint heads are loaded.
@@ -812,7 +942,9 @@ class Qwen3TTSModel(Model):
             )
         )
         loaded = load_hf_weights(decoder, weights)
-        self._verify_loaded(decoder, loaded, "Qwen3-TTS Codec")
+        _verify_checkpoint_coverage(
+            decoder, loaded, _checkpoint_keys(codec_dir, prefix), "Qwen3-TTS Codec"
+        )
         decoder.eval()
         return CodecSubmodule(decoder, self.config)
 
