@@ -215,9 +215,10 @@ def _checkpoint_keys(checkpoint_dir: str | Path, prefix: str) -> set[str]:
 
 
 def _expected_checkpoint_keys(module: torch.nn.Module) -> set[str]:
-    """Checkpoint keys an M* module consumes, expanding fused projections."""
+    """Checkpoint keys an M* module consumes: its state dict (parameters and
+    persistent buffers), with fused projections expanded to their shards."""
     expected: set[str] = set()
-    for name in dict(module.named_parameters()):
+    for name in module.state_dict():
         for fused, sources in _FUSED_SOURCES.items():
             if f".{fused}." in name:
                 expected.update(name.replace(f".{fused}.", f".{source}.") for source in sources)
@@ -227,25 +228,48 @@ def _expected_checkpoint_keys(module: torch.nn.Module) -> set[str]:
     return expected
 
 
+def _load_buffers(
+    module: torch.nn.Module,
+    weights,
+) -> set[str]:
+    """Copy checkpoint tensors into the module's persistent buffers.
+
+    ``load_hf_weights`` only fills parameters. Codec quantizers keep their
+    codebooks in buffers (``embed_sum`` / ``cluster_usage``), so a checkpoint
+    must be able to refill those too. Returns the buffer names it filled.
+    """
+    persistent = set(module.state_dict()) - set(dict(module.named_parameters()))
+    buffers = {name: buf for name, buf in module.named_buffers() if name in persistent}
+    loaded: set[str] = set()
+    for name, tensor in weights:
+        target = buffers.get(name)
+        if target is None:
+            continue
+        target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+        loaded.add(name)
+    return loaded
+
+
 def _verify_checkpoint_coverage(
     module: torch.nn.Module,
     loaded: set[str],
     checkpoint_keys: set[str],
     component: str,
 ) -> None:
-    """Fail startup on any parameter left uninitialized or any key left unused.
+    """Fail startup on any state left uninitialized or any key left unused.
 
-    Both directions matter: a missing key means random weights would serve
-    requests; an unused key means the checkpoint carries a component this
-    port silently ignores (the 1.7B code predictor projection, for example).
+    Both directions matter: a missing key means random weights (or default
+    buffers) would serve requests; an unused key means the checkpoint carries
+    a component this port silently ignores (the 1.7B code predictor
+    projection, or a quantizer codebook kept in buffers, for example).
     """
-    expected = set(dict(module.named_parameters()))
+    expected = set(module.state_dict())
     missing = sorted(expected - loaded)
     if missing:
         preview = ", ".join(missing[:8])
         raise RuntimeError(
             f"{component} checkpoint did not initialize {len(missing)} "
-            f"parameters: {preview}"
+            f"tensors: {preview}"
         )
     unused = sorted(
         key for key in checkpoint_keys - _expected_checkpoint_keys(module)
@@ -1061,13 +1085,12 @@ class Qwen3TTSModel(Model):
 
         codec_dir = Path(self.local_dir) / "speech_tokenizer"
         prefix = "decoder."
-        weights = (
-            (name.removeprefix(prefix), tensor)
-            for name, tensor in iter_safetensors_shards(
-                codec_dir, device=device, prefix=prefix
-            )
-        )
-        loaded = load_hf_weights(decoder, weights)
+
+        def weights():
+            for name, tensor in iter_safetensors_shards(codec_dir, device=device, prefix=prefix):
+                yield name.removeprefix(prefix), tensor
+
+        loaded = load_hf_weights(decoder, weights()) | _load_buffers(decoder, weights())
         _verify_checkpoint_coverage(
             decoder, loaded, _checkpoint_keys(codec_dir, prefix), "Qwen3-TTS Codec"
         )
@@ -1098,13 +1121,12 @@ class Qwen3TTSModel(Model):
             speaker_encoder = speaker_encoder.to(autocast_dtype)
         speaker_encoder = speaker_encoder.to(device=device)
         prefix = "speaker_encoder."
-        loaded = load_hf_weights(
-            speaker_encoder,
-            (
-                (name.removeprefix(prefix), tensor)
-                for name, tensor in iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)
-            ),
-        )
+
+        def speaker_weights():
+            for name, tensor in iter_safetensors_shards(self.local_dir, device=device, prefix=prefix):
+                yield name.removeprefix(prefix), tensor
+
+        loaded = load_hf_weights(speaker_encoder, speaker_weights())
         _verify_checkpoint_coverage(
             speaker_encoder, loaded, _checkpoint_keys(self.local_dir, prefix), "Qwen3-TTS speaker encoder"
         )
@@ -1112,20 +1134,20 @@ class Qwen3TTSModel(Model):
 
         # Mimi encoder of the speech tokenizer: reference clip -> codec frames.
         # Float32 like the decoder; built on the CPU for its non-persistent
-        # buffers (rotary tables, convolution geometry).
+        # buffers (rotary tables, convolution geometry). Its quantizer keeps
+        # the codebooks in persistent buffers, which the checkpoint refills.
         _, _, encoder_cls = _load_qwen3_tts_codec_classes()
         codec_encoder = encoder_cls(MimiConfig(**self.config.codec.encoder_config)).to(device=device)
         codec_dir = Path(self.local_dir) / "speech_tokenizer"
-        prefix = "encoder."
-        loaded = load_hf_weights(
-            codec_encoder,
-            (
-                (name.removeprefix(prefix), tensor)
-                for name, tensor in iter_safetensors_shards(codec_dir, device=device, prefix=prefix)
-            ),
-        )
+        encoder_prefix = "encoder."
+
+        def encoder_weights():
+            for name, tensor in iter_safetensors_shards(codec_dir, device=device, prefix=encoder_prefix):
+                yield name.removeprefix(encoder_prefix), tensor
+
+        loaded = load_hf_weights(codec_encoder, encoder_weights()) | _load_buffers(codec_encoder, encoder_weights())
         _verify_checkpoint_coverage(
-            codec_encoder, loaded, _checkpoint_keys(codec_dir, prefix), "Qwen3-TTS codec encoder"
+            codec_encoder, loaded, _checkpoint_keys(codec_dir, encoder_prefix), "Qwen3-TTS codec encoder"
         )
         codec_encoder.eval()
         return RefEncoderSubmodule(
