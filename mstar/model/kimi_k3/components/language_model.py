@@ -134,10 +134,11 @@ class KimiK3LanguageModel(nn.Module):
     def forward(self, hidden: torch.Tensor, *, label: str = "main", aux_layers: tuple[int, ...] | None = None,
                 aux_sink: Callable[[int, torch.Tensor], None] | None = None):
         """Paged path over packed tokens ``hidden [T, H]``; returns the final-normed
-        hidden states ``[T, H]``. With ``aux_layers`` also the residual stream entering each of
-        those layers (the stream after layer ``L - 1``: the running prefix plus the pending MLP
-        output, vLLM's default aux capture for Kimi K3), as a list in the given order, for a
-        speculative draft. With ``aux_sink`` each state goes to ``aux_sink(j, state)`` (``j`` its
+        hidden states ``[T, H]``. With ``aux_layers`` also the residual stream leaving each of
+        those layers (0-based: the running prefix plus the pending MLP output after layer ``L``;
+        vLLM feeds a DSpark draft's ``target_layer_ids`` this way, its capture list being those
+        ids plus one), as a list in the given order, for a speculative draft. With ``aux_sink``
+        each state goes to ``aux_sink(j, state)`` (``j`` its
         index in ``aux_layers``) as it appears and is not kept, so the list comes back empty: the
         draft's context projection sums over the states one at a time and a long prefill never
         holds all of them."""
@@ -149,7 +150,7 @@ class KimiK3LanguageModel(nn.Module):
         for i, layer in enumerate(self.layers):
             self._set_cursors(layer)
             prefix, blocks, pending = layer(prefix, blocks, pending)
-            if aux_layers is not None and i + 1 in aux_layers:
+            if aux_layers is not None and i in aux_layers:
                 state = prefix if pending is None else prefix + pending
                 if aux_sink is None:
                     aux.append(state)
