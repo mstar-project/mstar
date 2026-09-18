@@ -325,6 +325,35 @@ class OrpheusAdapter(OpenAIAdapter):
         )
 
 
+class KokoroAdapter(OpenAIAdapter):
+    """Kokoro-82M: text-to-speech, audio out only.
+
+    ``voice`` is a bundled voice or a blend (``af_bella+af_sky``,
+    ``af_bella(2)+af_sky(1)``) and ``speed`` scales the predicted durations;
+    both are real model knobs and are forwarded. Kokoro does not sample, so
+    ``temperature`` / ``top_p`` are ignored. ``lang_code`` (a G2P language
+    override; the default follows the voice's prefix) and ``phonemes`` (skip
+    G2P) arrive through ``extra_body``.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk.setdefault("voice", req.voice)
+        if getattr(req, "speed", None) is not None:
+            mk.setdefault("speed", req.speed)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -455,6 +484,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "orpheus": OrpheusAdapter(),
+    "kokoro": KokoroAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),
