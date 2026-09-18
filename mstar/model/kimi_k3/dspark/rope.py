@@ -52,6 +52,10 @@ class YarnRotary(nn.Module):
         self.register_buffer("sin", (freqs.sin() * table_scale).repeat_interleave(2, dim=-1), persistent=False)
 
     def apply(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda and x.is_contiguous() and positions.is_contiguous():
+            from mstar.model.kimi_k3.dspark.rope_kernel import yarn_rope_fused
+
+            return yarn_rope_fused(x, self.cos, self.sin, positions)  # one launch, bit-identical to below
         cos, sin = self.cos[positions], self.sin[positions]  # [T, dim]
         if x.dim() == 3:
             cos, sin = cos[:, None, :], sin[:, None, :]
