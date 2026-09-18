@@ -67,6 +67,10 @@ class SpecAcceptance(Resource):
         # rid -> (seq, slot, row) until its step's mirrors are read, then -> Verdict
         self._pending: dict[str, tuple[int, int | None, int] | Verdict] = {}
         self._max_rows_seen = 0
+        # acceptance statistics over the settled verdicts (every real row of every verify step)
+        self.rows_settled = 0
+        self.accepted_total = 0
+        self._log_every = 2000
 
     @classmethod
     def build(cls, spec: SpecAcceptanceSpec, info: EngineResourceInfo):
@@ -89,6 +93,8 @@ class SpecAcceptance(Resource):
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
 
     def cleanup(self):
+        if self.rows_settled:
+            logger.info("speculation, final: %s", self.stats())
         for d in (self._acc_dev, self._acc_host, self._tok_dev, self._tok_host):
             d.clear()
         self._pending.clear()
@@ -191,7 +197,21 @@ class SpecAcceptance(Resource):
             if isinstance(verdict, Verdict):
                 continue
             seq, slot, row = verdict
-            self._pending[rid] = Verdict(int(self._acc_host[slot][row]), self._tok_host[slot][row].tolist())
+            accepted = int(self._acc_host[slot][row])
+            self._pending[rid] = Verdict(accepted, self._tok_host[slot][row].tolist())
+            self.rows_settled += 1
+            self.accepted_total += accepted
+            if self.rows_settled % self._log_every == 0:
+                logger.info("speculation: %s", self.stats())
+
+    @property
+    def mean_accepted(self) -> float:
+        """Drafts accepted per verify row so far (0..k); tokens per step = this + 1."""
+        return self.accepted_total / self.rows_settled if self.rows_settled else 0.0
+
+    def stats(self) -> str:
+        return (f"{self.rows_settled} verify rows, {self.mean_accepted:.2f} of {self.k} drafts accepted per row "
+                f"({self.mean_accepted + 1:.2f} tokens per step)")
 
     def _wait(self, seq: int) -> None:
         if self.device.type != "cuda":
