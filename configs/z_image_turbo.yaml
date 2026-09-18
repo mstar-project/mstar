@@ -13,6 +13,8 @@ model_kwargs:
   capture_caption_lengths: [32, 64]
   capture_batch_sizes: [1, 2, 4, 8]
   max_batch_size: 8
+  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode
+  vae_compile: true
 
 node_groups:
   - node_names: [text_encoder]
