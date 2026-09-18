@@ -152,6 +152,8 @@ class Flux2KleinModel(Model):
                     head_dim=tcfg.attention_head_dim,
                     # one request == one bidirectional segment over [txt | img | ref]
                     max_segments_per_request=1,
+                    # the DiT's activation dtype: there is no KV cache to inherit one from
+                    dtype=torch.bfloat16,
                 ),
             )
         ]
@@ -224,20 +226,24 @@ class Flux2KleinModel(Model):
         from PIL import Image
 
         with Image.open(filepath) as raw:
-            image = raw.convert("RGB")
-        width, height = image.size
-        if width < 64 or height < 64:
-            raise ValueError(f"reference image too small: {width}x{height}; both sides must be >= 64 px")
-        if max(width / height, height / width) > 8:
-            raise ValueError(f"reference image aspect ratio too extreme: {width}x{height} (max 8:1)")
-        if width * height > self.config.ref_image_max_area:
-            scale = math.sqrt(self.config.ref_image_max_area / (width * height))
-            width, height = int(width * scale), int(height * scale)
-            image = image.resize((width, height), Image.Resampling.LANCZOS)
-        align = self.config.spatial_alignment
-        crop_w, crop_h = (width // align) * align, (height // align) * align
-        left, top = (width - crop_w) // 2, (height - crop_h) // 2
-        image = image.crop((left, top, left + crop_w, top + crop_h))
+            raw.load()
+            image = raw
+            width, height = image.size
+            if width < 64 or height < 64:
+                raise ValueError(f"reference image too small: {width}x{height}; both sides must be >= 64 px")
+            if max(width / height, height / width) > 8:
+                raise ValueError(f"reference image aspect ratio too extreme: {width}x{height} (max 8:1)")
+            if width * height > self.config.ref_image_max_area:
+                scale = math.sqrt(self.config.ref_image_max_area / (width * height))
+                width, height = int(width * scale), int(height * scale)
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+            align = self.config.spatial_alignment
+            crop_w, crop_h = (width // align) * align, (height // align) * align
+            left, top = (width - crop_w) // 2, (height - crop_h) // 2
+            image = image.crop((left, top, left + crop_w, top + crop_h))
+            # RGB last, as the reference image processor does: resampling an RGBA or palette
+            # image and then dropping the alpha differs from resampling its RGB conversion
+            image = image.convert("RGB")
         tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1).contiguous()
         return TensorAndMetadata(tensor.to(torch.float32).div_(255.0).to(device))
 
