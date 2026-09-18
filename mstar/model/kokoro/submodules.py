@@ -21,6 +21,8 @@ sentence is not padded to a long one. Anything without a captured bucket
 from __future__ import annotations
 
 import logging
+import os
+import time
 from functools import partial
 from typing import Any
 
@@ -50,6 +52,13 @@ from mstar.model.kokoro.config import (
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
+# One line per batched step (batch size, text bucket, frame groups, ms) when
+# MSTAR_KOKORO_STEP_LOG=1; a diagnostic, off by default (it syncs the device).
+step_logger = logging.getLogger(__name__ + ".steps")
+if os.environ.get("MSTAR_KOKORO_STEP_LOG"):
+    step_logger.setLevel(logging.INFO)
+else:
+    step_logger.setLevel(logging.WARNING)
 
 PCM16_SCALE = 32767
 
@@ -67,12 +76,26 @@ def pick_bucket(size: int, buckets: list[int]) -> int | None:
     return next((b for b in buckets if b >= size), None)
 
 
-def group_by_bucket(sizes: list[int], buckets: list[int]) -> list[tuple[int | None, list[int]]]:
-    """Row indices grouped by the bucket their size falls in, ascending; rows
-    that fit no bucket form a final ``(None, rows)`` group."""
+def group_by_bucket(
+    sizes: list[int], buckets: list[int], policy: str = "bucket"
+) -> list[tuple[int | None, list[int]]]:
+    """Row indices grouped by frame bucket, ascending; rows that fit no bucket
+    form a final ``(None, rows)`` group.
+
+    ``policy="single"`` puts every row that fits some bucket into the largest
+    needed bucket instead: one replay per step at the cost of padding.
+    """
     groups: dict[int | None, list[int]] = {}
     for row, size in enumerate(sizes):
         groups.setdefault(pick_bucket(size, buckets), []).append(row)
+    if policy == "single":
+        fitted = [(bucket, rows) for bucket, rows in groups.items() if bucket is not None]
+        if fitted:
+            largest = max(bucket for bucket, _ in fitted)
+            merged = sorted(row for _, rows in fitted for row in rows)
+            groups = {largest: merged, **({None: groups[None]} if None in groups else {})}
+    elif policy != "bucket":
+        raise ValueError(f"Unknown frame_grouping {policy!r}; use 'bucket' or 'single'")
     return sorted(groups.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))
 
 
@@ -206,11 +229,17 @@ class KokoroSynthSubmodule(NodeSubmodule):
         runners: dict[str, Any],
     ) -> list[torch.Tensor]:
         """One PCM16 chunk per row, sliced to its own length."""
+        logging_step = step_logger.isEnabledFor(logging.INFO)
+        if logging_step:
+            if input_ids.is_cuda:
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
         d, t_en, pred_dur = self._encode_text(input_ids, lengths, style, speed, runners)
         frame_lengths = pred_dur.sum(dim=1)
         sizes = frame_lengths.tolist()  # the one host read
         pcm: list[torch.Tensor | None] = [None] * len(sizes)
-        for bucket, rows in group_by_bucket(sizes, self.config.frame_buckets):
+        groups = group_by_bucket(sizes, self.config.frame_buckets, self.config.frame_grouping)
+        for bucket, rows in groups:
             index = torch.tensor(rows, device=input_ids.device)
             runner = runners.get(frame_region(bucket)) if bucket is not None else None
             if runner is not None and runner.can_run(len(rows)):
@@ -227,6 +256,17 @@ class KokoroSynthSubmodule(NodeSubmodule):
             audio = (audio.clamp(-1, 1) * PCM16_SCALE).to(torch.int16)
             for i, row in enumerate(rows):
                 pcm[row] = audio[i, : sizes[row] * self.config.samples_per_frame]
+        if logging_step:
+            if input_ids.is_cuda:
+                torch.cuda.synchronize()
+            step_logger.info(
+                "step bs=%d T=%d frames=%s groups=%s %.1f ms",
+                len(sizes),
+                input_ids.shape[1],
+                sizes,
+                [(b, len(r)) for b, r in groups],
+                (time.perf_counter() - t0) * 1000,
+            )
         return pcm
 
     def _encode_text(
