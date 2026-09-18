@@ -519,6 +519,9 @@ class Wan22Adapter(OpenAIAdapter):
 _CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
 _TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
+# Whisper's word timings follow the transcript after this marker, one
+# ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
+_WORDS_MARKER = "<|startoflm|>"
 
 
 def _transcription_kwargs(req: TranscriptionRequest) -> dict:
@@ -574,45 +577,61 @@ class WhisperAdapter(OpenAIAdapter):
         )
 
     def stream_delta(self, text: str) -> str:
+        if _WORDS_MARKER in text:
+            return ""  # the word timings arrive as one chunk after the transcript
         return _CONTROL_TOKEN.sub("", text)
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
-        language: str | None = None
-        segments: list[dict] = []
-        parts: list[str] = []
-        start: float | None = None
-        buffer: list[str] = []
-        cursor = 0
-        for match in _CONTROL_TOKEN.finditer(text):
-            span = text[cursor:match.start()]
-            cursor = match.end()
-            (buffer if start is not None else parts).append(span)
-            token = match.group(1)
-            if _TIMESTAMP.match(token):
-                stamp = float(token)
-                if start is None:
-                    start = stamp
-                else:
-                    segment_text = "".join(buffer).strip()
-                    if segment_text:
-                        segments.append({"start": start, "end": stamp, "text": segment_text})
-                        parts.append(segment_text)
-                    buffer = []
-                    start = None
-            elif language is None and _LANGUAGE.match(token):
-                language = token
-        tail = text[cursor:]
-        (buffer if start is not None else parts).append(tail)
-        if start is not None and "".join(buffer).strip():
-            # an open segment at the end of the stream: keep its text, no end
-            parts.append("".join(buffer).strip())
+        text, _, timed_words = text.partition(_WORDS_MARKER)
+        language, segments, parts, unfinished = _parse_timestamped(text)
         clean = " ".join(p.strip() for p in parts if p.strip())
         for idx, seg in enumerate(segments):
             seg["id"] = idx
+        words = [
+            {"word": seg["text"], "start": seg["start"], "end": seg["end"]}
+            for seg in _parse_timestamped(timed_words)[1]
+        ] if timed_words else []
         return Transcript(
-            text=clean, language=language or req.language, segments=segments,
-            unfinished=start is not None,
+            text=clean, language=language or req.language, segments=segments, words=words,
+            unfinished=unfinished,
         )
+
+
+def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bool]:
+    """Walk Whisper's rendered stream: ``(language, closed segments, text
+    pieces in order, whether a segment was left open)``. A segment is the
+    text between a start and an end timestamp; text outside timestamps is
+    kept as is."""
+    language: str | None = None
+    segments: list[dict] = []
+    parts: list[str] = []
+    start: float | None = None
+    buffer: list[str] = []
+    cursor = 0
+    for match in _CONTROL_TOKEN.finditer(text):
+        span = text[cursor:match.start()]
+        cursor = match.end()
+        (buffer if start is not None else parts).append(span)
+        token = match.group(1)
+        if _TIMESTAMP.match(token):
+            stamp = float(token)
+            if start is None:
+                start = stamp
+            else:
+                segment_text = "".join(buffer).strip()
+                if segment_text:
+                    segments.append({"start": start, "end": stamp, "text": segment_text})
+                    parts.append(segment_text)
+                buffer = []
+                start = None
+        elif language is None and _LANGUAGE.match(token):
+            language = token
+    tail = text[cursor:]
+    (buffer if start is not None else parts).append(tail)
+    if start is not None and "".join(buffer).strip():
+        # an open segment at the end of the stream: keep its text, no end
+        parts.append("".join(buffer).strip())
+    return language, segments, parts, start is not None
 
 
 class HiggsAudioAdapter(OpenAIAdapter):
