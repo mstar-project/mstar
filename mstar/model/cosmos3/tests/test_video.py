@@ -264,3 +264,33 @@ def _main() -> None:
 
 if __name__ == "__main__":
     _main()
+
+
+def test_video_postprocess_falls_back_to_pyav(monkeypatch) -> None:
+    """Without a loadable torchcodec (the compute nodes have no FFmpeg shared
+    libraries, so its import raises a RuntimeError, not an ImportError), the
+    mp4 is encoded through PyAV's bundled libx264 at the request frame rate,
+    and it decodes back to the same frame count and size."""
+    import io
+    import sys
+
+    import av
+    import torch
+
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    class _Broken:
+        def __getattr__(self, name):
+            raise RuntimeError("Could not load libtorchcodec")
+
+    monkeypatch.setitem(sys.modules, "torchcodec", _Broken())
+    monkeypatch.setitem(sys.modules, "torchcodec.encoders", None)
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    video = torch.randint(0, 255, (1, 3, 9, 48, 64), dtype=torch.uint8)
+    data = model.postprocess(video, "video", {"fps": 12.0})
+    assert data[4:8] == b"ftyp"
+    with av.open(io.BytesIO(data)) as container:
+        stream = container.streams.video[0]
+        frames = [f for f in container.decode(stream)]
+    assert len(frames) == 9 and (frames[0].width, frames[0].height) == (64, 48)
+    assert stream.codec_context.name == "h264" and float(stream.average_rate) == 12.0
