@@ -1464,18 +1464,52 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
         }}})
 
     assert submodule.cg_key_info("codec_chunk", {"a": meta(3), "b": meta(4)}) == 4
-    assert submodule.cg_key_info("codec_chunk", {"a": meta(1), "b": meta(4)}) is None
+    # Requests at different points of the ramp share a batch: the key (and the
+    # padding in preprocess) is the widest window among them.
+    assert submodule.cg_key_info("codec_chunk", {"a": meta(1), "b": meta(4)}) == 4
     for rid in ("a", "b"):
         submodule.request_state(rid).add("codec_bucket", 4)
     assert submodule.cg_key_info("codec_chunk", {"a": None, "b": None}) == 4
     submodule.request_state("b").add("codec_bucket", 1)
-    assert submodule.cg_key_info("codec_chunk", {"a": None, "b": None}) is None
+    assert submodule.cg_key_info("codec_chunk", {"a": None, "b": None}) == 4
 
-    mixed = model_inputs + [ARNodeInputs(tensor_inputs={"codec_tokens": torch.zeros(4, 1, dtype=torch.long)})]
-    assert not submodule.can_batch(batch, mixed)
+    mixed = model_inputs + [ARNodeInputs(tensor_inputs={"codec_tokens": torch.ones(4, 1, dtype=torch.long)})]
+    assert submodule.can_batch(batch, mixed)
+    assert submodule.can_use_cuda_graphs(batch, mixed)
+    packed = submodule.preprocess(
+        "codec_chunk", ModelInputsFromEngine(request_ids=["a", "b", "c"], per_request_info={}), mixed,
+    )
+    assert packed["codec_tokens"].shape == (3, 4, 4)
+    assert packed["codec_tokens"][2].tolist() == [[1, 0, 0, 0]] * 4   # 1-frame window padded on the right
     oversized = model_inputs * 9
     assert len(oversized) == 18
     assert not submodule.can_batch(batch, oversized)
+
+
+def test_qwen3_tts_codec_single_forward_yields_one_request_samples():
+    """The eager single-request path must hand postprocess a ``[samples]``
+    tensor: slicing a ``[1, samples]`` batch on its first axis emitted empty
+    chunks whenever a window carried context (the truncation seen at c=8)."""
+    config = _tiny_model_config()   # upsample 4, windows [1, 4]
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
+    engine_inputs = ModelInputsFromEngine(request_ids=["r"], per_request_info={})
+    window = ARNodeInputs(
+        tensor_inputs={"codec_tokens": torch.ones(4, 4, dtype=torch.long)},
+        kwargs={"frames": 4, "context": 2},
+    )
+    packed = submodule.preprocess("codec_chunk", engine_inputs, [window])
+    out = submodule.forward("codec_chunk", engine_inputs, **packed)
+    assert out["audio_chunk"][0].shape == (16,)
+    submodule.postprocess("r", None, out, inputs=window)
+    assert out["audio_chunk"][0].shape == (8,)   # frames 2..4 of 4
+
+    # A batch-shaped chunk is flattened rather than sliced on the batch axis;
+    # too few samples for the window is an error, never a silent cut.
+    batched = {"audio_chunk": [torch.arange(16).view(1, 16)]}
+    submodule.postprocess("r", None, batched, inputs=window)
+    assert batched["audio_chunk"][0].tolist() == list(range(8, 16))
+    with pytest.raises(ValueError, match="samples"):
+        submodule.postprocess("r", None, {"audio_chunk": [torch.arange(8)]}, inputs=window)
 
 
 class _FakeCodecEncoder(torch.nn.Module):
