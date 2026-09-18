@@ -511,3 +511,127 @@ def test_openai_adapter_maps_speech_request():
     assert args.text == "Hello" and args.output_modalities == ["audio"] and args.input_modalities == ["text"]
     assert args.model_kwargs["voice"] == "af_bella+af_sky" and args.model_kwargs["speed"] == 1.2
     assert args.model_kwargs["lang_code"] == "b" and "temperature" not in args.model_kwargs
+
+
+# --------------------------------------------------------------------------
+# CUDA-graph buckets (the capture functions run eagerly on CPU here)
+# --------------------------------------------------------------------------
+
+
+def test_bucket_selection_and_grouping():
+    from mstar.model.kokoro.submodules import group_by_bucket, pick_bucket
+
+    buckets = [48, 64, 96, 128]
+    assert pick_bucket(1, buckets) == 48 and pick_bucket(64, buckets) == 64 and pick_bucket(65, buckets) == 96
+    assert pick_bucket(129, buckets) is None
+    groups = group_by_bucket([100, 10, 64, 500, 90], buckets)
+    assert groups == [(48, [1]), (64, [2]), (96, [4]), (128, [0]), (None, [3])]
+
+
+def test_piecewise_regions_match_the_eager_halves():
+    """Each captured half, run as the runner would run it (padded to its bucket,
+    padding rows zeroed), reproduces the eager computation on the real rows."""
+    from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+    from mstar.model.kokoro.submodules import frame_region, text_region
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    config = tiny_config()
+    config.text_buckets = [8, 16]
+    config.frame_buckets = [16, 32, 64]
+    config.capture_batch_sizes = [1, 2, 4]
+    config.max_batch_frames = 128
+    submodule = KokoroSynthSubmodule(tiny_model(), config)
+    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+    assert set(regions) == {text_region(8), text_region(16)} | {frame_region(f) for f in (16, 32, 64)}
+    assert regions[text_region(16)].seq_len == 16 and regions[text_region(16)].capture_batch_sizes == [1, 2, 4]
+    # bs * frames <= max_batch_frames caps the decoder's batch per bucket
+    assert regions[frame_region(64)].capture_batch_sizes == [1, 2]
+    assert regions[frame_region(16)].capture_batch_sizes == [1, 2, 4]
+
+    torch.manual_seed(1)
+    ids = [torch.tensor([0, 1, 5, 3, 9, 2, 0]), torch.tensor([0, 4, 4, 0])]
+    style = torch.randn(2, 16)
+    speed = torch.tensor([1.0, 0.8])
+    padded = torch.nn.utils.rnn.pad_sequence(ids, batch_first=True, padding_value=BOUNDARY_TOKEN_ID)
+    lengths = torch.tensor([7, 4])
+    engine_inputs = ModelInputsFromEngine(request_ids=["a", "b", "pad", "pad"], per_request_info={})
+    with torch.no_grad():
+        d_ref, t_ref, dur_ref = submodule.model.encode_text(padded, lengths, style, speed)
+        # text region: bucket T=8, batch padded to 4 rows of zeros
+        shape = PiecewiseCaptureShape(bs=4, seq_lens=[8] * 4, total_tokens=32)
+        static = regions[text_region(8)].make_static_inputs(shape)
+        static["input_ids"][:2, :7] = padded
+        static["lengths"][:2] = lengths
+        static["style"][:2] = style
+        static["speed"][:2] = speed
+        out = regions[text_region(8)].capture_fn(PiecewiseCallInputs(static_inputs=static, engine_inputs=engine_inputs))
+        assert out["d"].shape == (4, 8, 24) and out["t_en"].shape == (4, 16, 8) and out["pred_dur"].shape == (4, 8)
+        assert torch.equal(out["pred_dur"][:2, :7], dur_ref)
+        assert rel_l2(out["d"][:2, :7], d_ref) < 1e-4 and rel_l2(out["t_en"][:2, :, :7], t_ref) < 1e-4
+        assert torch.isfinite(out["d"]).all()  # padding rows stay finite
+
+        # frame region: bucket F=32, one real row
+        num_frames = int(dur_ref[1].sum())
+        assert num_frames <= 32
+        en, asr, frame_lengths = submodule.model.align(d_ref[1:2], t_ref[1:2], dur_ref[1:2], 32)
+        audio_ref, _ = submodule.model.synthesize_frames(d_ref[1:2], t_ref[1:2], dur_ref[1:2], style[1:2], num_frames)
+        shape = PiecewiseCaptureShape(bs=2, seq_lens=[32, 32], total_tokens=64)
+        static = regions[frame_region(32)].make_static_inputs(shape)
+        static["en"][:1] = en
+        static["asr"][:1] = asr
+        static["frame_lengths"][:1] = frame_lengths
+        static["style"][:1] = style[1:2]
+        call = PiecewiseCallInputs(static_inputs=static, engine_inputs=engine_inputs)
+        out = regions[frame_region(32)].capture_fn(call)
+        n = num_frames * config.samples_per_frame
+        assert out["audio"].shape == (2, 32 * config.samples_per_frame)
+        assert rel_l2(out["audio"][0, :n], audio_ref[0]) < 5e-3 and out["audio"][0, n:].abs().sum() == 0
+
+
+def test_synthesize_uses_runners_when_they_fit():
+    """A fake runner stands in for a captured graph: the submodule routes
+    through it per bucket and slices each row to its own length."""
+    from mstar.model.kokoro.submodules import text_region
+
+    config = tiny_config()
+    config.text_buckets = [8]
+    config.frame_buckets = [16, 64]
+    submodule = KokoroSynthSubmodule(tiny_model(), config)
+    regions = submodule.get_piecewise_cuda_graph_configs(torch.device("cpu"), torch.float32)
+
+    class FakeRunner:
+        def __init__(self, config):
+            self.config = config
+            self.calls = []
+
+        def can_run(self, bs):
+            return bs <= max(self.config.capture_batch_sizes)
+
+        def run(self, static_inputs, real_bs):
+            from mstar.engine.cuda_graph_config import PiecewiseCallInputs, PiecewiseCaptureShape
+
+            bs = next(b for b in self.config.capture_batch_sizes if b >= real_bs)
+            seq_len = self.config.seq_len
+            shape = PiecewiseCaptureShape(bs=bs, seq_lens=[seq_len] * bs, total_tokens=bs * seq_len)
+            static = self.config.make_static_inputs(shape)
+            for k, v in static_inputs.items():
+                static[k][:real_bs] = v
+            self.calls.append((self.config.seq_len, real_bs))
+            out = self.config.capture_fn(PiecewiseCallInputs(static_inputs=static, engine_inputs=None))
+            return {k: v[:real_bs] for k, v in out.items()}
+
+    runners = {name: FakeRunner(cfg) for name, cfg in regions.items()}
+    torch.manual_seed(2)
+    ids = [torch.tensor([0, 1, 5, 3, 9, 2, 0]), torch.tensor([0, 4, 4, 0]), torch.tensor([0, 7, 1, 8, 0])]
+    padded = torch.nn.utils.rnn.pad_sequence(ids, batch_first=True, padding_value=BOUNDARY_TOKEN_ID)
+    lengths = torch.tensor([7, 4, 5])
+    style = torch.randn(3, 16)
+    speed = torch.tensor([1.0, 1.0, 1.0])
+    with torch.no_grad():
+        eager = submodule._synthesize(padded, lengths, style, speed, {})
+        captured = submodule._synthesize(padded, lengths, style, speed, runners)
+    assert runners[text_region(8)].calls == [(8, 3)]
+    frame_calls = [c for name, r in runners.items() if name.startswith("frames") for c in r.calls]
+    assert sum(bs for _, bs in frame_calls) == 3  # every row went through exactly one frame bucket
+    for a, b in zip(eager, captured, strict=True):
+        assert a.shape == b.shape and rel_l2(a.float(), b.float()) < 5e-3
