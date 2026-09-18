@@ -339,22 +339,26 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     # a prompt without <|notimestamps|> turns the rules on; the first token must be a timestamp
     row = sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE])], **ctx})
     assert sub.request_state("ts")["timestamps"] is True
-    assert row.tensor_inputs["ts_rules"].tolist() == [1, FIRST_TOKEN, cfg.timestamp_begin, cfg.timestamp_begin + 51]
-    # a plain prompt: inactive row, and decode rows stay inactive
+    assert row.tensor_inputs["ts_rules"].tolist() == [1, FIRST_TOKEN, cfg.timestamp_begin - 1, cfg.timestamp_begin + 51]
+    # a plain prompt: inactive row
     plain = type("F", (), {"request_id": "plain"})()
     row2 = sub.prepare_inputs(PREFILL_WALK, plain, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE, NOTS])], **ctx})
     assert row2.tensor_inputs["ts_rules"].tolist() == inactive_state()
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs(["ts", "plain"]), [row, row2])
     assert batch["ts_rules"].shape == (2, 4)
 
-    # check_stop records the history for the timestamped request only
-    info = type("I", (), {"graph_walk": PREFILL_WALK})()
-    sub.check_stop("ts", info, {"new_token": [torch.tensor([cfg.timestamp_begin + 2])]})
-    sub.check_stop("plain", info, {"new_token": [torch.tensor([1234])]})
-    assert sub.request_state("ts")["generated"] == [cfg.timestamp_begin + 2]
-    assert sub.request_state("plain")["generated"] == []
-    decode_row = sub.prepare_inputs(DECODE_WALK, fwd, {"text_inputs": [torch.tensor([cfg.timestamp_begin + 2])]})
-    assert decode_row.tensor_inputs["ts_rules"][1].item() == 2  # AFTER_PAIR: text must follow
+    # a decode step takes the state routed with its token, never a host history
+    routed = torch.tensor([1, 2, cfg.timestamp_begin + 2, cfg.vocab_size])
+    decode_row = sub.prepare_inputs(
+        DECODE_WALK, fwd, {"text_inputs": [torch.tensor([cfg.timestamp_begin + 2])], "ts_rules": [routed]},
+    )
+    assert torch.equal(decode_row.tensor_inputs["ts_rules"], routed)
+    bare = sub.prepare_inputs(DECODE_WALK, fwd, {"text_inputs": [torch.tensor([7])]})
+    assert bare.tensor_inputs["ts_rules"].tolist() == inactive_state()
+    # postprocess keeps the state under its own name for the loop-back edge
+    outputs = {"new_token": [torch.tensor([5])], "ts_rules": [routed]}
+    sub.postprocess("ts", None, outputs)
+    assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
     # the capture template carries the same row so the graph's input set is fixed
     (decode_cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
@@ -437,6 +441,9 @@ def test_graph_walks_and_resources():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {PREFILL_WALK, DETECT_LANGUAGE_WALK, PREFILL_PROMPT_WALK, DECODE_WALK}
+    loop_node = walks[DECODE_WALK].section
+    assert set(loop_node.input_names) == {"text_inputs", "ts_rules"}
+    assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {"text_inputs", "ts_rules"}
     assert model.nodes == [ENCODER_NODE, DECODER_NODE]
     specs = model.get_node_resources()
     kv = {s.resource_key: s for s in specs if isinstance(s, KVSpec)}
@@ -464,9 +471,13 @@ def test_state_machine_forced_language():
     ]
     assert len(args.unpersist_tensors) == 2
 
-    nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
+    rules = object()
+    nxt = model.get_partition_forward_pass_args(
+        "default", args.full_metadata, {"new_token": [object()], "ts_rules": [rules]},
+    )
     assert nxt.full_metadata.graph_walk == DECODE_WALK and not nxt.full_metadata.is_prefill
-    assert [(e.next_node, e.name) for e in nxt.inputs] == [(DECODER_NODE, "text_inputs")]
+    assert [(e.next_node, e.name) for e in nxt.inputs] == [(DECODER_NODE, "text_inputs"), (DECODER_NODE, "ts_rules")]
+    assert nxt.inputs[1].tensor_info == [rules] and len(nxt.unpersist_tensors) == 2
     done = model.get_partition_forward_pass_args("default", nxt.full_metadata, {})
     assert done.request_done
 
@@ -482,13 +493,16 @@ def test_state_machine_language_detection():
     # the tail is held for the second prefill, not dropped after the first
     assert tail not in args.unpersist_tensors and len(args.unpersist_tensors) == 2
 
-    lang = object()
-    second = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [lang]})
+    lang, stale_rules = object(), object()
+    second = model.get_partition_forward_pass_args(
+        "default", args.full_metadata, {"new_token": [lang], "ts_rules": [stale_rules]},
+    )
     assert second.full_metadata.graph_walk == PREFILL_PROMPT_WALK and second.full_metadata.is_prefill
     assert [(e.next_node, e.name, e.tensor_info) for e in second.inputs] == [
         (DECODER_NODE, "text_inputs", [lang]), (DECODER_NODE, "prompt_tail", [tail]),
     ]
-    assert set(map(id, second.unpersist_tensors)) == {id(lang), id(tail)}
+    # the detection step's (inactive) rule state is dropped, not routed
+    assert set(map(id, second.unpersist_tensors)) == {id(lang), id(tail), id(stale_rules)}
     assert second.step_metadata == {"is_prefill": True}
 
     third = model.get_partition_forward_pass_args("default", second.full_metadata, {"new_token": [object()]})
