@@ -277,6 +277,11 @@ def _forward_step(
     eager forward. Everything above the launch is the same either way.
     """
     runner = StepRunner(resources)
+    # The engine binds a node's resources into its layers at load; the harness
+    # drives the bare submodule, so bind (or re-bind, when a test swaps the
+    # resource set) here.
+    if dit.node_resources is not resources:
+        dit.bind_node_resources(resources)
     real_ids = list(rids)
     step_ids, step_fwds = real_ids, dict(fwds)
     lease = None
