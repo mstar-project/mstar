@@ -16,7 +16,7 @@ Architecture (two asynchronous partitions):
     Codec      - stateless speech-tokenizer decoder producing PCM chunks
 
 Streaming topology:
-    Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((4, 8, 16), 25, 25)]--> Codec
+    Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 25)]--> Codec
 
 Request state machine:
     Talker: talker_prefill | talker_prefill_clone -> talker_decode loop -> done on EOS/token limit
