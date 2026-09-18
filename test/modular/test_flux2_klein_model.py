@@ -428,3 +428,30 @@ def test_vae_compile_knob_reaches_the_decoder_node():
     compiled = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig(), compile_decode=True)
     assert compiled._decode != vae.decode and callable(compiled._decode)
     assert _make_model(vae_compile=True).vae_compile is True and _make_model().vae_compile is False
+
+
+def test_vae_decoder_warmup_decodes_each_grid_at_the_warmup_batch_sizes():
+    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
+
+    class RecordingVae(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))  # gives the node a device
+            self.shapes = []
+
+        @property
+        def dtype(self):
+            return self.weight.dtype
+
+        def decode(self, x):
+            self.shapes.append(tuple(x.shape))
+            return x
+
+    config = Flux2KleinConfig()
+    vae = RecordingVae()
+    KleinVaeDecoderSubmodule(vae, config, warmup_grids=[config.latent_grid(1024, 1024), config.latent_grid(512, 768)])
+    lc, ph, pw = config.vae.latent_channels, *config.vae.patch_size
+    # batch sizes 1 and 2 per grid: static compile, then the symbolic-batch recompile
+    assert vae.shapes == [(1, lc, 64 * ph, 64 * pw), (2, lc, 64 * ph, 64 * pw), (1, lc, 32 * ph, 48 * pw),
+                          (2, lc, 32 * ph, 48 * pw)]
+    assert KleinVaeDecoderSubmodule(RecordingVae(), config).vae.shapes == []  # no grids -> no warmup
