@@ -30,13 +30,21 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def qwen3_inv_freq(head_dim: int, theta: float) -> torch.Tensor:
+    """HF's default RoPE ``inv_freq`` (``_compute_default_rope_parameters``), computed on the
+    CPU as the reference does at module init: CPU and GPU ``pow`` differ in the last ulp for
+    some entries, and that ulp survives into the bf16 sin table and the attention output."""
+    steps = torch.arange(0, head_dim, 2, dtype=torch.int64).to(dtype=torch.float)
+    return 1.0 / (theta ** (steps / head_dim))
+
+
 def qwen3_rotary_tables(
     positions: torch.Tensor, head_dim: int, theta: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """HF ``Qwen3RotaryEmbedding``: fp32 ``cos, sin [S, head_dim]`` laid out ``[freqs | freqs]``."""
-    steps = torch.arange(0, head_dim, 2, dtype=torch.int64, device=positions.device).float()
-    inv_freq = 1.0 / (theta ** (steps / head_dim))
-    freqs = positions.float()[:, None] * inv_freq[None, :]
+    """HF ``Qwen3RotaryEmbedding.forward``: fp32 ``cos, sin [S, head_dim]`` laid out ``[freqs | freqs]``,
+    the angles from the same K=1 matmul on the positions' device."""
+    inv_freq = qwen3_inv_freq(head_dim, theta).to(positions.device)
+    freqs = (inv_freq[None, :, None] @ positions[None, None, :].float()).transpose(1, 2)[0]
     emb = torch.cat((freqs, freqs), dim=-1)
     return emb.cos(), emb.sin()
 
