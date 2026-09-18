@@ -1,8 +1,9 @@
-"""/v1/audio/speech handler (text-to-speech).
+"""/v1/audio/speech and /v1/audio/voices handlers (text-to-speech).
 
-Non-streaming returns the full audio as a container blob (WAV by default).
-Streaming returns a single open-ended WAV response (header + PCM16 frames) as
-the audio is produced.
+Non-streaming speech returns the full audio as a container blob (WAV by
+default). Streaming returns a single open-ended WAV response (header + PCM16
+frames) as the audio is produced. ``/v1/audio/voices`` lists the ``voice``
+values the served model accepts.
 """
 
 from __future__ import annotations
@@ -11,6 +12,19 @@ from fastapi.responses import Response, StreamingResponse
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import rid
+from mstar.api_server.openai.protocol import VoiceCard, VoiceList
+
+
+def list_voices(api) -> VoiceList | None:
+    """The served model's voices, or ``None`` when it has no fixed list."""
+    model = api.model
+    voices = model.get_voices() if model is not None else None
+    if voices is None:
+        return None
+    return VoiceList(
+        voices=[VoiceCard(id=v, name=v) for v in voices],
+        default_voice=model.get_default_voice(),
+    )
 
 
 async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
