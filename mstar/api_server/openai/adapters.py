@@ -185,6 +185,16 @@ class OpenAIAdapter:
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
 
+    # ``/v1/audio/speech`` sentence chunking (``serving_speech``): inputs of at
+    # least ``speech_chunk_min_chars`` characters are split into sentence
+    # groups of about ``speech_chunk_max_chars`` and synthesized as ordered
+    # sub-requests. ``None`` keeps the whole text in one request unless the
+    # client sends ``sentence_chunking: true``.
+    speech_chunk_min_chars: int | None = None
+    speech_chunk_max_chars: int = 400
+    # sub-requests kept in flight ahead of the one being streamed
+    speech_chunk_lookahead: int = 2
+
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
         # emits text, whereas BAGEL chat is text-only.
