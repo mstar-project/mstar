@@ -264,12 +264,15 @@ class SamplerResource(Resource):
         request's bonus-plus-drafts positions, ``drafts [N, k]``. Returns
         ``(tokens [N, k + 1], accepted [N])`` as ``verify_greedy`` defines them,
         agreed across TP ranks (rank 0's result is broadcast, as for ``sample``:
-        the all-reduces may round differently per rank). Greedy only for now:
-        a request's temperature is not applied here (rejection sampling against
-        the draft distribution is the follow-up), so a node that speculates
-        should refuse requests with temperature > 0 or say so.
+        the all-reduces may round differently per rank). Under a captured step
+        (the graph sampler's per-row buffers are in place) this is speculative
+        sampling with each request's temperature / top-k / top-p
+        (``verify_speculative_gpu``; greedy rows come out exactly as the argmax
+        match); an eager step verifies greedily.
         """
         del request_ids
+        if self._cg_sampler is not None and logits.is_cuda:
+            return self._cg_sampler.sample_verify(logits, drafts)
         tokens, accepted = verify_greedy(logits, drafts)
         packed = torch.cat([tokens, accepted.to(tokens.dtype).unsqueeze(1)], dim=1)
         packed = (self._cg_sampler or self._sampler)._broadcast_tokens(packed)
