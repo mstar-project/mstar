@@ -554,13 +554,20 @@ class ChatterboxModel(Model):
         raise ValueError(f"Unknown Chatterbox partition {partition_name!r}")
 
     @staticmethod
-    def _s3gen_voice_inputs(signals: dict[str, list[TensorPointerInfo]]) -> list[GraphEdge]:
-        """The reference clip and its key, handed to the S3Gen node with every
-        chunk (a stream consumer only fires once its other inputs are in)."""
+    def _s3gen_voice_inputs(
+        signals: dict[str, list[TensorPointerInfo]], with_tensors: bool = True,
+    ) -> list[GraphEdge]:
+        """The reference clip and its key for the S3Gen node. A stream consumer
+        with non-stream inputs fires once those are in, so the edges accompany
+        every chunk; the tensors themselves ride only with the first forward
+        (``with_tensors``), later chunks carry signal-only edges and the node
+        reuses the reference it conditioned on. Signal-only edges never touch
+        the transport, so the extra handshake the conductor issues after the
+        final chunk cannot race the request's teardown."""
         inputs = []
         for name in (REF_AUDIO, VOICE_KEY):
             edge = GraphEdge(next_node=S3GEN_NODE, name=name)
-            edge.tensor_info = list(signals.get(name, []))
+            edge.tensor_info = list(signals.get(name, [])) if with_tensors else []
             inputs.append(edge)
         return inputs
 
@@ -594,7 +601,7 @@ class ChatterboxModel(Model):
         if partition_name == S3GEN_PARTITION:
             inputs = []
             if partition_metadata.graph_walk == "s3gen_chunk_voice":
-                inputs = self._s3gen_voice_inputs(persist_signals)
+                inputs = self._s3gen_voice_inputs(persist_signals, with_tensors=False)
             return ForwardPassArgs(
                 full_metadata=partition_metadata,
                 inputs=inputs,
