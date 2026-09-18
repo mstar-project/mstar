@@ -147,6 +147,11 @@ class KokoroModelConfig:
     # Precision of the decoder's convolutional trunk and generator. The
     # harmonic source and the STFT head always run in fp32 (phase-sensitive).
     decoder_dtype: str = "float32"
+    # ``torch.compile`` the frame half (F0/energy heads + decoder) with dynamic
+    # shapes on CUDA: inductor fuses its many elementwise ops (masks, AdaIN,
+    # Snake) and the fused kernels are what the CUDA graphs capture. One
+    # compile serves every bucket. Off on CPU.
+    compile_decoder: bool = True
 
     # ---------------------------------------------------------------------
     @property
