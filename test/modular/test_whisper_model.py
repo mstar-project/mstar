@@ -53,6 +53,7 @@ def _tiny_config(**overrides) -> WhisperModelConfig:
         d_model=64, decoder_layers=2, decoder_attention_heads=4, decoder_ffn_dim=128,
         encoder_layers=2, encoder_attention_heads=4, encoder_ffn_dim=128,
         num_mel_bins=16, vocab_size=51866, max_target_positions=448, max_source_positions=50,
+        chunk_length=1,  # a 1 s window: 100 mel frames -> 50 encoder positions
         lang_to_id={"<|en|>": EN, "<|de|>": DE}, task_to_id={"transcribe": TRANSCRIBE, "translate": TRANSLATE},
         suppress_tokens=[1, 2], begin_suppress_tokens=[220, EOT],
     )
@@ -275,18 +276,24 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
     (capture,) = sub.get_cuda_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == PREFILL_WALK
     assert set(capture.replay_graph_walks) == {PREFILL_WALK, DETECT_LANGUAGE_WALK}
-    assert capture.single_request_inputs.tensor_inputs["audio_features"].shape == (cfg.num_mel_bins, cfg.num_frames)
+    assert capture.single_request_inputs.tensor_inputs["audio"].shape == (cfg.n_samples,)
     assert capture.capture_batch_sizes == sub.ENCODER_CAPTURE_BATCH_SIZES
     assert capture.get_total_tokens(8) == [8]
     assert sub.declare_step(PREFILL_WALK, ["r0"], []) is None  # no resources
     assert sub.can_batch(None, [])
 
     frames = cfg.max_source_positions * 2
-    rows = [sub.prepare_inputs(PREFILL_WALK, None, {"audio_features": [torch.randn(cfg.num_mel_bins, frames)]})
-            for _ in range(3)]
+    assert cfg.num_frames == frames
+    # samples in, padded to the window per request; log-mel of the batch out
+    rows = [sub.prepare_inputs(PREFILL_WALK, None, {"audio": [torch.randn(n)]})
+            for n in (cfg.n_samples, cfg.n_samples // 2, cfg.n_samples)]
     assert all(r.input_seq_len == 1 for r in rows)
+    assert all(r.tensor_inputs["audio"].shape == (cfg.n_samples,) for r in rows)
+    half = cfg.n_samples // 2
+    assert torch.equal(rows[1].tensor_inputs["audio"][half:], torch.zeros(cfg.n_samples - half))
     batch = sub.preprocess(PREFILL_WALK, _engine_inputs(["a", "b", "c"]), rows)
     assert batch["audio_features"].shape == (3, cfg.num_mel_bins, frames)
+    assert torch.allclose(batch["audio_features"][1], sub.log_mel(rows[1].tensor_inputs["audio"]), atol=1e-5)
     with torch.no_grad():
         out = sub.forward_batched(PREFILL_WALK, _engine_inputs(["a", "b", "c"]), **batch)
         single = sub.forward(PREFILL_WALK, _engine_inputs(["a"]), audio_features=batch["audio_features"][:1])
@@ -463,11 +470,11 @@ def _signals(names):
 def test_state_machine_forced_language():
     model = _make_model()
     args = model.get_initial_forward_pass_args(
-        "default", ["audio", "text"], ["text"], _signals(["audio_features", "text_inputs"]),
+        "default", ["audio", "text"], ["text"], _signals(["audio", "text_inputs"]),
     )
     assert args.full_metadata.graph_walk == PREFILL_WALK and args.full_metadata.is_prefill
     assert [(e.next_node, e.name) for e in args.inputs] == [
-        (ENCODER_NODE, "audio_features"), (DECODER_NODE, "text_inputs"),
+        (ENCODER_NODE, "audio"), (DECODER_NODE, "text_inputs"),
     ]
     assert len(args.unpersist_tensors) == 2
 
@@ -487,7 +494,7 @@ def test_state_machine_language_detection():
     tail = object()
     args = model.get_initial_forward_pass_args(
         "default", ["audio", "text"], ["text"],
-        {"audio_features": [object()], "text_inputs": [object()], "prompt_tail": [tail]},
+        {"audio": [object()], "text_inputs": [object()], "prompt_tail": [tail]},
     )
     assert args.full_metadata.graph_walk == DETECT_LANGUAGE_WALK
     # the tail is held for the second prefill, not dropped after the first
@@ -512,9 +519,9 @@ def test_state_machine_language_detection():
 
 def test_process_prompt_builds_window_and_prompts():
     model = _make_model()
-    wave = torch.randn(16_000 * 2)
+    wave = torch.randn(8_000)  # half the tiny config's 1 s window
     out = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
-    assert out["audio_features"][0].shape == (model.config.num_mel_bins, 3000)
+    assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder pads and makes the mel
     assert out["text_inputs"][0].tolist() == [SOT, EN, TRANSCRIBE, NOTS]
     assert "prompt_tail" not in out
 
@@ -531,7 +538,7 @@ def test_process_prompt_builds_window_and_prompts():
 
     long = torch.randn(16_000 * 45)  # beyond one window: trimmed, not rejected
     assert model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [long]}, language="en")[
-        "audio_features"][0].shape[-1] == 3000
+        "audio"][0].shape == (model.config.n_samples,)
     with pytest.raises(ValueError, match="exactly one audio"):
         model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": []}, language="en")
     with pytest.raises(ValueError, match="empty audio"):
