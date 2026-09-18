@@ -288,6 +288,21 @@ def _verify_checkpoint_coverage(
 # ---------------------------------------------------------------------------
 
 
+_CODEC_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+
+
+def codec_dtype(value: str | torch.dtype) -> torch.dtype:
+    """The codec decoder dtype named by a deployment's ``codec_dtype``."""
+    if isinstance(value, torch.dtype):
+        return value
+    try:
+        return _CODEC_DTYPES[str(value)]
+    except KeyError:
+        raise ValueError(
+            f"codec_dtype must be one of {sorted(_CODEC_DTYPES)}, got {value!r}"
+        ) from None
+
+
 class Qwen3TTSModel(Model):
     """Qwen3-TTS 12 Hz model contract (CustomVoice, VoiceDesign, Base).
 
@@ -304,6 +319,10 @@ class Qwen3TTSModel(Model):
     ) -> None:
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
+        # Server-init knob (deployment YAML ``model_kwargs``): the speech
+        # codec decoder's dtype. float32 reproduces the reference decoder
+        # bit for bit; bfloat16 roughly halves the codec's GPU time.
+        self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
 
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
@@ -1095,6 +1114,8 @@ class Qwen3TTSModel(Model):
             decoder, loaded, _checkpoint_keys(codec_dir, prefix), "Qwen3-TTS Codec"
         )
         decoder.eval()
+        if self.codec_dtype != torch.float32:
+            decoder.to(dtype=self.codec_dtype)
         return CodecSubmodule(decoder, self.config)
 
     def _create_ref_encoder_submodule(
