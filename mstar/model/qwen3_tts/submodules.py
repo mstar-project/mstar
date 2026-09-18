@@ -1006,6 +1006,7 @@ class CodecSubmodule(ARNodeSubmodule):
             raise ValueError(
                 f"Expected codec tokens with shape (frames, groups), got {codes.shape}"
             )
+        num_items = codes.shape[0]
         # EOS belongs to Talker loop control and is not a valid codec codebook
         # index for waveform reconstruction. It is only ever the last frame of
         # a stream, so the leading context count is unaffected.
@@ -1014,8 +1015,11 @@ class CodecSubmodule(ARNodeSubmodule):
             :self.config.codec.num_quantizers,
         ]
         frames = codes.shape[0]
-        context = int(self._stream_chunk_meta(fwd_info).get("context_items", 0))
-        bucket = self._bucket(max(frames, 1))
+        meta = self._stream_chunk_meta(fwd_info)
+        context = int(meta.get("context_items", 0))
+        # The bucket is chosen from the window's item count (EOS included) so
+        # that ``cg_key_info``, which only sees the stream metadata, agrees.
+        bucket = self._bucket(max(int(meta.get("num_items", num_items)), 1))
         if frames < bucket:
             codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
         state.add_all(
@@ -1109,12 +1113,21 @@ class CodecSubmodule(ARNodeSubmodule):
         graph_walk: str,
         per_request_info: Mapping[str, CurrentForwardPassInfo],
     ) -> Any:
-        """The window bucket this batch was padded to (``can_batch`` keeps it uniform)."""
+        """The window bucket this batch pads to (``can_batch`` keeps it uniform).
+
+        Derived from the stream metadata the worker attaches to each request
+        (available before ``prepare_inputs`` runs, so a pre-planned lease can
+        find its capture); the state written by ``prepare_inputs`` is the
+        fallback for callers without that metadata.
+        """
         del graph_walk
-        buckets = {
-            self.request_state(request_id).get("codec_bucket")
-            for request_id in per_request_info
-        }
+        buckets = set()
+        for request_id, fwd_info in per_request_info.items():
+            num_items = self._stream_chunk_meta(fwd_info).get("num_items")
+            if num_items is not None:
+                buckets.add(self._bucket(max(int(num_items), 1)))
+            else:
+                buckets.add(self.request_state(request_id).get("codec_bucket"))
         return buckets.pop() if len(buckets) == 1 else None
 
     def get_cuda_graph_configs(
