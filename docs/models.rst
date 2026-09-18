@@ -90,9 +90,10 @@ Qwen3-TTS notes
   (VoiceDesign, required). Base clones a voice from one reference clip: on
   ``/v1/audio/speech`` pass ``ref_audio`` (data URL, URL, path or base64) plus
   ``ref_text`` (its transcript) or ``x_vector_only_mode: true``; with the SDK,
-  ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip is
-  used for that request only; named, persisted voices arrive with the shared
-  voice registry.
+  ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
+  conditioning (x-vector and codec frames) is memoised by content, so a voice
+  reused across requests, or by the sentence chunks of one long request, is
+  encoded once; named, persisted voices arrive with the shared voice registry.
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
