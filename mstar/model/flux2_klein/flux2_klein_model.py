@@ -44,7 +44,7 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
-from mstar.model.components.diffusion.image_io import uint8_to_png
+from mstar.model.components.diffusion.image_io import encode_image
 from mstar.model.components.diffusion.lora import LoraSpec
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
@@ -160,12 +160,12 @@ class Flux2KleinModel(Model):
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
-            name="text_encoder",
+            name="text_encoder", enable_async_scheduling=False,
             input_names=[TEXT_INPUTS, TEXT_MASK],
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=TEXT_EMBEDS, persist=True)],
         )
         encode_image = GraphNode(
-            name="vae_encoder",
+            name="vae_encoder", enable_async_scheduling=False,
             input_names=[IMAGE_INPUTS],
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=REF_LATENTS, persist=True)],
         )
@@ -185,13 +185,17 @@ class Flux2KleinModel(Model):
                 input_names=dit_inputs,
                 # latents is the only loop-carried edge; the step index is the loop counter
                 outputs=[GraphEdge(next_node="dit", name=LATENTS)],
-                enable_async_scheduling=True,
+                # Lockstep, not speculative: the worker otherwise launches each request's next
+                # step alone while the current one runs (38 of 43 steps unbatched at 8 concurrent
+                # requests), so concurrent requests never share a batch. Waiting for the step to
+                # finish costs ~2 ms of launch overlap per step and batches everything ready.
+                enable_async_scheduling=False,
             ),
             max_iters=self.config.max_denoise_steps,
             outputs=[GraphEdge(next_node="vae_decoder", name=LATENTS)],
         )
         decoder = GraphNode(
-            name="vae_decoder",
+            name="vae_decoder", enable_async_scheduling=False,
             input_names=[LATENTS],
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=IMAGE_OUTPUT, output_modality="image")],
         )
@@ -380,7 +384,8 @@ class Flux2KleinModel(Model):
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality != "image":
             raise ValueError(f"unsupported output modality for FLUX.2 klein: {modality!r}")
-        return uint8_to_png(output)
+        # output_format / output_compression / png_compress_level from the request (OpenAI knobs)
+        return encode_image(output, request_kwargs)
 
     # ------------------------------------------------------------- loading
     def get_autocast_dtype(self):
