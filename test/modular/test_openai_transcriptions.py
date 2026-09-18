@@ -303,6 +303,25 @@ def test_transcription_404_for_models_without_the_surface(client_and_stub):
     assert r.status_code == 404
 
 
+def test_whisper_words_follow_the_transcript_after_the_marker():
+    ad = adapters.WhisperAdapter()
+    req = TranscriptionRequest(model="whisper_large", response_format="verbose_json",
+                               timestamp_granularities=["word"])
+    raw = ("<|en|><|0.00|> Hello there.<|1.20|>"
+           "<|startoflm|><|0.02|>Hello<|0.60|><|0.60|>there.<|1.18|>")
+    t = ad.parse_transcript(raw, req)
+    assert t.text == "Hello there." and t.language == "en"
+    assert [(s["start"], s["end"], s["text"]) for s in t.segments] == [(0.0, 1.2, "Hello there.")]
+    assert t.words == [
+        {"word": "Hello", "start": 0.02, "end": 0.6},
+        {"word": "there.", "start": 0.6, "end": 1.18},
+    ]
+    assert not t.unfinished
+    # streaming clients never see the timing chunk
+    assert ad.stream_delta("<|startoflm|><|0.02|>Hello<|0.60|>") == ""
+    assert ad.stream_delta("<|0.00|> Hello") == " Hello"
+
+
 # --------------------------------------------------------------------------
 # long form
 # --------------------------------------------------------------------------
