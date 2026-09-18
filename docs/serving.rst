@@ -217,6 +217,18 @@ no longer read. It raises an error with a message describing the migration.
      - {node_names: [vae_encoder, vae_decoder], ranks: [0]}
      - {node_names: [LLM], ranks: [0]}
 
+**Several workers on one GPU.** A worker is one process per rank, and by default rank
+``n`` runs on device ``n``. ``rank_devices`` maps ranks onto devices explicitly, so two
+node groups can run as separate workers on the same GPU: a heavy autoregressive node then
+never waits for a light node's steps on its worker loop (a TTS talker and its codec):
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0]}
+     - {node_names: [Codec], ranks: [1]}
+   rank_devices: {1: 0}
+
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:
 
