@@ -1316,12 +1316,12 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
     fwd_info = SimpleNamespace(
         request_id="request",
         step_metadata={"stream_chunks": {"codec_tokens": {
-            "start_offset": 1, "context_items": 1, "is_final": False,
+            "start_offset": 1, "context_items": 1, "num_items": 3, "is_final": False,
         }}},
     )
     prepared = submodule.prepare_inputs("codec_chunk", fwd_info, {"codec_tokens": [codes]})
 
-    # Two real frames pad up to the smallest captured window (4), not the largest.
+    # Three items (one of them EOS) pad up to the smallest captured window (4).
     packed = prepared.tensor_inputs["codec_tokens"]
     assert packed.shape == (4, 4)
     assert packed[:, :2].t().tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
@@ -1432,7 +1432,15 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
         "codec_chunk", "codec_chunk_clone",
     }
     assert submodule.max_batch_size("codec_chunk") == 16
-    # The batch's capture key is the bucket its requests were padded to.
+    # The batch's capture key is the bucket its requests pad to: read off the
+    # stream metadata when present (before prepare_inputs), else off the state.
+    def meta(num_items):
+        return SimpleNamespace(step_metadata={"stream_chunks": {"codec_tokens": {
+            "num_items": num_items, "context_items": 0, "start_offset": 0, "is_final": False,
+        }}})
+
+    assert submodule.cg_key_info("codec_chunk", {"a": meta(3), "b": meta(4)}) == 4
+    assert submodule.cg_key_info("codec_chunk", {"a": meta(1), "b": meta(4)}) is None
     for rid in ("a", "b"):
         submodule.request_state(rid).add("codec_bucket", 4)
     assert submodule.cg_key_info("codec_chunk", {"a": None, "b": None}) == 4
