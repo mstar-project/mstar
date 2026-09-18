@@ -21,7 +21,6 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.audio_features import LogMelSpectrogram
@@ -473,10 +472,14 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
                 "encoder_states": inp.tensor_inputs["encoder_states"],
                 "audio_frames": inp.tensor_inputs["audio_frames"],
             }
+        rows = [self._row_ids(inp) for inp in inputs]
         preprocessed: dict[str, torch.Tensor | Any] = {
-            "input_ids": torch.cat([self._row_ids(inp) for inp in inputs]),
+            "input_ids": torch.cat(rows),
             "ts_rules": torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs]),
         }
+        if graph_walk != DECODE_WALK:
+            # packed prefill: where each request's last token sits
+            preprocessed["row_lens"] = torch.tensor([r.shape[0] for r in rows], dtype=torch.long, device=rows[0].device)
         if graph_walk in ENCODER_WALKS:
             # Concatenated in segment order, which is how the context plan
             # laid the requests' pages out.
@@ -492,10 +495,10 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         encoder_states: torch.Tensor | None,
         ts_rules: torch.Tensor | None = None,
+        row_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the decoder and sample one token per request; also the
         timestamp rule state each row carries into its next step."""
-        attn: AttentionManager = engine_inputs.resources[ATTN]
         pos: PositionManager = engine_inputs.resources[POS]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
 
@@ -508,8 +511,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         hidden = self.decoder(input_embeds=input_embeds, label="main")
 
         if graph_walk != DECODE_WALK:
-            # packed prefill: one hidden per request, at its last token
-            hidden = attn.select_last_hidden(hidden)
+            # packed prefill: one hidden per request, at its last token.
+            # Indexed from the rows themselves: a one-token prompt (language
+            # detection) is planned as a decode step, whose attention wrapper
+            # keeps no packed offsets to select by.
+            hidden = self._last_rows(hidden, row_lens)
 
         logits = self.decoder.lm_head(hidden)
         if graph_walk == DETECT_LANGUAGE_WALK:
@@ -525,6 +531,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             return new_tokens, None
         return new_tokens, self.timestamp_rules.advance(ts_rules, new_tokens)
 
+    @staticmethod
+    def _last_rows(hidden: torch.Tensor, row_lens: torch.Tensor) -> torch.Tensor:
+        """The last hidden state of each packed request."""
+        last = row_lens.to(hidden.device).cumsum(0) - 1
+        return hidden.index_select(0, last)
+
     def forward(
         self,
         graph_walk: str,
@@ -533,6 +545,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         encoder_states: torch.Tensor | None = None,
         ts_rules: torch.Tensor | None = None,
         audio_frames: torch.Tensor | None = None,
+        row_lens: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
         if graph_walk == ALIGN_WALK:
@@ -543,6 +556,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             input_ids=input_ids,
             encoder_states=encoder_states,
             ts_rules=ts_rules,
+            row_lens=row_lens,
         )
         out: NameToTensorList = {"new_token": [new_tokens]}
         if next_rules is not None:
@@ -570,6 +584,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         encoder_states: torch.Tensor | None = None,
         ts_rules: torch.Tensor | None = None,
         audio_frames: torch.Tensor | None = None,
+        row_lens: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         if graph_walk == ALIGN_WALK:
@@ -581,6 +596,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             input_ids=input_ids,
             encoder_states=encoder_states,
             ts_rules=ts_rules,
+            row_lens=row_lens,
         )
         out: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(engine_inputs.request_ids):
