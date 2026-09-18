@@ -1,7 +1,8 @@
 # Qwen3-TTS-12Hz-1.7B-Base: zero-shot voice clone from reference audio (speaker encoder + optional ICL)
-# Same graph, resources and single-GPU placement as the 0.6B deployment
-# (configs/qwen3tts.yaml); only the checkpoint differs. KV geometry is
-# identical across sizes (28 layers, 8 KV heads, head_dim 128).
+# Same Talker/Codec graph and resources as the 0.6B deployment
+# (configs/qwen3tts.yaml) plus the RefEncoder node, which turns the request's
+# reference clip into the x-vector and codec frames the clone prefill needs.
+# KV geometry is identical across sizes (28 layers, 8 KV heads, head_dim 128).
 model: "qwen3_tts_base"
 max_seq_len: 32768
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
@@ -10,9 +11,9 @@ resources:
   talker_attn:
     flashinfer_backend: fa2
 node_groups:
-  - node_names: [Talker]
+  - node_names: [RefEncoder, Talker]
     ranks: [0]
-    graph_walks: [talker_prefill, talker_decode]
+    graph_walks: [talker_prefill, talker_prefill_clone, talker_decode]
   - node_names: [Codec]
     ranks: [0]
-    graph_walks: [codec_chunk]
+    graph_walks: [codec_chunk, codec_chunk_clone]
