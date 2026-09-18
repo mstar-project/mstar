@@ -25,6 +25,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
+from mstar.model.flux2_klein.submodules import compile_vae_decode
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -252,9 +253,10 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
 
     disable_torch_compile = True
 
-    def __init__(self, vae: nn.Module, config: ZImageConfig, max_batch_size: int = 8):
+    def __init__(self, vae: nn.Module, config: ZImageConfig, max_batch_size: int = 8, compile_decode: bool = False):
         super().__init__()
         self.vae = vae
+        self._decode_fn = compile_vae_decode(vae) if compile_decode else vae.decode  # see KleinVaeDecoderSubmodule
         self.config = config
         self._max_batch_size = max_batch_size
 
@@ -273,7 +275,7 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
 
     def _decode(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
-        return pixels_to_uint8(self.vae.decode(self.vae.unscale_latents(latents)))
+        return pixels_to_uint8(self._decode_fn(self.vae.unscale_latents(latents)))
 
     def forward(self, graph_walk, engine_inputs, latents: torch.Tensor, **kwargs):
         return {IMAGE_OUTPUT: [self._decode(latents)]}
