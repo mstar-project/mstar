@@ -249,25 +249,35 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         """A verify step's per-request outputs: ``new_token`` = the accepted tokens and the new
         bonus (``accepted + 1`` of the row's ``k1`` verified tokens, cut after the first stop token
         unless the request ignores EOS), ``text_inputs`` = the next row. Waits for the step's
-        verdicts (recorded mid-step, so the wait overlaps the draft); the slices are cloned off the
-        static buffers."""
+        verdicts (recorded mid-step, so the wait overlaps the draft). ``new_token`` is built on the
+        host from the verdict's pinned mirror, so no device copy is needed for it; ``text_inputs``
+        is a view of the step's static row like the plain path's sampled token (the capture slots
+        alternate, and the row is consumed before its slot is replayed again). Cloning both per
+        request cost two device copies and two host reads per request per step."""
         if "spec_tokens" not in static_output:
             return {}
         acceptance: SpecAcceptance = self._acceptance
         acceptance.note_step(request_ids)
         verdicts = acceptance.verdicts_for(request_ids)
-        tokens, nxt = static_output["spec_tokens"], static_output["next_inputs"]
+        dtype, nxt = static_output["spec_tokens"].dtype, static_output["next_inputs"]
         out = {}
         for i, rid in enumerate(request_ids):
-            n = verdicts[i].accepted + 1
             info = per_request_info.get(rid) if per_request_info else None
-            if info is not None and not info.resource_configs[SAMPLER].ignore_eos:
-                for j, t in enumerate(verdicts[i].tokens[:n]):
-                    if t in self.config.stop_token_ids:
-                        n = j + 1
-                        break
-            out[rid] = {"new_token": [tokens[i, :n].clone()], "text_inputs": [nxt[i].clone()]}
+            ignore_eos = info is None or info.resource_configs[SAMPLER].ignore_eos
+            emitted = self._emitted(verdicts[i], ignore_eos)
+            out[rid] = {"new_token": [torch.tensor(emitted, dtype=dtype)], "text_inputs": [nxt[i]]}
         return out
+
+    def _emitted(self, verdict, ignore_eos: bool) -> list[int]:
+        """The tokens a verify step emits for a row: the accepted drafts and the bonus, cut after
+        the first stop token unless the request ignores EOS."""
+        n = verdict.accepted + 1
+        if not ignore_eos:
+            for j, t in enumerate(verdict.tokens[:n]):
+                if t in self.config.stop_token_ids:
+                    n = j + 1
+                    break
+        return list(verdict.tokens[:n])
 
     def bind_node_resources(self, resources: dict) -> None:
         super().bind_node_resources(resources)
