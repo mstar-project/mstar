@@ -96,6 +96,10 @@ Qwen3-TTS notes
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
+- ``/v1/audio/speech`` inputs of 600 or more characters are synthesized as
+  ordered sentence chunks of about 400 characters (one Talker request each,
+  two kept in flight while the current one streams); set
+  ``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
 - Audio streams in a ramp of codec chunks: the first window is decoded after 4
   frames (320 ms of speech), later windows grow to 25 new frames behind 25
   frames of already decoded left context (the reference's own
