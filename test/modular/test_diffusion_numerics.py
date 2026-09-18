@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, ".")
 
-from mstar.model.components.diffusion.flow_match import FlowMatchConfig, FlowMatchSchedule  # noqa: E402
+from mstar.model.components.diffusion.flow_match import FlowMatchConfig, FlowMatchSchedule, euler_step  # noqa: E402
 from mstar.model.components.diffusion.image_io import encode_image, pixels_to_uint8, uint8_to_png  # noqa: E402
 from mstar.model.components.diffusion.text_encoder import Qwen3RMSNorm, qwen3_rotary_tables  # noqa: E402
 
@@ -118,3 +118,19 @@ def test_encode_image_honours_the_openai_output_knobs():
     assert webp[:4] == b"RIFF" and _decode(webp).shape == image.shape
     with pytest.raises(ValueError, match="output_format"):
         encode_image(image, {"output_format": "gif"})
+
+
+@pytest.mark.parametrize("shape", [(3, 40, 8), (3, 16, 4, 6)])
+def test_batched_euler_step_broadcasts_per_request_dt_over_any_latent_rank(shape):
+    """The loop stacks sigmas as [B, 1, 1]; token layouts [B, L, C] and latent layouts [B, C, H, W]
+    must both step each row by its own dt (right-aligned broadcasting would pair B with C)."""
+    gen = torch.Generator().manual_seed(0)
+    sample = torch.randn(*shape, generator=gen)
+    velocity = torch.randn(*shape, generator=gen).to(torch.bfloat16)
+    sigma = torch.tensor([1.0, 0.75, 0.5]).view(-1, 1, 1)
+    sigma_next = torch.tensor([0.75, 0.5, 0.0]).view(-1, 1, 1)
+    out = euler_step(sample, velocity, sigma, sigma_next)
+    assert out.shape == sample.shape and out.dtype == velocity.dtype
+    for i in range(3):
+        row = euler_step(sample[i], velocity[i], sigma[i, 0, 0], sigma_next[i, 0, 0])
+        torch.testing.assert_close(out[i], row, rtol=0, atol=0)
