@@ -16,7 +16,7 @@ Architecture (two asynchronous partitions):
     Codec      - stateless speech-tokenizer decoder producing PCM chunks
 
 Streaming topology:
-    Talker --[codec_tokens, LeftContextChunkPolicy(300, 25)]--> Codec
+    Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((4, 8, 16), 25, 25)]--> Codec
 
 Request state machine:
     Talker: talker_prefill | talker_prefill_clone -> talker_decode loop -> done on EOS/token limit
@@ -76,7 +76,7 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import LeftContextChunkPolicy
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 # ---------------------------------------------------------------------------
@@ -472,12 +472,14 @@ class Qwen3TTSModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        """Buffer codec frames with the decoder's required left context.
+        """Buffer codec frames in a ramp of chunks with left context.
 
-        The first Codec invocation receives up to ``chunk_frames`` new frames.
-        Later invocations prepend ``left_context_frames`` old frames to avoid
-        convolution boundary artifacts; ``CodecSubmodule.postprocess`` removes
-        the duplicated PCM prefix before emission.
+        The first Codec invocation runs after ``chunk_schedule[0]`` frames so
+        audio starts flowing early; chunks then grow to ``chunk_frames``. Every
+        window after the first is preceded by up to ``left_context_frames``
+        already decoded frames to avoid boundary artifacts;
+        ``CodecSubmodule.postprocess`` removes the duplicated PCM prefix using
+        the context count the stream buffer reports for each window.
         """
         codec = self.config.codec
         return PartitionTopology(
@@ -487,7 +489,8 @@ class Qwen3TTSModel(Model):
                     from_partition="Talker",
                     to_partition="Codec",
                     edge_name="codec_tokens",
-                    chunk_policy_factory=lambda: LeftContextChunkPolicy(
+                    chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
+                        schedule=codec.chunk_schedule,
                         chunk=codec.chunk_frames,
                         left_context=codec.left_context_frames,
                     ),
@@ -831,6 +834,7 @@ class Qwen3TTSModel(Model):
                     "codec_left_context_frames": (
                         self.config.codec.left_context_frames
                     ),
+                    "codec_chunk_schedule": list(self.config.codec.chunk_schedule),
                 },
             )
         raise ValueError(f"Unknown Qwen3-TTS partition: {partition_name!r}")
