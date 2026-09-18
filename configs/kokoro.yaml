@@ -9,3 +9,7 @@ node_groups:
 # model_kwargs:
 #   lang_code: "b"          # G2P language for every request (default: follow the voice prefix)
 #   espeak_fallback: false  # skip espeak-ng for out-of-dictionary English words even if installed
+#   default_voice: af_bella
+#   chunk_target_phonemes: 200          # sentence packing (first_chunk_target_phonemes bounds TTFA)
+#   frame_buckets: [64, 128, 256, 512, 1024]   # fewer CUDA graphs on a smaller GPU
+#   max_batch_frames: 8192              # batch x frames cap per captured decoder graph
