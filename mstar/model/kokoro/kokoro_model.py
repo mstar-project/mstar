@@ -55,7 +55,7 @@ METADATA_PATTERNS = ["config.json", "voices/*.pt"]
 # Config fields a deployment may set through the YAML ``model_kwargs``.
 SERVING_OVERRIDES = {
     "default_voice", "default_speed", "first_chunk_target_phonemes", "chunk_target_phonemes", "max_chunks",
-    "text_buckets", "frame_buckets", "capture_batch_sizes", "max_batch_frames",
+    "text_buckets", "frame_buckets", "capture_batch_sizes", "max_batch_frames", "frame_grouping", "decoder_dtype",
 }
 
 
