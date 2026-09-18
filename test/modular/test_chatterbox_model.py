@@ -643,6 +643,7 @@ def _s3_info(seed=7, watermark=False, rid="r"):
 
 def _s3_submodule(variant="chatterbox"):
     config = ChatterboxConfig.from_variant(variant)
+    config.stream_context_tokens = 0  # these tests check the full-history bookkeeping
     fake = _FakeS3Gen()
     builtin = SimpleNamespace(num_prompt_tokens=4)
     return S3GenSubmodule(fake, s3_tokenizer=None, config=config, builtin_voice=builtin), fake
@@ -898,7 +899,7 @@ def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
 def test_chunk_policy_growth_knobs_reach_the_ramp():
     model = ChatterboxModel(
         model_path_hf="ResembleAI/chatterbox", variant="chatterbox",
-        stream_chunk_growth=2.0, stream_max_chunk_tokens=100,
+        stream_chunk_tokens=25, stream_chunk_growth=2.0, stream_max_chunk_tokens=100,
     )
     policy = model._chunk_policy()
     sizes = []
@@ -907,11 +908,16 @@ def test_chunk_policy_growth_knobs_reach_the_ramp():
         sizes.append(policy.next_chunk_size(buffered))
         policy.register_chunk(buffered)
     assert sizes == [15, 25, 50, 100, 100]
-    # the default keeps fixed 25-token chunks after the first
-    fixed = _make_model()._chunk_policy()
-    fixed.register_chunk(15)
-    fixed.register_chunk(25)
-    assert fixed.next_chunk_size(25) == 25
+    # the shipped default: 15, then 50, 100, 200, 200 ... with a 25-token context window
+    default = _make_model()
+    assert default.config.stream_context_tokens == 25
+    policy = default._chunk_policy()
+    sizes = []
+    for buffered in (15, 50, 100, 200, 200):
+        assert policy.is_ready(buffered)
+        sizes.append(policy.next_chunk_size(buffered))
+        policy.register_chunk(buffered)
+    assert sizes == [15, 50, 100, 200, 200]
 
 
 def test_s3gen_keeps_the_reference_for_chunks_without_the_clip():
