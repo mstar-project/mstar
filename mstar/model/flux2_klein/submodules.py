@@ -273,7 +273,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
 # ---------------------------------------------------------------------------
 
 class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
-    """Final packed tokens ``[1, L, 128]`` -> uint8 image ``[1, 3, H, W]``.
+    """Final packed tokens ``[L, 128]`` per request -> uint8 images ``[B, 3, H, W]``.
 
     Unpacks to the grid, undoes the BatchNorm normalization (bf16, as the reference),
     unpatchifies to 32 channels and decodes; quantizes with the reference's
@@ -302,7 +302,7 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
         return {
-            LATENTS: torch.cat([inp.tensor_inputs[LATENTS] for inp in inputs], dim=0),
+            LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
             "grid": inputs[0].resource_step_info,
         }
 
