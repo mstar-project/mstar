@@ -105,6 +105,8 @@ def _body(args, prompt: str, seed: int) -> dict:
     }
     if args.guidance is not None:
         body["guidance_scale"] = args.guidance
+    if args.output_format:
+        body["output_format"] = args.output_format
     return body
 
 
@@ -202,6 +204,8 @@ def main():
     ap.add_argument("--size", default="1024x1024")
     ap.add_argument("--steps", type=int, default=4)
     ap.add_argument("--guidance", type=float, default=None, help="omit for distilled models")
+    ap.add_argument("--output-format", default=None, choices=[None, "png", "jpeg", "webp"],
+                    help="request this output_format (servers default differently: SGLang to JPEG, others to PNG)")
     ap.add_argument("--seed", type=int, default=0, help="request i uses seed + i")
     ap.add_argument("--n", type=int, default=20, help="measured requests (latency) / images per concurrency level")
     ap.add_argument("--warmup", type=int, default=3)
@@ -225,6 +229,7 @@ def main():
     result.update({
         "tag": args.tag, "url": url, "model": args.model, "size": args.size, "steps": args.steps,
         "guidance": args.guidance, "seed": args.seed, "prompts_file": args.prompts, "num_prompts": len(prompts),
+        "output_format": args.output_format,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
     if args.out:
