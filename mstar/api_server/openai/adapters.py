@@ -522,6 +522,8 @@ _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 # Whisper's word timings follow the transcript after this marker, one
 # ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
 _WORDS_MARKER = "<|startoflm|>"
+# Qwen3-ASR writes ``language {Name}<asr_text>{text}``
+ASR_TEXT_TAG = "<asr_text>"
 
 
 def _transcription_kwargs(req: TranscriptionRequest) -> dict:
@@ -632,6 +634,50 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
         # an open segment at the end of the stream: keep its text, no end
         parts.append("".join(buffer).strip())
     return language, segments, parts, start is not None
+class Qwen3ASRAdapter(OpenAIAdapter):
+    """Qwen3-ASR: an LLM decoder that writes ``language {Name}<asr_text>{text}``
+    (or the text alone when the language is forced). Hears up to 20 minutes
+    per request, so uploads are not windowed; continues a hypothesis through
+    ``assistant_prefix``, which is what the realtime session needs."""
+
+    supports_transcriptions = True
+    supports_realtime_transcription = True
+    max_audio_seconds = 1200.0
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        return SubmitArgs(
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=_transcription_kwargs(req),
+        )
+
+    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:
+        args = self.transcription_to_request(req, audio_path)
+        if prefix:
+            args.model_kwargs["assistant_prefix"] = prefix
+        return args
+
+    def stream_delta(self, text: str) -> str:
+        # the language line and the tag are structure, not speech; they are
+        # short and arrive as whole tokens, so hide them token by token
+        return "" if text.strip().startswith(("language", ASR_TEXT_TAG)) or ASR_TEXT_TAG in text else text
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+        raw = text.strip()
+        if ASR_TEXT_TAG not in raw:
+            return Transcript(text=raw, language=req.language)
+        meta, body = raw.split(ASR_TEXT_TAG, 1)
+        language = None
+        for line in meta.splitlines():
+            line = line.strip()
+            if line.lower().startswith("language "):
+                language = line[len("language "):].strip() or None
+                break
+        if language and language.lower() == "none":
+            language = None
+        return Transcript(text=body.strip(), language=req.language or language)
 
 
 class HiggsAudioAdapter(OpenAIAdapter):
@@ -663,6 +709,9 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
     "whisper_large": WhisperAdapter(),
+    "whisper_large_v3_turbo": WhisperAdapter(),
+    "qwen3_asr": Qwen3ASRAdapter(),
+    "qwen3_asr_realtime": Qwen3ASRAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
 }
 
