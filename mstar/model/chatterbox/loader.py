@@ -170,7 +170,23 @@ def load_component(
 
 def materialize(module: nn.Module, device: torch.device | str, dtype: torch.dtype | None) -> nn.Module:
     """Meta-built module -> real storage in ``dtype`` on ``device`` (cast on
-    meta first so nothing is allocated twice)."""
+    meta first so nothing is allocated twice).
+
+    Only for modules whose every tensor comes from the checkpoint: a buffer
+    computed in ``__init__`` (a window, a filter bank, a RoPE table) would come
+    back as uninitialised memory, so such modules are refused and must be
+    built on a real device instead.
+    """
+    computed = [
+        f"{prefix}.{name}" if prefix else name
+        for prefix, sub in module.named_modules()
+        for name in sorted(sub._non_persistent_buffers_set)
+    ]
+    if computed:
+        raise ValueError(
+            f"materialize() cannot rebuild computed buffers {computed}; "
+            "construct this module on a real device instead of meta"
+        )
     if dtype is not None:
         module = module.to(dtype)
     return module.to_empty(device=device)
