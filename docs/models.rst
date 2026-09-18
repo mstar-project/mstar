@@ -90,14 +90,25 @@ Kokoro notes
   synthesize a phoneme string directly).
 - Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
   ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
-  fallback even when it is installed.
+  fallback even when it is installed, ``chunk_target_phonemes`` and
+  ``first_chunk_target_phonemes`` set the sentence packing, ``text_buckets``,
+  ``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the CUDA
+  graphs captured at start-up (fewer buckets on a smaller GPU), ``compile_decoder: false``
+  skips the ``torch.compile`` of the vocoder (start-up in seconds instead of minutes, about
+  half the throughput on an H100) and ``decoder_dtype: bfloat16`` runs the vocoder trunk
+  in bf16 (about 13% more throughput at concurrency 32 in our runs, with the harmonic
+  source and the iSTFT kept in fp32; the parity test covers fp32 only).
 - Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
   PL-BERT window); each chunk is emitted to the client as soon as it is
   synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
   sentence. The first chunk is kept short so time to first audio is one short
   synthesis.
-- Output is 24 kHz mono PCM16. The model runs in fp32: its vocoder is
-  phase-sensitive and does not tolerate reduced precision.
+- Output is 24 kHz mono PCM16. The model runs in fp32 by default: its vocoder is
+  phase-sensitive, so reduced precision is opt-in. On CUDA the text half and the
+  frame half of the forward are captured as CUDA graphs per length bucket and the
+  frame half is compiled with dynamic shapes, so the first start-up on a GPU takes
+  about two minutes; rows of one step are grouped by frame bucket
+  (``frame_grouping: single`` pads them into one group instead, kept for comparison).
 - ``examples/livekit_kokoro.py`` and ``examples/pipecat_kokoro.py`` plug the server
   into LiveKit Agents and Pipecat through their OpenAI TTS plugins (``base_url``
   pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
