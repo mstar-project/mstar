@@ -721,28 +721,19 @@ def test_postprocess_finishes_captured_step() -> None:
 def test_video_postprocess_uses_request_fps(tmp_path) -> None:
     """The mp4 container carries the request's fps (falling back to the model
     default), so playback runs at the requested rate without a mux-side retime."""
-    import subprocess
+    import io
 
-    import pytest as _pytest
+    import av
     import torch
 
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     frames = torch.zeros(1, 3, 8, 32, 32, dtype=torch.uint8)
-    try:
-        data = model.postprocess(frames, "video", request_kwargs={"fps": 12})
-    except Exception as exc:  # noqa: BLE001 — encoder backend missing on this host
-        _pytest.skip(f"video encoder unavailable: {exc}")
-    out = tmp_path / "v.mp4"
-    out.write_bytes(data)
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", str(out)],
-        capture_output=True, text=True, timeout=30, check=False,
-    )
-    if probe.returncode != 0:
-        _pytest.skip("ffprobe unavailable")
-    num, den = probe.stdout.strip().split("/")
-    assert abs(float(num) / float(den) - 12.0) < 1e-3
+    data = model.postprocess(frames, "video", request_kwargs={"fps": 12})
+    (tmp_path / "v.mp4").write_bytes(data)
+    with av.open(io.BytesIO(data)) as container:
+        stream = container.streams.video[0]
+        assert abs(float(stream.average_rate) - 12.0) < 1e-3
+        assert sum(1 for _ in container.decode(stream)) == 8
 
 
 if __name__ == "__main__":
