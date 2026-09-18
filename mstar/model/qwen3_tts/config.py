@@ -246,8 +246,13 @@ class Qwen3TTSCodecConfig:
     # turns reference audio into codec frames for voice cloning.
     encoder_config: dict[str, Any] = field(default_factory=dict)
 
-    # M* stream policy: 300 new 12 Hz frames with 25 frames of overlap.
-    chunk_frames: int = 300
+    # M* stream policy: the codec pops a ramp of small chunks first (first
+    # audio after 4 frames = 320 ms of speech), then ``chunk_frames`` new
+    # frames per call, each preceded by up to ``left_context_frames`` already
+    # decoded frames so the causal decoder warms up (the reference's own
+    # ``chunked_decode`` uses 25 frames of left context).
+    chunk_schedule: tuple[int, ...] = (4, 8, 16)
+    chunk_frames: int = 25
     left_context_frames: int = 25
 
     @classmethod
@@ -272,6 +277,19 @@ class Qwen3TTSCodecConfig:
         })
         return cls(**values)
 
+    def codec_windows(self) -> list[int]:
+        """Distinct window sizes (context + new frames) the chunk schedule produces.
+
+        These are the shapes the codec captures CUDA graphs for; a terminal
+        flush shorter than a window is padded up to the next one.
+        """
+        windows = set()
+        delivered = 0
+        for size in (*self.chunk_schedule, self.chunk_frames):
+            windows.add(min(self.left_context_frames, delivered) + size)
+            delivered += size
+        return sorted(windows)
+
     def frames_for_samples(self, num_samples: int) -> int:
         """Codec frames the encoder emits for ``num_samples`` of input audio."""
         return -(-int(num_samples) // self.encode_downsample_rate)
@@ -285,6 +303,7 @@ class Qwen3TTSCodecConfig:
             "encode_downsample_rate",
             "encoder_valid_num_quantizers",
             "encoder_config",
+            "chunk_schedule",
             "chunk_frames",
             "left_context_frames",
         }
