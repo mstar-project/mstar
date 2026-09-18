@@ -63,8 +63,13 @@ def test_encoder_matches_hf_on_real_audio(models):
     worst = 0.0
     for path in _audio_paths(4):
         wave = model.load_audio(str(path), "cpu").data
-        feats = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [wave]}, language="en")
-        x = feats["audio_features"][0].cuda().to(torch.bfloat16).unsqueeze(0)
+        samples = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [wave]}, language="en")["audio"][0]
+        with torch.no_grad():
+            # the submodule's GPU log-mel against the same transform on the CPU
+            gpu_feats = enc_sub.log_mel(enc_sub.log_mel.pad_or_trim(samples.cuda()))
+            cpu_feats = model.log_mel(model.log_mel.pad_or_trim(samples))
+            assert torch.allclose(gpu_feats.cpu(), cpu_feats, atol=1e-3), (gpu_feats.cpu() - cpu_feats).abs().max()
+        x = gpu_feats.to(torch.bfloat16).unsqueeze(0)
         with torch.no_grad():
             ours = enc_sub.encoder(x).float()
             theirs = hf.model.encoder(x).last_hidden_state.float()
@@ -95,8 +100,8 @@ def test_greedy_tokens_match_hf_generate(models):
     for path in _audio_paths(6):
         wave = model.load_audio(str(path), "cpu").data
         feats = processor(wave.numpy(), sampling_rate=16000, return_tensors="pt")["input_features"]
-        ours_feats = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [wave]}, language="en")
-        assert torch.allclose(feats[0], ours_feats["audio_features"][0], atol=2e-4)
+        ours = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [wave]}, language="en")
+        assert torch.allclose(feats[0], model.log_mel(model.log_mel.pad_or_trim(ours["audio"][0])), atol=2e-4)
         with torch.no_grad():
             out = hf.generate(
                 feats.cuda().to(torch.bfloat16), language="en", task="transcribe",
