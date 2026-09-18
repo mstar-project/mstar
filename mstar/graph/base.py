@@ -79,6 +79,7 @@ class GraphEdge:
     # None on every other edge
     _stream_chunk_offset: int | None = field(default=None)
     _stream_chunk_context: int | None = field(default=None)
+    _stream_chunk_items: int | None = field(default=None)
 
     # Set for sharded configurations
     _total_fanin: int = 1
@@ -97,6 +98,7 @@ class GraphEdge:
             _final_stream_chunk=self._final_stream_chunk,
             _stream_chunk_offset=self._stream_chunk_offset,
             _stream_chunk_context=self._stream_chunk_context,
+            _stream_chunk_items=self._stream_chunk_items,
         )
 
 
