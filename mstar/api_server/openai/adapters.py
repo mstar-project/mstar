@@ -325,7 +325,6 @@ class OrpheusAdapter(OpenAIAdapter):
         )
 
 
-
 class OmniVoiceAdapter(OpenAIAdapter):
     """OmniVoice: zero-shot TTS in three modes over one endpoint.
 
@@ -377,6 +376,36 @@ class OmniVoiceAdapter(OpenAIAdapter):
             text=req.input,
             file_paths=file_paths,
             input_modalities=input_modalities,
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
+class Qwen3TTSAdapter(OpenAIAdapter):
+    """Qwen3-TTS (CustomVoice / VoiceDesign / Base): text-to-speech, audio only.
+
+    ``voice`` selects a built-in speaker (CustomVoice). ``instructions`` (the
+    OpenAI field; ``instruct`` also accepted) carries the style or voice
+    description. Non-standard knobs travel through ``extra_body``:
+    ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,
+    the residual-group ``subtalker_*`` sampling, ``max_new_tokens``.
+    ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk["voice"] = req.voice
+        # OpenAI's field is ``instructions``; the model reads ``instruct``.
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
             output_modalities=["audio"],
             model_kwargs=mk,
         )
@@ -513,6 +542,10 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
+    "qwen3_tts": Qwen3TTSAdapter(),
+    "qwen3_tts_1p7b": Qwen3TTSAdapter(),
+    "qwen3_tts_voicedesign": Qwen3TTSAdapter(),
+    "qwen3_tts_base": Qwen3TTSAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),
