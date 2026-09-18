@@ -128,6 +128,11 @@ class DSparkAttention(nn.Module):
         q_lat, q_pe = self.query(x, positions)
         lat = self.latent(x, positions)
         o_ctx, lse_ctx = attn.run(q_lat, label=label, kv_cache_layer=kv_layer, q_pe=q_pe, return_lse=True)
+        if x.is_cuda:
+            from mstar.model.kimi_k3.dspark.block_attn_kernel import dspark_block_attention
+
+            # one launch: the block's scores, softmax and output and the merge with the context part
+            return self.finish(dspark_block_attention(q_lat, q_pe, lat, o_ctx, lse_ctx, rows, self.cfg.kv_lora_rank, self.scale))
         scores = self.block_scores(q_lat, q_pe, lat, rows)  # [rows, H, k, k]
         lse_blk = torch.logsumexp(scores, dim=-1)  # [rows, H, k]
         c = lat[..., : self.cfg.kv_lora_rank].view(rows, -1, self.cfg.kv_lora_rank).float()
