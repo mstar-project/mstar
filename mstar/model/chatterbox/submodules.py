@@ -526,6 +526,7 @@ class S3GenSubmodule(NodeSubmodule):
         self.samples_per_frame = s3.hift.upsample_factor
         self.lookahead_tokens = s3.encoder.pre_lookahead_len
         self.context_tokens = config.stream_context_tokens
+        self.frame_bucket = config.s3gen_frame_bucket
         self.cache_frames = config.stream_mel_cache_frames
         self.cache_samples = self.cache_frames * self.samples_per_frame
         # crossfade of the re-synthesised tail: the second half of a Hamming
@@ -711,7 +712,9 @@ class S3GenSubmodule(NodeSubmodule):
         pending = [i for i, plan in enumerate(plans) if plan.row is not None]
         for steps in sorted({n_timesteps[i] for i in pending}):
             group = [i for i in pending if n_timesteps[i] == steps]
-            mels = self.s3gen.tokens_to_mel_rows([plans[i].row for i in group], n_timesteps=steps)
+            mels = self.s3gen.tokens_to_mel_rows(
+                [plans[i].row for i in group], n_timesteps=steps, frame_bucket=self.frame_bucket,
+            )
             for i, mel in zip(group, mels, strict=True):
                 outputs[i] = self._emit_chunk(plans[i], mel)
         return outputs
