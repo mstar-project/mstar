@@ -13,3 +13,6 @@ node_groups:
 #   chunk_target_phonemes: 200          # sentence packing (first_chunk_target_phonemes bounds TTFA)
 #   frame_buckets: [64, 128, 256, 512, 1024]   # fewer CUDA graphs on a smaller GPU
 #   max_batch_frames: 8192              # batch x frames cap per captured decoder graph
+#   compile_decoder: false              # skip torch.compile of the vocoder: start-up in seconds, about half the throughput
+#   decoder_dtype: "bfloat16"           # bf16 vocoder trunk (+13% audio-s/s at concurrency 32 on an H100; fp32 is parity-tested)
+#   frame_grouping: "single"            # pad one step's rows into one group instead of one group per frame bucket
