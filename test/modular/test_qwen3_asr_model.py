@@ -377,3 +377,32 @@ def test_registry_cli_config_and_benchmark_entries_agree(key, repo):
     bench = ModelType(key).inst()
     assert bench.get_hf_url() == repo and bench.get_supported_modalities() == {RequestType.A2T}
     assert "transcribe(" in _next_steps(key, "0.0.0.0", 8000)
+
+
+# --------------------------------------------------------------------------
+# OpenAI adapter
+# --------------------------------------------------------------------------
+
+
+def test_openai_adapter_parses_language_line_and_continues_hypotheses():
+    from mstar.api_server.openai import adapters
+    from mstar.api_server.openai.protocol import TranscriptionRequest
+
+    for key in ("qwen3_asr", "qwen3_asr_realtime", "whisper_large_v3_turbo"):
+        assert adapters.get_adapter(key).supports_transcriptions
+    ad = adapters.get_adapter("qwen3_asr")
+    assert ad.supports_realtime_transcription and ad.max_audio_seconds == 1200.0
+
+    req = TranscriptionRequest(language="en", prompt="names: Ada")
+    sa = ad.transcription_to_request(req, "/tmp/a.wav")
+    assert sa.model_kwargs == {"language": "en", "initial_prompt": "names: Ada", "temperature": 0.0}
+    step = ad.realtime_step_request(req, "/tmp/a.wav", "language English<asr_text> so far")
+    assert step.model_kwargs["assistant_prefix"] == "language English<asr_text> so far"
+
+    free = TranscriptionRequest()
+    t = ad.parse_transcript("language English<asr_text> Hello there.", free)
+    assert (t.text, t.language) == ("Hello there.", "English")
+    assert ad.parse_transcript("language None<asr_text>", free).language is None
+    assert ad.parse_transcript(" plain words ", req).text == "plain words"
+    assert ad.parse_transcript(" plain words ", req).language == "en"
+    assert ad.stream_delta("language English<asr_text>") == "" and ad.stream_delta(" Hello") == " Hello"
