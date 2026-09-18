@@ -219,9 +219,10 @@ Per-model notes:
   they run in order, openai-whisper style: each window gets the transcript so
   far as ``initial_prompt`` and the first window's detected language, is decoded
   with timestamps so the next window can start where its last closed segment
-  ended (no word is split by a boundary), and is decoded again at rising
-  temperatures when its text is a repetition loop (gzip compression ratio above
-  2.4) — after which the transcript so far stops conditioning later windows.
+  ended (no word is split by a boundary), and is decoded again when its text is
+  a repetition loop (gzip compression ratio above 2.4): first without the
+  conditioning text, then at rising temperatures — after which the transcript
+  so far stops conditioning later windows.
   Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
   as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
   once, each cut at the quietest moment before its boundary. Segment timestamps
