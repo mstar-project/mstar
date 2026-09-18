@@ -160,6 +160,11 @@ class KleinVaeEncoderSubmodule(NodeSubmodule):
         tokens = []
         for key in sorted(images, key=lambda name: int(name.split("_")[1])):
             pixels = normalize_pixels(images[key]).to(device=device, dtype=self.vae.dtype).unsqueeze(0)
+            # The reference's image processor hands the VAE an NHWC-strided view (numpy HWC transposed
+            # to NCHW); cuDNN picks different convolution kernels for that layout than for a dense
+            # NCHW tensor, and the one-ulp differences propagate into the edit. Same layout, same
+            # kernels, bit-exact reference latents.
+            pixels = pixels.contiguous(memory_format=torch.channels_last)
             latent = self.vae.normalize_latents(patchify_latents(self.vae.encode(pixels)))
             tokens.append(pack_latents(latent))
         return {REF_LATENTS: [torch.cat(tokens, dim=1)]}
