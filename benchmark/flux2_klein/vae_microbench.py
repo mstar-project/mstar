@@ -12,13 +12,20 @@ from __future__ import annotations
 
 import argparse
 import functools
+import math
 import statistics
 import time
 
 import torch
 
+from mstar.model.components.diffusion.image_io import pixels_to_uint8
 from mstar.model.flux2_klein.config import Flux2KleinConfig, resolve_snapshot_dir
 from mstar.model.flux2_klein.weight_loader import build_vae
+
+
+def _psnr(a: torch.Tensor, b: torch.Tensor) -> float:
+    mse = (a.float() - b.float()).pow(2).mean().item()
+    return float("inf") if mse == 0 else 20 * math.log10(255.0) - 10 * math.log10(mse)
 
 
 def _time(fn, repeats: int) -> float:
@@ -60,12 +67,19 @@ def main() -> None:
             variants["eager + cudnn.benchmark"] = functools.partial(vae.decode, latents)
             compiled = torch.compile(vae.decode, fullgraph=False, dynamic=False)
             variants["compiled + cudnn.benchmark"] = functools.partial(compiled, latents)
+            for mode in ("reduce-overhead", "max-autotune-no-cudagraphs"):
+                fn = torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=mode)
+                variants[f"compiled {mode}"] = functools.partial(fn, latents)
             print(f"== batch {batch}")
+            ref_u8 = pixels_to_uint8(reference)
             for name, fn in variants.items():
                 ms = _time(fn, args.repeats)
-                diff = (fn().float() - reference.float()).abs().max().item()
-                print(f"  {name:28s} {ms:8.2f} ms   max_abs vs eager {diff:.3e}")
+                out = fn()
+                diff = (out.float() - reference.float()).abs().max().item()
+                psnr = _psnr(pixels_to_uint8(out), ref_u8)
+                print(f"  {name:36s} {ms:8.2f} ms   max_abs vs eager {diff:.3e}   uint8 PSNR {psnr:6.2f} dB")
             torch.backends.cudnn.benchmark = False
+            torch._dynamo.reset()
         print(f"  peak alloc {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
 
