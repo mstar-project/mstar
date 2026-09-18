@@ -12,7 +12,7 @@ tokens, 8 steps and no guidance for Turbo — is spelled out as defaults here.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from mstar.model.components.diffusion.autoencoder_kl import AutoencoderKLConfig
@@ -97,9 +97,10 @@ class ZImageConfig:
         # hidden_states[-2] of the 36-layer Qwen3-4B == output of layer 35
         hidden_state_layers=(35,), max_sequence_length=512,
     ))
-    scheduler: FlowMatchConfig = field(default_factory=lambda: FlowMatchConfig.from_scheduler_config(
+    # torch_linspace: the Z-Image pipeline builds its base sigma grid with fp32 torch.linspace
+    scheduler: FlowMatchConfig = field(default_factory=lambda: replace(FlowMatchConfig.from_scheduler_config(
         {"num_train_timesteps": 1000, "shift": 3.0, "use_dynamic_shifting": False},
-    ))
+    ), torch_linspace=True))
 
     default_height: int = 1024
     default_width: int = 1024
@@ -134,7 +135,7 @@ class ZImageConfig:
             text_cfg, hidden_state_layers=(int(text_cfg["num_hidden_layers"]) - 1,), max_sequence_length=512,
         )
         with open(snapshot / "scheduler" / "scheduler_config.json") as f:
-            scheduler = FlowMatchConfig.from_scheduler_config(json.load(f))
+            scheduler = replace(FlowMatchConfig.from_scheduler_config(json.load(f)), torch_linspace=True)
         if transformer.cap_feat_dim != text_encoder.hidden_size:
             raise ValueError(f"cap_feat_dim {transformer.cap_feat_dim} != Qwen3 hidden size {text_encoder.hidden_size}")
         if vae.scaling_factor is None or vae.shift_factor is None:
