@@ -414,7 +414,9 @@ class Cosmos3Config:
     graph_max_latent_area: int = 2000
     # Video denoise steps to capture as CUDA graphs, as (height, width,
     # frames) pixel tiers: a plain t2v/i2v clip length and/or the windowed
-    # rollout's window length (e.g. Edge: (480, 832, 121) and (480, 832, 29)).
+    # rollout's window length. Pays only for small, launch-bound tiers: at
+    # 832x480 the captured (paged-attention) step measured slower than the
+    # eager dense FA3 one, so the Edge yaml leaves this empty.
     # The graph is built with every latent frame declared noisy and carries
     # the clean/noisy layout as a per-token mask input, so one graph per shape
     # serves t2v, i2v (anchor frame) and chained windows (overlap frames);
