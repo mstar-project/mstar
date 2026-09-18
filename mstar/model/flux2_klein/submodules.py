@@ -276,16 +276,32 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
 VAE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
 
-VAE_WARMUP_BATCH_SIZES = (1, 2)
+VAE_DECODE_BATCH_SIZES = (1, 2, 4, 8)
 
 
 def compile_vae_decode(vae: nn.Module):
-    """``vae.decode`` compiled with inductor autotuning (no cudagraphs: the engine's runner owns
-    capture). ``dynamic=None``: the first batch size compiles a static graph, the second turns
-    the batch dimension symbolic, so warming batch sizes 1 and 2 per grid covers every batch
-    size after that — a fresh max-autotune compile costs tens of seconds, far too much to pay
-    inside a request."""
-    return torch.compile(vae.decode, fullgraph=False, dynamic=None, mode=VAE_COMPILE_MODE)
+    """``vae.decode`` compiled per static shape with inductor autotuning (no cudagraphs: the
+    engine's runner owns capture). Static, not symbolic: a symbolic batch dimension decoded
+    batch 8 in 346 ms against 223 ms for the per-size graph. A fresh max-autotune compile costs
+    tens of seconds, so the decoder warms every batch size it will ever call at load and splits
+    larger batches into those sizes (see ``decode_in_chunks``)."""
+    return torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE)
+
+
+def decode_in_chunks(decode, latents: torch.Tensor, chunk_sizes: Sequence[int]) -> torch.Tensor:
+    """Decode ``latents`` in slices whose batch sizes are all in ``chunk_sizes`` (largest
+    first), so a compiled ``decode`` only ever sees the shapes it was warmed with."""
+    sizes = sorted(set(int(s) for s in chunk_sizes), reverse=True)
+    if not sizes or latents.shape[0] in sizes:
+        return decode(latents)
+    outputs, start, remaining = [], 0, latents.shape[0]
+    while remaining:
+        size = next((s for s in sizes if s <= remaining), sizes[-1])
+        if size > remaining:
+            raise ValueError(f"cannot split a batch of {latents.shape[0]} into chunks of {sizes}")
+        outputs.append(decode(latents[start:start + size]))
+        start, remaining = start + size, remaining - size
+    return torch.cat(outputs)
 
 
 class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
@@ -302,7 +318,7 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
 
     def __init__(
         self, vae: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 8, compile_decode: bool = False,
-        warmup_grids: Sequence[tuple[int, int]] = (),
+        warmup_grids: Sequence[tuple[int, int]] = (), decode_batch_sizes: Sequence[int] = VAE_DECODE_BATCH_SIZES,
     ):
         super().__init__()
         self.vae = vae
@@ -312,21 +328,29 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
         # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
         # deployment knob and stays off for the bit-exact parity path. CUDA graphs would add nothing:
         # the compiled decode is not launch-bound (measured), so the node declares no captures.
-        self._decode = compile_vae_decode(vae) if compile_decode else vae.decode
+        self._compiled = bool(compile_decode)
+        self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
+        # compiled: only these batch sizes are ever decoded (larger batches are split into them)
+        self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
         self.warmup(warmup_grids)
 
-    def warmup(self, grids: Sequence[tuple[int, int]], batch_sizes: Sequence[int] = VAE_WARMUP_BATCH_SIZES) -> None:
-        """Decode zeros at ``batch_sizes`` for every token grid at load, so the compile, its
-        autotuning and the switch to a symbolic batch dimension all happen before the first request."""
+    def _decode(self, latents: torch.Tensor) -> torch.Tensor:
+        return decode_in_chunks(self._decode_one, latents, self._decode_batch_sizes)
+
+    def warmup(self, grids: Sequence[tuple[int, int]]) -> None:
+        """Decode zeros at every decode batch size for every token grid at load, so the compiles
+        and their autotuning happen before the first request (only when the decode is compiled)."""
+        if not self._compiled:
+            return
         for h, w in grids:
             patch = self.config.vae.patch_size
-            for bs in batch_sizes:
+            for bs in self._decode_batch_sizes:
                 latent = torch.zeros(
                     bs, self.config.vae.latent_channels, h * patch[0], w * patch[1],
                     device=self.get_device(), dtype=self.vae.dtype,
                 )
                 with torch.no_grad():
-                    self._decode(latent)
+                    self._decode_one(latent)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         grid = self.config.latent_grid(int(fwd_info.step_metadata["height"]), int(fwd_info.step_metadata["width"]))
