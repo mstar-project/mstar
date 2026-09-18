@@ -16,7 +16,7 @@ import json
 import re
 from pathlib import Path
 
-RUN_NAME = re.compile(r"^(mstar|tts_server|chatterbox_vllm)_(.+)_c(\d+)$")
+RUN_NAME = re.compile(r"^(mstar|tts_server|chatterbox_vllm)_?(.*)_c(\d+)$")
 SYSTEMS = {"mstar": "M*", "tts_server": "Chatterbox-TTS-Server", "chatterbox_vllm": "chatterbox-vllm"}
 
 
@@ -30,7 +30,7 @@ def parse_run_name(name: str) -> tuple[str, str, str, int] | None:
     if not m:
         return None
     system, tag, conc = SYSTEMS[m.group(1)], m.group(2), int(m.group(3))
-    parts = tag.split("_")
+    parts = [p for p in tag.split("_") if p]
     variant = "turbo" if "turbo" in parts else "chatterbox"
     options = "_".join(p for p in parts if p not in ("chatterbox", "turbo", "original"))
     return system, variant, options, conc
