@@ -569,6 +569,32 @@ def test_bucket_selection_and_grouping():
     assert pick_bucket(129, buckets) is None
     groups = group_by_bucket([100, 10, 64, 500, 90], buckets)
     assert groups == [(48, [1]), (64, [2]), (96, [4]), (128, [0]), (None, [3])]
+    assert group_by_bucket([100, 10, 64, 500, 90], buckets, "single") == [(128, [0, 1, 2, 4]), (None, [3])]
+    with pytest.raises(ValueError, match="frame_grouping"):
+        group_by_bucket([1], buckets, "weird")
+
+
+def test_bf16_decoder_keeps_source_and_head_in_fp32():
+    config = tiny_config()
+    config.decoder_dtype = "bfloat16"
+    torch.manual_seed(0)
+    model = KokoroTTS(config).eval()
+    model.decoder.generator.m_source.deterministic = True
+    ids = torch.tensor([[0, 1, 5, 3, 9, 2, 0]])
+    lengths = torch.tensor([7])
+    style = torch.randn(1, 16)
+    with torch.no_grad():
+        audio, frame_lengths, _ = model(ids, lengths, style, torch.tensor([1.0]))
+        config32 = tiny_config()
+        ref = KokoroTTS(config32).eval()
+        ref.load_state_dict(model.state_dict())
+        ref.decoder.generator.m_source.deterministic = True
+        audio32, _, _ = ref(ids, lengths, style, torch.tensor([1.0]))
+    # mechanics only: the fp32 head returns fp32 audio of the same shape and it
+    # is finite; the quality of a bf16 trunk is judged on real weights (WER)
+    assert audio.dtype == torch.float32 and audio.shape == audio32.shape
+    assert torch.isfinite(audio).all()
+    assert model.decoder.autocast_dtype is torch.bfloat16 and ref.decoder.autocast_dtype is None
 
 
 def test_piecewise_regions_match_the_eager_halves():
