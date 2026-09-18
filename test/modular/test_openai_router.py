@@ -260,6 +260,28 @@ def test_videos_stream_ndjson(client_and_stub):
     assert _b64.b64decode(body["data"][0]["b64_json"]) == b"mp4-full"
 
 
+def test_chat_stream_reports_a_failed_request_in_band(client_and_stub):
+    """A request that fails after the stream opened ends with an error event,
+    not a ``finish_reason: stop`` that reads as a complete answer."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [
+        _Chunk("text", b"Paris"),
+        _Chunk("error", b"Error in worker: ValueError: q implies q_len_per_req=5", {"status": 500}),
+    ]
+    text = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "go"}], "stream": True},
+    ).text
+    events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+    assert events[1]["choices"][0]["delta"]["content"] == "Paris"
+    assert events[-1]["error"] == {
+        "message": "Error in worker: ValueError: q implies q_len_per_req=5", "type": "server_error", "code": 500,
+    }
+    assert not any(e.get("choices", [{}])[0].get("finish_reason") for e in events)
+    assert text.rstrip().endswith("data: [DONE]")
+
+
 def test_unsupported_model_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "pi05"
