@@ -88,6 +88,9 @@ Kokoro notes
   English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
   ``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
   synthesize a phoneme string directly).
+- Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
+  ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
+  fallback even when it is installed.
 - Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
   PL-BERT window); each chunk is emitted to the client as soon as it is
   synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
