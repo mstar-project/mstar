@@ -384,3 +384,32 @@ def test_component_iterator_filters_skipped_keys_before_reading(tmp_path):
     # the second shard is empty after the filter and is never opened
     assert [k for k, _ in iter_transformers_component(sharded, "cpu", skip=skip)] == ["model.layers.0.w"]
     assert sorted(k for k, _ in iter_transformers_component(sharded, "cpu")) == sorted(tensors)
+
+
+def test_postprocess_honours_output_format():
+    model = _make_model()
+    image = torch.randint(0, 256, (1, 3, 32, 48), dtype=torch.uint8)
+    assert model.postprocess(image, "image", None)[:8] == b"\x89PNG\r\n\x1a\n"
+    assert model.postprocess(image, "image", {"output_format": "jpeg", "output_compression": 80})[:3] == b"\xff\xd8\xff"
+    with pytest.raises(ValueError, match="modality"):
+        model.postprocess(image, "audio", None)
+
+
+def test_image_nodes_schedule_in_lockstep():
+    """Speculative scheduling launches each request's next step alone; batching needs lockstep."""
+    model = _make_model()
+    nodes: dict[str, GraphNode] = {}
+
+    def collect(section):
+        if isinstance(section, GraphNode):
+            nodes[section.name] = section
+        elif isinstance(section, Sequential):
+            for child in section.sections:
+                collect(child)
+        elif isinstance(section, Loop):
+            collect(section.section)
+
+    for section in model.get_graph_walk_graphs().values():
+        collect(section)
+    assert set(nodes) == {"text_encoder", "vae_encoder", "dit", "vae_decoder"}
+    assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, False)
