@@ -419,24 +419,33 @@ def test_vae_compile_knob_reaches_the_decoder_node():
     from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
 
     class FakeVae(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+
+        @property
+        def dtype(self):
+            return self.weight.dtype
+
         def decode(self, x):
             return x
 
     vae = FakeVae()
     plain = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig())
-    assert plain._decode == vae.decode  # the parity path: eager decode, bit-exact
+    assert plain._decode_one == vae.decode and plain._decode_batch_sizes == ()  # parity path: eager, any batch
     compiled = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig(), compile_decode=True)
-    assert compiled._decode != vae.decode and callable(compiled._decode)
+    assert compiled._decode_one != vae.decode and compiled._decode_batch_sizes == (1, 2, 4, 8)
     assert _make_model(vae_compile=True).vae_compile is True and _make_model().vae_compile is False
 
 
-def test_vae_decoder_warmup_decodes_each_grid_at_the_warmup_batch_sizes():
-    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
+def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(monkeypatch):
+    import mstar.model.flux2_klein.submodules as subs
+    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule, decode_in_chunks
 
     class RecordingVae(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros(1))  # gives the node a device
+            self.weight = torch.nn.Parameter(torch.zeros(1))
             self.shapes = []
 
         @property
@@ -447,11 +456,21 @@ def test_vae_decoder_warmup_decodes_each_grid_at_the_warmup_batch_sizes():
             self.shapes.append(tuple(x.shape))
             return x
 
+    monkeypatch.setattr(subs, "compile_vae_decode", lambda vae: vae.decode)  # no inductor on CPU tests
     config = Flux2KleinConfig()
     vae = RecordingVae()
-    KleinVaeDecoderSubmodule(vae, config, warmup_grids=[config.latent_grid(1024, 1024), config.latent_grid(512, 768)])
+    node = KleinVaeDecoderSubmodule(
+        vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)], decode_batch_sizes=(1, 2, 4, 8),
+    )
     lc, ph, pw = config.vae.latent_channels, *config.vae.patch_size
-    # batch sizes 1 and 2 per grid: static compile, then the symbolic-batch recompile
-    assert vae.shapes == [(1, lc, 64 * ph, 64 * pw), (2, lc, 64 * ph, 64 * pw), (1, lc, 32 * ph, 48 * pw),
-                          (2, lc, 32 * ph, 48 * pw)]
-    assert KleinVaeDecoderSubmodule(RecordingVae(), config).vae.shapes == []  # no grids -> no warmup
+    assert vae.shapes == [(bs, lc, 64 * ph, 64 * pw) for bs in (1, 2, 4, 8)]
+    vae.shapes.clear()
+    out = node._decode(torch.arange(7.0)[:, None, None, None].expand(7, lc, 4, 4).contiguous())
+    assert [s[0] for s in vae.shapes] == [4, 2, 1] and out.shape[0] == 7
+    assert torch.equal(out[:, 0, 0, 0], torch.arange(7.0))  # rows stay in order
+    # eager path: no warmup, any batch in one call
+    eager = RecordingVae()
+    KleinVaeDecoderSubmodule(eager, config, warmup_grids=[config.latent_grid(1024, 1024)])
+    assert eager.shapes == []
+    assert decode_in_chunks(eager.decode, torch.zeros(5, 1, 1, 1), ()).shape[0] == 5
+    assert eager.shapes == [(5, 1, 1, 1)]
