@@ -400,9 +400,16 @@ class Qwen3TTSAdapter(OpenAIAdapter):
     ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,
     the residual-group ``subtalker_*`` sampling, ``max_new_tokens``.
     ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.
+
+    Inputs of 600+ characters are synthesized as ordered sentence chunks
+    (``serving_speech``): each Talker request stays near the lengths the
+    model was trained on and the chunks batch like independent requests.
+    Benchmark sentences (5-40 words) never reach the threshold.
     """
 
     supports_speech = True
+    speech_chunk_min_chars = 600
+    speech_chunk_max_chars = 400
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
