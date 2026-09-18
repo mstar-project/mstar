@@ -5,8 +5,13 @@ model: "z_image_turbo"
 max_seq_len: 512
 
 model_kwargs:
-  attention_backend: flashinfer
+  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
+  # reference kernel; flashinfer stays available
+  attention_backend: sdpa
   compile: true
+  # inductor rounds intermediates like eager PyTorch: keeps the compiled transformer at the
+  # reference's numerics (without it the served images drift to 35-39 dB on a 4-step sampler)
+  compile_eager_rounding: true
   cuda_graph: true
   capture_sizes: [[1024, 1024]]
   # captions are padded to multiples of 32 tokens; graphs are captured for these lengths
