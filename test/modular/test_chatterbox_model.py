@@ -381,8 +381,16 @@ def test_s3gen_partition_reinjects_reference_each_chunk():
     result = model.get_partition_forward_pass_args("S3Gen", metadata, persist)
     assert result.full_metadata.graph_walk == "s3gen_chunk_voice"
     assert [e.name for e in result.inputs] == [REF_AUDIO, VOICE_KEY]
+    # signal-only after the first chunk: the node keeps the conditioned
+    # reference, and the handshake the conductor issues after the final chunk
+    # must not read a tensor the teardown may already have unlinked
+    assert all(e.tensor_info == [] for e in result.inputs)
     assert result.unpersist_tensors == [] and result.request_done is False
     assert result.step_metadata["watermark"] is False
+    # the first forward is the one that carries the clip
+    initial = model.get_initial_forward_pass_args("S3Gen", ["text", "audio"], ["audio"], persist, {})
+    assert [e.name for e in initial.inputs] == [REF_AUDIO, VOICE_KEY]
+    assert all(len(e.tensor_info) == 1 for e in initial.inputs)
 
     metadata.graph_walk = "s3gen_chunk"
     assert model.get_partition_forward_pass_args("S3Gen", metadata, persist).inputs == []
@@ -904,3 +912,23 @@ def test_chunk_policy_growth_knobs_reach_the_ramp():
     fixed.register_chunk(15)
     fixed.register_chunk(25)
     assert fixed.next_chunk_size(25) == 25
+
+
+def test_s3gen_keeps_the_reference_for_chunks_without_the_clip():
+    """The clip rides with the first chunk only; later chunks arrive with
+    signal-only voice edges and must reuse the conditioned reference rather
+    than fall back to the built-in voice."""
+    config = ChatterboxConfig.chatterbox()
+    sub = S3GenSubmodule(_FakeS3Gen(), s3_tokenizer=None, config=config, builtin_voice="builtin")
+    sub.condition = lambda wav: ("ref", wav.numel())  # noqa: E731
+    wav = torch.randn(2400)
+    key = torch.tensor([12345])
+    first = {SPEECH_TOKENS: [torch.tensor([1, 2, 3])], REF_AUDIO: [wav], VOICE_KEY: [key]}
+    later = {SPEECH_TOKENS: [torch.tensor([4, 5, 6])], REF_AUDIO: [], VOICE_KEY: []}
+
+    a = sub.prepare_inputs("s3gen_chunk_voice", _s3_info(rid="r"), first, is_final_stream_chunk=False)
+    b = sub.prepare_inputs("s3gen_chunk_voice", _s3_info(rid="r"), later, is_final_stream_chunk=True)
+    assert a.kwargs["ref"] == ("ref", 2400) and b.kwargs["ref"] == ("ref", 2400)
+    # another request without any clip still gets the built-in voice
+    c = sub.prepare_inputs("s3gen_chunk", _s3_info(rid="other"), {SPEECH_TOKENS: [torch.tensor([7])]})
+    assert c.kwargs["ref"] == "builtin"
