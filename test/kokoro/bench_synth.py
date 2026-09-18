@@ -31,17 +31,18 @@ def main() -> None:
     parser.add_argument("--phonemes", type=int, nargs="+", default=[40, 120, 300])
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--voice", default="af_heart")
-    parser.add_argument("--compile", action="store_true", help="torch.compile the two halves")
+    parser.add_argument("--compile", action="store_true", help="torch.compile decode_frames with dynamic shapes")
+    parser.add_argument("--decoder-dtype", default="float32", choices=["float32", "bfloat16", "float16"])
     args = parser.parse_args()
 
     local_dir = Path(_resolve_snapshot("hexgrad/Kokoro-82M", None, None))
     config = KokoroModelConfig.from_pretrained(local_dir)
+    config.decoder_dtype = args.decoder_dtype
     model = KokoroTTS(config)
     load_kokoro_weights(model, local_dir / config.weights_file)
     model = model.to(args.device).eval()
     if args.compile:
-        model.encode_text = torch.compile(model.encode_text, dynamic=False)
-        model.decode_frames = torch.compile(model.decode_frames, dynamic=False)
+        model.decode_frames = torch.compile(model.decode_frames, dynamic=True)
     voices = VoiceRegistry(local_dir / config.voices_dir, config.style_pack_rows, config.style_dim)
     ids = torch.tensor([v for k, v in config.vocab.items() if k.isalpha()], device=args.device)
 
