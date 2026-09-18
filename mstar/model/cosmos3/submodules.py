@@ -105,6 +105,13 @@ UNCOND_LABEL = "uncond"
 # one forward (``KVStep.combined_labels`` in the step declaration).
 CFG_BATCHED_LABEL = "_cfg_batched"
 
+# Ulysses exchange for the captured denoise step. all-gather (default) is
+# the faster one at the short sequences this path runs; see the call site
+# in ``_denoise_batched`` and ``ulysses_attention`` for the measurements.
+_SP_CAPTURE_ALL_GATHER = os.environ.get(
+    "MSTAR_SP_CAPTURE_ALL_GATHER", "1"
+) != "0"
+
 # Resource labels the DiT node declares (Cosmos3Model.get_node_resources) and
 # keys its resource steps by. ATTN is the paged backend: the understanding
 # tower's prefill writes its K/V through it, and a captured denoise graph
@@ -150,6 +157,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # step, classifier-free guidance combine), so torch.compile graph-breaks and
     # buys little; CUDA-graph capture of the fixed-shape step is the accelerator.
     disable_torch_compile = True
+
+    # Log the captured path's Ulysses exchange once per process, so which
+    # collective actually ran is answerable from the worker log.
+    _sp_exchange_logged = False
 
     # Run the two classifier-free-guidance branches as a single batched forward
     # per denoise step instead of two sequential forwards. The math is the same;
@@ -1695,15 +1706,29 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
-            # Captured into the denoise CUDA graph. Under SP the Ulysses
-            # exchange must be all-gather (all-to-all is grouped p2p send/recv —
-            # not graph-replayable); the flag holds across warmup/capture/replay
-            # so those kernels compile during eager warmup. No-op without SP.
+            # Captured into the denoise CUDA graph. The all-gather is the
+            # right exchange here, and measurably so: the captured path runs
+            # only short sequences (~240 tokens at 256p), where one tuned
+            # collective beats the all-to-all's P-1 send/recv pairs even
+            # though it moves more bytes. Switching costs 18% at 256p — see
+            # MSTAR_SP_CAPTURE_ALL_GATHER, which exists to re-test that if a
+            # captured path ever gets long sequences (the graph-replay
+            # objection that originally forced this choice no longer holds).
+            # Whichever it is must hold across warmup/capture/replay so those
+            # kernels compile during eager warmup. No-op without SP.
+            if not Cosmos3DiTSubmodule._sp_exchange_logged:
+                Cosmos3DiTSubmodule._sp_exchange_logged = True
+                logger.info(
+                    "Cosmos3 captured denoise: Ulysses exchange = %s "
+                    "(MSTAR_SP_CAPTURE_ALL_GATHER=%s)",
+                    "all_gather" if _SP_CAPTURE_ALL_GATHER else "all_to_all",
+                    os.environ.get("MSTAR_SP_CAPTURE_ALL_GATHER", "1"),
+                )
             cond_v, uncond_v = self.transformer.denoise_step_batched_cfg(
                 latents[0], vision_timesteps[0], position_ids_cond[0], position_ids_uncond[0],
                 layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
                 layout["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
-                prefer_all_gather=True,
+                prefer_all_gather=_SP_CAPTURE_ALL_GATHER,
             )
             return {rids[0]: {"cond_v": [cond_v], "uncond_v": [uncond_v]}}
         reqs = [

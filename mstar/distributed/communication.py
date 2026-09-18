@@ -1,8 +1,12 @@
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 
 class CommGroup:
@@ -27,6 +31,11 @@ class CommGroup:
         self.world_size = len(group_members)
         self.device_group = None
         self.initialized = False
+        # Fast all-reduce state; see ``_fast_all_reduce_buffer``. One
+        # symmetric-memory buffer per dtype, created on first use.
+        self._fast_ar_buffers: dict[torch.dtype, torch.Tensor] = {}
+        self._fast_ar_kind: dict[torch.dtype, str] = {}
+        self._fast_ar_group_name: str | None = None
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -64,8 +73,184 @@ class CommGroup:
             return
         dist.barrier(group=self.device_group)
 
+    # Small all-reduces dominate a TP decode step: a 28-layer model issues
+    # 2 per layer plus one for the vocab-parallel embedding, all of them
+    # ``[bs, hidden]`` — 6 KiB at bs=1, hidden 3072. NCCL is the wrong tool
+    # at that size. Measured on 2xH100 (NV18), inside a CUDA graph, 57
+    # back-to-back all-reduces of 6 KiB:
+    #
+    #   dist.all_reduce                1.050 ms   (18.4 us each)
+    #   symm_mem one-shot              0.490 ms   ( 8.6 us each)
+    #
+    # A single isolated ``dist.all_reduce`` is only 9.8 us; the other 8.6 us
+    # is the per-call fork/join between the compute stream and
+    # ProcessGroupNCCL's internal stream, which nothing can hide when the
+    # collectives serialize the way a transformer's do. The one-shot kernel
+    # runs on the calling stream, so it never pays it.
+    #
+    # ``MSTAR_FAST_ALLREDUCE``: ``1`` (default) uses the one-shot path where
+    # it applies, ``0`` forces NCCL everywhere.
+    # ``MSTAR_FAST_ALLREDUCE_MAX_KIB``: size cutoff, default 8 MiB. The two
+    # kernels cross over against NCCL at different sizes, so the effective
+    # cap is per kind (``_FAST_AR_KIND_MAX``) and this env var is an overall
+    # ceiling on top. Measured on 2xH100/NV18, us per all-reduce, chained
+    # and graph-replayed:
+    #
+    #             8 KiB    128 KiB    8 MiB
+    #   NCCL      18.48      20.71    58.72
+    #   one_shot   8.69       9.87    64.53   <- loses to NCCL by 8 MiB
+    #   multimem   7.76       8.33    74.88   <- loses harder; NVLS is a
+    #                                            small-message win only
+    #
+    # Re-measure with ``test/scratch/collective_shootout.py`` on new
+    # topology; multicast availability and crossover are fabric-dependent.
+    _fast_ar_enabled = os.environ.get("MSTAR_FAST_ALLREDUCE", "1") != "0"
+    _fast_ar_max_bytes = int(
+        float(os.environ.get("MSTAR_FAST_ALLREDUCE_MAX_KIB", "2048")) * 1024
+    )
+    # Per-kernel ceiling, applied under the env cap above.
+    _FAST_AR_KIND_MAX = {"multimem": 2 << 20, "one_shot": 2 << 20}
+    # Pre-registered at init; any other dtype falls back to NCCL rather
+    # than rendezvous'ing mid-run. float16 is listed on purpose even
+    # though torch has no one-shot kernel for it today — the probe in
+    # ``register_fast_allreduce_buffers`` finds that out and skips it, so
+    # this list needs no edit when one lands.
+    _FAST_AR_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+    def _fast_all_reduce_buffer(self, input_: torch.Tensor):
+        """A symmetric-memory staging buffer shaped like ``input_``, or None.
+
+        One flat buffer per dtype, registered up front by
+        ``register_fast_allreduce_buffers`` and sliced to fit here, so no
+        collective and no allocation happens on this path.
+
+        The buffer is shared by every all-reduce on the group, which is safe
+        only because they serialize: mstar submits all engine work from one
+        GPU executor thread onto the default stream, so two steps are never
+        staging through it at once. Two graphs replayed concurrently on
+        separate streams would need a buffer each.
+
+        Returns None (caller falls back to NCCL) when the fast path does not
+        apply: symmetric memory unavailable, tensor too large, not
+        contiguous, or of a dtype that was not pre-registered.
+        """
+        if not self._fast_ar_enabled or self.device_group is None:
+            return None
+        if input_.device.type != "cuda" or not input_.is_contiguous():
+            return None
+        buf = self._fast_ar_buffers.get(input_.dtype)
+        if buf is None:
+            return None
+        nbytes = input_.numel() * input_.element_size()
+        kind_max = self._FAST_AR_KIND_MAX.get(
+            self._fast_ar_kind.get(input_.dtype, "one_shot"), 0
+        )
+        if nbytes == 0 or nbytes > min(self._fast_ar_max_bytes, kind_max):
+            return None
+        return buf[: input_.numel()].view_as(input_)
+
+    def register_fast_allreduce_buffers(self, device: torch.device) -> None:
+        """Allocate and rendezvous the one-shot staging buffers.
+
+        Called once from ``init_dist``, not lazily on first use, for two
+        reasons. ``rendezvous`` is collective over the group, so doing it
+        from inside a forward would make correctness depend on every rank
+        meeting the same dtypes in the same order; and it cannot run under
+        CUDA-graph capture at all, so a buffer that first appeared mid-run
+        would be missing from exactly the graphs that need it.
+
+        Best-effort and per dtype: torch has no one-shot kernel for every
+        dtype (float16, today), and a dtype that cannot be registered must
+        only lose itself to NCCL, not the ones that already succeeded.
+        """
+        if (
+            not self._fast_ar_enabled
+            or self.world_size == 1
+            or self.device_group is None
+            or device.type != "cuda"
+        ):
+            return
+        try:
+            import torch.distributed._symmetric_memory as symm_mem
+        except Exception as exc:  # noqa: BLE001 - optional fast path
+            logger.warning(
+                "Fast all-reduce unavailable (%s: %s); using NCCL. Set "
+                "MSTAR_FAST_ALLREDUCE=0 to silence.",
+                type(exc).__name__, exc,
+            )
+            return
+
+        group_name = self.device_group.group_name
+        skipped: list[str] = []
+        for dtype in self._FAST_AR_DTYPES:
+            numel = self._fast_ar_max_bytes // dtype.itemsize
+            try:
+                buf = symm_mem.empty(numel, dtype=dtype, device=device)
+                # Collective: every member must reach it for this dtype, in
+                # this order. Failures below are local to the probe and
+                # deterministic (a missing kernel), so the ranks agree.
+                symm_mem.rendezvous(buf, group_name)
+                # Prove a sliced view still resolves to the registered
+                # allocation, and that a kernel exists for this dtype —
+                # that is exactly how ``all_reduce`` will use it.
+                probe = torch.zeros(8, dtype=dtype, device=device)
+                # Prefer multimem (NVLink SHARP): measured faster than
+                # one-shot at every size on 2xH100 -- 7.76 vs 8.62 us at
+                # 8 KiB, 8.53 vs 9.90 at 128 KiB, 51.3 vs 64.6 at 8 MiB --
+                # and unlike one-shot it still beats NCCL at 8 MiB, which
+                # is what lets the cutoff go past 2 MiB. Not every fabric
+                # exposes multicast, so fall back to one-shot.
+                kind = "multimem"
+                try:
+                    buf[:8].copy_(probe)
+                    torch.ops.symm_mem.multimem_one_shot_all_reduce_out(
+                        buf[:8], "sum", group_name, probe,
+                    )
+                except Exception:  # noqa: BLE001 - no multicast support
+                    kind = "one_shot"
+                    torch.ops.symm_mem.one_shot_all_reduce_copy_out(
+                        buf[:8], probe, "sum", group_name, probe,
+                    )
+            except Exception as exc:  # noqa: BLE001 - optional fast path
+                skipped.append(f"{dtype} ({type(exc).__name__}: {exc})")
+                continue
+            self._fast_ar_kind[dtype] = kind
+            self._fast_ar_buffers[dtype] = buf
+
+        self._fast_ar_group_name = group_name
+        if self._fast_ar_buffers:
+            logger.info(
+                "Fast all-reduce enabled for ranks %s: %s via %s, <= %d KiB",
+                self.group_members,
+                sorted(str(d) for d in self._fast_ar_buffers),
+                sorted(set(self._fast_ar_kind.values())),
+                self._fast_ar_max_bytes // 1024,
+            )
+        if skipped:
+            logger.info(
+                "Fast all-reduce falls back to NCCL for: %s", "; ".join(skipped),
+            )
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
+            return input_
+        buf = self._fast_all_reduce_buffer(input_)
+        if buf is not None:
+            # Both paths stage through the symmetric buffer and land the
+            # result back in ``input_``, so the in-place contract holds.
+            if self._fast_ar_kind.get(input_.dtype) == "multimem":
+                # ``multimem_all_reduce_`` would leave the result in the
+                # symmetric buffer and need a second copy back; the
+                # ``_out`` form reduces straight into ``input_``, so this
+                # stages exactly once, same as the one-shot path.
+                buf.copy_(input_)
+                torch.ops.symm_mem.multimem_one_shot_all_reduce_out(
+                    buf, "sum", self._fast_ar_group_name, input_,
+                )
+            else:
+                torch.ops.symm_mem.one_shot_all_reduce_copy_out(
+                    buf, input_, "sum", self._fast_ar_group_name, input_,
+                )
             return input_
         dist.all_reduce(input_, group=self.device_group)
         return input_
@@ -307,6 +492,22 @@ class WorkerParallelGroups:
                 continue
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
             comm_group.initialized = True
+
+        # Symmetric-memory staging buffers for the small-message all-reduce
+        # fast path. Sorted by membership, not by the dict order above: this
+        # rendezvous is collective over each subgroup, so every member has to
+        # walk the groups it shares in the same sequence, and a rank that
+        # belongs to several would not otherwise be guaranteed to.
+        by_members = {
+            tuple(g.group_members): g
+            for g in (
+                list(self.node_to_tp_group.values())
+                + list(self.node_to_sp_group.values())
+            )
+            if g.world_size > 1
+        }
+        for members in sorted(by_members):
+            by_members[members].register_fast_allreduce_buffers(device)
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:
         if node not in self.node_to_tp_group:

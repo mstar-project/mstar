@@ -1,6 +1,7 @@
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
 
@@ -50,6 +51,20 @@ class ShardDestination:
     tp_rank: int
     start_idxs: list[int] | None = None
     end_idxs: list[int] | None = None
+
+    _total_fanin: int | None = None
+
+
+class ShardCacheKey(NamedTuple):
+    source_node: str
+    source_graph_walk: str
+    dest_node: str
+    dest_graph_walk: str
+    edge: str
+    # The fanout picks the SOURCE rank's worker and only rank 0 contributes the
+    # broadcast destinations, so two source ranks with otherwise identical
+    # coordinates have different answers and must not share an entry.
+    source_tp_rank: int
 
 
 @dataclass
@@ -159,6 +174,10 @@ class ShardingConfig:
             if num_walk_combos[node] == 1:
                 self.group_mapping[NodeAndGraphWalk(node, None)] = singleton
 
+        # Cache of shard destinations, **only for replicated tensors for now**
+        # (the majority of use cases)
+        self._shard_destination_cache: dict[ShardCacheKey, list[ShardDestination]] = {}
+
     def compute_fanout(
         self, signal: str, source_graph_walk: str,
         source_node: str, dest_node: str,
@@ -265,6 +284,45 @@ class ShardingConfig:
         dest_graph_walk: str | None,
         source_tp_rank: int | None = None,
     ) -> dict[str, GraphEdge]: # dest worker to graph edge
+        # Replicated tensors route to the same destinations on every step, so
+        # the ShardDestination list is cached and only the per-destination
+        # edges are rebuilt. Sharded tensors are not cached: their slicing is
+        # derived from tensor_info, which changes every step.
+        cache_key = None
+        shard_dim = self.shard_dim.get(graph_edge.name)
+        if shard_dim is None:  # replicated
+            if not self._setup_done:
+                raise RuntimeError("Must call setup before fanout_graph_edges")
+            # Resolve the source rank the way compute_fanout does, because the
+            # answer depends on it and the conductor calls this once per source
+            # rank with every other coordinate identical
+            # (conductor.py, inputs grouped by info.source_tp_rank).
+            source_group = self.group_mapping.get(
+                NodeAndGraphWalk(source_node, source_graph_walk)
+            )
+            if source_group is None:
+                resolved_tp_rank = 0
+            elif source_tp_rank is not None:
+                resolved_tp_rank = source_tp_rank
+            else:
+                resolved_tp_rank = source_group._tp_rank
+            cache_key = ShardCacheKey(
+                source_node, source_graph_walk,
+                graph_edge.next_node, dest_graph_walk,
+                graph_edge.name, resolved_tp_rank,
+            )
+            cached = self._shard_destination_cache.get(cache_key)
+            if cached is not None:
+                # Always clone: the uncached path never hands back the caller's
+                # edge, and callers keep routing the original separately.
+                res = {}
+                for item in cached:
+                    new_edge = graph_edge.clone()
+                    new_edge._shard_dim = None
+                    new_edge._total_fanin = item._total_fanin
+                    res[item.worker] = new_edge
+                return res
+
         # canonical form: leading shard dim
         shard_dim_sizes = [
             info.dims[0] for info in graph_edge.tensor_info
@@ -288,13 +346,14 @@ class ShardingConfig:
         for item in fanout:
             new_edge = graph_edge.clone()
             new_edge.tensor_info = []
-            new_edge._shard_dim = self.shard_dim.get(new_edge.name)
+            new_edge._shard_dim = shard_dim
             new_edge._total_fanin = self.compute_fanin(
                 signal=new_edge.name, source_tp_size=source_tp_size,
                 dest_node=new_edge.next_node,
                 dest_graph_walk=dest_graph_walk,
                 dest_tp_rank=item.tp_rank
             )
+            item._total_fanin = new_edge._total_fanin
             if item.full_tensor:
                 new_edge.tensor_info = graph_edge.tensor_info
             else:
@@ -320,6 +379,8 @@ class ShardingConfig:
 
                     new_edge.tensor_info.append(new_info)
             result[item.worker] = new_edge
+        if cache_key is not None:
+            self._shard_destination_cache[cache_key] = fanout
         return result
 
     def compute_fanin(

@@ -486,13 +486,18 @@ class TensorCommunicationManager(ABC):
             node_name=node_name, graph_walk=graph_walk,
             skip_cuda_sync=skip_cuda_sync,
         )
+        debug_on = logger.isEnabledFor(logging.DEBUG)
         for name in tensors:
-            logger.debug(
-                "Storing tensor %s (uuids %s) for nodes %s",
-                name, str([info.uuid for info in graph_node_info[name]]),
-                str([edge.name for edge in name_to_graph_edges.get(name, [])])
-            )
             edges = name_to_graph_edges.get(name, [])
+            if debug_on:
+                # Two list comprehensions and two str() per tensor per
+                # request; as bare arguments they ran at every decode step
+                # whether or not debug logging was enabled.
+                logger.debug(
+                    "Storing tensor %s (uuids %s) for nodes %s",
+                    name, str([info.uuid for info in graph_node_info[name]]),
+                    str([edge.name for edge in edges])
+                )
             if skip_ref_count:
                 # Safety hold: ref=1 prevents premature GC. The caller
                 # must call set_output_ref_counts() to adjust to the real

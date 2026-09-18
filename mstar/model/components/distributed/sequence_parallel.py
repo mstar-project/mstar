@@ -98,15 +98,37 @@ def ulysses_attention(
     a passthrough — byte-identical to the non-SP path.
 
     ``prefer_all_gather`` selects the all-gather collective instead of the
-    all-to-all (see :func:`_ulysses_attention_via_all_gather`). The caller sets
-    it on the denoise forward that the CUDA graph captures: the all-to-all is
-    grouped point-to-point send/recv and does not replay from a captured graph,
-    whereas all-gather (a true collective, like the TP all-reduce) does. It must
-    be set consistently across warmup, capture and replay so the all-gather
-    kernels are compiled and autotuned during eager warmup, not mid-capture
-    (autotuning synchronizes, which is illegal while a graph is recording).
-    Eager paths (video, uncaptured resolutions) leave it off for the lighter
-    all-to-all. Both produce identical results."""
+    all-to-all (see :func:`_ulysses_attention_via_all_gather`). Both produce
+    identical results; which is faster depends entirely on the sequence length,
+    and the captured path wants the all-gather.
+
+    The flag was introduced because grouped point-to-point send/recv did not
+    replay from a captured CUDA graph. That constraint is gone on torch 2.12 /
+    current NCCL — ``dist.all_to_all`` captures and replays correctly with
+    fresh inputs, verified at SP2 and SP4 over 20 replays
+    (``test/scratch/sp_a2a_capture_check.py``) — but removing the constraint
+    does not make the switch worthwhile, because the two collectives trade off
+    against each other by size:
+
+    * Long sequences are bandwidth-bound, and the all-to-all moves ``P`` times
+      fewer bytes. At seq 8192 (32 heads, D=128) one exchange costs 450 us vs
+      261 us at SP2, and 491 us vs 190 us at SP4.
+    * Short sequences are latency-bound, and the all-gather is a single tuned
+      collective where the all-to-all is ``P-1`` send/recv pairs. The captured
+      denoise path only ever sees short sequences — images at the captured
+      resolutions, ~240 tokens at 256p and ~1560 at 480p, not the ~11.5k of a
+      video. End-to-end on cosmos3-nano SP4, ``MSTAR_SP_CAPTURE_ALL_GATHER=0``
+      made t2i **slower**: 256p 0.733 -> 0.866 s (+18%), 480p 0.990 -> 1.033 s
+      (+4%). Pixels were identical either way.
+
+    So the all-gather stays the default here and the flag is a lever for a
+    future captured path with long sequences, not a pending optimization.
+    Video already runs eager and already uses the all-to-all (a t2v control
+    moved 3.764 -> 3.700 s, i.e. not at all).
+
+    Whichever is chosen must be consistent across warmup, capture and replay so
+    the kernels are compiled and autotuned during eager warmup, not mid-capture
+    (autotuning synchronizes, which is illegal while a graph is recording)."""
     if sp_group.world_size == 1:
         return run_attention(q=q, k=k, v=v)
     if prefer_all_gather:
@@ -128,15 +150,26 @@ def _ulysses_attention_via_all_gather(
     v: torch.Tensor,
     run_attention: Callable[..., torch.Tensor],
 ) -> torch.Tensor:
-    """CUDA-graph-capturable Ulysses attention built from all-gather.
+    """Ulysses attention built from all-gather instead of all-to-all.
 
     Same result as :func:`ulysses_attention`'s all-to-all, different collective:
     each rank all-gathers the full sequence and attends over its own head-group,
-    then all-gathers the full heads back and keeps its own sequence shard. The
-    all-to-all would move fewer bytes, but it is grouped send/recv and does not
-    replay from a CUDA graph; all-gather is a true collective and does. Assumes
-    an even sequence split across the group (the captured resolutions guarantee
-    it). Head counts are divisible by the group size (the Ulysses constraint)."""
+    then all-gathers the full heads back and keeps its own sequence shard.
+
+    It moves more bytes: each rank *receives* ``(P-1)x`` its local tensor here
+    against ``(P-1)/P x`` for the all-to-all, and then discards all but ``1/P``
+    of what it gathered. That makes it the wrong choice for long sequences —
+    at seq 8192 (32 heads, D=128), graph-replayed, one exchange costs:
+
+        SP2:  all_gather 450 us   all_to_all 261 us   all_to_all_single 173 us
+        SP4:  all_gather 491 us   all_to_all 190 us   all_to_all_single 117 us
+
+    — and the right one for the short sequences the captured denoise path
+    actually runs, where a single collective beats ``P-1`` send/recv pairs and
+    bytes moved stop mattering. See :func:`ulysses_attention` for the
+    end-to-end numbers. Assumes an even sequence split across the group (the
+    captured resolutions guarantee it). Head counts are divisible by the group
+    size (the Ulysses constraint)."""
     world_size, rank = sp_group.world_size, sp_group.rank
     # [seq/P, H, D] -> all-gather sequence -> [seq, H, D] -> keep head-group rank
     q_full = sp_group.all_gather(q, dim=0)

@@ -244,3 +244,69 @@ Worker scheduling
      - ``0``
      - ``N > 0``: every N iterations log per-phase p50/p95/mean of the
        worker main loop (speculate, await_gpu, submit_spec, ...).
+
+Tensor-parallel collectives
+---------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 12 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_FAST_ALLREDUCE``
+     - ``1``
+     - Route small TP all-reduces through a symmetric-memory kernel on the
+       compute stream instead of NCCL. A decode step issues two all-reduces
+       per layer plus one for the vocab-parallel embedding, all small (8 KiB
+       at bs=1, hidden 4096), and they serialise — so the per-call fork/join
+       between the compute stream and ``ProcessGroupNCCL``'s internal stream
+       is unhideable. Prefers NVLink SHARP (``multimem``) where the fabric
+       exposes multicast, falling back to ``one_shot``, then to NCCL.
+
+       Measured on 2xH100 (NV18), Qwen3.5-9B TP2, collectives per decode step
+       in situ: NCCL 1.811 ms, one_shot 0.597 ms, multimem 0.379 ms.
+
+       End-to-end at 2304-token outputs, ``0`` vs ``1`` in one job, 3 trials
+       each: conc=1 222.6 -> 231.5 tok/s (+4.0%), conc=4 775.7 -> 800.4
+       (+3.2%). Trials repeat to within 0.2% at those concurrencies. conc=16
+       is not quoted: its run-to-run spread is ~8%, wider than the effect.
+       Greedy output is bitwise identical to the NCCL path.
+
+       ``0`` forces NCCL. Falls back automatically wherever the fast path
+       does not apply, so it is safe to leave on.
+   * - ``MSTAR_SP_CAPTURE_ALL_GATHER``
+     - ``1``
+     - Which Ulysses exchange the *captured* Cosmos3 denoise step uses.
+       ``1`` (default) all-gather; ``0`` all-to-all. Both compute the same
+       thing — identical output pixels — so this is purely a perf knob, and
+       the default is the fast one.
+
+       The all-gather was chosen because grouped point-to-point send/recv
+       would not replay from a CUDA graph. That constraint is gone (torch
+       2.12 / current NCCL captures and replays it correctly, verified at
+       SP2 and SP4 over 20 replays), but lifting it does not make the
+       all-to-all preferable here. The two trade off by sequence length:
+       the all-to-all moves ``P`` times fewer bytes and wins when
+       bandwidth-bound, the all-gather is one tuned collective instead of
+       ``P-1`` send/recv pairs and wins when latency-bound. The captured
+       path only sees short sequences (~240 tokens at 256p, ~1560 at 480p),
+       so it is firmly in the second regime: on cosmos3-nano SP4,
+       setting ``0`` made t2i **slower** — 256p 0.733 -> 0.866 s (+18%),
+       480p 0.990 -> 1.033 s (+4%).
+
+       Keep it at ``1``. It is worth revisiting only if a captured path
+       ever gets long sequences; at seq 8192 one exchange is 491 us
+       all-gather vs 190 us all-to-all at SP4. Video is unaffected either
+       way — it runs eager and already uses the all-to-all (t2v control:
+       3.764 -> 3.700 s, i.e. noise).
+   * - ``MSTAR_FAST_ALLREDUCE_MAX_KIB``
+     - ``2048``
+     - Size ceiling for the fast path; above it NCCL wins and mstar hands
+       off. Both kernels are small-message wins only — on 2xH100, us per
+       all-reduce (chained, graph-replayed, result landed back in place):
+       8 KiB NCCL 18.48 / one_shot 8.69 / multimem 7.76; 128 KiB 20.71 /
+       9.87 / 8.33; 8 MiB 58.72 / 64.53 / 74.88. Re-measure with
+       ``test/scratch/collective_shootout.py`` on new topology — multicast
+       availability and the crossover are fabric-dependent.

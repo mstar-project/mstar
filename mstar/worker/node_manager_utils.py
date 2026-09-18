@@ -400,23 +400,31 @@ class WorkerGraphsManager:
         Updates ready/waiting state in worker graphs on this worker, and
         builds the cross-worker routing map for edges destined elsewhere.
         """
-        # (0) separate streaming edges — they bypass the queue system
-        streaming_edges = [edge for edge in outputs if edge.is_streaming]
-        non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
-
         sharding_config = self.per_request_info[request_id].sharding_config
         group = sharding_config.get_sharding_group(node_name, graph_walk)
         # No group → singleton/non-TP; treat as rank 0.
         is_first_tp_rank = group is None or group._tp_rank == 0
 
-        # (1) find persist (to-conductor) and new-token-output edges
-        to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
-        # Leader only: the conductor discards a follower's counts anyway, and
-        # `_send_outputs` sizes each one from a store `_register_outputs` never
-        # filled on a follower.
-        new_token_outputs = [
-            edge for edge in non_streaming_outputs if edge.conductor_new_token
-        ] if is_first_tp_rank else []
+        # (0) split streaming edges (they bypass the queue system) and pick out
+        # persist / new-token edges in ONE pass — this ran as four separate
+        # comprehensions over the same list, per request, per step.
+        #
+        # new_token_outputs is leader-only: the conductor discards a follower's
+        # counts anyway, and `_send_outputs` sizes each one from a store
+        # `_register_outputs` never filled on a follower.
+        streaming_edges: list[GraphEdge] = []
+        non_streaming_outputs: list[GraphEdge] = []
+        to_conductor: list[GraphEdge] = []
+        new_token_outputs: list[GraphEdge] = []
+        for edge in outputs:
+            if edge.is_streaming:
+                streaming_edges.append(edge)
+                continue
+            non_streaming_outputs.append(edge)
+            if edge.persist:
+                to_conductor.append(edge)
+            if is_first_tp_rank and edge.conductor_new_token:
+                new_token_outputs.append(edge)
 
         # (2) route each output edge to its destination worker graph via the
         # inverted index. Compute the per-rank fanout first; ingest *this
@@ -503,10 +511,6 @@ class WorkerGraphsManager:
         # (4) route streaming edges — find destination workers for streaming outputs
         streaming_to_workers: dict[str, list[GraphEdge]] = {}
         streaming_local: list[GraphEdge] = []
-        my_node_names = set()
-        for gid in self.per_request_info[request_id].worker_graph_ids:
-            my_node_names.update(self.all_worker_graph_ids_to_nodes.get(gid, []))
-
         for edge in streaming_edges:
             fanout = sharding_config.fanout_graph_edges(
                 edge, source_node=node_name,
@@ -519,13 +523,18 @@ class WorkerGraphsManager:
             for (wkr, wkr_edge) in fanout.items():
                 streaming_to_workers.setdefault(wkr, []).append(wkr_edge)
 
-        logger.debug(
-            ("Finished processing outputs from rid %s. \n"
-             "Routed to this worker: %s; sent to others: %s; persist signals: %s; streaming: %d"),
-            request_id, format_graph_edge_list(routed_to_this_worker),
-            format_graph_edge_list(external_outputs), format_graph_edge_list(to_conductor),
-            len(streaming_edges),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            # format_graph_edge_list builds f-strings and joins; as bare
+            # arguments these ran on every decode step regardless of level.
+            logger.debug(
+                ("Finished processing outputs from rid %s. \n"
+                 "Routed to this worker: %s; sent to others: %s; "
+                 "persist signals: %s; streaming: %d"),
+                request_id, format_graph_edge_list(routed_to_this_worker),
+                format_graph_edge_list(external_outputs),
+                format_graph_edge_list(to_conductor),
+                len(streaming_edges),
+            )
         if completed_worker_graph_ids:
             logger.debug("Completed %d worker graphs", len(completed_worker_graph_ids))
 
