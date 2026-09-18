@@ -463,6 +463,14 @@ class Engine:
             submodule_mgmt.joint_comm_group.world_size,
         )
         runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        # One graph memory pool for all of the node's regions (see
+        # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
+        # the largest region's rather than the sum over regions.
+        memory_pool = (
+            torch.cuda.graphs.graph_pool_handle()
+            if configs and getattr(self._device, "type", None) == "cuda" and torch.cuda.is_available()
+            else None
+        )
         for label, config in configs.items():
             runner = PiecewiseCudaGraphRunner(
                 label=f"{node_name}_{label}",
@@ -474,6 +482,7 @@ class Engine:
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
+                memory_pool=memory_pool,
             )
             runners[label] = runner
         return runners
