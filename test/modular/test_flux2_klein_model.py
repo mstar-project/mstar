@@ -413,3 +413,18 @@ def test_image_nodes_schedule_in_lockstep():
         collect(section)
     assert set(nodes) == {"text_encoder", "vae_encoder", "dit", "vae_decoder"}
     assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, False)
+
+
+def test_vae_compile_knob_reaches_the_decoder_node():
+    from mstar.model.flux2_klein.submodules import KleinVaeDecoderSubmodule
+
+    class FakeVae(torch.nn.Module):
+        def decode(self, x):
+            return x
+
+    vae = FakeVae()
+    plain = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig())
+    assert plain._decode == vae.decode  # the parity path: eager decode, bit-exact
+    compiled = KleinVaeDecoderSubmodule(vae, Flux2KleinConfig(), compile_decode=True)
+    assert compiled._decode != vae.decode and callable(compiled._decode)
+    assert _make_model(vae_compile=True).vae_compile is True and _make_model().vae_compile is False
