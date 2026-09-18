@@ -175,7 +175,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - Maximum sequence length (sizes the KV cache).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``.
+       scoped to specific ``graph_walks``, sharded with ``tp_size``, and given a
+       weight ``residency`` policy (see below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -245,6 +246,89 @@ A node must be declared TP-enabled by the model to be eligible for ``tp_size > 1
 weight loaders then shard parameters automatically, with no model-code changes. See
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
+
+Weight residency
+----------------
+
+By default a node's weights load to its GPU once and stay there (``resident``).
+A deployment's memory floor is then the **sum** of its nodes, which rules out
+models whose components together exceed device memory even when no single one
+does. A node_group may instead declare:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 16 84
+
+   * - ``residency``
+     - Behavior
+   * - ``resident``
+     - *(default)* Weights load once and stay. The only policy that keeps
+       CUDA-graph capture, ``torch.compile`` and cross-request batching for that
+       node.
+   * - ``on_demand``
+     - Weights live on the host and move to the device around each execution.
+       Frees device memory; on a unified-memory part (GB10) host and device are
+       one physical pool, so this bounds the *device allocator* but not system
+       memory.
+   * - ``reload``
+     - Weights are dropped after each execution and rebuilt from the checkpoint
+       on the next one. The only policy that frees memory outright, and so the
+       only one that helps when a model's total exceeds physical memory.
+
+At most one non-resident node holds the device at a time, so the peak tracks the
+**largest single component** rather than the sum.
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [text_encoder], ranks: [0], residency: reload}
+     - {node_names: [dit], ranks: [0], residency: resident}
+
+**What it costs.** A non-resident node forgoes CUDA-graph capture and
+``torch.compile`` — a captured graph records the addresses of the weights it
+read, and compiled code guards on parameter devices, both of which an
+evict/reload cycle invalidates — and it forfeits cross-request batching, since
+requests are forced to serialize at phase boundaries. It suits a node that runs
+**once per request** (a prompt encoder, a VAE) far better than one that runs
+every decode step.
+
+Measured on ``wan22`` (UMT5-XXL encoder paged, DiT resident, one request):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Policy
+     - Peak allocated
+     - Latency
+     - Output
+   * - ``resident``
+     - 25.37 GiB
+     - 20 s
+     - 331,713 B
+   * - ``on_demand``
+     - 20.50 GiB
+     - 142 s
+     - 331,713 B
+   * - ``reload``
+     - 20.50 GiB
+     - 81 s
+     - 331,713 B
+
+Output is byte-identical under all three. ``reload`` beats ``on_demand`` here
+because the rebuild reads the checkpoint from page cache straight to the device,
+where ``on_demand`` pays a host↔device round trip.
+
+Set ``MSTAR_LOG_PEAK_MEM=1`` to log the allocator high-water mark as it grows;
+``nvidia-smi`` reports *reserved* memory (caching-allocator blocks plus
+fragmentation) and is too coarse to see the difference.
+
+.. note::
+
+   A model that caches its submodules — every model here memoises
+   ``get_submodule`` — must be able to forget one for ``reload`` to genuinely
+   rebuild. ``Model.release_submodule`` does that, and its default covers the
+   package's ``_submodule_cache`` convention.
 
 model_kwargs
 ------------
