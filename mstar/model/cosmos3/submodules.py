@@ -2983,6 +2983,13 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
             return []
         bs_env = os.environ.get("COSMOS3_REASONER_CAPTURE_BS")
         sizes = [int(x) for x in bs_env.split(",")] if bs_env else list(self.decode_capture_batch_sizes)
+        # Compile the captured decode step (inductor, then the graph): at bs=1
+        # the eager step is ~1240 kernels of which ~1000 are the norms', the
+        # rotary's and the residuals' pointwise pieces — 2.1 of its 3.8 ms on
+        # an H100 — and the fusion is what closes the gap to the weight-
+        # streaming floor (measured 4.2 -> 2.05 ms/token, 382 kernels).
+        env = os.environ.get("COSMOS3_REASONER_COMPILE")
+        compile_decode = (env == "1") if env is not None else bool(self.config.compile_reasoner_decode)
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk=REASONER_DECODE_WALK,
@@ -2993,7 +3000,7 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
                 ),
                 capture_batch_sizes=sizes,
                 caps_eager_batch_size=False,
-                compile=False,
+                compile=compile_decode,
             ),
         ]
 
