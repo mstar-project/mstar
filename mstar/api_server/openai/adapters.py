@@ -61,12 +61,16 @@ class Transcript:
     ``text`` is the clean transcript. ``language`` is an ISO-639-1 code when the
     model reported one (detected or forced). ``segments`` / ``words`` carry
     ``{"start", "end", "text"}`` / ``{"start", "end", "word"}`` in seconds when
-    the model emitted timestamps; empty otherwise.
+    the model emitted timestamps; empty otherwise. ``unfinished`` says the
+    output stopped inside a segment (a start timestamp with no end): the text
+    after the last closed segment is provisional, and a long-form driver
+    re-decodes that audio from the last segment end.
     """
     text: str
     language: str | None = None
     segments: list[dict] = field(default_factory=list)
     words: list[dict] = field(default_factory=list)
+    unfinished: bool = False
 
 
 def flatten_messages(
@@ -210,6 +214,15 @@ class OpenAIAdapter:
     # "parallel" submits them all at once. A request can override with
     # ``long_form`` in extra_body.
     long_form: str = "sequential"
+    # Sequential long form: decode every window with timestamps and start the
+    # next one where the last closed segment ended, instead of at a fixed
+    # boundary (openai-whisper's seek). Needs ``parse_transcript`` to report
+    # segments and ``unfinished``.
+    seeks_by_timestamps: bool = False
+    # Sequential long form: a window whose text compresses better than this
+    # (gzip bytes ratio) is a repetition loop; it is decoded again at rising
+    # temperatures (openai-whisper's fallback). None disables the check.
+    compression_ratio_threshold: float | None = 2.4
     # Streaming transcription over /v1/realtime: the model must be able to
     # continue a hypothesis it is handed (see ``realtime_step_request``).
     supports_realtime_transcription: bool = False
@@ -543,8 +556,10 @@ class WhisperAdapter(OpenAIAdapter):
     """
 
     supports_transcriptions = True
-    # Whisper hears one 30 s window; the route cuts longer uploads into them.
+    # Whisper hears one 30 s window; the route cuts longer uploads into them,
+    # each starting where the previous window's last segment closed.
     max_audio_seconds = 30.0
+    seeks_by_timestamps = True
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
         return SubmitArgs(
@@ -594,7 +609,10 @@ class WhisperAdapter(OpenAIAdapter):
         clean = " ".join(p.strip() for p in parts if p.strip())
         for idx, seg in enumerate(segments):
             seg["id"] = idx
-        return Transcript(text=clean, language=language or req.language, segments=segments)
+        return Transcript(
+            text=clean, language=language or req.language, segments=segments,
+            unfinished=start is not None,
+        )
 
 
 class HiggsAudioAdapter(OpenAIAdapter):
