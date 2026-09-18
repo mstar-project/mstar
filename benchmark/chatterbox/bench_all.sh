@@ -61,6 +61,7 @@ wait_http() {  # wait_http <url> <seconds>
 runner() {  # runner <base url> <concurrency> <out dir>
   local url=$1 c=$2 out=$3
   mkdir -p "$out/wavs"
+  { git -C "$MSTAR" rev-parse HEAD; git -C "$MSTAR" status --short | head -20; } > "$out/sha.txt" 2>/dev/null || true
   ( cd "$MSTAR" && python -m benchmark.runner --url "$url" --model chatterbox \
       --inference-system ours_openai --request-type text_to_speech \
       --dataset text --request-txt-file "$SENTENCES" \
