@@ -128,6 +128,36 @@ VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
 
 
+
+def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str = "ultrafast") -> bytes:
+    """H.264 mp4 bytes from uint8 frames ``[T, H, W, 3]`` through PyAV (its
+    wheel bundles FFmpeg + libx264), matching the torchcodec encoder's
+    CRF / preset / threading settings. Odd frame sizes are edge-padded to
+    even dimensions for yuv420p."""
+    import io
+    from fractions import Fraction
+
+    import av
+
+    _, h, w, _ = frames.shape
+    arr = frames.numpy()
+    if (w % 2) or (h % 2):
+        import numpy as np
+
+        arr = np.pad(arr, ((0, 0), (0, h % 2), (0, w % 2), (0, 0)), mode="edge")
+    buf = io.BytesIO()
+    with av.open(buf, mode="w", format="mp4") as container:
+        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1000))
+        stream.width, stream.height = arr.shape[2], arr.shape[1]
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": str(crf), "preset": preset, "threads": "0"}
+        for frame in arr:
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return buf.getvalue()
+
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
@@ -1026,34 +1056,15 @@ class Cosmos3Model(Model):
                 data = encoded.numpy().tobytes()
             except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError/OSError without FFmpeg
                 # Fallback for environments without a loadable torchcodec (no
-                # FFmpeg shared libraries, or the older decode-only build that
-                # lacks VideoEncoder), where torchvision still ships
-                # write_video (PyAV-backed).
-                import tempfile
-
+                # FFmpeg shared libraries on the host, or the older
+                # decode-only build that lacks VideoEncoder): PyAV, whose
+                # wheel bundles FFmpeg with libx264, at the same CRF/preset.
                 if not isinstance(exc, ImportError):
                     logger.warning(
-                        "Cosmos3 video encode: torchcodec unavailable (%s); using torchvision write_video",
+                        "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
-
-                from torchvision.io import write_video
-
-                frames = x.permute(1, 2, 3, 0).cpu()  # [T, H, W, C] uint8
-                fd, path = tempfile.mkstemp(suffix=".mp4")
-                os.close(fd)
-                try:
-                    write_video(
-                        path,
-                        frames,
-                        fps=fps,
-                        video_codec="libx264",
-                        options={"crf": "18", "preset": preset, "threads": "0"},
-                    )
-                    with open(path, "rb") as f:
-                        data = f.read()
-                finally:
-                    os.remove(path)
+                data = encode_mp4_pyav(x.permute(1, 2, 3, 0).cpu(), fps=fps, crf=18, preset=preset)
             return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
