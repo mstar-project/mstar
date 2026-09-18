@@ -13,7 +13,8 @@ model_kwargs:
   compile: true
   cuda_graph: true
   capture_sizes: [[1024, 1024]]
-  capture_batch_sizes: [1, 2, 4, 8]
+  # every batch size up to max_batch_size: a lockstep group of 5-7 requests would otherwise be padded into the 8-graph
+  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode
   vae_compile: true
