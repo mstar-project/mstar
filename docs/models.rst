@@ -121,10 +121,11 @@ Qwen3-TTS notes
   ordered sentence chunks of about 400 characters (one Talker request each,
   two kept in flight while the current one streams); set
   ``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
-- Audio streams in a ramp of codec chunks: the first window is decoded after 4
-  frames (320 ms of speech), later windows grow to 25 new frames behind 25
-  frames of already decoded left context (the reference's own
-  ``chunked_decode`` context). Each window size is a CUDA-graph bucket
+- Audio streams in a ramp of codec chunks: the first frame is decoded on its
+  own (first audio one Talker step after prefill), the next windows add 3, 8
+  and 16 frames, then 25 new frames behind 25 frames of already decoded left
+  context (the reference's own ``chunked_decode`` context; the decoder is
+  causal, so chunking does not change the audio). Each window size is a CUDA-graph bucket
   captured for batch sizes 1 to 32; the stream buffer reports how many leading
   frames of a window are repeated context, and the codec trims their audio.
 - Talker prefill remains eager because it runs once with variable sequence
