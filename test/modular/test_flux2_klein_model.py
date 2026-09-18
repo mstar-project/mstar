@@ -475,3 +475,11 @@ def test_vae_decoder_warmup_and_chunking_use_only_the_configured_batch_sizes(mon
     assert eager.shapes == []
     assert decode_in_chunks(eager.decode, torch.zeros(5, 1, 1, 1), ()).shape[0] == 5
     assert eager.shapes == [(5, 1, 1, 1)]
+
+
+def test_vae_decode_sizes_are_the_four_compiled_sizes_clamped_to_the_max_batch():
+    from mstar.model.flux2_klein.submodules import VAE_DECODE_BATCH_SIZES
+
+    assert VAE_DECODE_BATCH_SIZES == (1, 2, 4, 8)
+    small = _make_model(max_batch_size=4, capture_batch_sizes=[1, 2, 3, 4])
+    assert [s for s in VAE_DECODE_BATCH_SIZES if s <= small.max_batch_size] == [1, 2, 4]
