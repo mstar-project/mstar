@@ -36,6 +36,24 @@ def test_fused_rope_is_bit_identical(dtype, shape, pos_dtype):
     assert torch.equal(rope.apply(x, positions), want), "apply takes the fused path on CUDA"
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fused_rope_reads_split_views_in_place(dtype):
+    """The rope part of a query ``[T, H, nope + rope]`` or a key ``[T, latent + rope]`` is a strided
+    view: the kernel reads it where it is (no copy) and matches the torch path bit for bit."""
+    torch.manual_seed(3)
+    rope = YarnRotary(64, YarnParams(original_max_position_embeddings=2048, factor=4.0), max_positions=4096).to(DEV)
+    positions = torch.randint(0, 4096, (11,), device=DEV)
+    q = torch.randn(11, 4, 128 + 64, device=DEV).to(dtype)
+    q_pe = q.split([128, 64], dim=-1)[1]
+    assert not q_pe.is_contiguous()
+    assert torch.equal(rope.apply(q_pe, positions), torch_apply(rope, q_pe.contiguous(), positions))
+    kv = torch.randn(11, 512 + 64, device=DEV).to(dtype)
+    k_pe = kv.split([512, 64], dim=-1)[1]
+    assert not k_pe.is_contiguous()
+    got = rope.apply(k_pe, positions)
+    assert got.is_contiguous() and torch.equal(got, torch_apply(rope, k_pe.contiguous(), positions))
+
+
 def test_fused_rope_is_capturable():
     rope = YarnRotary(64, YarnParams(original_max_position_embeddings=2048, factor=4.0), max_positions=4096).to(DEV)
     x = torch.randn(16, 4, 64, device=DEV).to(torch.bfloat16)
