@@ -434,6 +434,7 @@ class Flux2KleinModel(Model):
             return KleinVaeDecoderSubmodule(
                 self._vae_module(device), self.config, max_batch_size=self.max_batch_size,
                 compile_decode=self.vae_compile,
+                warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes] if self.vae_compile else (),
             )
         if node_name == "dit":
             transformer = build_transformer(self.config, self.snapshot, device)
