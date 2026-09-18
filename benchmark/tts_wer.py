@@ -38,6 +38,26 @@ def load_sentences(path: str) -> dict[int, str]:
     return {i + 1: ln.strip() for i, ln in enumerate(lines) if ln.strip()}
 
 
+ASR_SAMPLE_RATE = 16000
+
+
+def load_for_asr(path: Path) -> dict:
+    """A WAV file as the pipeline's raw-audio input (mono float32 at 16 kHz).
+
+    Decoded with soundfile so the benchmark hosts need no ffmpeg binary.
+    """
+    import numpy as np
+    import soundfile as sf
+    import torch
+    import torchaudio.functional as taf
+
+    audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
+    mono = torch.from_numpy(np.ascontiguousarray(audio.mean(axis=1)))
+    if sample_rate != ASR_SAMPLE_RATE:
+        mono = taf.resample(mono, sample_rate, ASR_SAMPLE_RATE)
+    return {"raw": mono.numpy(), "sampling_rate": ASR_SAMPLE_RATE}
+
+
 def transcribe(audio_paths: list[Path], model_id: str, device: str, batch_size: int) -> list[str]:
     import torch
     from transformers import pipeline
@@ -49,7 +69,7 @@ def transcribe(audio_paths: list[Path], model_id: str, device: str, batch_size: 
         device=device,
     )
     outputs = asr(
-        [str(p) for p in audio_paths],
+        [load_for_asr(p) for p in audio_paths],
         batch_size=batch_size,
         generate_kwargs={"language": "en", "task": "transcribe"},
         return_timestamps=False,
