@@ -4,7 +4,10 @@
 #
 # Two submodules cover the complete text-to-speech streaming pipeline:
 #   1. TalkerSubmodule (KV_CACHE engine)
-#      - Builds the official text/voice prefill sequence.
+#      - Builds the official prefill sequence for every 12 Hz variant:
+#        optional instruction turn, ChatML assistant role, codec language /
+#        speaker tags, then the text either whole (non-streaming layout) or
+#        one token per generated frame (streaming layout).
 #      - Maintains the Talker paged KV cache across 12 Hz decode steps.
 #      - Predicts codec group 0 with the Talker and groups 1-15 with the
 #        depth-wise CodePredictor.
@@ -50,6 +53,8 @@ from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSTalkerModel,
 )
 from mstar.model.qwen3_tts.config import (
+    CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
+    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
@@ -89,8 +94,8 @@ class TalkerSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
-    CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (151644, 77091, 198)
-    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (151645, 198, 151644, 77091, 198)
+    CHATML_ASSISTANT_PREFIX_TOKEN_IDS = CHATML_ASSISTANT_PREFIX_TOKEN_IDS
+    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
 
     def __init__(
         self,
@@ -200,27 +205,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         bos, eos, pad = self._project_text(token_ids).to(dtype).chunk(3, dim=1)
         return bos, eos, pad
 
-    def _build_prefill(
-        self,
-        request_id: str,
-        text_ids: torch.Tensor,
-        speaker_id: int,
-        language_id: int,
-    ) -> torch.Tensor:
-        """Build the official mixed text/codec prefill embedding sequence.
-
-        The assistant-role prefix and codec conditioning tags enter the
-        one-shot prefill. Remaining prompt text is retained in per-request
-        state and added one token at a time to later recurrent codec embeds.
-        This aligns text progress with the 12 Hz acoustic generation steps.
-        """
-        text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
-        expected_prefix = text_ids.new_tensor(
-            self.CHATML_ASSISTANT_PREFIX_TOKEN_IDS
-        )
-        expected_suffix = text_ids.new_tensor(
-            self.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
-        )
+    def _validate_chatml(self, text_ids: torch.Tensor) -> tuple[int, int]:
+        """Check the fixed assistant-turn wrapper and return its (prefix, suffix) lengths."""
+        expected_prefix = text_ids.new_tensor(self.CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+        expected_suffix = text_ids.new_tensor(self.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS)
         prefix_len = expected_prefix.numel()
         suffix_len = expected_suffix.numel()
         if text_ids.shape[1] < prefix_len + 1 + suffix_len:
@@ -240,6 +228,48 @@ class TalkerSubmodule(ARNodeSubmodule):
                 f"{expected_suffix.tolist()}, got "
                 f"{text_ids[0, -suffix_len:].tolist()}"
             )
+        return prefix_len, suffix_len
+
+    def _build_prefill(
+        self,
+        request_id: str,
+        text_ids: torch.Tensor,
+        prompt_layout: torch.Tensor,
+        speaker_id: int,
+        language_id: int,
+    ) -> torch.Tensor:
+        """Build the official mixed text/codec prefill embedding sequence.
+
+        ``text_ids`` concatenates an optional instruction turn with the
+        assistant turn; ``prompt_layout`` is ``[instruct_len, text_len,
+        stream_text]`` and says where the split is and how the text is fed.
+        The layout mirrors ``Qwen3TTSForConditionalGeneration.generate``:
+
+        * instruction (``<|im_start|>user ... <|im_end|>``) as plain projected
+          text embeddings (VoiceDesign, 1.7B CustomVoice style control);
+        * the assistant role, then the codec think/language tags, the speaker
+          tag when the checkpoint has built-in speakers (``speaker_id >= 0``)
+          and the codec PAD, all summed with TTS PAD / BOS text embeddings;
+        * ``stream_text == 0`` (the reference default for CustomVoice and
+          VoiceDesign): every text token plus TTS EOS enters the prefill over
+          codec PADs, closed by TTS PAD + codec BOS. Decode then adds TTS PAD
+          to each frame.
+        * ``stream_text == 1`` (the reference default for Base): only the first
+          text token enters the prefill over codec BOS; the remaining tokens
+          plus TTS EOS are kept in per-request state and added one per frame.
+        """
+        text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
+        instruct_len, text_len, stream_text = (int(v) for v in prompt_layout.tolist())
+        instruct_ids = text_ids[:, :instruct_len]
+        assistant_ids = text_ids[:, instruct_len:]
+        prefix_len, suffix_len = self._validate_chatml(assistant_ids)
+        if assistant_ids.shape[1] != prefix_len + text_len + suffix_len:
+            raise ValueError(
+                "Qwen3-TTS prompt layout disagrees with the token stream: "
+                f"expected {prefix_len + text_len + suffix_len} assistant tokens, "
+                f"got {assistant_ids.shape[1]}"
+            )
+        text_tokens = assistant_ids[:, prefix_len:prefix_len + text_len]
 
         codec = self.talker_config
         codec_prefix = (
@@ -252,43 +282,44 @@ class TalkerSubmodule(ARNodeSubmodule):
                 codec.codec_think_eos_id,
             ]
         )
+        speaker_tag = [speaker_id] if speaker_id >= 0 else []
         codec_ids = torch.tensor(
-            [[*codec_prefix, speaker_id, codec.codec_pad_id, codec.codec_bos_id]],
+            [[*codec_prefix, *speaker_tag, codec.codec_pad_id, codec.codec_bos_id]],
             dtype=torch.long,
             device=self.get_device(),
         )
         codec_embeds = self.model.model.codec_embedding(codec_ids)
-        bos_embed, eos_embed, pad_embed = self._special_text_embeds(
-            codec_embeds.dtype
-        )
+        dtype = codec_embeds.dtype
+        bos_embed, eos_embed, pad_embed = self._special_text_embeds(dtype)
 
-        # Prefix layout mirrors the official CustomVoice generation helper:
-        # assistant role, language/voice codec tags, then first text token.
-        role_embed = self._project_text(
-            text_ids[:, :prefix_len]
-        ).to(codec_embeds.dtype)
+        def project(ids: torch.Tensor) -> torch.Tensor:
+            return self._project_text(ids).to(dtype)
+
+        # Tags: TTS PAD over every codec tag but the last, TTS BOS over the
+        # codec PAD; the codec BOS pairs with text below.
+        role_embed = project(assistant_ids[:, :prefix_len])
         tag_text = torch.cat([
             pad_embed.expand(-1, codec_embeds.shape[1] - 2, -1),
             bos_embed,
         ], dim=1)
-        tag_embed = tag_text + codec_embeds[:, :-1]
-        first_text = (
-            self._project_text(
-                text_ids[:, prefix_len:prefix_len + 1]
-            ).to(codec_embeds.dtype)
-            + codec_embeds[:, -1:]
-        )
-        prefill = torch.cat([role_embed, tag_embed, first_text], dim=1)
+        pieces = [role_embed, tag_text + codec_embeds[:, :-1]]
+        if instruct_len:
+            pieces.insert(0, project(instruct_ids))
 
-        # The fixed five-token ChatML suffix is replaced by projected TTS EOS.
-        # Decode consumes this tensor by ``generation_step`` and uses PAD once
-        # the text condition has been exhausted.
-        trailing = torch.cat([
-            self._project_text(
-                text_ids[:, prefix_len + 1:-suffix_len]
-            ).to(codec_embeds.dtype),
-            eos_embed,
-        ], dim=1)
+        if stream_text:
+            pieces.append(project(text_tokens[:, :1]) + codec_embeds[:, -1:])
+            trailing = torch.cat([project(text_tokens[:, 1:]), eos_embed], dim=1)
+        else:
+            text_embed = torch.cat([project(text_tokens), eos_embed], dim=1)
+            codec_pads = self.model.model.codec_embedding(
+                codec_ids.new_full((1, text_embed.shape[1]), codec.codec_pad_id)
+            )
+            pieces.append(text_embed + codec_pads)
+            pieces.append(pad_embed + codec_embeds[:, -1:])
+            # Nothing left to feed: every frame adds TTS PAD (empty stream).
+            trailing = eos_embed[:, :0]
+        prefill = torch.cat(pieces, dim=1)
+
         self.request_state(request_id).add_all(
             trailing_text_hidden=trailing.squeeze(0),
             tts_pad_embed=pad_embed[0, 0],
@@ -316,6 +347,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             input_embeds = self._build_prefill(
                 fwd_info.request_id,
                 inputs["text_inputs"][0],
+                inputs["prompt_layout"][0],
                 int(inputs["speaker_id"][0].item()),
                 int(inputs["language_id"][0].item()),
             )
