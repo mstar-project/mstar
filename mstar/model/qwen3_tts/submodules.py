@@ -1047,11 +1047,20 @@ class CodecSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        """Stack equal fixed-shape codec windows into one continuous batch."""
+        """Stack the batch's windows, padded to its widest bucket.
+
+        Requests reach the codec at different points of the chunk ramp, so one
+        batch mixes windows. The decoder is causal, so trailing padding never
+        changes the frames in front of it; each request's ``postprocess`` keeps
+        only its own frames.
+        """
         del graph_walk, engine_inputs
+        windows = [item.tensor_inputs["codec_tokens"] for item in inputs]
+        width = max(window.shape[-1] for window in windows)
         return {
             "codec_tokens": torch.stack([
-                item.tensor_inputs["codec_tokens"] for item in inputs
+                torch.nn.functional.pad(window, (0, width - window.shape[-1]))
+                for window in windows
             ])
         }
 
@@ -1067,8 +1076,9 @@ class CodecSubmodule(ARNodeSubmodule):
         codec_tokens: torch.Tensor,
         **kwargs: Any,
     ) -> NameToTensorList:
+        """One request's window (``[1, quantizers, frames]``) -> its ``[samples]`` audio."""
         del graph_walk, engine_inputs, kwargs
-        return {"audio_chunk": [self._decode(codec_tokens)]}
+        return {"audio_chunk": [self._decode(codec_tokens)[0]]}
 
     def forward_batched(
         self,
@@ -1112,17 +1122,21 @@ class CodecSubmodule(ARNodeSubmodule):
             dropped = min(skip, max(end - start, 0))
             start += dropped
             state.add("skip_samples", skip - dropped)
-        outputs["audio_chunk"][0] = outputs["audio_chunk"][0][start:end]
+        audio = outputs["audio_chunk"][0].reshape(-1)   # one request's samples, whatever the batch shape
+        if audio.numel() < end:
+            raise ValueError(
+                f"codec produced {audio.numel()} samples for a window of {frames} frames "
+                f"({end} expected)"
+            )
+        outputs["audio_chunk"][0] = audio[start:end]
         logger.debug(
             "codec %s: emit frames %d..%d (%d samples)", request_id, context, frames, max(end - start, 0)
         )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        """Batch codec requests only when their decoder input shapes match."""
+        """Any mix of windows batches (``preprocess`` pads to the widest)."""
         del batch
-        return 0 < len(model_inputs) <= self.MAX_BATCH_SIZE and len({
-            item.tensor_inputs["codec_tokens"].shape for item in model_inputs
-        }) == 1
+        return 0 < len(model_inputs) <= self.MAX_BATCH_SIZE
 
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
@@ -1133,7 +1147,7 @@ class CodecSubmodule(ARNodeSubmodule):
         graph_walk: str,
         per_request_info: Mapping[str, CurrentForwardPassInfo],
     ) -> Any:
-        """The window bucket this batch pads to (``can_batch`` keeps it uniform).
+        """The widest window bucket in this batch, which ``preprocess`` pads to.
 
         Derived from the stream metadata the worker attaches to each request
         (available before ``prepare_inputs`` runs, so a pre-planned lease can
@@ -1148,7 +1162,8 @@ class CodecSubmodule(ARNodeSubmodule):
                 buckets.add(self._bucket(max(int(num_items), 1)))
             else:
                 buckets.add(self.request_state(request_id).get("codec_bucket"))
-        return buckets.pop() if len(buckets) == 1 else None
+        buckets.discard(None)
+        return max(buckets) if buckets else None
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
