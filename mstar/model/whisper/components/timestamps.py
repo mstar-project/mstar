@@ -1,5 +1,5 @@
-"""Whisper timestamp decoding rules, split into a host-side state and a
-vectorized logits transform.
+"""Whisper timestamp decoding rules as a per-request state that travels with
+the token.
 
 When a request asks for timestamps (no ``<|notimestamps|>`` in its prompt),
 Whisper's decoding is constrained the way openai-whisper / HF's
@@ -14,12 +14,15 @@ Whisper's decoding is constrained the way openai-whisper / HF's
   * when the total probability of all timestamp tokens beats the best text
     token, a timestamp is sampled.
 
-The decision "which rule applies" depends on the request's generated
-history, which lives on the host; ``rule_state`` distils it into four
-integers per request. ``apply_rules`` turns a batch of those integers into
-masks on the ``(bs, vocab)`` logits with no data-dependent control flow, so
-it runs inside the captured decode graph: the state is just another staged
-input row.
+Which rule applies depends on the tokens generated so far. The worker
+launches the next decode step before it has read the previous step's token
+on the host, so that history cannot live in Python: the four integers that
+summarize it (``[active, phase, last_ts, ceil]``) are a tensor row that is
+routed along with the sampled token, updated by :meth:`TimestampRules.advance`
+inside the (captured) forward, and turned into masks on the ``(bs, vocab)``
+logits by :meth:`TimestampRules.apply` with no data-dependent control flow.
+:func:`rule_state` builds the same row from a token history on the host —
+the prefill's first row, and the tests' oracle for ``advance``.
 """
 from __future__ import annotations
 
@@ -27,12 +30,12 @@ import torch
 
 from mstar.model.whisper.config import WhisperModelConfig
 
-# state vector layout: [active, phase, ts_floor, ts_ceil]
+# state vector layout: [active, phase, last_ts, ceil]
 STATE_SIZE = 4
 # phases
 FIRST_TOKEN = 0        # nothing generated yet: force a timestamp <= max initial
 AFTER_SEGMENT_END = 1  # last token was a timestamp that closed a segment: no text
-AFTER_PAIR = 2         # two timestamps in a row: text only
+AFTER_PAIR = 2         # two timestamps in a row (or the very first one): text only
 IN_TEXT = 3            # last token was text: anything monotonic
 
 
@@ -41,17 +44,14 @@ def inactive_state() -> list[int]:
 
 
 def rule_state(generated: list[int], config: WhisperModelConfig) -> list[int]:
-    """The rule to apply to the next token, from what the request generated
-    since its prompt (its ``<|sot|>...`` prompt excluded).
-
-    ``ts_floor`` is the smallest timestamp token still allowed, ``ts_ceil``
-    the exclusive bound (``vocab_size`` except on the first token).
-    """
+    """The rule for the next token, from what the request generated since
+    its prompt. ``last_ts`` is the last timestamp token (``timestamp_begin -
+    1`` when none yet); ``ceil`` the exclusive timestamp bound."""
     tb = config.timestamp_begin
-    is_ts = [t >= tb for t in generated]
     if not generated:
         ceil = tb + config.max_initial_timestamp_index + 1
-        return [1, FIRST_TOKEN, tb, min(ceil, config.vocab_size)]
+        return [1, FIRST_TOKEN, tb - 1, min(ceil, config.vocab_size)]
+    is_ts = [t >= tb for t in generated]
     last_was_ts = is_ts[-1]
     penultimate_was_ts = len(generated) < 2 or is_ts[-2]
     if last_was_ts and penultimate_was_ts:
@@ -61,17 +61,12 @@ def rule_state(generated: list[int], config: WhisperModelConfig) -> list[int]:
     else:
         phase = IN_TEXT
     timestamps = [t for t, ts in zip(generated, is_ts, strict=True) if ts]
-    if not timestamps:
-        floor = tb
-    elif last_was_ts and not penultimate_was_ts:
-        floor = timestamps[-1]  # the pair may repeat the segment end
-    else:
-        floor = timestamps[-1] + 1  # never emit <|0.00|> (or any earlier stamp) again
-    return [1, phase, floor, config.vocab_size]
+    last_ts = timestamps[-1] if timestamps else tb - 1
+    return [1, phase, last_ts, config.vocab_size]
 
 
 class TimestampRules:
-    """Vectorized application of :func:`rule_state` rows to logits."""
+    """Vectorized rule application and state transition."""
 
     def __init__(self, config: WhisperModelConfig):
         self.timestamp_begin = config.timestamp_begin
@@ -93,8 +88,11 @@ class TimestampRules:
         ids = self._token_ids(logits.device)[None, :]
         active = state[:, 0:1].bool()
         phase = state[:, 1:2]
-        floor = state[:, 2:3]
+        last_ts = state[:, 2:3]
         ceil = state[:, 3:4]
+        # the pair may repeat the segment end; otherwise never emit an
+        # earlier (or the same) timestamp again
+        floor = torch.where(phase == AFTER_SEGMENT_END, last_ts, last_ts + 1)
 
         is_ts = ids >= self.timestamp_begin
         is_text = ids < self.timestamp_begin
@@ -102,8 +100,7 @@ class TimestampRules:
         # never emit <|notimestamps|> once timestamps are on
         mask |= ids == self.no_timestamps_token_id
         # first token: a timestamp no later than the initial bound
-        first = phase == FIRST_TOKEN
-        mask |= first & (is_text | (ids >= ceil))
+        mask |= (phase == FIRST_TOKEN) & (is_text | (ids >= ceil))
         # a segment just closed: no text (timestamp or end-of-text only)
         mask |= (phase == AFTER_SEGMENT_END) & (ids < self.eos_token_id)
         # a pair just completed: text only
@@ -120,3 +117,23 @@ class TimestampRules:
         text_logprob = logprobs.masked_fill(is_ts, float("-inf")).amax(dim=-1, keepdim=True)
         force_ts = active & (ts_logprob > text_logprob)
         return masked.masked_fill(force_ts & is_text, float("-inf"))
+
+    def advance(self, state: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """The state after sampling ``tokens: (bs,)``; inactive rows are
+        returned unchanged. Pure tensor ops, so it runs inside the graph."""
+        tokens = tokens.reshape(-1).to(state.dtype)
+        active = state[:, 0].bool()
+        phase = state[:, 1]
+        is_ts = tokens >= self.timestamp_begin
+        # after the first token, a segment end or a pair, the last token was
+        # (or counts as) a timestamp: one more makes a pair
+        last_was_ts = (phase == FIRST_TOKEN) | (phase == AFTER_SEGMENT_END) | (phase == AFTER_PAIR)
+        next_phase = torch.where(
+            is_ts,
+            torch.where(last_was_ts, torch.full_like(phase, AFTER_PAIR), torch.full_like(phase, AFTER_SEGMENT_END)),
+            torch.full_like(phase, IN_TEXT),
+        )
+        next_last_ts = torch.where(is_ts, tokens, state[:, 2])
+        next_ceil = torch.full_like(phase, self.vocab_size)
+        advanced = torch.stack([state[:, 0], next_phase, next_last_ts, next_ceil], dim=1)
+        return torch.where(active[:, None], advanced, state)
