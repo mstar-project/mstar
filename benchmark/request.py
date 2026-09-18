@@ -14,7 +14,7 @@ from typing import Optional
 import aiohttp
 import numpy as np
 
-from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
+from benchmark.base import Bagel, Kokoro, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
 
 
@@ -1494,7 +1494,7 @@ class OursOpenAI(VLLMOmni):
                 metrics=metrics,
                 additional_model_kwargs=additional_model_kwargs,
             )
-        if req_type.get_output_modalities() == "audio" and isinstance(model, Orpheus):
+        if req_type.get_output_modalities() == "audio" and isinstance(model, (Orpheus, Kokoro)):
             metrics = RequestMetrics(
                 request_id=request_id,
                 type=req_type,
@@ -1624,17 +1624,20 @@ class OursOpenAI(VLLMOmni):
         metrics: "RequestMetrics",
         additional_model_kwargs: dict,
     ) -> "RequestMetrics":
-        """Orpheus TTS via OpenAI ``/v1/audio/speech`` (streaming WAV).
+        """TTS via OpenAI ``/v1/audio/speech`` (streaming PCM16).
 
-        M*'s streaming speech response is a WAV: a 44-byte header followed by
-        16-bit PCM frames. Strip the header once, then record each subsequent
-        read as a PCM16 audio chunk so timing/throughput match the native path.
+        ``response_format="pcm"`` asks for bare 16-bit PCM frames so every
+        server's bytes count the same audio. A server that answers with a WAV
+        anyway (M* before ``pcm`` streaming landed, Kokoro-FastAPI's muxer)
+        starts with ``RIFF``; that 44-byte header is stripped once, then each
+        read is recorded as a PCM16 audio chunk so timing/throughput match the
+        native path.
         """
         kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
         payload: dict = {
             "model": model.get_hf_url(),
             "input": req_input.prompt,
-            "response_format": "wav",
+            "response_format": "pcm",
             "stream": True,
             **kwargs,
         }
@@ -1659,7 +1662,8 @@ class OursOpenAI(VLLMOmni):
                         pending += raw
                         if len(pending) < 44:
                             continue
-                        raw = pending[44:]  # drop the 44-byte streaming WAV header
+                        # drop a 44-byte streaming WAV header if the server sent one
+                        raw = pending[44:] if pending[:4] == b"RIFF" else pending
                         pending = b""
                         header_skipped = True
                         if not raw:
