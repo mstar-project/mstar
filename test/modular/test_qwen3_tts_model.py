@@ -490,6 +490,11 @@ def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
         input_signals=pointers,
     )
     assert codec.full_metadata.graph_walk == "codec_chunk_clone"
+    # The very first codec chunk already needs the reference frame count: it
+    # rides the initial inputs (and stays persisted for every later chunk).
+    assert [edge.name for edge in codec.inputs] == ["ref_frames"]
+    assert codec.inputs[0].tensor_info == pointers["ref_frames"]
+    assert codec.unpersist_tensors == []
     rearmed = model.get_partition_forward_pass_args(
         "Codec", codec.full_metadata, persist_signals={"ref_frames": pointers["ref_frames"]},
     )
