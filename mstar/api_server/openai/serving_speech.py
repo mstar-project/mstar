@@ -10,12 +10,17 @@ per chunk, ``speech_chunking.split_sentences``): the adapter's
 or suppress it per request with ``sentence_chunking: true|false``. The next
 chunks are submitted while the current one streams, so the engine batches them
 and playback never waits for a prefill.
+
+A streaming request only commits to HTTP 200 once its first result chunk has
+arrived and is not an error; an error chunk before that becomes the HTTP error
+it carries (the non-streaming path gets the same from ``collect_results``).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 
+from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
 from mstar.api_server import media_io
@@ -68,8 +73,15 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
 
     lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))
     if req.stream:
+        pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
+        # Look at the first result before committing to a 200: a request the
+        # engine rejects (bad voice, dead worker, ...) must surface as an HTTP
+        # error, not as an empty WAV.
+        first_iter = api.iter_result_chunks(pending[0])
+        first = await anext(first_iter, None)
+        _raise_if_error(first)
         return StreamingResponse(
-            _stream_wav(api, submit, len(chunks), lookahead, sample_rate),
+            _stream_wav(api, submit, len(chunks), pending, first_iter, first, sample_rate),
             media_type="audio/wav",
             headers={"Cache-Control": "no-cache"},
         )
@@ -85,13 +97,31 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
     return Response(content=audio_bytes, media_type=mime)
 
 
-async def _stream_wav(api, submit: Callable[[int], str], num_chunks: int, lookahead: int, sample_rate: int):
+def _raise_if_error(chunk) -> None:
+    """A data-worker failure arrives as an ``error`` chunk; turn it into the HTTP error it carries."""
+    if chunk is not None and chunk.modality == "error":
+        raise HTTPException(
+            status_code=int((chunk.metadata or {}).get("status", 500)),
+            detail=chunk.data.decode("utf-8", "replace") if isinstance(chunk.data, bytes) else str(chunk.data),
+        )
+
+
+async def _stream_wav(api, submit: Callable[[int], str], num_chunks: int, pending: list[str],
+                      first_iter, first, sample_rate: int):
     yield media_io.wav_stream_header(sample_rate)
-    pending: list[str] = [submit(i) for i in range(min(lookahead, num_chunks))]
     for index in range(num_chunks):
         if len(pending) < num_chunks:
             # Keep the next chunk generating while this one plays.
             pending.append(submit(len(pending)))
-        async for c in api.iter_result_chunks(pending[index]):
+        if index == 0:
+            iterator, head = first_iter, first
+        else:
+            iterator, head = api.iter_result_chunks(pending[index]), None
+        if head is not None and head.modality == "audio" and head.data:
+            yield head.data
+        async for c in iterator:
+            # Mid-stream the status is already sent; closing the stream is the
+            # only honest signal left, so raise rather than end quietly.
+            _raise_if_error(c)
             if c.modality == "audio" and c.data:
                 yield c.data
