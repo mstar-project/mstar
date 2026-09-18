@@ -789,6 +789,8 @@ class Worker:
                     name=edge_name,
                     tensor_info=[],
                     _final_stream_chunk=chunk.is_final,
+                    _stream_chunk_offset=chunk.start_offset,
+                    _stream_chunk_context=chunk.context_items,
                 )
             else:
                 # Normal chunk — store tensor and create edge with tensor_info.
@@ -807,6 +809,8 @@ class Worker:
                     name=edge_name,
                     tensor_info=tensor_infos.get(edge_name, []),
                     _final_stream_chunk=chunk.is_final,
+                    _stream_chunk_offset=chunk.start_offset,
+                    _stream_chunk_context=chunk.context_items,
                 )
         return synthetic_edge
 
@@ -958,6 +962,7 @@ class Worker:
 
         for request_id, node in batch.node_objects.items():
             tensors = {}
+            stream_chunks = {}
             ready_inputs = node.ready_signals.ready_inputs
             for input_name, edge in ready_inputs.items():
                 tensors[input_name] = [
@@ -967,8 +972,20 @@ class Worker:
                 ]
                 if edge._final_stream_chunk:
                     final_stream_rids.add(request_id)
+                if edge._stream_chunk_context is not None:
+                    stream_chunks[input_name] = {
+                        "start_offset": edge._stream_chunk_offset,
+                        "context_items": edge._stream_chunk_context,
+                        "is_final": edge._final_stream_chunk,
+                    }
             per_request_inputs[request_id] = tensors
-            per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            if stream_chunks:
+                # Where each streamed input sits in its stream and how many of
+                # its leading items are repeated context, for the consumer's
+                # ``prepare_inputs`` (a vocoder trims that context's audio).
+                fwd_info.step_metadata["stream_chunks"] = stream_chunks
+            per_request_info[request_id] = fwd_info
 
         return self._make_executing_batch(
             node_name=batch.node_name,
