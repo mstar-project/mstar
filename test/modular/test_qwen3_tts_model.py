@@ -42,14 +42,34 @@ from mstar.streaming.stream_buffer import StreamBuffer
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "qwen3tts.yaml"
 
 
+ASSISTANT_PREFIX = [151644, 77091, 198]
+ASSISTANT_SUFFIX = [151645, 198, 151644, 77091, 198]
+USER_PREFIX = [151644, 872, 198]
+USER_SUFFIX = [151645, 198]
+
+
 class _TokenizerStub:
+    """Tokenizes the two reference templates: fixed ChatML wrappers, one id per word."""
+
     def __init__(self):
-        self.last_text = None
+        self.texts = []
+
+    @property
+    def last_text(self):
+        return self.texts[-1] if self.texts else None
 
     def __call__(self, text, **kwargs):
-        self.last_text = text
+        self.texts.append(text)
         assert kwargs == {"return_tensors": "pt", "padding": True}
-        return {"input_ids": torch.tensor([[1, 2, 3]])}
+        if text.startswith("<|im_start|>assistant\n"):
+            body = text[len("<|im_start|>assistant\n"):-len("<|im_end|>\n<|im_start|>assistant\n")]
+            prefix, suffix = ASSISTANT_PREFIX, ASSISTANT_SUFFIX
+        else:
+            assert text.startswith("<|im_start|>user\n")
+            body = text[len("<|im_start|>user\n"):-len("<|im_end|>\n")]
+            prefix, suffix = USER_PREFIX, USER_SUFFIX
+        words = [1000 + i for i, _ in enumerate(body.split())]
+        return {"input_ids": torch.tensor([prefix + words + suffix])}
 
 
 def _make_model() -> Qwen3TTSModel:
@@ -186,6 +206,32 @@ def test_qwen3_tts_registry_engines_cache_and_yaml_are_consistent():
     assert by_walk["codec_chunk"].consumes_stream is True
 
 
+QWEN3_TTS_VARIANTS = {
+    "qwen3_tts_1p7b": ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "qwen3tts_1p7b.yaml"),
+    "qwen3_tts_voicedesign": ("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", "qwen3tts_voicedesign.yaml"),
+    "qwen3_tts_base": ("Qwen/Qwen3-TTS-12Hz-1.7B-Base", "qwen3tts_base.yaml"),
+}
+
+
+def test_qwen3_tts_1p7b_variants_share_class_configs_and_adapter():
+    from mstar.api_server.openai.adapters import Qwen3TTSAdapter, get_adapter
+    from mstar.cli.main import DEFAULT_CONFIGS
+
+    base_yaml = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    for key, (hf_id, yaml_name) in QWEN3_TTS_VARIANTS.items():
+        assert get_model_class(key) is Qwen3TTSModel
+        assert HF_MODELS[key] == {"model_path_hf": hf_id}
+        assert DEFAULT_CONFIGS[key] == yaml_name
+        deployment = yaml.safe_load(
+            (CONFIG_PATH.parent / yaml_name).read_text(encoding="utf-8")
+        )
+        assert deployment["model"] == key
+        assert deployment["node_groups"] == base_yaml["node_groups"]
+        assert deployment["resources"] == base_yaml["resources"]
+        assert isinstance(get_adapter(key), Qwen3TTSAdapter)
+    assert isinstance(get_adapter("qwen3_tts"), Qwen3TTSAdapter)
+
+
 def test_qwen3_tts_cli_and_benchmark_entries_are_registered():
     repo_root = str(Path(__file__).resolve().parents[2])
     sys.path.insert(0, repo_root)
@@ -284,9 +330,83 @@ def test_qwen3_tts_process_prompt_matches_official_template():
         "<|im_start|>assistant\n你好<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
-    assert tensors["text_inputs"][0].tolist() == [1, 2, 3]
+    assert tensors["text_inputs"][0].tolist() == ASSISTANT_PREFIX + [1000] + ASSISTANT_SUFFIX
+    # CustomVoice default: whole text in the prefill (stream_text = 0).
+    assert tensors["prompt_layout"][0].tolist() == [0, 1, 0]
     assert tensors["speaker_id"][0].item() == 3065
     assert tensors["language_id"][0].item() == 2055
+
+
+def _variant_model(tts_model_type: str, tts_model_size: str = "1b7") -> Qwen3TTSModel:
+    model = _make_model()
+    talker = Qwen3TTSTalkerConfig(hidden_size=2048, intermediate_size=6144)
+    if tts_model_type != "custom_voice":
+        talker.spk_id = {}
+        talker.spk_is_dialect = {}
+    model.config = Qwen3TTSModelConfig(
+        tts_model_type=tts_model_type, tts_model_size=tts_model_size, talker=talker
+    )
+    return model
+
+
+def test_qwen3_tts_1p7b_custom_voice_prepends_instruction_turn():
+    model = _variant_model("custom_voice")
+    assert model.config.supports_instruct and not model.config.requires_instruct
+
+    tensors = model.process_prompt(
+        "hello big world",
+        input_modalities=["text"],
+        output_modalities=["audio"],
+        voice="Ryan",
+        instructions="speak slowly",
+        non_streaming_mode=False,
+    )
+
+    instruct_ids = USER_PREFIX + [1000, 1001] + USER_SUFFIX
+    assistant_ids = ASSISTANT_PREFIX + [1000, 1001, 1002] + ASSISTANT_SUFFIX
+    assert model.tokenizer.texts[-1] == "<|im_start|>user\nspeak slowly<|im_end|>\n"
+    assert tensors["text_inputs"][0].tolist() == instruct_ids + assistant_ids
+    assert tensors["prompt_layout"][0].tolist() == [len(instruct_ids), 3, 1]
+    assert tensors["speaker_id"][0].item() == 3061
+
+
+def test_qwen3_tts_voice_design_requires_instruct_and_has_no_speakers():
+    model = _variant_model("voice_design")
+    assert model.config.default_speaker is None
+    assert model.config.requires_instruct
+
+    tensors = model.process_prompt(
+        "hello",
+        input_modalities=["text"],
+        output_modalities=["audio"],
+        instruct="A deep, calm male voice",
+    )
+    assert tensors["speaker_id"][0].item() == -1
+    assert tensors["prompt_layout"][0].tolist() == [3 + 5 + 2, 1, 0]
+
+    with pytest.raises(ValueError, match="requires an 'instruct'"):
+        model.process_prompt("hello", input_modalities=["text"], output_modalities=["audio"])
+    with pytest.raises(ValueError, match="no built-in speakers"):
+        model.process_prompt(
+            "hello", input_modalities=["text"], output_modalities=["audio"],
+            voice="vivian", instruct="x",
+        )
+
+
+def test_qwen3_tts_base_config_declares_speaker_encoder():
+    model = _variant_model("base")
+    assert model.config.supports_reference_audio
+    assert model.config.speaker_encoder is not None
+    assert model.config.speaker_encoder.enc_dim == 2048
+    # Base feeds text one token per frame by default (reference default).
+    assert model.config.default_non_streaming_mode is False
+    with pytest.raises(ValueError, match="reference audio"):
+        model.process_prompt("hello", input_modalities=["text"], output_modalities=["audio"])
+
+
+def test_qwen3_tts_config_rejects_unknown_variant():
+    with pytest.raises(ValueError, match="tts_model_type"):
+        Qwen3TTSModelConfig(tts_model_type="duplex")
 
 
 def test_qwen3_tts_validates_speaker_dialect_after_language_override():
@@ -352,8 +472,11 @@ def test_qwen3_tts_initial_partition_args_route_expected_inputs():
     model = _make_model()
     pointers = {
         name: [SimpleNamespace(name=name)]
-        for name in ("text_inputs", "speaker_id", "language_id")
+        for name in Qwen3TTSModel.PREFILL_INPUTS
     }
+    assert Qwen3TTSModel.PREFILL_INPUTS == (
+        "text_inputs", "prompt_layout", "speaker_id", "language_id",
+    )
 
     talker = model.get_initial_forward_pass_args(
         "Talker",
@@ -491,18 +614,83 @@ def test_qwen3_tts_talker_builds_official_streaming_prefill():
     submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
     submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
 
+    # 3 prefix + 4 text + 5 suffix tokens, streaming text layout.
     embeds = submodule._build_prefill(
         request_id="request",
         text_ids=torch.arange(1, 13),
+        prompt_layout=torch.tensor([0, 4, 1]),
         speaker_id=40,
         language_id=-1,
     )
 
+    # role(3) + [nothink, think_bos, think_eos, speaker, pad](5) + first text token
     assert embeds.shape == (9, 16)
     state = submodule.request_state("request")
     assert state["trailing_text_hidden"].shape == (4, 16)
     assert state["tts_pad_embed"].shape == (16,)
     assert state["generation_step"] == 0
+
+
+def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+    )
+    submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
+    submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
+
+    embeds = submodule._build_prefill(
+        request_id="request",
+        text_ids=torch.arange(1, 13),
+        prompt_layout=torch.tensor([0, 4, 0]),
+        speaker_id=40,
+        language_id=41,
+    )
+
+    # role(3) + [think, think_bos, lang, think_eos, speaker, pad](6)
+    # + (4 text + tts_eos) over codec pads (5) + (tts_pad + codec_bos)(1)
+    assert embeds.shape == (15, 16)
+    state = submodule.request_state("request")
+    # Nothing streams: every decode frame adds the TTS PAD embedding.
+    assert state["trailing_text_hidden"].shape == (0, 16)
+    prepared = submodule.prepare_inputs(
+        "talker_decode",
+        SimpleNamespace(request_id="request"),
+        {"talker_input_embeds": [torch.zeros(1, 16)]},
+    )
+    assert torch.equal(prepared.input_embeds[0], state["tts_pad_embed"])
+
+
+def test_qwen3_tts_talker_prefill_prepends_instruction_without_speaker():
+    config = _tiny_model_config()
+    submodule = TalkerSubmodule(
+        Qwen3TTSTalkerModel(config), Qwen3TTSCodePredictor(config), config
+    )
+    submodule.CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (1, 2, 3)
+    submodule.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (8, 9, 10, 11, 12)
+    instruct = torch.tensor([20, 21, 22, 23, 24, 25])
+    text_ids = torch.cat([instruct, torch.arange(1, 13)])
+
+    embeds = submodule._build_prefill(
+        request_id="request",
+        text_ids=text_ids,
+        prompt_layout=torch.tensor([6, 4, 1]),
+        speaker_id=-1,
+        language_id=-1,
+    )
+
+    # instruct(6) + role(3) + [nothink, think_bos, think_eos, pad](4) + first text
+    assert embeds.shape == (14, 16)
+    # A layout whose text span disagrees with the token stream is rejected
+    # even when the ChatML wrapper itself still lines up.
+    with pytest.raises(ValueError, match="prompt layout disagrees"):
+        submodule._build_prefill(
+            request_id="request",
+            text_ids=text_ids,
+            prompt_layout=torch.tensor([6, 3, 1]),
+            speaker_id=-1,
+            language_id=-1,
+        )
 
 
 def test_qwen3_tts_talker_rejects_changed_chatml_layout():
@@ -521,6 +709,7 @@ def test_qwen3_tts_talker_rejects_changed_chatml_layout():
         submodule._build_prefill(
             request_id="request",
             text_ids=text_ids,
+            prompt_layout=torch.tensor([0, 4, 1]),
             speaker_id=40,
             language_id=-1,
         )
@@ -711,6 +900,61 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     info["b"].step_metadata["subtalker_sampling"] = {"temperature": 0.7}
     assert submodule.can_batch(batch, model_inputs)
     assert submodule.can_use_cuda_graphs(batch, model_inputs)
+
+
+def test_qwen3_tts_code_predictor_projects_wider_talker_inputs():
+    """1.7B: Talker width 2048 vs predictor width 1024 -> biased projection on
+    every depth input; 0.6B (equal widths) -> identity, no extra parameters."""
+    narrow = _tiny_model_config()
+    assert isinstance(
+        Qwen3TTSCodePredictor(narrow).small_to_mtp_projection, torch.nn.Identity
+    )
+
+    wide = _tiny_model_config()
+    wide.talker.hidden_size = 32
+    predictor = Qwen3TTSCodePredictor(wide)
+    projection = predictor.small_to_mtp_projection
+    assert isinstance(projection, torch.nn.Linear)
+    assert projection.weight.shape == (16, 32)
+    assert projection.bias.shape == (16,)
+    # Residual embedding tables stay in the Talker width: their sum feeds the
+    # next Talker step, only the predictor input is projected.
+    assert predictor.model.codec_embedding[0].weight.shape == (32, 32)
+    assert {"small_to_mtp_projection.weight", "small_to_mtp_projection.bias"} <= set(
+        dict(predictor.named_parameters())
+    )
+
+    for layer in predictor.model.layers:
+        layer.input_layernorm = torch.nn.Identity()
+        layer.post_attention_layernorm = torch.nn.Identity()
+        layer.self_attn.q_norm = torch.nn.Identity()
+        layer.self_attn.k_norm = torch.nn.Identity()
+    predictor.model.norm = torch.nn.Identity()
+    import mstar.model.qwen3_tts.components.talker as talker_module
+    original_rope = talker_module.apply_rope_pos_ids
+    original_attn = talker_module.decode_attn_nhd
+    talker_module.apply_rope_pos_ids = lambda q, k, pos, theta: (q, k)
+    talker_module.decode_attn_nhd = lambda q, k_cache, v_cache, n: (
+        torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k_cache[:, :n].transpose(1, 2),
+            v_cache[:, :n].transpose(1, 2), enable_gqa=True,
+        ).transpose(1, 2)
+    )
+    try:
+        cp = wide.talker.code_predictor
+        out = predictor.forward_depth_unrolled(
+            inputs_embeds=torch.randn(2, 1, 32),
+            position_ids=torch.zeros(2, 1, dtype=torch.long),
+            kv_cache=torch.zeros(
+                cp.num_hidden_layers, 2, 2, wide.talker.num_code_groups,
+                cp.num_key_value_heads, cp.head_dim,
+            ),
+            cache_pos=0,
+        )
+    finally:
+        talker_module.apply_rope_pos_ids = original_rope
+        talker_module.decode_attn_nhd = original_attn
+    assert out.shape == (2, 1, 16)
 
 
 def test_qwen3_tts_code_predictor_uses_decode_attn_nhd(monkeypatch):
