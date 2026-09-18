@@ -64,6 +64,7 @@ from mstar.model.components.audio_features import LogMelSpectrogram, load_audio_
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer
 from mstar.model.whisper.config import (
+    ALIGN_WALK,
     ATTN,
     CONTEXT_LABEL,
     CROSS_ATTN,
@@ -112,6 +113,8 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
         super().__init__(tokenizer)
         self.config = config
         self._render_ids = set(config.language_token_ids)
+        # the align walk's word timings open with this marker (see submodules)
+        self._render_ids.add(tokenizer.convert_tokens_to_ids("<|startoflm|>"))
 
     def _rendered(self, token_id: int) -> bool:
         return token_id in self._render_ids or self.config.is_timestamp(token_id)
@@ -281,7 +284,8 @@ class WhisperModel(Model):
                 GraphNode(
                     name=ENCODER_NODE,
                     input_names=["audio"],
-                    outputs=[GraphEdge(next_node=DECODER_NODE, name="encoder_states")],
+                    # kept (persist) so the align walk can attend it again
+                    outputs=[GraphEdge(next_node=DECODER_NODE, name="encoder_states", persist=True)],
                 ),
                 GraphNode(
                     name=DECODER_NODE,
@@ -302,10 +306,12 @@ class WhisperModel(Model):
                 name=DECODER_NODE,
                 input_names=["text_inputs", "ts_rules"],
                 outputs=[
+                    # persisted as well: the align walk needs the whole transcript
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
                         name="new_token",
                         output_modality="text",
+                        persist=True,
                     ),
                     GraphEdge(
                         next_node=DECODER_NODE,
@@ -322,11 +328,18 @@ class WhisperModel(Model):
             outputs=[],
         )
 
+        align = GraphNode(
+            name=DECODER_NODE,
+            input_names=["encoder_states", "transcript", "audio_frames"],
+            outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="word_tokens", output_modality="text")],
+        )
+
         return {
             PREFILL_WALK: encoder_then_decoder(),
             DETECT_LANGUAGE_WALK: encoder_then_decoder(),
             PREFILL_PROMPT_WALK: prefill_prompt,
             DECODE_WALK: decode,
+            ALIGN_WALK: align,
         }
 
     # -------------------------------------------------------------------
@@ -356,7 +369,13 @@ class WhisperModel(Model):
             output_modalities=output_modalities,
             graph_walk=DETECT_LANGUAGE_WALK if detect else PREFILL_WALK,
             is_prefill=True,
-            kwargs={"prompt_tail": prompt_tail},
+            kwargs={
+                "prompt_tail": prompt_tail,
+                # for the align walk: how much of the window carries audio,
+                # and whether the request asked for word timestamps at all
+                "audio_frames": input_signals.get("audio_frames", []),
+                "word_timestamps": (model_kwargs or {}).get("timestamps") == "word",
+            },
         )
         inputs = [
             self._edge(ENCODER_NODE, "audio", input_signals.get("audio", [])),
@@ -377,10 +396,11 @@ class WhisperModel(Model):
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         """Single-partition state machine:
-        ``[detect_language -> prefill_prompt | prefill] -> decode -> done``."""
+        ``[detect_language -> prefill_prompt | prefill] -> decode -> [align] -> done``."""
         metadata = partition_metadata
         new_token = persist_signals.get("new_token", [])
         ts_rules = persist_signals.get("ts_rules", [])
+        word_timestamps = bool(metadata.kwargs.get("word_timestamps"))
 
         if metadata.is_prefill:
             if metadata.graph_walk == DETECT_LANGUAGE_WALK:
@@ -400,9 +420,24 @@ class WhisperModel(Model):
                 )
             metadata.is_prefill = False
             metadata.graph_walk = DECODE_WALK
-        elif metadata.graph_walk == DECODE_WALK:
-            # The decode dynamic loop returned to the conductor: EOS or
-            # max tokens was hit, so the request is complete.
+        elif metadata.graph_walk == DECODE_WALK and word_timestamps:
+            # The loop is done; align the transcript (every generated token
+            # is still persisted) against the persisted encoder output.
+            metadata.graph_walk = ALIGN_WALK
+            inputs = [
+                self._edge(DECODER_NODE, "encoder_states", persist_signals.get("encoder_states", [])),
+                self._edge(DECODER_NODE, "transcript", new_token),
+                self._edge(DECODER_NODE, "audio_frames", metadata.kwargs.get("audio_frames", [])),
+            ]
+            return ForwardPassArgs(
+                full_metadata=metadata,
+                inputs=inputs,
+                unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]) + list(ts_rules),
+                step_metadata={"is_prefill": False},
+            )
+        elif metadata.graph_walk in (DECODE_WALK, ALIGN_WALK):
+            # The decode dynamic loop returned to the conductor (EOS or max
+            # tokens), or the alignment after it ran: the request is complete.
             return ForwardPassArgs(
                 full_metadata=metadata,
                 inputs=[],
@@ -414,10 +449,13 @@ class WhisperModel(Model):
             self._edge(DECODER_NODE, "text_inputs", new_token),
             self._edge(DECODER_NODE, "ts_rules", ts_rules),
         ]
+        # the first transcript token stays persisted when the align walk
+        # will need the whole transcript
+        released = [] if word_timestamps else list(new_token)
         return ForwardPassArgs(
             full_metadata=metadata,
             inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
+            unpersist_tensors=released + list(ts_rules),
             step_metadata={"is_prefill": False},
         )
 
@@ -483,6 +521,8 @@ class WhisperModel(Model):
         out: NameToTensorList = {
             "audio": [window],
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
+            # mel frames that carry audio; word timestamps align within them
+            "audio_frames": [torch.tensor([self.log_mel.num_frames(window.numel())], dtype=torch.long)],
         }
         if language is None:
             out["prompt_tail"] = [torch.tensor(
@@ -599,4 +639,4 @@ class WhisperModel(Model):
         decoder.eval()
 
         from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-        return WhisperDecoderSubmodule(decoder=decoder, config=self.config)
+        return WhisperDecoderSubmodule(decoder=decoder, config=self.config, tokenizer=self.tokenizer)
