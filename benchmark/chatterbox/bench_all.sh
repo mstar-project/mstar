@@ -110,7 +110,7 @@ case ${1:-} in
     runner "http://127.0.0.1:$PORT" "$c" "$out"
     ;;
   tts)
-    variant=$2 c=$3 out=$RESULTS/tts_server_${variant}_c$c
+    variant=$2 c=$3 out=$RESULTS/tts_server_${variant}${RUN_TAG:+_$RUN_TAG}_c$c
     run_dir=$WS/baselines/tts-server/run_$variant
     port=$(awk '/^  port:/ {print $2}' "$run_dir/config.yaml")
     mkdir -p "$out"
