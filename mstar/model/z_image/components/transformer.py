@@ -20,6 +20,7 @@ resource); batching happens only at identical padded lengths, so no key mask is 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -117,6 +118,13 @@ class ZImageFeedForward(nn.Module):
         return self.w2(F.silu(gate) * up)
 
 
+# The three spans a forward attends over: the noise refiner over the (padded) image tokens
+# alone, the context refiner over the caption alone, the main layers over both. Each needs
+# its own ragged plan; the owning submodule declares them under these labels.
+IMAGE_SPAN, CAPTION_SPAN, MAIN_SPAN = "image", "caption", "main"
+ATTENTION_SPANS = (IMAGE_SPAN, CAPTION_SPAN, MAIN_SPAN)
+
+
 class ZImageBlock(nn.Module):
     def __init__(self, config: ZImageTransformerConfig, modulation: bool):
         super().__init__()
@@ -192,26 +200,31 @@ class ZImageDiT(nn.Module):
         t: torch.Tensor,
         image_freqs: torch.Tensor,
         caption_freqs: torch.Tensor,
-        ragged: RaggedAttentionFn | None = None,
+        ragged: Mapping[str, RaggedAttentionFn] | None = None,
     ) -> torch.Tensor:
         """``image_tokens [B, Lx, patch_dim]`` (padded to a multiple of 32), ``caption [B, Lc,
         cap_feat_dim]`` (padded likewise), boolean pad masks ``[B, Lx]`` / ``[B, Lc]`` (True at
         pad positions), ``t [B]`` fp32, complex rotary tables ``[Lx, D/2]`` / ``[Lc, D/2]``.
-        Returns the velocity for the image tokens ``[B, Lx, patch_dim]`` (pads included)."""
+        ``ragged``: one attention kernel per span in :data:`ATTENTION_SPANS`, or None for SDPA
+        throughout. Returns the velocity for the image tokens ``[B, Lx, patch_dim]`` (pads
+        included)."""
+        if ragged is not None and set(ragged) != set(ATTENTION_SPANS):
+            raise KeyError(f"ragged attention needs one kernel per span {ATTENTION_SPANS}; got {sorted(ragged)}")
+        attn = ragged or {}
         adaln_input = self.embed_time(t).type_as(image_tokens)
         x = self.x_embedder(image_tokens)
         x = torch.where(image_pad_mask[..., None], self.x_pad_token.to(x.dtype), x)
         for block in self.noise_refiner:
-            x = block(x, image_freqs, adaln_input, ragged)
+            x = block(x, image_freqs, adaln_input, attn.get(IMAGE_SPAN))
         cap = self.cap_proj(self.cap_norm(caption))
         cap = torch.where(caption_pad_mask[..., None], self.cap_pad_token.to(cap.dtype), cap)
         for block in self.context_refiner:
-            cap = block(cap, caption_freqs, None, ragged)
+            cap = block(cap, caption_freqs, None, attn.get(CAPTION_SPAN))
         num_image = x.shape[1]
         unified = torch.cat([x, cap], dim=1)
         freqs = torch.cat([image_freqs, caption_freqs], dim=0)
         for block in self.layers:
-            unified = block(unified, freqs, adaln_input, ragged)
+            unified = block(unified, freqs, adaln_input, attn.get(MAIN_SPAN))
         scale = 1.0 + self.final_mod(F.silu(adaln_input))
         out = self.final_norm(unified) * scale.unsqueeze(1)
         return self.final_proj(out)[:, :num_image]
