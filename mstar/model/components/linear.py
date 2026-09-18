@@ -90,5 +90,12 @@ class FusedColumnLinear(nn.Module):
         )
         dst.copy_(loaded_weight)
 
+    def shard_slice(self, shard_id: str | int) -> tuple[int, int]:
+        """``(offset, size)`` of one shard's rows in the fused parameter, for callers that
+        update a shard in place (e.g. merging a LoRA delta into ``q`` only)."""
+        if shard_id not in self._shard_sizes:
+            raise KeyError(f"unknown shard id {shard_id!r}; expected one of {list(self._shard_sizes)}")
+        return self._shard_offsets[shard_id], self._shard_sizes[shard_id]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
