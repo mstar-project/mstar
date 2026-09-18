@@ -1,0 +1,9 @@
+model: "qwen3_asr"
+max_seq_len: 65536
+resources:
+  kv_cache:
+    max_num_pages: 1024
+    cpu_offload_pages: 256
+node_groups:
+  - node_names: [audio_encoder, LLM]
+    ranks: [0]
