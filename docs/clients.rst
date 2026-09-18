@@ -215,11 +215,17 @@ Per-model notes:
   model for timestamps. Whisper's language and timestamp tokens travel in the
   text stream and are lifted into ``language`` / ``segments`` by the server; a
   streaming client receives only the spoken words. Uploads longer than the
-  model's clip (30 s for Whisper) are cut into consecutive windows; by default
-  they run in order with the transcript so far as each window's
-  ``initial_prompt`` and the first window's detected language (openai-whisper's
-  long-form algorithm), ``long_form="parallel"`` in ``extra_body`` submits them
-  all at once. Segment timestamps are offset to the whole file.
+  model's clip (30 s for Whisper) are served as consecutive windows. By default
+  they run in order, openai-whisper style: each window gets the transcript so
+  far as ``initial_prompt`` and the first window's detected language, is decoded
+  with timestamps so the next window can start where its last closed segment
+  ended (no word is split by a boundary), and is decoded again at rising
+  temperatures when its text is a repetition loop (gzip compression ratio above
+  2.4) — after which the transcript so far stops conditioning later windows.
+  Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
+  as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
+  once, each cut at the quietest moment before its boundary. Segment timestamps
+  are offset to the whole file.
 - **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
   session re-transcribes everything heard so far as one engine request whose assistant
   turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
