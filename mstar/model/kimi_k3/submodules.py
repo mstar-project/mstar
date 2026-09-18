@@ -154,12 +154,14 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         if self.draft is not None:
             # the prefill also writes the draft's context KV for the whole prompt (each row's
             # positions count from 0) so the first decode step drafts against a complete context
-            hidden, aux = self.language_model.model(
-                self.embed_tokens(text_inputs), label="main", aux_layers=self.draft.cfg.target_layer_ids)
+            context = self.draft.context_accumulator()
+            hidden, _ = self.language_model.model(
+                self.embed_tokens(text_inputs), label="main", aux_layers=self.draft.cfg.target_layer_ids,
+                aux_sink=context)
             qo = attn.qo_indptr_buf().long()
             rows = torch.repeat_interleave(torch.arange(qo.numel() - 1, device=qo.device), qo[1:] - qo[:-1])
             positions = torch.arange(text_inputs.shape[0], device=qo.device) - qo[rows]
-            self.draft.write_context(self.draft.combine(torch.cat(aux, dim=-1)), positions)
+            self.draft.write_context(context.finish(), positions)
         else:
             hidden = self.language_model.model(self.embed_tokens(text_inputs), label="main")
         if graph_walk == "prefill":
@@ -195,8 +197,10 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             drafts = self._draft(bonus[:, None])
         ids = torch.cat([bonus[:, None], drafts], dim=1)
         if self.draft is not None:
-            hidden, aux = self.language_model.model(
-                self.embed_tokens(ids.reshape(-1)), label="main", aux_layers=self.draft.cfg.target_layer_ids)
+            context = self.draft.context_accumulator()
+            hidden, _ = self.language_model.model(
+                self.embed_tokens(ids.reshape(-1)), label="main", aux_layers=self.draft.cfg.target_layer_ids,
+                aux_sink=context)
         else:
             hidden = self.language_model.model(self.embed_tokens(ids.reshape(-1)), label="main")
         logits = self.lm_head(hidden)
@@ -206,7 +210,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         new_bonus = tokens.gather(1, accepted.to(torch.long).unsqueeze(1))
         if self.draft is not None:
             positions = (ctx_len[:, None] + offsets[None, :]).reshape(-1)
-            self.draft.write_context(self.draft.combine(torch.cat(aux, dim=-1)), positions)
+            self.draft.write_context(context.finish(), positions)
         return {"spec_tokens": tokens, "spec_accepted": accepted, "next_inputs": new_bonus}
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor, **kwargs):
