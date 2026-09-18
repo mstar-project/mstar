@@ -116,6 +116,8 @@ class ChatterboxModel(Model):
         stream_chunk_tokens: int | None = None,
         stream_first_chunk_tokens: int | None = None,
         stream_context_tokens: int | None = None,
+        stream_chunk_growth: float | None = None,
+        stream_max_chunk_tokens: int | None = None,
         s3gen_compile: bool | None = None,
         s3gen_compile_mode: str | None = None,
         s3gen_frame_bucket: int | None = None,
@@ -149,6 +151,10 @@ class ChatterboxModel(Model):
             self.config.stream_first_chunk_tokens = int(stream_first_chunk_tokens)
         if stream_context_tokens is not None:
             self.config.stream_context_tokens = int(stream_context_tokens)
+        if stream_chunk_growth is not None:
+            self.config.stream_chunk_growth = float(stream_chunk_growth)
+        if stream_max_chunk_tokens is not None:
+            self.config.stream_max_chunk_tokens = int(stream_max_chunk_tokens)
         if s3gen_compile is not None:
             self.config.s3gen_compile = bool(s3gen_compile)
         if s3gen_compile_mode is not None:
@@ -367,6 +373,8 @@ class ChatterboxModel(Model):
         return RampChunkPolicy(
             first_chunk=self.config.stream_first_chunk_tokens,
             chunk_size=self.config.stream_chunk_tokens,
+            growth=self.config.stream_chunk_growth,
+            max_chunk=max(self.config.stream_max_chunk_tokens, self.config.stream_chunk_tokens),
         )
 
     def get_partition_topology(self) -> PartitionTopology:
