@@ -483,3 +483,20 @@ def test_vae_decode_sizes_are_the_four_compiled_sizes_clamped_to_the_max_batch()
     assert VAE_DECODE_BATCH_SIZES == (1, 2, 4, 8)
     small = _make_model(max_batch_size=4, capture_batch_sizes=[1, 2, 3, 4])
     assert [s for s in VAE_DECODE_BATCH_SIZES if s <= small.max_batch_size] == [1, 2, 4]
+
+
+def test_compile_eager_rounding_knob_sets_inductor_precision_emulation(monkeypatch):
+    import torch._inductor.config as inductor_config
+
+    from mstar.model.flux2_klein.submodules import compile_transformer_forward
+
+    calls = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: calls.append(kw) or fn)
+    module = torch.nn.Linear(2, 2)
+    compile_transformer_forward(module, eager_rounding=True)
+    assert inductor_config.emulate_precision_casts is True and calls[-1]["dynamic"] is False
+    compile_transformer_forward(module, eager_rounding=False)
+    assert inductor_config.emulate_precision_casts is False
+    inductor_config.emulate_precision_casts = False  # leave the process default behind
+    assert _make_model().compile_eager_rounding is True
+    assert _make_model(compile_eager_rounding=False).compile_eager_rounding is False
