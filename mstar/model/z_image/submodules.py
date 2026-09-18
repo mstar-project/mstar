@@ -15,6 +15,7 @@ negated and the Euler update runs in fp32); the transformer runs in bf16.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -25,7 +26,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.diffusion.image_io import pixels_to_uint8
-from mstar.model.flux2_klein.submodules import compile_vae_decode
+from mstar.model.flux2_klein.submodules import VAE_WARMUP_BATCH_SIZES, compile_vae_decode
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
     ATTENTION_SPANS,
@@ -253,12 +254,27 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
 
     disable_torch_compile = True
 
-    def __init__(self, vae: nn.Module, config: ZImageConfig, max_batch_size: int = 8, compile_decode: bool = False):
+    def __init__(
+        self, vae: nn.Module, config: ZImageConfig, max_batch_size: int = 8, compile_decode: bool = False,
+        warmup_grids: Sequence[tuple[int, int]] = (),
+    ):
         super().__init__()
         self.vae = vae
         self._decode_fn = compile_vae_decode(vae) if compile_decode else vae.decode  # see KleinVaeDecoderSubmodule
         self.config = config
         self._max_batch_size = max_batch_size
+        self.warmup(warmup_grids)
+
+    def warmup(self, grids: Sequence[tuple[int, int]], batch_sizes: Sequence[int] = VAE_WARMUP_BATCH_SIZES) -> None:
+        """Decode zeros at ``batch_sizes`` per latent grid at load (see ``KleinVaeDecoderSubmodule.warmup``)."""
+        patch = self.config.transformer.patch_size
+        for h, w in grids:
+            for bs in batch_sizes:
+                latent = torch.zeros(
+                    bs, self.config.transformer.in_channels, h * patch, w * patch, device=self.get_device(),
+                )
+                with torch.no_grad():
+                    self._decode(latent)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         latents = inputs[LATENTS][0]
