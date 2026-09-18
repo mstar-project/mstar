@@ -677,7 +677,20 @@ class Qwen3ASRAdapter(OpenAIAdapter):
                 break
         if language and language.lower() == "none":
             language = None
-        return Transcript(text=body.strip(), language=req.language or language)
+        return Transcript(text=body.strip(), language=req.language or _qwen3_language_code(language))
+
+
+def _qwen3_language_code(name: str | None) -> str | None:
+    """The ISO code clients expect (what Whisper reports too) for a language
+    name Qwen3-ASR wrote; a name outside its list passes through."""
+    if not name:
+        return None
+    from mstar.model.qwen3_asr.config import LANGUAGE_CODES
+
+    for code, canonical in LANGUAGE_CODES.items():
+        if canonical.lower() == name.lower():
+            return code
+    return name
 
 
 class HiggsAudioAdapter(OpenAIAdapter):
