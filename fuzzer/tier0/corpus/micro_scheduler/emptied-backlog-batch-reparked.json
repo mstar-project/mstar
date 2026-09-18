@@ -1,0 +1,66 @@
+{
+  "config": {
+    "caps": [
+      null,
+      2,
+      2
+    ],
+    "max_consec_tp_follower_batches": 1,
+    "num_nodes": 3,
+    "num_requests": 2,
+    "num_walks": 1,
+    "num_worker_graphs": 1
+  },
+  "machine": "micro_scheduler",
+  "notes": {
+    "diagnosis": "Same emptied chunk, other exit: with no remaining capacity it is parked back in the backlog, leaving a permanent empty entry under that (node, walk).",
+    "invariant": "sched.backlog_entries_are_never_empty",
+    "seed": 984,
+    "signature": [
+      "invariant",
+      "sched.backlog_entries_are_never_empty"
+    ],
+    "status": "open",
+    "summary": "[sched.backlog_entries_are_never_empty] backlog holds an empty batch under ('N0', 'w0'), which blocks that key from being re-created"
+  },
+  "ops": [
+    [
+      "make_ready",
+      [
+        0,
+        0
+      ]
+    ],
+    [
+      "make_ready",
+      [
+        1,
+        0
+      ]
+    ],
+    [
+      "next_batch",
+      [
+        3,
+        0,
+        1,
+        2
+      ]
+    ],
+    [
+      "set_unservable",
+      [
+        1
+      ]
+    ],
+    [
+      "next_batch",
+      [
+        0,
+        0,
+        0,
+        0
+      ]
+    ]
+  ]
+}

@@ -9,6 +9,9 @@ uv.lock
 *.sqlite
 *.prof
 *.json
+# The fuzzer corpus is the regression suite: each saved case is a known
+# failure that the tests replay. Keep it in the repository.
+!fuzzer/*/corpus/**/*.json
 profiler/
 traces/
 

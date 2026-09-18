@@ -1,0 +1,67 @@
+{
+  "config": {
+    "caps": [
+      1,
+      2,
+      2
+    ],
+    "max_consec_tp_follower_batches": 1,
+    "num_nodes": 3,
+    "num_requests": 2,
+    "num_walks": 1,
+    "num_worker_graphs": 1
+  },
+  "machine": "micro_scheduler",
+  "notes": {
+    "diagnosis": "The fresh ready-scan skips requests in pending_removes; the backlog drain does not, so a request with a deferred remove is given new work.",
+    "invariant": "sched.does_not_schedule_dropped_rid",
+    "seed": 390,
+    "signature": [
+      "invariant",
+      "sched.does_not_schedule_dropped_rid"
+    ],
+    "status": "open",
+    "summary": "[sched.does_not_schedule_dropped_rid] r1 was scheduled for ('N0', 'w0') after being failed or marked for removal"
+  },
+  "ops": [
+    [
+      "make_ready",
+      [
+        0,
+        0
+      ]
+    ],
+    [
+      "make_ready",
+      [
+        1,
+        0
+      ]
+    ],
+    [
+      "next_batch",
+      [
+        2,
+        0,
+        -1,
+        1
+      ]
+    ],
+    [
+      "pending_remove",
+      [
+        1,
+        1
+      ]
+    ],
+    [
+      "next_batch",
+      [
+        1,
+        0,
+        -1,
+        0
+      ]
+    ]
+  ]
+}

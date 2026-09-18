@@ -1,0 +1,65 @@
+{
+  "config": {
+    "caps": [
+      3,
+      2
+    ],
+    "max_consec_tp_follower_batches": 2,
+    "num_nodes": 1,
+    "num_requests": 4,
+    "num_walks": 2,
+    "num_worker_graphs": 1
+  },
+  "machine": "micro_scheduler",
+  "notes": {
+    "diagnosis": "When the backlog drain drops every rid of a chunk as failed, the now-empty batch is returned to the worker as a schedulable batch.",
+    "invariant": "sched.batch_is_not_empty",
+    "seed": 888,
+    "signature": [
+      "invariant",
+      "sched.batch_is_not_empty"
+    ],
+    "status": "open",
+    "summary": "[sched.batch_is_not_empty] get_next_batch returned an empty batch for ('N0', 'w1')"
+  },
+  "ops": [
+    [
+      "make_ready",
+      [
+        3,
+        0
+      ]
+    ],
+    [
+      "make_ready",
+      [
+        1,
+        0
+      ]
+    ],
+    [
+      "next_batch",
+      [
+        1,
+        1,
+        0,
+        0
+      ]
+    ],
+    [
+      "set_unservable",
+      [
+        3
+      ]
+    ],
+    [
+      "next_batch",
+      [
+        -1,
+        -1,
+        -1,
+        0
+      ]
+    ]
+  ]
+}

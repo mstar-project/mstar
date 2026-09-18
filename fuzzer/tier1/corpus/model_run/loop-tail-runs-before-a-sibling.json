@@ -1,0 +1,59 @@
+{
+  "config": {
+    "num_requests": 1,
+    "stages": [
+      {
+        "body": [
+          {
+            "fanin": 1,
+            "kind": "nodes",
+            "width": 2
+          },
+          {
+            "fanin": 1,
+            "kind": "nodes",
+            "width": 1
+          }
+        ],
+        "ext": 0,
+        "kind": "loop",
+        "max_iters": 1,
+        "num_accum": 0,
+        "num_outputs": 1
+      }
+    ],
+    "stops": []
+  },
+  "machine": "model_run",
+  "notes": {
+    "invariant": "emit.runs_match_reference",
+    "signature": [
+      "invariant",
+      "emit.runs_match_reference"
+    ],
+    "status": "open",
+    "summary": "[emit.runs_match_reference] r0 pass 0 ran {'s0L_s0n0': 2, 's0L_s1n0': 1}; the interpreter gives {'s0L_s0n0': 1, 's0L_s0n1': 1, 's0L_s1n0': 1}"
+  },
+  "ops": [
+    [
+      "start",
+      [
+        0
+      ]
+    ],
+    [
+      "step",
+      [
+        0,
+        0
+      ]
+    ],
+    [
+      "step",
+      [
+        0,
+        1
+      ]
+    ]
+  ]
+}

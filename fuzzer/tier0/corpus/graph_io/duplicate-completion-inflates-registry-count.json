@@ -1,0 +1,89 @@
+{
+  "config": {
+    "loop": {
+      "emit": true,
+      "end": 1,
+      "max_iters": 4,
+      "start": 0
+    },
+    "widths": [
+      2,
+      2,
+      2,
+      1,
+      1
+    ]
+  },
+  "machine": "graph_io",
+  "notes": {
+    "diagnosis": "GraphStateRegistry counts completions instead of tracking which entities completed, so completing one entity twice declares the iteration done with another entity never run.",
+    "invariant": "graph.drain_terminates",
+    "seed": 2949,
+    "signature": [
+      "invariant",
+      "graph.drain_terminates"
+    ],
+    "status": "open",
+    "summary": "[graph.drain_terminates] the graph stopped making progress before completing: 0 edge(s) pending, ready=[], completed 0/3"
+  },
+  "ops": [
+    [
+      "ingest",
+      [
+        1
+      ]
+    ],
+    [
+      "ingest",
+      [
+        0
+      ]
+    ],
+    [
+      "ingest",
+      [
+        0
+      ]
+    ],
+    [
+      "ingest",
+      [
+        0
+      ]
+    ],
+    [
+      "complete",
+      [
+        0
+      ]
+    ],
+    [
+      "complete",
+      [
+        0
+      ]
+    ],
+    [
+      "ingest_dup",
+      [
+        0
+      ]
+    ],
+    [
+      "complete",
+      [
+        0
+      ]
+    ],
+    [
+      "ingest_dup",
+      [
+        3
+      ]
+    ],
+    [
+      "drain",
+      []
+    ]
+  ]
+}

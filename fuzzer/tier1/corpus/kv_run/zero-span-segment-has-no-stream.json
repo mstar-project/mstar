@@ -1,0 +1,46 @@
+{
+  "config": {
+    "kv": {
+      "head_dim": 1,
+      "labels": {
+        "s0n0": "kv0"
+      },
+      "max_num_pages": 8,
+      "max_passes": 4,
+      "max_seq_len": 8,
+      "num_kv_heads": 1,
+      "num_layers": 1,
+      "page_size": 2,
+      "spans": {
+        "s0n0": 0
+      }
+    },
+    "num_requests": 1,
+    "stages": [
+      {
+        "fanin": 1,
+        "kind": "nodes",
+        "width": 1
+      }
+    ],
+    "stops": []
+  },
+  "machine": "kv_run",
+  "notes": {
+    "invariant": "kv.admit_gates_the_plan",
+    "signature": [
+      "invariant",
+      "kv.admit_gates_the_plan"
+    ],
+    "status": "open",
+    "summary": "A zero-span segment on a label with no stream: KVManager.admit returns OK and reserves nothing, and KVManager.plan then raises KeyError on that same step (manager.py:442, _sequence_views). Segment's docstring blesses a zero span, and admit skips it on purpose, so the two do not agree about the same step."
+  },
+  "ops": [
+    [
+      "start",
+      [
+        0
+      ]
+    ]
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "config": {
+    "kv": {
+      "capture": {
+        "bs": 2,
+        "num_tokens": 7,
+        "slots": 2
+      },
+      "forks": [],
+      "head_dim": 1,
+      "labels": {
+        "s0L_s0n0": "kv0",
+        "s0L_s0n1": "kv1",
+        "s0L_s1n0": "kv0"
+      },
+      "max_num_pages": 15,
+      "max_passes": 4,
+      "max_seq_len": 12,
+      "num_kv_heads": 2,
+      "num_layers": 2,
+      "page_size": 2,
+      "positions": false,
+      "preplan": true,
+      "spans": {
+        "s0L_s0n0": 1,
+        "s0L_s0n1": 1,
+        "s0L_s1n0": 2
+      },
+      "stage_new_labels": true
+    },
+    "num_requests": 1,
+    "stages": [
+      {
+        "body": [
+          {
+            "fanin": 1,
+            "kind": "nodes",
+            "width": 2
+          },
+          {
+            "fanin": 1,
+            "kind": "nodes",
+            "width": 1
+          }
+        ],
+        "ext": 0,
+        "kind": "loop",
+        "max_iters": 1,
+        "num_accum": 0,
+        "num_outputs": 1
+      }
+    ],
+    "stops": []
+  },
+  "machine": "kv_run",
+  "notes": {
+    "invariant": "preplan.abandon_restores_state",
+    "signature": [
+      "invariant",
+      "preplan.abandon_restores_state"
+    ],
+    "status": "open",
+    "summary": "An abandoned pre-plan keeps a label it invented, and the pages that label reserved. KVManager.admit records only fork targets in _preplan_new_labels, so a label that the step's own segments created through _ensure_label is not recorded, and clear_preplan does not remove it. clear_preplan's own comment says such a stream must go, because it holds the pages the reservation took."
+  },
+  "ops": [
+    [
+      "start",
+      [
+        0
+      ]
+    ],
+    [
+      "preplan",
+      [
+        0,
+        1
+      ]
+    ]
+  ]
+}

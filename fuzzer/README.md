@@ -14,18 +14,33 @@ schedules and faults. They do not make model inputs.
 | directory | what it drives | cost of one case | hardware |
 |---|---|---|---|
 | `tier0/` | the pure-Python state machines: the page allocator, the refcounts, the graph readiness, the scheduler and the resource lifecycle | approximately 1 ms | CPU |
+| `tier1/` `model_run` | the real graph layer, over a generated model, against an interpreter of that model | approximately 2 ms | CPU |
+| `tier1/` `kv_run` | the same, plus the real resources: the KV cache, the positions, the step runner, pre-planning, capture buckets and forks | approximately 25 ms | CPU |
+| `tier1/` `kv_race` | the real resources under several threads, with the interleaving inside the case | approximately 2 ms | CPU |
 | `tier1/` lane 1a | the real conductor and the real worker, over a generated synthetic model | approximately 1 s | CPU |
 | `tier1/` lane 1b | lane 1a on a real device: the behavior of a resource, the pre-plan threads, CUDA graphs, eviction | seconds | GPU, on `team1` |
 | `tier2/` | tier 1, plus injected faults: out-of-memory errors, aborts, evictions and changed messages | seconds | GPU, on `team1` |
 | `common/` | the shared driver: cases, generation, shrinking and the corpus | — | — |
 
-Tier 0 is complete. Tier 1 and tier 2 have design notes only. They will use
-`common/` without changes.
+Tier 0 is complete. Tier 1 has two machines. Both generate the model, run it,
+and compare every value that reaches the client against an interpreter of the
+same model. `model_run` runs it over the real graph layer. `kv_run` runs it
+over the real resources of `mstar/engine/resources/` as well, and the value of
+a step covers the cache pages that the step reads. The rest of lane 1a, lane
+1b and tier 2 have design notes only. All of them use `common/` without
+changes.
+
+Tier 0 drives the resource lifecycle against stubs, so it covers the order and
+the scope of the calls into a resource and no behavior of one. `kv_run` is
+where that behavior is covered, including the three that tier 0 can never
+reach: pre-planning a step ahead, the padded addressing of a capture bucket,
+and forks between cache streams.
 
 Nothing runs the fuzzer automatically yet. `.github/workflows/ci.yml` does not
-call `pytest fuzzer/`, so tier 0 is cheap enough for each pull request but no
-job runs it. Tier 1 lane 1b and tier 2 need a GPU, and the CI runners are
-`ubuntu-latest`. Those two lanes belong in a nightly job on the cluster.
+call `pytest fuzzer/`, so tier 0 and `tier1/model_run` are cheap enough for
+each pull request but no job runs them. Tier 1 lane 1b and tier 2 need a GPU,
+and the CI runners are `ubuntu-latest`. Those two lanes belong in a nightly job
+on the cluster.
 
 ## What a case is
 
@@ -89,9 +104,11 @@ python -m fuzzer.tier0 list
 python -m fuzzer.tier0 run --seeds 20000          # all of the machines
 python -m fuzzer.tier0 run --machine graph_io --time 120 --all
 python -m fuzzer.tier0 replay fuzzer/tier0/corpus/graph_io/<case>.json
+python -m fuzzer.tier1 run --seeds 20000 --all    # the generated models
 ```
 
-`--save LABEL` writes each small failure to the corpus.
+Each tier has the same command line. `--save LABEL` writes each small failure
+to the corpus.
 
 Three limits are important when you read a report:
 
