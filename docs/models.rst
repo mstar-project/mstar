@@ -28,6 +28,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``kokoro``
+     - ``hexgrad/Kokoro-82M``
+     - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
+       decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
+       batched across requests.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -65,6 +70,31 @@ Notes
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
+
+Kokoro notes
+------------
+
+- Install the G2P dependencies with ``pip install -e '.[kokoro]'`` and fetch the
+  spaCy tagger once with ``python -m spacy download en_core_web_sm`` (misaki does
+  this itself on first use when it has network access). ``pip install 'misaki[en]'``
+  additionally bundles espeak-ng (GPL), which Kokoro uses only as the fallback for
+  out-of-dictionary English words and as the G2P for Spanish, French, Hindi,
+  Italian and Portuguese voices; without it those words are skipped and those
+  languages are unavailable. Japanese and Mandarin voices need ``misaki[ja]`` /
+  ``misaki[zh]``.
+- Serve with ``mstar serve kokoro``. Request knobs: ``voice`` (a bundled voice such
+  as ``af_heart``, or a blend ``af_bella+af_sky`` / ``af_bella(2)+af_sky(1)``),
+  ``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
+  English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
+  ``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
+  synthesize a phoneme string directly).
+- Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
+  PL-BERT window); each chunk is emitted to the client as soon as it is
+  synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
+  sentence. The first chunk is kept short so time to first audio is one short
+  synthesis.
+- Output is 24 kHz mono PCM16. The model runs in fp32: its vocoder is
+  phase-sensitive and does not tolerate reduced precision.
 
 Qwen3-TTS notes
 ---------------
