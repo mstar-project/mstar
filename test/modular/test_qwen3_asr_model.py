@@ -188,9 +188,8 @@ def test_process_prompt_builds_features_and_prompt():
     model = _make_model()
     wave = torch.randn(16_000 * 3 + 40)
     out = model.process_prompt(None, ["audio", "text"], ["text"], {"audio_inputs": [wave]}, language="en")
-    feats = out["audio_features"][0]
-    assert feats.shape == (model.config.num_mel_bins, wave.numel() // 160)  # unpadded, variable length
-    n_tokens = model.config.audio.tokens_for_frames(feats.shape[-1])
+    assert torch.equal(out["audio"][0], wave)  # samples as they are; the encoder makes the mel
+    n_tokens = model.config.audio.tokens_for_frames(wave.numel() // 160)  # one frame per hop, unpadded
     ids = out["text_inputs"][0].tolist()
     assert ids.count(AUDIO_PAD) == n_tokens and ids[-1] == ASR_TEXT
 
@@ -204,7 +203,7 @@ def test_process_prompt_builds_features_and_prompt():
     assert prefixed["text_inputs"][0].tolist()[-3:] == model.tokenizer.encode("<asr_text> hi")[-3:]
 
     short = model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.randn(1600)]})
-    assert short["audio_features"][0].shape[-1] == 8000 // 160  # padded to 0.5 s
+    assert short["audio"][0].numel() == 8000  # padded to 0.5 s
     with pytest.raises(ValueError, match="at most"):
         model.process_prompt(None, ["audio"], ["text"],
                              {"audio_inputs": [torch.zeros(model.config.max_audio_samples + 16_000)]})
@@ -242,8 +241,10 @@ def test_encoder_submodule_declares_windows_and_packs_requests():
     cfg = _tiny_config()
     sub = _encoder_submodule(cfg)
     fwd = type("F", (), {"request_id": "a"})()
-    rows = [sub.prepare_inputs(PREFILL_WALK, fwd, {"audio_features": [torch.randn(cfg.num_mel_bins, n)]})
+    # samples in (one mel frame per hop), features made on the fly
+    rows = [sub.prepare_inputs(PREFILL_WALK, fwd, {"audio": [torch.randn(n * cfg.hop_length)]})
             for n in (230, 150, 305)]
+    assert [r.tensor_inputs["audio_features"].shape for r in rows] == [(cfg.num_mel_bins, n) for n in (230, 150, 305)]
     assert [r.input_seq_len for r in rows] == [cfg.audio.tokens_for_frames(n) for n in (230, 150, 305)]
     step = sub.declare_step(PREFILL_WALK, ["a", "b", "c"], rows)
     assert step.steps[AUT_ATTN].causal is False
@@ -338,10 +339,10 @@ def test_graph_resources_and_state_machine():
     assert model.get_max_output_tokens() == 4096 and model.get_max_output_tokens(max_output_tokens=8) == 8
 
     args = model.get_initial_forward_pass_args(
-        "default", ["audio", "text"], ["text"], {"audio_features": [object()], "text_inputs": [object()]},
+        "default", ["audio", "text"], ["text"], {"audio": [object()], "text_inputs": [object()]},
     )
     assert args.full_metadata.graph_walk == PREFILL_WALK
-    assert [(e.next_node, e.name) for e in args.inputs] == [(ENCODER_NODE, "audio_features"), (LLM_NODE, "text_inputs")]
+    assert [(e.next_node, e.name) for e in args.inputs] == [(ENCODER_NODE, "audio"), (LLM_NODE, "text_inputs")]
     nxt = model.get_partition_forward_pass_args("default", args.full_metadata, {"new_token": [object()]})
     assert nxt.full_metadata.graph_walk == DECODE_WALK and not nxt.full_metadata.is_prefill
     assert model.get_partition_forward_pass_args("default", nxt.full_metadata, {}).request_done
