@@ -21,6 +21,14 @@ checkpoint ships with (``qwen_tts`` 0.1.1, bf16 Talker, fp32 codec):
    the codes are compared frame by frame; both code sequences are decoded to
    audio by the codec on each side and the waveform max-abs-diff is reported.
 
+Verdict: the Talker and CodePredictor logits must differ from the reference
+by less than 2% of the logit scale and agree on every confident position
+(reference top-2 margin above 1.0 logit), and the codec must decode the same
+codes to the same waveform (max-abs-diff below 1e-3). Raw argmax agreement
+and the greedy divergence point are reported but not gated: bf16 with
+different attention kernels flips near-ties, and one flipped code changes
+every later frame of an autoregressive run.
+
 Run inside the GPU allocation (weights must already be in the HF cache)::
 
     python test/qwen3-tts/parity_qwen3_tts.py --repo Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \\
@@ -332,24 +340,42 @@ def mstar_greedy(driver: MStarTalkerDriver, tensors: dict, frames: int, greedy_k
 # ---------------------------------------------------------------------------
 
 
+CONFIDENT_MARGIN = 1.0  # reference top-2 logit gap above which bf16 noise cannot flip the argmax
+
+
 def compare_logits(name: str, ours: torch.Tensor, theirs: torch.Tensor) -> dict[str, Any]:
+    """Logit-level agreement between M* and the reference over the same inputs.
+
+    Both sides run bf16 with different attention kernels and matmul orders,
+    so raw argmax agreement is bounded by near-ties. The decisive numbers are
+    the mean difference relative to the logit scale and the agreement on
+    *confident* positions (reference top-2 margin above ``CONFIDENT_MARGIN``),
+    which an implementation bug would break and numerical noise cannot.
+    """
     ours = ours.float()
     theirs = theirs.float()
     diff = (ours - theirs).abs()
     agree = (ours.argmax(-1) == theirs.argmax(-1)).float()
     top2 = theirs.topk(2, dim=-1).values
     margin = (top2[..., 0] - top2[..., 1])
+    confident = margin > CONFIDENT_MARGIN
     return {
         "name": name,
         "positions": int(agree.numel()),
         "argmax_agreement": float(agree.mean()),
+        "confident_positions": int(confident.sum()),
+        "confident_agreement": float(agree[confident].mean()) if confident.any() else None,
         "max_abs_diff": float(diff.max()),
         "mean_abs_diff": float(diff.mean()),
         "ref_logit_scale": float(theirs.abs().mean()),
+        "rel_mean_diff": float(diff.mean() / theirs.abs().mean()),
         # disagreements should sit on near-ties: report the reference top-2
         # margin where the argmax differs
         "disagreement_margin_median": (
             float(margin[agree == 0].median()) if (agree == 0).any() else None
+        ),
+        "disagreement_margin_max": (
+            float(margin[agree == 0].max()) if (agree == 0).any() else None
         ),
     }
 
@@ -548,9 +574,19 @@ def main(argv: list[str] | None = None) -> None:
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    ok = talker_report["argmax_agreement"] >= 0.99 and cp_report["argmax_agreement"] >= 0.99 \
-        and codec_report["max_abs_diff"] < 1e-3
-    print("PARITY OK" if ok else "PARITY FAILED", file=sys.stderr)
+    def faithful(report: dict[str, Any]) -> bool:
+        confident = report["confident_agreement"]
+        return report["rel_mean_diff"] < 0.02 and (confident is None or confident >= 0.995)
+
+    ok = faithful(talker_report) and faithful(cp_report) and codec_report["max_abs_diff"] < 1e-3
+    verdict = "PARITY OK" if ok else "PARITY FAILED"
+    print(
+        f"{verdict}: talker rel diff {talker_report['rel_mean_diff']:.4f}, confident agreement "
+        f"{talker_report['confident_agreement']}; code predictor rel diff {cp_report['rel_mean_diff']:.4f}, "
+        f"confident agreement {cp_report['confident_agreement']}; "
+        f"codec max-abs-diff {codec_report['max_abs_diff']:.2e}",
+        file=sys.stderr,
+    )
     sys.exit(0 if ok else 1)
 
 
