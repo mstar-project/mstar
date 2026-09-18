@@ -85,3 +85,24 @@ def test_draft_mode_declares_the_draft_cache_and_rows_carry_one_id(tiny_dir, tmp
     sub.cuda_graphs = True
     cfg = sub.get_cuda_graph_configs(torch.device("cpu"))[0]
     assert cfg.single_request_inputs.input_ids.numel() == 1 and cfg.single_request_inputs.input_seq_len == 4
+
+
+def test_unpack_cuts_at_a_stop_token_unless_eos_is_ignored(tiny_dir):
+    from types import SimpleNamespace
+
+    model = get_model_class("kimi_k3")(model_path_hf=str(tiny_dir), speculative_tokens=3)
+    sub = model.get_submodule("LLM", device="cpu")
+    stop = next(iter(model.config.stop_token_ids))
+    tokens = torch.tensor([[5, 6, stop, 8], [9, 10, 11, 12]])
+    verdicts = [SimpleNamespace(accepted=3, tokens=tokens[0].tolist()), SimpleNamespace(accepted=2, tokens=tokens[1].tolist())]
+    sub._acceptance = SimpleNamespace(note_step=lambda rids: None, verdicts_for=lambda rids: verdicts)
+    static = {"spec_tokens": tokens, "spec_accepted": torch.tensor([3, 2]), "next_inputs": torch.tensor([[8], [11]])}
+    info = {"a": SimpleNamespace(resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)}),
+            "b": SimpleNamespace(resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)})}
+    out = sub.unpack_packed_outputs(static, ["a", "b"], [4, 4], [], info)
+    assert out["a"]["new_token"][0].tolist() == [5, 6, stop]  # cut after the stop token, the bonus dropped
+    assert out["b"]["new_token"][0].tolist() == [9, 10, 11]  # accepted 2 + bonus, no stop token
+    assert out["a"]["text_inputs"][0].tolist() == [8]
+    info["a"].resource_configs[SAMPLER].ignore_eos = True
+    out = sub.unpack_packed_outputs(static, ["a", "b"], [4, 4], [], info)
+    assert out["a"]["new_token"][0].tolist() == [5, 6, stop, 8]  # ignore_eos: the whole accepted run
