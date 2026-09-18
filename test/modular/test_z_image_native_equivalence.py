@@ -245,3 +245,46 @@ def test_schedule_matches_the_pipeline_grid(steps):
     ref.set_timesteps(sigmas=get_default_z_image_sigmas(steps), mu=1.15)  # the pipeline passes an ignored mu
     ours = FlowMatchSchedule.build(ZImageConfig().scheduler, steps, 4096)
     assert torch.equal(ref.sigmas, ours.sigmas) and torch.equal(ref.timesteps, ours.timesteps)
+
+
+def test_denoise_node_steps_a_batch_row_by_row(pair):
+    """The node's batched Euler step over 4-D latents must equal per-request steps (sigmas arrive
+    as [B, 1, 1] from the loop; a latent layout [B, C, H, W] broadcasts differently from [B, L, C])."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.components.diffusion.denoise_loop import LATENTS
+    from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.submodules import CAP_PAD_MASK, TEXT_EMBEDS, ZImageDenoiseSubmodule
+
+    _, native = pair
+    native = native.to(torch.float32)
+    config = ZImageConfig(transformer=ZImageTransformerConfig.from_dict(TINY))
+    node = ZImageDenoiseSubmodule(
+        native, config, loop_name="denoise_loop", attn_resource_key=None, compile_transformer=False,
+    )
+    h, w, cap_len, steps = 3, 5, padded_length(7), 4
+    height, width = h * config.spatial_alignment, w * config.spatial_alignment
+    gen = torch.Generator().manual_seed(0)
+    embeds = [torch.randn(1, cap_len, 20, generator=gen) for _ in range(2)]
+    eng = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
+
+    def info(rid, k, text_len):
+        return CurrentForwardPassInfo(
+            request_id=rid, graph_walk="image_gen", fwd_index=k, random_seed=7, max_tokens=0,
+            step_metadata={"height": height, "width": width, "num_inference_steps": steps, "cap_len": cap_len,
+                           "text_len": text_len},
+            dynamic_loop_iter_counts={"denoise_loop": k},
+        )
+
+    with torch.no_grad():
+        # batched: both requests at step 0 (different seeds are irrelevant: the noise is per request)
+        rows = [node.prepare_inputs("image_gen", info(rid, 0, n), {TEXT_EMBEDS: [e]})
+                for rid, n, e in (("a", 7, embeds[0]), ("b", 5, embeds[1]))]
+        out = node.forward_batched("image_gen", eng, **node.preprocess("image_gen", eng, rows))
+        # one request at a time, from the same prepared rows
+        for rid, row in zip(("a", "b"), rows, strict=True):
+            single = node.forward("image_gen", ModelInputsFromEngine(request_ids=[rid], per_request_info={}),
+                                  **node.preprocess("image_gen", eng, [row]))[LATENTS][0]
+            assert out[rid][LATENTS][0].shape == single.shape == (config.transformer.in_channels, h * 2, w * 2)
+            torch.testing.assert_close(out[rid][LATENTS][0], single, rtol=1e-4, atol=1e-4)
+    assert CAP_PAD_MASK in rows[0].tensor_inputs
