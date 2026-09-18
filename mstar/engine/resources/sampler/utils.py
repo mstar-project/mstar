@@ -295,6 +295,15 @@ def verify_speculative_gpu(
         top_k_rep = rep(torch.where(top_k > 0, top_k, vocab))
         probs = flashinfer.sampling.top_k_renorm_probs(probs, top_k_rep)
         probs = flashinfer.sampling.top_p_renorm_probs(probs, rep(top_p))
+        # greedy rows (the sampler's top-k 1 encoding): an exact one-hot at the argmax, the same op
+        # as `verify_greedy`, so a draft equal to the argmax is accepted with probability exactly 1
+        # (the renormalised top-1 comes out a few ulps under 1, which would reject it once in ~1e7
+        # tokens and resample from an empty residual) and the bonus is the argmax itself
+        greedy = top_k_rep == 1
+        argmax = logits.argmax(dim=-1, keepdim=True)
+        probs.mul_((~greedy).to(probs.dtype)[:, None])
+        kept = probs.gather(1, argmax)
+        probs.scatter_(1, argmax, torch.where(greedy[:, None], torch.ones_like(kept), kept))
         target = probs.view(n, k1, vocab)
         draft_probs = torch.zeros(n, k, vocab, dtype=torch.float32, device=logits.device)
         draft_probs.scatter_(2, drafts.to(torch.long).unsqueeze(-1), 1.0)
