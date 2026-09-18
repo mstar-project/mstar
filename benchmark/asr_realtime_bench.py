@@ -101,8 +101,11 @@ async def run_session(
         deltas: list[str] = []
         while True:
             msg = await ws.receive()
-            if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                break
+            if msg.type != aiohttp.WSMsgType.TEXT:  # close handshake, error, ping/pong
+                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+                continue
             event = json.loads(msg.data)
             now = time.perf_counter()
             kind = event.get("type")
