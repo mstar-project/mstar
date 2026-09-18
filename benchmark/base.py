@@ -159,6 +159,19 @@ class Orpheus(Model):
         return {RequestType.T2S}
 
 
+class Kokoro(Model):
+    """Kokoro-82M TTS via ``/v1/audio/speech`` (M* or Kokoro-FastAPI)."""
+
+    def get_hf_url(self):
+        return "hexgrad/Kokoro-82M"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2S}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"voice": self.config.get("voice", "af_heart")}
+
+
 class Qwen3Omni(Model):
     def get_hf_url(self):
         return "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -326,6 +339,7 @@ class HiggsAudio(Model):
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
+    KOKORO = "kokoro"
     QWEN3OMNI = "qwen3omni"
     QWEN3TTS = "qwen3_tts"
     PI05 = "pi05"
@@ -338,6 +352,8 @@ class ModelType(Enum):
             return Bagel(**kwargs)
         if self == ModelType.ORPHEUS:
             return Orpheus(**kwargs)
+        if self == ModelType.KOKORO:
+            return Kokoro(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
         if self == ModelType.QWEN3TTS:
