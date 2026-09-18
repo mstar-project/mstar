@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from mstar.api_server.openai import (
     serving_chat,
     serving_images,
+    serving_realtime,
     serving_speech,
+    serving_transcriptions,
     serving_videos,
 )
 from mstar.api_server.openai._util import now
@@ -26,6 +28,7 @@ from mstar.api_server.openai.protocol import (
     ModelCard,
     ModelList,
     SpeechRequest,
+    TranscriptionRequest,
     VideoGenerationRequest,
 )
 
@@ -106,6 +109,64 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
         return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+
+
+@router.post("/v1/audio/transcriptions")
+async def audio_transcriptions(request: Request):
+    # Multipart (audio file + the OpenAI fields), parsed manually like
+    # images/edits so unknown fields flow through as model_kwargs.
+    api, model_name, adapter, err = _resolve("supports_transcriptions")
+    if err is not None:
+        return err
+    try:
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            return _error(400, "audio/transcriptions requires a 'file' upload")
+        audio_bytes = await upload.read()
+        if not audio_bytes:
+            return _error(400, "audio/transcriptions received an empty 'file'")
+        fields: dict = {}
+        for key, value in form.multi_items():
+            if hasattr(value, "filename"):
+                continue
+            # OpenAI clients send list fields as repeated ``name[]`` keys.
+            if key.endswith("[]"):
+                fields.setdefault(key[:-2], []).append(value)
+                continue
+            try:
+                fields[key] = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                fields[key] = value
+        try:
+            req = TranscriptionRequest(**fields)
+        except Exception as e:  # noqa: BLE001 — pydantic validation
+            return _error(400, str(e))
+        return await serving_transcriptions.create_transcription(
+            api, model_name, adapter, req, audio_bytes,
+            getattr(upload, "filename", None), raw_request=request,
+        )
+    except Exception as e:  # noqa: BLE001
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+
+
+@router.websocket("/v1/realtime")
+async def realtime(websocket: WebSocket):
+    """OpenAI Realtime API, transcription intent (``?intent=transcription``):
+    streaming speech-to-text with partial results. See ``serving_realtime``."""
+    api, model_name, adapter, err = _resolve("supports_realtime_transcription")
+    if err is not None:
+        # 1008 = policy violation: the served model has no such surface
+        await websocket.accept()
+        await websocket.close(code=1008, reason=json.loads(bytes(err.body))["error"]["message"])
+        return
+    intent = websocket.query_params.get("intent", "transcription")
+    if intent != "transcription":
+        await websocket.accept()
+        await websocket.close(code=1008, reason=f"unsupported intent {intent!r}; use intent=transcription")
+        return
+    await serving_realtime.RealtimeTranscription(api, model_name, adapter, websocket).run()
 
 
 @router.post("/v1/images/generations")
