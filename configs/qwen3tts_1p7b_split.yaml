@@ -8,6 +8,11 @@ max_seq_len: 32768
 resources:
   talker_attn:
     flashinfer_backend: fa2
+  # Two workers share the GPU: cap the KV pool at 1024 pages x 128 tokens
+  # (16 GB; 32 concurrent requests of a few hundred tokens use ~300 pages)
+  # so the Talker's weights, graphs and pool fit next to the codec worker's.
+  talker_kv:
+    max_num_pages: 1024
 node_groups:
   - node_names: [Talker]
     ranks: [0]
