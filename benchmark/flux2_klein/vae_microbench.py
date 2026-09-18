@@ -45,7 +45,7 @@ def main() -> None:
     device = torch.device("cuda")
     snapshot = resolve_snapshot_dir(args.repo)
     config = Flux2KleinConfig.from_snapshot(snapshot)
-    vae = build_vae(config.vae, snapshot, device).eval()
+    vae = build_vae(config, snapshot, device).eval()
     h, w = (s // config.vae.spatial_compression for s in args.size)
     print(f"{args.repo}: decode of [B, {config.vae.latent_channels}, {h}, {w}] latents "
           f"-> {args.size[0]}x{args.size[1]}")
