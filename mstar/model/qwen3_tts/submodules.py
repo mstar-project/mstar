@@ -17,8 +17,11 @@
 #   2. CodecSubmodule (STATELESS engine)
 #      - Receives buffered codec frames from the Talker partition.
 #      - Pads variable final tails to fixed CUDA Graph capture shapes.
-#      - Runs the official speech-tokenizer decoder and trims overlap before
-#        emitting 24 kHz PCM.
+#      - Runs the official speech-tokenizer decoder and trims overlap (and, for
+#        voice clones, the reference frames) before emitting 24 kHz PCM.
+#   3. RefEncoderSubmodule (no resources; Base voice clone only)
+#      - Turns one reference clip into the ECAPA x-vector that replaces the
+#        speaker tag and, for in-context cloning, into its codec frames.
 #
 # Engine-facing lifecycle:
 #   prepare_inputs -> preprocess -> forward/forward_batched
@@ -48,6 +51,10 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.qwen3_tts.components.speaker_encoder import (
+    Qwen3TTSMelFrontEnd,
+    Qwen3TTSSpeakerEncoder,
+)
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
@@ -67,6 +74,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     ModelInputsFromEngine,
     NodeInputs,
+    NodeSubmodule,
 )
 
 # the CodePredictor depth loop, as a piecewise capture region
@@ -230,6 +238,14 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         return prefix_len, suffix_len
 
+    def _frame_embeds(self, codes: torch.Tensor) -> torch.Tensor:
+        """Sum of the 16 codec embeddings per frame, in the Talker width: ``[frames, D]``."""
+        embeds = self.model.model.codec_embedding(codes[:, 0])
+        tables = self.code_predictor.model.codec_embedding
+        for group in range(1, codes.shape[1]):
+            embeds = embeds + tables[group - 1](codes[:, group])
+        return embeds
+
     def _build_prefill(
         self,
         request_id: str,
@@ -237,37 +253,53 @@ class TalkerSubmodule(ARNodeSubmodule):
         prompt_layout: torch.Tensor,
         speaker_id: int,
         language_id: int,
+        speaker_embed: torch.Tensor | None = None,
+        ref_codes: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build the official mixed text/codec prefill embedding sequence.
 
-        ``text_ids`` concatenates an optional instruction turn with the
-        assistant turn; ``prompt_layout`` is ``[instruct_len, text_len,
-        stream_text]`` and says where the split is and how the text is fed.
-        The layout mirrors ``Qwen3TTSForConditionalGeneration.generate``:
+        ``text_ids`` concatenates an optional instruction turn, the assistant
+        turn and (voice clone) the reference transcript turn; ``prompt_layout``
+        is ``[instruct_len, text_len, stream_text, ref_text_len, ref_frames]``
+        and says where the splits are and how the text is fed. The layout
+        mirrors ``Qwen3TTSForConditionalGeneration.generate``:
 
         * instruction (``<|im_start|>user ... <|im_end|>``) as plain projected
           text embeddings (VoiceDesign, 1.7B CustomVoice style control);
         * the assistant role, then the codec think/language tags, the speaker
-          tag when the checkpoint has built-in speakers (``speaker_id >= 0``)
-          and the codec PAD, all summed with TTS PAD / BOS text embeddings;
-        * ``stream_text == 0`` (the reference default for CustomVoice and
-          VoiceDesign): every text token plus TTS EOS enters the prefill over
-          codec PADs, closed by TTS PAD + codec BOS. Decode then adds TTS PAD
-          to each frame.
+          (a built-in tag when ``speaker_id >= 0``, the reference x-vector
+          when ``speaker_embed`` is given, nothing for VoiceDesign) and the
+          codec PAD, all summed with TTS PAD / BOS text embeddings;
+        * ``ref_frames > 0`` (in-context clone): reference transcript + text
+          + TTS EOS over codec BOS + the reference frames' codec embeddings,
+          laid out per ``generate_icl_prompt``;
+        * otherwise ``stream_text == 0`` (the reference default for
+          CustomVoice and VoiceDesign): every text token plus TTS EOS enters
+          the prefill over codec PADs, closed by TTS PAD + codec BOS; decode
+          then adds TTS PAD to each frame;
         * ``stream_text == 1`` (the reference default for Base): only the first
           text token enters the prefill over codec BOS; the remaining tokens
           plus TTS EOS are kept in per-request state and added one per frame.
         """
         text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
-        instruct_len, text_len, stream_text = (int(v) for v in prompt_layout.tolist())
+        layout = [int(v) for v in prompt_layout.tolist()]
+        instruct_len, text_len, stream_text = layout[:3]
+        ref_text_len, ref_frames = (layout[3], layout[4]) if len(layout) >= 5 else (0, 0)
         instruct_ids = text_ids[:, :instruct_len]
-        assistant_ids = text_ids[:, instruct_len:]
+        assistant_end = text_ids.shape[1] - ref_text_len
+        assistant_ids = text_ids[:, instruct_len:assistant_end]
+        ref_text_ids = text_ids[:, assistant_end:]
         prefix_len, suffix_len = self._validate_chatml(assistant_ids)
         if assistant_ids.shape[1] != prefix_len + text_len + suffix_len:
             raise ValueError(
                 "Qwen3-TTS prompt layout disagrees with the token stream: "
                 f"expected {prefix_len + text_len + suffix_len} assistant tokens, "
                 f"got {assistant_ids.shape[1]}"
+            )
+        if ref_frames > 0 and (ref_codes is None or ref_codes.shape[0] < ref_frames):
+            raise ValueError(
+                f"Qwen3-TTS in-context clone needs {ref_frames} reference frames, got "
+                f"{0 if ref_codes is None else ref_codes.shape[0]}"
             )
         text_tokens = assistant_ids[:, prefix_len:prefix_len + text_len]
 
@@ -282,21 +314,32 @@ class TalkerSubmodule(ARNodeSubmodule):
                 codec.codec_think_eos_id,
             ]
         )
-        speaker_tag = [speaker_id] if speaker_id >= 0 else []
         codec_ids = torch.tensor(
-            [[*codec_prefix, *speaker_tag, codec.codec_pad_id, codec.codec_bos_id]],
+            [[*codec_prefix, codec.codec_pad_id, codec.codec_bos_id]],
             dtype=torch.long,
             device=self.get_device(),
         )
         codec_embeds = self.model.model.codec_embedding(codec_ids)
         dtype = codec_embeds.dtype
+        # The speaker slot sits between the language tags and the codec PAD:
+        # a built-in speaker's codec embedding, or the reference x-vector.
+        speaker_vector = None
+        if speaker_id >= 0:
+            speaker_vector = self.model.model.codec_embedding(codec_ids.new_tensor([[speaker_id]]))
+        elif speaker_embed is not None:
+            speaker_vector = speaker_embed.to(device=self.get_device(), dtype=dtype).reshape(1, 1, -1)
+        if speaker_vector is not None:
+            split = len(codec_prefix)
+            codec_embeds = torch.cat(
+                [codec_embeds[:, :split], speaker_vector, codec_embeds[:, split:]], dim=1
+            )
         bos_embed, eos_embed, pad_embed = self._special_text_embeds(dtype)
 
         def project(ids: torch.Tensor) -> torch.Tensor:
             return self._project_text(ids).to(dtype)
 
         # Tags: TTS PAD over every codec tag but the last, TTS BOS over the
-        # codec PAD; the codec BOS pairs with text below.
+        # codec PAD; the codec BOS pairs with text (or the reference) below.
         role_embed = project(assistant_ids[:, :prefix_len])
         tag_text = torch.cat([
             pad_embed.expand(-1, codec_embeds.shape[1] - 2, -1),
@@ -305,8 +348,33 @@ class TalkerSubmodule(ARNodeSubmodule):
         pieces = [role_embed, tag_text + codec_embeds[:, :-1]]
         if instruct_len:
             pieces.insert(0, project(instruct_ids))
+        empty_trailing = eos_embed[:, :0]
 
-        if stream_text:
+        if ref_frames > 0:
+            # ``<|im_start|>assistant\n{ref}<|im_end|>\n`` -> transcript tokens only.
+            ref_tokens = ref_text_ids[:, prefix_len:ref_text_ids.shape[1] - 2]
+            text_embed = torch.cat([project(torch.cat([ref_tokens, text_tokens], dim=1)), eos_embed], dim=1)
+            reference = ref_codes.to(device=self.get_device(), dtype=torch.long)[:ref_frames]
+            codec_embed = torch.cat(
+                [codec_embeds[:, -1:], self._frame_embeds(reference).to(dtype).unsqueeze(0)], dim=1
+            )
+            if not stream_text:
+                codec_pads = self.model.model.codec_embedding(
+                    codec_ids.new_full((1, text_embed.shape[1]), codec.codec_pad_id)
+                )
+                pieces += [text_embed + codec_pads, codec_embed + pad_embed]
+                trailing = empty_trailing
+            elif text_embed.shape[1] > codec_embed.shape[1]:
+                pieces.append(text_embed[:, :codec_embed.shape[1]] + codec_embed)
+                trailing = text_embed[:, codec_embed.shape[1]:]
+            else:
+                padded = torch.cat([
+                    text_embed,
+                    pad_embed.expand(-1, codec_embed.shape[1] - text_embed.shape[1], -1),
+                ], dim=1)
+                pieces.append(padded + codec_embed)
+                trailing = empty_trailing
+        elif stream_text:
             pieces.append(project(text_tokens[:, :1]) + codec_embeds[:, -1:])
             trailing = torch.cat([project(text_tokens[:, 1:]), eos_embed], dim=1)
         else:
@@ -317,15 +385,20 @@ class TalkerSubmodule(ARNodeSubmodule):
             pieces.append(text_embed + codec_pads)
             pieces.append(pad_embed + codec_embeds[:, -1:])
             # Nothing left to feed: every frame adds TTS PAD (empty stream).
-            trailing = eos_embed[:, :0]
+            trailing = empty_trailing
         prefill = torch.cat(pieces, dim=1)
 
-        self.request_state(request_id).add_all(
+        state = self.request_state(request_id)
+        state.add_all(
             trailing_text_hidden=trailing.squeeze(0),
             tts_pad_embed=pad_embed[0, 0],
             generation_step=0,
             generated_frames=0,
         )
+        if ref_frames > 0:
+            # The codec decodes the reference frames ahead of the generated
+            # ones (their audio is trimmed), exactly as the reference does.
+            state.add("reference_frames", reference)
         return prefill.squeeze(0)
 
     def prepare_inputs(
@@ -343,13 +416,15 @@ class TalkerSubmodule(ARNodeSubmodule):
         therefore prepare requests before admitting them to a micro-batch.
         """
         del kwargs
-        if graph_walk == "talker_prefill":
+        if graph_walk in ("talker_prefill", "talker_prefill_clone"):
             input_embeds = self._build_prefill(
                 fwd_info.request_id,
                 inputs["text_inputs"][0],
                 inputs["prompt_layout"][0],
                 int(inputs["speaker_id"][0].item()),
                 int(inputs["language_id"][0].item()),
+                speaker_embed=inputs["speaker_embed"][0] if "speaker_embed" in inputs else None,
+                ref_codes=inputs["ref_codes"][0] if "ref_codes" in inputs else None,
             )
             state = self.request_state(fwd_info.request_id)
         elif graph_walk == "talker_decode":
@@ -600,6 +675,20 @@ class TalkerSubmodule(ARNodeSubmodule):
         )
         return output["all_codes"], output["codec_embed_sum"]
 
+    def _codec_stream_items(self, graph_walk: str, request_id: str, frame: torch.Tensor) -> list[torch.Tensor]:
+        """Frames this step pushes into the codec stream, one item per frame.
+
+        The clone prefill leads with the reference clip's frames so the codec
+        warms up on the voice being cloned; ``CodecSubmodule`` trims their
+        audio. Decode steps (the captured path) always push exactly one frame.
+        """
+        if graph_walk != "talker_prefill_clone":
+            return [frame]
+        reference = self.request_state(request_id).get("reference_frames")
+        if reference is None:
+            return [frame]
+        return [*reference.unbind(0), frame]
+
     def forward(
         self,
         graph_walk: str,
@@ -609,11 +698,16 @@ class TalkerSubmodule(ARNodeSubmodule):
         suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> NameToTensorList:
-        del graph_walk, kwargs
+        del kwargs
         output = self._run_frame(
             engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
-        return {name: [tensor] for name, tensor in output.items()}
+        request_id = engine_inputs.request_ids[0]
+        return {
+            "talker_input_embeds": [output["talker_input_embeds"]],
+            "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][0]),
+            "new_token": [output["new_token"]],
+        }
 
     def forward_batched(
         self,
@@ -624,14 +718,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, NameToTensorList]:
-        del graph_walk, kwargs
+        del kwargs
         output = self._run_frame(
             engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         return {
             request_id: {
                 "talker_input_embeds": [output["talker_input_embeds"][i:i + 1]],
-                "codec_tokens": [output["codec_tokens"][i]],
+                "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][i]),
                 "new_token": [output["new_token"][i]],
             }
             for i, request_id in enumerate(engine_inputs.request_ids)
@@ -655,7 +749,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         if "new_token" in outputs:
             outputs["layer0_codes"] = outputs.pop("new_token")
         elif "layer0_codes" not in outputs and "codec_tokens" in outputs:
-            codec_tokens = outputs["codec_tokens"][0]
+            codec_tokens = outputs["codec_tokens"][-1]
             outputs["layer0_codes"] = [codec_tokens.reshape(-1)[0]]
         if "layer0_codes" in outputs:
             state = self.request_state(request_id)
@@ -700,7 +794,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         together freely.
         """
         return (
-            batch.graph_walk in {"talker_prefill", "talker_decode"}
+            batch.graph_walk in {"talker_prefill", "talker_prefill_clone", "talker_decode"}
             and bool(model_inputs)
             and len(model_inputs) <= self.MAX_BATCH_SIZE
         )
@@ -868,6 +962,14 @@ class CodecSubmodule(ARNodeSubmodule):
         so differently sized final tails can reuse the same CUDA Graph.
         """
         del graph_walk, kwargs
+        state = self.request_state(fwd_info.request_id)
+        if "ref_frames" in inputs and "skip_samples" not in state:
+            # Voice clone: the stream leads with the reference clip's frames,
+            # whose audio the client must not hear.
+            state.add(
+                "skip_samples",
+                int(inputs["ref_frames"][0].reshape(-1)[0].item()) * self.total_upsample,
+            )
         codes = inputs["codec_tokens"][0].to(
             device=self.get_device(), dtype=torch.long
         )
@@ -963,6 +1065,11 @@ class CodecSubmodule(ARNodeSubmodule):
         left_context = self.config.codec.left_context_frames if emitted else 0
         start = left_context * self.total_upsample
         end = frames * self.total_upsample
+        skip = int(state.get("skip_samples", 0))
+        if skip:
+            dropped = min(skip, max(end - start, 0))
+            start += dropped
+            state.add("skip_samples", skip - dropped)
         outputs["audio_chunk"][0] = outputs["audio_chunk"][0][start:end]
         state.add("codec_chunk_emitted", True)
 
@@ -1017,3 +1124,85 @@ class CodecSubmodule(ARNodeSubmodule):
             )
             and super().can_use_cuda_graphs(batch, model_inputs)
         )
+
+
+# ===========================================================================
+# 3. RefEncoderSubmodule - reference audio -> speaker conditioning (Base)
+# ===========================================================================
+
+
+class RefEncoderSubmodule(NodeSubmodule):
+    """Encode one reference clip into the Talker's voice conditioning.
+
+    Runs once per request, before the clone prefill, and owns no resources.
+    The x-vector comes from the ECAPA-TDNN encoder over a log-mel spectrogram
+    of the 24 kHz clip; for in-context cloning the codec encoder also turns
+    the clip into ``ref_frames`` 16-group frames. The mel front end and the
+    codec encoder run in float32 regardless of the engine's autocast dtype;
+    the x-vector is produced in the encoder's own (Talker) dtype.
+    """
+
+    disable_torch_compile = True
+
+    def __init__(
+        self,
+        speaker_encoder: Qwen3TTSSpeakerEncoder,
+        mel_front_end: Qwen3TTSMelFrontEnd,
+        codec_encoder: torch.nn.Module,
+        config: Qwen3TTSModelConfig,
+    ) -> None:
+        super().__init__()
+        self.speaker_encoder = speaker_encoder
+        self.mel_front_end = mel_front_end
+        self.codec_encoder = codec_encoder
+        self.config = config
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs: Any,
+    ) -> NodeInputs:
+        del graph_walk, fwd_info, kwargs
+        waveform = inputs["audio_inputs"][0].to(device=self.get_device(), dtype=torch.float32)
+        if waveform.ndim > 1:
+            waveform = waveform.mean(dim=0) if waveform.shape[0] < waveform.shape[-1] else waveform.mean(dim=-1)
+        layout = inputs["prompt_layout"][0].tolist()
+        ref_frames = int(layout[4]) if len(layout) >= 5 else 0
+        return NodeInputs(
+            tensor_inputs={"waveform": waveform.reshape(-1)},
+            kwargs={"ref_frames": ref_frames},
+        )
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        waveform: torch.Tensor,
+        ref_frames: int = 0,
+        **kwargs: Any,
+    ) -> NameToTensorList:
+        del graph_walk, engine_inputs, kwargs
+        device_type = waveform.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            mels = self.mel_front_end(waveform.unsqueeze(0))
+        encoder_dtype = next(self.speaker_encoder.parameters()).dtype
+        speaker_embed = self.speaker_encoder(mels.to(encoder_dtype))[0]
+
+        num_quantizers = self.config.codec.num_quantizers
+        if ref_frames > 0:
+            with torch.autocast(device_type=device_type, enabled=False):
+                encoded = self.codec_encoder.encode(
+                    input_values=waveform.view(1, 1, -1).float(), return_dict=True
+                )
+            codes = encoded.audio_codes[0, :num_quantizers, :ref_frames].t().contiguous().long()
+            if codes.shape[0] < ref_frames:
+                raise ValueError(
+                    f"codec encoder produced {codes.shape[0]} frames for a clip declared as {ref_frames}"
+                )
+        else:
+            # x-vector-only clone: no in-context frames. The edge still needs
+            # a tensor; the Talker ignores it because the layout says 0 frames.
+            codes = torch.zeros(1, num_quantizers, dtype=torch.long, device=waveform.device)
+        return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
