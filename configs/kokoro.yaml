@@ -5,3 +5,7 @@ node_groups:
   - node_names: [kokoro]
     ranks: [0]
     graph_walks: [synth]
+# Constructor options (forwarded to KokoroModel.__init__):
+# model_kwargs:
+#   lang_code: "b"          # G2P language for every request (default: follow the voice prefix)
+#   espeak_fallback: false  # skip espeak-ng for out-of-dictionary English words even if installed
