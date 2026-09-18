@@ -5,6 +5,7 @@ attention, KDA recurrent state, sampler) and runs the packed forward.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -63,6 +64,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         self.speculative_tokens = int(speculative_tokens)
         self.k1 = self.speculative_tokens + 1
         self._acceptance = None  # the SpecAcceptance resource, bound with the node's resources
+        self._spec_debug_rows = int(os.environ.get("MSTAR_SPEC_DEBUG_ROWS", "0"))
+        self._spec_debug_seen = 0
         # the DSpark draft (plan section 8.6): drafts at the start of a step from the row's bonus
         # token against its own context cache, which the end of the step extends from the target's
         # aux states. Without it, the stand-in draft and k + 1 ids per decode row.
@@ -206,7 +209,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             hidden = self.language_model.model(self.embed_tokens(ids.reshape(-1)), label="main")
         logits = self.lm_head(hidden)
         tokens, accepted = sampler.sample_verify(engine_inputs.request_ids, logits, ids[:, 1:])
-        acceptance.stage(accepted, tokens)
+        acceptance.stage(accepted, tokens, ids[:, 1:] if self._spec_debug_rows else None)
         kda.set_prefix_len(pool.block("spec_len", 0), accepted)
         new_bonus = tokens.gather(1, accepted.to(torch.long).unsqueeze(1))
         if self.draft is not None:
@@ -260,6 +263,17 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             return {}
         acceptance: SpecAcceptance = self._acceptance
         verdicts = acceptance.verdicts_for(request_ids)  # the step's commit registered the rows
+        if self._spec_debug_rows:
+            # MSTAR_SPEC_DEBUG_ROWS: the first rows' drafts against the target's verified tokens
+            # (verified[j] is the token at block position j + 1: the draft when accepted, the target's
+            # own choice at the first rejection); a shifted or constant pattern points at the bug
+            for i, rid in enumerate(request_ids):
+                if self._spec_debug_seen >= self._spec_debug_rows:
+                    break
+                self._spec_debug_seen += 1
+                v = verdicts[i]
+                logger.info("spec-debug %s row %d: drafts=%s verified=%s accepted=%d", rid[:8], self._spec_debug_seen,
+                            v.drafts, v.tokens, v.accepted)
         dtype, nxt = static_output["spec_tokens"].dtype, static_output["next_inputs"]
         out = {}
         for i, rid in enumerate(request_ids):
