@@ -212,6 +212,27 @@ def test_tokens_to_mel_rows_matches_single_per_row(pair):
         assert diff < 1e-3
 
 
+def test_frame_bucketed_rows_match_exact_length(pair):
+    """Padding the solve to a frame bucket (for a compiled or graph-captured
+    estimator) must not change the valid frames."""
+    from mstar.model.chatterbox.components.s3gen import FlowRow
+
+    variant, (ref, mine, ref_dict, mine_ref, n_steps) = pair
+    tokens = _tokens(mine_ref)[0]
+    gen = torch.Generator().manual_seed(21)
+    rows = []
+    for toks, final in ((tokens, True), (tokens[: NUM_TOKENS - 6], False)):
+        noise = torch.randn(1, 80, 2 * (mine_ref.num_prompt_tokens + toks.numel()), generator=gen)
+        rows.append(FlowRow(tokens=toks, ref=mine_ref, finalize=final, noise=noise))
+    exact = mine.tokens_to_mel_rows(rows, n_timesteps=n_steps)
+    bucketed = mine.tokens_to_mel_rows(rows, n_timesteps=n_steps, frame_bucket=64)
+    for a, b in zip(exact, bucketed, strict=True):
+        assert a.shape == b.shape
+        diff = (a - b).abs().max().item()
+        print(f"[{variant}] bucketed vs exact: {diff:.3e}")
+        assert diff < 1e-3
+
+
 def test_embed_reference_matches(pair):
     variant, (ref, mine, _, _, _) = pair
     sr = 24000
