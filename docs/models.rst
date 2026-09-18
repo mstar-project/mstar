@@ -105,7 +105,7 @@ Qwen3-TTS notes
   frames (320 ms of speech), later windows grow to 25 new frames behind 25
   frames of already decoded left context (the reference's own
   ``chunked_decode`` context). Each window size is a CUDA-graph bucket
-  captured for batch sizes 1 to 16; the stream buffer reports how many leading
+  captured for batch sizes 1 to 32; the stream buffer reports how many leading
   frames of a window are repeated context, and the codec trims their audio.
 - Talker prefill remains eager because it runs once with variable sequence
   lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
