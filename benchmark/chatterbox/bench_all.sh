@@ -28,6 +28,27 @@ PORT=${PORT:-8000}
 export CHATTERBOX_BENCH_VOICE=$VOICE
 mkdir -p "$RESULTS"
 
+# mstar-serve spawns a conductor and workers; killing only the front process
+# leaves them holding the GPU (and the next server on the same IPC prefix talks
+# to the stale workers). Start every server as its own process group with a
+# private socket prefix and take the whole group down.
+start_group() {  # start_group <log> <cmd...> -> sets GROUP_PID
+  local log=$1; shift
+  setsid "$@" > "$log" 2>&1 &
+  GROUP_PID=$!
+}
+
+stop_group() {
+  [ -n "${GROUP_PID:-}" ] || return 0
+  kill -TERM -- "-$GROUP_PID" 2>/dev/null || true
+  for _ in $(seq 1 20); do kill -0 "$GROUP_PID" 2>/dev/null || break; sleep 1; done
+  kill -KILL -- "-$GROUP_PID" 2>/dev/null || true
+  GROUP_PID=
+  # sweep workers this venv spawned that escaped the group
+  pkill -9 -u "$USER" -f "$WS/[.]venv/bin/python -c from multiprocessing" 2>/dev/null || true
+  sleep 3
+}
+
 wait_http() {  # wait_http <url> <seconds>
   local url=$1 deadline=$((SECONDS + $2))
   until curl -sf "$url" > /dev/null; do
@@ -70,9 +91,10 @@ case ${1:-} in
     mkdir -p "$out"
     # same preset voices as the TTS server, appended as model_kwargs to a copy of the config
     { cat "$MSTAR/$cfg"; printf 'model_kwargs:\n  voices_dir: %s\n' "$VOICES_DIR"; } > "$out/config.yaml"
-    ( cd "$MSTAR" && mstar-serve --config "$out/config.yaml" --port "$PORT" > "$out/server.log" 2>&1 ) &
-    server=$!
-    trap 'kill $server 2>/dev/null || true' EXIT
+    cd "$MSTAR"
+    start_group "$out/server.log" mstar-serve --config "$out/config.yaml" --port "$PORT" \
+        --tensor-comm-protocol SHM --socket-path-prefix "/tmp/mstar_${USER}_bench_$$/"
+    trap 'stop_group' EXIT
     wait_http "http://127.0.0.1:$PORT/health" 900
     runner "http://127.0.0.1:$PORT" "$c" "$out"
     ;;
@@ -81,10 +103,10 @@ case ${1:-} in
     run_dir=$WS/baselines/tts-server/run_$variant
     port=$(awk '/^  port:/ {print $2}' "$run_dir/config.yaml")
     mkdir -p "$out"
-    ( cd "$run_dir" && HF_HUB_OFFLINE=1 "$WS/baselines/tts-server/.venv/bin/python" \
-        "$WS/refs/Chatterbox-TTS-Server/server.py" > "$out/server.log" 2>&1 ) &
-    server=$!
-    trap 'kill $server 2>/dev/null || true' EXIT
+    cd "$run_dir"
+    HF_HUB_OFFLINE=1 start_group "$out/server.log" "$WS/baselines/tts-server/.venv/bin/python" \
+        "$WS/refs/Chatterbox-TTS-Server/server.py"
+    trap 'stop_group' EXIT
     wait_http "http://127.0.0.1:$port/docs" 900
     runner "http://127.0.0.1:$port" "$c" "$out"
     ;;
