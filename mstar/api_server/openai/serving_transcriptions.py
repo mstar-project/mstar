@@ -21,9 +21,10 @@ Long uploads
     unfinished segment up: the next window starts where the last closed
     segment ended, so no word is split by a boundary. A window whose text
     compresses better than ``compression_ratio_threshold`` is a repetition
-    loop and is decoded again at rising temperatures; once a temperature
-    above 0.5 was needed, the transcript so far stops conditioning the
-    windows after it, which keeps one bad window from infecting the rest.
+    loop and is decoded again, first without the conditioning text (the
+    usual cause), then at rising temperatures; once a temperature above 0.5
+    was needed, the transcript so far stops conditioning the windows after
+    it, which keeps one bad window from infecting the rest.
     (openai-whisper's log-probability and no-speech thresholds need
     per-token probabilities the engine does not report; they are not applied.)
 
@@ -219,10 +220,23 @@ def _window_request(req, language: str | None, carry_over: str | None, *, timest
     return req.model_copy(update=update) if update else req
 
 
-def _temperatures(req) -> tuple[float, ...]:
-    """What to decode a window at: the pinned temperature, or the fallback
-    schedule when the caller left it at 0 / unset (OpenAI's contract)."""
-    return (req.temperature,) if req.temperature else TEMPERATURE_FALLBACK
+def _attempts(req, carry_over: str | None) -> list[tuple[float, str | None]]:
+    """The ``(temperature, conditioning text)`` ladder for one window.
+
+    The first attempt is the caller's temperature with the transcript so far
+    as the prompt. A repetition loop is nearly always the prompt's doing, so
+    the first retry is the same greedy decode without it, and only then does
+    the temperature climb (openai-whisper's schedule, whose retries keep the
+    prompt but also sample five candidates and pick by log-probability, which
+    the engine does not offer). A pinned temperature is never escalated.
+    """
+    base = req.temperature or 0.0
+    ladder = [(base, carry_over)]
+    if carry_over:
+        ladder.append((base, None))
+    if not req.temperature:
+        ladder.extend((t, None) for t in TEMPERATURE_FALLBACK if t > base)
+    return ladder
 
 
 def _submit(api, adapter, req, window: Window, streaming: bool) -> str:
@@ -284,11 +298,10 @@ async def _sequential(api, adapter, req, planner: WindowPlanner, raw_request=Non
     while True:
         window = planner.window_at(offset)
         carry = _carry_over(texts[reset_since:]) if texts else None
-        base = _window_request(req, language, carry, timestamps=seeks)
-        for temperature in _temperatures(req):
-            attempt = base if temperature == (req.temperature or 0.0) else base.model_copy(
-                update={"temperature": temperature},
-            )
+        for temperature, prompt in _attempts(req, carry):
+            attempt = _window_request(req, language, prompt, timestamps=seeks)
+            if temperature != (req.temperature or 0.0):
+                attempt = attempt.model_copy(update={"temperature": temperature})
             _submit(api, adapter, attempt, window, streaming=False)
             window.raw_text = _text_of(await api.collect_results(window.request_id, raw_request))
             parsed = adapter.parse_transcript(window.raw_text, attempt)
