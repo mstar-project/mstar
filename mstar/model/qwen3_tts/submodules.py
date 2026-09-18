@@ -33,6 +33,8 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -1189,10 +1191,16 @@ class RefEncoderSubmodule(NodeSubmodule):
     was built with (``disable_autocast``): the mel front end and the codec
     encoder stay in float32, the speaker encoder runs in the Talker's dtype
     as the reference does.
+
+    The same clip recurs: a voice is reused across a session, and every
+    sentence chunk of a long clone request carries it. The conditioning is
+    memoised by clip content, so the encoders run once per distinct clip and a
+    repeat costs the prefill alone.
     """
 
     disable_torch_compile = True
     disable_autocast = True
+    CONDITIONING_CACHE_SIZE = 64
 
     def __init__(
         self,
@@ -1206,6 +1214,14 @@ class RefEncoderSubmodule(NodeSubmodule):
         self.mel_front_end = mel_front_end
         self.codec_encoder = codec_encoder
         self.config = config
+        # (clip digest, ref_frames) -> (speaker_embed, ref_codes), oldest first.
+        self._conditioning: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+
+    @staticmethod
+    def clip_digest(clip: torch.Tensor) -> str:
+        """Content key of a reference clip (its float32 samples)."""
+        samples = clip.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        return hashlib.blake2b(samples.numpy().tobytes(), digest_size=16).hexdigest()
 
     def prepare_inputs(
         self,
@@ -1215,14 +1231,15 @@ class RefEncoderSubmodule(NodeSubmodule):
         **kwargs: Any,
     ) -> NodeInputs:
         del graph_walk, fwd_info, kwargs
-        waveform = inputs["audio_inputs"][0].to(device=self.get_device(), dtype=torch.float32)
+        clip = inputs["audio_inputs"][0]
+        waveform = clip.to(device=self.get_device(), dtype=torch.float32)
         if waveform.ndim > 1:
             waveform = waveform.mean(dim=0) if waveform.shape[0] < waveform.shape[-1] else waveform.mean(dim=-1)
         layout = inputs["prompt_layout"][0].tolist()
         ref_frames = int(layout[4]) if len(layout) >= 5 else 0
         return NodeInputs(
             tensor_inputs={"waveform": waveform.reshape(-1)},
-            kwargs={"ref_frames": ref_frames},
+            kwargs={"ref_frames": ref_frames, "clip_key": (self.clip_digest(clip), ref_frames)},
         )
 
     def forward(
@@ -1231,9 +1248,14 @@ class RefEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         waveform: torch.Tensor,
         ref_frames: int = 0,
+        clip_key: tuple[str, int] | None = None,
         **kwargs: Any,
     ) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
+        if clip_key is not None and clip_key in self._conditioning:
+            self._conditioning.move_to_end(clip_key)
+            speaker_embed, codes = self._conditioning[clip_key]
+            return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
         device_type = waveform.device.type
         with torch.autocast(device_type=device_type, enabled=False):
             mels = self.mel_front_end(waveform.unsqueeze(0))
@@ -1255,4 +1277,8 @@ class RefEncoderSubmodule(NodeSubmodule):
             # x-vector-only clone: no in-context frames. The edge still needs
             # a tensor; the Talker ignores it because the layout says 0 frames.
             codes = torch.zeros(1, num_quantizers, dtype=torch.long, device=waveform.device)
+        if clip_key is not None:
+            self._conditioning[clip_key] = (speaker_embed, codes)
+            while len(self._conditioning) > self.CONDITIONING_CACHE_SIZE:
+                self._conditioning.popitem(last=False)
         return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
