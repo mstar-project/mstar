@@ -319,6 +319,17 @@ def test_first_chunk_stays_short_for_time_to_first_audio():
     assert [c.phonemes for c in g2p.chunk_tokens(tokens, target=100, hard_max=510)] == ["ab. cd ef. gh. ij."]
 
 
+def test_missing_spacy_model_gives_an_install_hint(monkeypatch):
+    import types
+
+    fake_en = types.SimpleNamespace(G2P=lambda **kwargs: (_ for _ in ()).throw(OSError("[E050] Can't find model")))
+    monkeypatch.setitem(sys.modules, "misaki", types.SimpleNamespace(en=fake_en))
+    monkeypatch.setitem(sys.modules, "misaki.en", fake_en)
+    frontend = G2PFrontend(chunk_target=40, max_phonemes=510, espeak_fallback=False)
+    with pytest.raises(ImportError, match="spacy download en_core_web_sm"):
+        frontend.backend("a")
+
+
 def test_misaki_english_g2p_if_available():
     pytest.importorskip("misaki")
     pytest.importorskip("spacy")
