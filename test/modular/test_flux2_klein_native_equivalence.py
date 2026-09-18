@@ -307,3 +307,37 @@ def test_text_encoder_tapped_hidden_states_bit_exact_with_padding():
     assert torch.equal(expected, ours)
     # the reference feeds the pad positions' states to the DiT, so they must match too
     assert expected[0, 7:].abs().max() > 0
+
+
+def test_vae_decoder_node_stacks_per_request_latents(tiny_vae_pair):
+    """The dit emits ``[L, 128]`` per request; the decoder node stacks rows at one grid."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.components.diffusion.denoise_loop import LATENTS
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+    from mstar.model.flux2_klein.submodules import IMAGE_OUTPUT, KleinVaeDecoderSubmodule
+
+    _, native = tiny_vae_pair
+    config = Flux2KleinConfig(vae=Flux2VaeConfig.from_dict(TINY_VAE))
+    node = KleinVaeDecoderSubmodule(native.to(torch.float32), config)
+    height, width = 4 * config.spatial_alignment, 6 * config.spatial_alignment
+    grid = config.latent_grid(height, width)
+    assert grid == (4, 6)
+    gen = torch.Generator().manual_seed(5)
+    rows = []
+    for i in range(2):
+        tokens = torch.randn(grid[0] * grid[1], config.vae.patched_latent_channels, generator=gen)
+        info = CurrentForwardPassInfo(
+            request_id=f"r{i}", graph_walk="image_gen", fwd_index=0, random_seed=0, max_tokens=1,
+            step_metadata={"height": height, "width": width},
+        )
+        rows.append(node.prepare_inputs("image_gen", info, {LATENTS: [tokens]}))
+    with torch.no_grad():
+        batched = node.forward("image_gen", None, **node.preprocess("image_gen", None, rows))[IMAGE_OUTPUT][0]
+        singles = [
+            node.forward("image_gen", None, **node.preprocess("image_gen", None, [row]))[IMAGE_OUTPUT][0]
+            for row in rows
+        ]
+    assert batched.dtype == torch.uint8 and batched.shape == (2, 3, height, width)
+    for i, single in enumerate(singles):
+        assert single.shape == (1, 3, height, width)
+        assert torch.equal(single[0], batched[i])
