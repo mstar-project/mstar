@@ -506,6 +506,54 @@ class Wan22Adapter(OpenAIAdapter):
         )
 
 
+class DiffusionImageAdapter(OpenAIAdapter):
+    """Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, ...):
+    text-to-image and reference-image editing.
+
+    ``size`` ("WxH") maps to the models' ``width`` / ``height`` kwargs; ``seed`` is
+    honoured by the conductor; every other knob (``num_inference_steps``,
+    ``guidance_scale`` on models that take it, ``negative_prompt``) passes through
+    ``extra_body``. ``n`` is served as ``n`` concurrent requests by the images handler,
+    which the equal-shape batching then runs together.
+    """
+
+    supports_images = True
+
+    @staticmethod
+    def _size_kwargs(size: str | None, mk: dict) -> None:
+        if not size:
+            return
+        try:
+            width, height = (int(v) for v in size.lower().split("x"))
+        except ValueError:
+            raise ValueError(f"size must be 'WxH' (e.g. '1024x1024'); got {size!r}") from None
+        mk.setdefault("width", width)
+        mk.setdefault("height", height)
+
+    def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        self._size_kwargs(getattr(req, "size", None), mk)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["image"],
+            model_kwargs=mk,
+        )
+
+    def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
+        mk = dict(extra_kwargs or {})
+        self._size_kwargs(mk.pop("size", None), mk)
+        return SubmitArgs(
+            text=prompt,
+            file_paths={"image": [image_path]},
+            input_modalities=["image", "text"],
+            output_modalities=["image"],
+            model_kwargs=mk,
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
