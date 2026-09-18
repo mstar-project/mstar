@@ -791,6 +791,7 @@ class Worker:
                     _final_stream_chunk=chunk.is_final,
                     _stream_chunk_offset=chunk.start_offset,
                     _stream_chunk_context=chunk.context_items,
+                    _stream_chunk_items=chunk.num_items,
                 )
             else:
                 # Normal chunk — store tensor and create edge with tensor_info.
@@ -811,6 +812,7 @@ class Worker:
                     _final_stream_chunk=chunk.is_final,
                     _stream_chunk_offset=chunk.start_offset,
                     _stream_chunk_context=chunk.context_items,
+                    _stream_chunk_items=chunk.num_items,
                 )
         return synthetic_edge
 
@@ -976,6 +978,7 @@ class Worker:
                     stream_chunks[input_name] = {
                         "start_offset": edge._stream_chunk_offset,
                         "context_items": edge._stream_chunk_context,
+                        "num_items": edge._stream_chunk_items,
                         "is_final": edge._final_stream_chunk,
                     }
             per_request_inputs[request_id] = tensors
