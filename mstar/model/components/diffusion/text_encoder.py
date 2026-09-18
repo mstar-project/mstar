@@ -109,10 +109,16 @@ class Qwen3EncoderAttention(nn.Module):
         q = q * cos + rotate_half(q) * sin
         k = k * cos + rotate_half(k) * sin
         groups = self.num_heads // self.num_kv_heads
-        if groups > 1:
-            k = k.repeat_interleave(groups, dim=1)
-            v = v.repeat_interleave(groups, dim=1)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask, is_causal=self.attn_mask is None)
+        if self.attn_mask is None:
+            # HF's mask-free path (no padding in the batch): ``is_causal`` and SDPA's native GQA
+            # (``use_gqa_in_sdpa``), which select a different kernel than the masked path below;
+            # both must be mirrored for the last bit to agree.
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=groups > 1)
+        else:
+            if groups > 1:
+                k = k.repeat_interleave(groups, dim=1)
+                v = v.repeat_interleave(groups, dim=1)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask)
         return self.o_proj(out.transpose(1, 2).reshape(batch, seq, self.num_heads * self.head_dim))
 
 
@@ -156,10 +162,17 @@ class Qwen3HiddenStateEncoder(nn.Module):
         return self.embed_tokens.weight.dtype
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """``input_ids, attention_mask [B, S]`` (right padded) -> ``[B, S, len(taps) * hidden]``."""
+        """``input_ids, attention_mask [B, S]`` (right padded) -> ``[B, S, len(taps) * hidden]``.
+
+        Follows HF's two attention paths exactly: a batch without padding attends mask-free
+        (``is_causal`` + native GQA), a padded one through a boolean causal-and-key-padding
+        mask; the two pick different SDPA kernels, so the choice is part of parity.
+        """
         seq = input_ids.shape[1]
         rotary = qwen3_rotary_tables(torch.arange(seq, device=input_ids.device), self.head_dim, self.rope_theta)
-        mask = padded_causal_mask(attention_mask)
+        # No padding anywhere in the batch: HF's create_causal_mask returns None and attention
+        # runs its is_causal path; mirror that rather than passing an all-True mask.
+        mask = None if bool(attention_mask.all()) else padded_causal_mask(attention_mask)
         hidden = self.embed_tokens(input_ids)
         taps = []
         for layer_idx, layer in enumerate(self.layers, start=1):
