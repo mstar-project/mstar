@@ -9,7 +9,7 @@ import requests
 from _env import get_server_url
 
 URL = get_server_url()
-IMAGE_PATH = "test/bagel/bagel_gen.png"
+IMAGE_PATH = "test/manual/bagel/bagel_gen.png"
 
 
 def main():
