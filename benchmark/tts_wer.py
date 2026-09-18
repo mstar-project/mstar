@@ -59,22 +59,28 @@ def load_for_asr(path: Path) -> dict:
 
 
 def transcribe(audio_paths: list[Path], model_id: str, device: str, batch_size: int) -> list[str]:
-    import torch
-    from transformers import pipeline
+    """Whisper transcripts, one per file, in the order given.
 
-    asr = pipeline(
-        "automatic-speech-recognition",
-        model=model_id,
-        torch_dtype=torch.float16 if device.startswith("cuda") else torch.float32,
-        device=device,
-    )
-    outputs = asr(
-        [load_for_asr(p) for p in audio_paths],
-        batch_size=batch_size,
-        generate_kwargs={"language": "en", "task": "transcribe"},
-        return_timestamps=False,
-    )
-    return [o["text"] for o in outputs]
+    Drives the model directly rather than through ``pipeline(...)``: the
+    pipeline decodes files with ffmpeg/torchcodec, which benchmark hosts may
+    not have, while the processor only needs 16 kHz arrays.
+    """
+    import torch
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+    dtype = torch.float16 if device.startswith("cuda") else torch.float32
+    processor = WhisperProcessor.from_pretrained(model_id)
+    model = WhisperForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
+    texts: list[str] = []
+    for start in range(0, len(audio_paths), batch_size):
+        clips = [load_for_asr(p)["raw"] for p in audio_paths[start:start + batch_size]]
+        features = processor(
+            clips, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt",
+        ).input_features.to(device=device, dtype=dtype)
+        with torch.inference_mode():
+            generated = model.generate(features, language="en", task="transcribe", max_new_tokens=440)
+        texts.extend(processor.batch_decode(generated, skip_special_tokens=True))
+    return [t.strip() for t in texts]
 
 
 def main(argv: list[str] | None = None) -> None:
