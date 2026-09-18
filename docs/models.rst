@@ -193,6 +193,15 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
+Concurrent chat requests share decode steps (continuous batching over the
+captured decode graphs, padded to the next batch bucket); a request's tokens
+are the same whether it runs alone or in a batch. Generation requests batch
+into one denoise pass too, which is the same maths but not the same bf16
+arithmetic — under classifier-free guidance the branch rounding is amplified,
+so an image or clip produced alongside other requests differs from its solo
+result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
+request at a time when outputs must be bitwise repeatable.
+
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
 ``output_modalities=action`` with ``model_kwargs``
