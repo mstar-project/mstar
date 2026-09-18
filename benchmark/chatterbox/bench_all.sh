@@ -126,7 +126,9 @@ case ${1:-} in
     # run from the results dir: the port symlinks its T3 weights into ./t3-model, next to
     # the vLLM model config files it ships in its repo
     cp -rn "$WS/refs/chatterbox-vllm/t3-model/." "$out/t3-model/" 2>/dev/null || true
-    ( cd "$out" && HF_HUB_OFFLINE=1 "$WS/baselines/chatterbox-vllm/.venv/bin/python" \
+    # the port registers its custom tokenizer at import time (no vLLM plugin entry point), which a
+    # spawned engine-core process never sees: run the engine core in-process
+    ( cd "$out" && HF_HUB_OFFLINE=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 "$WS/baselines/chatterbox-vllm/.venv/bin/python" \
         "$MSTAR/benchmark/chatterbox/bench_chatterbox_vllm.py" --sentences "$SENTENCES" --num "$NUM" \
         --warmup "$WARMUP" --batch "$b" --out "$out" ) 2>&1 | tee "$out.log"
     wer "$out" "$out/wer.json"
