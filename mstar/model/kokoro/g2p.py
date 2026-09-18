@@ -208,6 +208,13 @@ class G2PFrontend:
         except ImportError as exc:
             extra = {"j": "misaki[ja]", "z": "misaki[zh]"}.get(lang, "misaki[en]")
             raise ImportError(f"Kokoro G2P for language {lang!r} needs `pip install '{extra}'`: {exc}") from exc
+        except OSError as exc:
+            # spaCy raises OSError when its tagger model is not installed; misaki
+            # only downloads it when it has network access.
+            raise ImportError(
+                "Kokoro English G2P needs the spaCy tagger: `python -m spacy download en_core_web_sm` "
+                f"({exc})"
+            ) from exc
         self._backends[lang] = backend
         return backend
 
