@@ -137,8 +137,12 @@ def test_word_timestamps_match_hf_token_timestamps(models):
             )
         out = dict(out) if not isinstance(out, dict) else out  # a ModelOutput or a plain dict, by transformers version
         tokens = out["sequences"][0].tolist()
-        text = [t for t in tokens[4:] if t < model.config.eos_token_id]  # after <|sot|><|en|><|transcribe|><|nots|>
-        hf_times = out["token_timestamps"][0].tolist()  # one per output position, first text token at index 4
+        hf_times = out["token_timestamps"][0].tolist()  # one per sequence position
+        if tokens[0] == model.config.decoder_start_token_id:  # older versions keep the forced prompt
+            tokens, hf_times = tokens[4:], hf_times[4:]
+        keep = [i for i, t in enumerate(tokens) if t < model.config.eos_token_id]
+        text = [tokens[i] for i in keep]
+        hf_times = [hf_times[i] for i in keep]
         # ours: the same teacher-forced sequence through the served decoder weights
         encoder_states = enc_sub.encoder(
             enc_sub.log_mel(enc_sub.log_mel.pad_or_trim(wave.cuda())).to(torch.bfloat16).unsqueeze(0)
@@ -148,7 +152,8 @@ def test_word_timestamps_match_hf_token_timestamps(models):
         weights = dec_sub.decoder.cross_attention_weights(seq, encoder_states, heads)
         matrix = alignment.alignment_matrix(weights[:, 3:-1], wave.numel() // 160)
         starts = alignment.token_start_frames(matrix) / alignment.FRAMES_PER_SECOND
-        for i in range(len(text)):
+        # HF reports each token's *end*; a token starts where the previous one ends
+        for i in range(1, len(text)):
             total += 1
-            within += abs(starts[i] - hf_times[4 + i]) <= 0.1
+            within += abs(starts[i] - hf_times[i - 1]) <= 0.1
     assert within / total > 0.9, (within, total)
