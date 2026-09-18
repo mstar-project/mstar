@@ -128,6 +128,19 @@ class KokoroModelConfig:
     # Upper bound on chunks per request (the loop's ``max_iters``).
     max_chunks: int = 512
 
+    # --- CUDA-graph buckets ------------------------------------------------
+    # The text half is captured per padded phoneme count, the decoder half per
+    # padded frame count (~1.33x spacing keeps padding under a third). A batch
+    # is grouped by frame bucket so short and long sentences do not pad each
+    # other; ``max_batch_frames`` caps ``batch * frames`` per captured graph to
+    # bound the decoder's activations.
+    text_buckets: list[int] = field(default_factory=lambda: [32, 64, 96, 128, 192, 256, 384, 512])
+    frame_buckets: list[int] = field(
+        default_factory=lambda: [48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536]
+    )
+    capture_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32])
+    max_batch_frames: int = 16384
+
     # ---------------------------------------------------------------------
     @property
     def context_length(self) -> int:
