@@ -66,10 +66,12 @@ def text_ids(num_tokens: int, num_axes: int = 4) -> torch.Tensor:
 
 
 def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
-    """VAE output in ``[-1, 1]`` -> uint8 ``[B, 3, H, W]`` with the reference
-    image processor's rounding (``(x/2+0.5).clamp(0,1)``, then
-    ``round(x*255)``)."""
-    image = (image.to(torch.float32) / 2 + 0.5).clamp(0, 1)
+    """VAE output in ``[-1, 1]`` -> uint8 ``[B, 3, H, W]`` with the reference image
+    processor's rounding: ``(x * 0.5 + 0.5).clamp(0, 1)`` in the VAE's own dtype
+    (``denormalize``), then ``float()`` and ``round(x * 255)`` (``pt_to_numpy`` +
+    ``numpy_to_pil``). The order matters in bf16, whose spacing in ``[0.5, 1)`` is
+    ``1/256``: denormalizing after an fp32 upcast moves one pixel in five by a level."""
+    image = (image * 0.5 + 0.5).clamp(0, 1).to(torch.float32)
     return (image * 255).round().to(torch.uint8)
 
 
