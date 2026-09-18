@@ -16,7 +16,7 @@
 #        piecewise graph covering that loop on eager paths like prefill.
 #   2. CodecSubmodule (STATELESS engine)
 #      - Receives buffered codec frames from the Talker partition.
-#      - Pads variable final tails to fixed CUDA Graph capture shapes.
+#      - Pads each window of the chunk ramp to its CUDA Graph capture bucket.
 #      - Runs the official speech-tokenizer decoder and trims overlap (and, for
 #        voice clones, the reference frames) before emitting 24 kHz PCM.
 #   3. RefEncoderSubmodule (no resources; Base voice clone only)
@@ -28,7 +28,7 @@
 #                  -> postprocess -> check_stop (Talker only)
 #
 # Streaming topology:
-#   Talker --[codec_tokens, LeftContextChunkPolicy(300, 25)]--> Codec
+#   Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((4, 8, 16), 25, 25)]--> Codec
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -917,8 +917,15 @@ class CodecSubmodule(ARNodeSubmodule):
 
     The node runs on a stateless engine, but ``ARNodeInputs`` is reused as the
     typed container for fixed-length codec tensors. Per-request state stores
-    only how many non-padding frames arrived and whether a prior chunk was
-    emitted; the neural decoder itself has no cross-call state.
+    only the geometry of the latest window (how many frames are real, how
+    many of them are repeated context) and, for voice clones, how much
+    reference audio is still to be dropped; the neural decoder itself has no
+    cross-call state.
+
+    Windows follow the model's ``ScheduledLeftContextChunkPolicy``: a ramp of
+    small chunks, then ``chunk_frames`` new frames behind ``left_context_frames``
+    of context. Each distinct window size is a CUDA-graph bucket; a shorter
+    terminal flush is zero-padded up to the next bucket and trimmed after.
     """
 
     # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
@@ -926,27 +933,39 @@ class CodecSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    # The official 114M-parameter decoder materializes large fixed-shape
-    # activations while CUDA graphs are captured.  Capturing bs=16 exhausts an
-    # H100 once Talker weights and the CodePredictor graphs are resident, so
-    # keep the safe ceiling at 8 until the decoder is ported to M*'s
-    # lighter-weight codec components.
-    MAX_BATCH_SIZE = 8
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    # Windows are at most chunk + left_context frames (50 by default, 4 s of
+    # audio), so the decoder's activations stay small enough to capture
+    # batches of 16 next to the Talker; ``can_batch`` keeps the ceiling.
+    MAX_BATCH_SIZE = 16
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
 
     def __init__(self, decoder: torch.nn.Module, config: Qwen3TTSModelConfig):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        self.full_seq_len = (
-            config.codec.chunk_frames + config.codec.left_context_frames
-        )
+        self.windows = config.codec.codec_windows()
+        self.max_window = self.windows[-1]
         self.total_upsample = 1
         for factor in (
             *config.codec.upsample_rates,
             *config.codec.upsampling_ratios,
         ):
             self.total_upsample *= factor
+
+    def _bucket(self, frames: int) -> int:
+        """Smallest captured window that holds ``frames`` (the terminal flush is shorter)."""
+        for window in self.windows:
+            if frames <= window:
+                return window
+        raise ValueError(
+            f"Codec chunk has {frames} frames, maximum is {self.max_window}"
+        )
+
+    @staticmethod
+    def _stream_chunk_meta(fwd_info: CurrentForwardPassInfo) -> dict[str, Any]:
+        """Geometry of this window from the stream buffer (offset, context, final)."""
+        step_metadata = getattr(fwd_info, "step_metadata", None) or {}
+        return step_metadata.get("stream_chunks", {}).get("codec_tokens", {})
 
     def prepare_inputs(
         self,
@@ -955,11 +974,12 @@ class CodecSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Remove EOS frames and pad one stream chunk to its capture shape.
+        """Remove EOS frames and pad one stream window to its capture bucket.
 
         Input arrives as ``[frames, code_groups]``. The official decoder wants
-        ``[quantizers, frames]``; every request is padded to ``chunk + context``
-        so differently sized final tails can reuse the same CUDA Graph.
+        ``[quantizers, frames]``; every request is padded to the smallest
+        captured window that fits so the ramp's windows and the terminal tail
+        all replay CUDA graphs.
         """
         del graph_walk, kwargs
         state = self.request_state(fwd_info.request_id)
@@ -980,24 +1000,21 @@ class CodecSubmodule(ARNodeSubmodule):
                 f"Expected codec tokens with shape (frames, groups), got {codes.shape}"
             )
         # EOS belongs to Talker loop control and is not a valid codec codebook
-        # index for waveform reconstruction.
+        # index for waveform reconstruction. It is only ever the last frame of
+        # a stream, so the leading context count is unaffected.
         codes = codes[
             codes[:, 0] != self.config.talker.codec_eos_token_id,
             :self.config.codec.num_quantizers,
         ]
-        original_frames = codes.shape[0]
-        if original_frames > self.full_seq_len:
-            raise ValueError(
-                f"Codec chunk has {original_frames} frames, maximum is "
-                f"{self.full_seq_len}"
-            )
-        if original_frames < self.full_seq_len:
-            codes = torch.nn.functional.pad(
-                codes,
-                (0, 0, 0, self.full_seq_len - original_frames),
-            )
-        self.request_state(fwd_info.request_id).add(
-            "latest_codec_frames", original_frames
+        frames = codes.shape[0]
+        context = int(self._stream_chunk_meta(fwd_info).get("context_items", 0))
+        bucket = self._bucket(max(frames, 1))
+        if frames < bucket:
+            codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
+        state.add_all(
+            latest_codec_frames=frames,
+            latest_context_frames=min(context, frames),
+            codec_bucket=bucket,
         )
         return ARNodeInputs(
             tensor_inputs={"codec_tokens": codes.t().contiguous()},
@@ -1009,7 +1026,7 @@ class CodecSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        """Stack equal fixed-shape codec chunks into one continuous batch."""
+        """Stack equal fixed-shape codec windows into one continuous batch."""
         del graph_walk, engine_inputs
         return {
             "codec_tokens": torch.stack([
@@ -1053,17 +1070,14 @@ class CodecSubmodule(ARNodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
         **kwargs: Any,
     ) -> None:
-        """Remove padded tail and duplicated left-context PCM before emission."""
+        """Drop padding, repeated-context audio and (clone) reference audio before emission."""
         del request_info, kwargs
         if "audio_chunk" not in outputs:
             return
         state = self.request_state(request_id)
         frames = int(state.get("latest_codec_frames", 0))
-        emitted = bool(state.get("codec_chunk_emitted", False))
-        # The first chunk has no overlap. Later stream chunks include old codec
-        # frames at the front, whose decoded samples must not be emitted twice.
-        left_context = self.config.codec.left_context_frames if emitted else 0
-        start = left_context * self.total_upsample
+        context = int(state.get("latest_context_frames", 0))
+        start = context * self.total_upsample
         end = frames * self.total_upsample
         skip = int(state.get("skip_samples", 0))
         if skip:
@@ -1071,7 +1085,6 @@ class CodecSubmodule(ARNodeSubmodule):
             start += dropped
             state.add("skip_samples", skip - dropped)
         outputs["audio_chunk"][0] = outputs["audio_chunk"][0][start:end]
-        state.add("codec_chunk_emitted", True)
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         """Batch codec requests only when their decoder input shapes match."""
@@ -1084,42 +1097,57 @@ class CodecSubmodule(ARNodeSubmodule):
         del graph_walk
         return self.MAX_BATCH_SIZE
 
+    def cg_key_info(
+        self,
+        graph_walk: str,
+        per_request_info: Mapping[str, CurrentForwardPassInfo],
+    ) -> Any:
+        """The window bucket this batch was padded to (``can_batch`` keeps it uniform)."""
+        del graph_walk
+        buckets = {
+            self.request_state(request_id).get("codec_bucket")
+            for request_id in per_request_info
+        }
+        return buckets.pop() if len(buckets) == 1 else None
+
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
-        """Capture fixed-length Codec batches for all scheduler buckets."""
+        """Capture every window of the chunk schedule for all batch buckets."""
         del tp_world_size
-        return [BatchedCudaGraphConfig(
-            capture_graph_walk="codec_chunk",
-            single_request_inputs=ARNodeInputs(
-                # 1, not full_seq_len: batched buckets match on bs, and this
-                # keeps the intern seq_len from aliasing the fixed trailing dims.
-                input_seq_len=1,
-                tensor_inputs={
-                    "codec_tokens": torch.zeros(
-                        self.config.codec.num_quantizers,
-                        self.full_seq_len,
-                        dtype=torch.long,
-                        device=device,
-                    )
-                },
-            ),
-            capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
-            compile=False,
-        )]
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="codec_chunk",
+                replay_graph_walks=["codec_chunk", "codec_chunk_clone"],
+                single_request_inputs=ARNodeInputs(
+                    # 1, not the window: batched buckets match on bs, and this
+                    # keeps the intern seq_len from aliasing the trailing dims.
+                    input_seq_len=1,
+                    tensor_inputs={
+                        "codec_tokens": torch.zeros(
+                            self.config.codec.num_quantizers,
+                            window,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    },
+                ),
+                additional_key_info=window,
+                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                compile=False,
+            )
+            for window in self.windows
+        ]
 
     def can_use_cuda_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         return (
-            batch.graph_walk == "codec_chunk"
+            batch.graph_walk in ("codec_chunk", "codec_chunk_clone")
             and self.can_batch(batch, model_inputs)
             and all(
                 item.tensor_inputs["codec_tokens"].shape
-                == (
-                    self.config.codec.num_quantizers,
-                    self.full_seq_len,
-                )
+                in {(self.config.codec.num_quantizers, window) for window in self.windows}
                 for item in model_inputs
             )
             and super().can_use_cuda_graphs(batch, model_inputs)
