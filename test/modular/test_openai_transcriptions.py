@@ -384,7 +384,119 @@ def test_streaming_long_form_emits_every_window_in_order(client_and_stub):
         lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
     events = [json.loads(ln[len("data: "):]) for ln in lines[:-1]]
     deltas = [e["delta"] for e in events if e["type"] == "transcript.text.delta"]
-    assert deltas == [" one", " ", " two"]
+    # sequential windows stream once accepted, as their clean text
+    assert deltas == ["one", " ", "two"]
     assert events[-1]["type"] == "transcript.text.done" and events[-1]["text"] == "one two"
     assert stub.submits[1]["model_kwargs"]["initial_prompt"] == "one"
     assert stub.submits[1]["model_kwargs"]["language"] == "en"
+
+
+def test_streaming_parallel_windows_stream_token_by_token(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [_text("<|en|>", " one", " two"), _text(" three")]
+    with client.stream(
+        "POST", "/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true", "long_form": "parallel"},
+        files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
+    ) as r:
+        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+    events = [json.loads(ln[len("data: "):]) for ln in lines[:-1]]
+    deltas = [e["delta"] for e in events if e["type"] == "transcript.text.delta"]
+    assert deltas == [" one", " two", " ", " three"]
+    assert events[-1]["text"] == "one two three"
+
+
+def _wav_seconds(path: str) -> float:
+    import wave
+
+    with wave.open(path) as wf:
+        return wf.getnframes() / wf.getframerate()
+
+
+def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [
+        # stopped inside a segment: "Sec" is provisional and 20 s is where to resume
+        _text("<|en|>", "<|0.00|>", " First.", "<|20.00|>", "<|20.00|>", " Sec"),
+        _text("<|0.00|>", " Second.", "<|29.00|>"),
+        _text("<|0.00|>", " Third.", "<|15.00|>"),
+    ]
+    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+              filename="long.wav", content=_wav_bytes(65))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["text"] == "First. Second. Third."
+    assert [(s["start"], s["end"]) for s in body["segments"]] == [(0.0, 20.0), (20.0, 49.0), (50.0, 65.0)]
+    assert len(stub.submits) == 3
+    # the unfinished segment neither reaches the transcript nor conditions the next window
+    assert stub.submits[1]["model_kwargs"]["initial_prompt"] == "First."
+    assert stub.submits[2]["model_kwargs"]["initial_prompt"] == "First. Second."
+    # window 2 starts at 20 s and is a full window; window 3 starts where it ended (50 s)
+    assert [round(_wav_seconds(s["file_paths"]["audio"][0]), 2) for s in stub.submits] == [30.0, 30.0, 15.0]
+
+
+def test_sequential_json_decodes_windows_with_timestamps(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " one", "<|29.50|>"), _text("<|0.00|>", " two", "<|15.00|>")]
+    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(45))
+    assert r.json() == {"text": "one two"}
+    assert all(s["model_kwargs"]["timestamps"] == "segment" for s in stub.submits)
+
+
+def test_short_seek_or_no_closed_segment_takes_the_whole_window(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [
+        _text("<|en|>", "<|0.00|>", " open ended"),                  # no closed segment
+        _text("<|0.00|>", " a", "<|0.50|>", "<|0.50|>", " tail"),    # closed too early to seek to
+        _text("<|0.00|>", " last", "<|5.00|>"),
+    ]
+    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(65))
+    assert r.json() == {"text": "open ended a tail last"}
+    assert [round(_wav_seconds(s["file_paths"]["audio"][0]), 2) for s in stub.submits] == [30.0, 30.0, 5.0]
+
+
+def test_repetitive_window_falls_back_to_higher_temperatures_and_resets_the_prompt(client_and_stub):
+    client, stub = client_and_stub
+    loop = " the apostle and" * 60
+    assert serving_transcriptions.compression_ratio(loop) > 2.4
+    assert serving_transcriptions.compression_ratio("He hoped there would be stew for dinner.") < 2.4
+    stub.queued_chunks = [
+        _text("<|en|>", "<|0.00|>", " Hello there.", "<|20.00|>"),
+        _text("<|0.00|>", loop, "<|29.00|>"),           # window 2 at 0.0
+        _text("<|0.00|>", loop, "<|29.00|>"),           # 0.2
+        _text("<|0.00|>", loop, "<|29.00|>"),           # 0.4
+        _text("<|0.00|>", " Fine now.", "<|10.00|>"),   # 0.6: accepted
+        _text("<|0.00|>", " The end.", "<|15.00|>"),
+    ]
+    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+              filename="long.wav", content=_wav_bytes(75))
+    body = r.json()
+    assert body["text"] == "Hello there. Fine now. The end."
+    assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.0, 0.0, 0.2, 0.4, 0.6, 0.0]
+    assert body["segments"][1]["temperature"] == 0.6 and body["segments"][1]["compression_ratio"] < 2.4
+    # retries keep the conditioning text; the window after a hot one loses it
+    assert all(s["model_kwargs"]["initial_prompt"] == "Hello there." for s in stub.submits[1:5])
+    assert "initial_prompt" not in stub.submits[5]["model_kwargs"]
+
+
+def test_pinned_temperature_is_not_escalated(client_and_stub):
+    client, stub = client_and_stub
+    loop = " the apostle and" * 60
+    stub.queued_chunks = [_text("<|en|>", "<|0.00|>", loop, "<|29.00|>"), _text("<|0.00|>", " two", "<|15.00|>")]
+    r = _post(client, {"model": "whisper_large", "temperature": "0.3"}, filename="long.wav", content=_wav_bytes(45))
+    assert r.status_code == 200
+    assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.3, 0.3]
+
+
+def test_split_windows_cuts_at_the_quietest_point():
+    import numpy as np
+
+    from mstar.api_server import media_io
+
+    audio = np.ones(16_000 * 75, dtype="float32")
+    audio[16_000 * 28: 16_000 * 28 + 8_000] = 0.0  # a pause at 28.0-28.5 s
+    pieces = media_io.split_windows(audio, 30.0, 16_000, search_seconds=2.0)
+    assert [len(p) / 16_000 for p in pieces] == [28.5, 30.0, 16.5]
+    assert sum(len(p) for p in pieces) == len(audio)
+    fixed = media_io.split_windows(audio, 30.0, 16_000)
+    assert [len(p) / 16_000 for p in fixed] == [30.0, 30.0, 15.0]
