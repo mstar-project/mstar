@@ -332,8 +332,15 @@ def decode_audio(codec, codes: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def reference_decode_audio(ref, codes: torch.Tensor) -> torch.Tensor:
-    wavs, _ = ref.model.speech_tokenizer.decode([{"audio_codes": codes}])
+def reference_decode_audio(snapshot: str, device: str, codes: torch.Tensor) -> torch.Tensor:
+    """Reference codec in float32 (M* runs its codec in float32; the reference
+    wrapper would otherwise inherit the Talker's bf16)."""
+    from qwen_tts import Qwen3TTSTokenizer
+
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        str(Path(snapshot) / "speech_tokenizer"), device_map=device, dtype=torch.float32,
+    )
+    wavs, _ = tokenizer.decode([{"audio_codes": codes}])
     return torch.as_tensor(wavs[0]).float()
 
 
@@ -412,7 +419,7 @@ def main(argv: list[str] | None = None) -> None:
     codes_report = compare_codes(ours_codes, ref_codes)
     n = codes_report["frames_compared"]
     audio_ref_codes_mstar = decode_audio(codec, ref_codes[:n])
-    audio_ref_codes_ref = reference_decode_audio(ref, ref_codes[:n]).to(audio_ref_codes_mstar.device)
+    audio_ref_codes_ref = reference_decode_audio(snapshot, args.device, ref_codes[:n]).to(audio_ref_codes_mstar.device)
     m = min(audio_ref_codes_mstar.numel(), audio_ref_codes_ref.numel())
     codec_report = {
         "name": "codec_same_codes",
