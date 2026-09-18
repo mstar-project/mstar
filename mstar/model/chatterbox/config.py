@@ -426,9 +426,10 @@ class ChatterboxConfig:
     # what a chunk's latency is made of. Dynamic shapes, so one compile covers
     # every chunk length; costs a few minutes at startup.
     s3gen_compile: bool = False
-    # ``torch.compile`` mode for the estimator: "default" fuses kernels;
-    # "reduce-overhead" also replays it as CUDA graphs (one recording per
-    # distinct shape, so pair it with ``s3gen_frame_bucket``).
+    # ``torch.compile`` mode for the estimator: "default" fuses kernels
+    # (measured +14 % at concurrency 8, nothing at 32); "reduce-overhead"
+    # would replay CUDA graphs but trips an Inductor assertion with dynamic
+    # shapes on torch 2.11, so it is not usable yet.
     s3gen_compile_mode: str = "default"
     # Pad every flow solve to a multiple of this many mel frames (0 = exact
     # length). Padding is masked, so outputs stay the same up to float noise;
