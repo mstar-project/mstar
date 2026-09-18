@@ -113,3 +113,24 @@ def test_postprocess_png_and_adapter():
     from mstar.api_server.openai import adapters
 
     assert isinstance(adapters.get_adapter("z_image_turbo"), adapters.DiffusionImageAdapter)
+
+
+def test_text_node_pads_prompts_to_the_reference_length():
+    """The pipeline encodes 512-padded prompts; the kernel's accumulation order depends on it."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.submodules import TEXT_INPUTS, ZImageTextEncoderSubmodule
+
+    config = ZImageConfig()
+    node = ZImageTextEncoderSubmodule(None, config)
+    rows = []
+    for rid, n in (("a", 40), ("b", 7)):
+        info = CurrentForwardPassInfo(
+            request_id=rid, graph_walk="encode_text", fwd_index=0, random_seed=0, max_tokens=0,
+        )
+        rows.append(node.prepare_inputs("encode_text", info, {TEXT_INPUTS: [torch.arange(1, n + 1)]}))
+    batch = node.preprocess("encode_text", None, rows)
+    assert batch[TEXT_INPUTS].shape == (2, config.text_encoder.max_sequence_length) == batch["text_mask"].shape
+    assert batch["lengths"] == [40, 7]
+    assert batch["text_mask"].sum(dim=1).tolist() == [40, 7]
+    assert (batch[TEXT_INPUTS][1, 7:] == config.text_encoder.pad_token_id).all()
