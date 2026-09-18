@@ -546,18 +546,27 @@ class S3GenSubmodule(NodeSubmodule):
         tokens, lens = self.s3_tokenizer([wav16])
         return self.s3gen.embed_reference(wav24[None], wav16[None], tokens[:, : int(lens[0])])
 
-    def _reference(self, inputs: NameToTensorList):
-        if not inputs.get(REF_AUDIO):
-            if self.builtin_voice is None:
-                raise ValueError("No reference voice given and the checkpoint ships no built-in voice")
-            return self.builtin_voice
-        key = int(inputs[VOICE_KEY][0].reshape(-1)[0].item())
-        ref = self.cache.get(key)
-        if ref is None:
-            wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
-            ref = self.condition(wav)
-            self.cache.put(key, ref)
-        return ref
+    def _reference(self, inputs: NameToTensorList, request_id: str = ""):
+        """The request's reference conditioning: computed (or fetched from the
+        per-voice cache) from the clip that rides with the first chunk, then
+        kept in the request's state for the chunks that follow, which carry
+        the voice edges without tensors."""
+        state = self.request_state(request_id) if request_id else None
+        if inputs.get(REF_AUDIO):
+            key = int(inputs[VOICE_KEY][0].reshape(-1)[0].item())
+            ref = self.cache.get(key)
+            if ref is None:
+                wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
+                ref = self.condition(wav)
+                self.cache.put(key, ref)
+            if state is not None and state.get("ref") is None:
+                state.add("ref", ref)
+            return ref
+        if state is not None and state.get("ref") is not None:
+            return state["ref"]
+        if self.builtin_voice is None:
+            raise ValueError("No reference voice given and the checkpoint ships no built-in voice")
+        return self.builtin_voice
 
     # -- inputs ----------------------------------------------------------------
 
@@ -585,7 +594,7 @@ class S3GenSubmodule(NodeSubmodule):
             tensor_inputs={SPEECH_TOKENS: tokens},
             kwargs={
                 "request_id": fwd_info.request_id,
-                "ref": self._reference(inputs),
+                "ref": self._reference(inputs, fwd_info.request_id),
                 "n_timesteps": int(meta.get("n_cfm_timesteps", self.config.generation.n_cfm_timesteps)),
                 "watermark": bool(meta.get("watermark", self.config.generation.watermark)),
                 "seed": int(fwd_info.random_seed),
