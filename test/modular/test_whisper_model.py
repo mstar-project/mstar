@@ -663,3 +663,18 @@ def test_decoder_align_walk_emits_word_timings_in_the_timestamp_vocabulary():
     rendered = model._detokenizer.to_bytes(ids).decode()
     assert rendered.startswith("<|startoflm|><|") and rendered.count("<|") == 1 + len(stamps)
 
+
+def test_decoder_prefill_selects_each_request_last_row_itself():
+    cfg = _tiny_config()
+    sub = WhisperDecoderSubmodule(WhisperDecoderModel(cfg), cfg).eval()
+    hidden = torch.arange(7.0).view(7, 1)
+    assert sub._last_rows(hidden, torch.tensor([4, 1, 2])).flatten().tolist() == [3.0, 4.0, 6.0]
+    # a language-detection prompt is a single token: still its own last row
+    assert sub._last_rows(hidden[:1], torch.tensor([1])).flatten().tolist() == [0.0]
+    fwd = type("F", (), {"request_id": "a"})()
+    detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, fwd, {
+        "text_inputs": [torch.tensor([SOT])], "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
+    })
+    batch = sub.preprocess(DETECT_LANGUAGE_WALK, _engine_inputs(["a"]), [detect])
+    assert batch["row_lens"].tolist() == [1] and batch["input_ids"].tolist() == [SOT]
+
