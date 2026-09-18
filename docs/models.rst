@@ -128,8 +128,10 @@ Qwen3-TTS notes
   causal, so chunking does not change the audio). Each window size is a CUDA-graph bucket
   captured for batch sizes 1 to 32; the stream buffer reports how many leading
   frames of a window are repeated context, and the codec trims their audio.
-- Talker prefill remains eager because it runs once with variable sequence
-  lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
+- Talker prefill replays a packed CUDA Graph for the smallest token bucket
+  (32 to 1024 tokens) that holds the batch; only the clone prefill, which also
+  pushes the reference clip's frames into the codec stream, runs eager. Decode
+  always uses the whole-walk CUDA Graph, with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
   request state. Residual ``subtalker_*`` sampling is per-request through the
