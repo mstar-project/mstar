@@ -17,6 +17,9 @@ class StreamChunk:
     # leading items of this chunk that an earlier chunk already delivered
     # (sliding-window overlap / left context); the consumer trims their output
     context_items: int = 0
+    # items in this chunk (context included); lets a consumer pick its
+    # capture bucket before the chunk tensor is unpacked
+    num_items: int = 0
 
 
 @dataclass
@@ -145,6 +148,7 @@ class StreamBuffer:
             start_offset=offset,
             is_final=is_final,
             context_items=min(max(self._delivered_end - offset, 0), len(items)),
+            num_items=len(items),
         )
         self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1
