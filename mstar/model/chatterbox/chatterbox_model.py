@@ -661,11 +661,11 @@ class ChatterboxModel(Model):
         key = f"s3_tokenizer:{device}"
         if key not in self._shared:
             from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
-            from mstar.model.chatterbox.loader import iter_weights, materialize
+            from mstar.model.chatterbox.loader import iter_weights
 
-            with torch.device("meta"):
-                tokenizer = S3Tokenizer(self.config.s3_tokenizer)
-            materialize(tokenizer, device, torch.float32)
+            # built for real, not on meta: its mel filters, window and RoPE
+            # tables are computed in __init__ and have no checkpoint entry
+            tokenizer = S3Tokenizer(self.config.s3_tokenizer).to(device)
             tokenizer.load_weights(iter_weights(
                 self._weights_path(self.config.s3gen_weights), device=device, prefix="tokenizer.",
             ))
@@ -674,12 +674,11 @@ class ChatterboxModel(Model):
 
     def _create_voice_encoder_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.chatterbox.components.voice_encoder import VoiceEncoder
-        from mstar.model.chatterbox.loader import iter_weights, materialize
+        from mstar.model.chatterbox.loader import iter_weights
         from mstar.model.chatterbox.submodules import VoiceEncoderSubmodule
 
-        with torch.device("meta"):
-            encoder = VoiceEncoder(self.config.voice_encoder)
-        materialize(encoder, device, torch.float32)
+        # computed mel filters -> built for real (see _s3_tokenizer)
+        encoder = VoiceEncoder(self.config.voice_encoder).to(device)
         encoder.load_weights(iter_weights(
             self._weights_path(self.config.voice_encoder_weights), device=device,
         ))
@@ -707,12 +706,12 @@ class ChatterboxModel(Model):
 
     def _create_s3gen_submodule(self, device: str) -> NodeSubmodule:
         from mstar.model.chatterbox.components.s3gen import ReferenceConditioning, S3Gen
-        from mstar.model.chatterbox.loader import iter_weights, materialize
+        from mstar.model.chatterbox.loader import iter_weights
         from mstar.model.chatterbox.submodules import S3GenSubmodule
 
-        with torch.device("meta"):
-            s3gen = S3Gen(self.config.s3gen)
-        materialize(s3gen, device, torch.float32)
+        # mel basis, STFT windows, positional table and fades are computed in
+        # __init__ -> built for real (see _s3_tokenizer)
+        s3gen = S3Gen(self.config.s3gen).to(device)
         s3gen.load_weights(
             iter_weights(self._weights_path(self.config.s3gen_weights), device=device),
         )
