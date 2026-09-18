@@ -1,9 +1,10 @@
 """/v1/audio/speech and /v1/audio/voices handlers (text-to-speech).
 
 Non-streaming speech returns the full audio as a container blob (WAV by
-default). Streaming returns a single open-ended WAV response (header + PCM16
-frames) as the audio is produced. ``/v1/audio/voices`` lists the ``voice``
-values the served model accepts.
+default). Streaming returns one open-ended response as the audio is produced:
+a WAV header followed by PCM16 frames, or, with ``response_format="pcm"``,
+the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.
+``/v1/audio/voices`` lists the ``voice`` values the served model accepts.
 """
 
 from __future__ import annotations
@@ -44,9 +45,10 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
     )
 
     if req.stream:
+        raw_pcm = fmt == "pcm"
         return StreamingResponse(
-            _stream_wav(api, request_id, sample_rate),
-            media_type="audio/wav",
+            _stream_pcm(api, request_id, sample_rate, with_wav_header=not raw_pcm),
+            media_type="audio/pcm" if raw_pcm else "audio/wav",
             headers={"Cache-Control": "no-cache"},
         )
 
@@ -56,8 +58,9 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
     return Response(content=audio_bytes, media_type=mime)
 
 
-async def _stream_wav(api, request_id, sample_rate):
-    yield media_io.wav_stream_header(sample_rate)
+async def _stream_pcm(api, request_id, sample_rate, with_wav_header=True):
+    if with_wav_header:
+        yield media_io.wav_stream_header(sample_rate)
     async for c in api.iter_result_chunks(request_id):
         if c.modality == "audio" and c.data:
             yield c.data
