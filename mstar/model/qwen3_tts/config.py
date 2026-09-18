@@ -239,6 +239,12 @@ class Qwen3TTSCodecConfig:
     input_sample_rate: int = 24000
     output_sample_rate: int = 24000
     decode_upsample_rate: int = 1920
+    encode_downsample_rate: int = 1920
+    encoder_valid_num_quantizers: int = 16
+    # Raw Mimi encoder configuration (``encoder_config`` in the speech
+    # tokenizer's config.json); it is handed verbatim to the encoder that
+    # turns reference audio into codec frames for voice cloning.
+    encoder_config: dict[str, Any] = field(default_factory=dict)
 
     # M* stream policy: 300 new 12 Hz frames with 25 frames of overlap.
     chunk_frames: int = 300
@@ -258,10 +264,17 @@ class Qwen3TTSCodecConfig:
                 "input_sample_rate",
                 "output_sample_rate",
                 "decode_upsample_rate",
+                "encode_downsample_rate",
+                "encoder_valid_num_quantizers",
+                "encoder_config",
             )
             if name in data
         })
         return cls(**values)
+
+    def frames_for_samples(self, num_samples: int) -> int:
+        """Codec frames the encoder emits for ``num_samples`` of input audio."""
+        return -(-int(num_samples) // self.encode_downsample_rate)
 
     def decoder_kwargs(self) -> dict[str, Any]:
         """Arguments accepted by the official 12 Hz decoder config."""
@@ -269,6 +282,9 @@ class Qwen3TTSCodecConfig:
             "input_sample_rate",
             "output_sample_rate",
             "decode_upsample_rate",
+            "encode_downsample_rate",
+            "encoder_valid_num_quantizers",
+            "encoder_config",
             "chunk_frames",
             "left_context_frames",
         }
