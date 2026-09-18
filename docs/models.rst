@@ -164,7 +164,10 @@ Chatterbox notes
   off, and a deployment without the package logs that outputs are unmarked.
 - Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
   the first after 15 tokens, then every 25 (``model_kwargs:
-  stream_first_chunk_tokens`` / ``stream_chunk_tokens``). Each chunk re-runs
+  stream_first_chunk_tokens`` / ``stream_chunk_tokens``); ``stream_chunk_growth``
+  (default 1.0) lets later chunks grow geometrically up to
+  ``stream_max_chunk_tokens``, so a stream costs fewer, larger flow solves
+  while playback stays ahead. Each chunk re-runs
   the flow decoder over all tokens so far with a fixed noise field, holds back
   the three look-ahead tokens and crossfades the vocoder tail, so the stream
   is continuous but not sample-identical to the whole-utterance decode;
