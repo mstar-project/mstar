@@ -96,10 +96,12 @@ Qwen3-TTS notes
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
-- Codec CUDA graphs are captured through batch size 8. The upstream decoder's
-  batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
-  graphs are resident; larger Codec batches therefore use the scheduler's safe
-  ceiling.
+- Audio streams in a ramp of codec chunks: the first window is decoded after 4
+  frames (320 ms of speech), later windows grow to 25 new frames behind 25
+  frames of already decoded left context (the reference's own
+  ``chunked_decode`` context). Each window size is a CUDA-graph bucket
+  captured for batch sizes 1 to 16; the stream buffer reports how many leading
+  frames of a window are repeated context, and the codec trims their audio.
 - Talker prefill remains eager because it runs once with variable sequence
   lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
