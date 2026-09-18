@@ -102,7 +102,8 @@ def build_text_encoder(config: ZImageConfig, snapshot: Path, device, dtype=torch
     with torch.device("meta"):
         encoder = make_text_encoder(config.text_encoder)
     _materialize(encoder, dtype, device)
+    skip = text_encoder_skip(config.text_encoder)  # filtered before the read: the unused last layer stays on disk
     return load_native(
-        encoder, iter_transformers_component(snapshot / "text_encoder", device), remap_text_encoder_key,
-        "Qwen3 caption encoder", stacked_params=_QKV_RULES_LM, skip=text_encoder_skip(config.text_encoder),
+        encoder, iter_transformers_component(snapshot / "text_encoder", device, skip=skip), remap_text_encoder_key,
+        "Qwen3 caption encoder", stacked_params=_QKV_RULES_LM, skip=skip,
     )
