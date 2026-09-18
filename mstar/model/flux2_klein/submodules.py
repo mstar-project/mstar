@@ -185,7 +185,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         *,
         loop_name: str,
         attn_resource_key: str | None,
-        compile_transformer: bool = True,
+        compile_transformer: bool = True, compile_eager_rounding: bool = True,
         max_batch_size: int = 8,
         capture_shapes=(),
         capture_batch_sizes=(1, 2, 4, 8),
@@ -202,7 +202,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             # In place, so the module keeps its identity (dtype property, tests' swaps);
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
-            transformer.forward = torch.compile(transformer.forward, fullgraph=False, dynamic=False)
+            compile_transformer_forward(transformer, eager_rounding=compile_eager_rounding)
 
     # hooks -----------------------------------------------------------------
     def shape_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
@@ -277,6 +277,18 @@ VAE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 
 
 VAE_DECODE_BATCH_SIZES = (1, 2, 4, 8)
+
+
+def compile_transformer_forward(transformer: nn.Module, eager_rounding: bool = True) -> None:
+    """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
+    captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
+    tensor dtype exactly where eager PyTorch does (``emulate_precision_casts``): without it, fused
+    bf16 chains keep fp32 intermediates and the served images drift to 35-39 dB from the bit-exact
+    eager path on a 4-step distilled sampler (measured); with it the fusions keep eager numerics."""
+    import torch._inductor.config as inductor_config
+
+    inductor_config.emulate_precision_casts = bool(eager_rounding)
+    transformer.forward = torch.compile(transformer.forward, fullgraph=False, dynamic=False)
 
 
 def compile_vae_decode(vae: nn.Module):
