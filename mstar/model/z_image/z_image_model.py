@@ -285,8 +285,11 @@ class ZImageModel(Model):
             return ZImageTextEncoderSubmodule(build_text_encoder(self.config, self.snapshot, device), self.config,
                                               max_batch_size=self.max_batch_size)
         if node_name == "vae_decoder":
-            return ZImageVaeDecoderSubmodule(build_vae(self.config, self.snapshot, device), self.config,
-                                             max_batch_size=self.max_batch_size, compile_decode=self.vae_compile)
+            return ZImageVaeDecoderSubmodule(
+                build_vae(self.config, self.snapshot, device), self.config, max_batch_size=self.max_batch_size,
+                compile_decode=self.vae_compile,
+                warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes] if self.vae_compile else (),
+            )
         if node_name == "dit":
             return ZImageDenoiseSubmodule(
                 build_transformer(self.config, self.snapshot, device), self.config, loop_name=DENOISE_LOOP,
