@@ -14,6 +14,9 @@ class StreamChunk:
     chunk_index: int
     start_offset: int = 0  # global position of the first item in this chunk
     is_final: bool = False
+    # leading items of this chunk that an earlier chunk already delivered
+    # (sliding-window overlap / left context); the consumer trims their output
+    context_items: int = 0
 
 
 @dataclass
@@ -39,6 +42,9 @@ class StreamBuffer:
     _id_to_tensor: dict = field(default_factory=dict)
     _consumed: int = 0
     _chunks_popped: int = 0
+    # global position just past the last item ever handed out; everything
+    # before it in a later window is context, not new data
+    _delivered_end: int = 0
     producer_done: bool = False
     # Set once a chunk has been popped with ``is_final=True`` (the terminal
     # flush). Guards the empty-buffer final flush below so it fires exactly
@@ -138,7 +144,9 @@ class StreamBuffer:
             chunk_index=self._chunks_popped,
             start_offset=offset,
             is_final=is_final,
+            context_items=min(max(self._delivered_end - offset, 0), len(items)),
         )
+        self._delivered_end = max(self._delivered_end, offset + len(items))
         self._chunks_popped += 1
         return chunk
 
