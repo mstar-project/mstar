@@ -279,32 +279,34 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             tensor_inputs["prompt_tail"] = tail
             seq_len += tail.shape[0]
 
-        state = self.request_state(fwd_info.request_id)
-        if graph_walk != DECODE_WALK:
+        if graph_walk == DECODE_WALK:
+            # The rule state arrives with the token it was advanced by (see
+            # ``timestamps.py``): the worker launches this step before the
+            # previous token is readable on the host, so it cannot be rebuilt
+            # from a Python history here.
+            routed = inputs.get("ts_rules")
+            if routed:
+                tensor_inputs["ts_rules"] = routed[0].to(device).reshape(-1)
+            else:
+                tensor_inputs["ts_rules"] = torch.tensor(inactive_state(), dtype=torch.long, device=device)
+        else:
+            state = self.request_state(fwd_info.request_id)
             # The learned position table caps prompt + transcript at
             # max_target_positions; check_stop reads this back.
             state.add("prompt_len", state.get("prompt_len", 0) + seq_len)
             # Timestamps are on when the prompt omits <|notimestamps|>; the
             # detection walk's prompt ends at <|sot|> and says nothing yet.
             prompt = token_ids.tolist() + tensor_inputs.get("prompt_tail", token_ids[:0]).tolist()
-            if graph_walk != DETECT_LANGUAGE_WALK:
-                state.add("timestamps", self.config.no_timestamps_token_id not in prompt)
-                state.add("generated", [])
-        tensor_inputs["ts_rules"] = self._rules_row(graph_walk, state, device)
+            timestamps = graph_walk != DETECT_LANGUAGE_WALK and self.config.no_timestamps_token_id not in prompt
+            state.add("timestamps", timestamps)
+            row = rule_state([], self.config) if timestamps else inactive_state()
+            tensor_inputs["ts_rules"] = torch.tensor(row, dtype=torch.long, device=device)
 
         return ARNodeInputs(
             input_seq_len=seq_len,
             input_ids=token_ids,
             tensor_inputs=tensor_inputs,
         )
-
-    def _rules_row(self, graph_walk: str, state, device) -> torch.Tensor:
-        """This step's timestamp rule for one request (see ``timestamps.py``)."""
-        if graph_walk == DETECT_LANGUAGE_WALK or not state.get("timestamps", False):
-            row = inactive_state()
-        else:
-            row = rule_state(state.get("generated", []), self.config)
-        return torch.tensor(row, dtype=torch.long, device=device)
 
     @staticmethod
     def _context_span(inp: ARNodeInputs) -> int:
@@ -388,8 +390,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         encoder_states: torch.Tensor | None,
         ts_rules: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run the decoder and sample one token per request."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the decoder and sample one token per request; also the
+        timestamp rule state each row carries into its next step."""
         attn: AttentionManager = engine_inputs.resources[ATTN]
         pos: PositionManager = engine_inputs.resources[POS]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
@@ -415,7 +418,10 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             )
             if ts_rules is not None:
                 logits = self.timestamp_rules.apply(logits, ts_rules)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        new_tokens = sampler.sample(engine_inputs.request_ids, logits=logits)
+        if ts_rules is None:
+            return new_tokens, None
+        return new_tokens, self.timestamp_rules.advance(ts_rules, new_tokens)
 
     def forward(
         self,
@@ -426,15 +432,17 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         ts_rules: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        return {
-            "new_token": [self._forward(
-                graph_walk=graph_walk,
-                engine_inputs=engine_inputs,
-                input_ids=input_ids,
-                encoder_states=encoder_states,
-                ts_rules=ts_rules,
-            )]
-        }
+        new_tokens, next_rules = self._forward(
+            graph_walk=graph_walk,
+            engine_inputs=engine_inputs,
+            input_ids=input_ids,
+            encoder_states=encoder_states,
+            ts_rules=ts_rules,
+        )
+        out: NameToTensorList = {"new_token": [new_tokens]}
+        if next_rules is not None:
+            out["ts_rules"] = [next_rules[0]]
+        return out
 
     def can_batch(
         self, batch: ExecutingBatch,
@@ -456,17 +464,19 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         ts_rules: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        new_tokens = self._forward(
+        new_tokens, next_rules = self._forward(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
             input_ids=input_ids,
             encoder_states=encoder_states,
             ts_rules=ts_rules,
         )
-        return {
-            rid: {"new_token": [new_tokens[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        out: dict[str, NameToTensorList] = {}
+        for i, rid in enumerate(engine_inputs.request_ids):
+            out[rid] = {"new_token": [new_tokens[i:i + 1]]}
+            if next_rules is not None:
+                out[rid]["ts_rules"] = [next_rules[i]]
+        return out
 
     def postprocess(
         self,
@@ -476,7 +486,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         **kwargs,
     ):
         # Metadata-only: rebind output name so the decode loop feeds the
-        # sampled token back in as the next step's text_inputs.
+        # sampled token back in as the next step's text_inputs. ``ts_rules``
+        # keeps its name; the loop routes it back under it.
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
@@ -490,10 +501,6 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs or request_info.graph_walk == DETECT_LANGUAGE_WALK:
             return set()
         token = outputs["new_token"][0].item()
-        state = self.request_state(request_id)
-        if state.get("timestamps", False):
-            # the rule for the next step reads the history back on the host
-            state.get("generated").append(token)
         if request_info.graph_walk != DECODE_WALK:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
