@@ -164,10 +164,14 @@ def euler_step(
 ) -> torch.Tensor:
     """One flow-matching Euler update, ``x_{k+1} = x_k + (sigma_{k+1} - sigma_k) * v``.
 
-    ``sigma`` / ``sigma_next`` are float32 tensors broadcastable against the
-    sample (a scalar, or ``[B, 1, 1]`` for a batch of requests at different
-    steps). Every operand is a tensor so the step captures into a CUDA graph with
-    per-request values staged into static buffers.
+    ``sigma`` / ``sigma_next`` are float32 tensors: a scalar, or one value per
+    request (``[B, 1, 1]`` as the denoise loop stacks them) for a batch at
+    different steps; a per-request ``dt`` is reshaped to ``[B, 1, ...]`` at the
+    sample's rank, so ``[B, L, C]`` token layouts and ``[B, C, H, W]`` latent
+    layouts both broadcast over the batch (right-aligned broadcasting would pair
+    the batch with the channel dimension of a 4-D latent). Every operand is a
+    tensor so the step captures into a CUDA graph with per-request values staged
+    into static buffers.
 
     Op order and dtypes follow the reference scheduler's ``step`` exactly: the
     sample is upcast to fp32, but ``dt * velocity`` is evaluated in the
@@ -178,5 +182,7 @@ def euler_step(
     the result is cast back to ``velocity.dtype``.
     """
     dt = (sigma_next - sigma).to(velocity.dtype)
+    if dt.ndim > 0 and dt.ndim != velocity.ndim:
+        dt = dt.reshape(dt.shape[0], *([1] * (velocity.ndim - 1)))
     prev = sample.to(torch.float32) + dt * velocity
     return prev.to(velocity.dtype)
