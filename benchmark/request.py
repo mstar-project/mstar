@@ -1635,7 +1635,7 @@ class OursOpenAI(VLLMOmni):
         """
         kwargs = {**model.get_model_kwargs(req_input.req_type), **additional_model_kwargs}
         payload: dict = {
-            "model": model.get_hf_url(),
+            "model": model.get_served_model_name(),
             "input": req_input.prompt,
             "response_format": "pcm",
             "stream": True,
