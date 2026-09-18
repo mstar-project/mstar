@@ -4,7 +4,9 @@
 Transcribes every ``<index>.wav`` (or ``req_<index>.wav``) in a directory with Whisper and scores it
 against the sentence set the audio was synthesised from (line ``index`` of
 ``--sentences``), so throughput numbers can be reported alongside a WER that
-proves the speed did not come from garbled speech::
+proves the speed did not come from garbled speech. ``wer`` applies Whisper's
+English text normaliser to both sides (so "seven" and "7" agree); ``wer_raw``
+only folds case and punctuation::
 
     python benchmark/chatterbox/wer_eval.py --wavs results/<date>/mstar_c8/wavs \
         --sentences /path/sentences_200.txt --out results/<date>/mstar_c8/wer.json
@@ -17,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import soundfile as sf
@@ -30,10 +33,12 @@ from benchmark.asr_eval import _compute_wer  # noqa: E402
 ASR_MODEL = "openai/whisper-large-v3-turbo"
 
 
-def transcribe(wavs: list[Path], model_id: str, device: str, batch_size: int) -> list[str]:
+def transcribe(wavs: list[Path], model_id: str, device: str, batch_size: int) -> tuple[list[str], Callable[[str], str]]:
     """Whisper via the model classes directly: the ASR pipeline's preprocess
     imports torchcodec (FFmpeg libraries the nodes lack) even for in-memory
-    arrays, and soundfile already gives us the samples."""
+    arrays, and soundfile already gives us the samples. Also returns the
+    tokenizer's English text normaliser (numbers, spellings, punctuation), so
+    references and hypotheses are scored the way Whisper's own WER is."""
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
@@ -55,7 +60,7 @@ def transcribe(wavs: list[Path], model_id: str, device: str, batch_size: int) ->
                 feats.to(device, dtype), language="en", task="transcribe", max_new_tokens=220,
             )
         texts.extend(t.strip() for t in processor.batch_decode(ids, skip_special_tokens=True))
-    return texts
+    return texts, processor.tokenizer.normalize
 
 
 def main() -> None:
@@ -80,11 +85,14 @@ def main() -> None:
         raise SystemExit(f"no <index>.wav / req_<index>.wav files under {args.wavs}")
     references = [sentences[indexed[p] % len(sentences)] for p in wavs]
 
-    hypotheses = transcribe(wavs, args.asr_model, args.device, args.batch_size)
-    report = _compute_wer(references, hypotheses)
+    hypotheses, normalize = transcribe(wavs, args.asr_model, args.device, args.batch_size)
+    report = _compute_wer([normalize(r) for r in references], [normalize(h) for h in hypotheses])
+    raw = _compute_wer(references, hypotheses)
     durations = [sf.info(str(p)).duration for p in wavs]
     result = {
-        "asr_model": args.asr_model, "num_files": len(wavs), "wer": report["wer"],
+        "asr_model": args.asr_model, "num_files": len(wavs),
+        "wer": report["wer"],  # Whisper English normalisation on both sides
+        "wer_raw": raw["wer"],  # repo transform only (case/punctuation)
         "total_audio_s": sum(durations), "mean_audio_s": sum(durations) / len(durations),
         "worst": sorted(report["per_sample"], key=lambda s: -s["wer"])[:10],
         "files": [p.name for p in wavs],
