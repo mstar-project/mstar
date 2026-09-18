@@ -16,14 +16,24 @@ import json
 import re
 from pathlib import Path
 
-RUN_PATTERNS = {
-    # directory glob -> (system label, variant)
-    "mstar_chatterbox_c*": ("M*", "chatterbox"),
-    "mstar_chatterbox_turbo_c*": ("M*", "turbo"),
-    "tts_server_original_c*": ("Chatterbox-TTS-Server", "chatterbox"),
-    "tts_server_turbo_c*": ("Chatterbox-TTS-Server", "turbo"),
-    "chatterbox_vllm_c*": ("chatterbox-vllm", "chatterbox"),
-}
+RUN_NAME = re.compile(r"^(mstar|tts_server|chatterbox_vllm)_(.+)_c(\d+)$")
+SYSTEMS = {"mstar": "M*", "tts_server": "Chatterbox-TTS-Server", "chatterbox_vllm": "chatterbox-vllm"}
+
+
+def parse_run_name(name: str) -> tuple[str, str, str, int] | None:
+    """``mstar_chatterbox_ctx25_c8`` -> (system, variant, options, concurrency).
+
+    The tag after the system is the config name (``chatterbox``,
+    ``chatterbox_turbo``, ``original``, ``turbo``) plus the RUN_TAG of a
+    deployment variant (``ctx25``, ``chunk50``, ``compile_ctx25`` ...)."""
+    m = RUN_NAME.match(name)
+    if not m:
+        return None
+    system, tag, conc = SYSTEMS[m.group(1)], m.group(2), int(m.group(3))
+    parts = tag.split("_")
+    variant = "turbo" if "turbo" in parts else "chatterbox"
+    options = "_".join(p for p in parts if p not in ("chatterbox", "turbo", "original"))
+    return system, variant, options, conc
 
 
 def _num(pattern: str, text: str) -> float | None:
@@ -63,18 +73,21 @@ def parse_vllm_summary(path: Path) -> dict:
 
 def collect(results: Path) -> list[dict]:
     rows = []
-    for pattern, (system, variant) in RUN_PATTERNS.items():
-        for run in sorted(results.glob(pattern)):
-            conc = int(run.name.rsplit("_c", 1)[1])
-            if (run / "runner.log").exists():
-                row = parse_runner_log(run / "runner.log")
-            elif (run / "summary.json").exists():
-                row = parse_vllm_summary(run / "summary.json")
-            else:
-                continue
-            wer_path = run / "wer.json"
-            row["wer"] = json.loads(wer_path.read_text())["wer"] if wer_path.exists() else None
-            rows.append({"system": system, "variant": variant, "concurrency": conc, "run": run.name, **row})
+    for run in sorted(p for p in results.iterdir() if p.is_dir()):
+        parsed = parse_run_name(run.name)
+        if parsed is None:
+            continue
+        system, variant, options, conc = parsed
+        if (run / "runner.log").exists():
+            row = parse_runner_log(run / "runner.log")
+        elif (run / "summary.json").exists():
+            row = parse_vllm_summary(run / "summary.json")
+        else:
+            continue
+        wer_path = run / "wer.json"
+        row["wer"] = json.loads(wer_path.read_text())["wer"] if wer_path.exists() else None
+        rows.append({"system": system, "variant": variant, "options": options, "concurrency": conc,
+                     "run": run.name, **row})
     return rows
 
 
@@ -90,8 +103,10 @@ def table(rows: list[dict], variant: str, env: dict) -> str:
         "| System (version) | c | TTFA p50 / p95 (s) | RTF p50 / p95 | audio s / s | WER | notes |",
         "|---|---|---|---|---|---|---|",
     ]
-    for r in sorted((r for r in rows if r["variant"] == variant), key=lambda r: (r["system"], r["concurrency"])):
+    for r in sorted((r for r in rows if r["variant"] == variant),
+                    key=lambda r: (r["system"] != "M*", r["system"], r["options"], r["concurrency"])):
         version = env.get(r["system"], "")
+        label = r["system"] + (f" [{r['options']}]" if r["options"] else "")
         notes = []
         if r.get("succeeded") is not None and r.get("requested") and r["succeeded"] != r["requested"]:
             notes.append(f"{r['succeeded']}/{r['requested']} ok")
@@ -100,7 +115,7 @@ def table(rows: list[dict], variant: str, env: dict) -> str:
             if r.get("t3_tokens_per_s"):
                 notes.append(f"T3 {r['t3_tokens_per_s']:.0f} tok/s")
         lines.append(
-            f"| {r['system']} {version} | {r['concurrency']} | {fmt(r['ttfa_p50_s'])} / {fmt(r['ttfa_p95_s'])} "
+            f"| {label} {version} | {r['concurrency']} | {fmt(r['ttfa_p50_s'])} / {fmt(r['ttfa_p95_s'])} "
             f"| {fmt(r['rtf_p50'], 3)} / {fmt(r['rtf_p95'], 3)} | {fmt(r['audio_s_per_s'], 1)} "
             f"| {fmt(r['wer'] * 100 if r['wer'] is not None else None, 1, '%')} | {'; '.join(notes)} |"
         )
