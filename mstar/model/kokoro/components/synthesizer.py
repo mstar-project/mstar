@@ -4,11 +4,11 @@ Two halves, split where the frame count becomes known:
 
 * ``encode_text`` is shaped by the phoneme count ``T``: PL-BERT, the prosody
   encoder, the duration head and the text encoder.
-* ``synthesize_frames`` is shaped by the frame count ``F``: alignment, the F0
-  and energy heads and the decoder.
+* ``align`` expands phoneme features to frames once ``F`` is known, and
+  ``decode_frames`` is shaped by ``F``: the F0 and energy heads and the decoder.
 
-``forward`` joins them with the single host read of ``F``. The submodule can
-capture each half as its own CUDA graph.
+``forward`` joins them with the single host read of ``F``. The submodule
+captures ``encode_text`` and ``decode_frames`` as CUDA graphs per bucket.
 """
 
 from __future__ import annotations
@@ -64,6 +64,37 @@ class KokoroTTS(nn.Module):
         frames = torch.arange(num_frames, device=pred_dur.device)[None, :].expand(pred_dur.shape[0], -1)
         return torch.searchsorted(cumulative, frames.contiguous(), right=True).clamp(max=pred_dur.shape[1] - 1)
 
+    def align(
+        self,
+        d: torch.Tensor,
+        t_en: torch.Tensor,
+        pred_dur: torch.Tensor,
+        num_frames: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Expand phoneme features to ``num_frames`` frames.
+
+        Returns the frame-aligned prosody states ``[B, F, hidden + style]``, the
+        aligned text features ``[B, hidden, F]`` and each row's valid frame count.
+        """
+        frame_lengths = pred_dur.sum(dim=1)
+        token_index = self.alignment(pred_dur, num_frames)
+        mask = length_mask(frame_lengths, num_frames)
+        en = mask_features(d.gather(1, token_index[:, :, None].expand(-1, -1, d.shape[-1])), mask)
+        asr = mask_channels(t_en.gather(2, token_index[:, None, :].expand(-1, t_en.shape[1], -1)), mask)
+        return en, asr, frame_lengths
+
+    def decode_frames(
+        self,
+        en: torch.Tensor,
+        asr: torch.Tensor,
+        frame_lengths: torch.Tensor,
+        style: torch.Tensor,
+    ) -> torch.Tensor:
+        """Frame-aligned features -> waveform ``[B, F * samples_per_frame]``."""
+        decoder_style, predictor_style = self._split_style(style)
+        f0, energy = self.predictor.f0n(en, predictor_style, frame_lengths)
+        return self.decoder(asr, f0, energy, decoder_style, frame_lengths)
+
     def synthesize_frames(
         self,
         d: torch.Tensor,
@@ -72,20 +103,9 @@ class KokoroTTS(nn.Module):
         style: torch.Tensor,
         num_frames: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Expand phoneme features to ``num_frames`` frames and decode.
-
-        Returns the waveform ``[B, num_frames * samples_per_frame]`` and each
-        row's valid frame count.
-        """
-        decoder_style, predictor_style = self._split_style(style)
-        frame_lengths = pred_dur.sum(dim=1)
-        token_index = self.alignment(pred_dur, num_frames)
-        mask = length_mask(frame_lengths, num_frames)
-        en = mask_features(d.gather(1, token_index[:, :, None].expand(-1, -1, d.shape[-1])), mask)
-        asr = mask_channels(t_en.gather(2, token_index[:, None, :].expand(-1, t_en.shape[1], -1)), mask)
-        f0, energy = self.predictor.f0n(en, predictor_style, frame_lengths)
-        audio = self.decoder(asr, f0, energy, decoder_style, frame_lengths)
-        return audio, frame_lengths
+        """``align`` then ``decode_frames``: the waveform and each row's frame count."""
+        en, asr, frame_lengths = self.align(d, t_en, pred_dur, num_frames)
+        return self.decode_frames(en, asr, frame_lengths, style), frame_lengths
 
     def forward(
         self,
