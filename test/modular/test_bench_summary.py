@@ -10,9 +10,9 @@ sys.path.insert(0, ".")
 from benchmark.flux2_klein.summarize_bench import load_results, render_table  # noqa: E402
 
 
-def _latency(tag, model, median, p95, vram):
+def _latency(tag, model, median, p95, vram, observed=None):
     return {"tag": tag, "model": model, "mode": "latency", "size": "1024x1024", "steps": 4, "n": 20,
-            "median_s": median, "p95_s": p95, "peak_vram_mib": vram}
+            "median_s": median, "p95_s": p95, "peak_vram_mib": vram, "observed_output_format": observed}
 
 
 def _throughput(tag, model, rates, vram):
@@ -26,7 +26,7 @@ def test_table_groups_latency_and_throughput_by_system(tmp_path):
     for name, data in {
         "a_lat": _latency("mstar", "flux2_klein", 0.4, 0.45, 20000),
         "a_thr": _throughput("mstar", "flux2_klein", {4: 5.0, 8: 6.0, 16: 6.5}, 30000),
-        "b_lat": _latency("sglang", "black-forest-labs/FLUX.2-klein-4B", 0.5, 0.6, 25000),
+        "b_lat": _latency("sglang", "black-forest-labs/FLUX.2-klein-4B", 0.5, 0.6, 25000, observed="jpeg"),
     }.items():
         path = tmp_path / f"{name}.json"
         path.write_text(json.dumps(data))
@@ -44,3 +44,13 @@ def test_table_groups_latency_and_throughput_by_system(tmp_path):
     assert "n=20; 32 images x 3 repeats per level" in mstar_row
     sglang_row = next(line for line in lines if line.startswith("| sglang |"))
     assert "| n/a | n/a | n/a | 24.4 GiB |" in sglang_row  # no throughput file: nothing invented
+    assert "| jpeg (default) |" in sglang_row  # the format the server actually returned, unrequested
+
+
+def test_image_format_detection():
+    from benchmark.flux2_klein.bench_images import image_format
+
+    assert image_format(b"\x89PNG\r\n\x1a\n" + b"0" * 8) == "png"
+    assert image_format(b"\xff\xd8\xff\xe0" + b"0" * 8) == "jpeg"
+    assert image_format(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "webp"
+    assert image_format(b"GIF89a") == "unknown" and image_format(None) is None
