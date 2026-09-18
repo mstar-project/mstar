@@ -129,6 +129,18 @@ class Qwen3EncoderConfig:
     hidden_state_layers: tuple[int, ...] = (9, 18, 27)
     max_sequence_length: int = 512
 
+    def __post_init__(self):
+        if not self.hidden_state_layers or min(self.hidden_state_layers) < 1:
+            raise ValueError(
+                f"hidden_state_layers must name decoder layers (1-indexed); got {self.hidden_state_layers}"
+            )
+        if max(self.hidden_state_layers) >= self.num_hidden_layers:
+            raise ValueError(
+                f"hidden_state_layers {self.hidden_state_layers} must lie below layer {self.num_hidden_layers}: "
+                "HF's hidden_states[num_hidden_layers] is the normed last_hidden_state, which this encoder "
+                "(no final norm) does not produce"
+            )
+
     @property
     def num_layers_needed(self) -> int:
         """Decoder layers that must run to produce the deepest tap
