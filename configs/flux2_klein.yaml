@@ -9,8 +9,13 @@ max_seq_len: 512
 # transformer per shape, CUDA-graph capture of the denoise step for the listed
 # (height, width) shapes and batch sizes (other shapes run the eager batched path).
 model_kwargs:
-  attention_backend: flashinfer
+  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
+  # reference kernel; flashinfer stays available
+  attention_backend: sdpa
   compile: true
+  # inductor rounds intermediates like eager PyTorch: keeps the compiled transformer at the
+  # reference's numerics (without it the served images drift to 35-39 dB on a 4-step sampler)
+  compile_eager_rounding: true
   cuda_graph: true
   capture_sizes: [[1024, 1024]]
   # every batch size up to max_batch_size: a lockstep group of 5-7 requests would otherwise be padded into the 8-graph
