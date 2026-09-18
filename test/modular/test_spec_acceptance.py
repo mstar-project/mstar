@@ -49,6 +49,8 @@ def test_verdicts_flow_from_stage_to_the_next_plan():
     assert res.accepted_for(["a", "b"]) == [3, 1]
     va, vb = res.verdicts_for(["a", "b"])
     assert va.tokens == [10, 11, 12, 13, 14] and vb.accepted == 1 and vb.tokens[: vb.accepted + 1] == [20, 21]
+    assert res.rows_settled == 2 and res.accepted_total == 4 and res.mean_accepted == 2.0
+    assert res.stats().startswith("2 verify rows, 2.00 of 4 drafts accepted per row (3.00 tokens per step)")
     # next step: a and c (b is held), plus a padding row that must publish nothing
     s2, ctx2 = step(["a", "c"], padded=["a", "c", "__cg_LLM_0_2__"])
     out = res.plan(s2.get("spec_acceptance"), ctx2)
