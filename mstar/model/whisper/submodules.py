@@ -24,6 +24,7 @@ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerS
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.position.manager import PositionManager
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -67,14 +68,16 @@ FIRST_TOKEN_WALKS = (PREFILL_WALK, PREFILL_PROMPT_WALK)
 class WhisperEncoderSubmodule(NodeSubmodule):
     """Batched, graph-captured Whisper audio encoder.
 
-    Consumes one log-mel window per request (``(num_mel_bins, 3000)``, from
-    ``process_prompt``) and emits ``encoder_states`` of shape
-    ``(max_source_positions, d_model)`` for the decoder's cross-attention.
-    Every window is the same shape, so a batch is a dense
-    ``[bs, num_mel_bins, 3000]`` tensor and the forward is captured once per
-    batch size (``BatchedCudaGraphConfig``): the runner pads a smaller batch
-    with zero windows and replays the nearest bucket. The node holds no
-    resources, so ``declare_step`` stays at the base class's ``None``.
+    Consumes one window of samples per request (at most 30 s, from
+    ``process_prompt``), pads it to the window, turns the batch into log-mel
+    features with one STFT on the GPU (``preprocess``) and emits
+    ``encoder_states`` of shape ``(max_source_positions, d_model)`` for the
+    decoder's cross-attention. Every window is the same shape, so a batch is
+    a dense ``[bs, num_mel_bins, 3000]`` tensor and the forward is captured
+    once per batch size (``BatchedCudaGraphConfig``): the runner pads a
+    smaller batch with zero windows and replays the nearest bucket. The node
+    holds no resources, so ``declare_step`` stays at the base class's
+    ``None``.
     """
 
     ENCODER_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
@@ -93,6 +96,15 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.encoder = encoder
         self.config = config
+        # built here, after the encoder was materialized, so its filter bank
+        # and window are real tensors on the encoder's device
+        self.log_mel = LogMelSpectrogram(
+            num_mel_bins=config.num_mel_bins,
+            sampling_rate=config.sampling_rate,
+            n_fft=config.n_fft,
+            hop_length=config.hop_length,
+            chunk_length=config.chunk_length,
+        ).to(encoder.conv1.weight.device)
 
     def _param_dtype(self) -> torch.dtype:
         return self.encoder.conv1.weight.dtype
@@ -101,17 +113,16 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[CudaGraphConfig]:
         del tp_world_size
-        window = torch.zeros(
-            (self.config.num_mel_bins, self.config.num_frames),
-            dtype=self._param_dtype(), device=device,
-        )
+        window = torch.zeros(self.config.n_samples, dtype=torch.float32, device=device)
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(ENCODER_WALKS),
-                # one window per row; the token count is a row count here
+                # one window of samples per row; the token count is a row
+                # count here. ``preprocess`` turns the rows into the log-mel
+                # batch the captured forward reads.
                 single_request_inputs=NodeInputs(
-                    tensor_inputs={"audio_features": window}, input_seq_len=1,
+                    tensor_inputs={"audio": window}, input_seq_len=1,
                 ),
                 capture_batch_sizes=self.ENCODER_CAPTURE_BATCH_SIZES,
                 compile=self.ENCODER_COMPILE,
@@ -125,11 +136,9 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        feats = inputs["audio_features"][0]
-        if feats.dim() == 3:
-            feats = feats.squeeze(0)
-        feats = feats.to(device=self.get_device(), dtype=self._param_dtype())
-        return NodeInputs(tensor_inputs={"audio_features": feats}, input_seq_len=1)
+        audio = inputs["audio"][0].reshape(-1).to(device=self.get_device(), dtype=torch.float32)
+        audio = self.log_mel.pad_or_trim(audio)  # zero-pad to the 30 s window
+        return NodeInputs(tensor_inputs={"audio": audio}, input_seq_len=1)
 
     def preprocess(
         self,
@@ -137,11 +146,10 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        return {
-            "audio_features": torch.stack(
-                [inp.tensor_inputs["audio_features"] for inp in inputs], dim=0,
-            ),
-        }
+        # one STFT for the whole batch; the runner copies the result into the
+        # captured forward's static input
+        audio = torch.stack([inp.tensor_inputs["audio"] for inp in inputs], dim=0)
+        return {"audio_features": self.log_mel(audio).to(self._param_dtype())}
 
     def forward(
         self,
