@@ -123,6 +123,10 @@ class KokoroSynthSubmodule(NodeSubmodule):
         super().__init__()
         self.model = model
         self.config = config
+        if config.compile_decoder and next(model.parameters()).is_cuda:
+            # Bound-method attribute shadows the class method for both the
+            # captured regions and the eager fallback.
+            model.decode_frames = torch.compile(model.decode_frames, dynamic=True)
 
     # -- per request -------------------------------------------------------
 
