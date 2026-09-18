@@ -95,6 +95,10 @@ Kokoro notes
   synthesis.
 - Output is 24 kHz mono PCM16. The model runs in fp32: its vocoder is
   phase-sensitive and does not tolerate reduced precision.
+- ``examples/livekit_kokoro.py`` and ``examples/pipecat_kokoro.py`` plug the server
+  into LiveKit Agents and Pipecat through their OpenAI TTS plugins (``base_url``
+  pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
+  voices for a picker.
 
 Qwen3-TTS notes
 ---------------
