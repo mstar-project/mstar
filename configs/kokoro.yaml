@@ -1,0 +1,7 @@
+model: "kokoro"
+# Kokoro keeps no KV cache; this is the PL-BERT window (510 phonemes + <bos>/<eos>).
+max_seq_len: 512
+node_groups:
+  - node_names: [kokoro]
+    ranks: [0]
+    graph_walks: [synth]
