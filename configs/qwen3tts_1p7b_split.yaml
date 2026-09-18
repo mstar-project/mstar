@@ -1,0 +1,18 @@
+# Qwen3-TTS-12Hz-1.7B-CustomVoice with the codec on its own worker.
+# Both workers run on GPU 0 (rank_devices), so the Talker's decode steps no
+# longer alternate with codec windows on one worker loop: the Talker runs
+# back to back and the codec batches the windows that become ready while it
+# does. Same graph, resources and checkpoint as configs/qwen3tts_1p7b.yaml.
+model: "qwen3_tts_1p7b"
+max_seq_len: 32768
+resources:
+  talker_attn:
+    flashinfer_backend: fa2
+node_groups:
+  - node_names: [Talker]
+    ranks: [0]
+    graph_walks: [talker_prefill, talker_decode]
+  - node_names: [Codec]
+    ranks: [1]
+    graph_walks: [codec_chunk]
+rank_devices: {1: 0}
