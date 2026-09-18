@@ -198,7 +198,9 @@ class S3Gen(nn.Module):
         return mel[:, :, mel_prompt:]
 
     @torch.no_grad()
-    def tokens_to_mel_rows(self, rows: Sequence[FlowRow], *, n_timesteps: int | None = None) -> list[torch.Tensor]:
+    def tokens_to_mel_rows(
+        self, rows: Sequence[FlowRow], *, n_timesteps: int | None = None, frame_bucket: int = 0,
+    ) -> list[torch.Tensor]:
         """Several requests, each with its own reference, look-ahead state and
         noise, solved as one right-padded batch. Returns each row's generated
         mel ``[1, 80, 2 * usable]`` (``usable = n`` when final, ``n - 3`` while
@@ -207,7 +209,9 @@ class S3Gen(nn.Module):
         Right padding is invisible to the valid frames: the encoder zeroes the
         padding before its look-ahead convolution and masks attention, and the
         estimator's convolutions are causal or masked, so a row's result does
-        not depend on the longer rows it shares the batch with.
+        not depend on the longer rows it shares the batch with. ``frame_bucket``
+        pads the solve to a multiple of that many frames for the same reason,
+        so a compiled or graph-captured estimator meets few distinct shapes.
         """
         n_timesteps = n_timesteps or self.config.cfm.n_timesteps
         ratio = self.config.token_mel_ratio
@@ -225,6 +229,10 @@ class S3Gen(nn.Module):
         cuts = torch.tensor([0 if row.finalize else lookahead for row in rows], device=self.device)
         h_lens = (h_masks.sum(dim=-1).squeeze(-1) - cuts).clamp_min(0)
         total = mu.shape[-1]
+        if frame_bucket > 0 and total % frame_bucket:
+            padded = -(-total // frame_bucket) * frame_bucket
+            mu = torch.nn.functional.pad(mu, (0, padded - total))
+            total = padded
 
         cond = torch.zeros(len(rows), self.config.output_size, total, device=self.device, dtype=mu.dtype)
         noise = torch.zeros_like(cond)
