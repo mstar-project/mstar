@@ -201,7 +201,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             hidden = self.language_model.model(self.embed_tokens(ids.reshape(-1)), label="main")
         logits = self.lm_head(hidden)
         tokens, accepted = sampler.sample_verify(engine_inputs.request_ids, logits, ids[:, 1:])
-        acceptance.stage(accepted)
+        acceptance.stage(accepted, tokens)
         kda.set_prefix_len(pool.block("spec_len", 0), accepted)
         new_bonus = tokens.gather(1, accepted.to(torch.long).unsqueeze(1))
         if self.draft is not None:
@@ -243,19 +243,27 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     def unpack_packed_outputs(self, static_output: dict, request_ids: list[str], real_seq_lens: list[int],
                               inputs: list, per_request_info: dict) -> dict[str, dict[str, list[torch.Tensor]]]:
         """A verify step's per-request outputs: ``new_token`` = the accepted tokens and the new
-        bonus (``accepted + 1`` of the row's ``k1`` verified tokens), ``text_inputs`` = the next row.
-        Waits for the step's acceptance counts (recorded mid-step, so the wait overlaps the draft);
-        the slices are cloned off the static buffers."""
+        bonus (``accepted + 1`` of the row's ``k1`` verified tokens, cut after the first stop token
+        unless the request ignores EOS), ``text_inputs`` = the next row. Waits for the step's
+        verdicts (recorded mid-step, so the wait overlaps the draft); the slices are cloned off the
+        static buffers."""
         if "spec_tokens" not in static_output:
             return {}
         acceptance: SpecAcceptance = self._acceptance
         acceptance.note_step(request_ids)
-        counts = acceptance.accepted_for(request_ids)
+        verdicts = acceptance.verdicts_for(request_ids)
         tokens, nxt = static_output["spec_tokens"], static_output["next_inputs"]
-        return {
-            rid: {"new_token": [tokens[i, : counts[i] + 1].clone()], "text_inputs": [nxt[i].clone()]}
-            for i, rid in enumerate(request_ids)
-        }
+        out = {}
+        for i, rid in enumerate(request_ids):
+            n = verdicts[i].accepted + 1
+            info = per_request_info.get(rid) if per_request_info else None
+            if info is not None and not info.resource_configs[SAMPLER].ignore_eos:
+                for j, t in enumerate(verdicts[i].tokens[:n]):
+                    if t in self.config.stop_token_ids:
+                        n = j + 1
+                        break
+            out[rid] = {"new_token": [tokens[i, :n].clone()], "text_inputs": [nxt[i].clone()]}
+        return out
 
     def bind_node_resources(self, resources: dict) -> None:
         super().bind_node_resources(resources)
@@ -272,8 +280,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         if self.speculative_tokens > 0:
-            # several tokens per step: tally what was emitted; a stop token anywhere in them stops
-            # (the few tokens after it in the same step still reach the client: 4a limitation)
+            # several tokens per step: tally what was emitted (already cut at a stop token by
+            # `unpack_packed_outputs`); a stop token among them ends the loop
             emitted = outputs["new_token"][0].reshape(-1).tolist()
             state = self.request_state(request_id)
             n_done = state.get("emitted", 0) + len(emitted)
