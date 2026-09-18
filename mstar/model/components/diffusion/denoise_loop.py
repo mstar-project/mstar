@@ -14,6 +14,7 @@ leaves the model-specific parts to a handful of hooks:
   stop after the request's own step count         denoise(engine_inputs, key, latents, timestep,
   per-shape CUDA-graph buckets (Euler inside)              sigma, sigma_next, **cond) -> [B, L, C]
   ragged-attention step declaration               capture_request_inputs(key, device) -> {name: [..]}
+                                                  attention_segments(key) -> ((label, span), ...)
 
 Conventions the base fixes:
 
@@ -28,10 +29,16 @@ Conventions the base fixes:
   buffers.
 * Rows are batched only at an identical ``shape_key`` (latent grid, text
   length, conditioning layout); the key is also the CUDA-graph bucket key.
+* Every span a forward attends over must be declared: the default is one
+  ``"main"`` segment of all the request's tokens; a model whose layers also
+  attend over a sub-span (a refiner over the image tokens alone, say) lists
+  each span with its own label in :meth:`attention_segments` and threads
+  :meth:`ragged_for` that label to those layers.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Hashable, Mapping, Sequence
 from typing import Any
@@ -47,6 +54,7 @@ from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSu
 logger = logging.getLogger(__name__)
 
 LATENTS = "latents"
+MAIN_SPAN = "main"
 _STEP_KEYS = ("sigma", "sigma_next", "timestep")
 
 
@@ -124,6 +132,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """Derived per-shape state (e.g. rotary tables); cached by :meth:`layout`."""
         return None
 
+    def attention_segments(self, shape_key: Hashable) -> Sequence[tuple[str, int]]:
+        """``(label, span)`` for every span one request's layers attend over, in
+        declaration order. Default: one ``"main"`` segment of all its tokens."""
+        return ((MAIN_SPAN, self.num_tokens(shape_key)),)
+
     # --------------------------------------------------------------- helpers
     def layout(self, shape_key: Hashable, device: torch.device) -> Any:
         entry = self._layouts.get(shape_key)
@@ -135,10 +148,16 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         return int(fwd_info.dynamic_loop_iter_counts.get(self.loop_name, 0))
 
     def _ragged(self):
+        """The bound resource's ``run`` for the ``"main"`` span, or None (SDPA)."""
+        return self.ragged_for(MAIN_SPAN)
+
+    def ragged_for(self, label: str):
+        """``(q, k, v) -> out`` over the segments declared under ``label``, or None
+        when no ragged resource is bound (layers then fall back to SDPA)."""
         if self.attn_resource_key is None:
             return None
         resource = self.node_resources.get(self.attn_resource_key)
-        return None if resource is None else resource.run
+        return None if resource is None else functools.partial(resource.run, label=label)
 
     # --------------------------------------------------------- engine contract
     def prepare_inputs(
@@ -236,11 +255,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     ) -> SubmoduleStep | None:
         if self.attn_resource_key is None:
             return None
+        # every row (padding rows included) carries its shape key, so the spans are
+        # identical between a bucket's capture and its replays
+        segments = [
+            Segment(request_id=rid, label=label, span=span)
+            for rid, inp in zip(request_ids, inputs, strict=True)
+            for label, span in self.attention_segments(inp.resource_step_info)
+        ]
         return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label="main", span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
+            segments=segments,
             steps={self.attn_resource_key: AttentionStep(causal=False)},
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
