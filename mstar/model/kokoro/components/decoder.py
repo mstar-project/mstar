@@ -163,9 +163,10 @@ class Generator(nn.Module):
         self, x: torch.Tensor, style: torch.Tensor, f0: torch.Tensor, frame_lengths: torch.Tensor
     ) -> torch.Tensor:
         """``[B, C, n]`` features and ``[B, n]`` F0 -> ``[B, n * upsample]`` waveform."""
-        source = self.m_source(f0, frame_lengths)
-        magnitude, phase, _ = self.stft.transform(source, frame_lengths * self.m_source.upsample)
-        harmonics = torch.cat([magnitude, phase], dim=1)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            source = self.m_source(f0.float(), frame_lengths)
+            magnitude, phase, _ = self.stft.transform(source, frame_lengths * self.m_source.upsample)
+        harmonics = torch.cat([magnitude, phase], dim=1).to(x.dtype)
 
         lengths = frame_lengths
         for i in range(self.num_upsamples):
@@ -184,10 +185,11 @@ class Generator(nn.Module):
                 acc = out if acc is None else acc + out
             x = acc / self.num_kernels
 
-        x = mask_channels(self.conv_post(F.leaky_relu(x)), mask)
-        spec = torch.exp(x[:, : self.stft.bins])
-        phase = torch.sin(x[:, self.stft.bins :])
-        return self.stft.inverse(spec, phase, lengths)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = mask_channels(self.conv_post(F.leaky_relu(x.float())), mask)
+            spec = torch.exp(x[:, : self.stft.bins])
+            phase = torch.sin(x[:, self.stft.bins :])
+            return self.stft.inverse(spec, phase, lengths)
 
 
 class Decoder(nn.Module):
@@ -208,6 +210,10 @@ class Decoder(nn.Module):
         self.N_conv = nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1)
         self.asr_res = nn.Sequential(nn.Conv1d(hidden, res, kernel_size=1))
         self.generator = Generator(config)
+        # Reduced precision for the convolutional trunk and the generator's
+        # upsampling stages; the source and the STFT head stay fp32 regardless.
+        dtypes = {"float32": None, "bfloat16": torch.bfloat16, "float16": torch.float16}
+        self.autocast_dtype = dtypes[config.decoder_dtype]
 
     def forward(
         self,
@@ -218,11 +224,15 @@ class Decoder(nn.Module):
         frame_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """``asr [B, hidden, F]``, curves ``[B, 2F]`` -> ``[B, F * samples_per_frame]``."""
-        mask = length_mask(frame_lengths, asr.shape[-1])
-        f0 = mask_channels(self.F0_conv(f0_curve[:, None]), mask)
-        energy = mask_channels(self.N_conv(energy_curve[:, None]), mask)
-        x, lengths = self.encode(torch.cat([asr, f0, energy], dim=1), style, frame_lengths)
-        asr_res = mask_channels(self.asr_res(asr), mask)
-        for block in self.decode:
-            x, lengths = block(torch.cat([x, asr_res, f0, energy], dim=1), style, lengths)
-        return self.generator(x, style, f0_curve, lengths)
+        autocast = torch.autocast(
+            device_type=asr.device.type, dtype=self.autocast_dtype, enabled=self.autocast_dtype is not None
+        )
+        with autocast:
+            mask = length_mask(frame_lengths, asr.shape[-1])
+            f0 = mask_channels(self.F0_conv(f0_curve[:, None]), mask)
+            energy = mask_channels(self.N_conv(energy_curve[:, None]), mask)
+            x, lengths = self.encode(torch.cat([asr, f0, energy], dim=1), style, frame_lengths)
+            asr_res = mask_channels(self.asr_res(asr), mask)
+            for block in self.decode:
+                x, lengths = block(torch.cat([x, asr_res, f0, energy], dim=1), style, lengths)
+            return self.generator(x, style, f0_curve, lengths)
