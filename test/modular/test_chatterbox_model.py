@@ -596,6 +596,7 @@ class _FakeS3Gen(torch.nn.Module):
         self.anchor = torch.nn.Parameter(torch.zeros(()))
         self.calls = []
         self.rows_calls = []
+        self.buckets = []
 
     def tokens_to_mel(self, tokens, lens, ref, *, n_timesteps, generator=None, noise=None, finalize=True):
         self.calls.append(("mel", tokens.shape, int(lens[0]), n_timesteps, ref, finalize, noise is not None))
@@ -604,7 +605,8 @@ class _FakeS3Gen(torch.nn.Module):
             frames = frames[:, :, :-6]
         return frames.expand(-1, 80, -1).clone()
 
-    def tokens_to_mel_rows(self, rows, *, n_timesteps):
+    def tokens_to_mel_rows(self, rows, *, n_timesteps, frame_bucket=0):
+        self.buckets.append(frame_bucket)
         mels = [
             self.tokens_to_mel(
                 row.tokens[None], torch.tensor([row.tokens.numel()]), row.ref, n_timesteps=n_timesteps,
