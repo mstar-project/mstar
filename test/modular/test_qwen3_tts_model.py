@@ -1262,25 +1262,48 @@ def test_qwen3_tts_codec_trims_reported_context_audio():
     config = _tiny_model_config()
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
     assert submodule.windows == [1, 4] and submodule.max_window == 4
-    state = submodule.request_state("request")
 
     # The stream buffer reports how many leading frames are repeated context;
-    # the first window has none, later ones up to left_context (2).
-    state.add_all(latest_codec_frames=5, latest_context_frames=0)
+    # the first window has none, later ones up to left_context (2). The
+    # geometry travels with the pass's inputs.
     first = {"audio_chunk": [torch.arange(20)]}
-    submodule.postprocess("request", None, first)
+    submodule.postprocess("request", None, first, inputs=_geometry(frames=5, context=0))
     assert first["audio_chunk"][0].tolist() == list(range(20))
 
-    state.add_all(latest_codec_frames=5, latest_context_frames=2)
     second = {"audio_chunk": [torch.arange(20)]}
-    submodule.postprocess("request", None, second)
+    submodule.postprocess("request", None, second, inputs=_geometry(frames=5, context=2))
     assert second["audio_chunk"][0].tolist() == list(range(8, 20))
 
     # Padding frames of a bucket never reach the client.
-    state.add_all(latest_codec_frames=3, latest_context_frames=1)
     padded = {"audio_chunk": [torch.arange(16)]}
-    submodule.postprocess("request", None, padded)
+    submodule.postprocess("request", None, padded, inputs=_geometry(frames=3, context=1))
     assert padded["audio_chunk"][0].tolist() == list(range(4, 12))
+
+
+def _geometry(frames: int, context: int) -> ARNodeInputs:
+    return ARNodeInputs(kwargs={"frames": frames, "context": context})
+
+
+def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
+    """Speculative scheduling prepares a request's next window before the
+    current one is postprocessed; the trim must follow the pass, not the
+    request's latest state."""
+    config = _tiny_model_config()   # upsample 4, windows [1, 4]
+    submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
+    meta = lambda context: SimpleNamespace(  # noqa: E731
+        request_id="request",
+        step_metadata={"stream_chunks": {"codec_tokens": {"context_items": context, "is_final": False}}},
+    )
+    first = submodule.prepare_inputs("codec_chunk", meta(0), {"codec_tokens": [torch.ones(1, 4, dtype=torch.long)]})
+    second = submodule.prepare_inputs("codec_chunk", meta(1), {"codec_tokens": [torch.ones(4, 4, dtype=torch.long)]})
+    assert (first.kwargs, second.kwargs) == ({"frames": 1, "context": 0}, {"frames": 4, "context": 1})
+
+    out_first = {"audio_chunk": [torch.arange(4)]}
+    submodule.postprocess("request", None, out_first, inputs=first)
+    assert out_first["audio_chunk"][0].tolist() == [0, 1, 2, 3]
+    out_second = {"audio_chunk": [torch.arange(16)]}
+    submodule.postprocess("request", None, out_second, inputs=second)
+    assert out_second["audio_chunk"][0].tolist() == list(range(4, 16))
 
 
 def test_qwen3_tts_codec_trims_reference_audio_from_clone_streams():
@@ -1295,15 +1318,13 @@ def test_qwen3_tts_codec_trims_reference_audio_from_clone_streams():
     assert state["skip_samples"] == 16
 
     # First chunk: 3 frames = 12 samples, all reference -> nothing emitted.
-    assert state["latest_codec_frames"] == 3 and state["latest_context_frames"] == 0
     first = {"audio_chunk": [torch.arange(20)]}
-    submodule.postprocess("clone", None, first)
+    submodule.postprocess("clone", None, first, inputs=_geometry(frames=3, context=0))
     assert first["audio_chunk"][0].numel() == 0
     assert state["skip_samples"] == 4
     # Second chunk: 2 context + 3 new frames; 4 more samples belong to the reference.
-    state.add_all(latest_codec_frames=5, latest_context_frames=2)
     second = {"audio_chunk": [torch.arange(20)]}
-    submodule.postprocess("clone", None, second)
+    submodule.postprocess("clone", None, second, inputs=_geometry(frames=5, context=2))
     assert second["audio_chunk"][0].tolist() == list(range(12, 20))
     assert state["skip_samples"] == 0
 
@@ -1331,10 +1352,8 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
     assert packed.shape == (4, 4)
     assert packed[:, :2].t().tolist() == [[1, 2, 3, 4], [5, 6, 7, 8]]
     assert packed[:, 2:].count_nonzero().item() == 0
-    state = submodule.request_state("request")
-    assert state["latest_codec_frames"] == 2
-    assert state["latest_context_frames"] == 1
-    assert state["codec_bucket"] == 4
+    assert prepared.kwargs == {"frames": 2, "context": 1}
+    assert submodule.request_state("request")["codec_bucket"] == 4
 
     # A single frame lands in the first ramp bucket; too many frames is an error.
     one = submodule.prepare_inputs(
@@ -1390,7 +1409,7 @@ def test_qwen3_tts_streaming_policy_ramps_and_flushes_only_new_tail_audio():
     prepared = codec.prepare_inputs("codec_chunk", fwd_info, {"codec_tokens": [tail_codes]})
     assert prepared.tensor_inputs["codec_tokens"].shape == (4, 4)   # 3 frames padded to the 4-frame bucket
     outputs = {"audio_chunk": [torch.arange(16)]}
-    codec.postprocess("request", None, outputs)
+    codec.postprocess("request", None, outputs, inputs=prepared)
     assert outputs["audio_chunk"][0].tolist() == list(range(8, 12))
 
 
