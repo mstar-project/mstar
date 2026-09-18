@@ -2255,6 +2255,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             kwargs=dict(cfg=True, seq_lens=lens),
         )
 
+    # Native bf16, not the engine autocast — as forward()/forward_batched():
+    # the runner captures under the engine's autocast scope, and a graph
+    # captured that way replays the autocast'd kernels for the request's
+    # whole denoise (measured: ~23 dB latent PSNR from the native step after
+    # one iteration on Edge t2i, which compounds over the loop).
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward_captured(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
         latents, vision_timesteps, position_ids_cond, position_ids_uncond, noisy_token_mask,
