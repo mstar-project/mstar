@@ -84,11 +84,13 @@ class SineSource(nn.Module):
         bsz, num_frames = f0.shape
         num_samples = num_frames * self.upsample
         # Phase increment per frame, in cycles, for the fundamental and its
-        # harmonics ``[B, H, n]``; the frame-rate value equals the reference's
-        # downsampled sample-rate value because F0 is constant within a frame.
-        cycles = (f0[:, None, :] * self.harmonic_index[None, :, None] / self.sample_rate) % 1
+        # harmonics, time-major ``[B, n, H]`` like the reference: the frame-rate
+        # value equals its downsampled sample-rate value because F0 is constant
+        # within a frame, and summing over the same layout keeps the GPU scan's
+        # rounding identical (the vocoder amplifies one-ulp phase differences).
+        cycles = (f0[:, :, None] * self.harmonic_index / self.sample_rate) % 1
         torch.rand(bsz, self.num_harmonics, device=f0.device)  # reference's initial phase (has no effect)
-        phase = torch.cumsum(cycles, dim=2) * (2 * math.pi)
+        phase = (torch.cumsum(cycles, dim=1) * (2 * math.pi)).transpose(1, 2)
         # Hold each row's last valid phase through its padding: the linear
         # upsample then computes every valid sample with exactly the operands
         # the reference's single-row call uses, including the clamped tail.
