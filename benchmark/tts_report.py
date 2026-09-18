@@ -23,11 +23,14 @@ def _load(path: Path) -> dict:
 
 
 def benchmark_rows(results: Path) -> list[str]:
+    reports = [
+        _load(path) for path in sorted(results.glob("*_c[0-9]*.json"))
+        if not path.name.endswith("_wer.json")
+    ]
     rows = []
-    for path in sorted(results.glob("*_c[0-9]*.json")):
-        if path.name.endswith("_wer.json"):
-            continue
-        report = _load(path)
+    # one system's rows in concurrency order, systems alphabetically
+    for report in sorted(reports, key=lambda r: (r.get("label") or r["engine"], int(r["concurrency"]))):
+        path = results / f"{report.get('label') or report['engine']}_c{report['concurrency']}.json"
         med = report["median_over_repeats"]
         wer_path = path.with_name(path.stem + "_wer.json")
         wer = f"{_load(wer_path)['wer_percent']:.2f}" if wer_path.is_file() else "n/a"
@@ -84,7 +87,9 @@ def main(argv: list[str] | None = None) -> None:
              "|---|---|---|---|---|---|---|---|---|", *parity_rows(results)]
     env = results / "environment.txt"
     if env.is_file():
-        lines += ["", "## Environment", "", "```", env.read_text(encoding="utf-8").strip(), "```"]
+        # versions, GPU and clocks; the raw nvidia-smi clock dump that follows is left out
+        summary = env.read_text(encoding="utf-8").split("==============NVSMI LOG")[0].strip()
+        lines += ["", "## Environment", "", "```", summary, "```"]
     text = "\n".join(lines) + "\n"
     print(text)
     if args.out:
