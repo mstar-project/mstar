@@ -32,10 +32,12 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.model.whisper.components.alignment import word_timings
 from mstar.model.whisper.components.decoder import WhisperDecoderModel
 from mstar.model.whisper.components.encoder import WhisperEncoderModel
 from mstar.model.whisper.components.timestamps import TimestampRules, inactive_state, rule_state
 from mstar.model.whisper.config import (
+    ALIGN_WALK,
     ATTN,
     CONTEXT_LABEL,
     CROSS_ATTN,
@@ -104,7 +106,15 @@ class WhisperEncoderSubmodule(NodeSubmodule):
             n_fft=config.n_fft,
             hop_length=config.hop_length,
             chunk_length=config.chunk_length,
-        ).to(encoder.conv1.weight.device)
+        ).to(device=encoder.conv1.weight.device, dtype=torch.float32)  # float32 even under a bf16 default dtype
+
+    def _mel(self, audio: torch.Tensor) -> torch.Tensor:
+        """The spectrogram in float32 whatever dtype the engine cast this
+        module to (it casts submodules to the compute dtype after they are
+        built; a bf16 STFT would not match the reference features)."""
+        if self.log_mel.window.dtype != torch.float32:
+            self.log_mel.float()
+        return self.log_mel(audio)
 
     def _param_dtype(self) -> torch.dtype:
         return self.encoder.conv1.weight.dtype
@@ -149,7 +159,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         # one STFT for the whole batch; the runner copies the result into the
         # captured forward's static input
         audio = torch.stack([inp.tensor_inputs["audio"] for inp in inputs], dim=0)
-        return {"audio_features": self.log_mel(audio).to(self._param_dtype())}
+        return {"audio_features": self._mel(audio).to(self._param_dtype())}
 
     def forward(
         self,
@@ -202,6 +212,13 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
       - prefill_prompt: append ``<|lang|><|task|>[<|notimestamps|>]`` after a
         detected language token, over the already written context.
       - decode: embed the previous token, single-step decode.
+      - align: after the loop, when word timestamps were asked for: one
+        teacher-forced pass over ``<|sot|><|lang|><|task|><|notimestamps|>
+        transcript <|eot|>`` outside the caches; the alignment heads'
+        cross-attention is turned into word start/end times, emitted as a
+        token sequence in Whisper's own timestamp vocabulary
+        (``<|startoflm|> <|s0|> word <|e0|><|s1|> word ...``) that the
+        detokenizer renders and the serving layer parses.
 
     Both cache streams belong to the step: ``main`` grows by the token
     count, ``context`` grows by the encoder output at the walk that writes it
@@ -221,10 +238,13 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     # decode steps are graph replays and the prefill is four eager layers.
     disable_torch_compile = True
 
-    def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig):
+    def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig, tokenizer=None):
         super().__init__()
         self.decoder = decoder
         self.config = config
+        # the align walk groups tokens into words and re-encodes them
+        self.tokenizer = tokenizer
+        self._startoflm_id = tokenizer.convert_tokens_to_ids("<|startoflm|>") if tokenizer is not None else None
         self._suppress_ids: torch.Tensor | None = None
         self._begin_suppress_ids: torch.Tensor | None = None
         self._language_mask: torch.Tensor | None = None
@@ -285,6 +305,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         **kwargs,
     ) -> ARNodeInputs:
         device = self.get_device()
+        if graph_walk == ALIGN_WALK:
+            return self._prepare_alignment(fwd_info, inputs)
         token_ids = inputs["text_inputs"][0].to(device).reshape(-1)
         seq_len = token_ids.shape[0]
 
@@ -316,6 +338,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             # detection walk's prompt ends at <|sot|> and says nothing yet.
             prompt = token_ids.tolist() + tensor_inputs.get("prompt_tail", token_ids[:0]).tolist()
             timestamps = graph_walk != DETECT_LANGUAGE_WALK and self.config.no_timestamps_token_id not in prompt
+            # the align walk rebuilds the forced prompt from these
+            for tok in prompt:
+                if self.config.language_of(tok) is not None:
+                    state.add("language", tok)
+                elif tok in self.config.task_to_id.values():
+                    state.add("task", tok)
             state.add("timestamps", timestamps)
             row = rule_state([], self.config) if timestamps else inactive_state()
             tensor_inputs["ts_rules"] = torch.tensor(row, dtype=torch.long, device=device)
@@ -325,6 +353,53 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             input_ids=token_ids,
             tensor_inputs=tensor_inputs,
         )
+
+    # -- word timestamps ----------------------------------------------------
+
+    def _prepare_alignment(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList) -> ARNodeInputs:
+        """The teacher-forcing sequence for the align walk: the forced prompt
+        with ``<|notimestamps|>`` (word timing never uses timestamp tokens),
+        the transcript's text tokens, end-of-text."""
+        device = self.get_device()
+        state = self.request_state(fwd_info.request_id)
+        generated = [int(t) for part in inputs["transcript"] for t in part.reshape(-1).tolist()]
+        language = state.get("language")
+        if generated and self.config.language_of(generated[0]) is not None:
+            language, generated = generated[0], generated[1:]  # detected, not forced
+        task = state.get("task", self.config.task_token("transcribe"))
+        text = [t for t in generated if t < self.config.eos_token_id]
+        if language is None:
+            language = self.config.language_token("en")
+        seq = [self.config.decoder_start_token_id, language, task, self.config.no_timestamps_token_id]
+        seq += text + [self.config.eos_token_id]
+        return ARNodeInputs(
+            input_seq_len=len(seq),
+            input_ids=torch.tensor(seq, dtype=torch.long, device=device),
+            tensor_inputs={
+                "encoder_states": inputs["encoder_states"][0].to(device),
+                "audio_frames": inputs["audio_frames"][0].to(device).reshape(-1),
+            },
+        )
+
+    def _align(self, input_ids: torch.Tensor, encoder_states: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """Word timings for one request as a token sequence in the timestamp
+        vocabulary: ``<|startoflm|>`` then ``<|start|> word <|end|>`` per word,
+        each word re-encoded so the detokenizer renders it as text."""
+        heads = [(int(layer), int(head)) for layer, head in self.config.alignment_heads]
+        weights = self.decoder.cross_attention_weights(input_ids, encoder_states, heads)
+        prompt_len = 3  # <|sot|><|lang|><|task|>; the <|notimestamps|> row predicts the first text token
+        rows = weights[:, prompt_len:-1]
+        text = input_ids[prompt_len + 1:-1].tolist()
+        words = word_timings(rows, text, self.tokenizer.decode, num_frames)
+        tb, top = self.config.timestamp_begin, self.config.vocab_size - 1
+
+        def stamp(seconds: float) -> int:
+            return min(top, tb + int(round(seconds / self.config.timestamp_precision)))
+
+        ids = [self._startoflm_id]
+        for w in words:
+            ids += [stamp(w["start"])] + self.tokenizer.encode(w["word"], add_special_tokens=False) + [stamp(w["end"])]
+        return torch.tensor(ids, dtype=torch.long, device=input_ids.device)
 
     @staticmethod
     def _context_span(inp: ARNodeInputs) -> int:
@@ -344,7 +419,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         slot_lease: SlotLease | None = None,
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
-    ) -> SubmoduleStep:
+    ) -> SubmoduleStep | None:
+        if graph_walk == ALIGN_WALK:
+            return None  # eager pass over its own inputs; touches no cache
         context_segments = tuple(
             Segment(
                 request_id=rid,
@@ -389,6 +466,13 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if graph_walk == ALIGN_WALK:
+            (inp,) = inputs  # one request per align step
+            return {
+                "input_ids": inp.input_ids,
+                "encoder_states": inp.tensor_inputs["encoder_states"],
+                "audio_frames": inp.tensor_inputs["audio_frames"],
+            }
         preprocessed: dict[str, torch.Tensor | Any] = {
             "input_ids": torch.cat([self._row_ids(inp) for inp in inputs]),
             "ts_rules": torch.stack([inp.tensor_inputs["ts_rules"] for inp in inputs]),
@@ -448,8 +532,11 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         encoder_states: torch.Tensor | None = None,
         ts_rules: torch.Tensor | None = None,
+        audio_frames: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
+        if graph_walk == ALIGN_WALK:
+            return {"word_tokens": [self._align(input_ids, encoder_states, int(audio_frames.reshape(-1)[0]))]}
         new_tokens, next_rules = self._forward(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
@@ -471,6 +558,8 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int | None:
         if graph_walk == DECODE_WALK:
             return None  # the decode capture sizes cap it
+        if graph_walk == ALIGN_WALK:
+            return 1
         return self.MAX_PREFILL_BATCH_SIZE
 
     def forward_batched(
@@ -480,8 +569,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         input_ids: torch.Tensor,
         encoder_states: torch.Tensor | None = None,
         ts_rules: torch.Tensor | None = None,
+        audio_frames: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
+        if graph_walk == ALIGN_WALK:
+            (rid,) = engine_inputs.request_ids
+            return {rid: {"word_tokens": [self._align(input_ids, encoder_states, int(audio_frames.reshape(-1)[0]))]}}
         new_tokens, next_rules = self._forward(
             graph_walk=graph_walk,
             engine_inputs=engine_inputs,
