@@ -1584,6 +1584,12 @@ shape with the Euler update inside the graph — and asks the model for:
         def num_tokens(self, key): ...                # image tokens for the attention step
         def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
         def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
+        # optional: extra attention spans (a refiner over the image tokens alone, ...)
+        def attention_segments(self, key): return (("main", self.num_tokens(key)),)
+
+Every span a layer attends over must be declared with its own label (default: one
+``"main"`` segment per request); ``ragged_for(label)`` hands that span's kernel to the
+layers, which fall back to SDPA when no ragged resource is bound.
 
 Shared pieces to build the components from: ``flow_match.py`` (shift schedules and the
 exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
