@@ -59,7 +59,13 @@ def render_table(rows: dict[tuple[str, str], dict], concurrencies: tuple[int, ..
         if thr and by_c:
             first = next(iter(by_c.values()))
             notes.append(f"{first.get('images', '?')} images x {first.get('repeats', 1)} repeats per level")
-        output = any_part.get("output_format") or "server default"
+        observed = next(
+            (p.get("observed_output_format") for p in (lat, thr) if p and p.get("observed_output_format")), None,
+        )
+        requested = any_part.get("output_format")
+        output = observed or requested or "server default"
+        if observed and not requested:
+            output = f"{observed} (default)"
         cells = [tag, model, size, output, _fmt_s(lat and lat["median_s"]), _fmt_s(lat and lat["p95_s"])]
         cells += [_fmt_rate(by_c.get(str(c))) for c in concurrencies]
         cells += [_fmt_vram(lat, *by_c.values()), "; ".join(notes)]
